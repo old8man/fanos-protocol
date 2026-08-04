@@ -388,7 +388,7 @@ pub fn spawn_role_loop<F: Field>(
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
         let mut cur = Epoch::ZERO;
-        let mut seed = BeaconSeed::GENESIS;
+        let mut seed = client.genesis();
         genesis_assign::<F>(&client, &mut live, capacity, ready, vrf, &roles_tx).await;
         // The refresh is a fixed-point iteration over the roster, so it is polled at a rate proportional to how fast it
         // is still moving: back off geometrically while the assignment is unchanged, snap back to the floor the moment
@@ -576,7 +576,9 @@ async fn genesis_assign<F: Field>(
     if tokio::time::timeout(GENESIS_READY_TIMEOUT, both).await.is_err() {
         return; // the store is not answering; the beacon's first round will assign instead
     }
-    assign_epoch::<F>(client, live, Epoch::ZERO, &BeaconSeed::GENESIS, capacity, vrf, roles_tx).await;
+    // The roster is read at epoch 0 against this network's genesis seed: the records it must verify were
+    // published against that seed, so the constant would reject every one of them.
+    assign_epoch::<F>(client, live, Epoch::ZERO, &client.genesis(), capacity, vrf, roles_tx).await;
 }
 
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from

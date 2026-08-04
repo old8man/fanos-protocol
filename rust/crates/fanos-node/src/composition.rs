@@ -86,6 +86,14 @@ pub struct CellComposition {
 }
 
 impl CellComposition {
+    /// The genesis seed of the network this composition describes — derived from the beacon commitment it
+    /// already carries, so it cannot disagree with the beacon this node runs
+    /// ([`BeaconParams::genesis_seed`](crate::config::BeaconParams::genesis_seed)).
+    #[must_use]
+    pub fn genesis_seed(&self) -> BeaconSeed {
+        self.beacon.as_ref().map_or(BeaconSeed::GENESIS, BeaconParams::genesis_seed)
+    }
+
     /// A plain overlay node — no beacon, no relay, no service, no admission price.
     ///
     /// The shape most scenarios want, and the shape the simulator used to hard-code. Now it is one point in a
@@ -208,7 +216,10 @@ pub fn compose_engine<F: Field + 'static>(
                 ip.community.clone(),
                 // The host serves the epoch its dealing was made for; the rotation driver advances it.
                 Epoch::new(0),
-                BeaconSeed::GENESIS,
+                // …against **this network's** epoch-0 seed. A newcomer derives the community's ingress line
+                // from `(community, epoch, beacon)`; a host on the constant while the network is on its
+                // derived seed would sit on a line nobody looks at.
+                what.genesis_seed(),
                 ip.difficulty,
             )
             .with_kem_secret(kem_secret);

@@ -212,7 +212,9 @@ pub fn spawn_capability_publisher(
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut epoch = Epoch::ZERO;
-        let mut seed = BeaconSeed::GENESIS;
+        // This network's epoch-0 seed, not the constant — a bound advertisement proves a coordinate, and the
+        // coordinate it must prove is the one the node was seated at (`docs/design-genesis.md`).
+        let mut seed = client.genesis();
         // One publish path, chosen per write rather than per spawn: the beacon changes every epoch, so a bound record must
         // be re-proven against the current one — a proof captured once would verify only in the epoch it was made.
         let publish = |epoch: Epoch, seed: BeaconSeed| {

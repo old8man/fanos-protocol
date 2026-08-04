@@ -395,6 +395,12 @@ pub struct NodeHandle {
     events_rx: broadcast::Receiver<Notification>,
     endpoint: Endpoint,
     reflexive: Reflexive,
+    /// The **network's genesis seed** — the value epoch-0 coordinates on this network are drawn against
+    /// ([`Directory::genesis`]). Held here so every task spawned above the transport reads the network from
+    /// one place instead of each reaching for the `BeaconSeed::GENESIS` constant, which is what made the
+    /// publisher, the directory feeder and the role loop each independently wrong on a network that has a
+    /// beacon (`docs/design-genesis.md` §5).
+    genesis: BeaconSeed,
 }
 
 impl NodeHandle {
@@ -488,7 +494,14 @@ impl NodeHandle {
             input_tx: self.input_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
             events_tx: self.events_tx.clone(),
+            genesis: self.genesis,
         }
+    }
+
+    /// The genesis seed of the network this node is on — see [`Client::genesis`].
+    #[must_use]
+    pub fn genesis(&self) -> BeaconSeed {
+        self.genesis
     }
 
     /// Close the QUIC endpoint and stop serving. Idempotent.
@@ -538,6 +551,7 @@ pub struct Client {
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
+    genesis: BeaconSeed,
 }
 
 impl Client {
@@ -545,6 +559,23 @@ impl Client {
     #[must_use]
     pub fn address(&self) -> Triple {
         *self.addr.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The **genesis seed of the network this node is on** — the beacon value epoch 0 is drawn against.
+    ///
+    /// Every task that starts before the first `BeaconReady` needs a seed for epoch 0: the mix-key publisher,
+    /// the directory feeder a combiner reads, the capability publisher, the role loop. Each of them used to
+    /// name `BeaconSeed::GENESIS` directly, which was right only while that constant *was* the network's
+    /// seed. Once it is derived per network (`docs/design-genesis.md` §4) a producer on the constant and a
+    /// verifier on the constant still agree with each other — and both disagree with the node's own seat, so
+    /// the whole genesis epoch silently resolves nothing.
+    ///
+    /// Reading it from the client is what makes that unrepeatable: there is one seed per node, it arrives with
+    /// the transport that already used it to seat this node, and a task added later gets it by asking rather
+    /// than by remembering.
+    #[must_use]
+    pub fn genesis(&self) -> BeaconSeed {
+        self.genesis
     }
 
     /// Inject a fire-and-forget command (`Input::Command`). `false` once the engine has stopped.
@@ -928,7 +959,12 @@ where
     };
     // The node's verifiable coordinate for the genesis epoch: MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS)),
     // with the proof it announces so peers can verify it (spec §L0/§7.3).
-    let (coord, proof, rank) = verifiable_coordinate_ranked::<F>(creds, Epoch::ZERO, &BeaconSeed::GENESIS);
+    // The node's own genesis seat, drawn against THIS NETWORK's seed rather than a constant every FANOS
+    // deployment shares — see `Directory::for_network` and `docs/design-genesis.md`. The same value seeds the
+    // `BeaconWindow` below, and it must be the same value: a node's seat and its peers' verification of that
+    // seat are the two halves of one claim.
+    let genesis_seed = directory.genesis();
+    let (coord, proof, rank) = verifiable_coordinate_ranked::<F>(creds, Epoch::ZERO, &genesis_seed);
     let engine = make_engine(coord);
     // The self-certifying identity is now LIVE across epochs (Level B, #102): the HELLO and the beacon the
     // verifier checks peers against both sit behind locks the `reshuffle_loop` rewrites when the beacon
@@ -939,7 +975,7 @@ where
         &CoordinateClaim::direct(proof),
         capabilities,
     ))));
-    let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis()));
+    let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis(genesis_seed)));
     let verify_beacon = beacon_cell.clone();
     // Every peer whose claim this node verifies is remembered for the epoch, because coordinate resolution needs exactly
     // that: the best claim on each point of this node's own walk, and a witness for every step it advances
@@ -1025,7 +1061,9 @@ where
             output: rank,
             index: 0,
             epoch: Epoch::ZERO,
-            beacon: BeaconSeed::GENESIS,
+            // The seed this node's epoch-0 seat was actually drawn against, not the constant: the reshuffle
+            // loop compares against it to decide whether a new beacon moves the coordinate at all.
+            beacon: genesis_seed,
             joining: true,
         },
         Reseater {
@@ -1059,9 +1097,9 @@ impl BeaconWindow {
     /// Accept the current epoch plus this many previous epochs' beacons.
     const DEPTH: usize = 3;
 
-    fn genesis() -> Self {
+    fn genesis(seed: BeaconSeed) -> Self {
         let mut recent = VecDeque::with_capacity(Self::DEPTH);
-        recent.push_back((Epoch::ZERO, BeaconSeed::GENESIS));
+        recent.push_back((Epoch::ZERO, seed));
         Self { recent }
     }
 
@@ -1367,6 +1405,9 @@ fn spawn_inner(
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
     directory.insert(addr, local_addr);
+    // Read before the directory is moved into the transport: this is the network identity every task above
+    // the transport asks the handle for, so it is captured once rather than re-derived.
+    let genesis = directory.genesis();
     tracing::debug!(?addr, %local_addr, self_certifying = identity.is_some(), "fanos-quic node up");
 
     let (input_tx, input_rx) = mpsc::channel::<Input>(INPUT_CAP);
@@ -1424,6 +1465,8 @@ fn spawn_inner(
         reflexive,
         claims: None,
         identity: identity.clone(),
+        // The same value this node was seated against — one network, one seed, read once here.
+        genesis,
     })
 }
 
@@ -2402,7 +2445,7 @@ mod tests {
     fn the_beacon_window_admits_recent_epochs_and_evicts_beyond_its_depth() {
         // Safe-stall (R-C1): the HELLO verifier remembers the last DEPTH epochs' beacons, so a peer proving a
         // recent last-good epoch is admitted (no EPOCH_STALE deadlock), while a truly stale epoch falls out.
-        let mut w = BeaconWindow::genesis();
+        let mut w = BeaconWindow::genesis(BeaconSeed::GENESIS);
         assert_eq!(w.beacon_for(Epoch::ZERO), Some(BeaconSeed::GENESIS));
 
         let b1 = BeaconSeed::new([1; 32]);
@@ -2490,7 +2533,7 @@ mod tests {
 
         // Shared cells + a directory pre-bound at the genesis coordinate.
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8]))); // sentinel: rewritten on reshuffle
-        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis()));
+        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis(BeaconSeed::GENESIS)));
         let directory = Directory::new();
         let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_000).into();
         directory.insert(genesis_coord, local_addr);
@@ -2504,6 +2547,7 @@ mod tests {
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
+            genesis: BeaconSeed::GENESIS,
         };
 
         // A PROTEUS shaper started at genesis — the reshuffle must rotate its shape to the new epoch (§13.4).
@@ -2584,7 +2628,7 @@ mod tests {
         let genesis_coord = genesis.coords();
 
         let hello = Arc::new(RwLock::new(Arc::new(vec![0u8])));
-        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis()));
+        let beacon = Arc::new(RwLock::new(BeaconWindow::genesis(BeaconSeed::GENESIS)));
         let directory = Directory::new();
         let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_001).into();
 
@@ -2596,6 +2640,7 @@ mod tests {
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
+            genesis: BeaconSeed::GENESIS,
         };
         tokio::spawn(reshuffle_loop::<F2>(
             creds,

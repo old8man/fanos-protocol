@@ -151,6 +151,17 @@ impl fmt::Debug for BeaconParams {
 }
 
 impl BeaconParams {
+    /// This network's **genesis seed**, `H("FANOS-v1/genesis-beacon" ‖ commitment)`.
+    ///
+    /// The commitment is the only per-network random value every participant necessarily holds before it can
+    /// do anything, which is exactly what epoch 0 needs and had nothing to supply
+    /// (`docs/design-genesis.md` §4). One derivation, in [`crate::node::genesis_seed`]; this is the
+    /// ergonomic way to reach it from provisioning.
+    #[must_use]
+    pub fn genesis_seed(&self) -> fanos_primitives::BeaconSeed {
+        crate::node::genesis_seed(&self.commitment)
+    }
+
     /// Parse beacon provisioning from a `key = value` file (audit S1-H2), so a node can be handed its DKG
     /// output and run the **live epoch clock** (§7.6) — turning on E4 forward secrecy and E5 rotation — instead
     /// of pinning at genesis. Keys:
@@ -936,6 +947,36 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    /// The **genesis seed of the network this configuration describes** — the value every epoch-0 coordinate
+    /// on it is drawn against (`docs/design-genesis.md` §4).
+    ///
+    /// `H("FANOS-v1/genesis-beacon" ‖ commitment)` when a beacon is provisioned, and the bare constant when
+    /// none is. Both halves matter. The first is the defence: at genesis there is no reshuffle yet, so on the
+    /// base cell placement has no other protection, and a *constant* seed meant one grinding effort bought a
+    /// chosen placement on **every FANOS network that would ever exist**. The second is honest about the
+    /// deployment that has no beacon at all — it has no epoch clock and no reshuffle either, so it has no
+    /// placement defence at any epoch, and pretending otherwise would be worse than the constant.
+    ///
+    /// Derived from material the operator already holds: the commitment is in every provisioning file because
+    /// no node can verify a beacon round without it. No new field, no new ceremony step.
+    #[must_use]
+    pub fn genesis_seed(&self) -> fanos_primitives::BeaconSeed {
+        self.beacon.as_ref().map_or(fanos_primitives::BeaconSeed::GENESIS, BeaconParams::genesis_seed)
+    }
+
+    /// A short, comparable name for that network — the first four bytes of its genesis seed, hex.
+    ///
+    /// Operators need to answer "are we on the same network?" before they can debug anything else, and the
+    /// coordinate cannot answer it (two networks seat the same identity at different points, and two
+    /// identities on one network seat at different points — neither comparison separates the cases). This
+    /// does: same fingerprint, same genesis material.
+    #[must_use]
+    pub fn network_fingerprint(&self) -> String {
+        let seed = self.genesis_seed();
+        let b = seed.as_bytes();
+        format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
+    }
+
     /// Parse a node config from a simple `key = value` text file — one setting per line, `#` starts a
     /// comment — the operator-facing alternative to a long CLI-flag line (§11). Recognised keys:
     /// `listen`, `identity`, `bootstrap` (comma-separated `coord@addr` peers), `role` (comma-separated

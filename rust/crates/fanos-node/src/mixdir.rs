@@ -222,8 +222,11 @@ pub fn spawn_mix_publisher(
         let mut driver = EpochDriver::new(client.address(), onion_seed);
         let mut events = client.subscribe();
         // A coordinate-**bound** record (S1-M3), which a `Node` can always produce because it always runs VRF coordinates.
-        // Genesis first, so a circuit drawn before the first beacon can still seal to this relay.
-        let mut beacon = BeaconSeed::GENESIS;
+        // Genesis first, so a circuit drawn before the first beacon can still seal to this relay — against **this
+        // network's** genesis seed, which is what the node was seated against. Naming the constant here published a
+        // record bound to a coordinate the node does not occupy, so the reader verified it and found nothing: an
+        // empty mix directory for the whole genesis epoch on every network with a beacon.
+        let mut beacon = client.genesis();
         // `Some` ⇒ VRF coordinates, so publish a bound record; `None` ⇒ a pinned cell, where no proof is possible and the
         // legacy unbound record is all there is. Symmetric with the reader's `Option<BeaconSeed>`: on both ends, the
         // `Option` says whether the mechanism exists here, not whether someone chose to use it.
@@ -285,7 +288,7 @@ pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: boo
         // cell whose beacon has not advanced yet still has hosts registering and clients dialing, and a combiner
         // with no directory cannot forward. Waiting for the first `BeaconReady` would leave the whole genesis
         // epoch unserved — which is not a corner case, it is how every fixed-epoch deployment runs.
-        install(&client, Epoch::ZERO, BeaconSeed::GENESIS).await;
+        install(&client, Epoch::ZERO, client.genesis()).await;
         loop {
             match events.recv().await {
                 Ok(Notification::BeaconReady { epoch, seed }) => {

@@ -29,6 +29,9 @@ use fanos_core::roles::{Capability, Demand, Role, RoleController, RoleSet as Cor
 use fanos_primitives::NodeId;
 use fanos_quic::NodeCredentials;
 
+use fanos_primitives::BeaconSeed;
+use fanos_vrf::vss::VssCommitment;
+
 use crate::config::{IngressParams, NodeConfig, RoleSet};
 use crate::role_loop::{
     Assignment, LoadSensor, SelfOrgConfig, SelfOrganization, role_capacity, spawn_load_sensor,
@@ -423,6 +426,30 @@ fn spawn_exit_role(
     Ok(())
 }
 
+/// The **genesis beacon seed of this network**, derived from its beacon commitment.
+///
+/// `H("FANOS-v1/genesis-beacon" ‖ commitment)`. The commitment is the DKG-or-dealing output: random,
+/// per-network, already in every provisioning file because no node can verify a beacon round without it, and
+/// therefore requiring no new field, channel or operational step.
+///
+/// **What it replaces and why that mattered.** Epoch 0 has no reshuffle yet, and on `q = 2` the reshuffle is
+/// the *entire* placement defence (`docs/design-coordinates.md`) — so the genesis coordinate is only as
+/// unpredictable as its seed. `BeaconSeed::GENESIS` is a compile-time constant, which made it not
+/// unpredictable at all: an adversary grinds identities offline until it holds one per point (roughly seven
+/// mints per point on a Fano cell, which is why `fanos-quic::harness` can do it as a *test* facility) and
+/// joins wherever it chose. Worse, being a constant, **one grinding effort worked against every FANOS
+/// deployment that will ever exist** — computed before any of them was founded.
+///
+/// Proof-of-work does not substitute for this, and the reason is exact: `admission_challenge` binds
+/// `(id, coord, epoch)`, all three of which the adversary knows offline at genesis, so a proof is
+/// precomputable. In later epochs the same challenge bites because the adversary cannot know its own future
+/// coordinate. Unpredictability is what prices placement; work only makes precomputation slower.
+/// `docs/design-genesis.md` §2 has the derivation.
+#[must_use]
+pub fn genesis_seed(commitment: &VssCommitment) -> BeaconSeed {
+    BeaconSeed::new(fanos_primitives::hash_labeled("FANOS-v1/genesis-beacon", &commitment.to_bytes()))
+}
+
 /// Validate the **beacon** parameters, so a provisioning file cannot hand a node a threshold the beacon it
 /// names does not have.
 ///
@@ -736,7 +763,15 @@ impl Node {
         let credentials = identity::load_or_generate(config.identity_path.as_deref())?;
 
         // Seed the address book so a fresh node can dial into the network (design.md §9).
-        let directory = Directory::new();
+        //
+        // Bound to THIS network's genesis seed at creation, not later: a directory bound after some uses
+        // would leave those uses on the shared constant, and the whole point is that one value reaches every
+        // site. Where no beacon is configured the constant stands, which is right — such a deployment has no
+        // epoch clock and no reshuffle, so it has no placement defence at any epoch (`docs/design-genesis.md`).
+        let directory = match config.beacon.as_ref() {
+            Some(bp) => Directory::new().for_network(genesis_seed(&bp.commitment)),
+            None => Directory::new(),
+        };
         for peer in &config.bootstrap {
             directory.insert(peer.coord, peer.addr);
         }
@@ -1394,7 +1429,11 @@ mod tests {
         // branch. It exercises the bound one because `Node::start` sets `OverlayConfig::vrf_coordinates` and the publisher
         // therefore has a prover — assert the publisher below, since a `None` prover would silently emit bare keys that this
         // reader then would not find.
-        let genesis = fanos_primitives::BeaconSeed::GENESIS;
+        // **This network's** genesis seed, asked of the node rather than assumed. The relay publishes its mix
+        // key bound to the coordinate it actually occupies, and that coordinate is drawn against the seed
+        // derived from the beacon this test provisions — not the constant. Naming the constant here was the
+        // shape that hid the real defect: reader and writer agreed with each other and with nothing else.
+        let genesis = client.genesis();
         let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await;
         for _ in 0..30 {
             if !dir.is_empty() {
@@ -1710,6 +1749,68 @@ mod tests {
             .await
             .is_ok(),
             "a single-operator 1-of-1 beacon is a documented configuration and must still start",
+        );
+    }
+
+    #[test]
+    fn two_networks_seat_the_same_identity_at_different_genesis_points() {
+        // **The property, not the plumbing.** Epoch 0 has no reshuffle, and on `q = 2` the reshuffle is the
+        // entire placement defence — so the genesis coordinate is only as unpredictable as its seed. With
+        // `BeaconSeed::GENESIS` a compile-time constant it was not unpredictable at all, and worse, it was
+        // the SAME constant everywhere: one grinding effort bought a chosen genesis placement on every FANOS
+        // deployment that will ever exist, computed before any of them was founded.
+        //
+        // So the observable is that an identity's genesis placement now depends on WHICH NETWORK it joins.
+        // Asserted over the seeds rather than over a running node because that is where the property lives —
+        // the transport reads `Directory::genesis()`, and a test that stood up two cells would be measuring
+        // the same equality through more machinery.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let (_a, commitment_a) = deal(&[0x11; 32], 2, 3, &mut DeterministicRng::new(b"network-a")).unwrap();
+        let (_b, commitment_b) = deal(&[0x22; 32], 2, 3, &mut DeterministicRng::new(b"network-b")).unwrap();
+
+        let (a, b) = (genesis_seed(&commitment_a), genesis_seed(&commitment_b));
+        assert_ne!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "two networks must not share a genesis seed — sharing one is what let a single grinding effort \
+             hold a chosen placement on every deployment at once",
+        );
+        assert_ne!(
+            a.as_bytes(),
+            BeaconSeed::GENESIS.as_bytes(),
+            "and neither may be the shared constant",
+        );
+        assert_eq!(
+            genesis_seed(&commitment_a).as_bytes(),
+            a.as_bytes(),
+            "deterministic in the commitment: every node of one network must derive the identical seed, or \
+             they seat themselves in different coordinate spaces and cannot verify each other at epoch 0",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_with_a_beacon_binds_its_directory_to_that_network() {
+        // The wiring the property needs: `Node::start` must bind at directory CREATION, because a directory
+        // bound later leaves every earlier use on the shared constant — and the whole point is that one value
+        // reaches both sites that must agree, the node's own seat and the window peers' claims are checked
+        // against.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let (_s, commitment) = deal(&[0x33; 32], 2, 3, &mut DeterministicRng::new(b"bound-net")).unwrap();
+        let expected = genesis_seed(&commitment);
+        let node = Node::start::<F2>(NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("node starts");
+
+        assert_eq!(
+            node.directory().genesis().as_bytes(),
+            expected.as_bytes(),
+            "a node provisioned with a beacon must run on that network's genesis seed, not the constant",
         );
     }
 }

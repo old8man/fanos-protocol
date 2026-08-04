@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use fanos_geometry::Triple;
+use fanos_primitives::BeaconSeed;
 use fanos_vrf::{VrfOutput, claim_beats};
 
 /// One coordinate's occupant: where to dial it, and — when a coordinate proof was verified — the **rank** that decides
@@ -65,6 +66,23 @@ pub struct Directory {
     /// Count of sends dropped because the destination coordinate had no address (unroutable). Shared
     /// across clones (see [`Directory::unresolved_drops`]).
     unresolved_drops: Arc<AtomicUsize>,
+    /// The **genesis beacon seed of the network this directory belongs to** — what a node's epoch-0
+    /// coordinate is drawn against, and what peers check an epoch-0 claim against.
+    ///
+    /// It lives here because a `Directory` *is* the network from a node's point of view, and because both
+    /// sites that need the value already hold one: the node's own genesis seat (`driver.rs`) and the
+    /// `BeaconWindow` peers' epoch-0 claims are verified against. They must agree or a node's seat and its
+    /// peers' verification of that seat diverge, and threading one value to both is what makes that
+    /// structural rather than a convention.
+    ///
+    /// **Why not `NodeCredentials`,** which is also threaded to both: it derives `Wire` and is persisted as
+    /// the identity file, so a field there changes a stored format for every existing node — and it is the
+    /// wrong home anyway, since credentials are per-*node* and should exist independently of any network.
+    ///
+    /// `None` is `BeaconSeed::GENESIS`, and that is correct rather than lax: a deployment with no beacon has
+    /// no epoch clock and no reshuffle, so it has no placement defence at *any* epoch and nothing here can
+    /// give it one (`docs/design-genesis.md` §7). Where a beacon IS configured, `Node::start` binds this.
+    genesis: Option<BeaconSeed>,
 }
 
 impl Directory {
@@ -72,6 +90,26 @@ impl Directory {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind this directory to a network by its **genesis beacon seed** — the value every node of that network
+    /// draws its epoch-0 coordinate against.
+    ///
+    /// Without it the seed is `BeaconSeed::GENESIS`, a compile-time constant shared by every FANOS deployment
+    /// that has ever existed — so one grinding effort (roughly seven mints per point on a Fano cell) buys a
+    /// chosen genesis placement on *every* network anyone founds, computed before any of them exists. Binding
+    /// makes that work per-network and, since the seed is derived from the beacon commitment, unobtainable
+    /// before first contact. `docs/design-genesis.md` has the derivation and what it does not buy.
+    #[must_use]
+    pub fn for_network(mut self, genesis: BeaconSeed) -> Self {
+        self.genesis = Some(genesis);
+        self
+    }
+
+    /// The genesis beacon seed of this network, or the shared constant when unbound.
+    #[must_use]
+    pub fn genesis(&self) -> BeaconSeed {
+        self.genesis.unwrap_or(BeaconSeed::GENESIS)
     }
 
     /// Bind (or rebind) a coordinate to a network address, **without** a rank.

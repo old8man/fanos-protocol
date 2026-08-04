@@ -51,13 +51,20 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// The overlay coordinate a set of credentials resolves to over the field `F` — its **genesis** verifiable
-/// coordinate `MapToPoint(VRF(vrf_sk, cert‖0‖GENESIS))`, the same point the live engine is seated at.
+/// The overlay coordinate a set of credentials resolves to over the field `F` **on the network whose genesis
+/// seed is `genesis`** — its verifiable coordinate `MapToPoint(VRF(vrf_sk, cert‖0‖genesis))`, the same point
+/// the live engine is seated at ([`crate::node::genesis_seed`], `docs/design-genesis.md` §6).
+///
+/// **The seed is a parameter, and that is the whole point.** It used to be `BeaconSeed::GENESIS`, a
+/// compile-time constant, which made a credential's coordinate the same on every FANOS network in existence —
+/// the defect §3 of that note calls out. Once the seed is derived per network, a coordinate printed without
+/// one is not merely less informative, it is **wrong**: bootstrap addresses are `coord@host:port` and the pin
+/// is checked, so an operator pasting a constant-seed coordinate onto a network with a beacon publishes an
+/// address no node will match. Taking it as an argument is what stops a caller from forgetting there is a
+/// question to answer; [`crate::config::NodeConfig::genesis_seed`] answers it from the config already in hand.
 #[must_use]
-pub fn coordinate<F: Field>(credentials: &NodeCredentials) -> Triple {
-    verifiable_coordinate::<F>(credentials, Epoch::ZERO, &BeaconSeed::GENESIS)
-        .0
-        .coords()
+pub fn coordinate<F: Field>(credentials: &NodeCredentials, genesis: &BeaconSeed) -> Triple {
+    verifiable_coordinate::<F>(credentials, Epoch::ZERO, genesis).0.coords()
 }
 
 #[cfg(test)]
@@ -69,8 +76,9 @@ mod tests {
     #[test]
     fn generated_identity_has_a_stable_coordinate() {
         let creds = load_or_generate(None).unwrap();
-        // Deterministic function of the cert: two reads agree.
-        assert_eq!(coordinate::<F2>(&creds), coordinate::<F2>(&creds));
+        // Deterministic function of the cert *and the network*: two reads on one network agree.
+        let g = BeaconSeed::GENESIS;
+        assert_eq!(coordinate::<F2>(&creds, &g), coordinate::<F2>(&creds, &g));
     }
 
     #[test]
@@ -78,10 +86,26 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("fanos-id-test-{}.bin", std::process::id()));
         let first = load_or_generate(Some(&path)).unwrap();
-        let coord1 = coordinate::<F2>(&first);
+        let coord1 = coordinate::<F2>(&first, &BeaconSeed::GENESIS);
         // A second load reads the same file → same coordinate.
         let second = load_or_generate(Some(&path)).unwrap();
-        assert_eq!(coord1, coordinate::<F2>(&second));
+        assert_eq!(coord1, coordinate::<F2>(&second, &BeaconSeed::GENESIS));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// **One identity, two networks, two seats — and the display path must show it.**
+    ///
+    /// The live path already separates them (`Directory::for_network`), so the risk this pins is a *reporting*
+    /// one: a CLI that prints a coordinate without knowing the network prints a bootstrap address that no node
+    /// on that network will match. Written as a property of `coordinate` itself so it fails at the source
+    /// rather than three call sites downstream.
+    #[test]
+    fn one_identity_seats_differently_on_two_networks() {
+        let creds = load_or_generate(None).unwrap();
+        let a = coordinate::<F2>(&creds, &BeaconSeed::GENESIS);
+        // Any distinct seed; the Fano plane has 7 points, so a single draw is not proof on its own —
+        // sweep until one differs, and fail if the seed is being ignored altogether.
+        let moved = (1u8..=64).any(|i| coordinate::<F2>(&creds, &BeaconSeed::new([i; 32])) != a);
+        assert!(moved, "the genesis seed must move the seat — otherwise `coordinate` is ignoring it");
     }
 }

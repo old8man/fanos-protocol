@@ -749,10 +749,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         }
         None => Epoch::ZERO,
     };
-    let beacon = match flag(args, "--beacon") {
-        Some(s) => parse_beacon_hex(s)?,
-        None => BeaconSeed::GENESIS,
-    };
+    let beacon = beacon_arg(args)?;
     let threshold = mix_threshold_arg(args)?;
     if threshold == 0 {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
@@ -1015,10 +1012,7 @@ fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
         threshold,
         fwd_depth,
         reply_depth,
-        beacon: match flag(args, "--beacon") {
-            Some(s) => parse_beacon_hex(s)?,
-            None => BeaconSeed::GENESIS,
-        },
+        beacon: beacon_arg(args)?,
     })
 }
 
@@ -1040,6 +1034,24 @@ fn parse_beacon_hex(s: &str) -> Result<BeaconSeed, NodeError> {
         *byte = (hi * 16 + lo) as u8;
     }
     Ok(BeaconSeed::new(bytes))
+}
+
+/// The beacon seed a verb computes against: `--beacon HEX` when the operator names one, otherwise **epoch 0
+/// of the network this invocation is configured for**.
+///
+/// The default used to be `BeaconSeed::GENESIS` in four separate verbs, which was correct only while that
+/// constant *was* every network's epoch-0 seed. It is now derived per network
+/// (`docs/design-genesis.md` §4), so the constant would draw meeting lines, hidden-service dead-drops, mix
+/// routes and validator placements for a network nobody is on — each verb failing silently, by finding
+/// nothing, which is the hardest failure for an operator to attribute.
+///
+/// The value comes from the very configuration the same command line already names (`--config`,
+/// `--beacon-params`); with neither, there is no beacon and the constant is the honest answer.
+fn beacon_arg(args: &[String]) -> Result<BeaconSeed, NodeError> {
+    match flag(args, "--beacon") {
+        Some(s) => parse_beacon_hex(s),
+        None => Ok(node_config_from_args(args)?.genesis_seed()),
+    }
 }
 
 // ============================== first-run setup ==============================
@@ -1226,16 +1238,23 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     }
     std::fs::create_dir_all(&paths.data)?;
     let credentials = identity::load_or_generate(Some(&paths.identity))?;
-    let [x, y, z] = identity::coordinate::<F2>(&credentials);
     config.identity_path = Some(paths.identity.clone());
 
     ensure_beacon(&mut config, &paths, assume_yes, has_flag(args, "--private-cell"))?;
+
+    // **After the beacon, not before.** The seat is drawn against the network's genesis seed, and until
+    // `ensure_beacon` has run there is no network to draw against — computing it a few lines earlier printed,
+    // and then advertised at the end of this wizard, an address on a network this node was not about to join.
+    let [x, y, z] = identity::coordinate::<F2>(&credentials, &config.genesis_seed());
 
     // --- write ---
     let rendered = fanos_node::setup::render_config(&config, &paths.identity);
     write_file(&paths.config, &rendered, false)?;
     eprintln!("\n  wrote {}", paths.config.display());
     eprintln!("  coordinate {x}:{y}:{z}");
+    if config.beacon.is_some() {
+        eprintln!("  network    {}", config.network_fingerprint());
+    }
 
     // --- the daemon ---
     if has_flag(args, "--no-service") {
@@ -1563,6 +1582,16 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     println!("listen        : {}", config.listen);
     println!("roles         : {}", config.roles);
     println!("plane order   : q = {}", config.plane_order);
+    // The first question when two hosts disagree is whether they are even on the same network, and nothing
+    // else printed here answers it: coordinates differ between identities *and* between networks.
+    println!(
+        "network       : {}",
+        if config.beacon.is_some() {
+            config.network_fingerprint()
+        } else {
+            "none (no beacon — no epoch clock, no coordinate reshuffle)".to_owned()
+        }
+    );
     println!(
         "bootstrap     : {}",
         if config.bootstrap.is_empty() {
@@ -1574,7 +1603,8 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     match &config.identity_path {
         Some(p) if p.exists() => {
             let credentials = identity::load_or_generate(Some(p))?;
-            let [x, y, z] = identity::coordinate::<F2>(&credentials);
+            // On *this* network: the seat is a function of the identity and the genesis seed both.
+            let [x, y, z] = identity::coordinate::<F2>(&credentials, &config.genesis_seed());
             println!("coordinate    : {x}:{y}:{z}");
             println!("seed address  : {x}:{y}:{z}@<this-host>:{}", config.listen.port());
         }
@@ -1682,10 +1712,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
         None => Epoch::ZERO,
     };
-    let beacon = match flag(rest, "--beacon") {
-        Some(s) => parse_beacon_hex(s)?,
-        None => BeaconSeed::GENESIS,
-    };
+    let beacon = beacon_arg(rest)?;
     let threshold = mix_threshold_arg(rest)?;
 
     let (service, signer, bundle) = hidden_service_identity(&host_secret);
@@ -1748,11 +1775,34 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
 fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     let path = flag(args, "--identity").map(PathBuf::from);
     let credentials = identity::load_or_generate(path.as_deref())?;
-    let [x, y, z] = identity::coordinate::<F2>(&credentials);
+
+    // **Which network?** A coordinate is a function of the identity *and* the network's genesis seed
+    // (`docs/design-genesis.md`), so printing one without the network is printing a placement the node will
+    // not have — and this command's last line is a bootstrap address, which is coordinate-*pinned*. Read the
+    // same configuration the daemon reads, from the same default location, so the two cannot disagree.
+    let paths = fanos_node::setup::Paths::detect();
+    let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
+    let config = config_path
+        .exists()
+        .then(|| std::fs::read_to_string(&config_path).map_err(NodeError::from))
+        .transpose()?
+        .map(|text| NodeConfig::from_config_str(&text))
+        .transpose()?;
+    let genesis = config.as_ref().map_or(BeaconSeed::GENESIS, NodeConfig::genesis_seed);
+
+    let [x, y, z] = identity::coordinate::<F2>(&credentials, &genesis);
     println!("coordinate: {x}:{y}:{z}");
     match &path {
         Some(p) => println!("identity file: {}", p.display()),
         None => println!("(ephemeral — pass --identity <path> to persist this coordinate)"),
+    }
+    match config.as_ref().filter(|c| c.beacon.is_some()) {
+        Some(c) => println!("network: {} (from {})", c.network_fingerprint(), config_path.display()),
+        None => println!(
+            "network: none configured — this is the coordinate on a beacon-less cell only. \
+             A network with a beacon seats this identity elsewhere; pass --config <file> \
+             (or run `fanos init`) before publishing the address below."
+        ),
     }
     println!("bootstrap seed (add host:port): {x}:{y}:{z}@HOST:PORT");
     Ok(())
@@ -1976,10 +2026,7 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
         Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
         None => Epoch::ZERO,
     };
-    let beacon = match flag(args, "--beacon") {
-        Some(s) => parse_beacon_hex(s)?,
-        None => BeaconSeed::GENESIS,
-    };
+    let beacon = beacon_arg(args)?;
     let supply: u64 = match flag(args, "--supply") {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --supply '{s}'")))?,
         None => 1_000_000_000,

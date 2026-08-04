@@ -1,9 +1,10 @@
 # The genesis window — why it is open, why proof-of-work does not close it, and the one-line fix that does
 
-> **Status.** Analysis and a recommended change; the change is **not yet implemented**. The window itself is
-> established and measured (`docs/design-coordinates.md` §2, confirmed against `on_join` / `on_announce`).
-> This note is the synthesis the founding choreography needs before it can pick a defence, and it reaches a
-> different answer than the three options originally listed — one of those options is provably useless here.
+> **Status.** Analysis, and the change is **implemented** (2026-08-04). The window itself is established and
+> measured (`docs/design-coordinates.md` §2, confirmed against `on_join` / `on_announce`). This note is the
+> synthesis the founding choreography needed before it could pick a defence, and it reaches a different answer
+> than the three options originally listed — one of those options is provably useless here. §5 is rewritten
+> against what was actually built, including a defect the first half of the wiring introduced.
 
 ## 1. The window, stated once
 
@@ -114,49 +115,92 @@ coordinates and does not need to join, so there is no circularity — the cell c
 with no joiner present, and only then publish its bootstrap seeds. Each half is cheap, and each covers the
 other's residual.
 
-## 5. Where the cost actually is — corrected after attempting it
+## 5. Where the cost actually is — rewritten after building it
 
-The derivation costs nothing; **the seam does**, and the first shape I tried was wrong in a way worth
-recording, because it is the shape anyone would try first.
+The derivation costs nothing; **the seam does**. Two shapes were tried before the right one, and the first
+half of the wiring shipped a defect into the genesis epoch, which is the part most worth recording.
 
-The genesis seed is needed at exactly two places, and they must agree or a node's own seat and its peers'
-verification of that seat diverge:
+### 5.1 Two dead ends
 
-* `driver.rs`, where a node computes its own genesis coordinate
-  (`verifiable_coordinate_ranked(creds, Epoch::ZERO, &GENESIS)`);
-* `BeaconWindow::genesis()`, the window against which *peers'* epoch-0 claims are checked.
+The seed is needed where a node computes its own genesis coordinate (`driver.rs`,
+`verifiable_coordinate_ranked(creds, Epoch::ZERO, …)`) and where *peers'* epoch-0 claims are checked
+(`BeaconWindow::genesis`). Both sit in `fanos-quic`, the transport, which does not know what a
+`VssCommitment` is — that is `fanos-vrf`'s, held in `fanos-node`'s config.
 
-Both sit in `fanos-quic`, the transport, which does not know what a `VssCommitment` is — that is
-`fanos-vrf`'s, held in `fanos-node`'s config. So the value has to enter through the spawn call.
+**Hanging it on `NodeCredentials`** is the shortcut anyone would try, since credentials already reach both
+sites. It is wrong twice: `NodeCredentials` derives `Wire` and is *persisted*, so a field there changes a
+stored format for every existing node; and it is the wrong home semantically, because the seed is
+per-**network** while credentials are per-**node** and are exactly the thing that should exist independently
+of any particular network.
 
-**The tempting shortcut is to hang it on `NodeCredentials`**, which is already threaded to both sites, and it
-is wrong twice. `NodeCredentials` derives `Wire` and is *persisted* — the identity file on disk — so a field
-there changes a stored format for every existing node. And it is the wrong home semantically: the seed is
-per-**network** state, while credentials are per-**node** and are exactly the thing that should be able to
-exist independently of any particular network.
+**Adding a spawn parameter** was the second answer, and it is merely expensive: 16 external call sites.
 
-So the correct shape is a **transport parameter**: the spawn family takes the network's genesis seed, and
-`fanos-node` supplies `H(label ‖ commitment)` from the config it already holds. That is additive — a
-`None` keeps `BeaconSeed::GENESIS`, which is the right answer for a deployment with no beacon (§6) — but it
-touches the spawn family, which currently has **16 external call sites**.
+### 5.2 What was built
 
-That is a bounded, mechanical refactor rather than a design question. It is called out here so the estimate is
-honest: the derivation is one function, the wiring is an afternoon, and hurrying the wiring is how a
-half-applied security change happens.
+`Directory` already *is* the per-network object — it is created once per network, threaded to every spawn site
+in the family, and carries the peer addresses that only make sense on one network. So the seed rides there:
+
+```rust
+Directory::new().for_network(genesis_seed(&params.commitment))   // fanos-node, at Directory creation
+directory.genesis()                                              // fanos-quic, at both sites above
+```
+
+Zero signature changes, and the value cannot arrive at one of the two sites and not the other, because both
+read the same object.
+
+### 5.3 The defect that half the wiring introduced
+
+Deriving the seed **moves the seat**. Everything that computes an epoch-0 coordinate has to move with it, and
+the ones that do not are silent: a producer on the old constant still agrees with a verifier on the old
+constant, so nothing errors, no log line appears — they simply describe a network no node is on.
+
+Measured, with the transport wired and nothing else: **the cell's mix directory was empty for the whole
+genesis epoch on every network with a beacon.** The relay published its onion key bound to the constant-seed
+coordinate; the reader verified it against the constant-seed coordinate; the node sat somewhere else. Caught
+by one library test (`a_relay_node_publishes_its_mix_key_to_the_directory`), not by review, and only because
+the whole workspace was run rather than the crate being edited.
+
+The full set that had to move — a *family*, not a site:
+
+| where | what it does at epoch 0 |
+|---|---|
+| `mixdir::spawn_mix_publisher` | publishes this relay's onion key, coordinate-bound |
+| `mixdir::spawn_mix_directory_feeder` | builds the directory a combiner seals through |
+| `capdir::spawn_capability_publisher` | publishes this node's bound capability advertisement |
+| `role_loop::genesis_assign` + the loop's seed | reads the roster the role assignment runs on |
+| `composition::compose_engine` | seats a POROS ingress host on its community's line |
+| `driver`'s initial `Placement.beacon` | what the reshuffle compares the first beacon against |
+| four CLI verbs (`host`, `proxy --anonymous`, `message serve`, `taxis-deal`) | default when `--beacon` is absent |
+
+The fix that makes it not recur is to remove the *opportunity*: the seed is now readable from `Client::genesis()`
+inside any spawned task, from `NodeConfig::genesis_seed()` / `CellComposition::genesis_seed()` in
+provisioning, and from `beacon_arg()` in the CLI. A task added next year gets it by asking, not by
+remembering — and `fanos-cli/tests/genesis_seed.rs` fails if anything in `fanos-node` names the constant
+outside the derivation's own fallback.
 
 ## 6. The operator-visible cost
 
-One real consequence, and it is a *correction* rather than a regression: **`fanos id` becomes
-network-specific.** Today it prints a coordinate computed from the credentials alone, and that coordinate is
-the same on every FANOS network in existence. After this change it needs the network's commitment
-(`--beacon-params`) to print a meaningful point, and printing one without it would be printing a placement the
-node will not have.
+One real consequence, and it is a *correction* rather than a regression: **a coordinate is now a function of
+the identity and the network.** `fanos id` used to print a point computed from the credentials alone, the same
+on every FANOS network in existence; its last line is a bootstrap address, and bootstrap pins are
+coordinate-checked, so on a network with a beacon that address was one no node would match.
 
-That is the right shape — an identity's placement *should* depend on which network it is joining — but it
-changes a command's signature and the runbook's step 2, so it is a deliberate break rather than a silent one.
+It now reads the same configuration the daemon reads, from the same default path (`--config` to override), and
+says which network the answer is for:
 
-Three call sites compute the genesis coordinate for display (`bin/fanos.rs`), plus the live path through
-`spawn_self_certifying_persistent_over`, where the commitment is already in hand.
+```
+coordinate: 1:0:1
+network: 9f3ac7b2 (from /etc/fanos/node.conf)
+bootstrap seed (add host:port): 1:0:1@HOST:PORT
+```
+
+With no beacon configured it prints the constant-seed coordinate and says so, rather than implying a network.
+`fanos status` gained the same `network` line, and `fanos init` computes the coordinate **after** the beacon
+ceremony rather than before it — it printed, and then advertised, a pre-beacon placement otherwise.
+
+The fingerprint is the first four bytes of the genesis seed. It exists because "are we even on the same
+network?" is the first question when two hosts disagree, and nothing else printed can answer it: coordinates
+differ between identities *and* between networks, so comparing them separates neither case.
 
 ## 7. What would have to be true for this to be wrong
 
@@ -167,9 +211,19 @@ Three call sites compute the genesis coordinate for display (`bin/fanos.rs`), pl
   would be public again and the change would buy only the per-deployment separation, not the unpredictability.
   Nothing in the current design publishes it, but a directory or explorer that did would silently undo half of
   this.
+* The **fingerprint** (§6) is four bytes of `H(label ‖ commitment)`. It does not help grinding — that needs the
+  whole seed, and this is a preimage-resistant hash of it — but it is a *confirmation* oracle: someone holding
+  a candidate commitment can check it against a published fingerprint and learn that a given host runs that
+  network. It is printed by local operator commands and is not put on the wire; a future surface that
+  published it would be making a network-membership statement, and should say so.
 
-## 8. Recommendation
+## 8. What was adopted
 
-Adopt the derived genesis seed, and record the runbook step. Do **not** rely on admission proof-of-work for
-this window — §2 shows it does not apply — though admission remains correct and valuable for what it does
-address, which is the steady-state and Sybil cases.
+The derived genesis seed, wired through `Directory` (§5.2), with the runbook step recorded: **produce the
+first beacon round before opening joins.** Do **not** rely on admission proof-of-work for this window — §2
+shows it does not apply — though admission remains correct and valuable for what it does address, which is the
+steady-state and Sybil cases.
+
+The lesson worth carrying past this note is §5.3's: a value that moves *where a node sits* has as many
+consumers as there are things that name a position, and the ones that fail do so by finding nothing rather
+than by erroring. Finding them needed the whole suite, not the crate being edited.
