@@ -220,6 +220,18 @@ impl Internet {
         self.inner.log.lock().unwrap_or_else(PoisonError::into_inner).push((from, to));
     }
 
+    /// How many datagrams have been ADMITTED to `to` — the count of what actually reached an address,
+    /// whoever sent it. Used to measure what a node can be made to emit toward a third party.
+    fn arrivals_at(&self, to: SocketAddr) -> u64 {
+        self.inner
+            .log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, dst)| *dst == to)
+            .count() as u64
+    }
+
     /// Datagrams `AddressDependent` filtering has refused, across every mapping on this model.
     fn rejected(&self) -> u64 {
         self.inner.rejected.load(Ordering::Relaxed)
@@ -644,4 +656,75 @@ async fn a_hub_that_cannot_broker_a_punch_is_asked_at_most_once() {
     a.shutdown();
     b.shutdown();
     h.shutdown();
+}
+
+/// **A node cannot be made to flood a third party by sending it hole-punch frames.**
+///
+/// `PunchTo` is unsolicited on one side by construction — the hub tells *both* parties to dial, and the
+/// target never asked — so the receive path cannot correlate a punch to a request and must bound instead.
+/// Before it did, `accept_holepunch` took `(peer, addr)` straight off the frame, wrote the directory, and
+/// spawned a dial, consulting neither the sender nor any cap. Any established peer could therefore aim this
+/// node's QUIC Initials at **any address it named**, as often as it liked.
+///
+/// That is an outward harm before it is a local one: a fleet of FANOS nodes becomes a reflector pointed at
+/// someone who never joined anything. So the property under test is measured **at the victim**, not at the
+/// node — how much traffic arrives somewhere the attacker chose.
+#[tokio::test]
+async fn a_flood_of_punch_frames_cannot_aim_this_node_at_a_third_party() {
+    use fanos_wire::{FrameType, encode_frame};
+
+    let _serial = serial();
+    let net = Internet::new();
+    let a_sock = net.attach(Mapping::EndpointIndependent, Filtering::Open);
+    let x_sock = net.attach(Mapping::EndpointIndependent, Filtering::Open);
+    // The victim: an address on the model that belongs to no node, admitting everything, so every datagram
+    // that lands is one this node was talked into sending.
+    let victim_sock = net.attach(Mapping::EndpointIndependent, Filtering::Open);
+    let victim = victim_sock.primary;
+
+    let dir_a = Directory::new();
+    let dir_x = Directory::new();
+    let mut a = node_over(Fabric::Abstract(a_sock.clone()), &dir_a, 1);
+    let x = node_over(Fabric::Abstract(x_sock.clone()), &dir_x, 2);
+
+    // X is an ordinary, admitted peer: it completes the handshake like any cell member. The fault budget
+    // tolerates `f` of these, so "an established peer is hostile" is inside the threat model, not outside.
+    dir_x.insert(a.address(), a.local_addr());
+    x.command(Command::Send { to: a.address(), payload: b"hello".to_vec() });
+    assert_eq!(await_delivery(&mut a, x.address(), 5).await, b"hello", "X is an established peer of A");
+
+    // Forty crafted punches naming one coordinate and the victim's address. Body per `encode_punch`:
+    // `peer_coord(12B) || family(1B) || ip(4) || port(2B BE)`.
+    let target = Point::<F2>::at(4).coords();
+    let mut body = Vec::new();
+    for c in target {
+        body.extend_from_slice(&c.to_be_bytes());
+    }
+    body.push(4);
+    let std::net::IpAddr::V4(ip) = victim.ip() else { panic!("the model is IPv4") };
+    body.extend_from_slice(&ip.octets());
+    body.extend_from_slice(&victim.port().to_be_bytes());
+    let mut frame = Vec::new();
+    encode_frame(FrameType::PunchTo.code(), &body, &mut frame);
+    for _ in 0..40 {
+        x.command(Command::Emit { to: a.address(), frame: frame.clone() });
+    }
+
+    // THE PROPERTY, measured at the victim: what arrives is one dial's worth of handshake, not forty.
+    // A single QUIC connection attempt retransmits its Initial a handful of times before `DIAL_TIMEOUT`
+    // abandons it, so the bound is stated against that — one attempt, whatever its retry schedule — rather
+    // than against a packet count this test would have to keep in step with quinn.
+    let settled = settle(|| net.arrivals_at(victim).max(1), DIAL_QUIET, Duration::from_secs(90)).await;
+    assert!(
+        settled < 40,
+        "forty punch frames put {settled} datagrams on the victim: the node is being used as a reflector, \
+         and the count scales with what the attacker sends rather than with anything the node decided"
+    );
+
+    // THE MECHANISM, so the test cannot pass by the punch path being dead: the frames DID reach the punch
+    // path and it DID dial — one attempt's worth of traffic arrived at an address only the attacker named.
+    assert!(settled > 0, "no punch was attempted at all — this test would then prove nothing");
+
+    a.shutdown();
+    x.shutdown();
 }

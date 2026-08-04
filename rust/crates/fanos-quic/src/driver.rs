@@ -340,6 +340,10 @@ struct Transport {
     directory: Directory,
     /// Identity-keyed distrust, so a quarantine follows the peer rather than the point (audit R-M1).
     distrust: Arc<Distrust>,
+    /// Coordinates with a hole-punch dial already in flight — the bound on what an unsolicited `PunchTo`
+    /// can cost (see [`accept_holepunch`]). A *set of coordinates*, so the ceiling is the plane's own point
+    /// count and no constant has to assert one.
+    punching: Arc<Mutex<BTreeSet<Triple>>>,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -1439,6 +1443,7 @@ fn spawn_inner(
         peer_addrs,
         directory,
         distrust: distrust.clone(),
+        punching: Arc::new(Mutex::new(BTreeSet::new())),
     };
     tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe()));
     tokio::spawn(accept_loop(transport.clone()));
@@ -2262,18 +2267,62 @@ async fn broker_holepunch(t: &Transport, requester: Triple, req_conn: &Connectio
     .await;
 }
 
-/// Act on a hub's `PunchTo` (#119): learn where `peer` is and dial it at once, punching our NAT open for
-/// the peer's simultaneous inbound. Recording the address in the directory also makes future overlay
-/// sends to `peer` resolve directly, no longer needing the hub. The dial runs on a spawned task so a slow
-/// or filtered punch never blocks this connection's frame loop.
+/// Act on a hub's `PunchTo` (#119): dial `peer` at once at the address the hub observed it at, punching
+/// our NAT open for the peer's simultaneous inbound. The dial runs on a spawned task so a slow or filtered
+/// punch never blocks this connection's frame loop.
+///
+/// # What this frame is allowed to cause, and why it is bounded
+///
+/// A `PunchTo` is **unsolicited on one side by construction**: the hub tells *both* parties to dial, and the
+/// target never sent a `ConnectReq`. The simultaneous open needs that — each side's own outbound packet is
+/// what opens its mapping for the other's — so "only act on a punch I asked for" would break the mechanism
+/// on the side that did not ask. The receive path therefore cannot correlate, and must bound instead.
+///
+/// Before it did, this function took `(peer, addr)` off the frame, wrote the directory, and spawned a dial,
+/// consulting neither the sender nor any cap. Any established peer — and the fault budget tolerates `f` of
+/// them — could therefore point this node's QUIC Initials at **any address it named**, as many times as it
+/// liked. That is an outward harm before it is a local one: a fleet of FANOS nodes becomes a reflector
+/// aimed at a third party who never joined anything.
+///
+/// Two bounds, each derived rather than chosen:
+///
+/// * **No directory write until the identity is proven.** `get_or_connect` already refuses a peer that does
+///   not prove the dialed coordinate, and caches the connection only on success — so the address is worth
+///   recording exactly when that returns `Some`, and not a moment before. Writing first meant a single
+///   peer's say-so replaced the address of any coordinate it named, which is the very write `#50` hardened
+///   behind a quorum one frame along (`ObservedAddr`), left open here.
+/// * **At most one outstanding punch dial per coordinate**, tracked as a set of coordinates rather than a
+///   counter. That is the same rule the neighbouring guards derive — re-trying the same thing cannot yield
+///   a different answer while the mappings hold — and it makes the ceiling fall out of the address space
+///   instead of being asserted: a coordinate is a point of the plane, so at most `q² + q + 1` punches can
+///   ever be in flight, whatever an attacker sends. A repeat while one is outstanding is dropped rather
+///   than queued, because a punch is a *timing* operation and one held until a slot frees has already
+///   missed the simultaneous open.
 fn accept_holepunch(t: &Transport, body: &[u8]) {
     let Some((peer, addr)) = decode_punch(body) else {
         return;
     };
-    t.directory.insert(peer, addr);
+    // Claim the coordinate, or drop: a punch toward a peer we are already punching adds nothing, and
+    // dropping it is what makes the in-flight count bounded by the plane rather than by the sender.
+    let claimed = match t.punching.lock() {
+        Ok(mut set) => set.insert(peer),
+        Err(_) => false,
+    };
+    if !claimed {
+        return;
+    }
     let t = t.clone();
     tokio::spawn(async move {
-        let _ = get_or_connect(&t, peer, addr).await;
+        let reached = get_or_connect(&t, peer, addr).await.is_some();
+        if reached {
+            // Proven: whoever answered at that address proved the dialed coordinate. Only now is the
+            // address worth recording, so subsequent overlay sends resolve directly and stop needing the
+            // hub.
+            t.directory.insert(peer, addr);
+        }
+        if let Ok(mut set) = t.punching.lock() {
+            set.remove(&peer);
+        }
     });
 }
 
