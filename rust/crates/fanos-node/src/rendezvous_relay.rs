@@ -113,7 +113,7 @@ const MAX_REGISTRATIONS: usize = 4096;
 /// keep a route nothing can reach. Larger also re-widens the leak that retirement exists to close — a
 /// recorded tag buys an adversary exactly this window, and it should buy no more than every other component
 /// already concedes.
-const HOST_GRACE_EPOCHS: u64 = 1;
+pub(crate) const HOST_GRACE_EPOCHS: u64 = 1;
 
 /// The cap on concurrently-registered hidden-service hosts (§3b). A `HostRegister` peels out as an
 /// anonymous delivery, so — like the client registrations — an unbounded map would be a remote OOM; beyond

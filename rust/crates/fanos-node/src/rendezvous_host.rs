@@ -52,11 +52,22 @@ use tokio::time::Instant;
 
 use crate::diaulos::{MAX_SESSIONS, SESSION_IDLE_TIMEOUT, SESSION_SWEEP_INTERVAL, Session, evict_lru};
 
-/// How many recent epochs' dead-drop [`ReplyKeys`] the accept loop keeps. The meeting combiner, the
-/// dead-drop line, and the reply key all rotate with the beacon each epoch (§3b); a request forwarded just
-/// before a rotation is sealed to the *previous* epoch's key, so the loop tries the last few keys, not only
-/// the newest — enough to open across a boundary without unboundedly hoarding keys.
-const MAX_REPLY_KEYS: usize = 3;
+/// How many recent epochs' dead-drop [`ReplyKeys`] the accept loop keeps — **derived from the window a
+/// combiner will actually serve, not chosen.**
+///
+/// It was `3`, with the reasoning "enough to open across a boundary without unboundedly hoarding keys" — a
+/// number picked to be comfortably large because nothing fixed it. Something does now.
+///
+/// A forwarded request is opened with the reply key carried in the *registration* the combiner matched, and a
+/// combiner serves registrations from the current epoch plus [`HOST_GRACE_EPOCHS`](crate::rendezvous_relay)
+/// (`rendezvous_relay::retire_stale_hosts`). So the oldest key that can ever open anything is exactly that
+/// many epochs old, and `1 + grace` is both necessary and sufficient: one fewer and a request the combiner
+/// legitimately served cannot be opened; one more is a secret held past every path that could use it.
+///
+/// The ring and the registration move together — `rotate_host` mints the key and registers in the same step,
+/// and a skipped rotation lags both identically — so there is no case where the host's keys are older than
+/// its own registration. That is what makes the bound tight rather than optimistic.
+const MAX_REPLY_KEYS: usize = 1 + crate::rendezvous_relay::HOST_GRACE_EPOCHS as usize;
 
 /// One epoch's rotating host material, pushed to a running [`serve_anonymous`] loop by the
 /// `spawn_rendezvous_host` driver: the fresh dead-drop [`ReplyKeys`] (to open forwarded requests) and the
