@@ -198,10 +198,18 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
         // Asserted because no outcome can distinguish them: the conflict schedule is serial-equivalent by construction,
         // so a block executes to the identical state either way. `execute_block` was proven, stochastically tested — and
         // then called from nothing but its own tests, so the vertical-parallelism throughput claim delivered no real
-        // speedup. `waves_last_block` is `0` until the scheduler runs, which is exactly the wiring this pins.
+        // speedup.
+        //
+        // **Against the monotone count, not the last-block gauge, and that is a correctness fix rather than a
+        // de-flake.** `waves_last_block` answers "how deep was the LAST block" and must therefore reset —
+        // and BFT produces empty blocks routinely, so a heartbeat round landing between the transfer and this
+        // snapshot set it to zero and the assertion read "the serial default ran". It failed under machine
+        // contention and passed on a quiet host: the signature of an assertion that depends on when it looks
+        // rather than on what happened. What this test means to check is a *fact* — that the scheduler ran at
+        // all — and a fact a later empty block can erase is not one.
         assert!(
-            ledger.waves_last_block() > 0,
-            "the parallel scheduler executed this block (waves > 0), rather than the serial default"
+            ledger.parallel_blocks() > 0,
+            "the parallel scheduler executed a block on this node, rather than the serial default"
         );
     }
     // The data-availability layer actually RAN on this path, asserted for the same reason as `waves_last_block`

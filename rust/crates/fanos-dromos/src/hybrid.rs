@@ -87,6 +87,20 @@ pub struct HybridLedger {
     /// that the parallel executor ran at all — the schedule is serial-equivalent by construction, so no *outcome* can
     /// distinguish it from the serial default, and it was reachable from nothing but its own tests for exactly that reason.
     waves_last_block: usize,
+    /// How many blocks have gone through the parallel executor with work in them — **monotone, and separate
+    /// from the gauge above because they answer different questions.**
+    ///
+    /// `waves_last_block` answers "how deep was the last block", which is a gauge and must reset. "Has the
+    /// parallel executor run at all" is a *fact*, and a fact that a subsequent empty block can erase is not
+    /// one. BFT produces empty blocks routinely — a heartbeat round schedules nothing, so `schedule(&[])`
+    /// yields zero waves and resets the gauge — which made the full-platform end-to-end test read "the
+    /// serial default ran" whenever a snapshot happened to land after one. It failed under machine
+    /// contention and passed on a quiet host, which is the signature of an assertion that depends on WHEN it
+    /// looks rather than on what happened.
+    ///
+    /// Local metric, never consensus state, for the same reason as the gauge: not hashed into `state_root`,
+    /// not carried in `snapshot`, so validators with different core counts still agree.
+    parallel_blocks: u64,
     tokens: TokenLedger,
     shielded: ShieldedState,
     names: NameRegistry,
@@ -104,6 +118,7 @@ impl HybridLedger {
     pub fn new(genesis_tokens: TokenLedger) -> Self {
         Self {
             waves_last_block: 0,
+            parallel_blocks: 0,
             tokens: genesis_tokens,
             shielded: ShieldedState::new(),
             names: NameRegistry::new(),
@@ -533,6 +548,11 @@ impl HybridLedger {
         let access = self.access_lists(txs);
         let waves = schedule(&access);
         self.waves_last_block = waves.len();
+        // Counted only when there was work to schedule: an empty block exercises nothing, and counting it
+        // would make this claim true of a chain that never executed a transaction.
+        if !waves.is_empty() {
+            self.parallel_blocks = self.parallel_blocks.saturating_add(1);
+        }
         let verdicts = self.verify_batch(txs);
         let mut outcomes = vec![ExecOutcome::Malformed; txs.len()];
         for wave in &waves {
@@ -549,6 +569,13 @@ impl HybridLedger {
     #[must_use]
     pub fn waves_last_block(&self) -> usize {
         self.waves_last_block
+    }
+
+    /// How many non-empty blocks this ledger has executed through the parallel scheduler — monotone, so a
+    /// later empty block cannot erase the fact. See [`parallel_blocks`](Self::parallel_blocks) on the field.
+    #[must_use]
+    pub fn parallel_blocks(&self) -> u64 {
+        self.parallel_blocks
     }
 
     /// Verify every parallelizable transaction's signature or proof **concurrently** — the stateless, expensive
@@ -1065,6 +1092,7 @@ impl StateMachine for HybridLedger {
             // A restored snapshot has executed no block here, so the metric starts at zero rather than being carried: it
             // describes *this* validator's last scheduling pass, not the state it adopted.
             waves_last_block: 0,
+            parallel_blocks: 0,
             tokens,
             shielded,
             names,
@@ -2526,4 +2554,42 @@ mod tests {
         assert_eq!(ledger.tokens().balance(&bob), 1000, "the recipient is paid once the ordering resolves");
     }
 
+
+    #[test]
+    fn an_empty_block_resets_the_gauge_and_cannot_erase_the_fact() {
+        // **The two questions one number was answering.** "How deep was the last block" is a gauge and must
+        // reset; "has the parallel executor run at all" is a fact, and a fact a later empty block can erase
+        // is not one. BFT produces empty blocks routinely — a heartbeat round schedules nothing — so the
+        // full-platform end-to-end test read "the serial default ran" whenever a snapshot landed after one.
+        // It failed under machine contention and passed on a quiet host, which is what an assertion that
+        // depends on WHEN it looks looks like.
+        let mut ledger = HybridLedger::new(TokenLedger::new());
+        assert_eq!(ledger.waves_last_block(), 0, "no block has run");
+        assert_eq!(ledger.parallel_blocks(), 0, "and none has run through the scheduler");
+
+        // A block with work in it: the gauge reads its depth, and the fact is now true.
+        // A transaction that will not apply — its payload is a bare tag — but that IS scheduled, which is
+        // the only thing this test observes. The scheduler runs before any verdict is known.
+        let tx = Transaction { payload: vec![TAG_TRANSPARENT] };
+        let _ = ledger.execute_block(&[tx]);
+        let depth = ledger.waves_last_block();
+        assert!(depth > 0, "a block with a transaction schedules at least one wave");
+        assert_eq!(ledger.parallel_blocks(), 1, "and the scheduler is recorded as having run");
+
+        // Now a heartbeat block. The gauge is right to fall to zero — the last block really was empty — and
+        // the fact must not follow it.
+        let _ = ledger.execute_block(&[]);
+        assert_eq!(ledger.waves_last_block(), 0, "the gauge reports the empty block honestly");
+        assert_eq!(
+            ledger.parallel_blocks(),
+            1,
+            "but the fact that the parallel executor ran survives it — this is the assertion the end-to-end \
+             test needed and the gauge could not give it",
+        );
+
+        // And an empty block is not counted as a run: counting it would make the claim true of a chain that
+        // never executed a transaction.
+        let _ = ledger.execute_block(&[]);
+        assert_eq!(ledger.parallel_blocks(), 1, "an empty block exercises nothing and counts as nothing");
+    }
 }
