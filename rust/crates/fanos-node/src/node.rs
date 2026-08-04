@@ -423,6 +423,50 @@ fn spawn_exit_role(
     Ok(())
 }
 
+/// Validate the **beacon** parameters, so a provisioning file cannot hand a node a threshold the beacon it
+/// names does not have.
+///
+/// This is the most consequential parameter in the system and it was the least checked: `bp.threshold` went
+/// straight into `BeaconNode::new` with no floor and no comparison against the commitment.
+/// `docs/design-governance.md` §2.1 states why that matters — "coordinates derive from the beacon; whoever
+/// holds a reconstruction threshold of its shares influences where every joining node lands".
+///
+/// **The threshold must match the commitment.** A `VssCommitment` carries `t` coefficients, so it *knows*
+/// the degree it was dealt at ([`VssCommitment::threshold`]). A config claiming a different `t` describes a
+/// beacon that does not exist: rounds either never assemble (too high) or assemble from too few partials and
+/// verify against a polynomial of the wrong degree (too low). Nothing compared the two, so a typo produced a
+/// node that ran, flooded, and never adopted an epoch — with no diagnosis pointing at the file.
+///
+/// **There is deliberately no floor of `t ≥ 2` here, and that is a correction.** The obvious argument — at
+/// `t = 1` one anchor reconstructs the epoch randomness alone, hence chooses every coordinate — is true and
+/// still does not make `t = 1` refusable, because `fanos beacon-deal 1 1` is a *documented* configuration:
+/// `docs/design-governance.md` §2.1 calls the dealt path "correct for a private or test cell, where the
+/// dealer is the only operator". With one anchor, `t = 1` is the only threshold there is and distributes
+/// nothing that was ever distributed.
+///
+/// The danger is `t = 1` with *several* anchors — a threshold that fails to spread trust across parties that
+/// exist — and `BeaconParams` cannot express that: it carries the commitment and this node's share, never
+/// the anchor count. So the check that can be made is made, and the one that cannot is named rather than
+/// approximated by a floor that would refuse a legitimate deployment.
+///
+/// This differs from the service line's floor, which is right: a service *line* has `q+1` members by
+/// construction, so `t = 1` there is one of several holding everything — the inversion the design warns
+/// about. The beacon has no such structural guarantee, and reusing the argument across the two was an error.
+fn beacon_params_checked(config: &NodeConfig) -> Result<(), NodeError> {
+    let Some(bp) = config.beacon.as_ref() else {
+        return Ok(());
+    };
+    let committed = bp.commitment.threshold();
+    if bp.threshold != committed {
+        return Err(NodeError::Config(format!(
+            "the beacon threshold {} does not match the commitment, which was dealt at {committed} — the \
+             file describes a beacon that does not exist, and rounds would never assemble",
+            bp.threshold,
+        )));
+    }
+    Ok(())
+}
+
 /// Validate the `service` role's parameters, returning the member-key seed, line roster, and threshold to
 /// compose into a [`ServiceNode`] — or `None` when the role is off. The role requires its parameters (there
 /// is no line to serve without them) and a threshold in `1..=line.len()` (zero would serve every intro from
@@ -734,6 +778,7 @@ impl Node {
         // Validate the exit role's parameters up front too (it spawns its relay after the node is up).
         let exit = exit_params(&config)?;
         // And the ingress role's, for the same reason.
+        beacon_params_checked(&config)?;
         let ingress = ingress_params(&config)?;
         let rotation_params = ingress.as_ref().map(|p| (p.community.clone(), p.kem_seed));
         let handle = spawn_self_certifying_persistent_over::<F>(
@@ -1595,6 +1640,76 @@ mod tests {
         assert!(
             Node::start::<F2>(start(2)).await.is_ok(),
             "2-of-3 is the smallest line that means what the design says, and it must still run",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_beacon_threshold_that_the_commitment_does_not_have_is_refused() {
+        // **The most consequential parameter, and it was the least checked.** `bp.threshold` went straight
+        // into `BeaconNode::new` with no floor and no comparison against the commitment — which knows the
+        // degree it was dealt at, since it carries exactly `t` coefficients.
+        //
+        // A mismatch describes a beacon that does not exist. Rounds either never assemble (threshold above
+        // the degree) or assemble from too few partials and verify against a polynomial of the wrong degree.
+        // Either way the node runs, floods, and silently never adopts an epoch, with nothing pointing at the
+        // file that caused it.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let (_shares, commitment) = deal(&[0xB4; 32], 3, 5, &mut DeterministicRng::new(b"beacon-check")).unwrap();
+        let start = |threshold: usize| NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams {
+                commitment: commitment.clone(),
+                threshold,
+                share: None,
+                authority: None,
+            }),
+            ..NodeConfig::default()
+        };
+
+        assert!(
+            Node::start::<F2>(start(3)).await.is_ok(),
+            "the threshold the commitment was dealt at is accepted",
+        );
+        assert!(
+            Node::start::<F2>(start(2)).await.is_err(),
+            "a threshold BELOW the commitment's degree must be refused — it would verify rounds against a \
+             polynomial of the wrong degree",
+        );
+        assert!(
+            Node::start::<F2>(start(4)).await.is_err(),
+            "and one above it must be refused too — rounds would never assemble, silently",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_operator_beacon_still_starts_because_it_is_a_documented_deployment() {
+        // **The floor I nearly added, and why it was wrong.** At `t = 1` one anchor reconstructs the epoch
+        // randomness alone and so chooses every node's coordinate — which sounds exactly like the inversion
+        // the service line's `t ≥ 2` floor prevents, and I added the same floor here on that reasoning.
+        //
+        // It refused `fanos beacon-deal 1 1`, which `docs/design-governance.md` §2.1 documents as "correct
+        // for a private or test cell, where the dealer is the only operator". With ONE anchor, `t = 1` is the
+        // only threshold that exists and distributes nothing that was ever distributed. The service line is
+        // different because a line has `q+1` members by construction — there, `t = 1` really is one of
+        // several holding everything.
+        //
+        // `BeaconParams` cannot tell the two apart: it carries the commitment and this node's share, never
+        // the anchor count. So the check that CAN be made is made, and this pins that the one that cannot is
+        // not faked with a floor that refuses a real deployment.
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let (shares, commitment) = deal(&[0xB5; 32], 1, 1, &mut DeterministicRng::new(b"solo-beacon")).unwrap();
+        let share = shares.into_iter().next();
+        assert!(
+            Node::start::<F2>(NodeConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                beacon: Some(BeaconParams { commitment, threshold: 1, share, authority: None }),
+                ..NodeConfig::default()
+            })
+            .await
+            .is_ok(),
+            "a single-operator 1-of-1 beacon is a documented configuration and must still start",
         );
     }
 }
