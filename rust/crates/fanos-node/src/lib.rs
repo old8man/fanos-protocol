@@ -78,7 +78,7 @@ pub use diaulos::{
     AnonRouteParams, FanosDialer, NodeTransport, ServiceResolver, StaticResolver, dial_service,
     serve, serve_rpc,
 };
-pub use epoch_driver::EpochDriver;
+pub use epoch_driver::{EpochDriver, next_epoch};
 pub use error::NodeError;
 pub use exit::{
     ExitPolicy, build_cell_exit_directory, dial_exit, publish_exit_key, resolve_exit_key, serve_exit,

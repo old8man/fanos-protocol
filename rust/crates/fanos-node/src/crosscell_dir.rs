@@ -24,8 +24,6 @@ use fanos_taxis::checkpoint::ExecCertificate;
 use fanos_taxis::crosscell::CrossCellReceipt;
 use fanos_taxis::hierarchy::ChildRegistry;
 
-use fanos_runtime::Notification;
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
@@ -154,20 +152,14 @@ pub fn spawn_health_publisher(
     health: impl Fn() -> Report + Send + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         publish_health(&client, cell, epoch, health()).await;
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: e, .. }) => {
-                    if e > epoch {
-                        epoch = e;
-                        publish_health(&client, cell, epoch, health()).await;
-                    }
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+        // Latest-state, not the lossy stream: a cell whose health report is missing for an epoch reads to its
+        // neighbours as a cell that has nothing to say, which is not the same as one that is healthy (#86).
+        while let Some((e, _)) = crate::next_epoch(&mut beacons, epoch).await {
+            epoch = e;
+            publish_health(&client, cell, epoch, health()).await;
         }
     })
 }

@@ -211,6 +211,7 @@ pub fn spawn_capability_publisher(
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         // This network's epoch-0 seed, not the constant — a bound advertisement proves a coordinate, and the
         // coordinate it must prove is the one the node was seated at (`docs/design-genesis.md`).
@@ -235,23 +236,30 @@ pub fn spawn_capability_publisher(
         // be assigned from a roster that does not yet contain it. Signalling is deterministic where polling the
         // directory is not — each poll costs a full cell scan, so a retry loop cannot converge promptly.
         let _ = ready_tx.send(());
+        // **Two sources, and they are different kinds of thing.** The epoch is latest-state and comes off
+        // the `watch`: a node whose advertisement is missing for an epoch is invisible to that epoch's role
+        // assignment, and the notification stream can drop the round that would have triggered it (#86). A
+        // *move* is genuinely an event — there is no "current move" to converge on — so it stays on the
+        // stream, where a dropped one costs at most a stale point until the next epoch republishes anyway.
         loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: e, seed: s }) => {
-                    if e > epoch {
-                        epoch = e;
-                        seed = BeaconSeed::new(s);
-                        publish(epoch, seed).await;
-                    }
-                }
-                // The node MOVED. Republishing only on a beacon was the other half of the stale-descriptor defect: a
-                // within-epoch move left the advertisement at the point the node had left until the next epoch, so the
-                // cell's roster scan was short by exactly this node for up to a whole epoch.
-                Ok(Notification::Reseated { .. }) => {
+            tokio::select! {
+                advanced = crate::next_epoch(&mut beacons, epoch) => {
+                    let Some((e, s)) = advanced else { break };
+                    epoch = e;
+                    seed = s;
                     publish(epoch, seed).await;
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
+                event = events.recv() => match event {
+                    // The node MOVED. Republishing only on a beacon was the other half of the
+                    // stale-descriptor defect: a within-epoch move left the advertisement at the point the
+                    // node had left until the next epoch, so the cell's roster scan was short by exactly this
+                    // node for up to a whole epoch.
+                    Ok(Notification::Reseated { .. }) => {
+                        let _ = publish(epoch, seed).await;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });

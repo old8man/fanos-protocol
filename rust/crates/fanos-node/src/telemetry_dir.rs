@@ -169,20 +169,21 @@ pub fn cell_telemetry_coords<F: Field>() -> Vec<Coord> {
 pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         loop {
             match events.recv().await {
                 // The engine's own mandatory self-observation. It is the *exact* frame — this is the boundary that adds
                 // noise, and the only place with both the frame and entropy.
                 Ok(Notification::Observed(bytes)) => {
+                    // Read the epoch at publish time from latest-state rather than tracking it off the
+                    // stream: a reading published at a stale epoch lands at the address of a period that has
+                    // passed, and the stream can drop the round that would have advanced the counter (#86).
+                    if let Some((e, _)) = *beacons.borrow_and_update() {
+                        epoch = e;
+                    }
                     if let Some(frame) = CoherenceFrame::decode(&bytes) {
                         publish_coherence(&client, epoch, &frame, budget).await;
-                    }
-                }
-                // Track the epoch so a reading lands at the address of the epoch it describes.
-                Ok(Notification::BeaconReady { epoch: e, .. }) => {
-                    if e > epoch {
-                        epoch = e;
                     }
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}

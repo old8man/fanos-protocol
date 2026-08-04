@@ -368,6 +368,14 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// completes in a small fraction of this even under load.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The node's **current epoch and beacon seed**, as latest-state rather than as an event.
+///
+/// An epoch is state: a driver only ever wants the one that is current, and an intermediate epoch it missed
+/// is already worthless. Carried on a `watch` for exactly that reason — the notification broadcast is lossy,
+/// and a publisher that missed a `BeaconReady` never published for that epoch at all, leaving its directory
+/// slot empty for a full period with nothing to say so (#86).
+pub type Beacons = tokio::sync::watch::Receiver<Option<(Epoch, [u8; 32])>>;
+
 /// A running QUIC-backed node: the handle an application uses to drive it and hear from it.
 ///
 /// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
@@ -397,6 +405,8 @@ pub struct NodeHandle {
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
     events_rx: broadcast::Receiver<Notification>,
+    /// The live epoch, as latest-state — see [`Beacons`].
+    beacons: Beacons,
     endpoint: Endpoint,
     reflexive: Reflexive,
     /// The **network's genesis seed** — the value epoch-0 coordinates on this network are drawn against
@@ -498,6 +508,7 @@ impl NodeHandle {
             input_tx: self.input_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
             events_tx: self.events_tx.clone(),
+            beacons: self.beacons.clone(),
             genesis: self.genesis,
         }
     }
@@ -564,6 +575,7 @@ pub struct Client {
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
+    beacons: Beacons,
     genesis: BeaconSeed,
 }
 
@@ -618,6 +630,21 @@ impl Client {
             Ok(Ok(value)) => value,
             _ => None,
         }
+    }
+
+    /// The live epoch as **latest-state**: a receiver that always yields the newest `(epoch, seed)` this node
+    /// has seen, and never the fact that one went by while the reader was busy.
+    ///
+    /// Use this rather than `subscribe()` for anything driven by the epoch. The notification broadcast is
+    /// lossy by design, and a driver that missed a `BeaconReady` on it simply never ran for that epoch —
+    /// which for a `(coordinate, epoch)`-keyed publisher is a directory slot left empty for a full period,
+    /// with nothing anywhere to say so (#86). A `watch` cannot express that failure: a reader that was
+    /// descheduled through three epochs wakes on the third, which is the only one it wanted.
+    ///
+    /// `None` until the first round assembles, and on a node with no beacon clock, for ever.
+    #[must_use]
+    pub fn beacons(&self) -> Beacons {
+        self.beacons.clone()
     }
 
     /// This node's **durable state** as canonical bytes — what a persister writes to disk, and `None` if the
@@ -697,6 +724,7 @@ async fn router_loop(
     mut notify_rx: mpsc::UnboundedReceiver<Notification>,
     mut ctrl_rx: mpsc::UnboundedReceiver<Control>,
     events_tx: broadcast::Sender<Notification>,
+    beacon_tx: tokio::sync::watch::Sender<Option<(Epoch, [u8; 32])>>,
     seat: Arc<Mutex<Triple>>,
 ) {
     let mut gets: GetWaiters = HashMap::new();
@@ -754,6 +782,25 @@ async fn router_loop(
                     // command are all sources, and each maintaining its own copy is how the stale one survived.
                     Notification::Reseated { new, .. } => {
                         *seat.lock().unwrap_or_else(PoisonError::into_inner) = *new;
+                    }
+                    // **The epoch is republished as latest-state, and this is the only place that can do it
+                    // losslessly.** This task owns `notify_rx`, an unbounded mpsc, so it never misses a
+                    // round; every other consumer reads the *broadcast*, which drops messages for anyone who
+                    // falls behind. A publisher that missed a `BeaconReady` never published for that epoch —
+                    // a relay's onion key, an exit's key, a node's capability or load simply absent from the
+                    // directory for a full period, self-healing at the next and invisible while it lasted.
+                    //
+                    // Monotone: a replayed or reordered older round is ignored, so a reader can treat the
+                    // value as "the newest epoch this node has seen" without checking.
+                    Notification::BeaconReady { epoch, seed } => {
+                        let (epoch, seed) = (*epoch, *seed);
+                        beacon_tx.send_if_modified(|live| match *live {
+                            Some((seen, _)) if seen >= epoch => false,
+                            _ => {
+                                *live = Some((epoch, seed));
+                                true
+                            }
+                        });
                     }
                     // **Answers, not events, and they leave here rather than going on to the broadcast.**
                     // A `Retrieved`/`Stored` is the reply to one caller's `get`/`put`, correlated by digest;
@@ -1503,6 +1550,8 @@ fn spawn_inner(
     let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Notification>();
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<Control>();
     let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
+    // Latest-state for the epoch, fed by the router (the one lossless reader) — see [`Beacons`].
+    let (beacon_tx, beacon_rx) = tokio::sync::watch::channel::<Option<(Epoch, [u8; 32])>>(None);
     let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(reflexive_quorum)));
     let peer_addrs: PeerAddrs = Arc::new(Mutex::new(HashMap::new()));
@@ -1541,7 +1590,7 @@ fn spawn_inner(
         distrust,
     ));
     // The router owns the notification stream: it correlates get/put replies and fans events out.
-    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), seat.clone()));
+    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), beacon_tx, seat.clone()));
 
     Ok(NodeHandle {
         addr: seat,
@@ -1550,6 +1599,7 @@ fn spawn_inner(
         ctrl_tx,
         events_tx,
         events_rx,
+        beacons: beacon_rx,
         endpoint,
         reflexive,
         claims: None,
@@ -2712,6 +2762,7 @@ mod tests {
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
+            beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
         };
 
@@ -2805,6 +2856,7 @@ mod tests {
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
+            beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
         };
         tokio::spawn(reshuffle_loop::<F2>(

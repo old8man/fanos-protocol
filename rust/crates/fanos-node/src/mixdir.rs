@@ -24,12 +24,11 @@ use fanos_geometry::{Plane, Point};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::Client;
 use fanos_rendezvous::{Epoch, MixDirectory};
-use fanos_runtime::{Command, Notification};
-use tokio::sync::broadcast;
+use fanos_runtime::Command;
 use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
-use crate::EpochDriver;
+use crate::{EpochDriver, next_epoch};
 use fanos_primitives::BeaconSeed;
 use fanos_vrf::{VrfProof, VrfPublic};
 
@@ -220,7 +219,7 @@ pub fn spawn_mix_publisher(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut driver = EpochDriver::new(client.address(), onion_seed);
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         // A coordinate-**bound** record (S1-M3), which a `Node` can always produce because it always runs VRF coordinates.
         // Genesis first, so a circuit drawn before the first beacon can still seal to this relay — against **this
         // network's** genesis seed, which is what the node was seated against. Naming the constant here published a
@@ -235,22 +234,15 @@ pub fn spawn_mix_publisher(
             None => publish_mix_key(client, client.address(), epoch, key).await,
         };
         publish(&client, driver.epoch(), &beacon, driver.public()).await;
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch, seed }) => {
-                    // The record binds `(id, epoch, beacon)`, so a republish must use the beacon of the epoch it publishes
-                    // for — carrying the old one forward would produce a record no reader can verify.
-                    beacon = BeaconSeed::new(seed);
-                    // Advance the mirror ratchet to the beacon epoch; a stale/replayed epoch reports 0
-                    // steps and nothing is republished. On a real advance, republish the now-current key.
-                    if driver.advance_to(epoch) > 0 {
-                        publish(&client, driver.epoch(), &beacon, driver.public()).await;
-                    }
-                }
-                // Other notifications are irrelevant to key rotation; a lagged stream only means we may
-                // have missed an epoch, and the next BeaconReady's catch-up advance covers it.
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
+        // Latest-state, not the notification stream: a relay whose key is missing from the directory for an
+        // epoch cannot be routed through for that epoch, and the broadcast could drop the round that says so
+        // (#86). `advance_to` already handles a multi-step catch-up, which is what a skipped epoch produces.
+        while let Some((epoch, seed)) = next_epoch(&mut beacons, driver.epoch()).await {
+            // The record binds `(id, epoch, beacon)`, so a republish must use the beacon of the epoch it
+            // publishes for — carrying the old one forward would produce a record no reader can verify.
+            beacon = seed;
+            if driver.advance_to(epoch) > 0 {
+                publish(&client, driver.epoch(), &beacon, driver.public()).await;
             }
         }
     })
@@ -274,7 +266,7 @@ pub fn spawn_mix_publisher(
 /// does not forward. That is the correct failure: a partial directory never produces a *wrong* route.
 pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: bool) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let install = async |client: &Client, epoch: Epoch, beacon: BeaconSeed| {
             let dir = build_cell_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
             if !dir.is_empty() {
@@ -289,14 +281,12 @@ pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: boo
         // with no directory cannot forward. Waiting for the first `BeaconReady` would leave the whole genesis
         // epoch unserved — which is not a corner case, it is how every fixed-epoch deployment runs.
         install(&client, Epoch::ZERO, client.genesis()).await;
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch, seed }) => {
-                    install(&client, epoch, BeaconSeed::new(seed)).await;
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+        // A combiner with a stale directory seals to keys the line has ratcheted past, so this must not be
+        // able to sleep through an epoch — latest-state, not the lossy stream (#86).
+        let mut cur = Epoch::ZERO;
+        while let Some((epoch, seed)) = next_epoch(&mut beacons, cur).await {
+            cur = epoch;
+            install(&client, epoch, seed).await;
         }
     })
 }

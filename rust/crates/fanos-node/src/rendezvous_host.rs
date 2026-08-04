@@ -383,19 +383,16 @@ where
     );
     let ctx = HostContext { service_public, host_secret, threshold, vrf_coordinates, identity, signer };
     tokio::spawn(async move {
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let (mut epoch, mut seed) = initial;
         rotate_host(&client, coord, &ctx, epoch, seed, &epoch_tx).await;
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
-                    epoch = reached;
-                    seed = s;
-                    rotate_host(&client, coord, &ctx, epoch, seed, &epoch_tx).await;
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+        // Latest-state, not the lossy stream: a host that sleeps through an epoch keeps registering at the
+        // meeting points of a period that has passed, so every client dialing it looks in the right place
+        // and finds nothing — unreachable for the epoch, with no error on either side (#86).
+        while let Some((reached, s)) = crate::next_epoch(&mut beacons, epoch).await {
+            epoch = reached;
+            seed = *s.as_bytes();
+            rotate_host(&client, coord, &ctx, epoch, seed, &epoch_tx).await;
         }
     })
 }

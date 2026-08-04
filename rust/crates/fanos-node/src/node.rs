@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fanos_diaulos::StaticKeypair;
@@ -152,40 +152,6 @@ fn spawn_epoch_driver(client: Client, period: Duration) -> JoinHandle<()> {
             }
         }
     })
-}
-
-/// A shared cell holding the node's live `(epoch, beacon seed)` — written from its own `BeaconReady`
-/// notifications by [`spawn_beacon_tracker`], read by an anonymous proxy through [`Node::live_beacon`].
-type LiveBeacon = Arc<Mutex<Option<(Epoch, [u8; 32])>>>;
-
-/// Spawn a task tracking the node's live beacon from its own `BeaconReady` notifications into a shared cell
-/// (audit S1-M2). An anonymous proxy reads it so it draws its mix directory + meeting lines for the epoch the
-/// relays have actually rotated to — without this the proxy stays pinned at its static `--epoch`/`--beacon` and
-/// its dials break after the first epoch turn (an issue S1-H2 aggravated by making relays advance).
-fn spawn_beacon_tracker(client: Client, enabled: bool) -> (Option<JoinHandle<()>>, LiveBeacon) {
-    let cell: LiveBeacon = Arc::new(Mutex::new(None));
-    if !enabled {
-        return (None, cell); // a bare node has no beacon clock — `live_beacon` stays `None` (static fallback)
-    }
-    let shared = cell.clone();
-    let task = tokio::spawn(async move {
-        let mut events = client.subscribe();
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch, seed }) => {
-                    if let Ok(mut live) = shared.lock() {
-                        // Monotone: adopt only a strictly-newer epoch, ignoring a lagged/replayed older round.
-                        if live.is_none_or(|(e, _)| epoch > e) {
-                            *live = Some((epoch, seed));
-                        }
-                    }
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-    (Some(task), cell)
 }
 
 /// How many consecutive epoch-driver periods with no beacon advance confirm a stall. Set above the safe-stall
@@ -707,9 +673,6 @@ pub struct Node {
     /// The background task issuing the wall-clock `AdvanceEpoch` tick — present only when a beacon is
     /// configured (the live epoch clock). Held for the node's lifetime; it ends when the engine stops.
     _epoch_driver: Option<JoinHandle<()>>,
-    /// The background task tracking the node's live beacon (audit S1-M2) — present only when a beacon is
-    /// configured. Held for the node's lifetime.
-    _beacon_tracker: Option<JoinHandle<()>>,
     /// The recovery auto-trigger (audit §4 R-C1) — present only with a beacon; fires proactive reshare /
     /// escalates re-genesis on a beacon freeze. Held for the node's lifetime.
     _recovery_trigger: Option<JoinHandle<()>>,
@@ -723,7 +686,7 @@ pub struct Node {
     self_org: SelfOrganization,
     /// The node's live `(epoch, beacon seed)`, updated by `_beacon_tracker`; `None` until the first round is
     /// adopted (or always, for a node with no beacon clock). Read by an anonymous proxy via [`live_beacon`](Self::live_beacon).
-    live_beacon: LiveBeacon,
+    live_beacon: fanos_quic::Beacons,
 }
 
 /// A point-in-time health snapshot of a node.
@@ -912,7 +875,11 @@ impl Node {
         // The root epoch tick driving the live beacon clock (§L3, §7.6) — only when a beacon is configured.
         let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
 
-        let (beacon_tracker, live_beacon) = spawn_beacon_tracker(handle.client(), has_beacon); // live beacon (S1-M2)
+        // The live beacon (audit S1-M2) comes straight off the router's latest-state watch. It used to be a
+        // second copy — its own task, subscribed to the *lossy* notification stream, maintaining an
+        // `Arc<Mutex<Option<_>>>` that said the same thing. One task fewer, one lossy consumer fewer, and no
+        // second answer to a question that has one.
+        let live_beacon = handle.client().beacons();
 
         let recovery_trigger = spawn_recovery::<F>(handle.client(), &config, address, has_beacon); // audit §4 R-C1
 
@@ -950,7 +917,6 @@ impl Node {
             roles: config.roles,
             _mix_publisher: mix_publisher,
             _epoch_driver: epoch_driver,
-            _beacon_tracker: beacon_tracker,
             _recovery_trigger: recovery_trigger,
             _move_announcer: move_announcer,
             _store_persister: store_persister,
@@ -993,7 +959,7 @@ impl Node {
     /// to, rather than a stale static `--epoch`/`--beacon`.
     #[must_use]
     pub fn live_beacon(&self) -> Option<(Epoch, [u8; 32])> {
-        self.live_beacon.lock().ok().and_then(|live| *live)
+        *self.live_beacon.borrow()
     }
 
     /// The node's overlay coordinate, **as of now**.

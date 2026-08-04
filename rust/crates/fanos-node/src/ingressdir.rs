@@ -207,57 +207,53 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (_secret, public) = ingress_keypair(&kem_seed);
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         // Genesis first, so a line rotating out of epoch 0 can already resolve this member.
         publish_ingress_key(&client, client.address(), Epoch::new(0), &public).await;
         let mut current = Epoch::new(0);
-        loop {
-            match events.recv().await {
-                Ok(fanos_runtime::Notification::BeaconReady { epoch, seed }) if epoch > current => {
-                    let beacon = fanos_rendezvous::BeaconSeed::new(seed);
-                    let next = epoch.next();
-                    // Publish for the epoch AFTER this one: the rotation into it happens at that boundary,
-                    // and a key published at the boundary is a key the outgoing line could not have read.
-                    publish_ingress_key(&client, client.address(), next, &public).await;
+        // Latest-state, not the lossy stream: a missed round is a rotation that never happens, and an ingress
+        // line that stops rotating forfeits the moving-target property §6 rests on — its blocklist stops
+        // going stale (#86).
+        while let Some((epoch, beacon)) = crate::next_epoch(&mut beacons, current).await {
+            let next = epoch.next();
+            // Publish for the epoch AFTER this one: the rotation into it happens at that boundary,
+            // and a key published at the boundary is a key the outgoing line could not have read.
+            publish_ingress_key(&client, client.address(), next, &public).await;
 
-                    let old_line = crate::poros::ingress_line::<F>(&community, current, &beacon);
-                    let new_line = crate::poros::ingress_line::<F>(&community, epoch, &beacon);
-                    let old_members = fanos_rendezvous::line_member_coords::<F>(old_line.coords());
-                    let new_members = fanos_rendezvous::line_member_coords::<F>(new_line.coords());
-                    current = epoch;
+            let old_line = crate::poros::ingress_line::<F>(&community, current, &beacon);
+            let new_line = crate::poros::ingress_line::<F>(&community, epoch, &beacon);
+            let old_members = fanos_rendezvous::line_member_coords::<F>(old_line.coords());
+            let new_members = fanos_rendezvous::line_member_coords::<F>(new_line.coords());
+            current = epoch;
 
-                    // Only an OUTGOING member emits. A node on neither line has nothing to do; a node on
-                    // only the incoming line was armed by `IngressNode` and waits for sub-shares.
-                    if !old_members.contains(&client.address()) {
-                        continue;
-                    }
-                    let Some(keys) = resolve_ingress_line(&client, &new_members, epoch).await else {
-                        // Fail-closed and quiet on the wire, which is why it must not be quiet to an
-                        // operator: a line that stops rotating is a line whose blocklist stops going stale.
-                        tracing::warn!(
-                            epoch = epoch.get(),
-                            "ingress rotation skipped: an incoming line member published no key"
-                        );
-                        continue;
-                    };
-                    // Fresh entropy per rotation, drawn here because the engine must stay deterministic.
-                    // Two independent draws: the Shamir polynomial and the KEM seed must not share
-                    // material, or a sub-share's confidentiality would rest on the same bytes that
-                    // determine its value.
-                    let (mut key_rnd, mut kem_seed) = (vec![0u8; RESHARE_RANDOMNESS_LEN], [0u8; 32]);
-                    if getrandom::fill(&mut key_rnd).is_err() || getrandom::fill(&mut kem_seed).is_err() {
-                        tracing::warn!("ingress rotation skipped: OS entropy unavailable");
-                        continue;
-                    }
-                    let body = encode_rotation(epoch, &new_members, &keys, &key_rnd, &kem_seed);
-                    client.command(fanos_runtime::Command::Control {
-                        tag: CONTROL_INGRESS_ROTATION,
-                        body,
-                    });
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            // Only an OUTGOING member emits. A node on neither line has nothing to do; a node on
+            // only the incoming line was armed by `IngressNode` and waits for sub-shares.
+            if !old_members.contains(&client.address()) {
+                continue;
             }
+            let Some(keys) = resolve_ingress_line(&client, &new_members, epoch).await else {
+                // Fail-closed and quiet on the wire, which is why it must not be quiet to an
+                // operator: a line that stops rotating is a line whose blocklist stops going stale.
+                tracing::warn!(
+                    epoch = epoch.get(),
+                    "ingress rotation skipped: an incoming line member published no key"
+                );
+                continue;
+            };
+            // Fresh entropy per rotation, drawn here because the engine must stay deterministic.
+            // Two independent draws: the Shamir polynomial and the KEM seed must not share
+            // material, or a sub-share's confidentiality would rest on the same bytes that
+            // determine its value.
+            let (mut key_rnd, mut kem_seed) = (vec![0u8; RESHARE_RANDOMNESS_LEN], [0u8; 32]);
+            if getrandom::fill(&mut key_rnd).is_err() || getrandom::fill(&mut kem_seed).is_err() {
+                tracing::warn!("ingress rotation skipped: OS entropy unavailable");
+                continue;
+            }
+            let body = encode_rotation(epoch, &new_members, &keys, &key_rnd, &kem_seed);
+            client.command(fanos_runtime::Command::Control {
+                tag: CONTROL_INGRESS_ROTATION,
+                body,
+            });
         }
     })
 }

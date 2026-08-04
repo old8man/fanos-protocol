@@ -20,7 +20,38 @@
 use fanos_diaulos::Coord;
 use fanos_pqcrypto::OnionKeyRatchet;
 use fanos_pqcrypto::kem::HybridKemPublic;
-use fanos_rendezvous::Epoch;
+use fanos_quic::Beacons;
+use fanos_rendezvous::{BeaconSeed, Epoch};
+
+/// Await the epoch **after** `seen`, or `None` once the node stops.
+///
+/// The one way an epoch-driven publisher should learn the time. Every such publisher used to match
+/// `Notification::BeaconReady` on the node's `subscribe()` stream — a *broadcast*, which drops messages for
+/// any subscriber that falls behind, and every one of them wrote `Err(Lagged(_)) => {}`. A publisher that
+/// missed a round therefore never published for that epoch at all: a relay's onion key, an exit's key, a
+/// node's capability or load simply absent from the `(coordinate, epoch)`-keyed directory for a full period,
+/// self-healing at the next one and with nothing anywhere to say it had happened (#86).
+///
+/// **A `watch` cannot express that failure**, which is why the primitive is the fix rather than a bigger
+/// buffer. An epoch is *state*, not an event: a reader only ever wants the one that is current, and an
+/// intermediate epoch it slept through is already worthless — its slot belongs to a period that has passed.
+/// A reader descheduled across three epochs wakes on the third, which is the only one it wanted.
+///
+/// Returns immediately when the current epoch already exceeds `seen`, so a publisher that starts *after* a
+/// round assembled does not wait out a whole period for the next one — the mistake the borrow-then-await
+/// shape below exists to avoid.
+pub async fn next_epoch(beacons: &mut Beacons, seen: Epoch) -> Option<(Epoch, BeaconSeed)> {
+    loop {
+        // Copied out before the await: holding the watch's borrow across one would deadlock every writer.
+        let live = *beacons.borrow_and_update();
+        if let Some((epoch, seed)) = live
+            && epoch > seen
+        {
+            return Some((epoch, BeaconSeed::new(seed)));
+        }
+        beacons.changed().await.ok()?;
+    }
+}
 
 /// Drives a mix-relay's per-epoch onion-key rotation from the beacon (audit E4∩E5). Monotone: a stale or
 /// replayed beacon epoch is ignored.

@@ -23,7 +23,6 @@ use fanos_geometry::{Plane, Point};
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_quic::{Client, CoordinateProver};
 use fanos_rendezvous::{BeaconSeed, Epoch};
-use fanos_runtime::Notification;
 use fanos_vrf::{VrfProof, VrfPublic};
 
 use crate::bound::Entitlement;
@@ -32,7 +31,6 @@ use std::net::Ipv4Addr;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
@@ -411,7 +409,7 @@ pub fn spawn_exit_publisher(
     prover: Option<CoordinateProver>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         // This network's epoch-0 seed, not the constant (`docs/design-genesis.md`) — a record bound against
         // the wrong seed proves a coordinate this node does not occupy, so no reader can verify it.
@@ -424,16 +422,12 @@ pub fn spawn_exit_publisher(
             async move { publish_exit_key(&client, client.address(), epoch, &public, credential.as_ref()).await }
         };
         publish(epoch, seed, &public).await;
-        loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: reached, seed: s }) if reached > epoch => {
-                    epoch = reached;
-                    seed = BeaconSeed::new(s);
-                    publish(epoch, seed, &public).await;
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+        // Latest-state, not the lossy notification stream: an exit missing from the directory for an epoch
+        // is an exit no proxy can discover for that epoch, and the stream could drop the round (#86).
+        while let Some((reached, s)) = crate::next_epoch(&mut beacons, epoch).await {
+            epoch = reached;
+            seed = s;
+            publish(epoch, seed, &public).await;
         }
     })
 }

@@ -206,6 +206,7 @@ pub fn spawn_load_publisher(
     let (ready_tx, ready_rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         // This network's epoch-0 seed, not the constant — the same rule every epoch-0 publisher follows
         // (`docs/design-genesis.md`): a record bound against the wrong seed proves a coordinate this node
@@ -227,22 +228,26 @@ pub fn spawn_load_publisher(
         // from these reports, and a setpoint of zero correctly assigns nobody — so assigning before the node's own
         // report lands produces an empty assignment that looks like a controller fault.
         let _ = ready_tx.send(());
+        // Epoch from the `watch`, moves from the stream — see the capability publisher for why the two are
+        // different kinds of thing (#86). A missing load report makes this node's work invisible to the
+        // setpoint, which then provisions the role as though nobody were carrying it.
         loop {
-            match events.recv().await {
-                Ok(Notification::BeaconReady { epoch: e, seed: s }) => {
-                    if e > epoch {
-                        epoch = e;
-                        seed = BeaconSeed::new(s);
-                        publish(epoch, seed, load_source()).await;
-                    }
-                }
-                // The node MOVED — see the capability publisher: republishing only on a beacon left the report at the point
-                // the node had left, for up to a whole epoch.
-                Ok(Notification::Reseated { .. }) => {
+            tokio::select! {
+                advanced = crate::next_epoch(&mut beacons, epoch) => {
+                    let Some((e, s)) = advanced else { break };
+                    epoch = e;
+                    seed = s;
                     publish(epoch, seed, load_source()).await;
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
+                event = events.recv() => match event {
+                    // The node MOVED — see the capability publisher: republishing only on a beacon left the
+                    // report at the point the node had left, for up to a whole epoch.
+                    Ok(Notification::Reseated { .. }) => {
+                        let _ = publish(epoch, seed, load_source()).await;
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });

@@ -387,6 +387,7 @@ pub fn spawn_role_loop<F: Field>(
     let handle = tokio::spawn(async move {
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
+        let mut beacons = client.beacons();
         let mut cur = Epoch::ZERO;
         let mut seed = client.genesis();
         genesis_assign::<F>(&client, &mut live, capacity, ready, vrf, &roles_tx).await;
@@ -403,18 +404,25 @@ pub fn spawn_role_loop<F: Field>(
         refresh.tick().await; // the first tick is immediate; the genesis assignment just ran
         loop {
             tokio::select! {
+                // **The epoch is latest-state; a move is an event.** A missed `BeaconReady` on the lossy
+                // notification stream meant this loop never assigned for that epoch at all — every node of
+                // the cell running the previous epoch's assignment while the lottery had already
+                // re-randomised, for a full period, with nothing to say so (#86). There is no "current move"
+                // to converge on, so those stay on the stream below, where a dropped one costs a delayed
+                // re-derivation rather than a skipped one.
+                advanced = crate::next_epoch(&mut beacons, cur) => {
+                    let Some((epoch, s)) = advanced else { break };
+                    cur = epoch;
+                    seed = s;
+                    (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
+                    // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
+                    // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
+                    stable = 0;
+                    backoff = ROSTER_REFRESH;
+                    refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
+                    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                }
                 event = events.recv() => match event {
-                    Ok(Notification::BeaconReady { epoch, seed: s }) if epoch > cur => {
-                        cur = epoch;
-                        seed = BeaconSeed::new(s);
-                        (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
-                        // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
-                        // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
-                        stable = 0;
-                        backoff = ROSTER_REFRESH;
-                        refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
-                        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    }
                     // A coordinate moved — this node's own (`Reseated`) or a peer's (`PeerMoved`). Either changes the
                     // cell's composition, so the assignment is expected to move and the loop must re-derive at the FLOOR
                     // rather than on whatever backoff it had reached.
