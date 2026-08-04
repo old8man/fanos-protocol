@@ -446,7 +446,7 @@ mod tests {
         let block = block_with_payload();
         let hash = block.hash();
         let shards = block.da_shards();
-        let n = CellParams::FANO.n;
+        let n = CellParams::FANO.n();
 
         let mut cell: Vec<Sampler> = (0..n).map(|i| Sampler::new(u8::try_from(i).unwrap())).collect();
         for (i, s) in cell.iter_mut().enumerate() {
@@ -477,7 +477,7 @@ mod tests {
         let block = block_with_payload();
         let hash = block.hash();
         let shards = block.da_shards();
-        let n = CellParams::FANO.n;
+        let n = CellParams::FANO.n();
         let mut cell: Vec<Sampler> = (0..n).map(|i| Sampler::new(u8::try_from(i).unwrap())).collect();
 
         let (first, rest) = cell.split_first_mut().expect("a non-empty cell");

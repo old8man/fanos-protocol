@@ -48,11 +48,14 @@
       { "name": "EPOCH_AGREE", "code": "0x19", "group": 1 },
       { "name": "PUBLISH", "code": "0x22", "group": 2 },
       { "name": "ROUTE", "code": "0x30", "group": 3 },
+      { "name": "ROUTE_HIER", "code": "0x34", "group": 3 },
       { "name": "TESSERA", "code": "0x40", "group": 4 },
       { "name": "RDV_INTRO", "code": "0x50", "group": 5 },
-      { "name": "DIAG_VERDICT", "code": "0x62", "group": 6 },
+      { "name": "POROS_REQUEST", "code": "0x56", "group": 5 },
+      { "name": "DIAG_GOSSIP", "code": "0x60", "group": 6 },
       { "name": "DIAG_ATTEST", "code": "0x63", "group": 6 },
-      { "name": "DIAG_LOSS", "code": "0x64", "group": 6 }
+      { "name": "DIAG_LOSS", "code": "0x64", "group": 6 },
+      { "name": "CELL_ESCALATE", "code": "0x65", "group": 6 }
     ],
     "examples": [
       { "type": "0x22", "body_utf8": "payload", "hex": "22077061796c6f6164" }

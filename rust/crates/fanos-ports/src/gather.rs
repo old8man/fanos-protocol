@@ -183,6 +183,7 @@ impl GatherClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     /// **A deadline trained only on what beat it can never learn that it is short.**
     ///
@@ -429,11 +430,12 @@ mod tests {
             clock.observe_late(truth);
             rounds += 1;
             if rounds <= 8 || clock.deadline() >= truth {
-                report.push_str(&format!(
-                    "  {rounds:5}   {:12}   {}\n",
+                let _ = writeln!(
+                    report,
+                    "  {rounds:5}   {:12}   {}",
                     clock.deadline().as_nanos() / 1_000_000,
                     clock.deadline() >= truth,
-                ));
+                );
             }
         }
         println!("{report}");

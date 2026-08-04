@@ -201,7 +201,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert!(
-        cert.verify(CellParams::FANO.quorum, &verifiers),
+        cert.verify(CellParams::FANO.quorum(), &verifiers),
         "the published checkpoint is a valid Q-quorum certificate over the executed state",
     );
 

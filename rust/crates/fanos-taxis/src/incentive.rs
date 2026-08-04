@@ -458,8 +458,8 @@ mod tests {
         let cell = CellParams::FANO; // f = 2
         for mask in 0u16..(1 << fano::N) {
             let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
-            if c.len() <= cell.f {
-                assert!(!can_permanently_censor(&c, cell), "coalition {c:?} (≤ f={}) must not censor every line", cell.f);
+            if c.len() <= cell.f() {
+                assert!(!can_permanently_censor(&c, cell), "coalition {c:?} (≤ f={}) must not censor every line", cell.f());
             }
         }
         // The smallest coalition that CAN permanently censor is n − 1 = 6 — its complement is the single point no
@@ -472,7 +472,7 @@ mod tests {
             .min()
             .expect("some coalition censors");
         assert_eq!(min_censor, fano::N - 1, "permanent censorship needs n−1 validators");
-        assert!(min_censor > cell.f, "the censoring coalition exceeds the BFT fault bound f={}", cell.f);
+        assert!(min_censor > cell.f(), "the censoring coalition exceeds the BFT fault bound f={}", cell.f());
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
         let bribe = 1_000; // a large censorship bribe — still uncollectable within the fault bound
         for mask in 1u16..(1 << fano::N) {
             let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
-            if c.len() <= cell.f {
+            if c.len() <= cell.f() {
                 assert!(
                     coalition_best_response_is_honest(&P, cell, &c, bribe),
                     "coalition {c:?} (≤ f) cannot profit by any joint deviation"

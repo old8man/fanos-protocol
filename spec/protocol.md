@@ -723,14 +723,30 @@ frame = type:varint  ‖  length:varint  ‖  body:bytes[length]
 
 | Range | Group | Types |
 |---|---|---|
-| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `GOAWAY`, `ERROR`, `OBSERVED_ADDR`, `CONNECT_REQ`, `PUNCH_TO`, `RELAY` |
-| `0x1*` | Membership | `JOIN`, `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL`, `EPOCH_AGREE` |
-| `0x2*` | Overlay/storage | `LOOKUP`, `VALUE`, `PUBLISH`, `ACK`, `BRIDGE` |
-| `0x3*` | Direct route | `ROUTE`, `STREAM_OPEN`, `STREAM_DATA`, `STREAM_FIN`, `ROUTE_HIER` |
-| `0x4*` | APHANTOS/NYX | `TESSERA`, `PARTIAL_DEC`, `COVER` |
-| `0x5*` | Rendezvous / CALYPSO | `RDV_INTRO`, `RDV_REPLY`, `SVC_ANNOUNCE`, `RDV_REGISTER`, `SVC_SHARE_REQ`, `SVC_PARTIAL` |
-| `0x6*` | DIAKRISIS | `DIAG_GOSSIP`, `DIAG_SYNDROME`, `DIAG_VERDICT`, `DIAG_ATTEST`, `DIAG_LOSS` |
+| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `ERROR`, `OBSERVED_ADDR`, `CONNECT_REQ`, `PUNCH_TO`, `RELAY` |
+| `0x1*` | Membership | `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL`, `EPOCH_AGREE`, `BEACON_RESHARE_*` |
+| `0x2*` | Overlay/storage | `LOOKUP`, `VALUE`, `PUBLISH`, `ACK` |
+| `0x3*` | Direct route | `ROUTE`, `ROUTE_HIER` |
+| `0x4*` | APHANTOS/NYX | `TESSERA` |
+| `0x5*` | Rendezvous / CALYPSO / POROS | `RDV_INTRO`, `RDV_REPLY`, `RDV_REGISTER`, `SVC_SHARE_REQ`, `SVC_PARTIAL`, `POROS_*` |
+| `0x6*` | DIAKRISIS | `DIAG_GOSSIP`, `DIAG_ATTEST`, `DIAG_LOSS`, `CELL_ESCALATE` |
 | `0x7*` | Application | `APP` |
+
+**This table is the registry, not a wish-list, and it is checked as one.** Eleven types it once listed —
+`GOAWAY`, `JOIN`, `BRIDGE`, `STREAM_OPEN`, `STREAM_DATA`, `STREAM_FIN`, `PARTIAL_DEC`, `COVER`,
+`SVC_ANNOUNCE`, `DIAG_SYNDROME`, `DIAG_VERDICT` — named codes the implementation never spoke, each having a
+working mechanism under a different name (diagnosis gossips as `DIAG_GOSSIP`/`DIAG_ATTEST`/`DIAG_LOSS`;
+streams frame themselves inside an established session as inner `SessionFrameType`s; a service announces
+through the descriptor store; a partial decryption is a CALYPSO method rather than a frame; joining floods an
+`ANNOUNCE` that carries strictly more than `JOIN` would). They were deleted from the implementation rather
+than documented, because a reserved code is not neutral: the decoder maps attacker-supplied bytes onto a type
+nothing handles, and every reader of the registry reasonably concludes the capability exists. Deleting makes
+those bytes *unknown*, which is what the framing layer already does with garbage.
+
+The table lagged that deletion by six days, and so did `conformance/vectors/wire.json` — which asserted
+`DIAG_VERDICT` and had been failing that whole time, unseen because `cargo test` stops at the first failing
+target and a different flake came first. Both are now reconciled, and `fanos-cli/tests/frame_registry.rs`
+fails if this table and `fanos_wire::FrameType` ever disagree again.
 
 The registry is versioned (§7.4); new types are added by IANA-style allocation without breaking old decoders. The following forward-compatible additions extend the base set, each wired to a live subsystem: `BEACON_PARTIAL` carries one anchor's distributed-VRF beacon partial for an epoch (a threshold of them assemble a `BEACON` round, §L3); `EPOCH_AGREE` gossips the epoch **ordinal** for membership agreement — distinct from the `BEACON` randomness round; `ROUTE_HIER` carries a hierarchical route (`HierAddr(dst) ‖ payload`) forwarded cell-to-cell toward a multi-level destination (§L1), degenerating to `ROUTE` at hierarchy depth 1; the NAT-traversal session sub-group `OBSERVED_ADDR` / `CONNECT_REQ` / `PUNCH_TO` / `RELAY` carries reflexive-address reports, hole-punch brokering, and the symmetric-NAT relay fallback (§L2); `RDV_REGISTER` lets a client register its coordinate with a rendezvous relay so anonymous replies assembled at the relay's combiner reach it; `SVC_SHARE_REQ` / `SVC_PARTIAL` carry the CALYPSO threshold-hosting share request and partial decryption (§12.3); `DIAG_ATTEST` / `DIAG_LOSS` carry DIAKRISIS cross-attestation (§6.4) and grey-loss reports (§6.3); `APP` (group `0x7*`) is a length-skippable outer type multiplexing application-overlay protocols above the FANOS core, so a decoder unaware of a given overlay still forward-compatibly skips it. A separate **inner** `SessionFrameType` registry (`PADDING` / `DATA` / `ACK` / `RESET`) numbers the intra-cell DIAULOS stream frames; `fanos-wire` is the single frame-numbering authority for both layers.
 
