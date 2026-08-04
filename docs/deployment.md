@@ -124,7 +124,15 @@ docker run -d --name fanos \
 ```
 
 Publish the port as **`/udp`** — QUIC is UDP, and a `-p 9000:9000` (TCP) mapping silently carries no
-traffic. Keep the `fanos-state` volume across restarts and upgrades to keep the identity.
+traffic. Keep the `fanos-state` volume across restarts and upgrades: it holds the identity **and, since
+2026-08-04, the node's store** (`store.snapshot` — the erasure shards this node is custodian of for the cell,
+its expiry schedule and its loss ledger). Recreating the container without it returns a member that has
+forgotten everything the cell asked it to hold; the `[7,3,4]` code re-heals one such member, but that
+tolerance is the budget for real failures and not for `docker run`.
+
+The store's directory is the config's `state = …` key, which `fanos init` writes to the platform state
+directory and `--data DIR` overrides. A node with neither says so at startup — "no state directory
+configured — this node keeps nothing across a restart" — rather than leaving it to be discovered later.
 
 ### In the foreground (for a quick check)
 

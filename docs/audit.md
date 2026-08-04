@@ -2961,3 +2961,175 @@ supplies the observation the two together predict.
 That q=3 and q=4 are strictly worse than q=2 is still an untested prediction, and it matters to anyone
 choosing a plane order. It is no longer on #38's critical path. Testing it needs the general-q rendezvous path
 (audit A2: the stack is pinned to `F2` throughout), which is worth doing on its own merits.
+
+---
+
+# Audit pass 2026-08-04 — the founding ceremony's own hygiene, and what a node keeps
+
+Three findings, all in provisioning or persistence, all confirmed by running the tool rather than reading it.
+
+## §1. [Closed, #74] The recovery committee no longer needs a trusted dealer
+
+`beacon-deal` generated all `n` authority keypairs itself, so for the moment of dealing one machine held the
+entire recovery committee — the same concentration the beacon shares have, and a residual `docs/testnet.md`
+§7 had recorded honestly and left open.
+
+Closed by a ceremony step and a flag, needing no cryptography that did not exist. `fanos authority-key`
+generates one founder's keypair **on that founder's own machine**, keeps the seed there at mode 0600, and
+prints only the verifier; `beacon-deal --authority-verifiers FILE` deals against the collected public halves
+and writes no authority secret at all. The count must equal `n` and the tool refuses otherwise, because the
+list's **order is genesis material**: a signature names its member by index, so a list one short does not deal
+a smaller committee — it renames every member after the gap.
+
+The recovery authority is now the *less* centralized half of the founding: it needs no trusted dealer, and the
+beacon secret still does until the DKG is wired.
+
+## §2. [HIGH, FIXED, #82] Every dealing ceremony wrote its secrets at the process umask
+
+`bin/fanos.rs` has one writer that sets `0600` **before** the bytes land, with a comment on it explaining that
+a key written world-readable and chmod-ed a microsecond later *was* world-readable. Five secret-bearing dealer
+outputs went around it to `std::fs::write` and landed at the umask default:
+
+| file | what is in it |
+|---|---|
+| `anchor-<i>.beacon` | the beacon **share** |
+| `recovery-authority-<i>.key` | an authority seed |
+| `ingress-<i>.poros` | a POROS share **and** the member's `kem_seed` |
+| `validator-<i>.taxis` | the validator's secret config |
+| `founder.key` | the genesis founder's spending seed |
+
+Readable by every account on the dealing host — which is the host an operator is most likely to be sharing,
+because it is the one they only use for the ceremony. **The guard was not missing.** It was written,
+documented, and simply not called on the paths that hold the most; the identity key and `fanos init`'s own
+`.beacon` did use it. The shape is the one this audit keeps finding: a mechanism that exists and a caller that
+does not.
+
+Fixed by generalizing the writer to bytes and routing all five through it.
+`crates/fanos-node/tests/ceremony_secrets.rs` asserts the classification is **total** — the set of files a
+ceremony produces must equal `secret ∪ public` — so a ceremony that grows a new output fails until someone
+declares which kind it is. The public half is asserted too (`consumer.beacon` and `chain-info.taxis` must
+*not* be 0600), because a test where everything may be 0600 cannot fail.
+
+## §3. [Closed, #77] A node kept nothing but its identity
+
+The L4 erasure store was three in-memory maps with no serialization, and `loss_ledger`'s own documentation
+called itself durable — an audit trail of permanent data loss that did not survive a restart is a record of
+nothing.
+
+Closed with the seam the codebase already draws: `fanos-runtime` is sans-I/O and `no_std`, so the engine says
+*what* is durable and in what bytes (`Command::Snapshot` → `Notification::Snapshot`) and the host says *where*
+and *how often* (`fanos_node::durable`). Restore runs the other way and deliberately has no command: adopting
+a snapshot is only correct before the engine has served anything, so it is an argument to construction
+(`CellComposition::restore`), and a node that has already stored something refuses one.
+
+**The cadence is derived.** A shard is exposed only between its write and its home's next snapshot, so with
+period `T`, per-node restart rate `λ` and a uniformly-phased write the per-home loss probability is `≈ λT/2`;
+the `[7,3,4]` code loses a value only when 5 of 7 homes lose it, so `P ≈ C(7,5)·(λT/2)⁵ ≤ ε` gives
+`T ≤ (2/λ)·(ε/21)^(1/5)` — **≈ 592 s** at one restart per node per day and eleven nines per write.
+
+**A snapshot is a file, so it is provisioning, so it is a surface.** The restore path re-applies the store's
+own `MAX_STORE_ENTRIES`/`MAX_VALUE_LEN` caps, and a first attempt capped only the held shards — leaving
+`expiry` and `loss_ledger` bounded by nothing but the file's length, a memory amplification no peer can
+perform. Both are *documented* as subsets of the held keys, but that is an invariant of the code that writes a
+snapshot, and the premise of reading one is that it may not have come from that code. Every map is capped, and
+the test for it fails when the side-map bound is removed.
+
+Anything unrecognised — truncated, one flipped bit, a version this build never wrote — is refused **whole**
+and the node starts empty: a partially-loaded store silently claims custody of shards it does not have, and a
+member that lies about custody is worse for the cell than one that starts clean. Startup reports which
+happened, because a silent empty start is the failure the whole change removes.
+
+**The delivery path is a reply, not an event, and the first version got that wrong.** A snapshot is the whole
+store — up to `MAX_STORE_ENTRIES × MAX_VALUE_LEN` — and the engine's only channel out is the notification
+stream, which `broadcast::send` hands a *clone* of to every subscriber. A running node keeps about eight, so
+fanning a snapshot out would have allocated the entire store once per subscriber every period, from a store
+any peer can fill: a remote-triggerable memory amplification introduced by the fix for a durability defect.
+It is now a correlated `Control::Snapshot` with a `oneshot` reply, delivered to the one asker and never
+broadcast — the same shape `get`/`put` already used, which is what should have been noticed first.
+
+Still open: `fanos-taxis` touches no filesystem, so the ledger remains memory-only (one validator re-syncs
+from a cert-verified snapshot; a whole-cell restart is still total loss of the chain).
+
+## §4. [Blocked, not open, #76] The POROS Sybil cap needs a credential, not a wire
+
+Two anchors that look available were derived and rejected; both are recorded in `poros.rs` so they are not
+tried again.
+
+**The plane.** A requester's coordinate is `MapToPoint(VRF(sk, id ‖ epoch ‖ beacon))`, so the distinct
+coordinates any adversary can present in one epoch are bounded by `q² + q + 1` — independent of identity
+count, which is exactly what the proof-of-work cannot give. It **inverts into an attack**: a coordinate is a
+*shared* address (a cell holds ≈ `q` nodes before collisions), so an adversary occupying all 7 Fano points for
+7 proofs of work locks every honest requester out for the epoch. A quota loose enough for the honest
+identities sharing a point is a per-point rate-limiter, not a cap.
+
+**Currency.** A genuine scarce resource the platform already has, and useless here: POROS exists for a
+newcomer behind a censor who has no coins yet.
+
+What is left is a per-**invitee** credential, since `community` is a string shared by everyone told it. That
+is a subsystem with an unlinkability requirement (the design authority names Lox, *PoPETs 2023*), not a wiring
+change, and the task now says so.
+
+## §5. [HIGH, FIXED, #83] A store write that succeeded was reported to its caller as a failure
+
+Found by chasing an "intermittent" FFI test rather than filing it as contention, and it was neither
+intermittent in cause nor confined to the test.
+
+`Client::put` registers its waiter by sending `Control::Put{digest, reply}`, **then** sends the input that
+makes the engine answer, then awaits the oneshot. The router consumed both channels in one `tokio::select!`,
+which polls its branches in **random order**. Whenever the router was mid-iteration while both a registration
+and its answering `Notification::Stored` were queued, it could take the answer first, find no waiter in
+`puts`, and drop it — and the registration arriving next iteration was then never resolved. The client waited
+out `REQUEST_TIMEOUT` and returned `false` for a write that had landed.
+
+Measured before assuming: `fanos-ffi`'s C-ABI round trip failed 2 in 12 runs, and a probe printing
+`Stored with NO waiter registered` fired on **exactly** the failing runs and on no passing one.
+
+Not a test-only concern. Every `(coordinate, epoch)` directory publisher — `capdir`, `loaddir`, `mixdir`,
+`exit`, `telemetry_dir`, `crosscell_dir` — writes through `put_ephemeral`, so a node could believe its own
+capability, load or onion-key publish had failed when it had not; `get` has the identical shape, so a stored
+value could report absent.
+
+The fix is `biased;`. The registration is always enqueued strictly before the input that produces the answer,
+so draining registrations first restores the order the design already assumed — and it is deterministic
+rather than merely likelier, because a control message enqueued before an input cannot be dispatched after
+the notification that input causes.
+
+### The regression test had to be found, not reasoned out
+
+Three plausible shapes caught nothing. With the fix reverted:
+
+| shape | caught |
+|---|---|
+| 64 writes, 8 waves of 8, current-thread | 0 of 6 |
+| 64 writes, one burst, current-thread | 3 of 5 |
+| 512 writes, one burst, current-thread | 0 of 8 |
+| 64 writes, one burst, **multi-thread** | 6 of 8 |
+| **256 writes, one burst, multi-thread** | **8 of 8** |
+
+Two results contradict the obvious reasoning. **Waves are worse than a burst** — awaiting each wave leaves
+the router idle between them, and an idle router wakes on the registration it was given first. And on a
+current-thread runtime **a bigger burst is worse**, because every spawned task is polled before the engine
+task runs at all, so all the registrations are enqueued before any answer exists — which is precisely the
+ordering the fix guarantees, arrived at by accident. `#[tokio::test]` defaults to current-thread, so a test
+written the ordinary way would have been unable to fail. Only real parallelism separates the router, the
+engine and the clients, and only then does burst size help.
+
+## §6. [Instrument, open, #84] The whole async suite runs single-threaded
+
+`#[tokio::test]` defaults to a **current-thread** runtime. This tree has 198 of them and three with a
+`flavor`, two of which were added closing §5. So every real-QUIC integration test drives a stack of concurrent
+tasks — the engine actor, the router actor, the per-peer send workers, the epoch/role/publisher drivers — on
+one thread, while production runs them on a multi-threaded runtime.
+
+That is a **second unrecorded difference between the instrument and production**, alongside transport, which
+the standing fidelity rule says should be the only one.
+
+It is proven rather than suspected: §5 was invisible to all 198, and the only test that ever caught it was the
+C-ABI round trip, *because* `fanos-ffi` owns a real multi-thread runtime. The measurement table in §5 shows
+the sharper version — on a current-thread runtime a bigger concurrent burst detects **less**, because the
+scheduler manufactures exactly the ordering the fix guarantees.
+
+Not changed in this pass, and the reason is method rather than effort: switching runtime flavor moves timing
+everywhere and will surface real defects and contention artefacts together, and this box was at load 120
+while the change would have had to be measured. Doing it under load would have produced verdicts of the kind
+this audit spent two sessions retracting.

@@ -120,6 +120,50 @@ This draws a fresh secret from OS entropy, Shamir-splits it 5-of-7 (illustrative
   order** — a signature names its member by index into that list, so the order is genesis material and
   reordering it invalidates every signature.
 
+#### 3.1a Founders who do not want the dealer to hold their authority key
+
+The command above generates the whole committee on the dealing machine, so for the instant of dealing that
+machine holds every authority secret — the same concentration the beacon shares have, and fine for a private
+or test cell where one operator runs the ceremony anyway. It is not fine for a cell whose founders are not
+the dealer, and closing it needs no cryptography that does not already exist, only a ceremony step:
+
+```sh
+# On EACH founder's own machine (never the dealer's):
+fanos authority-key --out ~/.fanos/recovery-authority.key
+#   → writes the SECRET seed here, mode 0600, and prints ONE public hex line
+```
+
+Each founder sends back only that printed line. The dealer collects them, **one per line, in an agreed
+order**, and deals against them:
+
+```sh
+# ordered, one verifier per line; `#` comments are ignored
+cat > ./ceremony/verifiers.txt <<'EOF'
+# 1 alice
+9f3c…
+# 2 bob
+71a0…
+EOF
+
+fanos beacon-deal 7 5 --out ./ceremony/beacon --authority-verifiers ./ceremony/verifiers.txt
+```
+
+No `recovery-authority-<i>.key` is written, because none exists to write: **the dealer never sees an
+authority secret.** The count must equal `n` and the tool refuses otherwise — a list one short does not
+deal a smaller committee, it renames every member after the gap, and every signature those members produce
+would verify against the wrong key. The order is genesis material for the same reason.
+
+The beacon secret itself is still dealt in one place; that is the DKG's job and it is unbuilt (§7).
+
+#### 3.1b Every dealt secret is written owner-only
+
+`beacon-deal`, `ingress-deal` and `taxis-deal` create their share-bearing files at mode `0600` **at
+creation**, not with a `chmod` a moment later — a file that was world-readable for a microsecond was
+world-readable. `consumer.beacon` and `chain-info.taxis` are deliberately not: they carry commitments and
+thresholds and are what a client is *given*. `crates/fanos-node/tests/ceremony_secrets.rs` asserts the
+classification is **total**, so a ceremony that grows a new output fails until someone declares which kind
+it is.
+
 Hand `anchor-<i>.beacon` to founding operator `i` over a channel you trust (SSH, an encrypted messenger —
 the tool doesn't specify one, and that gap is real; see §6). Each file carries that operator's secret
 share: treat it like a private key, because a `VssShare` is exactly that.
@@ -431,7 +475,8 @@ was split a moment later:
   their holders can authorize a reshare or re-genesis for the life of the cell, by design (it's what
   recovers a cell that loses too many anchors). Keeping them "offline" is a promise the tooling cannot
   enforce. What the committee *does* buy is that this is now a promise from four people rather than one, and
-  that no single compromised laptop is sufficient.
+  that no single compromised laptop is sufficient — and with §3.1a not even the dealing laptop, which never
+  holds an authority secret at all.
 
 None of this is a reason not to launch. It is a reason to say, in whatever the testnet's own operator
 documentation is, who dealt it and what the authority holders promise to do with their keys — the same
@@ -490,13 +535,14 @@ ever holding the whole secret.
   it's easy to assume the DKG closes the whole governance gap in §2.1 and it does not: `DkgNode` has no
   concept of a recovery-authority keypair. Even a fully-wired `fanos keygen` would still need the step
   `beacon-deal` performs today.
-  *(Narrowed 2026-08-04: that step is no longer "one party generates a key". `beacon-deal` now generates one
-  authority keypair per founder and a strict majority must sign, so the single-party trust the DKG removes
-  from the beacon secret is no longer sitting undisturbed next to it. What remains genuinely open is that
-  the authority keys are still generated **in one place** by the dealing tool, exactly as the beacon shares
-  are — a trust-minimized founding would have each operator generate their own authority key locally and
-  publish only the verifier, which needs no cryptography that does not already exist, only a ceremony
-  step.)*
+  *(Closed 2026-08-04, in two steps. First the step stopped being "one party generates a key": `beacon-deal`
+  generates one authority keypair per founder and a strict majority must sign. Then the generation itself
+  moved off the dealer — `fanos authority-key` generates a founder's keypair on that founder's own machine
+  and `beacon-deal --authority-verifiers` deals against the collected public halves, writing no authority
+  secret at all (§3.1a). So the recovery authority is now the **less** centralized half of the founding: it
+  needs no trusted dealer, and the beacon secret still does until the DKG below is wired. The step remains
+  separate from a `fanos keygen` run — a DKG that produced the beacon share would still not produce these
+  keys — but it is no longer a single-party one.)*
 * **No discovery/transport step** for "these `n` operators, each on their own machine, are all in the same
   run." `fanos-sim`'s test wires every `DkgNode` directly in one process over a hand-rolled bus; a real
   multi-operator run needs the participants reachable by network address first.
@@ -515,7 +561,9 @@ Naming this precisely, so it's a scoped piece of work rather than an open questi
    `anchor-<index>.beacon`-equivalent file from `final_share()` + `aggregate_commitment()` + `t` — in the
    same `BeaconParams::to_config_string()` format already in use, so nothing downstream of this document's
    §3.4 needs to change once the file exists.
-2. The recovery-authority step above, run separately and manually, exactly as today.
+2. The recovery-authority step above, run separately — each founder's own `fanos authority-key`, collected
+   into a verifier list (§3.1a). Unchanged by the DKG in either direction: it is already trust-minimized,
+   and a `keygen` run that produced the beacon share would still not produce these keys.
 3. All `n` founding operators running step 1 at roughly the same time — the library's sharing/complaint
    deadlines default to 1.5 s each (`DEFAULT_SHARE_DEADLINE`/`DEFAULT_COMPLAINT_DEADLINE`), tuned for a
    simulated bus, not real network latency plus human coordination across operators in different locations.
@@ -570,24 +618,46 @@ meeting line from `(epoch, beacon)` independently, so the grace window is the th
 between them — and the window is now derived and unit-tested, but the composition of host + client + relay
 across a live `BeaconReady` is not.
 
-**Nothing a node stores survives a restart of the cell.** Measured, not inferred: six files in the shipped
-tree touch the filesystem at all — the config, the identity key, the setup wizard, the admin socket, the CLI,
-and a telemetry snapshot module that has no caller. The L4 erasure store is three in-memory maps with no
-serialization; `fanos-taxis` touches no filesystem, so the ledger is in memory too; and `--data DIR` is used
-only to place the control socket.
+**The L4 store now survives a restart; the chain still does not.** This was "nothing a node stores survives a
+restart of the cell" in full until 2026-08-04 (#77) — six files in the shipped tree touched the filesystem at
+all, the erasure store was three in-memory maps with no serialization, and `--data DIR` only placed the
+control socket.
 
-The severity splits in two, and the distinction is the whole of it:
+What changed: a node whose config names a `state` directory — which `fanos init` always writes — keeps its
+held shards, its expiry schedule and its loss ledger in `store.snapshot` there, and adopts them at startup.
+`fanos-runtime` is sans-I/O and cannot open a file, so the split is `Command::Snapshot` out of the engine and
+`CellComposition::restore` back into it; the host does the writing. A snapshot is written atomically
+(temporary → `fsync` → `rename`) and re-checked against the store's own `MAX_STORE_ENTRIES`/`MAX_VALUE_LEN`
+caps on the way in, because a file is provisioning and provisioning is a surface. Anything it does not
+recognise — truncated, one bit flipped, a version this build never wrote — is refused **whole** and the node
+starts empty, which is survivable for one member and is not survivable when it is silent, so startup says
+which happened.
 
-* **One node restarting is fine, by construction.** The `[7,3,4]` erasure code tolerates the loss and the
-  cell re-heals; a restarted validator re-syncs from a cert-verified snapshot. This is the case the design
-  anticipates and it works.
-* **The whole cell restarting is total, permanent loss** — every stored object and the entire chain. There is
-  no other copy. For a testnet whose purpose is connectivity and consensus that may be acceptable; for
-  anything storing content people want back, or holding balances, it is not.
+**The cadence is derived, not chosen.** A shard is exposed only between its write and its home's next
+snapshot; with period `T`, per-node restart rate `λ`, and a uniformly-phased write, the per-home loss
+probability is `≈ λT/2`, and the `[7,3,4]` code loses a value only when 5 of 7 homes lose it:
+
+```text
+P(lost) ≈ C(7,5)·(λT/2)⁵  ≤  ε      ⇒      T ≤ (2/λ)·(ε/21)^(1/5)
+```
+
+At one restart per node per day and eleven nines per write that is **≈ 592 s**, which is what a deployed node
+uses (`fanos_node::durable::snapshot_interval`). The fifth power is what makes it affordable: a target a
+hundred times stricter costs a period only ~2.5× shorter.
+
+What remains:
+
+* **The chain is still memory-only.** `fanos-taxis` touches no filesystem. One validator restarting re-syncs
+  from a cert-verified snapshot, so this is the anticipated case and it works; a whole-cell restart is still
+  total, permanent loss of the ledger. For a testnet exercising connectivity and consensus that may be
+  acceptable; for anything holding balances it is not.
+* **A cell that restarts entirely inside one snapshot period still loses the writes in that window** — the
+  `ε` above is the size of that risk, and it is a number rather than a hope.
 
 One interaction is unanalyzed and worth knowing before you plan an upgrade: `docs/design-upgrade.md` describes
 cell-wide activation with canaries, and a rolling restart that moves faster than the store re-heals loses data
-the erasure code would otherwise have recovered. Nothing measures that window.
+the erasure code would otherwise have recovered. Persistence shrinks that window — a restarted node comes back
+holding its shards instead of needing repair — but nothing measures it.
 
 **A POROS ingress host runs with no Sybil cap.** The per-request proof of work is a *rate*-limiter — it
 bounds how fast identities can be created, never how many exist (Boneh et al., CRYPTO 2018), and
@@ -600,6 +670,14 @@ is now written out at the call site rather than reached by an `Option` defaultin
 This is a design gap, not a missing wire: it needs a source of vouches before there is a set to install. If
 the testnet is exercising POROS specifically (§3.5 says most should not), assume ingress admission is
 rate-limited only.
+
+Two anchors that look available were derived and rejected, recorded in `poros.rs` so they are not tried again:
+**the plane itself** (distinct requester coordinates per epoch are bounded by `q²+q+1` regardless of identity
+count — but a coordinate is a *shared* address, so an adversary occupying all 7 Fano points for 7 proofs of
+work locks every honest requester out for the epoch, inverting the cap into an attack); and **currency**
+(a real scarce resource the platform already has, and useless here — POROS exists for a newcomer behind a
+censor who has no coins yet). What is left is a per-**invitee** credential, since the `community` string is
+shared by everyone told it.
 
 **POROS ingress lines do now rotate** — `Node::start` spawns `spawn_ingress_rotation` automatically for any
 node given `--role ingress --ingress-params FILE` (§3.5), landed after the receive half was built. Listed

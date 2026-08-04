@@ -691,6 +691,28 @@ struct PendingServe {
 ///
 /// Promotion is still possible at run time via [`PorosHost::set_admitted`] — the cap is a per-epoch quantity
 /// that the trust graph re-mixes, so it must be replaceable without rebuilding the host.
+///
+/// ## The plane cannot supply the cap, and the reason is worth writing down
+///
+/// The tempting derivation, because it needs no new subsystem: a requester's coordinate is
+/// `MapToPoint(VRF(sk, id ‖ epoch ‖ beacon))`, so the distinct coordinates *any* adversary can present in one
+/// epoch are a subset of the plane's `q² + q + 1` points — a bound **independent of how many identities it
+/// creates**, which is exactly what the PoW cannot give. Serve each coordinate once per epoch and the
+/// per-epoch harvest is `(q² + q + 1) · INGRESS_BUCKET`, a constant in the identity count.
+///
+/// It does not work, and it inverts into an attack. **A coordinate is not a per-identity resource** — it is a
+/// shared address, and a cell holds only `≈ q` nodes before coordinates start colliding
+/// ([[coordinate-collision-capacity-bound]]). So an adversary that occupies all `q² + q + 1` points — 7 on
+/// the Fano base cell — does not exhaust a quota of its own; it locks **every honest requester in the
+/// community** out for the rest of the epoch, at a cost of 7 proofs of work. The quota would have to be
+/// loose enough to admit the many honest identities sharing each point, at which point it is a per-point
+/// rate-limiter and not a cap at all.
+///
+/// The scarce resource has to be per-*identity*. The design authority names the two that are
+/// (`docs/design-anonymity-substrate.md` §6): a fast-mixing trust graph, or a credential system — and the
+/// credential must be per-**invitee**, because POROS's `community` byte-string is shared by everyone who was
+/// told it, so knowing it caps nothing. That is task #76's real content and it is a subsystem, not a wiring
+/// change.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Sybil {
     /// No cap: the PoW rate-limiter alone. Every requester that clears the work is served.
