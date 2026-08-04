@@ -506,11 +506,26 @@ different parties with different exposures, and conflating them overstates what 
 
 Closing it needs per-epoch **key blinding**: a public derivation of an epoch verification key from a stable
 one, so the combiner verifies a signature under a key it can check against the tag while learning nothing that
-persists. Tor v3 does exactly this with ed25519. **ML-DSA offers no standard blinding operation**, which is
-the research gate — not an implementation gap — and inventing one unaudited would be worse than the leak. The
-alternative shapes worth evaluating are a committed chain of per-epoch verification keys with a
-membership proof, and an anonymous-credential presentation; both cost a proof per registration, which is a
-real budget question against a fixed-width onion.
+persists. Tor v3 does exactly this with ed25519.
+
+**The gap is field-wide, not FANOS's** — and that changes what the right response is. A frontier audit of the
+2018–2026 signature literature (`docs/reference-solutions.md` §4) establishes that **no audited lattice
+signature scheme supports public key blinding**. The nearest construction is CSI-Otter (*CRYPTO 2023*), which
+is isogeny-based and would import a **second post-quantum hardness family** into a system that currently rests
+on one. So this is not work FANOS has failed to do; it is a hole in the literature, and the honest positions
+are three:
+
+1. **Wait and track.** Lattice blinding is active research. Adopt when something is audited, and carry the
+   leak in the meantime with it written down — which is what this section is for.
+2. **Accept a second hardness family.** Import CSI-Otter for this one purpose and pay for the assumption
+   diversity in review surface, code, and the argument that two families are not worse than one.
+3. **Restructure so blinding is not needed.** A committed chain of per-epoch verification keys with a
+   membership proof, or an anonymous-credential presentation. Both cost a proof per registration, which is a
+   real budget question against a fixed-width onion, and both are more machinery than the leak they remove.
+
+Worth stating alongside: the hybrid KEM and signature *construction* is separately **best-known** — FANOS's
+KEM combiner independently matches the leading IETF draft (X-Wing). The gap here is precise and isolated, not
+a general weakness in the cryptographic choices, and it should not be re-litigated as one.
 
 **The Sybil gate is load-bearing, and must be anchored correctly.** Mahdian's `Ω(t)` floor binds POROS too:
 anyone admitted who can *compute* coordinates can block them at the same `t·log` rate — so **keeping `t` small is
