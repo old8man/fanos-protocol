@@ -114,7 +114,37 @@ coordinates and does not need to join, so there is no circularity — the cell c
 with no joiner present, and only then publish its bootstrap seeds. Each half is cheap, and each covers the
 other's residual.
 
-## 5. The cost, honestly
+## 5. Where the cost actually is — corrected after attempting it
+
+The derivation costs nothing; **the seam does**, and the first shape I tried was wrong in a way worth
+recording, because it is the shape anyone would try first.
+
+The genesis seed is needed at exactly two places, and they must agree or a node's own seat and its peers'
+verification of that seat diverge:
+
+* `driver.rs`, where a node computes its own genesis coordinate
+  (`verifiable_coordinate_ranked(creds, Epoch::ZERO, &GENESIS)`);
+* `BeaconWindow::genesis()`, the window against which *peers'* epoch-0 claims are checked.
+
+Both sit in `fanos-quic`, the transport, which does not know what a `VssCommitment` is — that is
+`fanos-vrf`'s, held in `fanos-node`'s config. So the value has to enter through the spawn call.
+
+**The tempting shortcut is to hang it on `NodeCredentials`**, which is already threaded to both sites, and it
+is wrong twice. `NodeCredentials` derives `Wire` and is *persisted* — the identity file on disk — so a field
+there changes a stored format for every existing node. And it is the wrong home semantically: the seed is
+per-**network** state, while credentials are per-**node** and are exactly the thing that should be able to
+exist independently of any particular network.
+
+So the correct shape is a **transport parameter**: the spawn family takes the network's genesis seed, and
+`fanos-node` supplies `H(label ‖ commitment)` from the config it already holds. That is additive — a
+`None` keeps `BeaconSeed::GENESIS`, which is the right answer for a deployment with no beacon (§6) — but it
+touches the spawn family, which currently has **16 external call sites**.
+
+That is a bounded, mechanical refactor rather than a design question. It is called out here so the estimate is
+honest: the derivation is one function, the wiring is an afternoon, and hurrying the wiring is how a
+half-applied security change happens.
+
+## 6. The operator-visible cost
 
 One real consequence, and it is a *correction* rather than a regression: **`fanos id` becomes
 network-specific.** Today it prints a coordinate computed from the credentials alone, and that coordinate is
@@ -128,7 +158,7 @@ changes a command's signature and the runbook's step 2, so it is a deliberate br
 Three call sites compute the genesis coordinate for display (`bin/fanos.rs`), plus the live path through
 `spawn_self_certifying_persistent_over`, where the commitment is already in hand.
 
-## 6. What would have to be true for this to be wrong
+## 7. What would have to be true for this to be wrong
 
 * If a deployment genuinely has no beacon — no commitment at all — this has nothing to hash and must fall back
   to the constant. Such a deployment has no epoch clock and no reshuffle either, so it has no placement
@@ -138,7 +168,7 @@ Three call sites compute the genesis coordinate for display (`bin/fanos.rs`), pl
   Nothing in the current design publishes it, but a directory or explorer that did would silently undo half of
   this.
 
-## 7. Recommendation
+## 8. Recommendation
 
 Adopt the derived genesis seed, and record the runbook step. Do **not** rely on admission proof-of-work for
 this window — §2 shows it does not apply — though admission remains correct and valuable for what it does
