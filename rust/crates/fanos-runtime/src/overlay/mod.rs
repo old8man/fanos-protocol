@@ -69,14 +69,81 @@ pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 pub(crate) const BEHAVIOR_WINDOW: usize = 8;
 
 /// Homeostatic **decoupling** control (audit C6). `Decouple` must actually lower the cell's integration,
-/// not merely notify: the node carries a mutable shed factor in `[0, DECOUPLE_MAX]` that scales its
-/// effective correlation down, and that reduced correlation feeds `phi_equicorrelated` — so each
-/// over-coupled round genuinely restores headroom, and the reflexive loop lowers `Φ` (spec §2.7/§6.5).
-/// Over-coupling raises the factor by `DECOUPLE_STEP` per round (capped); once back in band it decays by
-/// `DECOUPLE_DECAY` toward zero (re-integration).
-pub(crate) const DECOUPLE_STEP: f64 = 0.25;
-pub(crate) const DECOUPLE_MAX: f64 = 0.6;
-pub(crate) const DECOUPLE_DECAY: f64 = 0.5;
+/// not merely notify: the node carries a mutable shed factor that scales its effective correlation down,
+/// and that reduced correlation feeds `phi_equicorrelated` — so each over-coupled round genuinely restores
+/// headroom, and the reflexive loop lowers `Φ` (spec §2.7/§6.5).
+///
+/// # The shed is the homeostat's own law, and it used to be a constant
+///
+/// `Homeostat::control` computes `effort = κ(r − hi)/hi` — proportional to the over-excursion, and
+/// documented as gradient descent on `V = ‖Γ − ρ*‖²`, which is what makes the closed loop inherit the T-104
+/// contraction. That value had **exactly one production consumer and it discarded it**: actuation ran on a
+/// different path (`plan_healing` → `HealingAction::Decouple`) and added a fixed `0.25`.
+///
+/// The constant was not merely unjustified, it was wrong by a factor of three for the shipped cell. The shed
+/// scales the *configured baseline* `healthy_correlation = 0.45`, and the collective-subject band at `N = 7`
+/// is `(1/√6, √(2/6)] = (0.4082, 0.5774]`, so the largest shed that keeps the cell a collective subject is
+/// `1 − 0.4082/0.45 ≈ 0.093`. One step of `0.25` modelled the correlation at `0.3375` — **below the floor**,
+/// classifying the cell as `Aggregate`, whose homeostatic answer is `Bind`: the opposite action, reachable in
+/// a single round. The proportional law cannot do that, and says so at its own definition ("never negative,
+/// so it cannot push `r` below the band").
+///
+/// So there is no step constant any more. [`decouple_ceiling`] is the cap, derived below.
+pub(crate) const DECOUPLE_DECAY: f64 = decouple_decay();
+
+/// The largest shed that still leaves the cell a **collective subject**, for a cell of `n` live nodes at
+/// baseline correlation `healthy`.
+///
+/// The shed must not push the modelled correlation below `lo = 1/√(n−1)`, because that converts an
+/// over-coupled cell into an *aggregate* (`Φ < 1`) — the opposite failure, and the one `Bind` exists to
+/// answer. From `healthy·(1 − d) ≥ lo`:
+///
+/// ```text
+/// d_max = 1 − lo/healthy = 1 − 1 / (healthy·√(n−1))
+/// ```
+///
+/// **It depends on the plane, which is why it cannot be a constant.** At `n = 7` and `healthy = 0.45` the
+/// budget is `0.093`; the retired `DECOUPLE_MAX = 0.6` was six and a half times that, and fixed on every
+/// plane — the same shape as `MIX_THRESHOLD` pinned at 2 (E7).
+///
+/// **Half the budget, and the half is a stated policy rather than a derivation.** `d_max` is a *supremum*:
+/// `classify_collective` reads `r ≤ lo` as `Aggregate`, so spending the whole budget lands exactly on the
+/// boundary and is classified as the failure it was avoiding. A controller must not drive its variable onto
+/// the boundary it is defined against — the band is itself a threshold on a *measured* quantity, so arriving
+/// at it means arriving inside its error. Half leaves a symmetric margin; anything in `(0, 1)` would satisfy
+/// the argument, and this says so rather than implying 0.5 was derived.
+///
+/// Clamped to `[0, 1)`: a baseline already at or below the floor admits no shed at all, which is the honest
+/// answer rather than a negative one.
+pub(crate) fn decouple_ceiling(n: usize, healthy: f64) -> f64 {
+    if n < 2 || healthy <= 0.0 {
+        return 0.0;
+    }
+    // The floor comes from DIAKRISIS rather than being re-derived here, so a change to the band moves this
+    // ceiling with it instead of leaving two copies of `1/√(n−1)` to drift.
+    let lo = fanos_diakrisis::coherence::systemic_correlation(n);
+    (1.0 - lo / healthy).clamp(0.0, 1.0) * DECOUPLE_MARGIN
+}
+
+/// The fraction of the shed budget a single control loop may spend — see [`decouple_ceiling`].
+///
+/// A **policy**, declared as one. Any value in `(0, 1)` satisfies "do not drive onto the boundary"; a half
+/// leaves a symmetric margin between the modelled correlation and the classification edge it must stay
+/// inside.
+const DECOUPLE_MARGIN: f64 = 0.5;
+
+
+/// The per-round re-integration factor: **half-life of one detection dwell**.
+///
+/// Derived rather than chosen. The loop must not un-shed faster than it can observe the effect of a shed, or
+/// an intermittent cause produces a limit cycle — the standard anti-chatter condition. Detection takes
+/// [`DECOUPLE_DWELL`] consecutive diagnoses, so the decay's half-life is set equal to it:
+/// `DECAY = 2^(−1/DWELL)`. The retired `0.5` was a half-life of **one round**, three times faster than the
+/// loop can decide anything.
+const fn decouple_decay() -> f64 {
+    // `2^(-1/3)`, written out because `powf` is not `const`. Checked against the formula in the tests.
+    0.793_700_525_984_099_7
+}
 /// Hysteresis dwell for the over-coupling shed (audit #122). The measured `Γ_net` must read over-coupled
 /// for this many *consecutive* self-driven diagnoses before `Decouple` actuates. Diagnosis now runs every
 /// heartbeat (not a one-shot injected command), so a single transient over-threshold reading — e.g. a
@@ -2196,6 +2263,23 @@ mod tests {
                 < 1e-12
         );
 
+        // **The shed must leave the cell a COLLECTIVE SUBJECT (#91).** This is the property the retired
+        // constants got wrong: `DECOUPLE_STEP = 0.25` against a baseline of 0.45 modelled the correlation at
+        // 0.3375, below the `1/√6 ≈ 0.4082` floor — so a single over-coupling response classified the cell
+        // as `Aggregate`, whose homeostatic answer is `Bind`, the opposite action. Asserted against the band
+        // rather than against a cap, because the band is what the value has to respect.
+        let alive = node.healer.decoupling; // keep the shed visible in the failure message
+        let eff = node
+            .healer
+            .effective_correlation(Config::default().healthy_correlation);
+        let floor = fanos_diakrisis::coherence::systemic_correlation(7);
+        assert!(
+            eff > floor,
+            "the shed dropped the modelled correlation to {eff:.4} against the collective-subject floor \
+             {floor:.4} (shed factor {alive:.4}) — an over-coupling response must not turn the cell into an \
+             aggregate, which is the failure `Bind` exists to answer"
+        );
+
         // Dedup holds under an explicit diagnose too: it keeps shedding but does NOT re-fire.
         let d2 = node.step(Instant(t), Input::Command(Command::Diagnose));
         assert!(
@@ -2813,6 +2897,55 @@ mod tests {
             node.store.entries.contains_key(&content_digest),
             "content is not swept — it never declared a lifetime, and saying nothing means saying content. \
              Reclaiming by AGE instead would have discarded this and kept the corpse beside it.",
+        );
+    }
+
+    /// **The shed ceiling is a function of the plane, and this is what the retired constant got wrong.**
+    ///
+    /// `DECOUPLE_MAX = 0.6` was fixed on every plane while the budget it approximates moves with `n` through
+    /// the collective-subject floor `1/√(n−1)`. On the shipped Fano cell it was six and a half times the
+    /// whole budget.
+    #[test]
+    fn the_shed_ceiling_tracks_the_plane_and_leaves_the_cell_a_collective_subject() {
+        const HEALTHY: f64 = 0.45;
+        for n in [7usize, 21, 57, 993] {
+            let d = decouple_ceiling(n, HEALTHY);
+            let modelled = HEALTHY * (1.0 - d);
+            let floor = fanos_diakrisis::coherence::systemic_correlation(n);
+            assert!(
+                modelled > floor,
+                "n={n}: a full shed models r={modelled:.4} against the floor {floor:.4} — an over-coupling \
+                 response must never classify the cell as an aggregate"
+            );
+            assert!(d > 0.0, "n={n}: a cell whose baseline is inside the band must be able to shed at all");
+        }
+
+        // It really does move with the plane: a larger cell has a lower floor and therefore more room.
+        assert!(
+            decouple_ceiling(993, HEALTHY) > decouple_ceiling(7, HEALTHY),
+            "the budget grows as the floor 1/√(n−1) falls — which is why one constant cannot serve every plane"
+        );
+
+        // A baseline at or below the floor admits no shed, rather than a negative one.
+        assert!(
+            decouple_ceiling(7, 0.40) <= f64::EPSILON,
+            "a baseline below the floor has no budget to spend"
+        );
+        assert!(
+            decouple_ceiling(1, HEALTHY) <= f64::EPSILON,
+            "a degenerate cell has no correlation window"
+        );
+    }
+
+    /// The re-integration factor is the dwell's half-life, not a round's.
+    #[test]
+    fn the_decay_half_life_is_one_detection_dwell() {
+        // After DWELL rounds of decay, exactly half the shed remains: the loop cannot un-shed faster than it
+        // can decide to shed, which is the anti-chatter condition. The retired 0.5 halved every round.
+        let after_dwell = DECOUPLE_DECAY.powi(i32::try_from(DECOUPLE_DWELL).expect("small dwell"));
+        assert!(
+            (after_dwell - 0.5).abs() < 1e-9,
+            "DECAY^DWELL must be 1/2 (half-life = one dwell), got {after_dwell}"
         );
     }
 }

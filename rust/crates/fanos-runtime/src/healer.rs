@@ -10,7 +10,7 @@
 //! index-addressed geometry take `<F>` per call.
 
 use crate::overlay::{
-    BEHAVIOR_WINDOW, Config, DECOUPLE_DECAY, DECOUPLE_DWELL, DECOUPLE_MAX, DECOUPLE_STEP, ENDPOINT_MIN_STALE,
+    BEHAVIOR_WINDOW, Config, DECOUPLE_DECAY, DECOUPLE_DWELL, ENDPOINT_MIN_STALE, decouple_ceiling,
     ENDPOINT_WINDOW, PARTITION_DWELL, QUARANTINE_TTL, polar_gap_from_liveness,
 };
 use crate::ports::{Duration, Effect, Instant, Notification};
@@ -661,7 +661,26 @@ impl Healer {
             // hysteresis above; `apply_healing_plan` raises the mutable decoupling state and dedups the
             // notification (audit C6/#122). Crash/Byzantine actions in the plan are never gated.
             let decouple_ready = self.overcoupling_streak >= DECOUPLE_DWELL;
-            effects.extend(self.apply_healing_plan::<F>(now, &plan, decouple_ready));
+            // **The shed comes from the homeostat, which is where the law is.** `control` returns a
+            // `Decouple { effort }` proportional to the over-excursion; every other band contributes no
+            // shed. Read here, before actuation, so the effort actuates in the round it was computed for
+            // rather than the next one — the two paths used to be a round apart *and* the effort was thrown
+            // away entirely (#91).
+            let shed = measured.as_ref().map_or(0.0, |coherence| {
+                let m = coherence.measures();
+                match self.homeostat.control(m.purity, coherence.mean_correlation(), coherence.n()) {
+                    BandControl::Decouple { effort } => effort,
+                    _ => 0.0,
+                }
+            });
+            effects.extend(self.apply_healing_plan::<F>(
+                now,
+                &plan,
+                decouple_ready,
+                shed,
+                alive_count,
+                config.healthy_correlation,
+            ));
 
             // The homeostat covers the bands the Systemic verdict does not: **re-integration** once the
             // measured `Γ_net` is back in (or below) the band (Bind/Hold — decay the shed), and
@@ -681,7 +700,9 @@ impl Healer {
                         }
                     }
                     BandControl::Decouple { .. } => {
-                        // Actuated via the verdict→plan path above; only clear the escalation latch.
+                        // Actuated via the verdict→plan path above, which now reads this same control's
+                        // `effort` before acting (#91) — so the law and the actuation are one decision
+                        // rather than two that disagreed. Only the escalation latch is cleared here.
                         self.escalated_coherence = false;
                     }
                     band @ (BandControl::Bind { .. } | BandControl::Hold) => {
@@ -729,11 +750,16 @@ impl Healer {
 
     /// Apply a [`HealingPlan`], mutating the reroute / repaired / quarantine state and emitting a
     /// notification for each *new* corrective action (idempotent across repeated rounds).
+    /// `shed` is the homeostat's proportional effort for this round and `(alive, healthy)` the cell size and
+    /// baseline correlation the shed ceiling is derived from — see the `Decouple` arm.
     pub(crate) fn apply_healing_plan<F: Field>(
         &mut self,
         now: Instant,
         plan: &fanos_diakrisis::HealingPlan,
         decouple_ready: bool,
+        shed: f64,
+        alive: usize,
+        healthy: f64,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         for action in &plan.actions {
@@ -761,10 +787,19 @@ impl Healer {
                 HealingAction::Decouple => {
                     // Real correlation-shedding (audit C6), gated by the dwell hysteresis (#122): only once
                     // over-coupling has held for DECOUPLE_DWELL consecutive diagnoses do we raise the
-                    // mutable decoupling factor (capped), lowering the effective correlation feeding `Φ`
-                    // next round. Notify once on *entering* the shed regime (dedup), not each round.
+                    // mutable decoupling factor, lowering the effective correlation feeding `Φ` next round.
+                    // Notify once on *entering* the shed regime (dedup), not each round.
+                    //
+                    // **The step is the homeostat's own proportional law, not a constant (#91).**
+                    // `Homeostat::control` computes `effort = κ(r − hi)/hi` — gradient descent on
+                    // `V = ‖Γ − ρ*‖²`, which is what makes the closed loop inherit the T-104 contraction —
+                    // and this actuator used to discard it and add a fixed 0.25. That was wrong by a factor
+                    // of three for the shipped cell: one such step modelled `r` at 0.3375 against a
+                    // collective-subject floor of 0.4082, so a single over-coupling response flipped the
+                    // cell's self-model into the *under*-coupled band, whose answer is `Bind`.
                     if decouple_ready {
-                        self.decoupling = (self.decoupling + DECOUPLE_STEP).min(DECOUPLE_MAX);
+                        let ceiling = decouple_ceiling(alive, healthy);
+                        self.decoupling = (self.decoupling + shed).min(ceiling);
                         if !self.decoupled {
                             self.decoupled = true;
                             effects.push(Effect::Notify(Notification::Decoupled));
