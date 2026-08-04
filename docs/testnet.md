@@ -522,35 +522,53 @@ any binary depends on it (`crates/fanos-node/Cargo.toml` has no such dependency;
 `fanos-dromos` do). Whatever ERGON's execution model proves on paper, no process this testnet runs
 constructs or serializes one.
 
-**A hole-punch that fails has never been exercised against a real NAT.** Direct hole-punch initiation is
-now wired (`docs/deployment.md` §5), but every test of it runs over loopback or a simulated fabric, neither
-of which can produce a punch that genuinely fails the way a symmetric NAT does — which is the exact case
-the relay fallback exists for. On home connections, whether that fallback actually engages when it needs to
-is untested. No harness for it exists yet.
+**A punch that fails is now exercised — against a modelled NAT, not a real one (2026-08-04).**
+`crates/fanos-quic/tests/real_nat.rs` supplies a `quinn::AsyncUdpSocket` modelling both RFC 4787 axes —
+mapping (cone vs symmetric) and filtering — through the same `Fabric::Abstract` seam the simulator uses, so
+real QUIC, real TLS and the real driver run above a carrier that can genuinely *refuse* the punch. The
+symmetric-NAT case, the one the relay fallback exists for, had never run before it.
 
-**A hidden service's reachability across a live epoch turn is unmeasured.** `fanos host`
-(`spawn_rendezvous_host`) does follow the beacon and re-registers at each new meeting line as epochs
-advance — it is not pinned. But every anonymous end-to-end test in the tree pins a fixed epoch instead of
-turning one under a running host and then dialing (`crates/fanos-node/tests/anonymous_quic.rs` uses
-`Epoch::new(4)`, `Epoch::new(5)`, and `Epoch::ZERO` as constants throughout, including in the one test that
-exercises the full `spawn_rendezvous_host` driver). A client and a host derive their meeting line from
-`(epoch, beacon)` independently, so if either computes it a moment before the other during a turn, whether
-the old registration covers that window is unverified. If a hidden service on this testnet goes briefly
-unreachable once per `epoch_period` (default 600 s), that is this gap, not a bug report waiting to happen —
-it just hasn't been measured either way.
+The residual, stated honestly: it is still an in-memory model, not real OS NAT/firewall filters, so a
+home-connection deployment remains the untested case. It was worth what it cost regardless — it found a
+live defect the loopback tests structurally could not, on its first honest run: after a failed punch the
+hub's brokered (permanently unreachable) address stayed in the directory, so **every subsequent frame paid
+a full `DIAL_TIMEOUT` QUIC handshake** before falling back to the relay that was always going to carry it,
+and each failure was reported to the morph auto-fallback breaker as if the transport were censored. Fixed
+in the same change; `docs/audit.md` has the derivation.
+
+**A hidden service across a live epoch turn: the mechanism is proven, the end-to-end run is not.** The
+failure mode here is real and was found by measurement — an earlier retirement fix made every hidden service
+unreachable once per `epoch_period` by retiring registrations at the instant the epoch turned. That is
+closed at the engine: a registration outlives its epoch by `HOST_GRACE_EPOCHS = 1`
+(`rendezvous_relay.rs`), the host keeps `MAX_REPLY_KEYS = 1 + HOST_GRACE_EPOCHS` reply keys to match, and
+`fanos-cli/tests/skew_windows.rs` fails if either drifts from the other — it asserts the *expression*, not
+the value.
+
+What is still not run is the whole path across a turn: every anonymous end-to-end test in the tree pins a
+fixed epoch (`crates/fanos-node/tests/anonymous_quic.rs` uses `Epoch::new(4)`, `Epoch::new(5)`,
+`Epoch::ZERO`) rather than turning one under a running host and then dialing. Client and host derive their
+meeting line from `(epoch, beacon)` independently, so the grace window is the thing that covers a skew
+between them — and the window is now derived and unit-tested, but the composition of host + client + relay
+across a live `BeaconReady` is not.
 
 **POROS ingress lines do now rotate** — `Node::start` spawns `spawn_ingress_rotation` automatically for any
 node given `--role ingress --ingress-params FILE` (§3.5), landed after the receive half was built. Listed
 here only because earlier notes described ingress as non-rotating, and that's now stale.
 
-**Two CLI sharp edges worth knowing before they cost you an hour:**
+**One CLI sharp edge left, and two that were fixed:**
 
-* `fanos <verb> --help` does not print that verb's usage. Only bare `fanos help` (or no arguments) does —
-  the dispatch table checks for `help`/`--help`/`-h` at the *top level* only. `fanos node --help` silently
-  starts a real node, with `--help` treated as an unrecognized, ignored argument (verified by running it).
-* `--service`, `--exit` and `--ingress-params` have no config-file key — see §3.4's callout — and
-  `--ingress-params` alone silently does nothing without `--role ingress` alongside it, while every other
-  parameterized role (`service`, `exit`) auto-enables its own role flag — see §3.5.
+* Still true: `fanos <verb> --help` prints the **top-level** help, not that verb's own usage. There is no
+  per-verb usage text; the flags for each verb are in the one listing.
+* Fixed (2026-08-04): `--help` or `-h` anywhere in the argument list now prints help and exits
+  (`bin/fanos.rs`). Before that the dispatch table checked only the *first* argument, so `fanos node
+  --help` silently started a real node with `--help` treated as an unrecognized, ignored argument — found
+  by running it, which is also how it was confirmed fixed.
+* Fixed (2026-08-04): `--ingress-params FILE` now implies `--role ingress`, as `--service` and `--exit`
+  already implied theirs. Handing a node a community's dealt descriptor share *is* the operator asking it
+  to serve that community; a flag whose effect depends on a second flag being remembered is a flag that
+  will be absent in production. It used to parse the file and then compose no ingress host at all.
+* Still true: `--service`, `--exit` and `--ingress-params` have no config-file key — see §3.4's callout —
+  so a supervised unit needs them on its `ExecStart=` line.
 
 ---
 
