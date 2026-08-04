@@ -670,7 +670,7 @@ async fn assign_epoch<F: Field>(
     // below stay short enough to converge while keeping its duty cycle bounded.
     let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
         build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),
-        build_cell_setpoint::<F>(client, epoch, capacity)
+        build_cell_setpoint::<F>(client, epoch, capacity, vrf.then_some(*beacon))
     );
     let setpoint = setpoint_to_track(setpoint, load_complete, live.demand(), Demand::supply(&members));
     let roles = live.step(&members, epoch, beacon, setpoint);
@@ -731,7 +731,7 @@ pub fn spawn_self_organization<F: Field>(
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller, prover } = config;
     let (capability_publisher, capability_ready) =
         spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability, prover.clone());
-    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source);
+    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source, prover.clone());
     let (role_loop, assigned) =
         spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, prover.is_some());
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
