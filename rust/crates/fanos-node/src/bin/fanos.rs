@@ -78,6 +78,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
         Some("authority-key") => cmd_authority_key(args.get(2..).unwrap_or(&[])),
         Some("ingress-deal") => cmd_ingress_deal(args.get(2..).unwrap_or(&[])),
+        Some("service-deal") => cmd_service_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
         Some("resolve") => cmd_resolve(args.get(2..).unwrap_or(&[])).await,
         Some("help" | "--help" | "-h") | None => {
@@ -2195,6 +2196,83 @@ fn store_status(state_dir: Option<&Path>) -> String {
     }
 }
 
+/// `fanos service-deal <coord>... [--out DIR] [--threshold T]`: assemble a **threshold-hosted service line**
+/// and write one provisioning file per member.
+///
+/// **Every other role had a dealer and this one had instructions**, which is why it is here. A service line's
+/// members hold *independent* keys rather than shares of one split secret, so assembling one is simpler than
+/// the beacon or ingress ceremony — and it was therefore left entirely manual: each of the `M` operators ran
+/// `openssl rand -hex 32`, reported a coordinate, and hand-copied the same roster and threshold into their own
+/// file.
+///
+/// The failure mode that makes this worth a tool is not the seeds, it is the **roster**. A line whose members
+/// disagree by one coordinate cannot reconstruct, and it says nothing when it fails to: a client's intro is
+/// sealed to a set of members, and a member that thinks the line is different simply contributes a share for
+/// the wrong position. Dealing all `M` files from one list makes the disagreement impossible by construction,
+/// which is the whole of what a ceremony buys — and the same reason `beacon-deal` writes every anchor file
+/// rather than telling seven operators to agree on a commitment.
+///
+/// The seeds are still independent, one per member and never shared, so this holds no secret after it exits:
+/// unlike the beacon, there is no split secret for a dealer to know. Each file is written mode 0600 (#82).
+fn cmd_service_deal(args: &[String]) -> Result<(), NodeError> {
+    let usage = || {
+        NodeError::Config(
+            "usage: fanos service-deal <x:y:z>... [--out DIR] [--threshold T]".to_owned(),
+        )
+    };
+    let line: Vec<fanos_geometry::Triple> = args
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .map(|a| parse_line_coord(a))
+        .collect::<Result<_, _>>()?;
+    if line.is_empty() {
+        return Err(usage());
+    }
+    let out = flag(args, "--out").unwrap_or(".");
+    // The default is the plane's own mix threshold ⌈2(q+1)/3⌉ rather than a chosen number, for the reason
+    // that value exists: two corrupt members must not own a line however wide it grows. A `q+1`-member line
+    // therefore gets the same threshold every other line on this plane gets.
+    let threshold: usize = match flag(args, "--threshold") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
+        None => fanos_node::node::mix_threshold(line.len()),
+    };
+    if threshold < 2 || threshold > line.len() {
+        return Err(NodeError::Config(format!(
+            "the service threshold {threshold} must be in 2..={} (the line has {} members); a threshold of \
+             1 would let any single member serve the whole service alone, which is the property a threshold \
+             line exists to remove",
+            line.len(),
+            line.len(),
+        )));
+    }
+
+    for (i, coord) in line.iter().enumerate() {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+        let roster: Vec<String> =
+            line.iter().map(|[x, y, z]| format!("{x}:{y}:{z}")).collect();
+        let body = format!(
+            "seed = {}\nline = {}\nthreshold = {threshold}\n",
+            fanos_node::config::hex_encode(&seed),
+            roster.join(", "),
+        );
+        let [x, y, z] = *coord;
+        let path = format!("{out}/service-{}.conf", i + 1);
+        write_dealt(&path, body, true)?;
+        println!("  ↳ for the member at {x}:{y}:{z}");
+    }
+    println!(
+        "dealt a {threshold}-of-{} service line; run each member with `fanos node --service service-<i>.conf` \
+         (the flag implies the role, and `service = PATH` is a config key)",
+        line.len()
+    );
+    println!(
+        "every file carries the SAME roster and threshold — which is the point: a line whose members \
+         disagree by one coordinate cannot reconstruct, and says nothing when it fails to."
+    );
+    Ok(())
+}
+
 /// `fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64]`: deal a fresh 7-validator TAXIS cell (the base
 /// Fano cell) from OS entropy and write each validator's provisioning file (`validator-<i>.taxis`, `i = 0..6`)
 /// into `DIR` (default `.`). Run each with `fanos validator --config validator-<i>.taxis`. A single-operator
@@ -3053,6 +3131,9 @@ fn print_help_advanced() {
          \x20 fanos authority-key [--out FILE]\n\
          \x20             (generate THIS founder's recovery-authority key locally: the seed stays here, the\n\
          \x20              printed verifier goes to whoever deals the beacon)\n\
+         \x20 fanos service-deal x:y:z... [--out DIR] [--threshold T]\n\
+         \x20             (assemble a threshold-hosted service line: one file per member, all carrying the\n\
+         \x20              SAME roster — a line whose members disagree by one coordinate cannot reconstruct)\n\
          \x20 fanos ingress-deal COMMUNITY PEER... [--out DIR] [--threshold T] [--difficulty D] [--line C:C:C,...]\n\
          \x20                                     (deal a community's POROS ingress line; writes *.poros files)\n\
          \x20 fanos taxis-deal [--out DIR] [--epoch N] [--beacon HEX64] [--supply N]\n\

@@ -302,21 +302,28 @@ Omit `ports =` to relay any destination port — an open relay, opted into expli
 decision (traffic other people send leaves under this host's address, and complaints arrive here); the
 `fanos init` wizard prints the same warning if you take this role interactively.
 
-**Service** (threshold CALYPSO hosting) — **there is no `fanos service-deal` tool.** Unlike the beacon and
-ingress, a service line's members hold *independent* keys rather than shares of one split secret
-(`fanos-calypso`'s hosting doc: "the operator generates each member's seed"), so assembling one is simpler
-but entirely manual today:
+**Service** (threshold CALYPSO hosting) — `fanos service-deal` (2026-08-04):
 
-1. Pick `M` of the 7 founders to host one service line and agree a threshold `T` (`1 ≤ T ≤ M`).
-2. Each of the `M` independently runs `openssl rand -hex 32` for their own seed and reports their node's
-   coordinate (from `fanos id`, once they've generated an identity — §3.2).
-3. Each writes the **same** roster and threshold into their own file, differing only in `seed`:
-   ```
-   seed = <their own 64 hex chars>
-   line = 4:1:0, 2:3:0, 0:0:1
-   threshold = 2
-   ```
-4. `fanos node … --service service.params` (implies `--role service`).
+```sh
+fanos service-deal 4:1:0 2:3:0 0:0:1 --out ./ceremony/service
+#   → service-1.conf … service-3.conf, mode 0600, one per member in the order given
+```
+
+The threshold defaults to the plane's own `⌈2(q+1)/3⌉` — the value that exists so two corrupt members cannot
+own a line however wide it grows — and `--threshold T` overrides it. A threshold of 1, or one above the line,
+is refused: either inverts the property a threshold line exists to provide.
+
+Hand `service-<i>.conf` to the member at the *i*-th coordinate you listed, and run it with
+`fanos node --service service-<i>.conf` (the flag implies the role; `service = PATH` is also a config key,
+so a supervised unit can carry it).
+
+**What the tool is for, since the seeds are independent.** A service line's members hold independent keys
+rather than shares of one split secret, so this ceremony holds no secret after it exits and each operator
+could in principle draw their own seed — which is exactly why it was left manual. The failure worth
+preventing is not a weak seed, it is the **roster**: a line whose members disagree by one coordinate cannot
+reconstruct, and says nothing when it fails to. Dealing every file from one list makes that disagreement
+impossible by construction, which is the same reason `beacon-deal` writes all seven anchor files rather than
+asking seven operators to agree on a commitment.
 
 **Ingress** (POROS censorship-resistant bootstrap, `docs/design-anonymity-substrate.md` §6) — for a
 community that wants a moving-target set of entry peers a censored newcomer can bootstrap from without

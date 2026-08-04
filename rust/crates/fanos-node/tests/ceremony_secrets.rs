@@ -267,3 +267,76 @@ fn a_verifier_list_that_does_not_match_the_cell_is_refused() {
         "the refusal must name the mismatch it is about; got: {err}"
     );
 }
+
+/// **Every member's file must carry the SAME roster**, which is the only thing this ceremony exists to
+/// guarantee — the seeds are independent and each operator could have drawn their own.
+///
+/// A service line's members hold independent keys rather than shares of one split secret, so assembling one
+/// was left entirely manual: each operator ran `openssl rand -hex 32` and hand-copied the roster. The failure
+/// that makes a tool worth having is not a weak seed, it is a roster that differs by one coordinate between
+/// two members — a line that cannot reconstruct and says nothing when it fails to.
+#[test]
+fn the_service_ceremony_deals_one_roster_and_keeps_every_seed_apart() {
+    const SCRATCH: &str = "service";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    let produced =
+        deal(dir.path(), &["service-deal", "1:0:0", "0:1:0", "0:0:1", "--out", &path]);
+    assert_classified(
+        dir.path(),
+        &produced,
+        &["service-1.conf", "service-2.conf", "service-3.conf"],
+        &[],
+    );
+
+    let files: Vec<String> = (1..=3)
+        .map(|i| {
+            std::fs::read_to_string(dir.path().join(format!("service-{i}.conf"))).expect("member file")
+        })
+        .collect();
+
+    let roster_of = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| l.starts_with("line =") || l.starts_with("threshold ="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let first = roster_of(&files[0]);
+    assert!(!first.is_empty(), "a member file must name the line and the threshold");
+    for (i, text) in files.iter().enumerate() {
+        assert_eq!(
+            roster_of(text),
+            first,
+            "member {} disagrees about the line or the threshold — the one thing dealing all the files from \
+             a single list is supposed to make impossible",
+            i + 1
+        );
+    }
+
+    // And the seeds are independent, which is the other half: this dealer holds no secret after it exits,
+    // because there is no split secret for it to hold.
+    let seeds: std::collections::BTreeSet<&str> = files
+        .iter()
+        .filter_map(|t| t.lines().find(|l| l.starts_with("seed =")))
+        .collect();
+    assert_eq!(seeds.len(), 3, "every member must get its own seed, not a copy of one");
+}
+
+/// A one-member line, or a threshold of one, is refused: it inverts the claim a threshold line makes.
+#[test]
+fn a_service_line_that_one_member_could_serve_alone_is_refused() {
+    const SCRATCH: &str = "service-degenerate";
+    let dir = Scratch::new(SCRATCH);
+    let path = dir.path().to_string_lossy().into_owned();
+    for (what, args) in [
+        ("a threshold of one", vec!["service-deal", "1:0:0", "0:1:0", "--threshold", "1", "--out", &path]),
+        ("a threshold above the line", vec!["service-deal", "1:0:0", "--threshold", "2", "--out", &path]),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_fanos")).args(&args).output().expect("the fanos binary");
+        assert!(!out.status.success(), "{what} was dealt");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("threshold"),
+            "{what}: the refusal must name what it is about"
+        );
+    }
+}
