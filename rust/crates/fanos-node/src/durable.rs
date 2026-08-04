@@ -120,15 +120,27 @@ pub fn read_snapshot(state_dir: &Path) -> Option<Vec<u8>> {
 /// The `sync_all` before it is the other half: without it the rename can be durable while the bytes it points
 /// at are not, and the node comes back with a perfectly-named empty file.
 pub fn write_snapshot(state_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    let final_path = state_dir.join(STORE_FILE);
-    let tmp = state_dir.join(format!("{STORE_FILE}.tmp"));
+    write_bytes(&state_dir.join(STORE_FILE), bytes)
+}
+
+/// Write `bytes` to `path` atomically — the general form of [`write_snapshot`], for the other durable file a
+/// node keeps (a validator's certified chain state, #57).
+///
+/// Shared rather than copied because the two properties are the same and both are easy to lose: the rename
+/// is atomic so a reader never sees a half-written file, and the `sync_all` **before** it is what stops the
+/// rename being durable while the bytes it points at are not — the failure that returns a node with a
+/// perfectly-named empty file.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, &final_path)
+    std::fs::rename(&tmp, path)
 }
 
 /// Keep `state_dir`'s snapshot current for as long as the node runs.

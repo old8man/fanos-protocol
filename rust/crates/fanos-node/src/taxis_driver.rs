@@ -239,6 +239,45 @@ pub struct TaxisParams<S> {
     /// How to seal a detected equivocation into a submittable slash transaction, or `None` to only surface a
     /// [`TaxisEvent::Slashed`] without auto-submitting. Injected by the node (which holds the keyper registry).
     pub slash_sealer: Option<SlashSealer>,
+    /// Where to keep this validator's **certified executed state** across a restart, or `None` to keep
+    /// nothing (#57).
+    ///
+    /// One validator restarting was always survivable — it state-syncs from the cell. A **whole-cell**
+    /// restart was total, permanent loss of the chain, because no validator wrote anything down. With this
+    /// set, each one persists the checkpoint it could serve a peer, and the cell can re-seed itself from any
+    /// single survivor's disk.
+    ///
+    /// The file is adopted through [`Input::SyncResp`](fanos_taxis::consensus::Input::SyncResp), the same
+    /// path a peer's answer takes, so a tampered snapshot is refused by the quorum certificate rather than
+    /// trusted because it was local: **persistence adds no trust in the filesystem.**
+    pub state_dir: Option<std::path::PathBuf>,
+}
+
+/// The file a validator's certified executed state lives in, inside its state directory.
+pub const CHAIN_FILE: &str = "taxis.snapshot";
+
+/// `cert_len(u32-le) ‖ cert ‖ snapshot`, the two halves a `SyncResp` is made of.
+#[must_use]
+pub fn encode_chain_state(cert: &ExecCertificate, snapshot: &[u8]) -> Vec<u8> {
+    let cert = cert.to_bytes();
+    let mut out = Vec::with_capacity(4 + cert.len() + snapshot.len());
+    out.extend_from_slice(&u32::try_from(cert.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(&cert);
+    out.extend_from_slice(snapshot);
+    out
+}
+
+/// The inverse of [`encode_chain_state`]. `None` on anything this build did not write — and that is the
+/// **only** structural check made here, deliberately: the certificate's quorum, the head it binds, and the
+/// root the snapshot must restore to are all checked by the engine when the pair is fed back in, exactly as
+/// they are for a peer's answer. Duplicating any of it here would be a second, weaker copy of a check that
+/// already exists.
+#[must_use]
+pub fn decode_chain_state(bytes: &[u8]) -> Option<(ExecCertificate, Vec<u8>)> {
+    let (len, rest) = bytes.split_at_checked(4)?;
+    let len = u32::from_le_bytes(len.try_into().ok()?) as usize;
+    let (cert, snapshot) = rest.split_at_checked(len)?;
+    Some((ExecCertificate::from_bytes(cert)?, snapshot.to_vec()))
 }
 
 /// A node's **secret-leader sortition** registration (SSLE, spec §10.1) — its own post-quantum Merkle-VRF
@@ -442,6 +481,46 @@ where
         if let Some(s) = params.sortition {
             engine.enable_sortition(s.secret, s.roots, s.base);
         }
+
+        // **The previous run's certified state, adopted the way a peer's answer is (#57).** Before this, a
+        // whole-cell restart was total, permanent loss of the chain: one validator restarting state-syncs
+        // from its neighbours, but if every neighbour also started at genesis there was nothing to sync from.
+        //
+        // Fed through `Input::SyncResp` rather than installed directly, which is the whole design. The
+        // quorum certificate is verified, the head it binds is checked, and the snapshot must restore to the
+        // certified root — by the same code that refuses a forged answer on the wire. So a tampered file
+        // cannot fork this validator, and persistence adds **no trust in the filesystem**.
+        let chain_state = params.state_dir.as_deref().map(|dir| dir.join(CHAIN_FILE));
+        let mut persisted_height = 0u64;
+        if let Some(path) = &chain_state {
+            match std::fs::read(path).ok().as_deref().and_then(decode_chain_state) {
+                Some((cert, snapshot)) => {
+                    let height = cert.height;
+                    let before = engine.height();
+                    for _ in engine.step(Input::SyncResp { cert, snapshot }) {}
+                    if engine.height() > before {
+                        persisted_height = height;
+                        eprintln!(
+                            "fanos: adopted the certified chain state at height {height} from {}",
+                            path.display()
+                        );
+                    } else {
+                        // Refused by the quorum check, not by a parser. Said out loud because "started at
+                        // genesis with a file present" and "started at genesis with no file" are the same
+                        // silence otherwise, and only one of them is an attack.
+                        eprintln!(
+                            "fanos: REFUSED the chain state in {} — its certificate does not verify against \
+                             this cell's validator set; starting from genesis",
+                            path.display()
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "fanos: no chain state in {} — starting from genesis",
+                    path.display()
+                ),
+            }
+        }
         // How to auto-submit a caught equivocation as an on-chain slash (moved out of `params` before it is
         // otherwise consumed above). `None` on a driver that only surfaces the slash as an event.
         let slash_sealer = params.slash_sealer;
@@ -628,6 +707,28 @@ where
                 timed_out_this_height = false;
                 height_started = now;
                 timeout_deadline = now + round_timeout;
+            }
+
+            // **Persist the certified state when the checkpoint advances (#57).** Here rather than in a
+            // subscriber task, because the certificate and the snapshot it certifies must be taken
+            // *together*: a task that heard `Checkpointed` and then asked for the state would get one the
+            // engine had already advanced past, and the file would be refused on restore by the very root
+            // check that makes this safe.
+            //
+            // Paced by the checkpoint cadence, which needs no timer and no derived period: a checkpoint is
+            // exactly the moment a quorum has attested a state, so it is the only moment there is anything
+            // certified to write.
+            if let Some(path) = &chain_state
+                && last_ckpt.is_some_and(|h| h > persisted_height)
+                && let Some((cert, snapshot)) = engine.servable_sync()
+            {
+                let height = cert.height;
+                match crate::durable::write_bytes(path, &encode_chain_state(&cert, &snapshot)) {
+                    Ok(()) => persisted_height = height,
+                    // Retried at the next checkpoint rather than fatal: a full disk should cost this
+                    // validator its restart-resilience, not its participation in consensus.
+                    Err(e) => eprintln!("fanos: could not persist the chain state to {}: {e}", path.display()),
+                }
             }
         }
     });

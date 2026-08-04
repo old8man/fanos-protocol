@@ -1549,6 +1549,23 @@ impl<S: StateMachine> ConsensusEngine<S> {
         Vec::new()
     }
 
+    /// The quorum-certified state this validator could hand a peer right now: the current checkpoint and the
+    /// snapshot it certifies, or `None` when the two are not both in hand.
+    ///
+    /// Exists so a **disk** can be served the same thing a peer is (#57). Persisting `(cert, snapshot)` and
+    /// feeding it back through [`Input::SyncResp`](crate::consensus::Input::SyncResp) at startup means a file
+    /// is adopted by exactly the checks that adopt a peer's answer — quorum verified, head bound, root
+    /// re-derived from the restored state. A tampered snapshot is refused by the same `cert.verify` that
+    /// refuses a forged one on the wire, so persistence adds **no trust in the filesystem**: the disk is just
+    /// a peer that happens to be local.
+    #[must_use]
+    pub fn servable_sync(&self) -> Option<(ExecCertificate, Vec<u8>)> {
+        let cert = self.checkpoint.clone()?;
+        let (root, _head) = *self.sync_heads.get(&cert.height)?;
+        let snapshot = self.sync_states.get(&root)?.clone();
+        Some((cert, snapshot))
+    }
+
     /// Serve a catch-up request: if we hold a checkpoint STRICTLY newer than the requester's height and the
     /// certified state's snapshot, send it point-to-point to the authenticated requester `from` (never a
     /// broadcast, and never to a spoofable field — `from` is the real transport source). A Byzantine requester

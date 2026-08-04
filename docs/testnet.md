@@ -647,10 +647,20 @@ hundred times stricter costs a period only ~2.5× shorter.
 
 What remains:
 
-* **The chain is still memory-only.** `fanos-taxis` touches no filesystem. One validator restarting re-syncs
-  from a cert-verified snapshot, so this is the anticipated case and it works; a whole-cell restart is still
-  total, permanent loss of the ledger. For a testnet exercising connectivity and consensus that may be
-  acceptable; for anything holding balances it is not.
+* **The chain survives too, as of 2026-08-04.** A validator persists the `(ExecCertificate, snapshot)` pair
+  it could serve a peer, into `taxis.snapshot` in the same `--data` directory, and at startup feeds it back
+  through the **same `Input::SyncResp` path a peer's answer takes**. So the quorum certificate is verified,
+  the head it binds is checked, and the snapshot must restore to the certified root — by the code that
+  already refuses a forged answer on the wire. **Persistence adds no trust in the filesystem**: a tampered
+  file cannot fork a validator, it is refused and the validator starts clean, saying so.
+
+  The cadence needs no timer: a checkpoint is exactly the moment a quorum has attested a state, so it is the
+  only moment there is anything certified to write. A whole-cell restart re-seeds from any single survivor's
+  disk.
+
+  What is lost is the blocks between the last checkpoint and the crash — the cell resumes from the certified
+  height, not from the tip. That is the same bound state-sync already has and is the reason a checkpoint
+  exists.
 * **A cell that restarts entirely inside one snapshot period still loses the writes in that window** — the
   `ε` above is the size of that risk, and it is a number rather than a hope.
 

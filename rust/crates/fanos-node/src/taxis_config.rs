@@ -104,8 +104,12 @@ pub struct ValidatorConfig {
 impl ValidatorConfig {
     /// Rebuild the [`TaxisParams`] `spawn_taxis` consumes, running on the genesis ledger this config's
     /// allocation defines. `None` if a stored verifier is malformed.
+    ///
+    /// `state_dir` is where this validator keeps its certified executed state across a restart (#57) —
+    /// `None` keeps nothing, which is what a test or an ephemeral validator means. A node passes its
+    /// configured state directory, so a whole-cell restart can re-seed from any single survivor's disk.
     #[must_use]
-    pub fn to_taxis_params(&self) -> Option<TaxisParams<HybridLedger>> {
+    pub fn to_taxis_params(&self, state_dir: Option<std::path::PathBuf>) -> Option<TaxisParams<HybridLedger>> {
         let verifiers = self
             .verifiers
             .iter()
@@ -128,6 +132,7 @@ impl ValidatorConfig {
             reward_per_block: 0,
             sortition: None,
             slash_sealer,
+            state_dir,
         })
     }
 
@@ -386,7 +391,7 @@ mod tests {
         // The params rebuild for every validator, seating each at its own index over a shared genesis whose
         // token balances match the allocation — so every validator starts from the identical funded state.
         for c in &configs {
-            let params = c.to_taxis_params().expect("params rebuild");
+            let params = c.to_taxis_params(None).expect("params rebuild");
             assert_eq!(params.me, c.me);
             assert_eq!(params.verifiers.len(), cell.n());
             assert_eq!(params.keyper_commit, shared.keyper_commit);
@@ -421,7 +426,7 @@ mod tests {
             &[([1u8; 32], 1_000u64)],
             &mut SeedRng::from_seed(b"sealer-test"),
         );
-        let params = configs[0].to_taxis_params().expect("dealt params rebuild");
+        let params = configs[0].to_taxis_params(None).expect("dealt params rebuild");
         let sealer = params.slash_sealer.expect("a dealt validator has a slash sealer");
 
         // Validator 2 equivocates: two conflicting Commit votes signed by its own consensus key.

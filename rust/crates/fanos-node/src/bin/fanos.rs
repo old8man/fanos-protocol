@@ -2671,8 +2671,10 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     .map_err(|e| NodeError::Config(format!("could not start the validator node: {e:?}")))?;
 
     // Run the consensus engine over the DROMOS hybrid ledger. The handle owns the driver tasks; keep it alive.
+    // The validator keeps its certified executed state here, so a whole-cell restart can re-seed from any
+    // single survivor's disk (#57). `--data` names it, exactly as it names the store's.
     let params = config
-        .to_taxis_params()
+        .to_taxis_params(Some(data_dir_for(args)))
         .ok_or_else(|| NodeError::Config("the validator config carries a malformed verifier".to_owned()))?;
     let handle = spawn_taxis::<F2, HybridLedger>(node.client(), params);
     let mut events = handle.subscribe();

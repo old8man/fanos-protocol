@@ -145,6 +145,8 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
             reward_per_block: 0,
             sortition: None,
             slash_sealer: None,
+            // Ephemeral: a test cell keeps no chain state on disk (#57).
+            state_dir: None,
         };
         handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
     }
@@ -273,6 +275,8 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
             reward_per_block: 0,
             sortition: None,
             slash_sealer: None,
+            // Ephemeral: a test cell keeps no chain state on disk (#57).
+            state_dir: None,
         };
         handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
     }
@@ -374,6 +378,8 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
             reward_per_block: 0,
             sortition: None,
             slash_sealer: None,
+            // Ephemeral: a test cell keeps no chain state on disk (#57).
+            state_dir: None,
         };
         handles.push(spawn_taxis::<F2, HybridLedger>(cell.nodes[i].client(), params));
     }

@@ -124,6 +124,8 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
                 base: 0,
             }),
             slash_sealer: None,
+            // Ephemeral: a test cell keeps no chain state on disk (#57).
+            state_dir: None,
         };
         handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params));
     }
@@ -263,6 +265,8 @@ async fn a_validator_joining_late_reaches_the_cells_executed_state() {
         reward_per_block: 0,
         sortition: None,
         slash_sealer: None,
+        // Ephemeral: a test cell keeps no chain state on disk (#57).
+        state_dir: None,
     };
 
     // Only six drivers start. The seventh node exists on the overlay (so the cell is routable) but runs no
