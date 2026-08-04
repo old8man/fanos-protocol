@@ -2774,3 +2774,61 @@ Both guards are falsified independently: making `asked.insert(hub_coord)` uncond
 the reason can be a *property of the platform* — here, that a 7-point plane cannot hold three randomly-drawn
 nodes without collisions ([[coordinate-collision-capacity-bound]]). Any test that asserts two nodes are
 distinct must pin them, or it is asserting something about the birthday problem instead.
+
+---
+
+# Which spawns can a peer multiply, and which addresses does it get to name? (2026-08-04)
+
+Two questions asked of `fanos-quic`'s peer-facing surface, both mechanical, one of which found a live HIGH.
+
+## §1. [HIGH, FIXED] `PunchTo` aimed this node's handshakes wherever the sender liked (#78)
+
+`accept_holepunch` took `(peer, addr)` straight off the frame, wrote `directory.insert(peer, addr)`, and
+spawned a `get_or_connect` to that address — consulting neither the sender nor any bound. Any established
+peer (and `f` of them are tolerated by construction) could therefore point this node's QUIC Initials at any
+address it named, as often as it liked.
+
+**The harm is outward first.** A fleet of FANOS nodes becomes a reflector aimed at a third party who never
+joined anything, which is why the test measures the property *at the victim* — an address on the modelled
+network owned by no node. Forty crafted frames from one admitted peer put **160 datagrams** on it, four per
+frame, scaling with what the attacker sent. Four now: one dial's worth, whatever the flood.
+
+Two lesser consequences travelled with it: unbounded concurrent spawned dials, each holding a task and a
+socket for up to `DIAL_TIMEOUT`; and a directory entry for any coordinate the sender chose — the HELLO
+identity check stops impersonation, but the poisoned entry still demotes a directly-reachable pair to relay.
+
+**Why it cannot be fixed by correlation.** A `PunchTo` is unsolicited on one side *by construction*: the hub
+tells both parties to dial, and the target never sent a `ConnectReq`. That asymmetry is the mechanism — each
+side's own outbound packet is what opens its mapping for the other's — so "act only on a punch I asked for"
+would break the side that did not ask. It has to be bounded instead:
+
+* the directory write moved *after* `get_or_connect` proves the dialed coordinate;
+* at most one outstanding punch dial **per coordinate**, held as a set of coordinates rather than a counter,
+  so the ceiling falls out of the address space (`q² + q + 1` points) instead of being asserted by a
+  constant. A repeat is dropped, not queued — a punch is a timing operation, and one held until a slot frees
+  has already missed the simultaneous open.
+
+**The asymmetry worth naming:** the *broker* side was disciplined and said so — "we broker only what we can
+attribute" — while the *accept* side had no matching rule. And one frame along, `#50` had already hardened
+the neighbouring address-write (`ObservedAddr`) behind a quorum, because a tolerated coalition could
+otherwise move a node's public address. `PunchTo` took one sender's word. Hardening a path and leaving its
+sibling open is [[canonical-addressee-family]] again.
+
+## §2. [Clean] Every other address the transport acts on is observed, not claimed
+
+The generalizing question — *which handlers act on an address that came off the wire?* — has exactly one
+other answer, and it is the right one. Both writers of the hub's `peer_addrs` table use
+`conn.remote_address()`, so a broker can only ever hand out an endpoint it personally observed; `ConnectReq`
+brokering reads from that table and never from the requester's frame; bootstrap seeds are operator-supplied.
+`peer_addrs` is keyed by `Triple`, so it is bounded by the plane.
+
+Recorded as a negative result because it is the load-bearing half: the fix above is only sufficient if
+`PunchTo` really was the only claimed-address path, and it was.
+
+## §3. [Clean] The spawn sweep
+
+`tokio::spawn` on the peer-facing path, asked as *what can a peer multiply?* — the accept loop is bounded by
+a global semaphore plus a per-source cap (audit C3), the observed-address side-channel is one task per
+established connection, the timer task is one per engine-armed timer and the engines' pending maps are
+count-bounded, and the send worker is one per peer coordinate. `PunchTo` was the only spawn a single frame
+could trigger without limit.
