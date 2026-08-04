@@ -49,6 +49,18 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: &[String]) -> Result<(), NodeError> {
+    // **`--help` anywhere means help, and this guard is why.** The dispatch below matches `--help` only in
+    // verb position, so `fanos node --help` fell through to `cmd_node`, which ignores flags it does not know
+    // — and *launched a real node*, binding a port and joining a cell. An operator asking what a command does
+    // got a running daemon instead of an answer, which is the one response a help request must never produce.
+    //
+    // Checked here rather than in each verb: uniform by construction, and a new verb inherits it instead of
+    // having to remember. It runs before any argument is parsed, so a malformed command still explains itself
+    // rather than failing on the first bad flag.
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
     match args.get(1).map(String::as_str) {
         Some("node") => cmd_node(args.get(2..).unwrap_or(&[])).await,
         Some("proxy") => cmd_proxy(args.get(2..).unwrap_or(&[])).await,
@@ -212,6 +224,12 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         // set with `fanos ingress-deal`, and hand each member exactly one file.
         config.ingress =
             Some(fanos_node::config::IngressParams::from_config_str(&std::fs::read_to_string(path)?)?);
+        // **And imply the role, as `--service` and `--exit` do.** Without this the flag was accepted, the
+        // file parsed, and the node then composed no ingress host — a silent no-op unless the operator also
+        // passed `--role ingress`. Handing a node a community's dealt descriptor share IS the operator
+        // asking it to serve that community; there is no other reason to provision one, and a flag whose
+        // effect depends on a second flag being remembered is a flag that will be absent in production.
+        config.roles.ingress = true;
     }
     Ok(config)
 }
@@ -2902,5 +2920,43 @@ mod tests {
         assert_eq!(decode_hex(""), Some(Vec::new()));
         assert!(decode_hex("abc").is_none(), "odd length rejected");
         assert!(decode_hex("zz").is_none(), "non-hex rejected");
+    }
+
+    #[test]
+    fn ingress_params_provisions_the_ingress_role_like_every_sibling_flag() {
+        // **A flag whose effect depended on a second flag being remembered.** `--service` and `--exit` both
+        // imply their own role; `--ingress-params` did not, so it parsed the file, stored the parameters, and
+        // then composed no ingress host at all unless the operator also wrote `--role ingress`. A silent
+        // no-op: no error, no warning, a node that looks provisioned for a community and admits nobody.
+        //
+        // Handing a node a community's dealt descriptor share IS asking it to serve that community — there is
+        // no other reason to provision one — so the implication is not a convenience, it is what the flag
+        // means.
+        let path = std::env::temp_dir().join(format!("fanos-ing-{}.poros", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                "threshold = 2\ndifficulty = 4\ncommunity = {}\nshare = {}\nbinding = {}\n\
+                 kem_seed = {}\nmember = 1:0:0\nmember = 0:1:0\nmember = 0:0:1\n",
+                "cd".repeat(16),
+                // x = 1, then a short y — the codec takes the first byte as the index.
+                "01".to_owned() + &"ef".repeat(8),
+                // A binding with the dealing commitment and no per-share commitments (the rotated form).
+                "ab".repeat(32) + "00000000",
+                "12".repeat(32),
+            ),
+        )
+        .unwrap();
+
+        let args = vec!["--ingress-params".to_owned(), path.to_string_lossy().into_owned()];
+        let config = node_config_from_args(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(config.ingress.is_some(), "the file was read");
+        assert!(
+            config.roles.ingress,
+            "and the role it implies is set — otherwise the node stores the parameters and hosts nothing, \
+             which is exactly what `--service` and `--exit` avoid by implying theirs",
+        );
     }
 }

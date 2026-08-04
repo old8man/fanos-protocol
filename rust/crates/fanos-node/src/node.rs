@@ -57,7 +57,7 @@ fn ingress_params(config: &NodeConfig) -> Result<Option<IngressParams>, NodeErro
         NodeError::Config(
             "the ingress role hosts a member of a POROS ingress line and needs ingress parameters (the \
              community secret, this node's dealt descriptor share, the dealing's public binding, the line \
-             roster and its threshold) — run `fanos ingress deal` to produce them"
+             roster and its threshold) — run `fanos ingress-deal` to produce them"
                 .to_owned(),
         )
     })?;

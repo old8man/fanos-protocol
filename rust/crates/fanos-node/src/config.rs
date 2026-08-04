@@ -268,7 +268,7 @@ impl fmt::Debug for ServiceParams {
 /// §6): the community it serves, its own dealt descriptor share, and the dealing's public bindings.
 ///
 /// Provisioned out-of-band by a **ceremony**, exactly like the beacon share and the service line: an operator
-/// runs `fanos ingress deal` once over the community's entry peers, which threshold-shards the descriptor across
+/// runs `fanos ingress-deal` once over the community's entry peers, which threshold-shards the descriptor across
 /// the line and emits one file per member plus the public binding every member and every combiner is configured
 /// with. The share is secret; the binding is not.
 ///
@@ -298,7 +298,7 @@ pub struct IngressParams {
 }
 
 impl IngressParams {
-    /// Render as the `key = value` provisioning file `fanos ingress deal` writes and `fanos node` reads.
+    /// Render as the `key = value` provisioning file `fanos ingress-deal` writes and `fanos node` reads.
     ///
     /// Everything but `community`, `share` and `kem_seed` is public; those three are why the file is secret.
     /// The binding travels **in the same file as the share** on purpose: they are only correct as a pair (a
