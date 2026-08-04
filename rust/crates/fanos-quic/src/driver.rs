@@ -541,6 +541,15 @@ enum Control {
         digest: [u8; 32],
         reply: oneshot::Sender<()>,
     },
+    /// A request for the engine's durable state.
+    ///
+    /// Correlated by **arrival order** rather than by a digest, because a snapshot has no key: exactly one
+    /// `Notification::Snapshot` answers each `Command::Snapshot`, in order, so the front of the queue is the
+    /// asker. There is no fan-out at all — see the router's arm for why that matters.
+    Snapshot {
+        /// Where the durable bytes go.
+        reply: oneshot::Sender<Vec<u8>>,
+    },
 }
 
 /// A cloneable, correlated client for a node. Many tasks share it to issue content-addressed
@@ -611,6 +620,25 @@ impl Client {
         }
     }
 
+    /// This node's **durable state** as canonical bytes — what a persister writes to disk, and `None` if the
+    /// node stopped or did not answer in time.
+    ///
+    /// Not a subscription. The answer goes to this caller alone, because a snapshot is the whole store and
+    /// broadcasting it would clone it once per subscriber (see the router's `Notification::Snapshot` arm).
+    pub async fn snapshot(&self) -> Option<Vec<u8>> {
+        let (reply, rx) = oneshot::channel();
+        if self.ctrl_tx.send(Control::Snapshot { reply }).is_err() {
+            return None;
+        }
+        if self.input_tx.try_send(Input::Command(Command::Snapshot)).is_err() {
+            return None;
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(bytes)) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// Store `value` under `key`, awaiting the responsible node's acknowledgement. `false` if the
     /// node stopped before acking.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
@@ -673,6 +701,14 @@ async fn router_loop(
 ) {
     let mut gets: GetWaiters = HashMap::new();
     let mut puts: PutWaiters = HashMap::new();
+    // Snapshot askers, in the order they asked, each stamped so the sweep below can drop it.
+    //
+    // **Stamped for the same reason the maps are, and it is not symmetry for its own sake.** A registration
+    // whose `Input` never reaches the engine — `try_send` on a full channel — leaves an asker in this queue
+    // that no answer will ever match. Order-correlated means the *next* answer goes to that orphan instead
+    // of to whoever earned it: one dropped input silently mis-delivers every snapshot after it. The sweep
+    // and the `is_closed` check on the way out make an orphan cost nothing beyond its own request.
+    let mut snapshots: VecDeque<(std::time::Instant, oneshot::Sender<Vec<u8>>)> = VecDeque::new();
     // Periodic waiter-map eviction (audit C1): a `get` is self-cleaning (the engine always concludes a
     // `Retrieved` via read-repair exhaustion), but a `put` to a node that never `Ack`s never resolves — so
     // sweep both maps, dropping any waiter whose receiver the client already abandoned (`is_closed`, the
@@ -682,7 +718,32 @@ async fn router_loop(
     let mut sweep = tokio::time::interval(REQUEST_TIMEOUT);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // **`biased`, and it is the correctness of every `get`/`put` rather than a preference.** A client
+        // registers its waiter on `ctrl_rx` and *then* sends the input that makes the engine answer, so the
+        // registration is always enqueued strictly first. An unbiased `select!` polls its branches in random
+        // order, so whenever this task was busy while both arrived it could take the answer first, find no
+        // waiter, drop it — and resolve the registration that arrived next iteration never. The client then
+        // waited out `REQUEST_TIMEOUT` and reported a **failure for a write that had succeeded**.
+        //
+        // Measured at ~2 failures in 12 runs of the FFI round-trip, with a probe that fired on exactly the
+        // failing runs (#83). Every directory publisher writes through `put_ephemeral`, so the same race told
+        // nodes their own capability/load/onion-key publishes had failed; `get` has the identical shape and
+        // could report a stored value absent.
+        //
+        // Biasing toward `ctrl_rx` restores the order the design already assumed. It cannot starve
+        // notifications: a control message is one client call, is `O(1)` to record, and every client that
+        // sends one then waits.
         tokio::select! {
+            biased;
+            ctrl = ctrl_rx.recv() => {
+                let Some(ctrl) = ctrl else { break };
+                let now = std::time::Instant::now();
+                match ctrl {
+                    Control::Get { digest, reply } => gets.entry(digest).or_default().push((now, reply)),
+                    Control::Put { digest, reply } => puts.entry(digest).or_default().push((now, reply)),
+                    Control::Snapshot { reply } => snapshots.push_back((now, reply)),
+                }
+            }
             note = notify_rx.recv() => {
                 let Some(note) = note else { break };
                 match &note {
@@ -708,23 +769,36 @@ async fn router_loop(
                             }
                         }
                     }
+                    // **Delivered to the one asker and never broadcast, and that is a memory bound rather
+                    // than tidiness.** A snapshot is the whole store — up to `MAX_STORE_ENTRIES ×
+                    // MAX_VALUE_LEN` — and `events_tx.send` hands a *clone* to every subscriber. A running
+                    // node keeps eight or so (the mix and exit publishers, the role loop, the beacon
+                    // tracker, the recovery watcher…), so fanning it out would allocate the entire store
+                    // once per subscriber every snapshot period, from a store any peer can fill. It is a
+                    // reply, not an event; nothing subscribes to it because nothing should.
+                    Notification::Snapshot(_) => {
+                        let Notification::Snapshot(bytes) = note else { unreachable!() };
+                        // Skip askers that have already given up, so an abandoned request cannot consume the
+                        // answer a live one is waiting for.
+                        while let Some((_, tx)) = snapshots.pop_front() {
+                            if !tx.is_closed() {
+                                let _ = tx.send(bytes);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     _ => {}
                 }
                 // Fan every notification out to subscribers (Err only if no receivers — ignored).
                 let _ = events_tx.send(note);
             }
-            ctrl = ctrl_rx.recv() => {
-                let Some(ctrl) = ctrl else { break };
-                let now = std::time::Instant::now();
-                match ctrl {
-                    Control::Get { digest, reply } => gets.entry(digest).or_default().push((now, reply)),
-                    Control::Put { digest, reply } => puts.entry(digest).or_default().push((now, reply)),
-                }
-            }
             _ = sweep.tick() => {
                 let now = std::time::Instant::now();
                 evict_stale(&mut gets, now);
                 evict_stale(&mut puts, now);
+                snapshots
+                    .retain(|(at, tx)| !tx.is_closed() && now.duration_since(*at) < REQUEST_TIMEOUT);
             }
         }
     }
