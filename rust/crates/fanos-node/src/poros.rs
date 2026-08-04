@@ -230,8 +230,17 @@ pub enum Recovery {
 /// plane the budget is `⌊(q+1)/3⌋ > 1`, and the answer there is **not** a deeper search but the per-share
 /// commitments in [`DescriptorBinding`], which reject a forged share at arrival in `O(1)` each and never
 /// interpolate at all. The residual is a line that has already *rotated* (per-share commitments are stale
-/// after resharing) and holds more than one corrupt share: it fails safe as [`Recovery::Unrecoverable`],
-/// and verified resharing is the follow-on that closes it.
+/// after resharing) and holds more than one corrupt share: it fails safe as [`Recovery::Unrecoverable`].
+///
+/// **And the follow-on is not verified secret sharing — it is this same search, moved to where it is
+/// affordable.** The amplification argument above is about the *per-request* path and nothing else. A
+/// post-rotation round is per-epoch: a new line can reconstruct once among themselves against the descriptor
+/// commitment (which survives rotation, since resharing preserves the secret), and on a match every member's
+/// rotated share is provably on the committed polynomial — so each can publish `H(dealing ‖ x ‖ y_new)` and
+/// the line has per-share commitments again for the whole epoch, at the cost of one round. On a mismatch the
+/// `C(n, t)` subset search *is* affordable there, bounded by the roster rather than by traffic, and it
+/// attributes the member so the rotation can retry from a different old subset. No new primitive, no
+/// per-share proof the fixed-width onion could not carry.
 #[must_use]
 pub fn recover(shares: &[Share], threshold: usize, commitment: &[u8; 32]) -> Recovery {
     let held: Vec<&Share> = {
