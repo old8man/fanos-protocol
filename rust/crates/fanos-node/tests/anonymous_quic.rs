@@ -9,6 +9,10 @@
 //! directions). The full session works because the client and service pace their retransmits to the
 //! mixnet's effective round trip (a hop is a multi-round threshold gather), rather than the Direct
 //! profile's base tick — otherwise the onion flood saturates the per-hop gathers.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(
     clippy::unwrap_used,
@@ -211,7 +215,7 @@ fn signing_half(kem: &HybridKemPublic, seed: &[u8]) -> (HybridSigSecret, Vec<u8>
     (signer, bundle)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     common::require_quiet_host("whether an onion reaches the meeting line");
     let _serial = serial();
@@ -266,7 +270,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_anonymous_session_completes_over_real_quic() {
     common::require_quiet_host("whether a full anonymous session completes");
     let _serial = serial();
@@ -398,7 +402,7 @@ async fn spawn_composite(
     (handle, onion_public)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     common::require_quiet_host("whether an anonymous session completes over a cell of composites");
     let _serial = serial();
@@ -858,7 +862,7 @@ impl OffCombiner {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     common::require_quiet_host("whether a service hosted off its combiner is reached by forwarding");
     let _serial = serial();
@@ -874,7 +878,7 @@ async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "diagnostic sweep: several fixtures, minutes — run explicitly with --ignored"]
 async fn reachability_does_not_depend_on_which_node_is_the_client() {
     /// The pinned host: any non-combiner point, since the plane is point-transitive.
@@ -916,7 +920,7 @@ async fn reachability_does_not_depend_on_which_node_is_the_client() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "diagnostic sweep: ~7 fixtures, minutes — run explicitly with --ignored"]
 async fn every_legitimate_host_placement_is_reachable() {
     let _serial = serial();
@@ -959,7 +963,7 @@ async fn every_legitimate_host_placement_is_reachable() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_service_survives_one_meeting_point_going_silent() {
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
@@ -1032,7 +1036,7 @@ async fn the_service_survives_one_meeting_point_going_silent() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "autopsy: reproduces the wedge and interrogates the cell — run explicitly with --ignored"]
 async fn probe_a_wedged_session_reports_where_it_stopped() {
     let _serial = serial();
@@ -1116,7 +1120,7 @@ async fn probe_a_wedged_session_reports_where_it_stopped() {
     println!("PASS: 12/12 dials landed on an idle host (cpu share {share:.2}) — no wedge{report}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "statistical experiment: 24 real-QUIC dials, minutes — run explicitly with --ignored"]
 async fn hedging_holds_the_arrival_rate_when_a_meeting_point_is_silent() {
     const ATTEMPTS: usize = 12;
@@ -1180,7 +1184,7 @@ async fn hedging_holds_the_arrival_rate_when_a_meeting_point_is_silent() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     common::require_quiet_host("whether the host driver serves a dialer");
     let _serial = serial();

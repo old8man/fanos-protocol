@@ -9,6 +9,10 @@
 //! (`HybridLedger` as the TAXIS `StateMachine`), and `fanos-node::spawn_taxis` (the live consensus driver over
 //! `fanos-quic`). The genesis mints one shielded note to Alice; the transfer spends it to Bob; the assertion is
 //! that all seven nodes' shielded pools converge to "Alice's note spent, Bob's note created".
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -112,7 +116,7 @@ fn genesis_ledger() -> HybridLedger {
     ledger
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time — see `common::serial_cell`
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
@@ -242,7 +246,7 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
 /// anywhere. That validator ingests it into its mempool and gossips it once to the rest of the cell, so every
 /// validator's mempool converges and the transfer executes. This proves the shipped chain accepts client
 /// transactions over the wire (the network ingress + gossip), not just via a test's in-process injection.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_whole_cell() {
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time — see `common::serial_cell`
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");
@@ -335,7 +339,7 @@ fn htlc_genesis_ledger(sender: &[u8; 32]) -> HybridLedger {
 /// and the **claim** must release exactly that value to the recipient against the preimage. Submitted the
 /// same way its sibling above is — one ingress point, one validator, sealed to the keyper line — so the
 /// contract has to reach every mempool by gossip rather than by seven direct submissions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble the QUIC cell");

@@ -8,6 +8,10 @@
 //! certificates, real concurrency. Because the Fano plane is fully connected (any two points share a
 //! line), each node derives all six others as peers at construction — so a freshly assembled cell
 //! replicates and read-repairs with no discovery walk.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -24,7 +28,7 @@ fn make_node(coord: Point<F2>) -> Box<dyn Engine + Send> {
 }
 
 /// The grind seats each of the seven nodes on a distinct Fano point — the cell is fully populated.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_fano_cell_assembles_at_the_seven_points() {
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
     assert_eq!(cell.nodes.len(), 7, "a Fano cell has seven points");
@@ -51,7 +55,7 @@ async fn full_fano_cell_assembles_at_the_seven_points() {
 
 /// A value stored at one node is read back at a **different** node — content-addressed routing,
 /// replication, and read-repair over real QUIC, not a loopback pair.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dht_put_on_one_node_is_read_by_another_across_the_cell() {
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
 
@@ -81,7 +85,7 @@ async fn dht_put_on_one_node_is_read_by_another_across_the_cell() {
 
 /// The value survives the loss of a node: a `Put` replicates to every member (LRC availability, spec
 /// §L4), so shutting one down still leaves every survivor able to serve the key.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stored_value_survives_losing_a_node() {
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
 
@@ -120,7 +124,7 @@ async fn a_stored_value_survives_losing_a_node() {
 /// plain-transfer block. That two-orders-of-magnitude gap is why every small-payload suite passed while the shielded one
 /// wedged, with validators holding their own dispersed shard and never obtaining a single one from a peer across 48 s of
 /// retries. Both sizes are asserted here so a regression says which one broke.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_app_frame_fans_out_to_every_cell_point() {
     use fanos_runtime::{Command, Notification};
 
@@ -181,7 +185,7 @@ async fn a_large_app_frame_fans_out_to_every_cell_point() {
 /// `Command::Emit` resolves the destination coordinate through the sender's own directory, so what each node knows is
 /// per-node state — and a missing entry drops the frame silently, with the sender's `command` still returning `true`.
 /// Consensus hides that: votes are broadcast, so a quorum forms while one pair never talks.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_ordered_pair_of_cell_points_can_deliver() {
     use fanos_runtime::{Command, Notification};
 

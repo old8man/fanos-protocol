@@ -10,6 +10,10 @@
 //! A single 1-of-1 beacon anchor exercises the full live chain — driver → `AdvanceEpoch` → partial →
 //! threshold round → `BeaconReady` — without a multi-node cell (an anchor self-buffers its own partial, so
 //! threshold 1 assembles immediately).
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::expect_used)]
 
@@ -21,7 +25,7 @@ use fanos_node::{BeaconParams, Node, NodeConfig};
 use fanos_runtime::Notification;
 use fanos_vrf::vss::{DeterministicRng, deal};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_live_epoch_clock_advances_the_beacon_across_epochs() {
     // A 1-of-1 beacon anchor: its own partial assembles the round.
     let (shares, commitment) =

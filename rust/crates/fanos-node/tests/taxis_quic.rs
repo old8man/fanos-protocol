@@ -8,6 +8,10 @@
 //! reveals, and executes it — every message crossing the real overlay as an App-overlay (`0x70`) frame — until
 //! every node's finalized ledger reflects the transfer. Divergent execution would show as a mismatched ledger,
 //! so agreement on the executed balances across all seven nodes is the end-to-end safety+liveness witness.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -80,7 +84,7 @@ fn vrf_seed(i: usize) -> [u8; 32] {
     s
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // A genuine seven-node Fano cell over mutual-TLS QUIC, membership established (routing by coordinate works).
@@ -226,7 +230,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
 /// ordinary following cannot close, and a first attempt at that (four transfers) hit something else entirely —
 /// the cell executed three of them and froze at height 20 with the fourth unexecuted, on a host that was
 /// demonstrably answering. That is its own thread, recorded rather than folded in here.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_validator_joining_late_reaches_the_cells_executed_state() {
     const LATE: usize = 6;
 

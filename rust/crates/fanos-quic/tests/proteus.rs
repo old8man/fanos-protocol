@@ -2,6 +2,10 @@
 //! community secret still deliver application traffic — the same `OverlayNode` engine, now behind
 //! a polymorph transport that carries no static FANOS signature (spec §13.2). The shaping lives
 //! entirely in the driver; the engine is byte-for-byte the one the simulator runs.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -74,13 +78,13 @@ async fn deliver_under(proteus: ProteusConfig) {
     assert_eq!(got, payload);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaped_nodes_deliver_over_a_polymorph_transport() {
     // The flagship codec: no static signature, no size/timing shaping (zero-cost default).
     deliver_under(ProteusConfig::polymorph(b"community-transport-secret".to_vec())).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaped_nodes_deliver_under_a_timing_and_size_morph() {
     // A shaping morph (TLS-tunnel profile): every data frame is padded up into the MTU band AND paced by an
     // exponential inter-packet delay. Delivery must still round-trip — size padding is transparent to decode
@@ -92,7 +96,7 @@ async fn shaped_nodes_deliver_under_a_timing_and_size_morph() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaped_nodes_deliver_under_a_pluggable_codec() {
     // The pluggable-transport SPI (§13.3): a custom `MorphCodec` fully replaces the built-in transform on the
     // wire, and two nodes running it still deliver application traffic end to end over a real socket.

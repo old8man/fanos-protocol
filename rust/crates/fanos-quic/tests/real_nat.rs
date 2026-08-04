@@ -52,6 +52,10 @@
 //!    and permanently unreachable — address on *every frame*, ahead of the relay that was always going to
 //!    carry it; the failures also fed `apply_outcome(false)` and so the morph auto-fallback breaker
 //!    (§13.7), which made an unreachable peer read as a censored transport.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
@@ -451,7 +455,7 @@ async fn settle(mut f: impl FnMut() -> u64, quiet: Duration, deadline: Duration)
 // Tests
 // =================================================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filtering_nat_lets_a_hole_punch_succeed() {
     let _serial = serial();
     // A rendezvous hub (open — see the module doc for why) plus two peers behind a "restricted cone" NAT:
@@ -504,7 +508,7 @@ async fn filtering_nat_lets_a_hole_punch_succeed() {
     h.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn symmetric_nat_defeats_the_punch_and_the_relay_carries_the_pair() {
     let _serial = serial();
     // The case that has never run: A and B behind a SYMMETRIC NAT (a fresh external mapping per distinct
@@ -573,7 +577,7 @@ async fn symmetric_nat_defeats_the_punch_and_the_relay_carries_the_pair() {
     h.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hub_that_cannot_broker_a_punch_is_asked_at_most_once() {
     let _serial = serial();
     // The derived bound in `peer_send_worker`'s `asked: BTreeSet<Triple>`: once a hub has been asked to
@@ -669,7 +673,7 @@ async fn a_hub_that_cannot_broker_a_punch_is_asked_at_most_once() {
 /// That is an outward harm before it is a local one: a fleet of FANOS nodes becomes a reflector pointed at
 /// someone who never joined anything. So the property under test is measured **at the victim**, not at the
 /// node — how much traffic arrives somewhere the attacker chose.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_of_punch_frames_cannot_aim_this_node_at_a_third_party() {
     use fanos_wire::{FrameType, encode_frame};
 

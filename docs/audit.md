@@ -3129,7 +3129,23 @@ C-ABI round trip, *because* `fanos-ffi` owns a real multi-thread runtime. The me
 the sharper version — on a current-thread runtime a bigger concurrent burst detects **less**, because the
 scheduler manufactures exactly the ordering the fix guarantees.
 
-Not changed in this pass, and the reason is method rather than effort: switching runtime flavor moves timing
-everywhere and will surface real defects and contention artefacts together, and this box was at load 120
-while the change would have had to be measured. Doing it under load would have produced verdicts of the kind
-this audit spent two sessions retracting.
+**Changed later the same day, once the box was quiet enough to measure.** Every integration test in
+`fanos-quic` and `fanos-node` now runs `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`.
+
+The worker count is measured, not chosen. Against the reverted #83 fix, on 256 concurrent writes:
+
+| workers | caught |
+|---|---|
+| current-thread | 0 of 8 |
+| 2 | 3 of 8 |
+| **4** | **8 of 8** |
+
+Two is not enough, which is worth knowing because two is the number that "real parallelism" suggests.
+
+It also made the suite **faster**, which was not the goal: `anonymous_quic` went from 60 s to 12.9 s, because
+a current-thread runtime was serializing real network I/O that has no reason to be serial.
+
+One test surfaced and was triaged rather than accepted: `a_validator_joining_late_reaches_the_cells_executed_state`
+reported INCONCLUSIVE at its 240 s ceiling in a parallel run and completes in **6 s** alone — a 40× spread, so
+contention, not a regression. Its own harness said so ("still changing at the ceiling, so this is latency
+rather than a wedge"), which is the budgeted-exchange machinery working as designed.

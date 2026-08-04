@@ -3,6 +3,10 @@
 //! dispatching both protocols off one shared dialer and shutting down cleanly — deterministically, without a
 //! QUIC node (the end-to-end FANOS session is covered by `diaulos_quic.rs`; the SOCKS/HTTP protocol itself by
 //! `fanos-proxy`'s own tests). Here the seam between them — `serve_proxy` — is what is under test.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::sync::Arc;
@@ -21,7 +25,7 @@ async fn socks_greet(client: &mut TcpStream) {
     assert_eq!(method, [5, 0], "server selects no-auth");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_proxy_tunnels_a_socks5_connect_through_one_shared_dialer() {
     let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = socks.local_addr().unwrap();
@@ -57,7 +61,7 @@ async fn serve_proxy_tunnels_a_socks5_connect_through_one_shared_dialer() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_proxy_tunnels_an_http_connect_on_the_second_listener() {
     let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();

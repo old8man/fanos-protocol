@@ -8,6 +8,10 @@
 //! because a quinn endpoint uses one socket for both accepting and dialing, the address the hub observes a
 //! peer at is exactly that peer's listener, so the punched dial reaches it (over loopback the NAT is
 //! absent, but the coordination mechanism exercised is identical to the deployed one).
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
@@ -66,7 +70,7 @@ async fn await_resolved(dir: &Directory, coord: Triple, secs: u64) -> bool {
     .is_ok()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hub_brokers_a_direct_hole_punched_connection() {
     let _serial = serial();
     // Three nodes, each on its OWN directory: A and B know only the hub H, never each other.
@@ -129,7 +133,7 @@ async fn a_hub_brokers_a_direct_hole_punched_connection() {
     h.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
     let _serial = serial();
     // Symmetric-NAT fallback: A and B can each reach a hub H but NOT each other. A's traffic to B is relayed
@@ -197,7 +201,7 @@ async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
     h.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relaying_peer_asks_its_hub_to_punch_instead_of_relaying_for_ever() {
     let _serial = serial();
     // **The wiring this file's first test never exercised.** `hole_punch` is a manual call, and until now it

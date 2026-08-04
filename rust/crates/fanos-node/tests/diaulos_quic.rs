@@ -6,6 +6,10 @@
 //! (the sim covers the same path deterministically). Cell members are placed at *distinct*
 //! coordinates: a node's point derives from its identity, so two fresh identities collide 1/7 of the
 //! time (F2), which would make the coordinate→node mapping ambiguous and break routing.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
@@ -32,7 +36,7 @@ type Coord = [u32; 3];
 /// Real-QUIC integration tests each bring up several nodes on loopback; running them concurrently
 /// overloads the transport and stalls handshakes/DHT lookups (a flaky hang, not a code fault). Every
 /// test blocks on this lock first, so the file's tests run one at a time. A blocking `std` mutex (not
-/// `tokio`'s) is deliberate: each `#[tokio::test]` is its own current-thread runtime, and a `tokio`
+/// `tokio`'s) is deliberate: each `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` is its own current-thread runtime, and a `tokio`
 /// mutex shared across runtimes can lose its cross-runtime wake and deadlock; a plain blocking lock at
 /// the top of each test (before any task is spawned) serializes them reliably.
 static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -81,7 +85,7 @@ fn warm(a: &Node, b: &Node) {
     });
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diaulos_request_response_over_quic() {
     let _serial = serial();
     let a = start(vec![]).await; // service
@@ -120,7 +124,7 @@ async fn diaulos_request_response_over_quic() {
     b.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diaulos_full_duplex_service_over_quic() {
     let _serial = serial();
     // The FULL-DUPLEX serve: a service whose handler **talks first** (an unsolicited banner) and then
@@ -181,7 +185,7 @@ async fn diaulos_full_duplex_service_over_quic() {
     b.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diaulos_serves_two_clients_concurrently() {
     let _serial = serial();
     // One service, two distinct clients — proving the multi-client accept loop (a session per client
@@ -229,7 +233,7 @@ async fn diaulos_serves_two_clients_concurrently() {
     c2.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fanos_dialer_reaches_a_service_by_name() {
     let _serial = serial();
     // The full SOCKS5→.fanos seam: a FanosDialer resolves a name to the service's coordinate + key
@@ -293,7 +297,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
 /// runs in 10, with the sender's write returning its full count and the session layer exonerated by 200 clean
 /// rounds over an in-process transport. This puts it under test without the FFI's two runtimes and accept queue,
 /// so a failure here is a streaming defect and a pass narrows it to those.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interactive_write_without_half_close_reaches_the_peer() {
     let _serial = common::serial_cell().await;
     let a = start(vec![]).await;
@@ -340,7 +344,7 @@ async fn an_interactive_write_without_half_close_reaches_the_peer() {
 ///
 /// This isolates the first from the second: the same queue-and-guard shape, entirely async on one runtime. A
 /// failure here indicts the indirection; a clean run leaves only the arrangement.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_accepted_stream_taken_from_a_queue_receives_an_interactive_write() {
     let _serial = common::serial_cell().await;
     let a = start(vec![]).await;

@@ -36,7 +36,8 @@ use fanos_runtime::{Config, OverlayNode};
 /// | 64, one burst, current-thread | 3 of 5 |
 /// | 512, one burst, current-thread | 0 of 8 |
 /// | 64, one burst, **multi-thread** | 6 of 8 |
-/// | **256, one burst, multi-thread** | **8 of 8** |
+/// | 256, one burst, multi-thread, **2 workers** | 3 of 8 |
+/// | **256, one burst, multi-thread, 4 workers** | **8 of 8** |
 ///
 /// Two things the table says that intuition did not. **Waves are worse than a burst**, because awaiting each
 /// wave leaves the router idle between them and an idle router wakes on the registration it was given first.

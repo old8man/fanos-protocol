@@ -3,6 +3,10 @@
 //! real coordinate proofs — not the pure-function unit tests in `fanos-quic/src/identity.rs` (which
 //! cover the version-mismatch path directly, since `PROTOCOL_VERSION` is a build-wide constant, not
 //! a per-node knob the public API exposes to construct a live version-mismatched peer).
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,7 +27,7 @@ async fn spawn_with(caps: Capabilities, dir: &Directory) -> NodeHandle {
         .expect("spawn")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overlapping_capability_sets_negotiate_and_deliver() {
     fanos_testkit::require_quiet_host("whether two peers negotiate a shared capability and deliver across it");
     // A minimal (CORE-only) node and a "full" node (CORE + every optional flag) — spec §7.4's own
@@ -54,7 +58,7 @@ async fn overlapping_capability_sets_negotiate_and_deliver() {
     assert_eq!(got, b"negotiated");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disjoint_capability_sets_abort_cleanly_without_delivering() {
     // Neither side advertises CORE, and their optional-only sets don't overlap either — an empty
     // intersection, the genuine incompatibility condition (spec §7.3: HELLO_SENT → CLOSED). The
@@ -77,7 +81,7 @@ async fn disjoint_capability_sets_abort_cleanly_without_delivering() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_way_capability_diversity_each_negotiates_its_own_true_intersection() {
     fanos_testkit::require_quiet_host("whether three peers each negotiate their own true intersection");
     // A minimal, a lite, and a full node — each pair negotiates a DIFFERENT intersection, proving

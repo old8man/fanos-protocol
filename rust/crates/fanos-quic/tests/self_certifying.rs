@@ -2,6 +2,10 @@
 //! `MapToPoint(H(cert))`; the mutual-TLS handshake proves the peer holds that certificate's key,
 //! so the peer's coordinate is *authenticated by the handshake* — no HELLO, no directory-trust for
 //! identity. An impostor at a resolved address (wrong cert → wrong coordinate) is rejected.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,7 +38,7 @@ async fn spawn_distinct(dir: &Directory, taken: &[Triple]) -> NodeHandle {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
     // A *delivery* assertion, so it is guarded. Its two siblings here are not, deliberately: an impostor
     // being rejected and a coordinate surviving a restart are structural, and a starved box cannot make
@@ -67,7 +71,7 @@ async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
     assert_eq!(from, a.address());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_impostor_at_the_resolved_address_is_rejected() {
     let dir = Directory::new();
     let a = spawn_distinct(&dir, &[]).await;
@@ -119,7 +123,7 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     let _ = c; // keep C alive for the duration
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_credentials_keep_the_same_coordinate_across_restarts() {
     // Mint an identity, persist it to bytes, and reload it (as an app would across a restart).
     let creds = NodeCredentials::generate().expect("generate credentials");

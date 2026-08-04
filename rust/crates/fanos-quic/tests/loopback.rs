@@ -1,6 +1,10 @@
 //! Real-QUIC loopback e2e: the *same* `OverlayNode` engine the simulator runs, driven here over a
 //! real UDP + TLS 1.3 socket. If these pass, the sans-I/O boundary holds — production transport
 //! and the deterministic simulator are two drivers of one engine.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -49,7 +53,7 @@ async fn await_delivery(node: &mut NodeHandle, want_from: Triple, secs: u64) -> 
     deadline.await.expect("delivery timed out")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn application_payload_delivers_over_real_quic() {
     let dir = Directory::new();
     let a = node(0, &dir, Config::default()).await;
@@ -64,7 +68,7 @@ async fn application_payload_delivers_over_real_quic() {
     assert_eq!(await_delivery(&mut b, a.address(), 5).await, payload);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delivery_is_bidirectional_and_reuses_the_connection() {
     // A→B establishes the connection; B→A must ride it back (connection reuse), not deadlock.
     let dir = Directory::new();
@@ -84,7 +88,7 @@ async fn delivery_is_bidirectional_and_reuses_the_connection() {
     assert_eq!(await_delivery(&mut a, b.address(), 5).await, b"pong-app");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_learns_its_public_address_only_once_the_fault_budget_agrees() {
     // NAT traversal #119, reflexive discovery: a node does not know the address remote peers reach it at.
     // A dials its peers; each, on accepting, reports back the source address it observes A arriving from (an
@@ -148,7 +152,7 @@ async fn a_node_learns_its_public_address_only_once_the_fault_budget_agrees() {
     drop(peers);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn heartbeat_keeps_a_live_peer_up_then_detects_its_death() {
     // Full liveness loop over QUIC: ping → pong keeps B alive; killing B makes A report it down.
     let dir = Directory::new();

@@ -7,6 +7,10 @@
 //! The relay is byte-transparent and fully interactive: the client here streams — writes then reads with
 //! no half-close, as an HTTPS-CONNECT tunnel would — which the DIAULOS session now supports (the
 //! flush-on-write fix in `fanos-session`/`fanos-diaulos`).
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::await_holding_lock)]
 
@@ -136,7 +140,7 @@ async fn exit_and_client() -> (Node, Node, StaticKeypair, SocketAddr) {
     (e, c, keypair, echo)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
     let _serial = serial();
     let (e, c, keypair, echo) = exit_and_client().await;
@@ -171,7 +175,7 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
     c.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_exit_policy_refuses_a_disallowed_port() {
     let _serial = serial();
     // The exit serves a web-only policy (80/443); the echo server is on an ephemeral port, so the exit must
@@ -221,7 +225,7 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
     c.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exit_advertises_itself_and_is_discovered() {
     let _serial = serial();
     // An exit node publishes its descriptor to the overlay store on startup; the live exit directory
@@ -269,7 +273,7 @@ async fn an_exit_advertises_itself_and_is_discovered() {
     node.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
     let _serial = serial();
     // The full proxy path: a `FanosDialer` configured with an exit dials a CLEARNET target (the echo
@@ -307,7 +311,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
     c.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_proxy_dialer_relays_udp_through_the_exit() {
     let _serial = serial();
     // The UDP counterpart of the clearnet path: a `FanosDialer` with an exit opens a datagram tunnel to a

@@ -7,6 +7,10 @@
 //! [`MixDirectory`] ([`build_cell_mix_directory`]) with no central directory and no hand-built map. The
 //! cell is genuine mutual-TLS QUIC (via [`fanos_quic::spawn_cell`]), the tier the deterministic simulator
 //! cannot cover: real sockets, real replication, real concurrency.
+//!
+//! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
+//! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured
+//! against the reverted fix for #83; the table is in `fanos-quic/tests/store_acks.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -61,7 +65,7 @@ async fn publish_until(client: &fanos_quic::Client, coord: [u32; 3], epoch: Epoc
 /// Seven relays each publish their genesis onion key; a client on a *different* node assembles the whole
 /// live cell directory from the store, and every discovered key is exactly the key that relay will peel
 /// with. A different epoch's directory is empty — the slots are epoch-tagged (forward secrecy, audit E4).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic() {
     // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
@@ -115,7 +119,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
 /// The directory is a **best-effort roster view**, not all-or-nothing: when only some relays have
 /// published for an epoch, the client discovers exactly those and the silent ones are simply absent — a
 /// down or not-yet-published relay degrades to a smaller mixnet, never a failed lookup.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
     // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
@@ -163,7 +167,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
 /// key with no further prompting, so a client that only ever calls [`build_cell_mix_directory`] finds a
 /// fully populated, live directory. (Beacon-driven republish is proven deterministically by the
 /// `EpochDriver` unit tests; here we confirm the async task publishes over real QUIC.)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_publisher_task_keeps_each_relays_key_live() {
     // One whole-cell fixture at a time: three tests in this file each stand up a seven-node QUIC cell, so
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
