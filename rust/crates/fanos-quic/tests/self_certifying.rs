@@ -36,6 +36,10 @@ async fn spawn_distinct(dir: &Directory, taken: &[Triple]) -> NodeHandle {
 
 #[tokio::test]
 async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
+    // A *delivery* assertion, so it is guarded. Its two siblings here are not, deliberately: an impostor
+    // being rejected and a coordinate surviving a restart are structural, and a starved box cannot make
+    // either of them wrongly pass — guarding them would weaken a test for no reason.
+    fanos_testkit::require_quiet_host("whether a cert-bound identity delivers and authenticates its sender");
     let dir = Directory::new();
     // A and B sit at their cert-derived coordinates (none was assigned), at distinct points.
     let a = spawn_distinct(&dir, &[]).await;

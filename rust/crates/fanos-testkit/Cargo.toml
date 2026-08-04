@@ -1,0 +1,10 @@
+[package]
+name = "fanos-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Instruments shared by FANOS test harnesses: how loaded the host is, and when not to conclude."
+
+[lints]
+workspace = true

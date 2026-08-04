@@ -38,6 +38,7 @@ members = [
     "crates/fanos-session",
     "crates/fanos-rendezvous",
     "crates/fanos-node",
+    "crates/fanos-testkit",
     "crates/fanos-ffi",
     "crates/fanos-vpn",
     "crates/fanos-proxy",

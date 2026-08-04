@@ -25,6 +25,7 @@ async fn spawn_with(caps: Capabilities, dir: &Directory) -> NodeHandle {
 
 #[tokio::test]
 async fn overlapping_capability_sets_negotiate_and_deliver() {
+    fanos_testkit::require_quiet_host("whether two peers negotiate a shared capability and deliver across it");
     // A minimal (CORE-only) node and a "full" node (CORE + every optional flag) — spec §7.4's own
     // example: they must still interoperate on the shared baseline, not merely on identical offers.
     let dir = Directory::new();
@@ -78,6 +79,7 @@ async fn disjoint_capability_sets_abort_cleanly_without_delivering() {
 
 #[tokio::test]
 async fn three_way_capability_diversity_each_negotiates_its_own_true_intersection() {
+    fanos_testkit::require_quiet_host("whether three peers each negotiate their own true intersection");
     // A minimal, a lite, and a full node — each pair negotiates a DIFFERENT intersection, proving
     // the negotiated set is genuinely per-connection, not a single cached/global outcome.
     let dir = Directory::new();

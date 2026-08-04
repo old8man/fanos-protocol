@@ -213,6 +213,7 @@ fn signing_half(kem: &HybridKemPublic, seed: &[u8]) -> (HybridSigSecret, Vec<u8>
 
 #[tokio::test]
 async fn an_onion_reaches_the_meeting_line_over_real_quic() {
+    common::require_quiet_host("whether an onion reaches the meeting line");
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
@@ -267,6 +268,7 @@ async fn an_onion_reaches_the_meeting_line_over_real_quic() {
 
 #[tokio::test]
 async fn a_full_anonymous_session_completes_over_real_quic() {
+    common::require_quiet_host("whether a full anonymous session completes");
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     let dir = Directory::new();
@@ -398,6 +400,7 @@ async fn spawn_composite(
 
 #[tokio::test]
 async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
+    common::require_quiet_host("whether an anonymous session completes over a cell of composites");
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full deployed shape: a Fano cell of `CellNode`s (each overlay + beacon + mix router), an
@@ -857,6 +860,7 @@ impl OffCombiner {
 
 #[tokio::test]
 async fn a_service_hosted_off_its_meeting_combiner_is_reached_via_forwarding() {
+    common::require_quiet_host("whether a service hosted off its combiner is reached by forwarding");
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // Plain reachability, nothing silenced: the operator is NOT the node at its meeting combiner, so every
@@ -1178,6 +1182,7 @@ async fn hedging_holds_the_arrival_rate_when_a_meeting_point_is_silent() {
 
 #[tokio::test]
 async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
+    common::require_quiet_host("whether the host driver serves a dialer");
     let _serial = serial();
     let _serial = common::serial_cell().await; // one whole-cell fixture at a time
     // The full operator driver (§3b): `spawn_rendezvous_host` builds the cell directory, registers an

@@ -1110,6 +1110,7 @@ dependencies = [
  "fanos-session",
  "fanos-taxis",
  "fanos-telemetry",
+ "fanos-testkit",
  "fanos-vpn",
  "fanos-vrf",
  "fanos-wire",
@@ -1239,6 +1240,7 @@ dependencies = [
  "fanos-primitives",
  "fanos-proteus",
  "fanos-runtime",
+ "fanos-testkit",
  "fanos-vrf",
  "fanos-wire",
  "fanos-wire-derive",
@@ -1363,6 +1365,10 @@ dependencies = [
  "rand_core 0.10.1",
  "sysinfo",
 ]
+
+[[package]]
+name = "fanos-testkit"
+version = "0.1.0"
 
 [[package]]
 name = "fanos-thesauros"

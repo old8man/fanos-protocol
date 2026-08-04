@@ -48,5 +48,6 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 tracing.workspace = true
 
 [dev-dependencies]
+fanos-testkit = { path = "../fanos-testkit" }
 fanos-field = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

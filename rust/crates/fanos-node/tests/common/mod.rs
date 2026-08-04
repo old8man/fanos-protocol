@@ -393,97 +393,10 @@ async fn within_span<F: Future>(work: F) -> Option<F::Output> {
 /// was still draining a previous experiment the one-minute average had not caught up with. The independent
 /// variable was never actually controlled. A shorter-horizon measure (run-queue depth sampled directly) would fix
 /// both, and is the obvious next step if this correction ever needs to be tighter.
-/// The fraction of a core this process can expect right now — `1.0` on an idle host, falling as the host is
-/// oversubscribed. Exported so a diagnostic can refuse to draw conclusions from a starved run.
-///
-/// A timing experiment on a loaded box measures the box. This harness already knows that, and encodes it in
-/// the `INCONCLUSIVE` branch of its budgeted exchange; a diagnostic that reads station counters by hand
-/// bypasses that machinery entirely and can spend hours attributing contention to the system under test.
-#[must_use]
-pub fn host_cpu_share() -> f64 {
-    cpu_share()
-}
-
-/// The share below which a real-QUIC **liveness** assertion cannot tell a starved machine from a defect.
-///
-/// Derived from what the number means rather than chosen: `share_at` returns `cores / load`, so 0.5 is the
-/// point at which this process can expect half a core — i.e. every deadline in the test is competing with an
-/// equal amount of foreign work, and a missed one is at least as likely to be the box as the system.
-pub const QUIET_ENOUGH: f64 = 0.5;
-
-/// Refuse to conclude from a starved run, for an assertion whose subject is **liveness within a deadline**.
-///
-/// Call it immediately before such an assertion. On a quiet host it does nothing; on a loaded one it fails
-/// with a message naming the machine, so the run is reported as unmeasurable rather than as a defect.
-///
-/// **Why this fails rather than skips.** A skip is silent, and a test that quietly skips under load is a test
-/// that stops running exactly when the suite is busiest — which is most of the time. Failing converts a
-/// *false defect report* into a *true environment report*: the run still goes red, but it goes red for the
-/// reason it actually had.
-///
-/// **Why only liveness assertions.** A structural property — a forgery refused, a codec round-tripping, a
-/// quorum arithmetic — does not depend on how fast the box is, and guarding it would weaken a test for no
-/// reason. This is for the ones that count arrivals or wait on a deadline.
-///
-/// The cost of not having this is measured: #38 and #41 each sat open for weeks as suspected defects and
-/// both were contention; three more real-QUIC tests produced false failures in a single day
-/// (`handshake_negotiation`, `self_certifying`, `the_service_survives_one_meeting_point_going_silent`), each
-/// passing 3/3 in isolation on a quiet box.
-pub fn require_quiet_host(what: &str) {
-    // **Re-measured, not sampled once, because load is bursty.** The first version read the average at one
-    // instant and declined on it, so a co-tenant's link step — thirty seconds inside a run that takes five
-    // minutes — decided the verdict for the whole test. Seen live: a run declined at cpu share 0.50, exactly
-    // at the threshold, while the box was on its way back to idle.
-    //
-    // Waiting is honest in a way that lowering the threshold is not: a host that is busy *now* may not be in
-    // twenty seconds, and the property under test does not change while we wait. A host that is busy for the
-    // whole window genuinely cannot measure this, and then it still declines.
-    let mut share = host_cpu_share();
-    for _ in 0..QUIET_RETRIES {
-        if share >= QUIET_ENOUGH {
-            return;
-        }
-        std::thread::sleep(QUIET_RETRY_WAIT);
-        share = host_cpu_share();
-    }
-    assert!(
-        share >= QUIET_ENOUGH,
-        "INCONCLUSIVE (cpu share {share:.2} < {QUIET_ENOUGH} after {QUIET_RETRIES} re-measurements over \
-         {}s): this run cannot measure {what} — a starved host and a defect look the same here. Re-run with \
-         nothing else on the box; do not read this as a failure of the property.",
-        QUIET_RETRIES * QUIET_RETRY_WAIT.as_secs() as u32,
-    );
-}
-
-/// How many times to re-measure before declining.
-///
-/// The load average this reads is a **one-minute** average, so successive samples inside a minute are not
-/// independent — the number of retries has to span more than that window to see a different world. Six
-/// samples twenty seconds apart cover two minutes, which is two full averaging windows.
-const QUIET_RETRIES: u32 = 6;
-/// How long to wait between re-measurements — see [`QUIET_RETRIES`].
-const QUIET_RETRY_WAIT: Duration = Duration::from_secs(20);
-
-fn cpu_share() -> f64 {
-    let cores = f64::from(u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1));
-    share_at(read_load_average().unwrap_or(0.0), cores)
-}
-
-/// The derivation itself, separated from the host it reads — so the tests exercise **this** function rather than a
-/// copy of it that can drift, and so they do not depend on the load the machine happens to be under.
-fn share_at(load: f64, cores: f64) -> f64 {
-    if load <= cores { 1.0 } else { cores / load }
-}
-
-/// The 1-minute load average, or `None` if this host does not offer one the way we know how to ask.
-fn read_load_average() -> Option<f64> {
-    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
-        return text.split_whitespace().next()?.parse().ok();
-    }
-    let out = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output().ok()?;
-    // `{ 1.23 4.56 7.89 }`
-    String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?.parse().ok()
-}
+// **The host-load instrument lives in `fanos-testkit`.** It was here, where exactly one test called it and
+// `fanos-quic` — which holds two of the three known load-sensitive tests — could not reach it at all (#87).
+#[allow(unused_imports)] // each test target uses a different subset of this module
+pub use fanos_testkit::{QUIET_ENOUGH, cpu_share, host_cpu_share, require_quiet_host, share_at};
 
 /// Wait until `node`'s rendezvous relay binds a §3b host registration, and return the tag it bound.
 ///

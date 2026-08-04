@@ -85,6 +85,7 @@ vpn = ["fanos-vpn/device"]
 validator = ["dep:fanos-dromos", "dep:fanos-obolos"]
 
 [dev-dependencies]
+fanos-testkit = { path = "../fanos-testkit" }
 # `getloadavg`, for the integration harness's contention-aware budget (tests/common). Test-only.
 libc = { workspace = true }
 # Build return circuits for the SURB relay tests (audit §5 S1-H3).
