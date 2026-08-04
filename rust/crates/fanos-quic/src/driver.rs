@@ -755,12 +755,21 @@ async fn router_loop(
                     Notification::Reseated { new, .. } => {
                         *seat.lock().unwrap_or_else(PoisonError::into_inner) = *new;
                     }
+                    // **Answers, not events, and they leave here rather than going on to the broadcast.**
+                    // A `Retrieved`/`Stored` is the reply to one caller's `get`/`put`, correlated by digest;
+                    // nothing subscribes to either, in any crate. Fanning them out cloned every read value —
+                    // up to `MAX_VALUE_LEN` — once per subscriber, and a running node keeps twenty-one, all
+                    // of which discarded it. That was not only waste: it was the dominant source of
+                    // broadcast volume, and this channel drops messages when a subscriber falls behind, so
+                    // it was buying nothing with the budget an epoch-driven publisher needs to not miss a
+                    // `BeaconReady`. The `Snapshot` arm below is the same rule for the same reason.
                     Notification::Retrieved { key, value } => {
                         if let Some(waiters) = gets.remove(key) {
                             for (_, tx) in waiters {
                                 let _ = tx.send(value.clone());
                             }
                         }
+                        continue;
                     }
                     Notification::Stored(key) => {
                         if let Some(waiters) = puts.remove(key) {
@@ -768,6 +777,7 @@ async fn router_loop(
                                 let _ = tx.send(());
                             }
                         }
+                        continue;
                     }
                     // **Delivered to the one asker and never broadcast, and that is a memory bound rather
                     // than tidiness.** A snapshot is the whole store — up to `MAX_STORE_ENTRIES ×
