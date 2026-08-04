@@ -34,7 +34,7 @@ use crate::cell_node::CellNode;
 use crate::config::{BeaconParams, IngressParams};
 use crate::ingress_node::IngressNode;
 use crate::overlay_beacon::OverlayBeaconNode;
-use crate::poros::PorosHost;
+use crate::poros::{PorosHost, Sybil};
 use crate::service_node::ServiceNode;
 use crate::threshold_service::ThresholdService;
 
@@ -221,6 +221,19 @@ pub fn compose_engine<F: Field + 'static>(
                 // derived seed would sit on a line nobody looks at.
                 what.genesis_seed(),
                 ip.difficulty,
+                // **Uncapped, and this is the honest answer rather than a default.** The Sybil *cap* needs an
+                // admitted set, canonically from the fast-mixing trust graph (`crate::sybil`) — which is
+                // fully built and constructed nowhere, because nothing in a running node collects trust
+                // EDGES. There is no set to install, so the cap is genuinely unavailable here and a deployed
+                // ingress host runs the PoW *rate*-limiter alone. `sybil.rs`'s own module doc says what that
+                // means: a sequential-cost proof bounds identity-creation rate, never total identities
+                // (Boneh et al., CRYPTO 2018).
+                //
+                // It is written out because it used to be a `None` default behind a builder nobody called,
+                // which reads as "no decision was needed" rather than "the mechanism is missing". Task #76
+                // carries the design question — where vouches come from — and `set_admitted` is the seam
+                // that promotes this host the moment there is an answer.
+                Sybil::Uncapped,
             )
             .with_kem_secret(kem_secret);
             Box::new(IngressNode::new(base, host))

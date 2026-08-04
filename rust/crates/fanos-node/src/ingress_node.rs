@@ -223,7 +223,7 @@ mod tests {
 
     use super::*;
     use crate::config::Peer;
-    use crate::poros::{IngressDescriptor, request_frame, shard_descriptor, solve_ingress_request};
+    use crate::poros::{IngressDescriptor, request_frame, shard_descriptor, solve_ingress_request, Sybil};
 
     const COMMUNITY: &[u8] = b"ingress-community";
     const EPOCH: Epoch = Epoch::new(1);
@@ -258,7 +258,8 @@ mod tests {
             EPOCH,
             beacon,
             DIFFICULTY,
-        );
+                Sybil::Uncapped,
+            );
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
         (IngressNode::new(Box::new(overlay), host), beacon)
     }
@@ -317,7 +318,8 @@ mod tests {
             EPOCH,
             beacon,
             DIFFICULTY,
-        );
+                Sybil::Uncapped,
+            );
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
         let mut node = IngressNode::new(Box::new(overlay), host);
 
@@ -375,6 +377,7 @@ mod tests {
         let old_node = |i: usize| {
             let host = PorosHost::new(
                 old_coords[i], shares[i].clone(), binding.clone(), old_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
+                Sybil::Uncapped,
             );
             let overlay = OverlayNode::<F2>::new(Point::<F2>::at(i), OverlayConfig::default());
             IngressNode::new(Box::new(overlay), host)
@@ -388,7 +391,8 @@ mod tests {
                 let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
                 let host = PorosHost::new(
                     new_coords[j], placeholder, binding.clone(), new_coords.clone(), t, community.clone(), old_epoch, beacon, difficulty,
-                )
+                Sybil::Uncapped,
+            )
                 .with_kem_secret(HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB1, j as u8])).0);
                 let overlay = OverlayNode::<F2>::new(Point::<F2>::at(new_idx[j]), OverlayConfig::default());
                 IngressNode::new(Box::new(overlay), host)
@@ -509,7 +513,8 @@ mod tests {
             EPOCH,
             BeaconSeed::new([0x31; 32]),
             DIFFICULTY,
-        )
+                Sybil::Uncapped,
+            )
         .with_kem_secret(secret);
 
         let mut node = IngressNode::new(Box::new(Clock { coord, epoch: EPOCH.get() }), host);
@@ -585,7 +590,8 @@ mod tests {
             EPOCH,
             BeaconSeed::new([0x2A; 32]),
             DIFFICULTY,
-        );
+                Sybil::Uncapped,
+            );
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
         let mut node = IngressNode::new(Box::new(overlay), host);
 

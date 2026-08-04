@@ -43,11 +43,19 @@
 //! insider count `t` small — the Mahdian *FUN 2010* `Ω(t)` floor, not `n`, is what a censor must pay
 //! to enumerate — but a true cap requires anchoring to a scarce resource: a fast-mixing trust graph
 //! (SybilLimit `O(log n)`/edge) or proof-of-personhood. That anchor is the coherence/credential layer
-//! ([`crate::sybil`]). Both gates now compose in the host: [`PorosHost::with_admission`] takes the
-//! trust layer's admitted coordinate set, and [`on_request`](PorosHost) serves a requester only if it
+//! ([`crate::sybil`]). Both gates compose in the host — [`Sybil::Capped`] carries the trust layer's
+//! admitted coordinate set, and [`on_request`](PorosHost) serves a requester only if it
 //! *both* clears the PoW (rate) *and* is in the admitted set (cap) — so a flood of freshly-minted
 //! identities behind a sparse trust cut cannot buy ingress no matter how much work it burns. POROS
 //! consumes the admitted *set*, not the graph, so it stays decoupled from the specific cap mechanism.
+//!
+//! **And a deployed host today runs [`Sybil::Uncapped`]**, which this doc used to leave the reader to
+//! infer. The composition site (`crate::composition`) has no set to supply: the trust graph is built and
+//! constructed nowhere, because nothing collects trust *edges*. So the paragraph above describes a
+//! mechanism that exists and a deployment that does not yet use it, and the gap is a **design** question —
+//! where a vouch comes from — rather than a wire that was forgotten. Task #76 carries it. Saying so here is
+//! the point of the [`Sybil`] type: the previous shape was `Option<_>` defaulting to `None` behind a
+//! builder method nobody called, so "uncapped" was reachable without anyone ever deciding it.
 //!
 //! **The irreducible residual, stated plainly** (the frontier does the same): a brand-new node with
 //! no beacon and no peer still needs **one** out-of-band unblockable carrier to receive the first
@@ -667,6 +675,33 @@ struct PendingServe {
     unrecoverable: bool,
 }
 
+/// Whether this host imposes the **Sybil cap**, and it is a decision the caller has to write down.
+///
+/// The two gates are different things and the module doc is precise about it: the proof-of-work is a
+/// *rate*-limiter (Boneh et al., CRYPTO 2018 — a sequential-cost proof bounds identity-creation rate, never
+/// total identities), and the cap is what bounds the total. `Uncapped` therefore means "this host has the
+/// weaker of the two defences and knows it".
+///
+/// **It is a constructor argument rather than a builder method, and that is the whole point.** It was
+/// `Option<BTreeSet<Triple>>` behind `with_admission`, defaulting to `None`, and `None` admits everyone —
+/// so every deployed ingress host ran uncapped, silently, because nothing ever called the builder. A guard
+/// behind an opt-in method is a guard that will be absent in production; making it an argument means the
+/// composition site has to state which it meant, and a reader can see the answer without searching for a
+/// call that may not exist.
+///
+/// Promotion is still possible at run time via [`PorosHost::set_admitted`] — the cap is a per-epoch quantity
+/// that the trust graph re-mixes, so it must be replaceable without rebuilding the host.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Sybil {
+    /// No cap: the PoW rate-limiter alone. Every requester that clears the work is served.
+    Uncapped,
+    /// Only these requester coordinates are served, after they also clear the PoW. Canonically the trust
+    /// graph's [`admitted`](crate::sybil::TrustGraph::admitted) output, whose conductance bound caps admitted
+    /// Sybils at `O(attack edges)` regardless of how many exist — but POROS consumes the *set*, so a
+    /// proof-of-personhood or credential system can supply it instead.
+    Capped(BTreeSet<Triple>),
+}
+
 /// One member of a **threshold-hosted POROS ingress line**, as a sans-I/O engine. It holds only *one*
 /// descriptor share (dealt via [`shard_descriptor`] for this epoch's line), so seizing it discloses
 /// nothing; a threshold `t` of members collectively reconstruct the descriptor and serve. The combiner
@@ -700,12 +735,10 @@ pub struct PorosHost {
     /// silent `Vec::new()`, so an operator could not tell "we are under a Sybil flood" from "our
     /// difficulty is set wrong" — four different worlds, one empty vector.
     stations: Stations,
-    // The Sybil **cap** layer (design authority §6): an optional allowlist of admitted requester coordinates,
-    // supplied by the coherence/credential layer — canonically the fast-mixing trust graph ([`crate::sybil`]),
-    // whose conductance bound caps admitted Sybils at `O(attack edges)` regardless of their count. `None` ⇒ the
-    // PoW rate-limiter alone (the pre-cap default). POROS stays decoupled from the mechanism: it consumes the
-    // admitted SET, not the graph, so proof-of-personhood or a credential system can supply it instead.
-    admitted: Option<BTreeSet<Triple>>,
+    // The Sybil **cap** layer (design authority §6) — see [`Sybil`]. POROS stays decoupled from the
+    // mechanism: it consumes the admitted SET, not the graph, so proof-of-personhood or a credential system
+    // can supply it instead of the trust graph.
+    sybil: Sybil,
     // This host's KEM secret — needed only to OPEN sealed reshare sub-shares when rotating into a new epoch
     // line ([`with_kem_secret`](Self::with_kem_secret)). `None` ⇒ a serve-only host that cannot receive a
     // reshare (it can still emit contributions, which use only the new members' PUBLIC keys).
@@ -756,6 +789,7 @@ impl PorosHost {
         epoch: Epoch,
         beacon: BeaconSeed,
         difficulty: u32,
+        sybil: Sybil,
     ) -> Self {
         Self {
             coord,
@@ -772,7 +806,7 @@ impl PorosHost {
             gather: GatherClock::new(),
             gather_override: None,
             stations: Stations::new(),
-            admitted: None,
+            sybil,
             kem_secret: None,
             rotation: None,
             binding,
@@ -803,27 +837,22 @@ impl PorosHost {
         self.gather_override.unwrap_or_else(|| self.gather.deadline())
     }
 
-    /// Impose the **Sybil cap**: only requesters whose coordinate is in `admitted` are served (after they also
-    /// clear the PoW rate-limiter). The set is the coherence layer's admission output — canonically the trust
-    /// graph's [`admitted`](crate::sybil::TrustGraph::admitted) coordinates — and is refreshed as trust evolves
-    /// (call again with a fresh set each epoch). Without this the host runs the rate-limiter alone.
-    #[must_use]
-    pub fn with_admission(mut self, admitted: BTreeSet<Triple>) -> Self {
-        self.admitted = Some(admitted);
-        self
-    }
-
-    /// Refresh the Sybil-cap allowlist in place (e.g. after the trust graph re-mixes for a new epoch). Passing
-    /// an empty set admits no one; to remove the cap entirely, rebuild the host.
+    /// Refresh the Sybil-cap allowlist in place (e.g. after the trust graph re-mixes for a new epoch).
+    /// Passing an empty set admits no one. Promotes an [`Sybil::Uncapped`] host to capped, which is the
+    /// intended path once a trust source exists — the cap is a per-epoch quantity, so it must be replaceable
+    /// without rebuilding the host.
     pub fn set_admitted(&mut self, admitted: BTreeSet<Triple>) {
-        self.admitted = Some(admitted);
+        self.sybil = Sybil::Capped(admitted);
     }
 
     /// Whether `requester` clears the Sybil cap: always `true` when no cap is configured, else membership in the
     /// admitted allowlist. (The PoW rate-limiter is a separate, additional gate — see [`on_request`](Self::on_request).)
     #[must_use]
     fn sybil_admits(&self, requester: &Triple) -> bool {
-        self.admitted.as_ref().is_none_or(|set| set.contains(requester))
+        match &self.sybil {
+            Sybil::Uncapped => true,
+            Sybil::Capped(set) => set.contains(requester),
+        }
     }
 
     /// This host's ingress line as a coordinate triple — the STRUCTURE key the data-path counters use
@@ -1301,8 +1330,8 @@ mod tests {
             epoch,
             beacon,
             difficulty,
-        )
-        .with_admission([admitted].into_iter().collect());
+                Sybil::Capped([admitted].into_iter().collect()),
+            );
 
         // Gate 0 — a valid proof arriving from the WRONG coordinate (relayed/replayed).
         let good = solve_ingress_request(admitted, &community, epoch, &beacon, difficulty);
@@ -1479,6 +1508,7 @@ mod tests {
                 epoch,
                 beacon,
                 difficulty,
+                Sybil::Uncapped,
             )
         };
         let mut combiner = host(0); // the requester contacts line[0], the ingress combiner
@@ -1561,7 +1591,8 @@ mod tests {
             epoch,
             beacon,
             difficulty,
-        );
+                Sybil::Uncapped,
+            );
         // A request whose nonce does not solve the challenge is refused: no gather is opened, no share
         // requests are fanned — the PoW gate holds before any threshold work is done.
         let bad = IngressRequest { requester: coord(4), nonce: 0 };
@@ -1645,8 +1676,8 @@ mod tests {
             epoch,
             beacon,
             difficulty,
-        )
-        .with_admission(admitted.clone());
+                Sybil::Capped(admitted.clone()),
+            );
 
         // An admitted honest requester with a valid PoW opens a gather (both gates pass).
         let good_coord = id_coord(3);
@@ -1691,7 +1722,8 @@ mod tests {
             epoch,
             beacon,
             difficulty,
-        );
+                Sybil::Uncapped,
+            );
         let armed_deadline = |effects: &[Effect]| {
             effects.iter().find_map(|e| match e {
                 Effect::ArmTimer { after, .. } => Some(*after),
@@ -1887,7 +1919,9 @@ mod tests {
 
         // Old-line hosts, each holding its real descriptor share.
         let old_host = |i: usize| {
-            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
         };
         // New-line hosts: a placeholder share (adopt replaces it), a KEM secret (to open sealed sub-shares), and
         // the rotation context set to the new line.
@@ -1898,7 +1932,9 @@ mod tests {
             .map(|j| {
                 let placeholder = Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]);
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, j as u8])).0; // same seed ⇒ same secret
-                let mut h = PorosHost::new(new_line[j], placeholder, binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                let mut h = PorosHost::new(new_line[j], placeholder, binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
                     .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
@@ -1932,7 +1968,9 @@ mod tests {
         );
         // A stale sub-share for a DIFFERENT epoch is ignored (no spurious adoption / gather pollution).
         let fresh_secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF0, 0])).0; // new_host[0]'s secret
-        let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        let mut fresh = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
             .with_kem_secret(fresh_secret);
         fresh.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
         let stale = old_host(0).emit_reshare(Epoch::new(99), &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xC0]);
@@ -1958,13 +1996,17 @@ mod tests {
         let dealt = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
         let (shares, binding) = (dealt.shares, dealt.binding);
         let old_host = |i: usize| {
-            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+            PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
         };
         let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, 0])).0;
         let new_pubs: Vec<HybridKemPublic> =
             (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x77, j as u8])).1).collect();
         let new_keys: Vec<&HybridKemPublic> = new_pubs.iter().collect();
-        let mut victim = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+        let mut victim = PorosHost::new(new_line[0], Share::new(1, vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
             .with_kem_secret(secret);
         victim.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
 
@@ -1998,10 +2040,14 @@ mod tests {
 
         // Old member 0 is honest; old member 1 is Byzantine — it holds a CORRUPTED share (flipped bytes), so its
         // reshare contribution poisons the combination.
-        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            );
         let mut bad_y = shares[1].y().to_vec();
         bad_y[0] ^= 0xFF;
-        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            );
 
         let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
             (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8]))).collect();
@@ -2010,7 +2056,9 @@ mod tests {
         let mut new_hosts: Vec<PorosHost> = (0..3)
             .map(|j| {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
-                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
                     .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
@@ -2048,11 +2096,15 @@ mod tests {
         );
 
         // Control: an UNcorrupted rotation of the same committed line DOES serve (the guard is not over-eager).
-        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4);
+        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            );
         let mut good_hosts: Vec<PorosHost> = (0..3)
             .map(|j| {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
-                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4)
+                let mut h = PorosHost::new(new_line[j], Share::new(u8::try_from(j + 1).unwrap(), vec![0u8; secret_len]), binding.clone(), new_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+                Sybil::Uncapped,
+            )
                     .with_kem_secret(secret);
                 h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
                 h
@@ -2143,6 +2195,7 @@ mod tests {
                 epoch,
                 beacon,
                 difficulty,
+                Sybil::Uncapped,
             )
         };
         let mut combiner = host(0);
@@ -2251,7 +2304,8 @@ mod tests {
             epoch,
             beacon,
             difficulty,
-        );
+                Sybil::Uncapped,
+            );
         let requester = coord(5);
         let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
         combiner.step(Instant(0), Input::Message { from: requester, frame: request_frame(&req) });

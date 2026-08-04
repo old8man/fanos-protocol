@@ -570,6 +570,18 @@ meeting line from `(epoch, beacon)` independently, so the grace window is the th
 between them — and the window is now derived and unit-tested, but the composition of host + client + relay
 across a live `BeaconReady` is not.
 
+**A POROS ingress host runs with no Sybil cap.** The per-request proof of work is a *rate*-limiter — it
+bounds how fast identities can be created, never how many exist (Boneh et al., CRYPTO 2018), and
+`fanos-node/src/sybil.rs` says so in its own module doc. The *cap* is the fast-mixing trust graph in that
+same module: fully built, with the exact `w`-step walk and the conductance bound that holds admitted Sybils
+to `O(attack edges)` regardless of how many are minted — and **constructed nowhere**, because nothing in a
+running node collects trust *edges*. So `compose_engine` builds every ingress host `Sybil::Uncapped`, which
+is now written out at the call site rather than reached by an `Option` defaulting to `None`.
+
+This is a design gap, not a missing wire: it needs a source of vouches before there is a set to install. If
+the testnet is exercising POROS specifically (§3.5 says most should not), assume ingress admission is
+rate-limited only.
+
 **POROS ingress lines do now rotate** — `Node::start` spawns `spawn_ingress_rotation` automatically for any
 node given `--role ingress --ingress-params FILE` (§3.5), landed after the receive half was built. Listed
 here only because earlier notes described ingress as non-rotating, and that's now stale.
