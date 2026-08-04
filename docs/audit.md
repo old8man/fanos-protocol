@@ -3187,3 +3187,29 @@ A second, smaller instance of the family, fixed in the same pass: `read_coherenc
 footprint that arrives immediately before the `Observed` frame and fell back to `(0, 0)` — "nothing degraded,
 nobody alive" — if a `Lagged` fell between them, so `fanos status coherence` could print a confident report of
 a cell it had not seen. It now says the footprint was dropped.
+
+### §7a. The rest of the sweep, and what it correctly did **not** find
+
+Having found three in the family, the mechanical form is worth recording: `grep -rn "RecvError::Lagged"` and
+for each handler ask *what it would have done with the message*. If the answer is "written a slot", "advanced
+a counter", or "added to a set the logic later reads", it is state and the channel is wrong.
+
+One more fixed: the **move announcer**. `Notification::Reseated` triggers the cell-wide `Announce` that the
+module's own doc calls the *only* path reaching a peer this node is not connected to — that peer "holds no
+address for the mover, so it never dials, never connects, and never learns — permanently". A dropped
+notification made that permanence real. The event stays for promptness; beside it a `ROSTER_REFRESH` tick
+compares the node's *current* coordinate (which the driver already keeps as shared state) against what was
+last announced, so a lost event costs one tick rather than a peer.
+
+The rest were checked and are correct as they stand, which is the more useful half of a sweep:
+
+* `rendezvous.rs` / `rendezvous_host.rs` — session payloads. Events, and DIAULOS retransmits, which the code
+  already says at the site.
+* `spawn_load_sensor` — `record` uses `store`, not `fetch_add`. Latest-wins, so a dropped report is covered by
+  the next one. Had it accumulated, the setpoint would have under-provisioned the role for good.
+* `telemetry_dir` — a dropped observation is one skipped reading in a stream of them.
+* `capdir` / `loaddir` moves, `taxis_driver`'s checkpoint publish — bounded to one epoch or one checkpoint
+  interval by a later write to the same slot.
+
+A comment claiming the next event covers it deserves suspicion rather than trust: `mixdir` said "the next
+BeaconReady's catch-up advance covers it", and it covered the ratchet state, not the directory hole.

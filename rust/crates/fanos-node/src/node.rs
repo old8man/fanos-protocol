@@ -323,13 +323,37 @@ fn announce_node(handle: &NodeHandle, config: &NodeConfig) -> Option<JoinHandle<
 fn spawn_move_announcer(client: Client, info: Vec<u8>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut events = client.subscribe();
+        // **The coordinate is state, so a lost `Reseated` must not be permanent — and here it would have
+        // been.** This flood is the *only* path that reaches a peer this node is not connected to (see
+        // above): that peer holds no address for the mover, so it never dials and never learns. The
+        // notification stream drops messages for a subscriber that falls behind, so one dropped move left
+        // that peer without the new coordinate for good.
+        //
+        // The event stays, for promptness. Beside it, a tick compares the node's *current* coordinate — which
+        // the driver keeps as shared state — against what was last announced, so a lost event costs one tick
+        // rather than a peer. `ROSTER_REFRESH` is the cadence at which the cell already re-checks its own
+        // composition, which is the same question asked from the other side.
+        let mut last = client.address();
+        let mut ticker = tokio::time::interval(crate::role_loop::ROSTER_REFRESH);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the immediate tick would re-announce what `announce_node` just sent
         loop {
-            match events.recv().await {
-                Ok(Notification::Reseated { .. }) => {
-                    client.command(Command::Join { info: info.clone() });
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(Notification::Reseated { .. }) => {
+                        last = client.address();
+                        client.command(Command::Join { info: info.clone() });
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = ticker.tick() => {
+                    let now = client.address();
+                    if now != last {
+                        last = now;
+                        client.command(Command::Join { info: info.clone() });
+                    }
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })
