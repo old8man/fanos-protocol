@@ -254,33 +254,35 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-core", 15),
     ("fanos-diakrisis", 40),
     ("fanos-diaulos", 6),
-    // 19: `name_register_term` and `term_payload` (2026-07-31) build the name-registration term, and nothing
-    // in a running node builds a term at all — same gap as `fanos-ergon`'s codec below, tracked as the ERGON
-    // CLI verbs. Raised rather than wired because inventing a caller to satisfy the count is the one thing
-    // this ratchet must never reward. (`conflicts_with`, also here, is deliberate: it is the SPECIFICATION of
-    // the scheduler's conflict property, used by the test to verify the O(accesses) `schedule` that
-    // implements it. Wiring it onto the hot path would make block scheduling quadratic.)
-    // 19 → 20 (2026-08-04): `parallel_blocks` joins `waves_last_block`, which is already here for the same
-    // reason. Both exist so that a claim with no other observable can be checked — the conflict schedule is
-    // serial-equivalent by construction, so no OUTCOME distinguishes parallel from serial execution, and
-    // without a counter the vertical-parallelism claim is unfalsifiable. Their only legitimate caller is
-    // therefore the test that falsifies it, which is exactly the "accessors a test asserts on" debt this
-    // table's own preamble names as legitimate. Wiring a production reader to satisfy the count would be
-    // inventing a caller, which the ratchet must never reward.
-    ("fanos-dromos", 20),
-    // 3 → 4, and the bump has a reason as the rule requires: `Expr::bin`, `exec::compare` and `Predicate::host_with`
-    // are the expression layer's constructors. Nothing in production builds a computed argument or a compared gate yet
-    // — `transfer_term` is the only term builder — and the callers are the Verum emitter and contract authors
-    // (`docs/design-ergon.md` §11 step 6). This is the ratchet working as intended: the debt is named and bounded, not
-    // hidden. `Journal::written` was the fifth and was deleted instead of budgeted — an accessor I added speculatively
-    // with no caller anywhere, which is dead code rather than pending work.
-    // 5: `decode_value` (2026-07-31, one day after this ratchet was set — the guard working exactly as
-    // intended). The ERGON *value* layer IS wired: `ergon_host` converts ledger records to and from `Value`
-    // on the live read/write path. The **codec** is not, and its own test says why that matters — "a record
-    // that decodes to itself but re-encodes differently would give one ledger record two contract identities"
-    // — so canonicity is enforced in a function nothing in production calls. Wiring it means deciding where
-    // ledger records get serialized, which is a design question, not a count to satisfy.
-    ("fanos-ergon", 5),
+    // **20 → 17 (2026-08-04), LOWERED — the debt was paid, not re-justified.** `fanos term` now builds a
+    // term, type-checks it, encodes it canonically and submits it, so `name_register_term` and
+    // `term_payload` left this set by acquiring the caller they were budgeted for. The count is the true
+    // one: raising a budget needs a reason, and leaving it high after the work lands is a ratchet gone
+    // slack, which is the same defect-in-the-record class as a stale finding.
+    //
+    // What remains is legitimate and named. `conflicts_with` is the SPECIFICATION of the scheduler's
+    // conflict property, used by the test to verify the O(accesses) `schedule` that implements it — wiring
+    // it onto the hot path would make block scheduling quadratic. `waves_last_block` and `parallel_blocks`
+    // exist so a claim with no other observable can be checked: the conflict schedule is serial-equivalent
+    // by construction, so no OUTCOME distinguishes parallel from serial execution, and without a counter the
+    // vertical-parallelism claim is unfalsifiable. The rest are sub-ledger payload builders (`htlc_*`,
+    // `shield*`, `stake_*`, `storage_*`, `mint_shielded`, `name_payload`) whose verbs are not built yet —
+    // the same debt `term_payload` just paid, still outstanding for its siblings.
+    ("fanos-dromos", 17),
+    // **5 → 1 (2026-08-04), LOWERED.** `Expr::bin`, `exec::compare`, `Predicate::host_with` and
+    // `encode_value` all acquired production callers when `fanos term` landed: it composes a computed
+    // argument and a gated term, and `Checked::encode` is what the submitted bytes ARE — the signature
+    // covers them and `SignedTerm::checked` decodes those same bytes to execute, so there is no second
+    // representation.
+    //
+    // `decode_value` is the one left, and the reason it stays is narrower than the old note implied. That
+    // note said canonicity "is enforced in a function nothing in production calls", which reads as a live
+    // risk. It is not: the live `Reader::get` path projects **typed ledger state** into `Value`
+    // structurally — `Value::Int(balance)`, `Value::Bytes32(hashlock)` — and never serializes a record at
+    // all, so the boundary this codec guards does not exist yet rather than existing unguarded. It acquires
+    // a caller when records are persisted, which is #77 (a node persists nothing today), and the canonicity
+    // property starts mattering at exactly that moment.
+    ("fanos-ergon", 1),
     ("fanos-field", 1),
     ("fanos-geometry", 2),
     ("fanos-holarch", 1),
