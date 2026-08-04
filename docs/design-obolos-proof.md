@@ -77,7 +77,7 @@ All of it reduces to Module-SIS (the commitment binding, the SIS hash collision 
 
 ## 3. What LaBRADOR delivers, and the two places it does not
 
-Sourcing note, stated once so every figure below can be weighed: the eprint PDFs (2022/1341, 2024/1293) refuse direct fetch (HTTP 403), so the numbers here come from the abstract pages, which were read directly, corroborated by a technical review series that quotes the papers' formalism verbatim and by two independent implementation write-ups. Where no source produced a number, this document says **not established** rather than estimating. That distinction is load-bearing in §3.3.
+Sourcing note, stated once so every figure below can be weighed: the eprint PDFs (2022/1341, 2024/1293, 2024/1846, 2026/1289) refuse direct fetch (HTTP 403), as does the ACM DL copy; the RWC slides are unparseable and the Wayback Machine is unreachable from here. So the numbers come from abstract pages read directly, corroborated by a technical review series that quotes the papers' formalism verbatim and by two independent implementation write-ups. Where no source produced a number, this document says **not established** rather than estimating, and §8 tables every claim by its basis. That distinction is load-bearing in §3.3 and it is what caught a circulating benchmark figure that no primary page contains (§6).
 
 ### 3.1 The relation is already OBOLOS's shape — this is the finding that matters
 
@@ -131,13 +131,25 @@ So a validator's per-transaction verification work stays proportional to ≈2×1
 
 **Therefore the recommendation is LaBRADOR alone, and Greyhound is explicitly rejected** — which reverses the pairing `docs/reference-solutions.md` §5 proposed, on the grounds that the two solve different problems and only one of them is OBOLOS's.
 
-### 3.5 The zero-knowledge question — the gate before any of this
+### 3.5 The zero-knowledge question — settled, and it is a maturity risk rather than a crypto one
 
-eprint 2026/1289, *A Toolkit for Succinct Lattice-Based Zero Knowledge Proofs*, describes its own contribution as "the first concrete construction and implementation that adds **zero-knowledge** proofs to LaBRADOR."
+For OBOLOS, witness-hiding is not a feature — it is the entire product; a shielded pool whose proof leaks the witness is a public ledger with extra steps. So the first reading of eprint 2026/1289, *A Toolkit for Succinct Lattice-Based Zero Knowledge Proofs*, was alarming: it calls itself "the first concrete construction and implementation that adds **zero-knowledge** proofs to LaBRADOR", which from the abstract alone could mean the 2023 construction has no witness-hiding treatment at all.
 
-Read plainly, that says the 2023 construction is a succinct argument of *knowledge* without an efficient integrated witness-hiding treatment, and that the concrete zero-knowledge version dates from 2026. **For OBOLOS, witness-hiding is not a feature — it is the entire product.** A shielded pool whose proof leaks the witness is a public ledger with extra steps.
+**It does not mean that, and the paper says so in the same paragraph:**
 
-Stated with the hedge it deserves: this reading is from the abstract, not the body, and it is the single most important thing to verify before committing engineering effort. It is listed first in §6's gates for that reason.
+> "Achieving [witness privacy] can, in theory, be done by combining LaBRADOR with a linear-size zero-knowledge proof. **While such a combination has already been described in the LaBRADOR paper itself**, as well as in the works of Albrecht et al. (Eurocrypt 2024) and del Pino et al. (Crypto 2025), **its concrete costs remained unexplored**. In this work, we provide the first concrete construction and implementation…"
+
+So the theory has been in place since 2023 and has been engaged with by two further papers since. What was missing was **an implementation and a number**, supplied in June 2026 by integrating Lyubashevsky–Nguyen–Plançon's linear-size zero-knowledge proof (CRYPTO 2022, eprint 2022/284) into the protocol. That technique is separately published and well established, and its shape — only the final masked opening `z` scales with the witness, the inner messages staying sublinear — is the same mask-then-reveal structure OBOLOS's own [`ring_zk`](../rust/crates/fanos-obolos/src/ring_zk.rs) already uses. *(That last sentence is a structural observation about the technique in general; whether the "linear" term stays small once grafted onto LaBRADOR's recursion is **inference, not confirmed** — see §8.)*
+
+**The residual risk is therefore maturity, not correctness**, and it should be stated as exactly that:
+
+* the only concrete, benchmarked, witness-hiding LaBRADOR is **about six weeks old** (approved 2026-06-22);
+* it has **one implementation** — LaZer, whose repository tracks both this paper and the CCS 2024 one and ships the scripts that reproduce its tables;
+* **its cost is not established.** No source reachable — paper (the PDF 403s, and at six weeks old it has not propagated to any mirror), repository README, or secondary coverage — states a KB or millisecond figure for the ZK variant against the bare 47–58 KB. The abstract's "under 100 KB for arbitrarily large statements" is context about the LaBRADOR family stated *before* the ZK contribution is introduced, and reading it as a bound on the hiding variant would be an overreach.
+
+**And this residual is measurable rather than research-blocked**, which is what makes it a work item instead of an open question: LaZer ships `benchmark_*.py` scripts that reproduce the paper's own tables. Running them is the cheapest way to get the number, and it does not require the PDF.
+
+One note on the other implementation: **condor-rs is not a second ZK implementation.** Its own README scopes it to "Falcon signature aggregation with LaBRADOR in Rust", with no mention of witness-hiding — signature aggregation is a use case where hiding the witness is not the point. Read LaZer as carrying the ZK variant and condor-rs as the bare argument of knowledge. (A third library, **Lattirust** — "arkworks for lattice-based constructions" — surfaced during this and has not been investigated.)
 
 ## 4. The alternatives, compared honestly
 
@@ -154,7 +166,7 @@ Two levers exist inside the current construction, and neither is a fix:
 
 ### 4.2 The lattice-folding line — LatticeFold, LatticeFold+, Neo
 
-* **LatticeFold** (Boneh–Chen, eprint 2024/257) folds R1CS/CCS instances under Module-SIS. Its base construction carries a restriction on `q` that a technical review states plainly: it "does not work with certain finite fields such as **Goldilocks** or Mersenne61." **That is OBOLOS's exact prime.** A modification for wider moduli exists (§3.3 of the paper) whose details are not established here, but as published this is not a drop-in.
+* **LatticeFold** (Boneh–Chen, eprint 2024/257) folds R1CS/CCS instances under Module-SIS. Its base construction carries a restriction on `q` that a technical review states plainly: it "does not work with certain finite fields such as **Goldilocks** or Mersenne61." **That is OBOLOS's exact prime**, and Neo's own abstract names the cause rather than just the symptom — "the required ring structure places restrictions on the choice of primes (e.g., LatticeFold is not compatible with the Goldilocks field)", i.e. the ring structure constrains the modulus. Worth keeping in view because it is the named failure mode of this whole literature, and it is the frame in which §5.3's degree question should be read. A modification for wider moduli exists (§3.3 of the paper) whose details are not established here, but as published this is not a drop-in.
 * **LatticeFold+** (CRYPTO 2025, eprint 2025/247) claims a 5–10× faster prover and, notably, "a new purely algebraic range proof" replacing bit-decomposition — which is precisely OBOLOS's 78.2% dominant term (§1.1). No concrete figures were obtainable. This is the most interesting item in the field for OBOLOS specifically, and it is too new to build on.
 * **Neo** (eprint 2025/294) and **SuperNeo** (eprint 2026/242) adapt HyperNova-style folding to lattices *without* the cyclotomic restriction, explicitly **Goldilocks-compatible**, with a "pay-per-bit" Ajtai commitment. This is the closest field-match alternative and is genuinely live.
 
@@ -188,9 +200,18 @@ The *statements* are unchanged. What changes is that they stop each carrying the
 
 **Per-transaction, not per-block.** ≈50 KB per shielded spend puts 100 spends at 5 MB of block, which is a real TAXIS capacity question rather than a solved one. And the obvious fix does not work: LaBRADOR amortizes over relations **with their witnesses**, and a block proposer does not hold the senders' witnesses, so it cannot aggregate their proofs. Compressing a block's spends into one proof requires *recursive verification* — proving "I checked these k proofs" — which is what the folding line (§4.2) is for and which is not available on Goldilocks today outside Neo/SuperNeo. This is the honest limit of the recommendation, and it belongs in the record rather than in a footnote.
 
-### 5.3 The ring-degree mismatch
+### 5.3 The ring-degree mismatch — probably incidental, not confirmed
 
-LaBRADOR's practical instantiation uses `d = 64` and `q ≈ 2⁶⁴+1`; OBOLOS uses `D = 256` and Goldilocks `q = 2⁶⁴ − 2³² + 1`. Same assumption family, same power-of-two cyclotomic shape, same modulus magnitude — but a **4× ring-degree difference**, and third-party implementations use different moduli again (Ingonyama's uses a CRT pair of ~31-bit NTT primes rather than one 64-bit prime), so `q` is implementation-dependent rather than fixed by the construction. Whether OBOLOS keeps `D = 256` or must move toward `d ≈ 64` is **an open engineering question neither paper answers**, and it is gate 3 in §6.
+LaBRADOR's practical instantiation uses `d = 64` and `q ≈ 2⁶⁴+1`; OBOLOS uses `D = 256` and Goldilocks `q = 2⁶⁴ − 2³² + 1`. Same assumption family, same power-of-two cyclotomic shape, same modulus magnitude — but a **4× ring-degree difference**. Third-party implementations already use different moduli again (Ingonyama's is a CRT pair of ~31-bit NTT primes rather than one 64-bit prime), so `q` is implementation-dependent rather than fixed by the construction.
+
+The best evidence reachable says the **degree is the same kind of choice**. Two independent technical write-ups present `d = 64` as a performance convention rather than a soundness requirement — one states "in practice, LaBRADOR uses d=64" alongside NTT efficiency as "pretty standard practice in lattice-based cryptography", and the Greyhound companion tells readers outright that the concrete degree "is not important to understand the protocol". Neither implementation pins it: condor-rs's documented ring is the general `Z_q[x]/(x^d + 1)` with `d` symbolic.
+
+Two caveats, because "probably" is not "yes":
+
+* **The paper's own parameter-selection section is unread** (the PDF 403s), and that is where a degree constraint would live if there is one. So this is the better-supported reading, not a closed question.
+* **No source reports running LaBRADOR at `d = 256`** — neither working nor broken. Genuinely not established either way.
+
+One piece of standard lattice reasoning, flagged as **inference** because no LaBRADOR-specific source states it: Module-SIS hardness conventionally depends on the *total* lattice dimension — module rank × ring degree — rather than the degree alone, so a 4× larger degree generically permits a *smaller* module rank at the same security level rather than breaking anything. That is precisely what reading the parameter section would confirm or refute.
 
 ## 6. Recommendation
 
@@ -198,19 +219,32 @@ LaBRADOR's practical instantiation uses `d = 64` and `q ≈ 2⁶⁴+1`; OBOLOS u
 
 That is the strictly-better option on the evidence: it is the only candidate whose native input language is what OBOLOS already writes (§3.1), it lands the proof in the ≈50 KB band at OBOLOS's measured statement size (§3.3), it makes Merkle depth almost free (§3.3), and it keeps the platform on one hardness base. Greyhound is rejected because it solves polynomial-evaluation succinctness and would require acquiring the front end §3.1 shows is unnecessary. STARKs are rejected because the migration is a rebuild of the crate's cryptographic content, not a change of proof system. The parameter levers are rejected because 16× on 145 MiB is still 9 MiB (§4.1).
 
-**Three gates before engineering effort is committed**, in order, because each can invalidate the ones after it:
+**Three gates were named before committing engineering effort. All three have now been worked, and none of them blocks — but what they returned changes what the work is.**
 
-1. **Zero-knowledge (§3.5).** Read the body of eprint 2026/1289 and establish whether witness-hiding LaBRADOR is the 2023 construction or the 2026 addition. If it is the latter, this recommendation rests on a one-year-old paper with one implementation, and that fact must be stated in the decision rather than discovered later.
-2. **Verifier time (§3.4).** LaBRADOR's verifier is linear. Measure it at ≈2×10⁵ constraints against what a TAXIS validator can spend per transaction. If it is seconds, the recommendation changes shape — Neo/SuperNeo (§4.2) becomes the live alternative, not because LaBRADOR is wrong but because a chain cannot pay a linear verifier per spend.
-3. **Ring degree (§5.3).** Establish whether `D = 256` is workable or whether `d ≈ 64` is required, since that decides whether `ring.rs`, `commit.rs` and `ring_hash.rs` are genuinely kept.
+**Gate 1 — zero-knowledge (§3.5): PASSED, with a maturity caveat.** The alarming reading was wrong: the ZK combination has been described since the 2023 LaBRADOR paper itself and engaged with by Albrecht et al. (Eurocrypt 2024) and del Pino et al. (Crypto 2025); what 2026/1289 contributes is the first *implementation and concrete cost*. So this is not "the crypto might not exist". It is "the only benchmarked, witness-hiding instantiation is six weeks old and has one implementation, and its cost is unquantified".
 
-Reference implementations to read rather than depend on: **LaZer** (IBM, C+Python, eprint 2024/1846) for the relation-specification front end, **condor-rs** (Nethermind, Rust) for the construction. FANOS's own rule applies — a proof system this load-bearing is implemented in-tree against the papers, with the references used as an oracle for test vectors, not linked.
+**Gate 2 — verifier time (§3.4): NOT ESTABLISHED, and it will not be settled by reading.** Every avenue was tried and each is blocked or empty: the eprint PDFs 403 (2022/1341, 2024/1846), the ACM DL copy 403s, the RWC slides are unparseable, the Wayback Machine is unreachable, and every abstract page that *does* load contains no benchmarks — confirmed by fetching them, not assumed. The two technical deep-dives are explicitly asymptotic-only. **A trap worth recording rather than repeating:** a search summary asserted a specific figure ("verification 45–72 ms, proof size 32–48 KB, memory 512–645 MB, median of 100 runs") attributed to LaZer, and direct fetches of both pages it could plausibly have come from show no such numbers. It is a lead for someone with PDF access, **not a citable fact**, and it must not enter this document as one.
+
+**Gate 3 — ring degree (§5.3): probably incidental, not confirmed.** Two independent write-ups present `d = 64` as an NTT/performance convention rather than a soundness requirement, and neither implementation pins it. The paper's own parameter-selection section is unread, so this stays open rather than closed.
+
+### What the gates turned the work into
+
+The two unresolved items are **measurements, not research questions**, and both are cheap:
+
+1. **Run LaZer's own benchmarks.** Its repository ships `benchmark_expansion.py`, `benchmark_compression.py`, `benchmark_membership_proof.py` and `benchmark_blind_sign.py`, which reproduce the paper's Tables 1–4 (reported on a single Tiger Lake-H core). That gets gate 1's missing ZK cost *and* gate 2's verifier time from runnable code, without the PDF. **This is the single highest-value next step on #65** and it needs no FANOS work at all.
+2. **Read the parameter-selection section** once any copy of 2022/1341 becomes reachable, to close gate 3.
+
+Neither is a reason to delay the architectural decision, because neither can change *which* system is the right one — gate 2 can only change whether a linear verifier is affordable, and if it is not, §4.2's Neo/SuperNeo is the alternative for the same reasons LaBRADOR was chosen over the rest.
+
+Reference implementations to read rather than depend on: **LaZer** (IBM, C+Python, eprint 2024/1846 and 2026/1289 — it carries the zero-knowledge variant) for the relation-specification front end, and **condor-rs** (Nethermind, Rust) for the construction, noting it is scoped to Falcon signature aggregation and is the bare argument-of-knowledge variant, not a second ZK implementation. FANOS's own rule applies — a proof system this load-bearing is implemented in-tree against the papers, with the references used as an oracle for test vectors, not linked.
 
 ## 7. What would have to be true for this to be wrong
 
-* **If gate 1 fails badly** — if witness-hiding LaBRADOR turns out to be materially more expensive than the argument-of-knowledge version — the ≈50 KB figure is not OBOLOS's figure, and every number in §3.3 needs redoing against the zero-knowledge variant.
-* **If gate 2 fails** — a linear verifier at 2×10⁵ constraints costing more than a validator can spend — then proof *size* was never the binding constraint and this whole analysis optimized the wrong axis. The measurement in §1 would still stand; the conclusion would not.
+* **If witness-hiding is materially more expensive than the argument of knowledge** — gate 1's unquantified half — the ≈50 KB figure is not OBOLOS's figure, and every number in §3.3 needs redoing against the zero-knowledge variant. The theory is no longer in doubt; the constant factor is.
+* **If the verifier is too slow** — a linear verifier at 2×10⁵ constraints costing more than a validator can spend — then proof *size* was never the binding constraint and this whole analysis optimized the wrong axis. The measurement in §1 would still stand; the conclusion would not.
+* **If the ring degree turns out to be load-bearing** after all, `ring.rs` / `commit.rs` / `ring_hash.rs` are not "kept" as §5.1 claims and the adoption is substantially larger than costed.
 * **If the field settles elsewhere.** LatticeFold+, Neo and SuperNeo all postdate Greyhound, and the lattice-SNARK race is visibly unfinished. Committing to LaBRADOR should be a deliberate choice made knowing that Neo/SuperNeo is a live, actively developed, same-field alternative — not a belief that the question is closed.
+* **A methodological one, because it nearly happened.** Two of the three gates were nearly answered by a search-engine summary rather than a source: gate 1 by an abstract fragment that read as "ZK did not exist before 2026", and gate 2 by a fabricated-looking benchmark line. Both were caught by fetching the primary page and finding the claim absent. Any future number entering this document needs the same treatment — §8 exists so that a reader can see which ones had it.
 
 ## 8. Status of the claims in this document
 
@@ -222,6 +256,12 @@ Reference implementations to read rather than depend on: **LaZer** (IBM, C+Pytho
 | OBOLOS's statement ≈2¹⁷·⁵ constraints | **derived here** from the construction (§3.3) |
 | linear verifier | two independent sources quoting the paper (§3.4) |
 | Greyhound uses LaBRADOR internally | Greyhound abstract + a technical analysis of the composition (§3.4) |
-| zero-knowledge may be a 2026 addition | **abstract only, hedged** — gate 1 exists to settle it (§3.5) |
+| the ZK combination predates 2026; 2026/1289 supplies the first implementation | **quoted from 2026/1289's own abstract**, fetched directly (§3.5) |
+| the ZK variant's size/time cost | **not established** — no source reachable states one; measurable by running LaZer's own benchmark scripts (§6) |
+| LaZer carries the ZK variant, condor-rs does not | repository contents + condor-rs's own scoping statement (§3.5) |
+| the ZK technique's linear term stays small on LaBRADOR's recursion | **inference**, explicitly not confirmed (§3.5) |
+| `d = 64` is a convention, not a soundness requirement | two independent write-ups; the paper's parameter section is **unread** (§5.3) |
+| a larger degree permits a smaller module rank | **inference** from standard Module-SIS reasoning, no LaBRADOR source (§5.3) |
+| LatticeFold's Goldilocks incompatibility is a ring-structure/prime coupling | Neo's abstract, quoted (§4.2) |
 | REPETITIONS = 16 traces to full splitting | eprint 2017/523 abstract; the OBOLOS-specific consequence is **inference** (§4.1) |
-| prover/verifier times in seconds; full benchmark table | **not established** — PDFs unreachable, no source reproduced them |
+| prover/verifier times in seconds; full benchmark table | **not established** — every avenue tried and blocked; one circulating figure is a **lead, not a fact** (§6) |
