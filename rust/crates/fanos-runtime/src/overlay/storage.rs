@@ -397,6 +397,24 @@ impl<F: Field> OverlayNode<F> {
             }
             PUBLISH_SHARD => {
                 // A single versioned shard for Fano point `index` — store it, keeping the higher version.
+                //
+                // **`version` is attacker-choosable and nothing here can currently stop it (task #79).** It
+                // arrives off the wire and `insert_shard` keeps `version >= held`; a real distribution
+                // stamps `now.as_nanos()` (~1.75e18) while `u64::MAX` is an order of magnitude above, so one
+                // frame per (digest, index) pins that shard permanently, and reads take the highest version
+                // group. That reaches every directory built on this store.
+                //
+                // The obvious guard — require `from` to be the node responsible for this digest — **cannot
+                // be written here**, and the reason is structural rather than an oversight: responsibility
+                // is `storage_point::<F>(key)`, a function of the KEY, and the shard frame carries only the
+                // digest. A receiver therefore cannot recompute who should have sent it. (Checking
+                // `nearest_occupied(index)` instead compares against the *receiver's* own home, which is
+                // `me` for every legitimate publish — tried, and it rejects them all.)
+                //
+                // The ordering it protects was never sound either: `now` is `Instant(origin.elapsed())`,
+                // time since *this node* started, so two nodes' versions are incomparable. The scheme works
+                // only because one node stamps and the rest copy — which is exactly the invariant nothing
+                // enforces. #79 carries the three real options and their costs.
                 self.store
                     .insert_shard(digest, index, version, payload.to_vec());
                 Vec::new()
