@@ -2923,3 +2923,41 @@ refuted hypothesis because the counter's correctness is what makes the 22 readab
 stayed loaded. The platform now has the discipline that prevents a third: `host_cpu_share()` is printed,
 thresholded at 0.5, and load-bearing in the autopsy's assertion, so a starved run declines to conclude
 instead of reporting the machine as a defect.
+
+---
+
+# The liveness spare explains the wedge, quantitatively (#47 × #38, 2026-08-04)
+
+`t = ⌈2(q+1)/3⌉` comes from the BFT safety ratio, and safety is what it is for — but the same number silently
+fixes **liveness**: a gather completes when `t` of `q + 1` answer in time, so the spare is
+`(q+1) − t = ⌊(q+1)/3⌋`, and the ceiling's rounding is a tax paid unevenly. It vanishes exactly when
+`3 | q + 1`, i.e. **q ≡ 2 (mod 3)**: q = 2, 5, 8, 11… The shipped Fano cell is the smallest member of that
+family, so the base cell is defensible on liveness grounds and not only tradition, and the sensible step up is
+q=5 or q=8 — **never q=3 or q=4**, which carry more members while tolerating the same single absence. This
+inverts the naive reading that a bigger plane is more robust, which is why it is asserted in `node.rs` rather
+than argued.
+
+## What closed it: `r` is measured, not assumed
+
+The model's per-member response probability `r` is not a constant — it is *P(a member answers inside the
+measured deadline)*, and it moves with load. #41 measured it on an idle host: 12 expiries in 1872 gathers, so
+`r = 0.9936`. Evaluating the same model at both values, with #47's own N = 50 gathers per session:
+
+| regime | P(gather) | P(session) | P(60 clean dials) |
+|---|---|---|---|
+| loaded, `r = 0.90` | 0.9720 | 0.2417 | **1.0 × 10⁻³⁷** |
+| idle, `r = 0.9936` (measured) | 0.999878 | 0.9939 | **0.69** |
+
+#38 observed exactly 60 clean dials on an idle host. **The loaded model calls that impossible; the idle model
+calls it likely.** So the wedge is the Fano cell's structural margin evaluated at the `r` contention produces
+— which turns #38's "capacity, by elimination" into "capacity, with a model that predicts the observed
+counts", and turns #47's `r = 0.90` table from an illustration into a calibration.
+
+Three findings that arrived separately are one thing: #47 supplies the model, #41 supplies its parameter, #38
+supplies the observation the two together predict.
+
+## Residual
+
+That q=3 and q=4 are strictly worse than q=2 is still an untested prediction, and it matters to anyone
+choosing a plane order. It is no longer on #38's critical path. Testing it needs the general-q rendezvous path
+(audit A2: the stack is pinned to `F2` throughout), which is worth doing on its own merits.

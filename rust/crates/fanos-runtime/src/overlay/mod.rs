@@ -2287,6 +2287,80 @@ mod tests {
         );
     }
 
+    /// **A shard stamped in the future is refused, so no frame can pin a slot for ever.**
+    ///
+    /// `version` arrives off the wire and `insert_shard` keeps the higher one. A real distribution stamps
+    /// the epoch it happened in; `u64::MAX` is an epoch no cell will reach, so before this an attacker sent
+    /// one frame per (digest, index) and that shard could never be superseded — and since reads take the
+    /// highest version group, filling every index owned the reconstruction, against every directory built on
+    /// this store (#79).
+    ///
+    /// The bound is the beacon clock: agreed cell-wide and unforgeable *ahead*, because a future epoch's
+    /// beacon cannot be known before its round assembles. One epoch of grace is allowed, the same one-epoch
+    /// allowance the platform derives wherever a peer may be a turn ahead across an epoch boundary.
+    #[test]
+    fn a_shard_stamped_beyond_the_epoch_clock_is_refused() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let from = Point::<F2>::at(1).coords();
+        let digest = flood_digest(1);
+        let epoch = node.epoch().get();
+
+        // THE PROPERTY: a far-future stamp — the pin — is refused outright, and so is one two epochs ahead,
+        // which is the first value past the grace.
+        for ahead in [u64::MAX >> OverlayNode::<F2>::VERSION_EPOCH_SHIFT, epoch + 2] {
+            let version = ahead << OverlayNode::<F2>::VERSION_EPOCH_SHIFT;
+            node.step(
+                Instant(1),
+                Input::Message { from, frame: encode_publish(PUBLISH_SHARD, 0, version, &digest, b"pinned") },
+            );
+            assert!(
+                !node.store.entries.contains_key(&digest),
+                "a shard stamped at epoch {ahead} against a clock at {epoch} must be refused — accepting it \
+                 lets one frame hold this slot against every later write"
+            );
+        }
+
+        // **The PRODUCER is pinned too, and it has to be.** Removing the guard fails this test; removing
+        // the epoch from `write_version` did NOT, because at `Instant(1)` raw nanos shift to 0 and the guard
+        // waves them through. In production it is a liveness break rather than a no-op: raw nanos put
+        // `uptime_seconds / 4.3` in the epoch field, so a node up ~9 s stamps epoch 2, and every peer at
+        // epoch 0 refuses its shards. A second producer really was still doing that — `Command::Put`'s own
+        // path — and this assertion is what stops it coming back.
+        // Driven through `Command::Put` rather than by calling `write_version` beside it, because the
+        // regression was at a CALL SITE: one of the two producers still passed raw `now.as_nanos()`. A test
+        // that calls the helper directly cannot see that, and an earlier version of this assertion did not.
+        // A one-node cell homes every shard on itself, so the stamp is read back out of the local store —
+        // the same value a peer would have received.
+        let late = Instant(60_000_000_000); // a minute of uptime — far past where nanos overflow 32 bits
+        let key = alloc::vec![9u8];
+        node.step(late, Input::Command(Command::Put { key: key.clone(), value: alloc::vec![7u8; 64] }));
+        let (stored_digest, _) = OverlayNode::<F2>::address_of(&key);
+        let stamped = node
+            .store
+            .entries
+            .get(&stored_digest)
+            .and_then(|held| held.values().next().map(|(version, _)| *version))
+            .expect("a Put stores at least one shard");
+        assert_eq!(
+            stamped >> OverlayNode::<F2>::VERSION_EPOCH_SHIFT,
+            node.epoch().get(),
+            "uptime must never leak into the epoch half — a receiver reads it as a claim about the clock, so \
+             raw nanos make a node refuse every shard from a peer that has been up a few seconds"
+        );
+
+        // THE MECHANISM, so the test cannot pass by refusing everything: this epoch is accepted, and so is
+        // one epoch ahead, which is the grace a peer a turn ahead legitimately needs.
+        for ok in [epoch, epoch + 1] {
+            let d = flood_digest(u32::try_from(ok).unwrap_or(0) + 100);
+            let version = ok << OverlayNode::<F2>::VERSION_EPOCH_SHIFT;
+            node.step(
+                Instant(1),
+                Input::Message { from, frame: encode_publish(PUBLISH_SHARD, 0, version, &d, b"ok") },
+            );
+            assert!(node.store.entries.contains_key(&d), "a shard stamped at epoch {ok} must be stored");
+        }
+    }
+
     #[test]
     fn an_existing_key_updates_even_when_the_store_is_full() {
         // Reject-when-full must never block overwriting an already-stored key (no growth) — otherwise a

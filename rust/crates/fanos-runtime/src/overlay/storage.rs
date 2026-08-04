@@ -176,7 +176,7 @@ impl<F: Field> OverlayNode<F> {
             if value.len() > MAX_VALUE_LEN {
                 return Vec::new();
             }
-            let mut effects = self.distribute_shards(&digest, value, now.as_nanos());
+            let mut effects = self.distribute_shards(&digest, value, self.write_version(now));
             effects.push(Effect::Notify(Notification::Stored(digest)));
             effects
         } else {
@@ -365,6 +365,27 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
+    /// How many low bits of a shard version carry the within-epoch tiebreak; the rest carry the epoch.
+    ///
+    /// 32 each. The epoch half must outlive the network — at the 600 s default, `2^32` epochs is ~82,000
+    /// years — and the tiebreak half only has to separate writes to one key inside one epoch, which 2^32
+    /// distinct values do with room to spare. Splitting a `u64` evenly is what makes both true at once, so
+    /// this is a consequence of the word size rather than a tuning choice.
+    pub(super) const VERSION_EPOCH_SHIFT: u32 = 32;
+
+    /// The version a distribution stamps: **the epoch it happened in**, with a within-epoch tiebreak below.
+    ///
+    /// The epoch is what makes the ordering checkable by a receiver (see `on_publish`'s `PUBLISH_SHARD`
+    /// arm). It used to be `now.as_nanos()` alone, which is `Instant(origin.elapsed())` — time since *this
+    /// node* started — so two nodes' versions were not comparable at all, and the scheme only worked because
+    /// one node stamps and the rest copy. That was exactly the invariant nothing enforced.
+    pub(super) fn write_version(&self, now: Instant) -> u64 {
+        let epoch = self.epoch().get() << Self::VERSION_EPOCH_SHIFT;
+        #[allow(clippy::cast_possible_truncation)] // the low half IS the tiebreak; truncation is the point
+        let tiebreak = now.as_nanos() as u32;
+        epoch | u64::from(tiebreak)
+    }
+
     pub(super) fn on_publish(&mut self, now: Instant, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(&flag) = body.first() else {
             return Vec::new();
@@ -388,7 +409,7 @@ impl<F: Field> OverlayNode<F> {
             PUBLISH_ORIGIN => {
                 // We are the responsible node: stamp this write's version (our distribution time),
                 // erasure-distribute the full value across the cell, and acknowledge the origin.
-                let mut effects = self.distribute_shards(&digest, payload, now.as_nanos());
+                let mut effects = self.distribute_shards(&digest, payload, self.write_version(now));
                 effects.push(Effect::Send {
                     to: from,
                     frame: encode(FrameType::Ack, &digest),
@@ -396,7 +417,28 @@ impl<F: Field> OverlayNode<F> {
                 effects
             }
             PUBLISH_SHARD => {
-                // A single versioned shard for Fano point `index` — store it, keeping the higher version.
+                // **A version from the future is not a distribution that has happened.** `version` arrives
+                // off the wire and `insert_shard` keeps the higher one, so an attacker sent `u64::MAX` and
+                // that shard could never be superseded — one frame per (digest, index), permanently, against
+                // every directory built on this store. Reads take the highest version group, so filling
+                // every index owned the reconstruction (#79).
+                //
+                // The bound comes from the beacon clock, which is the ordering source this platform already
+                // has: agreed cell-wide, and unforgeable *ahead*, because a future epoch's beacon cannot be
+                // known before its round assembles. So a receiver rejects any version whose epoch exceeds
+                // its own — plus **one** epoch of grace, which is not a chosen slack but the same one-epoch
+                // allowance the platform derives everywhere a peer may be a turn ahead across an epoch
+                // boundary (`HOST_GRACE_EPOCHS`, `MAX_REPLY_KEYS`).
+                //
+                // What this does and does not buy, stated exactly. It converts a **permanent** pin into one
+                // bounded by two epochs — after which any legitimate write supersedes it — using machinery
+                // that exists, with no signature on the hot path, no wire change, and no key on the wire.
+                // It does **not** stop an attacker from winning the tiebreak against a concurrent write
+                // *inside* the current window; that residual is real and is recorded on #79, and closing it
+                // needs the distributor's identity, not a better clock.
+                if version >> Self::VERSION_EPOCH_SHIFT > self.epoch().get().saturating_add(1) {
+                    return Vec::new();
+                }
                 //
                 // **`version` is attacker-choosable and nothing here can currently stop it (task #79).** It
                 // arrives off the wire and `insert_shard` keeps `version >= held`; a real distribution
