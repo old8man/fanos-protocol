@@ -330,7 +330,16 @@ mod tests {
         assert_eq!(depth_for(8), 1, "q = 7 affords only one — the bucket is too narrow for a circuit there");
         // And the payload is what the policy is for: budget-filling left 2.4 KiB, which is smaller than structures this
         // protocol nests *inside* an onion payload (sealing to a 3-member line alone is ~3.5 KiB).
-        assert!(payload_len(3).unwrap() > 8192, "capping depth leaves a real payload: {:?}", payload_len(3));
+        // **Against the packet's own width, not a copy of it.** `8192` here was `fanos_wire::tessera::TOTAL_LEN`
+        // spelled out by hand — this crate imports that module, so the literal bought nothing and would have
+        // gone quietly wrong the moment the packet resized: the assertion would still pass while testing a
+        // ratio the layout no longer has. A payload worth more than the whole packet is the meaningful claim,
+        // and it is only meaningful if the two numbers cannot drift apart.
+        assert!(
+            payload_len(3).unwrap() > fanos_wire::tessera::TOTAL_LEN,
+            "capping depth leaves a real payload — more than a whole packet's worth: {:?}",
+            payload_len(3),
+        );
     }
 
     #[test]
