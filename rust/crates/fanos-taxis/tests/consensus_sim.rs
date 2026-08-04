@@ -1726,7 +1726,7 @@ fn honest_validators_certify_the_executed_state() {
         let cp = e.latest_checkpoint().expect("an execution checkpoint formed");
         assert_eq!(cp.height, 0, "checkpoint is at the executed height");
         assert_eq!(cp.state_root, root, "checkpoint certifies the agreed executed state root");
-        assert!(cp.verify(CellParams::FANO.quorum, &verifiers), "it is a valid Q-quorum certificate");
+        assert!(cp.verify(CellParams::FANO.quorum(), &verifiers), "it is a valid Q-quorum certificate");
         // A divergent validator (a wrong root at the same height) would be detectable + attributable.
         let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], [0xAA; 32], 6, &gen_keys()[6].sig);
         assert_eq!(cp.conflicting(&bad, &verifiers), Some(6), "a wrong-root execution is flagged, not silent");
@@ -1834,7 +1834,7 @@ fn a_finalized_blocks_commit_certificate_is_recorded_as_the_next_blocks_last_com
         assert_eq!(cert.phase, Phase::Commit, "last_commit is a COMMIT certificate");
         assert_eq!(cert.block_hash, b.header.parent, "it certifies exactly the parent block");
         assert_eq!(cert.height, b.header.height - 1, "at the parent's height");
-        assert!(cert.verify(CellParams::FANO.quorum, &verifiers), "a valid Q-quorum of distinct finalizers");
+        assert!(cert.verify(CellParams::FANO.quorum(), &verifiers), "a valid Q-quorum of distinct finalizers");
         assert!(cert.votes.len() >= 5, "at least a Q-quorum of finalizers is recorded, got {}", cert.votes.len());
     }
     // The first block (height 0, parent GENESIS_PARENT) has no parent commit to record.
@@ -2308,7 +2308,7 @@ fn a_cell_whose_timers_never_agree_still_finalizes_a_run_of_heights() {
         assert_eq!(c.hashes_at(h).len(), 1, "drifting timers must not fork height {h}: {report}");
     }
     assert!(
-        c.honest_count_at(reached - 1) >= CellParams::FANO.quorum,
+        c.honest_count_at(reached - 1) >= CellParams::FANO.quorum(),
         "and a quorum must be carried along, not left behind: {report}"
     );
 }
@@ -2405,7 +2405,7 @@ fn a_cell_whose_rounds_split_four_three_still_finalizes() {
     let rounds: BTreeSet<u32> = (0..N).map(|i| c.engines[i].round()).collect();
     assert_eq!(rounds.len(), 1, "the cell must be back in one round: {rounds:?} — {report}");
     assert!(
-        c.honest_count_at(0) >= CellParams::FANO.quorum,
+        c.honest_count_at(0) >= CellParams::FANO.quorum(),
         "a one-round offset must not cost the cell its liveness — {} of {N} finalized. {report}",
         c.honest_count_at(0)
     );

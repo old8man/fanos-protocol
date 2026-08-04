@@ -139,10 +139,10 @@ impl ValidatorConfig {
         let mut out = Vec::new();
         out.push(self.me);
         out.extend_from_slice(&self.node_seed);
-        out.extend_from_slice(&(self.cell.q).to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.n).to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.f).to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.quorum).to_be_bytes());
+        out.extend_from_slice(&(self.cell.q()).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.n()).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.f()).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.quorum()).to_be_bytes());
         out.extend_from_slice(&self.epoch.get().to_be_bytes());
         out.extend_from_slice(self.beacon.as_bytes());
         out.extend_from_slice(&self.keyper_commit);
@@ -167,12 +167,11 @@ impl ValidatorConfig {
         let mut r = Cursor::new(bytes);
         let me = r.u8()?;
         let node_seed = r.array32()?;
-        let cell = CellParams {
-            q: r.u32()?,
-            n: r.u32()? as usize,
-            f: r.u32()? as usize,
-            quorum: r.u32()? as usize,
-        };
+        // **Checked, not believed.** The three non-`q` fields are a pure function of `q`, so a file whose
+        // four disagree is either tampered or mistyped — and a `quorum` below `⌈(n+f+1)/2⌉` runs consensus in
+        // which two quorums can be DISJOINT, so two conflicting blocks both finalize. That is a fork: a
+        // safety failure, not a liveness one, and it would look healthy until the cell partitioned.
+        let cell = CellParams::checked(r.u32()?, r.u32()? as usize, r.u32()? as usize, r.u32()? as usize)?;
         let epoch = Epoch::new(r.u64()?);
         let beacon = BeaconSeed::new(r.array32()?);
         let keyper_commit = r.array32()?;
@@ -219,10 +218,10 @@ impl ChainInfo {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&self.cell.q.to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.n).to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.f).to_be_bytes());
-        out.extend_from_slice(&u32_of(self.cell.quorum).to_be_bytes());
+        out.extend_from_slice(&self.cell.q().to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.n()).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.f()).to_be_bytes());
+        out.extend_from_slice(&u32_of(self.cell.quorum()).to_be_bytes());
         out.extend_from_slice(&self.epoch.get().to_be_bytes());
         out.extend_from_slice(self.beacon.as_bytes());
         let reg = self.keyper.to_bytes();
@@ -235,12 +234,11 @@ impl ChainInfo {
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Cursor::new(bytes);
-        let cell = CellParams {
-            q: r.u32()?,
-            n: r.u32()? as usize,
-            f: r.u32()? as usize,
-            quorum: r.u32()? as usize,
-        };
+        // **Checked, not believed.** The three non-`q` fields are a pure function of `q`, so a file whose
+        // four disagree is either tampered or mistyped — and a `quorum` below `⌈(n+f+1)/2⌉` runs consensus in
+        // which two quorums can be DISJOINT, so two conflicting blocks both finalize. That is a fork: a
+        // safety failure, not a liveness one, and it would look healthy until the cell partitioned.
+        let cell = CellParams::checked(r.u32()?, r.u32()? as usize, r.u32()? as usize, r.u32()? as usize)?;
         let epoch = Epoch::new(r.u64()?);
         let beacon = BeaconSeed::new(r.array32()?);
         let reg_len = r.u32()? as usize;
@@ -265,10 +263,10 @@ pub fn deal_validators<R: CryptoRng>(
     rng: &mut R,
 ) -> (Vec<ValidatorConfig>, KeyperRegistry) {
     // Draw each validator's secret seed, and derive its public verifier + keyper KEM public in one pass.
-    let mut node_seeds = Vec::with_capacity(cell.n);
-    let mut verifiers: Vec<Vec<u8>> = Vec::with_capacity(cell.n);
-    let mut certs = Vec::with_capacity(cell.n);
-    for i in 0..cell.n {
+    let mut node_seeds = Vec::with_capacity(cell.n());
+    let mut verifiers: Vec<Vec<u8>> = Vec::with_capacity(cell.n());
+    let mut certs = Vec::with_capacity(cell.n());
+    for i in 0..cell.n() {
         let mut node_seed = [0u8; 32];
         rng.fill_bytes(&mut node_seed);
         let mut kr = SeedRng::from_seed(&node_seed);
@@ -363,7 +361,7 @@ mod tests {
         let alloc = vec![([0x11; 32], 1_000_000u64), ([0x22; 32], 500u64)];
         let (configs, _registry) =
             deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &alloc, &mut SeedRng::from_seed(b"deal"));
-        assert_eq!(configs.len(), cell.n, "one config per validator seat");
+        assert_eq!(configs.len(), cell.n(), "one config per validator seat");
 
         // Every validator agrees on the SAME public cell config (verifiers, keyper commit, cell, beacon, alloc)…
         let shared = &configs[0];
@@ -390,7 +388,7 @@ mod tests {
         for c in &configs {
             let params = c.to_taxis_params().expect("params rebuild");
             assert_eq!(params.me, c.me);
-            assert_eq!(params.verifiers.len(), cell.n);
+            assert_eq!(params.verifiers.len(), cell.n());
             assert_eq!(params.keyper_commit, shared.keyper_commit);
             assert_eq!(params.genesis_state.tokens().balance(&[0x11; 32]), 1_000_000, "genesis credited the alloc");
             assert_eq!(params.genesis_state.tokens().balance(&[0x22; 32]), 500);

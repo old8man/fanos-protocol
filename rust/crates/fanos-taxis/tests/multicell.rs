@@ -206,7 +206,7 @@ impl<S: StateMachine + Clone> Cell<S> {
     }
 
     fn committee(&self, cell: u32) -> ChildCommittee {
-        ChildCommittee { cell, verifiers: self.verifiers.clone(), quorum: CellParams::FANO.quorum }
+        ChildCommittee { cell, verifiers: self.verifiers.clone(), quorum: CellParams::FANO.quorum() }
     }
 }
 
@@ -231,7 +231,7 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
     // ── The bridge relays a receipt. Cell B verifies it against ONLY cell A's committee keys — no bridge trust.
     let receipt = outbox.receipt(0, accounts_root, cert_a.clone()).expect("a receipt for the mint message");
     let msg: &CrossMsg = receipt
-        .verify(&cell_a.verifiers, CellParams::FANO.quorum)
+        .verify(&cell_a.verifiers, CellParams::FANO.quorum())
         .expect("cell B accepts a genuinely-certified cross-cell message");
     assert_eq!(msg.dest_cell, CELL_B);
     // Decode (recipient ‖ amount) and mint in cell B.
@@ -251,14 +251,14 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
         p.extend_from_slice(&1_000_000u64.to_be_bytes());
         p
     };
-    assert!(forged.verify(&cell_a.verifiers, CellParams::FANO.quorum).is_none(), "a forged mint is rejected");
+    assert!(forged.verify(&cell_a.verifiers, CellParams::FANO.quorum()).is_none(), "a forged mint is rejected");
 
     // ── The parent cell anchors both children's finalities (shared security).
     let cert_b = {
         // Cell B's own checkpoint after minting (its committee attests the post-mint state root).
         let keys_b = gen_keys(0xB0);
         let root_b = b_state.state_root();
-        let votes: Vec<ExecVote> = (0..CellParams::FANO.quorum).map(|i| ExecVote::sign(0, root_b, [0xEE; 32], i as u8, &keys_b[i].sig)).collect();
+        let votes: Vec<ExecVote> = (0..CellParams::FANO.quorum()).map(|i| ExecVote::sign(0, root_b, [0xEE; 32], i as u8, &keys_b[i].sig)).collect();
         ExecCertificate { height: 0, state_root: root_b, head: [0xEE; 32], votes }
     };
     let mut parent = ChildRegistry::new();

@@ -5,6 +5,7 @@
 //!   * `fanos proxy` — run local SOCKS5 / HTTP-CONNECT listeners tunnelling to `.fanos` services (§11.3).
 //!   * `fanos host`  — host a hidden service on the anonymous rendezvous, forwarding to a local port (§3b).
 //!   * `fanos validator` / `taxis-deal` — deal + run a TAXIS blockchain cell over the DROMOS ledger.
+//!   * `fanos term`  — compose an atomic ERGON term (multi-leg pays, name registrations, gates) and submit it.
 //!   * `fanos id`    — print (and optionally persist) a node's self-certifying coordinate.
 //!   * `fanos help`  — usage.
 
@@ -55,6 +56,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("message") => cmd_message(args.get(2..).unwrap_or(&[])).await,
         Some("validator") => cmd_validator(args.get(2..).unwrap_or(&[])).await,
         Some("pay") => cmd_pay(args.get(2..).unwrap_or(&[])).await,
+        Some("term") => cmd_term(args.get(2..).unwrap_or(&[])).await,
         Some("vpn") => cmd_vpn(args.get(2..).unwrap_or(&[])).await,
         Some("init") => cmd_init(args.get(2..).unwrap_or(&[])),
         Some(v @ ("start" | "stop" | "restart")) => cmd_service_lifecycle(v),
@@ -1999,7 +2001,7 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     println!(
         "dealt a {}-validator TAXIS cell (epoch {}); genesis-funded a founder with {supply} (key in founder.key)\n\
          run each validator with `fanos validator --config validator-<i>.taxis`",
-        cell.n,
+        cell.n(),
         epoch.get(),
     );
     Ok(())
@@ -2097,6 +2099,275 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
 #[cfg(not(feature = "validator"))]
 #[allow(clippy::unused_async)]
 async fn cmd_pay(_args: &[String]) -> Result<(), NodeError> {
+    Err(NodeError::Config(
+        "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
+            .to_owned(),
+    ))
+}
+
+/// `fanos term`: compose an **ERGON term** — one atomic, optionally gated, optionally computed transaction over
+/// the ledger's primitive effects — and submit it exactly the way `fanos pay` submits a transfer. **The door**
+/// `docs/design-ergon.md` §11 names as the residual after step 3 wired `TAG_ERGON` into the ledger's own dispatch
+/// (`HybridLedger::apply_with_verdict`'s `apply_term`, and `access_of`): before this verb, an ERGON term was
+/// built, signed, and executed only inside this workspace's own tests — nothing running as a node ever produced
+/// one. This does.
+///
+/// ```text
+/// fanos term --chain-info chain-info.taxis --key founder.key [--nonce M] [--dry-run]
+///            [--to <hex>[,<hex>...] --amount AMT[,AMT...]]      AMT = N | N% | all
+///            [--register-name NAME:TARGETHEX:DURATION[:FEE]]...
+///            [--require-name NAME=OWNERHEX]...
+///            [--require-min ACCTHEX:N]...
+///            [--bootstrap <coord>@host:port,…]
+/// ```
+///
+/// The term is `Gate(guards, Seq[registrations…, payments…])`, degenerating to the bare effect when only one leg
+/// and no guard is given. What each piece buys, and why no fixed tag can express it:
+///
+/// * **Atomic legs.** Every `--register-name` and every `--to`/`--amount` pair is one leg of a `Seq`: all apply
+///   or none do. Registrations run first so a later `all` payment sweeps what the fees LEFT — "register a name
+///   and forward the whole remainder" is one term, not a race between two transactions.
+/// * **Computed amounts** (`N%`, `all`). The amount is an expression evaluated at execution against the state as
+///   the previous legs left it — `all` is `Load(balance(sender))`, `N%` is `balance·N/100` — so a sweep cannot
+///   miss or overdraw by racing a concurrent debit. The expression's reads join the derived footprint, so DROMOS
+///   schedules on exactly what the amount reads.
+/// * **Guards.** `--require-name` gates the whole term on *live on-chain ownership* of a name
+///   (`PRED_NAME_OWNED`, the TOCTOU close for paying a name's off-chain resolution), `--require-min` on a
+///   balance floor. Several guards conjoin. A declined guard is the identity: the transaction applies, nothing
+///   moves, the nonce advances.
+///
+/// Everything downstream of building the payload is identical to `fanos pay`: the same chain-info/key parsing,
+/// the same anti-MEV seal to the epoch keyper line (no validator sees the term before its order is fixed), the
+/// same join-the-overlay-and-emit-to-a-validator submission. The chain re-derives everything it relies on —
+/// canonical decode, `well_typed`, the footprint, confinement — so this builder is a convenience, never an
+/// authority; `--dry-run` prints the same admission-facing numbers (depth, size, cost, footprint width, effect
+/// kinds) the chain will compute, and stops.
+#[cfg(feature = "validator")]
+#[allow(clippy::too_many_lines)] // one verb, one linear pipeline: parse → build → check → seal → submit
+async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
+    use fanos_dromos::HybridLedger;
+    use fanos_dromos::ergon::exec::compare;
+    use fanos_dromos::ergon::{Checked, Cmp, Expr, Limits, Predicate, Term, cost};
+    use fanos_dromos::ergon_host::{
+        PRED_NAME_OWNED, SignedTerm, balance_key, name_key, name_register_term, payment_term, transfer_term_with,
+    };
+    use fanos_dromos::naming::name_digest;
+    use fanos_dromos::token::account_id;
+    use fanos_dromos::price;
+    use fanos_geometry::Point;
+    use fanos_node::ChainInfo;
+    use fanos_pqcrypto::HybridSigSecret;
+    use fanos_pqcrypto::rng::SeedRng;
+    use fanos_runtime::Command;
+    use fanos_taxis::Transaction;
+    use fanos_taxis::keyper::seal_to_keyper_line;
+    use fanos_taxis::wire::tx_to_frame;
+
+    init_tracing();
+
+    let key_path = flag(args, "--key").ok_or_else(|| {
+        NodeError::Config("fanos term requires --key <32-byte seed file> (e.g. founder.key)".to_owned())
+    })?;
+    let seed: [u8; 32] = std::fs::read(key_path)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| NodeError::Config("the --key file must be a 32-byte seed".to_owned()))?;
+    let (signer, from_key) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
+    let from = account_id(&from_key);
+
+    let account32 = |what: &str, s: &str| -> Result<[u8; 32], NodeError> {
+        decode_hex(s)
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| NodeError::Config(format!("{what} '{s}' is not a 32-byte (64 hex char) account id")))
+    };
+
+    // Registration legs, first in the `Seq` (see the doc comment): NAME:TARGETHEX:DURATION[:FEE], with the fee
+    // defaulting to the registry's own floor `price(name, duration)` — computed here as a convenience, checked by
+    // the chain as the rule.
+    let mut registrations: Vec<Term> = Vec::new();
+    let mut register_display: Vec<String> = Vec::new();
+    for spec in flag_all(args, "--register-name") {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (name, target_hex, duration_s, fee_s) = match parts.as_slice() {
+            [n, t, d] => (*n, *t, *d, None),
+            [n, t, d, f] => (*n, *t, *d, Some(*f)),
+            _ => {
+                return Err(NodeError::Config(format!(
+                    "bad --register-name '{spec}' (expected NAME:TARGETHEX:DURATION[:FEE])"
+                )));
+            }
+        };
+        let target = decode_hex(target_hex)
+            .ok_or_else(|| NodeError::Config(format!("--register-name target '{target_hex}' is not hex")))?;
+        let duration: u64 =
+            duration_s.parse().map_err(|_| NodeError::Config(format!("bad duration in --register-name '{spec}'")))?;
+        let fee: u64 = match fee_s {
+            Some(f) => f.parse().map_err(|_| NodeError::Config(format!("bad fee in --register-name '{spec}'")))?,
+            None => price(name.as_bytes(), duration),
+        };
+        registrations.push(name_register_term(name.as_bytes(), &target, duration, fee, from));
+        register_display.push(format!("register '{name}' for {duration} blocks (fee {fee})"));
+    }
+
+    // Payment legs: `--to`/`--amount` are parallel comma lists — the `ports = 80,443` convention — zipped into
+    // pairs immediately so a length mismatch is a usage error here, not a silently truncated payment. An amount is
+    // a constant, `N%` of the sender's balance, or `all` of it — the computed forms are expressions evaluated at
+    // execution, against the state as the previous legs left it.
+    let to_arg = flag(args, "--to");
+    let amount_arg = flag(args, "--amount");
+    if to_arg.is_some() != amount_arg.is_some() {
+        return Err(NodeError::Config("--to and --amount must be given together".to_owned()));
+    }
+    let mut fixed_legs: Vec<([u8; 32], u64)> = Vec::new(); // the all-constant case, for `payment_term`
+    let mut pay_terms: Vec<Term> = Vec::new();
+    let mut pay_display: Vec<String> = Vec::new();
+    let mut all_fixed = true;
+    if let (Some(to_arg), Some(amount_arg)) = (to_arg, amount_arg) {
+        let to_list: Vec<&str> = to_arg.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let amount_list: Vec<&str> = amount_arg.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if to_list.len() != amount_list.len() {
+            return Err(NodeError::Config(format!(
+                "--to has {} recipient(s) but --amount has {} — they must pair up",
+                to_list.len(),
+                amount_list.len()
+            )));
+        }
+        for (&t, &a) in to_list.iter().zip(amount_list.iter()) {
+            let to = account32("--to entry", t)?;
+            let amount: Expr = if a == "all" {
+                all_fixed = false;
+                Expr::Load(balance_key(from))
+            } else if let Some(pct) = a.strip_suffix('%') {
+                let pct: u64 = pct.parse().map_err(|_| NodeError::Config(format!("bad --amount entry '{a}'")))?;
+                all_fixed = false;
+                Expr::bin(
+                    fanos_dromos::ergon::BinOp::Div,
+                    Expr::bin(
+                        fanos_dromos::ergon::BinOp::Mul,
+                        Expr::Load(balance_key(from)),
+                        Expr::int(u128::from(pct)),
+                    ),
+                    Expr::int(100),
+                )
+            } else {
+                let n: u64 = a.parse().map_err(|_| NodeError::Config(format!("bad --amount entry '{a}'")))?;
+                fixed_legs.push((to, n));
+                Expr::int(u128::from(n))
+            };
+            pay_terms.push(transfer_term_with(from, to, amount));
+            pay_display.push(format!("pay {a} -> {t}"));
+        }
+    }
+
+    // The body: registrations, then payments, one atomic `Seq` — or the bare leg when there is only one. The
+    // all-constant pure-payment case goes through `payment_term`, the canonical builder for it; the general case
+    // composes the same legs by hand.
+    let body: Term = if registrations.is_empty() && all_fixed && !fixed_legs.is_empty() {
+        payment_term(from, &fixed_legs)
+            .unwrap_or_else(|| unreachable!("fixed_legs is non-empty, so payment_term returns Some"))
+    } else {
+        let mut legs = registrations;
+        legs.append(&mut pay_terms);
+        match legs.len() {
+            0 => {
+                return Err(NodeError::Config(
+                    "fanos term needs at least one leg: --to/--amount and/or --register-name".to_owned(),
+                ));
+            }
+            1 => legs.remove(0),
+            _ => Term::Seq(legs),
+        }
+    };
+
+    // Guards, conjoined: live name ownership (the TOCTOU close for paying a name's off-chain resolution) and
+    // balance floors. The author imposes them on their own term — a declined guard is the identity, not a fault.
+    let mut guards: Vec<Predicate> = Vec::new();
+    let mut guard_display: Vec<String> = Vec::new();
+    for spec in flag_all(args, "--require-name") {
+        let (name, owner_hex) = spec.split_once('=').ok_or_else(|| {
+            NodeError::Config(format!("bad --require-name '{spec}' (expected NAME=OWNERHEX)"))
+        })?;
+        let owner = account32("--require-name owner", owner_hex)?;
+        guards.push(Predicate::host_with(
+            PRED_NAME_OWNED,
+            vec![name_key(name_digest(name.as_bytes()))],
+            vec![Expr::bytes32(owner)],
+        ));
+        guard_display.push(format!("require name '{name}' owned by {owner_hex}"));
+    }
+    for spec in flag_all(args, "--require-min") {
+        let (acct_hex, min_s) = spec.split_once(':').ok_or_else(|| {
+            NodeError::Config(format!("bad --require-min '{spec}' (expected ACCTHEX:N)"))
+        })?;
+        let acct = account32("--require-min account", acct_hex)?;
+        let min: u64 = min_s.parse().map_err(|_| NodeError::Config(format!("bad --require-min '{spec}'")))?;
+        guards.push(compare(Cmp::Ge, Expr::Load(balance_key(acct)), Expr::int(u128::from(min))));
+        guard_display.push(format!("require balance({acct_hex}) >= {min}"));
+    }
+    let term: Term = match guards.len() {
+        0 => body,
+        1 => Term::Gate(guards.remove(0), Box::new(body)),
+        _ => Term::Gate(Predicate::And(guards), Box::new(body)),
+    };
+
+    // The client-side admission preview: the SAME check and the SAME price the chain computes at its port
+    // (`well_typed` + `cost`, `docs/design-ergon.md` §4/§6), run before anything is signed — a term the chain
+    // would refuse should be refused here, for free.
+    let checked = Checked::new(term, &Limits::unbounded())
+        .map_err(|e| NodeError::Config(format!("the term is not well-typed: {e:?}")))?;
+    let fp = checked.term().footprint();
+    println!(
+        "term: depth {}, {} node(s), cost {} unit(s), footprint {} key(s) ({} read, {} written), effects {:?}",
+        checked.term().depth(),
+        checked.term().size(),
+        cost(checked.term()),
+        fp.width(),
+        fp.reads().len(),
+        fp.writes().len(),
+        checked.term().effect_kinds(),
+    );
+    for line in register_display.iter().chain(&pay_display).chain(&guard_display) {
+        println!("  {line}");
+    }
+    if has_flag(args, "--dry-run") {
+        return Ok(());
+    }
+
+    // Sign, seal, submit — byte-for-byte the `fanos pay` path from here on; the seal operates on the
+    // transaction's bytes and does not care which tag is inside them.
+    let info_path = flag(args, "--chain-info")
+        .ok_or_else(|| NodeError::Config("fanos term requires --chain-info chain-info.taxis".to_owned()))?;
+    let info = ChainInfo::from_bytes(&std::fs::read(info_path)?)
+        .ok_or_else(|| NodeError::Config("malformed chain-info file".to_owned()))?;
+    let nonce: u64 = match flag(args, "--nonce") {
+        Some(s) => s.parse().map_err(|_| NodeError::Config("bad --nonce".to_owned()))?,
+        None => 0,
+    };
+    let envelope = SignedTerm::sign(checked.encode(), nonce, &signer, from_key);
+    let tx = Transaction::new(HybridLedger::term_payload(&envelope));
+    let mut rng_seed = [0u8; 32];
+    getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let sealed = seal_to_keyper_line(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+        .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
+
+    let config = node_config_from_args(args)?;
+    let node = Node::start::<F2>(config).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
+    let submitted = node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: tx_to_frame(&sealed) });
+    tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
+    node.shutdown();
+    if submitted {
+        println!("submitted: ERGON term (nonce {nonce}), sealed to the epoch {} keyper line", info.epoch.get());
+        Ok(())
+    } else {
+        Err(NodeError::Config("could not emit the transaction (is the client connected to a validator?)".to_owned()))
+    }
+}
+
+/// Without the `validator` feature the binary carries no ledger, so `fanos term` cannot build a term.
+#[cfg(not(feature = "validator"))]
+#[allow(clippy::unused_async)]
+async fn cmd_term(_args: &[String]) -> Result<(), NodeError> {
     Err(NodeError::Config(
         "this build lacks validator support — rebuild with `cargo build -p fanos-node --features validator`"
             .to_owned(),
@@ -2511,6 +2782,16 @@ fn print_help() {
          \x20             validator-<i>.taxis + founder.key; --features validator)\n\
          \x20 fanos validator --config validator-<i>.taxis [--listen ADDR] [--bootstrap <coord>@host:port,…]\n\
          \x20             (run a TAXIS blockchain validator over the DROMOS ledger; --features validator)\n\
+         \x20 fanos pay --chain-info chain-info.taxis --key founder.key --to HEX --amount N [--nonce M] \\\n\
+         \x20             [--bootstrap ...]  (submit a transparent transfer; --features validator)\n\
+         \x20 fanos term --chain-info chain-info.taxis --key founder.key [--nonce M] [--dry-run] \\\n\
+         \x20             [--to HEX[,HEX...] --amount AMT[,AMT...]] (AMT = N | N% | all) \\\n\
+         \x20             [--register-name NAME:TARGETHEX:DUR[:FEE]] [--require-name NAME=OWNERHEX] \\\n\
+         \x20             [--require-min ACCTHEX:N] [--bootstrap ...]\n\
+         \x20             (compose ONE atomic ERGON term: multi-leg payments — amounts constant, N% of the\n\
+         \x20             live balance, or `all` of it — plus name registrations, gated on live name\n\
+         \x20             ownership or balance floors; all legs apply or none do, which no single tag\n\
+         \x20             expresses; --dry-run prints depth/cost/footprint and stops; --features validator)\n\
          \x20 fanos help\n\
          \n\
          PROXY PROFILES:\n\

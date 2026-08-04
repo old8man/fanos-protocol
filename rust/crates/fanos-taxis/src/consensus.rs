@@ -1429,7 +1429,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if let Some(cert) = block.last_commit.as_ref()
             && cert.phase == Phase::Commit
             && cert.height == claimed.saturating_sub(1)
-            && cert.verify(self.params.quorum, &self.verifiers)
+            && cert.verify(self.params.quorum(), &self.verifiers)
         {
             self.note_height(cert.height.saturating_add(1));
         }
@@ -1647,7 +1647,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if cert.height < self.height() {
             return Vec::new(); // (1) not ahead of us
         }
-        if !cert.verify(self.params.quorum, &self.verifiers) {
+        if !cert.verify(self.params.quorum(), &self.verifiers) {
             // **The T-H6 site.** `verify` now requires every `ExecVote` to agree on the head as well as the
             // root (`1fa8edc`), so a certificate stitched across two tips is refused here — but refusing it
             // silently leaves the victim looking merely quiet. A validator that cannot catch up and a
@@ -1876,7 +1876,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             self.cc_rejects.0 = self.cc_rejects.0.saturating_add(1);
             return Vec::new();
         }
-        if !cert.verify(self.params.quorum, &self.verifiers) {
+        if !cert.verify(self.params.quorum(), &self.verifiers) {
             self.cc_rejects.1 = self.cc_rejects.1.saturating_add(1);
             return Vec::new();
         }
@@ -1979,7 +1979,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             c.phase == Phase::Prepare
                 && c.height == height
                 && c.block_hash == bh
-                && c.verify(self.params.quorum, &self.verifiers)
+                && c.verify(self.params.quorum(), &self.verifiers)
         });
         if pol_ok
             && let Some(cert) = block.pol.as_deref()
@@ -2148,7 +2148,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let Some(held) = &self.locked_cert else { return false };
         let Some(pol) = &block.pol else { return false };
         pol_shape_releases(pol, block.hash(), self.height(), held.round, self.round)
-            && pol.verify(self.params.quorum, &self.verifiers)
+            && pol.verify(self.params.quorum(), &self.verifiers)
     }
 
     /// Prepare the **lowest-ticket** round-0 proposal collected so far — the elected secret leader. Called on
@@ -2302,15 +2302,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 by_value.entry(sv.vote.block_hash).or_default().insert(sv.vote.voter);
             }
         }
-        if voters.len() < self.params.quorum {
+        if voters.len() < self.params.quorum() {
             return Vec::new(); // the round has not spoken yet
         }
         // A value that already holds a quorum decides the round; one that *could still* reach one keeps it
         // alive. Only when neither is true has the round provably failed.
-        let undecided = self.params.n.saturating_sub(voters.len());
+        let undecided = self.params.n().saturating_sub(voters.len());
         let alive = by_value
             .iter()
-            .any(|(hash, who)| *hash != NIL && who.len().saturating_add(undecided) >= self.params.quorum);
+            .any(|(hash, who)| *hash != NIL && who.len().saturating_add(undecided) >= self.params.quorum());
         if alive {
             return Vec::new();
         }
@@ -2347,7 +2347,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 *slot = (*slot).max(sv.vote.round);
             }
         }
-        let threshold = self.params.f + 1;
+        let threshold = self.params.f() + 1;
         if highest.len() < threshold {
             return Vec::new();
         }
@@ -2420,7 +2420,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return Vec::new();
         }
         let cert = self.collect_cert(Phase::Prepare, block_hash);
-        if !cert.verify(self.params.quorum, &self.verifiers) {
+        if !cert.verify(self.params.quorum(), &self.verifiers) {
             return Vec::new();
         }
         // Prepared: lock the block and commit to it. The certificate that justified the lock is retained as the
@@ -2440,7 +2440,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// If a commit certificate exists for `block_hash`, finalize the block.
     fn check_committed(&mut self, block_hash: [u8; 32]) -> Vec<Output> {
         let cert = self.collect_cert(Phase::Commit, block_hash);
-        if !cert.verify(self.params.quorum, &self.verifiers) {
+        if !cert.verify(self.params.quorum(), &self.verifiers) {
             return Vec::new();
         }
         self.finalize(block_hash)
@@ -2486,7 +2486,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
                 cert.phase == Phase::Commit
                     && cert.block_hash == block.header.parent
                     && cert.height == block.header.height.saturating_sub(1)
-                    && cert.verify(self.params.quorum, &self.verifiers)
+                    && cert.verify(self.params.quorum(), &self.verifiers)
             }
         }
     }
@@ -2887,7 +2887,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             by_state.entry((v.state_root, v.head)).or_default().push(v.clone());
         }
         for ((root, head), votes) in by_state {
-            if votes.len() >= self.params.quorum {
+            if votes.len() >= self.params.quorum() {
                 self.checkpoint = Some(ExecCertificate { height, state_root: root, head, votes });
                 self.prune_recovery_retention();
                 return;
