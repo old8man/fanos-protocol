@@ -27,8 +27,13 @@ pub mod token;
 
 pub use bridge::{POOL_SINK, ShieldTx};
 pub use hybrid::{
-    HybridLedger, TAG_NAME, TAG_SHIELD, TAG_SHIELDED, TAG_SLASH, TAG_STAKE, TAG_TRANSPARENT,
+    HybridLedger, TAG_ERGON, TAG_NAME, TAG_SHIELD, TAG_SHIELDED, TAG_SLASH, TAG_STAKE, TAG_TRANSPARENT,
 };
+// The execution algebra this ledger hosts, re-exported whole. The node binary builds terms to submit
+// (`fanos term`) and reaches the algebra THROUGH the ledger crate on purpose: `fanos-ergon` is `no_std` with no
+// dependencies, and the one place its types must agree with a running node's is exactly where the ledger interprets
+// them — a separate direct dependency would be a second version-agreement point with nothing to enforce it.
+pub use fanos_ergon as ergon;
 pub use stake::{STAKE_SINK, SlashTx, StakeLedger, StakeTx};
 pub use naming::{
     Descriptor, DescriptorKind, NameError, NameOp, NameRecord, NameRegistry, NameTx, TREASURY, price,

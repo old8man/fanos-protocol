@@ -114,6 +114,45 @@ impl<S: State + ?Sized> State for Confined<'_, S> {
     }
 }
 
+/// A read-only state view restricted to a declared read set, recording the first violation — the predicate-side
+/// counterpart of [`Confined`].
+///
+/// It exists because the first real host predicate exposed an asymmetry: an effect's rule runs behind a view confined
+/// to its derived footprint, while a host predicate was handed the raw state. A predicate rule that read a key outside
+/// its declared `reads` would then answer from state the scheduler never saw — the same footprint-soundness hole
+/// [`Confined`] closes for effects, open on the side that *gates* them. The check is `contains` rather than a binary
+/// search because a `Predicate::Host`'s read set, unlike a [`Footprint`], can be constructed unsorted (the enum is
+/// public); the constructors and the codec both sort, but soundness here must not depend on which door the term came
+/// through.
+pub struct ConfinedReader<'a> {
+    inner: &'a dyn Reader,
+    reads: &'a [Key],
+    violation: core::cell::Cell<Option<Key>>,
+}
+
+impl<'a> ConfinedReader<'a> {
+    /// Restrict `inner` to `reads`.
+    pub fn new(inner: &'a dyn Reader, reads: &'a [Key]) -> Self {
+        Self { inner, reads, violation: core::cell::Cell::new(None) }
+    }
+
+    /// The first out-of-read-set key touched, if any.
+    #[must_use]
+    pub fn violation(&self) -> Option<Key> { self.violation.get() }
+}
+
+impl Reader for ConfinedReader<'_> {
+    fn get(&self, key: &Key) -> Option<Value> {
+        if !self.reads.contains(key) {
+            if self.violation.get().is_none() {
+                self.violation.set(Some(*key));
+            }
+            return None;
+        }
+        self.inner.get(key)
+    }
+}
+
 /// A state wrapper that can undo its writes, so a composite is atomic.
 pub struct Journal<'a, S: State + ?Sized> {
     inner: &'a mut S,
@@ -283,11 +322,22 @@ fn eval_predicate<S: State + ?Sized, H: Host>(
     receipt.predicates += 1;
     match pred {
         Predicate::Host { kind, reads, args: exprs } => {
+            // The argument expressions read the raw journal: their loads are collected into the term's footprint
+            // structurally (`Predicate::collect_reads`), so they cannot reach a key the scheduler did not see. The
+            // host's own rule is native code with no such structure, so it runs behind [`ConfinedReader`] — and the
+            // violation is checked BEFORE its verdict, for the same reason an effect's is: a rule that read outside
+            // its declared set usually saw `None` and answered something plausible, which would mask the one signal
+            // that says the footprint DROMOS scheduled on was not the footprint the rule used.
             let mut evaluated = Vec::with_capacity(exprs.len());
             for e in exprs {
                 evaluated.push(e.eval(state, args)?);
             }
-            host.predicate(*kind, reads, &evaluated, state)
+            let confined = ConfinedReader::new(state, reads);
+            let verdict = host.predicate(*kind, reads, &evaluated, &confined);
+            if let Some(key) = confined.violation() {
+                return Err(Fault::OutsideFootprint(key));
+            }
+            verdict
         }
         Predicate::Compare { op, lhs, rhs } => {
             let (a, b) = (lhs.eval(state, args)?, rhs.eval(state, args)?);
@@ -363,11 +413,17 @@ mod tests {
         }
 
         /// Kind 1: unconditionally true. Kind 8: true iff the first argument is 42 — the argument-relative question a
-        /// host predicate could not ask before, and the shape an HTLC's "does this preimage match" takes.
-        fn predicate(&self, kind: u16, _reads: &[Key], args: &[Value], _state: &dyn Reader) -> Result<bool, Fault> {
+        /// host predicate could not ask before, and the shape an HTLC's "does this preimage match" takes. Kind 9: a
+        /// rule that reads a key OUTSIDE its declared read set and confidently answers true — the misbehaviour
+        /// [`ConfinedReader`] exists to catch.
+        fn predicate(&self, kind: u16, _reads: &[Key], args: &[Value], state: &dyn Reader) -> Result<bool, Fault> {
             match kind {
                 1 => Ok(true),
                 8 => Ok(args.first() == Some(&Value::Int(42))),
+                9 => {
+                    let _ = state.get(&self.stray);
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         }
@@ -525,6 +581,35 @@ mod tests {
         let r = eval(&ck(gate(41)), &[], &mut rules(), &mut no).expect("evaluates");
         assert_eq!(r.effects, 0, "a different argument refuses — so the predicate is reading it, not ignoring it");
         assert_eq!(no.get(&k(10)), None);
+    }
+
+    #[test]
+    fn a_host_predicate_reading_outside_its_declared_reads_faults_rather_than_answering() {
+        // The predicate-side confinement, falsified by construction: kind 9 reads `stray` (k99), declares only k1,
+        // and answers `true`. Measured with the wrap removed (the raw journal handed to `host.predicate`): the gate
+        // admits, the body runs, and this test fails at the `expect_err` — so the fault below is the confinement
+        // working, not kind 9 failing some other way. The property assertion comes first: the fault must name the
+        // stray key, and it must win over the
+        // rule's own confident verdict, or the one signal that says "the footprint DROMOS scheduled on is not the
+        // footprint the rule used" is the signal the caller never sees.
+        let mut mem = Mem::default();
+        mem.set(k(1), Value::Int(5));
+        let sneaky = Term::Gate(
+            Predicate::host(9, vec![k(1)]),
+            alloc::boxed::Box::new(write_to(k(10), Expr::int(1))),
+        );
+        let fault = eval(&ck(sneaky), &[], &mut rules(), &mut mem).expect_err("the stray read must fault");
+        assert_eq!(fault, Fault::OutsideFootprint(k(99)));
+        assert_eq!(mem.get(&k(10)), None, "and the gated body never ran");
+
+        // The same rule with the stray key DECLARED is in bounds — so the fault above is confinement, not kind 9
+        // being broken some other way.
+        let declared = Term::Gate(
+            Predicate::host(9, vec![k(1), k(99)]),
+            alloc::boxed::Box::new(write_to(k(10), Expr::int(1))),
+        );
+        eval(&ck(declared), &[], &mut rules(), &mut mem).expect("declared reads are permitted");
+        assert_eq!(mem.get(&k(10)), Some(Value::Int(1)), "the gate admitted and the body ran");
     }
 
     #[test]

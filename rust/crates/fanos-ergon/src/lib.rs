@@ -62,7 +62,7 @@ pub mod codec;
 pub mod exec;
 pub mod value;
 
-pub use exec::{Confined, Host, Journal, Reader, Receipt, State, eval};
+pub use exec::{Confined, ConfinedReader, Host, Journal, Reader, Receipt, State, eval};
 pub use value::{BinOp, Cmp, EXPR_DEPTH_MAX, Expr, Fault, Value};
 
 use alloc::vec::Vec;
@@ -509,7 +509,13 @@ impl Term {
     #[must_use]
     pub fn footprint(&self) -> Footprint {
         match self {
-            Self::Do(e) => e.footprint.clone(),
+            // The DERIVED footprint — declared keys ∪ argument loads — never the declared field alone. The first
+            // version cloned the field here, and the two answers diverged exactly where it mattered: the evaluator
+            // confines a rule to `Effect::footprint()` (which admits argument loads), while this function is what the
+            // scheduler's access list and `Par`'s disjointness proof consume. A term whose argument loads a key would
+            // then execute reads the schedule never saw — two conflicting transactions sharing a wave, the fork the
+            // derivation exists to prevent. Pinned by `a_terms_footprint_sees_argument_loads_not_only_declared_keys`.
+            Self::Do(e) => e.footprint(),
             Self::Seq(ts) | Self::Par(ts) => {
                 ts.iter().fold(Footprint::empty(), |acc, t| acc.union(&t.footprint()))
             }
@@ -922,6 +928,35 @@ mod tests {
         assert_eq!(fp.reads(), ks(&[1, 2]));
         assert_eq!(fp.writes(), ks(&[2, 3]));
         assert_eq!(fp.width(), 4);
+    }
+
+    #[test]
+    fn a_terms_footprint_sees_argument_loads_not_only_declared_keys() {
+        // The seam between the two footprint answers, pinned shut. `exec::eval` confines a rule to
+        // `Effect::footprint()` — declared keys ∪ argument loads — but the scheduler and `Par`'s disjointness proof
+        // consume `Term::footprint()`. If the latter returned the declared field alone (as it originally did), a term
+        // whose argument loads a key would execute a read the schedule never saw, and two conflicting transactions
+        // would share a wave. Falsified against the original body (`Self::Do(e) => e.footprint.clone()`): both
+        // assertions below then fail — the read is missing, and the conflicting `Par` typechecks.
+        let computed = Term::Do(
+            Effect::internal(1, Footprint::new(vec![], ks(&[2])))
+                .with_args(vec![Expr::Load(k(9))]),
+        );
+        assert!(
+            computed.footprint().reads().contains(&k(9)),
+            "an argument load is part of the TERM's footprint, where the scheduler reads it"
+        );
+
+        // And the same seam from `Par`'s side: a branch writing what another branch's ARGUMENT loads is a conflict,
+        // so the disjointness proof must refuse it — order would otherwise be observable through the argument.
+        let clash = Term::Par(vec![
+            Term::Do(Effect::internal(1, Footprint::new(vec![], ks(&[9])))),
+            computed,
+        ]);
+        assert_eq!(
+            well_typed(&clash, &Limits::unbounded()),
+            Err(TypeError::ParallelConflict { left: 0, right: 1 })
+        );
     }
 
     #[test]

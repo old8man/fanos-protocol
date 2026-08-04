@@ -1121,6 +1121,13 @@ enum StatelessJob {
     Transparent(Box<SignedTransfer>),
     /// A shielded transfer: verify its zero-knowledge proof against the pool parameters.
     Shielded(Box<(ShieldedTx, TransparentProof)>),
+    /// An ERGON term envelope: verify its hybrid post-quantum signature over the nonce and the exact term bytes.
+    ///
+    /// Included for the same reason the transparent transfer is: the envelope's signature is the identical
+    /// multi-kilobyte hybrid check, stateless by construction (`SignedTerm::verify` reads nothing but the envelope),
+    /// and a term left out of this batch would pay its verification serially inside the commit loop — the term path
+    /// would then be structurally slower than the tag it re-expresses, for no reason but an omission here.
+    Term(Box<SignedTerm>),
 }
 
 /// The stateless verification job for `tx`, or `None` for a transaction type committed with an inline check (or
@@ -1131,6 +1138,7 @@ fn stateless_job(tx: &Transaction) -> Option<StatelessJob> {
             SignedTransfer::from_bytes(body).map(|st| StatelessJob::Transparent(Box::new(st)))
         }
         Some((&TAG_SHIELDED, body)) => decode_submission(body).map(|pair| StatelessJob::Shielded(Box::new(pair))),
+        Some((&TAG_ERGON, body)) => SignedTerm::from_bytes(body).map(|env| StatelessJob::Term(Box::new(env))),
         _ => None,
     }
 }
@@ -1140,6 +1148,7 @@ fn eval_job((i, job): &(usize, StatelessJob), params: &Params) -> (usize, bool) 
     let ok = match job {
         StatelessJob::Transparent(st) => st.verify(),
         StatelessJob::Shielded(pair) => ShieldedState::verify_proof(params, &pair.0, &pair.1),
+        StatelessJob::Term(env) => env.verify(),
     };
     (*i, ok)
 }
@@ -1277,6 +1286,60 @@ mod tests {
             "exactly the two balances"
         );
         assert!(access.reads.is_empty());
+
+        // A COMPUTED argument's load reaches the access list too — the production-facing face of the seam
+        // `fanos-ergon` pins in `a_terms_footprint_sees_argument_loads_not_only_declared_keys`. A sweep's amount
+        // reads the payer's balance at execution, so the scheduler must see that read here, where waves are cut;
+        // with the original field-only `Term::footprint` this read was invisible and two conflicting transactions
+        // could share a wave.
+        let sweep = crate::ergon_host::transfer_term_with(
+            alice,
+            bob,
+            fanos_ergon::Expr::Load(balance_key(alice)),
+        );
+        let access = HybridLedger::new(TokenLedger::new())
+            .access_of(&ergon_tx(&sweep, 0, &signer, &key), &empty, &empty);
+        assert!(
+            access.reads.contains(&balance_key(alice)),
+            "the computed amount's load is a scheduled read: {access:?}"
+        );
+    }
+
+    #[test]
+    fn a_term_executes_through_the_block_path_with_its_signature_batched() {
+        // `execute_block` verifies the stateless half of every transaction in a parallel pre-pass and commits with
+        // the pre-computed verdicts. A term envelope's hybrid PQ signature is exactly that half, so it must ride the
+        // batch (`StatelessJob::Term`) — left out, every term would pay a multi-kilobyte verification serially inside
+        // the commit loop, making the term path structurally slower than the tag it re-expresses.
+        //
+        // Falsified by inverting the Term arm in `eval_job` (`!env.verify()`): the valid term below is then Rejected
+        // by the block path — so the batch verdict is demonstrably what admits it, not an inline re-check quietly
+        // covering for a broken batch.
+        let (signer, key, alice) = account(4);
+        let (_, _, bob) = account(5);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        let honest = ergon_tx(&transfer_term(alice, bob, 25), 0, &signer, &key);
+        assert_eq!(ledger.execute_block(&[honest]), vec![ExecOutcome::Applied]);
+        assert_eq!(ledger.tokens().balance(&bob), 25, "the batched verdict admitted the term and it executed");
+
+        // And a spliced envelope — the signature covering different term bytes — is refused on the same path, so
+        // the batch is checking the signature rather than waving envelopes through.
+        let greedy = transfer_term(alice, bob, 900);
+        let envelope = SignedTerm::sign(transfer_term(alice, bob, 1).encode(), 1, &signer, key.clone());
+        let forged = SignedTerm::from_bytes(&{
+            let mut b = envelope.to_bytes();
+            b.truncate(b.len() - transfer_term(alice, bob, 1).encode().len());
+            b.extend_from_slice(&greedy.encode());
+            b
+        })
+        .expect("the forged envelope still decodes");
+        let mut payload = vec![TAG_ERGON];
+        payload.extend_from_slice(&forged.to_bytes());
+        assert_eq!(ledger.execute_block(&[Transaction::new(payload)]), vec![ExecOutcome::Rejected]);
+        assert_eq!(ledger.tokens().balance(&bob), 25, "nothing moved on the forged submission");
     }
 
     #[test]

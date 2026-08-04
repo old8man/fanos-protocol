@@ -53,6 +53,28 @@ pub const EFFECT_TRANSFER: u16 = TAG_TRANSPARENT as u16;
 /// the split is right.)
 pub const EFFECT_NAME_REGISTER: u16 = TAG_NAME as u16;
 
+/// The name-ownership predicate: **does a live name record owned by the given account sit at the declared key?**
+///
+/// The first real host predicate, and the one `docs/design-ergon.md` §5(a) has named from the start — *"transfer, but
+/// only if the recipient's name is registered" is `Gate (NameExists r) Transparent`* — sharpened to ownership because
+/// existence alone answers the wrong question: a payment routed via a name resolves the name to an account **off
+/// chain**, and what the payer needs at execution time is that the name still belongs to that account. Between
+/// resolution and execution the name can expire or change hands; this predicate closes that window on chain, where
+/// the race actually is. A `Predicate::Compare` cannot ask it: liveness needs the *runtime's* height (a term must
+/// never name its own clock — see [`LedgerHost`]), and ownership needs a field of a record the author cannot fully
+/// reconstruct (the expiry is the registry's).
+///
+/// Shape: `reads = [name_key(digest)]` — the record's key IS the name, so no name argument is carried — and
+/// `args = [owner: Bytes32]`. It is the characteristic function of "a live record owned by `owner` sits at this key":
+/// absent, expired, foreign-owned, or not-a-name-record are all `false`, never a fault, so a `Gate` on it declines
+/// cleanly. Wrong arity or a non-digest owner argument is a deterministic [`Fault::Rejected`] — a malformed question,
+/// not a false answer.
+///
+/// Numbered by the wire tag of the sub-ledger it interrogates, the same mechanical correspondence the effect kinds
+/// use ([`EFFECT_TRANSFER`], [`EFFECT_NAME_REGISTER`]). Predicate kinds are their own namespace — [`Host::predicate`]
+/// dispatches them separately from effects — so the reuse of the number is correspondence, not collision.
+pub const PRED_NAME_OWNED: u16 = TAG_NAME as u16;
+
 /// The projective point ledger state currently lives at.
 ///
 /// One cell, so one point. It is spelled out rather than left implicit because `Key` carries a point precisely so that
@@ -107,12 +129,55 @@ pub const fn balance_key(account: [u8; 32]) -> Key { Key::at(LEDGER_POINT, SPACE
 /// the same set independently — the chain never reads this declaration, it recomputes it.
 #[must_use]
 pub fn transfer_term(from: [u8; 32], to: [u8; 32], amount: u64) -> Term {
+    transfer_term_with(from, to, Expr::int(u128::from(amount)))
+}
+
+/// A transparent transfer whose amount is a **computed expression** — the general form [`transfer_term`] is the
+/// constant case of.
+///
+/// This is the capability `docs/design-ergon.md` §10b names as the difference between composing and programming:
+/// `Expr::Load(balance_key(from))` sweeps the whole balance at execution time, and
+/// `balance · pct / 100` pays a fraction of whatever the balance IS when the term runs — under a `Seq`, the state as
+/// the previous legs left it, which is what makes "pay these two, then sweep the rest to a third" one atomic term
+/// rather than a race against yourself.
+///
+/// The footprint needs no extra declaration for the expression's loads: `Effect::footprint`/`Term::footprint` collect
+/// them structurally, so DROMOS schedules on exactly what the amount reads. That derivation is load-bearing enough
+/// that `fanos-ergon` pins it from both sides (`a_terms_footprint_sees_argument_loads_not_only_declared_keys`).
+#[must_use]
+pub fn transfer_term_with(from: [u8; 32], to: [u8; 32], amount: Expr) -> Term {
     let footprint = Footprint::new(vec![], vec![balance_key(from), balance_key(to)]);
     Term::Do(Effect::internal(EFFECT_TRANSFER, footprint).with_args(vec![
         Expr::bytes32(from),
         Expr::bytes32(to),
-        Expr::int(u128::from(amount)),
+        amount,
     ]))
+}
+
+/// An atomic multi-recipient payment: `Seq[transfer_term, transfer_term, …]` for more than one leg, or the bare
+/// [`transfer_term`] for exactly one. `None` for zero legs — there is no term for "pay nobody", and a caller that
+/// reached here with an empty list has a bug worth surfacing before a fee is charged for a no-op, rather than a
+/// term `well_typed` would refuse anyway as `TypeError::EmptyCombinator`.
+///
+/// This is `docs/design-ergon.md` §5(a)'s worked example — *"pay a storage provider **and** register a name …
+/// all or nothing"*, specialised to the payment leg — made reachable from outside a test: `fanos term` is
+/// what calls this from a running node, not a unit test. A single tag cannot express it. `TAG_TRANSPARENT` moves
+/// one balance pair per transaction, so "pay everyone or pay no one" otherwise needs either N separate
+/// transactions — no atomicity, since a later leg can fail after an earlier one has already committed — or a
+/// bespoke multi-transfer tag, i.e. a protocol release per fan-out size. `Seq` gets both for free:
+/// `Term::footprint` derives the exact union of balances touched, so DROMOS schedules it against everything it
+/// actually conflicts with, and the evaluator's journal (`fanos_ergon::exec`) makes the whole term all-or-nothing.
+///
+/// One leg is returned bare rather than wrapped in a one-element `Seq`, because a combinator composing a single
+/// child composes nothing — it only adds a node `Term::depth`/`Term::footprint` walk through for no semantic
+/// gain, and `transfer_term` alone is already exactly as executable.
+#[must_use]
+pub fn payment_term(from: [u8; 32], legs: &[([u8; 32], u64)]) -> Option<Term> {
+    match legs {
+        [] => None,
+        &[(to, amount)] => Some(transfer_term(from, to, amount)),
+        many => Some(Term::Seq(many.iter().map(|&(to, amount)| transfer_term(from, to, amount)).collect())),
+    }
 }
 
 /// A term that registers `name` — the composable form of what `TAG_NAME` does.
@@ -457,11 +522,28 @@ impl Host for LedgerHost {
         }
     }
 
-    fn predicate(&self, kind: u16, _reads: &[Key], _args: &[Value], _state: &dyn Reader) -> Result<bool, Fault> {
-        // No host predicates yet: everything the transfer needs to ask is expressible as a `Predicate::Compare` over the
-        // balance keys, which is the point of the expression layer. A signature check is the first real host predicate,
-        // and it belongs to the envelope rather than a `Gate` — see the module note on authorization.
-        Err(Fault::Rejected { kind })
+    fn predicate(&self, kind: u16, reads: &[Key], args: &[Value], state: &dyn Reader) -> Result<bool, Fault> {
+        match kind {
+            // See [`PRED_NAME_OWNED`]. The read goes through `state`, which the evaluator has confined to the
+            // predicate's declared read set (`fanos_ergon::ConfinedReader`) — so this rule *cannot* consult a key the
+            // scheduler did not see, and the discipline is enforced rather than reviewed. Liveness is the same
+            // comparison the registration rule uses for "taken" (`apply_name_register`): a name is owned at this
+            // height iff `height <= expiry`, with the height the runtime's, never the term's.
+            PRED_NAME_OWNED => {
+                let (Some(key), [owner]) = (reads.first(), args) else {
+                    return Err(Fault::Rejected { kind });
+                };
+                let owner = owner.as_bytes32()?;
+                Ok(state
+                    .get(key)
+                    .as_ref()
+                    .and_then(name_record_from)
+                    .is_some_and(|rec| self.height <= rec.expiry && rec.owner == owner))
+            }
+            // An unknown predicate kind is a malformed question. A signature check stays the envelope's job, never a
+            // gate's — see the module note on authorization.
+            _ => Err(Fault::Rejected { kind }),
+        }
     }
 }
 
@@ -863,6 +945,170 @@ mod tests {
         let mut ledger2 = funded();
         run(&ok, ALICE, &mut ledger2).expect("both legs fit");
         assert_eq!((ledger2.balance(&ALICE), ledger2.balance(&BOB), ledger2.balance(&CAROL)), (200, 400, 400));
+    }
+
+    /// **The CLI's exact path, replayed as a test.** `fanos ergon-pay` builds a term with [`payment_term`], signs
+    /// it into a [`SignedTerm`], wraps it with [`HybridLedger::term_payload`], and submits the resulting bytes as
+    /// a [`crate::Transaction`]. This test does precisely that — no shortcut through a bare `eval` or a
+    /// hand-built `Term::Seq` — so a defect in the wiring between the new builder and the ledger's own dispatch
+    /// (`apply_with_verdict`'s `TAG_ERGON` arm, i.e. `apply_term`) would show up here, not only in a unit test of
+    /// the bare algebra.
+    ///
+    /// Two submissions from one account: the first term pays two recipients and must land atomically; the second
+    /// term's own second leg overdraws and must roll back **both** of its legs while leaving the first term's
+    /// already-committed effect untouched — the same claim `a_composite_of_two_transfers_is_atomic` makes for the
+    /// bare algebra, re-checked here through the wire envelope and `apply_term`'s nonce handling specifically.
+    ///
+    /// **Falsified twice, both reverted after confirming failure.** (1) Changed `payment_term`'s multi-leg arm to
+    /// keep only `many[0]` (silently dropping every further leg) — `carol`'s balance assertion failed (`0` instead
+    /// of `200`), proving the test actually checks that every leg lands, not just that *something* applies. (2)
+    /// Changed the second term's overdraw from `100_000` to `100` (i.e. made it fit) — the `ExecOutcome::Rejected`
+    /// assertion then failed, proving the rejection path is not vacuously true.
+    #[test]
+    fn payment_term_pays_every_recipient_atomically_through_the_full_wire_path() {
+        use crate::hybrid::HybridLedger;
+        use fanos_pqcrypto::SeedRng;
+
+        let mut rng = SeedRng::from_seed(&[0x9E; 2]);
+        let (signer, verifier) = HybridSigSecret::generate(&mut rng);
+        let alice = crate::token::account_id(&verifier);
+        let (bob, carol) = ([2u8; 32], [3u8; 32]);
+
+        let mut tokens = TokenLedger::new();
+        tokens.credit(alice, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Two legs that both fit: 300 + 200 = 500 <= 1000.
+        let legs = [(bob, 300u64), (carol, 200u64)];
+        let term = payment_term(alice, &legs).expect("two legs make a Some term");
+        let envelope = SignedTerm::sign(term.encode(), 0, &signer, verifier.clone());
+        let tx = crate::Transaction::new(HybridLedger::term_payload(&envelope));
+        assert_eq!(
+            <HybridLedger as crate::StateMachine>::apply(&mut ledger, &tx),
+            crate::ExecOutcome::Applied,
+            "the wire-submitted term must apply"
+        );
+        assert_eq!(ledger.tokens().balance(&alice), 500, "both legs debited atomically");
+        assert_eq!(ledger.tokens().balance(&bob), 300, "the first leg landed");
+        assert_eq!(ledger.tokens().balance(&carol), 200, "the second leg landed too, not just the first");
+
+        // A second term whose second leg overdraws must roll back BOTH of its own legs, leaving the first term's
+        // already-committed effect above untouched.
+        let doomed = [(bob, 100u64), (carol, 100_000u64)];
+        let term2 = payment_term(alice, &doomed).expect("two legs make a Some term");
+        let envelope2 = SignedTerm::sign(term2.encode(), 1, &signer, verifier);
+        let tx2 = crate::Transaction::new(HybridLedger::term_payload(&envelope2));
+        assert_eq!(
+            <HybridLedger as crate::StateMachine>::apply(&mut ledger, &tx2),
+            crate::ExecOutcome::Rejected,
+            "the second term's overdrawing leg must refuse the whole term"
+        );
+        assert_eq!(ledger.tokens().balance(&alice), 500, "the doomed term left no trace");
+        assert_eq!(ledger.tokens().balance(&bob), 300, "unchanged by the rejected second term");
+        assert_eq!(ledger.tokens().balance(&carol), 200, "unchanged by the rejected second term");
+    }
+
+    /// [`PRED_NAME_OWNED`] end to end through the wire envelope: the gate admits exactly when a LIVE record with
+    /// the EXPECTED owner sits at the declared key, and declines — cleanly, as the identity, with the transaction
+    /// still applying — for expired, foreign-owned, and absent names.
+    ///
+    /// Falsified against its own mechanism twice: (1) with the `self.height <= rec.expiry` comparison removed from
+    /// the predicate, the expired case pays (the `after-expiry` assertion fails at 100 instead of 0); (2) with the
+    /// owner comparison removed, the foreign-owner case pays. Both restored; each clause below is therefore known to
+    /// be the one refusing its case.
+    #[test]
+    fn a_name_ownership_gate_admits_the_live_owner_and_declines_expired_foreign_and_absent() {
+        use crate::StateMachine as _;
+        use crate::hybrid::HybridLedger;
+        use fanos_pqcrypto::SeedRng;
+
+        let mut rng = SeedRng::from_seed(&[0x77; 2]);
+        let (signer, verifier) = HybridSigSecret::generate(&mut rng);
+        let payer = crate::token::account_id(&verifier);
+        let (owner, stranger, bob) = ([4u8; 32], [5u8; 32], [6u8; 32]);
+
+        let mut tokens = TokenLedger::new();
+        tokens.credit(payer, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.names_mut().put(NameRecord {
+            name: b"alice".to_vec(),
+            owner,
+            target: vec![1],
+            expiry: 50,
+        });
+
+        // "Pay bob 100 iff `alice` is currently owned by `expect`" — the author's own condition over registry state.
+        let gated = |expect: [u8; 32], name: &[u8]| {
+            Term::Gate(
+                fanos_ergon::Predicate::host_with(
+                    PRED_NAME_OWNED,
+                    vec![name_key(name_digest(name))],
+                    vec![Expr::bytes32(expect)],
+                ),
+                Box::new(transfer_term(payer, bob, 100)),
+            )
+        };
+        let submit = |ledger: &mut HybridLedger, term: &Term, nonce: u64| {
+            let envelope = SignedTerm::sign(term.encode(), nonce, &signer, verifier.clone());
+            <HybridLedger as crate::StateMachine>::apply(ledger, &crate::Transaction::new(HybridLedger::term_payload(&envelope)))
+        };
+
+        // Live and owned: the gate admits and the payment lands.
+        ledger.begin_block(10);
+        assert_eq!(submit(&mut ledger, &gated(owner, b"alice"), 0), crate::ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 100, "owned at height 10, so the gate admitted");
+
+        // Foreign owner: declines — the transaction applies, nothing moves.
+        assert_eq!(submit(&mut ledger, &gated(stranger, b"alice"), 1), crate::ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 100, "a stranger's claim of ownership declined");
+
+        // Absent name: declines the same way, rather than faulting — `false`, not `Missing`.
+        assert_eq!(submit(&mut ledger, &gated(owner, b"nobody"), 2), crate::ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 100, "an absent name is not owned by anyone");
+
+        // Expired: the SAME record, the SAME owner, past its expiry — the height is the runtime's, so the payer
+        // cannot be tricked by a stale resolution.
+        ledger.begin_block(51);
+        assert_eq!(submit(&mut ledger, &gated(owner, b"alice"), 3), crate::ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 100, "after-expiry: ownership has lapsed, so the gate declined");
+    }
+
+    /// A computed amount is evaluated against the state **as the previous legs left it** — the `Seq` semantics that
+    /// make "pay a fixed leg, then sweep the remainder" one atomic term instead of a race against oneself.
+    ///
+    /// The 700 below is what distinguishes the two candidate semantics: an evaluator that froze arguments against
+    /// the pre-term state would sweep 1000 (hand-computed — the balance before the first leg), so the assertion
+    /// fails if argument evaluation ever moves to a snapshot taken before the term began, rather than accepting
+    /// either answer.
+    #[test]
+    fn a_computed_amount_reads_the_state_the_previous_legs_left() {
+        use crate::hybrid::HybridLedger;
+        use fanos_pqcrypto::SeedRng;
+
+        let mut rng = SeedRng::from_seed(&[0x78; 2]);
+        let (signer, verifier) = HybridSigSecret::generate(&mut rng);
+        let payer = crate::token::account_id(&verifier);
+        let (bob, carol) = ([7u8; 32], [8u8; 32]);
+
+        let mut tokens = TokenLedger::new();
+        tokens.credit(payer, 1000);
+        let mut ledger = HybridLedger::new(tokens);
+
+        // Pay bob 300, then sweep EVERYTHING REMAINING to carol: the sweep's amount is `Load(balance(payer))`,
+        // which after the first leg is 700.
+        let term = Term::Seq(vec![
+            transfer_term(payer, bob, 300),
+            transfer_term_with(payer, carol, Expr::Load(balance_key(payer))),
+        ]);
+        let envelope = SignedTerm::sign(term.encode(), 0, &signer, verifier);
+        let outcome = <HybridLedger as crate::StateMachine>::apply(
+            &mut ledger,
+            &crate::Transaction::new(HybridLedger::term_payload(&envelope)),
+        );
+        assert_eq!(outcome, crate::ExecOutcome::Applied);
+        assert_eq!(ledger.tokens().balance(&bob), 300);
+        assert_eq!(ledger.tokens().balance(&carol), 700, "the sweep took what the first leg left, not the pre-term balance");
+        assert_eq!(ledger.tokens().balance(&payer), 0, "swept clean");
     }
 
     #[test]
