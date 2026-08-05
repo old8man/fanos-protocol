@@ -53,16 +53,54 @@ use alloc::vec::Vec;
 use fanos_primitives::hash::hash_xof;
 use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, ThresholdError};
 
-/// The circuit depth the layout targets, when the plane's budget allows it.
+/// The fewest **intermediate** hops a forward circuit needs before its destination line — derived, and the
+/// derivation is what [`TARGET_DEPTH`] rests on.
+///
+/// Write the forward circuit as `[H_1, …, H_d, M]`, where `M` is the service's meeting line. Two of those
+/// lines can *name* an endpoint, and which two follows from the protocol rather than from policy:
+///
+/// * **`H_1` names the client.** The client transmits the onion to `H_1`'s members itself, so `H_1` sees its
+///   address. Nothing else on the path does.
+/// * **`H_d` names the service.** Peeling the last intermediate slot reveals the next hop, which is `M` — and
+///   `M` is a deterministic function of the service's public key (the client derives it with no lookup), so
+///   knowing `M` *is* knowing the service.
+///
+/// Deanonymization is one adversary holding both names. Each line costs `t = ⌈2(q+1)/3⌉` corrupted members to
+/// capture, and two **distinct** lines meet in exactly one point, so two of them cost `2t − 1`. On every plane
+/// this platform recommends that exceeds the tolerated budget `f = ⌊(n−1)/3⌋` — at `q = 2`, `2t − 1 = 3 > 2 = f`
+/// — which is the whole anonymity claim, and it holds **only while the two lines are two**.
+///
+/// So `H_1 ≠ H_d`, hence `d ≥ 2`. At `d = 1` the single intermediate hop is both: it is dialled by the client
+/// *and* it learns `M`, so `t` corrupted members — exactly `f` at Fano — deanonymize the session outright. At
+/// `d = 0` the client dials the service's own meeting line. Neither is a weaker anonymity setting; both are
+/// none, and the circuit still looks like a circuit.
+pub const MIN_FORWARD_DEPTH: usize = 2;
+
+/// The fewest **intermediate** hops a reply circuit needs before the client's drop line.
+///
+/// The same argument on the return leg. The reply circuit is `[R_1, …, R_e, D]`: `R_1` is dialled by whoever
+/// launches the reply, so it names the service side, and `D` is the client's own drop line, so it names the
+/// client to within its `q + 1` members. `R_1 ≠ D` gives `e ≥ 1`.
+///
+/// One rather than two because the reply's client-side name is weaker: `D` narrows the client to a line's
+/// worth of points, where `H_1` gives an address.
+pub const MIN_REPLY_DEPTH: usize = 1;
+
+/// The circuit depth the layout targets, when the plane's budget allows it — **intermediate hops plus the
+/// destination**, so [`MIN_FORWARD_DEPTH`] `+ 1`.
 ///
 /// A **policy**, not a budget maximum, and the distinction is load-bearing. Filling the cell with slots leaves almost
 /// nothing for the payload — and worse, it makes the payload *shrink* as the cell grows, since a wider cell buys more slots
 /// rather than more room. Measured: doubling `THRESHOLD_ONION_LEN` to 40 960 took the payload from 2 444 B to **1 288 B**.
 /// An experiment that widened the cell to test for a payload shortage therefore tested nothing, and wrongly cleared it.
 ///
-/// Three hops is the depth that actually buys anonymity (it is what Tor uses), and capping there leaves ~9.6 KiB of payload
-/// at `q = 2` instead of 2.4.
-pub const TARGET_DEPTH: usize = 3;
+/// It used to say "three hops is what Tor uses". That is true and it is not a derivation — worse, Tor's hop is a
+/// *node* that knows both its neighbours, while a hop here is a **line** that must be captured `t`-of-`q+1`, so
+/// the two systems are not counting the same thing and one's number cannot justify the other's. The number is
+/// the same and the reason is now the platform's own: `MIN_FORWARD_DEPTH + 1`.
+///
+/// Capping here also leaves ~9.6 KiB of payload at `q = 2` instead of 2.4.
+pub const TARGET_DEPTH: usize = MIN_FORWARD_DEPTH + 1;
 
 /// The number of slots in every header on a plane whose lines hold `line_size` points — and so the ceiling on circuit
 /// depth there: [`TARGET_DEPTH`], or fewer if the plane's slots are too wide to fit that many.
@@ -96,6 +134,23 @@ pub const fn depth_for(line_size: usize) -> usize {
         Some(n) if n - 1 < TARGET_DEPTH => n - 1,
         Some(_) => TARGET_DEPTH,
     }
+}
+
+/// Whether a plane whose lines hold `line_size` points can carry a **sound** anonymous circuit — that is,
+/// whether its slot budget reaches [`TARGET_DEPTH`].
+///
+/// The two halves were never joined. [`depth_for`] is a *budget*: how many hops the fixed-slot header can
+/// afford once one slot is reserved for the payload. [`MIN_FORWARD_DEPTH`] is a *requirement*: how many the
+/// anonymity argument needs. A plane can satisfy the budget and miss the requirement, and until this predicate
+/// existed nothing compared them — the platform picked the depth that fit rather than the depth that was
+/// needed, and a circuit one hop short still looks exactly like a circuit.
+///
+/// At the shipped `THRESHOLD_ONION_LEN` this is true at `q = 2` and `q = 3` and **false at `q = 4` and above**.
+/// That is a real limit and it has a real answer — the onion budget is a per-deployment parameter, so a wide
+/// plane wants a wider onion — but it must be *reported*, not discovered as dials that carry no anonymity.
+#[must_use]
+pub const fn plane_can_anonymize(line_size: usize) -> bool {
+    depth_for(line_size) >= TARGET_DEPTH
 }
 
 /// The largest structure this protocol nests inside an onion payload: a threshold seal to one hop line.

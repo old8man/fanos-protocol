@@ -753,6 +753,65 @@ A follow-up spec-vs-implementation audit (driving toward #97) re-swept the spec 
 
 None of these is a regression — each is a tracked frontier item, several already in progress. This addendum records where the "drive to 100%" effort stands; it does not supersede the Tier-0/1 resolutions above.
 
+## Anonymity sweep — 2026-08-05: one derivation, four defects
+
+The whole section came from refusing a single sentence. `TARGET_DEPTH = 3` was documented as *"the depth that
+actually buys anonymity (it is what Tor uses)"* — true, and not a derivation. Worse, Tor's hop is a **node**
+that knows both its neighbours while a hop here is a **line** that must be captured `t`-of-`q+1`, so the two
+systems are not counting the same object and one's number cannot justify the other's.
+
+**The derivation.** Write the forward circuit `[H_1, …, H_d, M]`. Exactly two of its lines can *name* an
+endpoint, and which two follows from who dials whom: `H_1` sees the client's address because the client
+transmits to it, and `H_d` learns `M` when it peels its slot — `M` being a deterministic function of the
+service's key. Capturing a line costs `t = ⌈2(q+1)/3⌉` members; two **distinct** lines meet in one point, so
+both cost `2t − 1`, which exceeds `f = ⌊(n−1)/3⌋` on every plane the platform recommends (at Fano `3 > 2`).
+So `H_1 ≠ H_d`, so `d ≥ 2`, so `TARGET_DEPTH = MIN_FORWARD_DEPTH + 1 = 3`. Same number, and now it is the
+platform's own. The reply leg gives `e ≥ 1` the same way, and the pairing rule
+`{H_1, D} ∩ {H_d, M, R_1} = ∅` falls out.
+
+Then four things the derivation could see and nothing else could.
+
+**A-C1 — the client's drop line lands on its own forward circuit. CRITICAL, fixed.** `RendezvousRoute::draw`
+laid every hop knowing nothing about the NOSTOS drop line, and `anonymous_dial` then *overwrote* the reply
+terminus with a line derived from the client's own coordinate. Measured at `q = 2`, production depths,
+4 000 trials: `D == H_1` **14.7 %**, `D == H_d` **15.0 %**, `D == M` **14.2 %**, `D == R_1` **13.8 %**,
+`H_1 == R_1` **16.4 %** — some forbidden pair on **43 %** of dials. Each one puts a client-name and a
+service-name on **one** line, so the cost of deanonymizing falls from `2t − 1 = 3` to `t = 2`, and `2` **is**
+the tolerated budget at Fano. The margin the whole design rests on is one node, and it was being spent by an
+ordering accident.
+
+The comment at the overwrite already called it *"an unchecked overwrite of a checked choice, the sharpest form
+of the same defect `random_hops` had"* — and checked sealability only. Seeing the shape is not the same as
+following it through.
+
+Fixed by **order**: the drop line is *derived* and has `q + 1` candidates, the hops are *drawn* and have `n`,
+so the derived side settles first and the flexible side is laid around it. Plus `route_leaks` as an
+unconditional gate on every dial, naming the offending line. Both halves are needed — a gate with no
+construction behind it would refuse 43 % of dials, and construction with no gate would trust its caller.
+
+**A-H1 — no floor under the circuit depth.** `--fwd-depth 0` and `1` were accepted. At `1` the single
+intermediate is both the hop the client dials and the hop that learns `M`; at `0` the client dials the
+service's meeting line itself. Neither is a weaker anonymity setting — both are none, while the profile still
+prints "anonymous". The ceiling had been checked since the beginning because *that* failure is silent; nobody
+asked whether there was a floor beneath it. On Fano the two now **meet at 2**: the depth is forced.
+
+**A-H2 — the depth ceiling was computed on the wrong plane.** `parse_anon_config` read
+`fanos_geometry::fano::LINE_SIZE`, a constant, regardless of `--plane-order`, while the mix threshold two
+functions away read the configured order. So on a wide plane the guard admitted exactly the over-depth
+configuration whose silent failure its own comment says it exists to prevent. One reader now, `line_size_arg`.
+
+**A-H3 — the node recommended the planes where circuits cannot be built.** `warn_if_plane_cannot_anonymize`
+told the operator that `q = 2` supports only 2 concurrent circuits (a passive flow-matching floor of 0.50 —
+true) and to "pass `--plane-order 4|7|31`". `depth_for` says those planes carry 2 hops and 1, against the 3
+required. Two subsystems, opposite counsel, neither aware of the other, sending the operator from a real
+weakness to a worse one. Joined by `plane_can_anonymize`, and the honest answer for a wide cell is a wider
+**onion budget** — cell width and onion width are independent deployment parameters.
+
+**And the tests had never run at the shipped depth.** Every `anonymous_quic` e2e used `depths: (1, 1)` while
+production defaults to `(2, 2)`. So the suite that proves an anonymous session completes over real QUIC was
+proving it for a circuit that carries no anonymity. Raised to `(2, 2)`: 10/10 green, ~37 s. That is
+[[test-narrower-than-production]] again, in the subsystem where it costs most.
+
 ## Verification sweep — 2026-08-04: two failures that a running network reaches on a clock
 
 Both were found by asking a mechanical question rather than by reading: *what does this system accumulate,

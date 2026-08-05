@@ -13,6 +13,7 @@
 //! wires it to a real [`Client`].
 
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
+use fanos_aphantos::slots;
 use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord};
 use fanos_field::{F2, Field};
@@ -191,6 +192,24 @@ pub struct RendezvousRoute {
     pub beacon: BeaconSeed,
 }
 
+#[derive(Clone)]
+/// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
+/// profile (spec §L5, #54). Each connection gets new random forward/reply hops drawn from the live mix
+/// `directory`, so an observer cannot link successive dials by their shared path (the fixed-route
+/// [`FanosDialer::anonymous`] reuses one path across dials and is linkable — a real proxy must use this).
+pub struct AnonRouteParams {
+    /// The live mixnet key directory (e.g. from [`build_cell_mix_directory`](crate::build_cell_mix_directory)).
+    pub directory: MixDirectory,
+    /// How many of each hop line's members must cooperate to peel an onion.
+    pub threshold: u8,
+    /// The rendezvous epoch (the meeting line and placement rotate with it).
+    pub epoch: Epoch,
+    /// The epoch's beacon seed (folds into the meeting-line derivation).
+    pub beacon: BeaconSeed,
+    /// `(forward, reply)` intermediate-hop depths for each freshly-drawn circuit.
+    pub depths: (usize, usize),
+}
+
 impl RendezvousRoute {
     /// Draw a **fresh** route for one anonymous dial (#54): random, distinct forward and reply hop lines —
     /// a new, unlinkable path each dial rather than a fixed route — with the client's reply rendezvous
@@ -199,28 +218,42 @@ impl RendezvousRoute {
     /// `depths` is `(forward, reply)` — the number of intermediate hops before the meeting line / before
     /// the reply rendezvous. `rng` MUST be a CSPRNG in production — the path's unpredictability is what
     /// unlinks successive dials.
+    ///
+    /// `client_drop` is the session's NOSTOS drop line, and passing it is what makes the route **sound** rather
+    /// than merely fresh: every hop is then laid around it, so no line can hold both a client-name and a
+    /// service-name ([`route_leaks`]). Passing `None` draws an arbitrary reply rendezvous instead, which
+    /// [`anonymous_dial`] will replace — and then that dial has to check, and refuse, what this could have
+    /// avoided.
     #[must_use]
     pub fn draw<F: Field, R: CryptoRng>(
-        directory: MixDirectory,
-        threshold: u8,
-        epoch: Epoch,
-        beacon: BeaconSeed,
+        params: &AnonRouteParams,
         service_meeting: Coord,
-        depths: (usize, usize),
+        client_drop: Option<Coord>,
         rng: &mut R,
     ) -> Self {
+        let AnonRouteParams { directory, threshold, epoch, beacon, depths } = params.clone();
         // The client's reply rendezvous: a random line distinct from the meeting line — the service must not
         // receive the client's reply traffic as a delivery on its own line — and **sealable**: every member's
         // key present in the directory, because a reply onion seals to the whole line and its launch draws a
         // per-onion member (#55, `combiner_for_salted`), so no single member's liveness is the gate any more.
         // Falls back to the meeting line only on a degenerate plane that offers no such line.
-        let reply_rendezvous =
+        // The terminus is settled FIRST, and the order is the fix rather than a detail. The client's drop line
+        // is *derived* from its own coordinate, so it has only `q + 1` candidates; the hops are *drawn*, from
+        // `n`. Constrain the flexible side. Laying the hops first and patching the terminus afterwards — which
+        // is what `anonymous_dial` used to do — put the drop line somewhere on the client's own forward circuit
+        // on 43% of dials at `q = 2`, and on the hop that learns the meeting line on 15% of them.
+        let terminus = client_drop.unwrap_or_else(|| {
             draw_line::<F, R>(rng, |l| l != service_meeting && line_is_sealable::<F>(l, &directory))
-                .unwrap_or(service_meeting);
-        let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting], &directory, rng);
-        let mut reply_circuit =
-            random_hops::<F, R>(depths.1, &[service_meeting, reply_rendezvous], &directory, rng);
-        reply_circuit.push(reply_rendezvous);
+                .unwrap_or(service_meeting)
+        });
+        let forward_hops = random_hops::<F, R>(depths.0, &[service_meeting, terminus], &directory, rng);
+        // `R_1` must differ from `H_1`: one is dialled by the client and the other from the service side, so a
+        // single line holding both names the pair. Only the first forward hop is excluded — the middles name
+        // nobody, and excluding them too would use six of Fano's seven lines and make the draw predictable.
+        let mut reply_avoid = vec![service_meeting, terminus];
+        reply_avoid.extend(forward_hops.first().copied());
+        let mut reply_circuit = random_hops::<F, R>(depths.1, &reply_avoid, &directory, rng);
+        reply_circuit.push(terminus);
         Self {
             forward_hops,
             reply_circuit,
@@ -252,6 +285,67 @@ pub fn line_is_sealable<F: Field>(line: Coord, directory: &MixDirectory) -> bool
     fanos_rendezvous::line_member_coords::<F>(line)
         .iter()
         .all(|m| directory.get(m).is_some())
+}
+
+/// The client's NOSTOS drop line for this session: the reply circuit's terminus, **derived** from the client's
+/// own coordinate rather than drawn, so it has only `q + 1` candidates.
+///
+/// `forbidden` are lines it must not land on. `None` when every candidate is forbidden or unsealable — which is
+/// a real outcome on a narrow plane and must be treated as one: [`fanos_aphantos::nostos::select_drop_line`]
+/// falls back to an unusable line rather than failing, so the result is re-checked here and the fallback is
+/// converted into the `None` it means.
+#[must_use]
+pub fn client_drop_line<F: Field>(
+    client_address: Coord,
+    secret: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    directory: &MixDirectory,
+    forbidden: &[Coord],
+) -> Option<Coord> {
+    let point = Point::<F>::new(client_address)?;
+    let usable =
+        |l: Line<F>| !forbidden.contains(&l.coords()) && line_is_sealable::<F>(l.coords(), directory);
+    let line = select_drop_line::<F>(point, secret, epoch.get(), beacon.as_bytes(), &usable);
+    usable(line).then(|| line.coords())
+}
+
+/// The line that would let one captured coalition name **both** endpoints of `forward_circuit` /
+/// `reply_circuit`, or `None` if the route is sound.
+///
+/// The anonymity claim is arithmetic, and it is worth stating before the rule that follows from it: naming an
+/// endpoint costs capturing a line — `t = ⌈2(q+1)/3⌉` of its `q + 1` members — and two **distinct** lines meet
+/// in exactly one point, so naming both costs `2t − 1`. At Fano that is `3`, against a tolerated budget of
+/// `f = 2`. The margin is one node, and it exists *only* while the two lines are two.
+///
+/// Which lines carry a name is not a matter of degree — it follows from who dials whom:
+///
+/// | line | names | how |
+/// |---|---|---|
+/// | `H_1` | the client | the client transmits to it, so it sees the address |
+/// | `D` (reply terminus) | the client | its `q + 1` members include the client, which reads the dead drop there |
+/// | `H_d` | the service | peeling its slot reveals the next hop, `M` |
+/// | `M` | the service | it *is* the service's meeting line |
+/// | `R_1` | the service | the reply is launched to it from the service side |
+///
+/// So the rule is one line: **no line may appear on both sides.** Everything between those positions is a
+/// middle — it learns only the next hop, names nobody, and a middle-to-middle coincidence is harmless. Stating
+/// the rule as "the circuits must be disjoint" would be wrong in the expensive direction: at `q = 2` there are
+/// seven lines and a disjoint pair of depth-2 circuits plus a meeting line uses six of them, which makes the
+/// draw nearly deterministic — and *a predictable circuit is a targetable one*.
+///
+/// Returns the offending line so the caller can say which, rather than that something was wrong.
+#[must_use]
+pub fn route_leaks(forward_circuit: &[Coord], reply_circuit: &[Coord], meeting: Coord) -> Option<Coord> {
+    let names_client = [forward_circuit.first(), reply_circuit.last()];
+    // `H_d` is the last INTERMEDIATE hop, i.e. the one before the meeting line the circuit ends at.
+    let h_d = forward_circuit.len().checked_sub(2).and_then(|i| forward_circuit.get(i));
+    let names_service = [h_d, Some(&meeting), reply_circuit.first()];
+    names_client
+        .into_iter()
+        .flatten()
+        .find(|c| names_service.iter().flatten().any(|s| s == c))
+        .copied()
 }
 
 /// Draw `count` distinct random hop lines — none in `avoid`, none repeated, and every one **sealable**
@@ -329,19 +423,54 @@ pub fn anonymous_dial<R: CryptoRng>(
     // each epoch. The client receives the dead-drop there as a line member and no relay learns it. The
     // drawn intermediate reply hops are kept; only the terminus becomes the own line.
     let mut reply_circuit = route.reply_circuit.clone();
-    if let Some(point) = Point::<F2>::new(client.address()) {
-        // Sealable, because this line REPLACES the `reply_rendezvous` the route draw already checked — an
-        // unchecked overwrite of a checked choice, which is the sharpest form of the same defect
-        // `random_hops` had. The service seals every reply along this circuit and this line is its last hop,
-        // so a member missing from the directory is a reply path that carries nothing, forever, in silence.
-        let drop_line = select_drop_line(point, secret, route.epoch.get(), route.beacon.as_bytes(), |l| {
-            line_is_sealable::<F2>(l.coords(), &route.directory)
-        })
-        .coords();
+    // The terminus must be one of the client's OWN lines — that is what lets it read the dead drop as a member,
+    // and it is checkable here without re-deriving anything. When `draw` was given the drop line the circuit
+    // already ends there and every hop was laid around it; when it was not (a FIXED route, drawn once and
+    // reused across sessions) the terminus is still an arbitrary rendezvous and must be replaced now.
+    //
+    // Replacing it late is the weaker order and is only the fallback: by then the hops cannot move, so the drop
+    // line has to dodge them out of its `q + 1` candidates and can fail. It used to be the ONLY order, and it
+    // did not dodge at all — it overwrote a checked choice with an unchecked one, which the comment here
+    // called "the sharpest form of the same defect `random_hops` had" while checking only sealability.
+    let own_line = |l: &Coord| fanos_rendezvous::line_member_coords::<F2>(*l).contains(&client.address());
+    if !reply_circuit.last().is_some_and(own_line) {
+        let mut forbidden = vec![meeting];
+        forbidden.extend(forward_circuit.iter().copied());
+        forbidden.extend(reply_circuit.iter().rev().skip(1).copied());
+        let drop_line = client_drop_line::<F2>(
+            client.address(),
+            secret,
+            route.epoch,
+            &route.beacon,
+            &route.directory,
+            &forbidden,
+        )?;
         match reply_circuit.last_mut() {
             Some(last) => *last = drop_line,
             None => reply_circuit.push(drop_line),
         }
+    }
+    // The gate, and it is unconditional. Everything above is an attempt to make the sound route the one that
+    // gets built; this is the refusal to dial when it is not. Both halves are needed — a check with no
+    // construction behind it would fail 43% of dials, and a construction with no check would trust a caller.
+    if forward_circuit.len() < slots::TARGET_DEPTH {
+        tracing::warn!(
+            depth = forward_circuit.len(),
+            required = slots::TARGET_DEPTH,
+            "refusing an anonymous dial: the forward circuit is too shallow to hide either endpoint. Its \
+             first hop is dialled by this node and its last learns the meeting line, so below the minimum \
+             those are ONE line and `t` corrupted members — the tolerated budget at Fano — name both ends."
+        );
+        return None;
+    }
+    if let Some(line) = route_leaks(&forward_circuit, &reply_circuit, meeting) {
+        tracing::warn!(
+            ?line,
+            "refusing an anonymous dial: one line of this route names both this node and the service, so \
+             capturing it alone (`t` members, the tolerated budget at Fano) deanonymizes the session — where \
+             two distinct lines would cost `2t - 1` and exceed it."
+        );
+        return None;
     }
     // The matching reply keypair — the client advertises the public half in every Request; this driver
     // keeps the secret half to open the dead-drop.
@@ -374,6 +503,11 @@ mod tests {
     use fanos_geometry::{Line, Point};
     use fanos_pqcrypto::{HybridKemSecret, SeedRng};
     use fanos_rendezvous::{MixDirectory, meeting_line};
+
+    /// The shipped Fano parameters: `2`-of-`3` peeling at the production `(2, 2)` depths.
+    fn fano_params(directory: MixDirectory, epoch: Epoch) -> AnonRouteParams {
+        AnonRouteParams { directory, threshold: 2, epoch, beacon: BeaconSeed::GENESIS, depths: (2, 2) }
+    }
 
     fn fano_directory() -> MixDirectory {
         let mut dir = MixDirectory::new();
@@ -424,12 +558,9 @@ mod tests {
                 .expect("a plane missing one point still has sealable lines");
 
             let route = RendezvousRoute::draw::<F2, _>(
-                dir.clone(),
-                2,
-                Epoch::new(3),
-                BeaconSeed::GENESIS,
+                &fano_params(dir.clone(), Epoch::new(3)),
                 meeting,
-                (2, 2),
+                None,
                 &mut rng,
             );
 
@@ -480,6 +611,94 @@ mod tests {
     }
     impl rand_core::TryCryptoRng for TestRng {}
 
+    /// Drawing the route AROUND the drop line removes every way one line can name both endpoints — and the
+    /// same measurement on the old order shows the test can see the defect, so the first half is not vacuous.
+    #[test]
+    fn no_line_of_a_drawn_route_names_both_endpoints() {
+        let dir = fano_directory();
+        let epoch = Epoch::new(1);
+        let trials = 2000u64;
+        let (mut sound_leaks, mut legacy_leaks, mut sound_routes) = (0u32, 0u32, 0u32);
+        for i in 0..trials {
+            let meeting = meeting_line::<F2>(&i.to_le_bytes(), epoch, &BeaconSeed::GENESIS).coords();
+            let client = Point::<F2>::at((i as usize) % 7).coords();
+            let secret = [i as u8; 32];
+            let drop = client_drop_line::<F2>(
+                client, &secret, epoch, &BeaconSeed::GENESIS, &dir, &[meeting],
+            );
+            // The order under test: derive the terminus first, lay every hop around it.
+            let sound = RendezvousRoute::draw::<F2, _>(
+                &fano_params(dir.clone(), epoch),
+                meeting,
+                drop,
+                &mut TestRng(i.wrapping_mul(0x9E37_79B9).wrapping_add(1)),
+            );
+            let mut fwd = sound.forward_hops.clone();
+            fwd.push(meeting);
+            if fwd.len() >= slots::TARGET_DEPTH {
+                sound_routes += 1;
+                if route_leaks(&fwd, &sound.reply_circuit, meeting).is_some() {
+                    sound_leaks += 1;
+                }
+            }
+            // The order that shipped: lay the hops blind, then overwrite the terminus with the drop line.
+            let legacy = RendezvousRoute::draw::<F2, _>(
+                &fano_params(dir.clone(), epoch),
+                meeting,
+                None,
+                &mut TestRng(i.wrapping_mul(0x9E37_79B9).wrapping_add(1)),
+            );
+            let mut lfwd = legacy.forward_hops.clone();
+            lfwd.push(meeting);
+            let mut lreply = legacy.reply_circuit.clone();
+            if let (Some(d), Some(last)) = (drop, lreply.last_mut()) {
+                *last = d;
+            }
+            if route_leaks(&lfwd, &lreply, meeting).is_some() {
+                legacy_leaks += 1;
+            }
+        }
+        // The PROPERTY first, so a falsification that breaks the mechanism reaches this assertion.
+        assert_eq!(
+            sound_leaks, 0,
+            "{sound_leaks} of {sound_routes} routes drawn around their own drop line still had a line naming \
+             both endpoints — the whole 2t-1 argument rests on those two lines being two"
+        );
+        assert!(
+            sound_routes > trials as u32 * 9 / 10,
+            "only {sound_routes} of {trials} draws reached the minimum depth — a sound route must also be the \
+             ordinary one, or the fix trades a leak for a liveness failure"
+        );
+        // And the falsification, kept in the tree rather than performed by hand once: the shipped order leaks
+        // often enough that the assertion above is a real constraint.
+        assert!(
+            legacy_leaks > trials as u32 / 4,
+            "the pre-fix order leaked on only {legacy_leaks} of {trials} draws, so this test cannot see the \
+             defect it exists to pin"
+        );
+    }
+
+    /// A circuit one hop short is refused rather than dialled, and the reason is that it is not a weaker
+    /// setting: `H_1` and `H_d` become one line, so `t` members — the tolerated budget at Fano — name both ends.
+    #[test]
+    fn a_circuit_too_shallow_to_hide_either_endpoint_names_both() {
+        let lines: Vec<Coord> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
+        let meeting = lines[0];
+        let (h1, r1, d) = (lines[1], lines[2], lines[3]);
+        // Depth 1: the forward circuit is [H_1, M], so the hop the client dials is the hop that learns M.
+        let shallow = vec![h1, meeting];
+        assert!(shallow.len() < slots::TARGET_DEPTH, "depth 1 is below the derived floor");
+        assert_eq!(
+            route_leaks(&shallow, &[r1, d], meeting),
+            Some(h1),
+            "at depth 1 the single intermediate is both the client's entry and the hop that learns the \
+             meeting line, and the predicate must name it"
+        );
+        // Depth 2 with the same endpoints is sound — so the refusal above is about the depth, not the lines.
+        let sound = vec![h1, lines[4], meeting];
+        assert_eq!(route_leaks(&sound, &[r1, d], meeting), None);
+    }
+
     #[test]
     fn drawn_routes_are_fresh_and_avoid_the_meeting_line() {
         let dir = fano_directory();
@@ -487,12 +706,9 @@ mod tests {
         let meeting = meeting_line::<F2>(b"draw-svc", epoch, &BeaconSeed::GENESIS).coords();
         let draw = |seed: u64| {
             RendezvousRoute::draw::<F2, _>(
-                dir.clone(),
-                2,
-                epoch,
-                BeaconSeed::GENESIS,
+                &fano_params(dir.clone(), epoch),
                 meeting,
-                (2, 2),
+                None,
                 &mut TestRng(seed),
             )
         };

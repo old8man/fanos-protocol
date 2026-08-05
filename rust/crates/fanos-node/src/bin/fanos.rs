@@ -119,24 +119,58 @@ fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
     if let Some(s) = flag(args, "--threshold") {
         return s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")));
     }
-    let plane_order: u32 = match flag(args, "--plane-order") {
+    u8::try_from(fanos_node::node::mix_threshold(line_size_arg(args)?))
+        .map_err(|_| NodeError::Config("plane order too large for a u8 threshold".to_owned()))
+}
+
+/// The configured plane's line size, `q + 1` — the ONE place `--plane-order` becomes a geometry parameter.
+///
+/// It was read in two places that then disagreed: the mix threshold used the configured order while the
+/// circuit-depth ceiling used `fano::LINE_SIZE`, a constant. So on `--plane-order 7` the ceiling was computed
+/// for a plane the node was not running, and admitted a depth the onion header there cannot carry — the exact
+/// silent failure the check exists to prevent, and its comment says so.
+fn line_size_arg(args: &[String]) -> Result<usize, NodeError> {
+    let plane_order: usize = match flag(args, "--plane-order") {
         Some(s) => s
             .parse()
             .map_err(|_| NodeError::Config(format!("bad --plane-order '{s}' (expected 2, 4, 7 or 31)")))?,
         None => 2,
     };
-    u8::try_from(fanos_node::node::mix_threshold((plane_order + 1) as usize))
-        .map_err(|_| NodeError::Config("plane order too large for a u8 threshold".to_owned()))
+    Ok(plane_order + 1)
 }
 
+/// Report the plane's anonymity limits — **both** of them, because they pull in opposite directions and this
+/// used to state only one.
+///
+/// It advised "pass `--plane-order 4|7|31`", which is sound advice about the anonymity *set* and was, at the
+/// same time, advice to use the planes where [`slots::plane_can_anonymize`] is false: the fixed-slot header
+/// there carries fewer hops than [`slots::TARGET_DEPTH`], so those deployments cannot build a circuit that
+/// hides either endpoint. Two subsystems, opposite counsel, neither aware of the other — so the operator was
+/// being sent from a real weakness to a worse one.
+///
+/// The reconciliation is not a compromise between the two numbers. Cell width and onion width are *independent*
+/// deployment parameters, and the configuration the warning should point at raises both.
 fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
+    let line_size = config.plane_order as usize + 1;
+    if !fanos_aphantos::slots::plane_can_anonymize(line_size) {
+        eprintln!(
+            "warning: plane order {q} cannot carry an anonymous circuit at the shipped onion budget — its header holds \
+             {have} hops where {want} are needed. Raise the onion budget for a plane this wide; a shallower circuit is \
+             not a weaker one, it is none.",
+            q = config.plane_order,
+            have = fanos_aphantos::slots::depth_for(line_size),
+            want = fanos_aphantos::slots::TARGET_DEPTH,
+        );
+        return;
+    }
     if config.plane_order > 2 {
         return;
     }
     eprintln!(
         "warning: anonymity requested on plane order {q} — PG(2,{q}) supports only 2 concurrent circuits, so a passive \
-         adversary's flow-matching floor is a COIN FLIP (0.50) regardless of the mix schedule. Pass \
-         `--plane-order 4|7|31` for the anonymity the profile implies (every node of a cell must agree on it); see \
+         adversary's flow-matching floor is a COIN FLIP (0.50) regardless of the mix schedule. A wider cell raises that \
+         floor, but only together with a wider onion budget: at the shipped budget every plane above order 3 fails the \
+         depth check above, so `--plane-order 4` alone would trade a small anonymity set for none at all. See \
          fanos_node::config::plane_order.",
         q = config.plane_order
     );
@@ -1028,21 +1062,54 @@ fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
     }
     // A circuit is `depth` intermediate hops plus its destination line, so it costs `depth + 1` slots of the fixed-slot
-    // onion header. Checked here because the failure is otherwise **silent**: `create_forward` swallows the over-depth error
-    // with `.ok()?`, so an operator who raises this past the ceiling gets dials that quietly never connect rather than a
-    // message saying why. The default of 2 sits exactly at the ceiling for the Fano plane.
-    let line_size = fanos_geometry::fano::LINE_SIZE;
+    // onion header. Both ends are checked because both failures are otherwise **silent**, in opposite ways.
+    //
+    // Too DEEP: `create_forward` swallows the over-depth error with `.ok()?`, so an operator past the ceiling gets dials
+    // that quietly never connect rather than a message saying why.
+    //
+    // Too SHALLOW is the worse one, and it had no check at all: the dials connect. They just carry no anonymity, while the
+    // profile still calls itself anonymous. `slots::MIN_FORWARD_DEPTH` derives why — below it the hop the client dials and
+    // the hop that learns the meeting line are ONE line, so `t` corrupted members name both ends, and `t` is the tolerated
+    // budget at Fano. At `--fwd-depth 0` the client dials the service's meeting line itself.
+    //
+    // On the Fano plane the two bounds MEET at 2, so the depth is forced rather than chosen — which is the honest reading of
+    // a default that was picked to sit "exactly at the ceiling" without anyone checking there was a floor beneath it.
+    let line_size = line_size_arg(args)?;
     let max_depth = fanos_aphantos::slots::depth_for(line_size).saturating_sub(1);
     let (fwd_depth, reply_depth) = (usize_flag("--fwd-depth", 2)?, usize_flag("--reply-depth", 2)?);
-    for (name, depth) in [("--fwd-depth", fwd_depth), ("--reply-depth", reply_depth)] {
+    let floors = [
+        ("--fwd-depth", fwd_depth, fanos_aphantos::slots::MIN_FORWARD_DEPTH),
+        ("--reply-depth", reply_depth, fanos_aphantos::slots::MIN_REPLY_DEPTH),
+    ];
+    for (name, depth, floor) in floors {
         if depth > max_depth {
             return Err(NodeError::Config(format!(
-                "{name} is {depth}, but the onion header carries at most {} hops on this plane, so {max_depth} \
+                "{name} is {depth}, but the onion header carries at most {} hops on a plane of order {}, so {max_depth} \
                  intermediate hops. A deeper circuit needs payload fragmentation, not a wider cell — widening the cell buys \
                  more slots and so a SMALLER payload.",
-                max_depth + 1
+                max_depth + 1,
+                line_size - 1
             )));
         }
+        if depth < floor {
+            return Err(NodeError::Config(format!(
+                "{name} is {depth}, below the {floor} intermediate hops anonymity needs. This is not a weaker setting, it \
+                 is none: a circuit that short has one line holding both endpoints' names, so capturing it alone — `t` \
+                 members, which IS the tolerated fault budget on this plane — deanonymizes every session it carries. Use \
+                 `--profile direct` if that is what you want, and it will say so."
+            )));
+        }
+    }
+    if !fanos_aphantos::slots::plane_can_anonymize(line_size) {
+        return Err(NodeError::Config(format!(
+            "plane order {} cannot carry an anonymous circuit at the shipped onion budget: its header holds {} hops where \
+             {} are needed ({} intermediate plus the destination). The onion budget is a per-deployment parameter, so the \
+             answer for a wide plane is a wider onion — not a shallower circuit, which would be no circuit.",
+            line_size - 1,
+            fanos_aphantos::slots::depth_for(line_size),
+            fanos_aphantos::slots::TARGET_DEPTH,
+            fanos_aphantos::slots::MIN_FORWARD_DEPTH,
+        )));
     }
     Ok(AnonConfig {
         threshold,

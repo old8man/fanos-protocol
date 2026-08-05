@@ -12,12 +12,11 @@ use fanos_diaulos::service_public_from_bundle;
 use fanos_diaulos::{ClientSession, Coord, StaticKeypair};
 use fanos_field::F2;
 use fanos_geometry::Triple;
-use fanos_onoma::Epoch;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_proxy::{DialError, Dialer, Target, UdpDialer, UdpTunnel};
 use fanos_quic::Client;
-use fanos_rendezvous::{BeaconSeed, MixDirectory, meeting_lines};
+use fanos_rendezvous::meeting_lines;
 use fanos_runtime::{Command, Notification};
 use fanos_session::{
     ChannelTransport, GIVE_UP_ATTEMPTS, OverlayTransport, dial_over_transport, serve_over_channels,
@@ -363,22 +362,8 @@ pub struct FanosDialer<R: ServiceResolver> {
     exit: Option<(Coord, Vec<u8>)>,
 }
 
-/// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
-/// profile (spec §L5, #54). Each connection gets new random forward/reply hops drawn from the live mix
-/// `directory`, so an observer cannot link successive dials by their shared path (the fixed-route
-/// [`FanosDialer::anonymous`] reuses one path across dials and is linkable — a real proxy must use this).
-pub struct AnonRouteParams {
-    /// The live mixnet key directory (e.g. from [`build_cell_mix_directory`](crate::build_cell_mix_directory)).
-    pub directory: MixDirectory,
-    /// How many of each hop line's members must cooperate to peel an onion.
-    pub threshold: u8,
-    /// The rendezvous epoch (the meeting line and placement rotate with it).
-    pub epoch: Epoch,
-    /// The epoch's beacon seed (folds into the meeting-line derivation).
-    pub beacon: BeaconSeed,
-    /// `(forward, reply)` intermediate-hop depths for each freshly-drawn circuit.
-    pub depths: (usize, usize),
-}
+pub use crate::rendezvous::AnonRouteParams;
+
 
 /// The dialer's routing profile.
 enum Profile {
@@ -494,16 +479,20 @@ impl<R: ServiceResolver> FanosDialer<R> {
                     // hops that avoid the destination, so a route drawn toward one meeting point and sealed to
                     // another is a circuit built for somewhere it is not going — measured as 0 of 8 dials
                     // arriving. Redrawing per attempt is required, not merely tidy.
-                    let route = crate::rendezvous::RendezvousRoute::draw::<F2, _>(
-                        params.directory.clone(),
-                        params.threshold,
-                        params.epoch,
-                        params.beacon,
-                        meeting,
-                        params.depths,
-                        rng,
-                    );
+                    // The session secret is drawn BEFORE the route, because the drop line derives from it and
+                    // the route must be laid around the drop line rather than patched afterwards. Reversing
+                    // these two lines is what put the client's own drop line on its own forward circuit.
                     let secret = os_entropy_32()?;
+                    let drop = crate::rendezvous::client_drop_line::<F2>(
+                        self.client.address(),
+                        &secret,
+                        params.epoch,
+                        &params.beacon,
+                        &params.directory,
+                        &[meeting],
+                    );
+                    let route =
+                        crate::rendezvous::RendezvousRoute::draw::<F2, _>(params, meeting, drop, rng);
                     crate::rendezvous::anonymous_dial(self.client.clone(), identity, &route, meeting, &secret, rng)
                         .ok_or(DialError::Unreachable)
                 })

@@ -691,8 +691,9 @@ Two decisions are folded in there, and both were forced by measurement:
 - **A target depth, not "fill the budget".** Filling it leaves almost nothing for the payload, and has a perverse
   consequence: payload *shrinks* as the cell grows, because a wider cell buys more slots rather than more room. Measured —
   doubling `THRESHOLD_ONION_LEN` to 40 960 took the payload from 2 444 B to **1 288 B**. That is also why an experiment
-  which widened the cell to test for a payload shortage tested nothing and wrongly cleared it. `TARGET_DEPTH = 3` is the
-  depth that actually buys anonymity (it is what Tor uses) and leaves ~9.6 KiB of payload at `q = 2`.
+  which widened the cell to test for a payload shortage tested nothing and wrongly cleared it. `TARGET_DEPTH = 3`
+  leaves ~9.6 KiB of payload at `q = 2` — and it is **derived**, see below. It used to say "it is what Tor uses",
+  which is true and is not a derivation.
 
 Exceeding the ceiling is now an error rather than, as before, a silent leak.
 
@@ -735,8 +736,75 @@ The whole trade at `q = 2`, where a slot costs 3 606 B:
 | 4 | 14 424 | 6 050 | headroom for one more intermediate hop; **unverified** |
 | 5 | 18 030 | 2 444 | what budget-filling chose, and what broke every full session |
 
+### Why three, and not two or four
+
+Tor's answer does not transfer, and it is worth being exact about why rather than borrowing the number. A Tor hop is a
+**node** that knows both its neighbours. A hop here is a **line**, which reveals nothing until `t = ⌈2(q+1)/3⌉` of its
+`q + 1` members collude. The two systems are not counting the same object, so one's depth cannot justify the other's.
+
+Write the forward circuit as `[H_1, …, H_d, M]`. Exactly two of those lines can **name** an endpoint, and which two
+follows from who dials whom rather than from any policy:
+
+* **`H_1` names the client** — the client transmits the onion to its members itself, so it sees the address.
+* **`H_d` names the service** — peeling its slot reveals the next hop, and that is `M`, a deterministic function of the
+  service's public key. Knowing `M` is knowing the service.
+
+Every line between them is a middle: it learns only the next hop and names nobody.
+
+Deanonymization is one coalition holding both names. Capturing a line costs `t` members; two **distinct** lines meet in
+exactly one point, so two cost `2t − 1`. Against the tolerated budget `f = ⌊(n−1)/3⌋`:
+
+| `q` | `n` | `f` | `t` | `2t − 1` | correlation within budget? |
+|---|---|---|---|---|---|
+| 2 | 7 | 2 | 2 | 3 | **no** — 3 > 2 |
+| 3 | 13 | 4 | 3 | 5 | **no** — 5 > 4 |
+| 4 | 21 | 6 | 4 | 7 | **no** — 7 > 6 |
+| 5 | 31 | 10 | 4 | 7 | yes, but needs the draw to land: `4.7 × 10⁻³` |
+| 7 | 57 | 18 | 6 | 11 | yes: `6.0 × 10⁻⁵` |
+| 31 | 993 | 330 | 22 | 43 | yes: `1.2 × 10⁻⁹` |
+
+So on the planes this platform recommends, first-and-last correlation is **structurally impossible**, not merely
+unlikely — and above them it is a hypergeometric long shot that falls monotonically with `q`. The interesting row is
+`q = 5`, the worst supported plane on this axis as well as on liveness spare.
+
+That whole argument holds **only while the two lines are two**. Hence `H_1 ≠ H_d`, hence `d ≥ 2`, hence
+`TARGET_DEPTH = MIN_FORWARD_DEPTH + 1 = 3`. At `d = 1` the single intermediate is both — it is dialled by the client
+*and* it learns `M` — so `t` members, which at Fano **is** `f`, name both ends. At `d = 0` the client dials the service's
+meeting line. Neither is a weaker anonymity setting. Both are none, and the circuit still looks like a circuit.
+
+Four hops buys nothing against this adversary: the event is still "the client-naming line and the service-naming line
+are both captured", and adding middles does not change it. What a fourth hop would buy is resistance to an adversary
+that corrupts *adaptively* — one that captures `H_1`, reads off `H_2`, and attacks it next — and coordinates are
+VRF-redrawn each epoch, so that adversary's reach is bounded by the epoch rather than by the depth. Three is the floor
+and the floor is the answer.
+
+**The same rule governs the reply leg and the pairing between the two.** The reply circuit `[R_1, …, R_e, D]` has `R_1`
+named by the service side (the reply is launched to it) and `D` — the client's own drop line — naming the client to
+within its `q + 1` members. So `e ≥ 1`, and across the two circuits **no line may hold both a client-name and a
+service-name**: `{H_1, D} ∩ {H_d, M, R_1} = ∅`. That is `route_leaks`, and it is a gate on every anonymous dial rather
+than a property of the draw, because a draw can be handed a route it did not lay.
+
+Stating it as "the two circuits must be disjoint" would be wrong in the expensive direction: at `q = 2` there are seven
+lines, and two disjoint depth-2 circuits plus a meeting line use six of them, which makes the draw nearly deterministic.
+*A predictable circuit is a targetable one.* The derived rule constrains five pairs and leaves the middles free.
+
+### The budget and the requirement are different numbers
+
+`depth_for` answers "how many hops fit"; `MIN_FORWARD_DEPTH` answers "how many are needed". Nothing compared them until
+`plane_can_anonymize` did, and the two disagree above `q = 3`: the shipped `THRESHOLD_ONION_LEN` gives 2 hops at `q = 4`
+and 1 at `q = 7`, against the 3 required. Those deployments need a **wider onion budget**, which is a per-deployment
+parameter — cell width and onion width are independent, and a wide cell wants both.
+
+This matters because the node used to *recommend* exactly those orders: the narrow-plane warning said "pass
+`--plane-order 4|7|31`" for a better anonymity set, sending the operator from a real weakness (only 2 concurrent
+circuits at Fano, so a passive flow-matching floor of 0.50) to a worse one. Both facts are true; neither subsystem knew
+the other existed.
+
+---
+
 A circuit is `depth` intermediate hops **plus** its destination line, so `D = 3` means at most **2** intermediate hops —
-exactly the CLI default (`--fwd-depth 2`). That leaves no headroom, so the depth is validated at config time: an operator
+exactly the CLI default (`--fwd-depth 2`). On the Fano plane the floor and the ceiling therefore **meet at 2**: the depth
+is forced, not chosen. That leaves no headroom, so the depth is validated at config time: an operator
 raising it gets a message naming the ceiling, because `create_forward` swallows the over-depth error with `.ok()?` and the
 failure is otherwise a dial that quietly never connects.
 

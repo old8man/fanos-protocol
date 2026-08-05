@@ -303,8 +303,14 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         .unwrap();
     let rp_combiner = combiner_for::<F2>(rp).unwrap();
     let rp_index = Point::<F2>::new(rp_combiner).unwrap().index();
-    let hop_to_l = *lines.iter().find(|&&l| l != meeting).unwrap();
-    let hop_to_rp = *lines.iter().find(|&&l| l != rp && l != meeting).unwrap();
+    // TWO forward intermediates, which is the shipped minimum and not a taste: with one, the hop the client
+    // dials is also the hop that learns the meeting line, so `t` corrupted members — the tolerated budget at
+    // Fano — name both ends. These tests ran at depth 1 for their whole life, so the suite that proves an
+    // anonymous session works over real QUIC was proving it for a circuit that carried no anonymity.
+    let mut spare = lines.iter().copied().filter(|&l| l != meeting && l != rp);
+    let hop_to_l = spare.next().unwrap();
+    let hop_to_l2 = spare.next().unwrap();
+    let hop_to_rp = spare.next().unwrap();
 
     let service_node = nodes[l_index].take().unwrap();
     // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
@@ -346,7 +352,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
 
     let client_node = nodes[rp_index].take().unwrap();
     let route = RendezvousRoute {
-        forward_hops: vec![hop_to_l],
+        forward_hops: vec![hop_to_l, hop_to_l2],
         reply_circuit: vec![hop_to_rp, rp],
         directory: mix,
         threshold: t as u8,
@@ -489,7 +495,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         threshold: t as u8,
         epoch,
         beacon: TEST_BEACON,
-        depths: (1, 1),
+        depths: (2, 2),
     };
     let resolver = StaticResolver::new().with("cell.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
@@ -690,7 +696,7 @@ impl OffCombiner {
         threshold: t as u8,
         epoch,
         beacon: TEST_BEACON,
-        depths: (1, 1),
+        depths: (2, 2),
     };
     let resolver = StaticResolver::new().with("off.fanos", meeting, bundle.clone());
     // The dialer, not a dial: each test opens its own fresh session through `OffCombiner::exchange`, so a
@@ -1269,7 +1275,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         threshold: t as u8,
         epoch,
         beacon: TEST_BEACON,
-        depths: (1, 1),
+        depths: (2, 2),
     };
     let resolver = StaticResolver::new().with("driver.fanos", meeting, bundle.clone());
     let dialer = FanosDialer::anonymous_fresh(client_node.client(), resolver, params);
