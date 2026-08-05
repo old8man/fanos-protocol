@@ -96,6 +96,8 @@ structure, which is why the answers compose instead of conflicting:
 | E3 | **Side channels** (non-constant-time on secrets) | Constant-time `GF(256)` on secret shares; `subtle`/`zeroize` | ✅ 🟡 | **#63:** constant-time Shamir (B7), `subtle::ConstantTimeEq` on credit redemption (B8), `zeroize` on onion-ratchet + Shamir secrets (A6); **#73:** `VrfSecret` dropped `Copy` + redacted `Debug`. 🟡 residual: `pub` secret fields (encapsulation — a tracked #73 review item) |
 | E4 | **Downgrade / MitM** | Transcript binds service identity; ephemeral-KEM forward secrecy | ✅ | handshake (audit "excellent") |
 | E5 | **Nonce-counter wrap** | Hard connection-kill at the AEAD nonce limit | ✅ | **#66:** `fanos-diaulos::conn` `next_nonce` uses `checked_add` — at 2⁶⁴ constant-size cells the connection refuses to mint any further cell rather than wrap the nonce (a hard kill), so no `(key, nonce)` pair is ever reused |
+| E6 | **Harvest-now-decrypt-later on *long-lived public* material** — distinct from E1, which is about the transport | The beacon's group commitment is a **Feldman** commitment over ristretto255: `commitment.coeffs[0] = x·G`, where `x` is the beacon's long-term threshold secret. It is published as `commitment = <hex>` in **every node's config** and, via `genesis_seed = H("FANOS-v1/genesis-beacon" ‖ commitment)`, it **is the network's public name** — so it must stay public forever. | 🔴 | **Open (#98).** `spec/protocol.md` §1265 marks the PQ beacon `[P]` honestly ("we use classical variants as an interim"), but the *blast radius* of this particular interim is nowhere stated, and it is not peer to the others. One DL solve on public provisioning data recomputes `seed(epoch) = H(x·M(epoch))` for **every past epoch**, and everything derived from a seed — meeting points, ingress-line rosters, role assignment, coordinates — is a pure function of `(community, epoch, beacon)`. An adversary who archives one config file today can, post-quantum, **replay the network's entire recorded history**. The other classical interims (PQ-VRF, PQ shuffle) are per-node and forward-looking; this one is global and retroactive. `fanos_vrf::pqvss` exists as the replacement (blinded, non-algebraic commitments) and is NOVEL/UNAUDITED — so the trade is *audited-but-leaky* against *PQ-but-novel*, and #98 also records that the fix is entangled: swapping the commitment renames the network. |
+
 
 ## F. Consensus & consistency
 
@@ -130,6 +132,11 @@ structure, which is why the answers compose instead of conflicting:
 Existing audit tasks cover most code-level gaps (#57–#69). This model surfaces **network-science** gaps that
 deserve their own verified treatment, tracked as new tasks:
 
+- **Retroactive beacon exposure (E6):** the genesis commitment is simultaneously the network's public name
+  and a discrete-log encryption of its master secret. Two roles with opposite lifetime requirements on one
+  32-byte-per-coefficient object. Owned by **#98**, whose first step is cheap and available now: give the
+  network an explicit random `network_id` so `genesis_seed` no longer derives from the commitment, which
+  decouples the two roles and makes a later `pqvss` migration a key rotation rather than a re-founding.
 - ~~**Sybil-cost bound (B1):**~~ **done** — `sim/tests/sybil_cost.rs` derives + measures `E[T]=N` per seat
   (coupon-collector for thresholds), grounded in `MapToPoint` uniformity.
 - ~~**Eclipse resistance (B2):**~~ **done** — `sim/tests/eclipse.rs` proves the derived-neighbour invariant
