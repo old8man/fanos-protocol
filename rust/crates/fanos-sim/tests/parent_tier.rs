@@ -23,9 +23,16 @@ fn config() -> Config {
 /// Seven arbitrary F31 seats for the parent cell — none on the base points 0..6.
 const PARENT: [usize; 7] = [7, 21, 55, 111, 300, 600, 950];
 
-fn cell_escalate_frame(child_index: u8, residue: u8, ttl: u8) -> Vec<u8> {
+/// The `CellEscalate` body: `child_index(2, big-endian) ‖ residue ‖ ttl`.
+///
+/// **Two bytes, and this file is exactly the reason** (#110). It runs on `F31` — 993 points — where the old
+/// one-byte index aliased any child above 255 onto a different, *valid* sibling that the receiver's bounds
+/// check happily accepted. `usize` here rather than `u8` so a future case can name a child this plane really
+/// has, instead of the helper quietly capping what the test is able to say.
+fn cell_escalate_frame(child_index: usize, residue: u8, ttl: u8) -> Vec<u8> {
     let mut f = Vec::new();
-    encode_frame(FrameType::CellEscalate.code(), &[child_index, residue, ttl], &mut f);
+    let idx = u16::try_from(child_index).expect("a child index fits the wire field").to_be_bytes();
+    encode_frame(FrameType::CellEscalate.code(), &[idx[0], idx[1], residue, ttl], &mut f);
     f
 }
 
