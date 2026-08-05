@@ -763,7 +763,7 @@ which is why no adversarial scenario had ever produced them.
 slots by `(coordinate, epoch)` — `mixdir`, `capdir`, `loaddir`, `telemetry_dir`, `exit`, `crosscell_dir` —
 and every one re-publishes on each epoch advance, so every node mints a distinct key every epoch. The store
 had **no deletion path at all**: no `Delete` command, no prune, no TTL. Its admission rule is fail-closed, so
-past `MAX_STORE_ENTRIES = 4096` a new digest is refused while keys already held keep accepting writes.
+past `MAX_STORE_ENTRIES` (2048 as of 2026-08-05, derived from `STORE_MEMORY_BUDGET`) a new digest is refused while keys already held keep accepting writes.
 
 The arithmetic: 4 slots × 7 nodes = 28 per epoch; 4096/28 = 146 epochs; × 600 s = **1.01 days**. After that
 the cell answers every existing lookup and can no longer rotate a mix key, advertise a capability or report a

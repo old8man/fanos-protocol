@@ -236,7 +236,7 @@ The memory ceiling is a sum of explicit caps rather than an empirical guess. The
 
 | cap | value | what it bounds |
 |---|---|---|
-| `MAX_STORE_ENTRIES` | 4096 keys | the overlay store |
+| `MAX_STORE_ENTRIES` | 2048 keys (`STORE_MEMORY_BUDGET / MAX_VALUE_LEN`) | the overlay store |
 | `MAX_VALUE_LEN` | 64 KiB | one stored value |
 | `MAX_PENDING_GETS` | 1024 | reads in flight |
 | `HELD_CAP` | 512 | own shards retained to serve peers |
@@ -244,18 +244,23 @@ The memory ceiling is a sum of explicit caps rather than an empirical guess. The
 | `SEEN_TX_CAP` | 8192 | transaction dedup (validator) |
 | `RECENT_BODY_CAP` | 64 | finalized bodies kept to help a lagging peer |
 
-Worst-case store: **`4096 × 64 KiB = 256 MiB` exactly.**
+Worst-case store: **`2048 × 64 KiB = 128 MiB` exactly** — half the relay/storage recommendation, by
+construction.
 
-**This was stated as `4096 × ⌈64 KiB / 3⌉ ≈ 85 MB` and that was wrong, in the one number an operator sizes
-RAM against.** The `/3` assumed `MAX_VALUE_LEN` caps the *reconstructed value* while a node holds one shard
-of it — but the cap is applied to the body of the `PUBLISH_SHARD` frame, which is the shard itself.
-`fanos-runtime`'s own `an_oversize_published_value_is_refused` publishes a shard of exactly `MAX_VALUE_LEN`
+**Two things were wrong here and both are fixed.** The figure read `4096 × ⌈64 KiB / 3⌉ ≈ 85 MB`, dividing
+by the erasure rate as though `MAX_VALUE_LEN` capped the *reconstructed value* while a node held one shard of
+it. The cap is applied to the body of the `PUBLISH_SHARD` frame — the shard itself —
+and `fanos-runtime`'s `an_oversize_published_value_is_refused` publishes a shard of exactly `MAX_VALUE_LEN`
 and asserts it is **stored**. An attacker floods full-size shards directly; nothing makes them a third of
-anything.
+anything. So the true ceiling at 4096 entries was 256 MiB, three times what this said, and *exactly* the RAM
+recommended below — the whole budget in one map.
 
-The consequence is the recommendation below: at 85 MB the store fits comfortably inside the 256 MB suggested
-for a relay/storage node, and at 256 MiB it *is* that budget with nothing left for the rest of the process.
-Either the cap or the recommendation has to move — see the note on the role table.
+And `4096` itself had no derivation: its doc said what the cap did, never why it was that number.
+`MAX_STORE_ENTRIES` is now `STORE_MEMORY_BUDGET / MAX_VALUE_LEN`, so the count and the bytes cannot drift,
+with both bounds derived and the point between them owned as a choice — see the constant's own
+documentation. The floor is honest use (56 live directory slots, computed by `store_lifetime.rs`); the
+ceiling is every cap saturating inside the recommendation (~203 MiB); the value is the largest power of two
+leaving a full doubling of headroom.
 
 A *sparse* cell holds several shards per key, which scales the typical case up by the number of points it
 covers; it does not change this ceiling, which is already per-key-per-node.
@@ -266,7 +271,7 @@ Estimates from the measurements plus the caps — not measured under load, and m
 
 | role | RAM | CPU | disk | network |
 |---|---|---|---|---|
-| **relay / storage** (the default) | 256 MB — **but see the correction above** | 1 core | 1 GB | any stable link; cover traffic is constant-rate, so budget for it |
+| **relay / storage** (the default) | 256 MB | 1 core | 1 GB | any stable link; cover traffic is constant-rate, so budget for it |
 | **validator** (TAXIS) | 512 MB | 2 cores | 2 GB | consensus is chatty per round; latency matters more than bandwidth |
 | **shielded-pool user** (OBOLOS) | 2 GB | 4 cores | — | **the heavy case**: a zero-knowledge proof at real parameters takes **~40 s on a release build**, and far longer unoptimised |
 

@@ -238,7 +238,39 @@ const GREY_TOL: f64 = 0.10;
 /// clock — and whether that is survivable is arithmetic over this number, the epoch period and the publisher
 /// count. Keeping it crate-private meant no publisher could do that arithmetic, and none did
 /// (`fanos-node/tests/store_lifetime.rs`).
-pub const MAX_STORE_ENTRIES: usize = 4096;
+pub const MAX_STORE_ENTRIES: usize = STORE_MEMORY_BUDGET / MAX_VALUE_LEN;
+
+/// The memory one node's store slice may occupy **at its ceiling** — the budget [`MAX_STORE_ENTRIES`]
+/// divides, so the count and the bytes cannot drift apart.
+///
+/// **The value was 4096 entries and had no derivation** — its doc said what the cap did, never why it was
+/// that number, which is the shape #45 exists to remove. Deriving it turned up a second thing:
+/// `4096 × 64 KiB = 256 MiB` is *exactly* the RAM `docs/deployment-minima.md` recommends for the default
+/// relay/storage role, so a node under a publish flood had its entire budget in one map with nothing left
+/// for the transport, the engine or the process. (That guide also understated the ceiling threefold, having
+/// divided by the erasure rate as though the cap applied to a reconstructed value; the cap is applied to the
+/// `PUBLISH_SHARD` body, and `an_oversize_published_value_is_refused` stores a shard of exactly
+/// `MAX_VALUE_LEN`.)
+///
+/// **Both bounds are derived; the point between them is a stated choice.**
+///
+/// *Ceiling.* Every cap saturating at once must still fit the recommendation: the other terms are
+/// `HELD_CAP × MAX_VALUE_LEN` = 32 MiB, `PENDING_CAP × MAX_VALUE_LEN` = 4 MiB, in-flight reads < 1 MiB and
+/// 7.6 MB measured resident, so the store may have at most `256 − 45 ≈ 203 MiB`. That is the largest legal
+/// value, not a good one: it leaves a saturated node exactly at its recommendation, where the OS reclaims or
+/// the kernel kills.
+///
+/// *Floor.* Honest use must be nowhere near it. A fully-provisioned Fano cell writes 4 directory slots per
+/// node per epoch and keeps one epoch of grace, so **56 slots are live at any moment**
+/// (`fanos-node/tests/store_lifetime.rs`, which computes it from the shipped constants), and that test
+/// additionally requires the directories to stay under a quarter of the cap — a floor of 224.
+///
+/// *The choice.* 128 MiB — half the relay recommendation, and the largest power of two that leaves a full
+/// doubling of headroom below the 203 MiB ceiling. It gives **2048 entries**: 36× the live directory set and
+/// 9× the floor that test enforces, so honest use is untouched, while a flooded node occupies half its
+/// budget instead of all of it. The bounds are arithmetic; picking the round number inside them is
+/// engineering judgement, and saying which is which is the point of writing it down.
+pub(crate) const STORE_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
 pub(crate) const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
