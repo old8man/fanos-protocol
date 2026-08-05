@@ -158,18 +158,19 @@ where
             // host at 0.70 "busy, which is quiet" and asserted anyway. Below `QUIET_ENOUGH` this process
             // cannot expect half a core, so every deadline competes with an equal amount of foreign work.
             let share = host_cpu_share();
-            assert!(
-                share >= QUIET_ENOUGH,
+            if share < QUIET_ENOUGH {
+                eprintln!(
+                    "{what}: DECLINED — the ceiling was reached with only {share:.2} of a core available \
+                     (quiet needs >= {QUIET_ENOUGH:.2}), so this measures the machine. Re-run it alone \
+                     before believing anything. Last seen: {last}"
+                );
+                return;
+            }
+            panic!(
                 "{what}: INCONCLUSIVE — still changing at the {HANG_CEILING:?} ceiling with {share:.2} of a \
                  core available, which is quiet enough to conclude, so this is the system and not the \
                  machine. Last seen: {last}"
             );
-            eprintln!(
-                "{what}: DECLINED — the ceiling was reached with only {share:.2} of a core available \
-                 (quiet needs >= {QUIET_ENOUGH:.2}), so this measures the machine. Re-run it alone before \
-                 believing anything. Last seen: {last}"
-            );
-            return;
         }
         granted += POLL;
         tokio::time::sleep(POLL).await;
