@@ -258,7 +258,7 @@ pub use mixdir::{
 };
 pub use ingress_node::IngressNode;
 pub use ingressdir::{ingress_keypair, publish_ingress_key, resolve_ingress_key, resolve_ingress_line};
-pub use node::{Health, Node};
+pub use node::{Health, NetworkId, Node};
 pub use poros::{
     DealtDescriptor, DescriptorBinding, IngressDescriptor, IngressRequest, IngressResponse, PorosHost,
     Recovery, descriptor_commitment, recover, request_frame, shard_descriptor, solve_ingress_request,

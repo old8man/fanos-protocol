@@ -34,6 +34,7 @@ async fn the_live_epoch_clock_advances_the_beacon_across_epochs() {
     let config = NodeConfig {
         listen: "127.0.0.1:0".parse().expect("loopback addr"),
         beacon: Some(BeaconParams {
+            network_id: fanos_node::NetworkId::from_seed(b"test-network"),
             commitment,
             threshold: 1,
             share: Some(share),

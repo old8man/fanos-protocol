@@ -113,6 +113,11 @@ pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 /// (the pre-beacon behaviour), so this is fully backward-compatible.
 #[derive(Clone)]
 pub struct BeaconParams {
+    /// This network's **public name** — the value epoch 0's coordinates are drawn against.
+    ///
+    /// Independent of `commitment` on purpose; see [`NetworkId`](crate::NetworkId) for why the two were the
+    /// same value and what separating them does and does not buy (#98).
+    pub network_id: crate::NetworkId,
     /// The beacon group's public commitment — a genesis parameter shared across the network.
     pub commitment: VssCommitment,
     /// The DVRF reconstruction threshold `t`.
@@ -161,20 +166,25 @@ impl fmt::Debug for BeaconParams {
 }
 
 impl BeaconParams {
-    /// This network's **genesis seed**, `H("FANOS-v1/genesis-beacon" ‖ commitment)`.
+    /// This network's **genesis seed**, `H("FANOS-v1/genesis-beacon" ‖ network_id)`.
     ///
-    /// The commitment is the only per-network random value every participant necessarily holds before it can
-    /// do anything, which is exactly what epoch 0 needs and had nothing to supply
+    /// It used to hash the *commitment*, on the reasoning that it is the only per-network random value every
+    /// participant necessarily holds before it can do anything — which is exactly what epoch 0 needs and had
+    /// nothing to supply
     /// (`docs/design-genesis.md` §4). One derivation, in [`crate::node::genesis_seed`]; this is the
     /// ergonomic way to reach it from provisioning.
     #[must_use]
     pub fn genesis_seed(&self) -> fanos_primitives::BeaconSeed {
-        crate::node::genesis_seed(&self.commitment)
+        crate::node::genesis_seed(&self.network_id)
     }
 
     /// Parse beacon provisioning from a `key = value` file (audit S1-H2), so a node can be handed its DKG
     /// output and run the **live epoch clock** (§7.6) — turning on E4 forward secrecy and E5 rotation — instead
     /// of pinning at genesis. Keys:
+    /// - `network_id = <32 bytes of hex>` — this **network's public name**, the value epoch 0's coordinates
+    ///   are drawn against. Required, and deliberately not derivable from anything else in this file: see
+    ///   [`NetworkId`](crate::NetworkId). Two deployments that share it share every genesis coordinate, so it
+    ///   is minted once per network and copied verbatim to every member;
     /// - `threshold = <t>` — the DVRF reconstruction threshold;
     /// - `commitment = <hex>` — the group's public [`VssCommitment`] (network-wide genesis material);
     /// - `share = <hex>` — THIS node's anchor [`VssShare`]; omit for a pure consumer (verifies + adopts only);
@@ -191,6 +201,7 @@ impl BeaconParams {
         let mut commitment: Option<VssCommitment> = None;
         let mut share: Option<VssShare> = None;
         let mut authority: Option<RecoveryAuthoritySet> = None;
+        let mut network_id: Option<crate::NetworkId> = None;
         for (n, raw) in text.lines().enumerate() {
             let l = raw.split('#').next().unwrap_or("").trim();
             if l.is_empty() {
@@ -205,6 +216,12 @@ impl BeaconParams {
                     threshold = Some(value.parse().map_err(|_| {
                         NodeError::Config(format!("bad beacon threshold '{value}'"))
                     })?);
+                }
+                "network_id" => {
+                    let bytes: [u8; 32] = hex_decode(value)?.try_into().map_err(|_| {
+                        NodeError::Config("bad network_id (expected 32 bytes of hex)".to_owned())
+                    })?;
+                    network_id = Some(crate::NetworkId::new(bytes));
                 }
                 "commitment" => {
                     commitment = Some(VssCommitment::from_bytes(&hex_decode(value)?).ok_or_else(|| {
@@ -240,6 +257,11 @@ impl BeaconParams {
             }
         }
         Ok(Self {
+            // Required, with no fallback to the commitment. Defaulting would keep the coupling #98 removes
+            // for exactly the configurations that forgot the field — and a network whose name is a function
+            // of its beacon can never retire that beacon without re-seating every node.
+            network_id: network_id
+                .ok_or_else(|| NodeError::Config("beacon config missing `network_id`".to_owned()))?,
             commitment: commitment
                 .ok_or_else(|| NodeError::Config("beacon config missing `commitment`".to_owned()))?,
             threshold: threshold
@@ -256,6 +278,9 @@ impl BeaconParams {
     pub fn to_config_string(&self) -> String {
         use core::fmt::Write as _;
         let mut s = String::new();
+        // First, because it is the network's name: an operator diffing two provisioning files to answer
+        // "are these the same network?" reads it before anything else.
+        let _ = writeln!(s, "network_id = {}", hex_encode(self.network_id.as_bytes()));
         let _ = writeln!(s, "threshold = {}", self.threshold);
         let _ = writeln!(s, "commitment = {}", hex_encode(&self.commitment.to_bytes()));
         if let Some(share) = &self.share {
@@ -1240,14 +1265,14 @@ mod tests {
 
         // An ANCHOR's file carries the threshold, the public commitment, and its own share.
         let anchor =
-            BeaconParams { commitment: commitment.clone(), threshold: 4, share: Some(s2.clone()), authority: None };
+            BeaconParams { network_id: crate::NetworkId::from_seed(b"test-network"), commitment: commitment.clone(), threshold: 4, share: Some(s2.clone()), authority: None };
         let parsed = BeaconParams::from_config_str(&anchor.to_config_string()).unwrap();
         assert_eq!(parsed.threshold, 4);
         assert_eq!(parsed.commitment.to_bytes(), commitment.to_bytes(), "the group commitment round-trips");
         assert_eq!(parsed.share.unwrap().to_bytes(), s2.to_bytes(), "the anchor's share round-trips");
 
         // A pure CONSUMER's file omits the share (it verifies + adopts, never contributes).
-        let consumer = BeaconParams { commitment, threshold: 4, share: None, authority: None };
+        let consumer = BeaconParams { network_id: crate::NetworkId::from_seed(b"test-network"), commitment, threshold: 4, share: None, authority: None };
         let parsed = BeaconParams::from_config_str(&consumer.to_config_string()).unwrap();
         assert!(parsed.share.is_none(), "a consumer has no share");
 
@@ -1269,12 +1294,32 @@ mod tests {
         let (_shares, commitment) =
             deal(&[0x2C; 32], 4, 7, &mut DeterministicRng::new(b"cfg-authority")).unwrap();
         let params = BeaconParams {
+            network_id: crate::NetworkId::from_seed(b"test-network"),
             commitment: commitment.clone(),
             threshold: 4,
             share: None,
             authority: Some(RecoveryAuthoritySet::new(vec![verifier.clone()]).unwrap()),
         };
         let back = BeaconParams::from_config_str(&params.to_config_string()).expect("round trip");
+        // The network's NAME must survive byte-identically, and this is not a formality: it is what epoch 0's
+        // coordinates are drawn against, so two members whose files disagree by one byte seat themselves in
+        // different coordinate spaces and cannot verify each other at genesis (#98).
+        assert_eq!(
+            back.network_id.as_bytes(),
+            params.network_id.as_bytes(),
+            "the network name must come back byte-identical or the cell cannot agree on a single genesis"
+        );
+        // And a file WITHOUT it is refused rather than defaulted. A fallback to the commitment would keep the
+        // very coupling this replaced, for exactly the configurations that forgot the field — the opt-in
+        // shape that keeps producing findings. Fail closed: an unnamed network is a provisioning error.
+        let full = params.to_config_string();
+        let kept: Vec<&str> =
+            full.lines().filter(|l| !l.trim_start().starts_with("network_id")).collect();
+        let unnamed = kept.join("\n");
+        assert!(
+            BeaconParams::from_config_str(&unnamed).is_err(),
+            "a beacon file with no network_id must be refused, never silently renamed after its commitment"
+        );
         let recovered = back.authority.expect("the authority must survive the file");
         assert_eq!(
             recovered.members().first().expect("one member").encode(),
@@ -1285,7 +1330,7 @@ mod tests {
         // And a file without one still parses: an operator may deliberately provision a cell that cannot be
         // reshaped, and that must be a choice rather than a parse error.
         let without = BeaconParams::from_config_str(
-            &BeaconParams { commitment: commitment.clone(), threshold: 4, share: None, authority: None }
+            &BeaconParams { network_id: crate::NetworkId::from_seed(b"test-network"), commitment: commitment.clone(), threshold: 4, share: None, authority: None }
                 .to_config_string(),
         )
         .expect("a file without an authority is still valid");

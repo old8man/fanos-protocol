@@ -1426,7 +1426,18 @@ fn deal_own_beacon(path: &Path) -> Result<(), NodeError> {
     let (shares, commitment) = deal(&secret, 1, 1, &mut DeterministicRng::new(&rng_seed))
         .ok_or_else(|| NodeError::Config("could not deal a 1-of-1 beacon".to_owned()))?;
     let share = shares.first().cloned();
-    let params = BeaconParams { commitment, threshold: 1, share, authority: None };
+    // The network's name is minted here, from its own entropy — **not** derived from the commitment, and not
+    // from `secret` or `rng_seed` either. A name that is any function of the beacon's key material is the
+    // coupling #98 removes, and deriving it from the same draw would reintroduce it one step further away.
+    let mut name = [0u8; 32];
+    getrandom::fill(&mut name).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let params = BeaconParams {
+        network_id: fanos_node::NetworkId::new(name),
+        commitment,
+        threshold: 1,
+        share,
+        authority: None,
+    };
     // Secret: it carries this cell's beacon share.
     write_file(path, params.to_config_string(), true)
 }
@@ -2044,8 +2055,17 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     // party holds it; an authority that can order that key REPLACED must not be weaker, and a single key was.
     let (authority_seeds, authority) = resolve_authority(args, n)?;
 
+    // One name for the whole ceremony, minted from its own entropy: every file this loop writes must carry
+    // the SAME name, or the anchors and the consumer would sit on different networks and never agree on a
+    // single genesis coordinate. Drawn separately from `secret`/`rng_seed` so the name is not a function of
+    // the beacon's key material — that coupling is what #98 removes.
+    let mut name = [0u8; 32];
+    getrandom::fill(&mut name).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let network_id = fanos_node::NetworkId::new(name);
+
     for (i, share) in shares.iter().enumerate() {
         let params = BeaconParams {
+            network_id,
             commitment: commitment.clone(),
             threshold: t,
             share: Some(share.clone()),
@@ -2055,7 +2075,7 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
         write_dealt(&path, params.to_config_string(), true)?;
     }
     let consumer =
-        BeaconParams { commitment, threshold: t, share: None, authority: Some(authority.clone()) };
+        BeaconParams { network_id, commitment, threshold: t, share: None, authority: Some(authority.clone()) };
     let cpath = format!("{out}/consumer.beacon");
     write_dealt(&cpath, consumer.to_config_string(), false)?;
     // The SEEDS, not the derived secrets: `HybridSigSecret::generate` is deterministic in one, so a member

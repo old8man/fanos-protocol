@@ -84,6 +84,7 @@ pub fn spawn_composed_beacon_cell<F: Field + 'static>(
     for (i, point) in Plane::<F>::points().enumerate() {
         let what = CellComposition {
             beacon: Some(BeaconParams {
+                network_id: fanos_node::NetworkId::from_seed(b"test-network"),
                 commitment: commitment.clone(),
                 threshold,
                 share: (i < anchors).then(|| shares[i].clone()),
@@ -121,6 +122,7 @@ pub fn spawn_composed_relay_cell<F: Field + 'static>(
     for (i, point) in Plane::<F>::points().enumerate() {
         let mut what = CellComposition::overlay_only(config);
         what.beacon = Some(BeaconParams {
+            network_id: fanos_node::NetworkId::from_seed(b"test-network"),
             commitment: commitment.clone(),
             threshold: 2,
             share: Some(shares[i].clone()),

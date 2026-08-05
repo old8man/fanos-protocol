@@ -6,6 +6,7 @@
 //! endpoint, connection pool, event loop — lives in the driver; this type is the supervisor that
 //! wires identity, bootstrap, and the engine together and exposes control.
 
+use core::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +32,6 @@ use fanos_primitives::NodeId;
 use fanos_quic::NodeCredentials;
 
 use fanos_primitives::BeaconSeed;
-use fanos_vrf::vss::VssCommitment;
 
 use crate::config::{IngressParams, NodeConfig, RoleSet};
 use crate::role_loop::{
@@ -472,8 +472,62 @@ fn spawn_exit_role(
 /// coordinate. Unpredictability is what prices placement; work only makes precomputation slower.
 /// `docs/design-genesis.md` §2 has the derivation.
 #[must_use]
-pub fn genesis_seed(commitment: &VssCommitment) -> BeaconSeed {
-    BeaconSeed::new(fanos_primitives::hash_labeled("FANOS-v1/genesis-beacon", &commitment.to_bytes()))
+pub fn genesis_seed(network: &NetworkId) -> BeaconSeed {
+    BeaconSeed::new(fanos_primitives::hash_labeled("FANOS-v1/genesis-beacon", network.as_bytes()))
+}
+
+/// A network's **public name**: 32 bytes fixed once, at founding, and carried in every node's provisioning.
+///
+/// **Separate from the beacon commitment, and that separation is the point (#98).** The seed used to be
+/// `H(label ‖ commitment)`, on the reasoning that the commitment is the only per-network random value every
+/// participant necessarily holds before it can do anything. True, and it made the network's name a function
+/// of the beacon's key material — a `VssCommitment` is a Feldman commitment `x·G` over ristretto255, so the
+/// name was a discrete-log encryption of the beacon master secret, published in every configuration file and,
+/// *because it was the name*, impossible to ever withdraw (`spec/protocol.md` §1265,
+/// `docs/network-threat-model.md` E6).
+///
+/// **What this buys, stated exactly.** Not a bound on the retroactive exposure — an adversary who archived a
+/// configuration file still holds that commitment, and one discrete-log solve still recomputes every epoch
+/// that commitment served. What it buys is the **precondition for retiring one**: with the name independent,
+/// a beacon can be replaced without re-seating the network, so the damage from a solve is confined to the
+/// epochs its own commitment covered instead of all history. The bound arrives with rotation; this is what
+/// rotation was blocked on.
+///
+/// It is **required**, never defaulted back to the commitment. A fallback would silently keep the coupling
+/// for every configuration that omits the field, which is the shape that produced the last several findings:
+/// an opt-in property is absent exactly where it matters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct NetworkId([u8; 32]);
+
+impl NetworkId {
+    /// Wrap 32 bytes chosen at founding.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Derive a name from any founding material — a chosen phrase, a ceremony transcript, a random draw.
+    ///
+    /// Domain-separated so a name can never coincide with a seed, a slot key or a challenge derived from the
+    /// same bytes elsewhere.
+    #[must_use]
+    pub fn from_seed(material: &[u8]) -> Self {
+        Self(fanos_primitives::hash_labeled("FANOS-v1/network-id", material))
+    }
+
+    /// The raw name.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NetworkId {
+    /// Public material, so it prints in full — an operator comparing two nodes' networks needs the whole
+    /// value, and a truncated one silently matches on a prefix.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NetworkId({})", encode_hex(&self.0))
+    }
 }
 
 /// Validate the **beacon** parameters, so a provisioning file cannot hand a node a threshold the beacon it
@@ -839,7 +893,7 @@ impl Node {
         // site. Where no beacon is configured the constant stands, which is right — such a deployment has no
         // epoch clock and no reshuffle, so it has no placement defence at any epoch (`docs/design-genesis.md`).
         let directory = match config.beacon.as_ref() {
-            Some(bp) => Directory::new().for_network(genesis_seed(&bp.commitment)),
+            Some(bp) => Directory::new().for_network(genesis_seed(&bp.network_id)),
             None => Directory::new(),
         };
         for peer in &config.bootstrap {
@@ -1362,6 +1416,7 @@ mod tests {
         let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             beacon: Some(BeaconParams {
+                network_id: NetworkId::from_seed(b"test-network"),
                 commitment,
                 threshold: 2,
                 share: None,
@@ -1519,7 +1574,7 @@ mod tests {
         let offered = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
+            beacon: Some(BeaconParams { network_id: NetworkId::from_seed(b"test-network"), commitment, threshold: 2, share: None, authority: None }),
             roles: offered,
             ..NodeConfig::default()
         })
@@ -1563,6 +1618,7 @@ mod tests {
         let mut node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             beacon: Some(BeaconParams {
+                network_id: NetworkId::from_seed(b"test-network"),
                 commitment,
                 threshold: 2,
                 share: None,
@@ -1763,7 +1819,7 @@ mod tests {
 
         let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
+            beacon: Some(BeaconParams { network_id: NetworkId::from_seed(b"test-network"), commitment, threshold: 2, share: None, authority: None }),
             roles: RoleSet { ingress: true, ..RoleSet::default() },
             ingress: Some(IngressParams {
                 community: b"a-testnet-community".to_vec(),
@@ -1819,6 +1875,7 @@ mod tests {
         let start = |threshold: usize| NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             beacon: Some(BeaconParams {
+                network_id: NetworkId::from_seed(b"test-network"),
                 commitment: commitment.clone(),
                 threshold: 2,
                 share: None,
@@ -1857,6 +1914,7 @@ mod tests {
         let start = |threshold: usize| NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             beacon: Some(BeaconParams {
+                network_id: NetworkId::from_seed(b"test-network"),
                 commitment: commitment.clone(),
                 threshold,
                 share: None,
@@ -1902,7 +1960,7 @@ mod tests {
         assert!(
             Node::start::<F2>(NodeConfig {
                 listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-                beacon: Some(BeaconParams { commitment, threshold: 1, share, authority: None }),
+                beacon: Some(BeaconParams { network_id: NetworkId::from_seed(b"test-network"), commitment, threshold: 1, share, authority: None }),
                 ..NodeConfig::default()
             })
             .await
@@ -1923,12 +1981,15 @@ mod tests {
         // Asserted over the seeds rather than over a running node because that is where the property lives —
         // the transport reads `Directory::genesis()`, and a test that stood up two cells would be measuring
         // the same equality through more machinery.
-        use fanos_vrf::vss::{DeterministicRng, deal};
+        // Drawn from each network's NAME, not from its beacon commitment (#98). The commitment was the
+        // obvious source — it is the one per-network random value everybody necessarily holds — and it made
+        // the network's public name a Feldman `x·G` over its own master secret, published everywhere and,
+        // being the name, unwithdrawable. The property below is the same either way, which is exactly why
+        // nothing caught the coupling: it is invisible to any test that only asks "do two networks differ?".
+        let net_a = NetworkId::from_seed(b"network-a");
+        let net_b = NetworkId::from_seed(b"network-b");
 
-        let (_a, commitment_a) = deal(&[0x11; 32], 2, 3, &mut DeterministicRng::new(b"network-a")).unwrap();
-        let (_b, commitment_b) = deal(&[0x22; 32], 2, 3, &mut DeterministicRng::new(b"network-b")).unwrap();
-
-        let (a, b) = (genesis_seed(&commitment_a), genesis_seed(&commitment_b));
+        let (a, b) = (genesis_seed(&net_a), genesis_seed(&net_b));
         assert_ne!(
             a.as_bytes(),
             b.as_bytes(),
@@ -1941,11 +2002,46 @@ mod tests {
             "and neither may be the shared constant",
         );
         assert_eq!(
-            genesis_seed(&commitment_a).as_bytes(),
+            genesis_seed(&net_a).as_bytes(),
             a.as_bytes(),
-            "deterministic in the commitment: every node of one network must derive the identical seed, or \
-             they seat themselves in different coordinate spaces and cannot verify each other at epoch 0",
+            "deterministic in the name: every node of one network must derive the identical seed, or they \
+             seat themselves in different coordinate spaces and cannot verify each other at epoch 0",
         );
+    }
+
+    /// **The network's name is independent of its beacon** (#98) — the property the old derivation could not
+    /// have, and which no "do two networks differ?" test can see.
+    ///
+    /// `genesis_seed` used to hash the `VssCommitment`. That is a Feldman commitment `x·G` over ristretto255,
+    /// so the network's public name was a discrete-log encryption of the beacon master secret — published in
+    /// every provisioning file and, *because it was the name*, impossible to withdraw. What this buys is not
+    /// a bound on that exposure (an archived file still holds the commitment) but the **precondition for
+    /// retiring one**: re-deal the beacon, keep the name, and a later discrete-log solve reaches only the
+    /// epochs its own commitment served instead of all history.
+    ///
+    /// Both halves are needed. That one name gives one seed across different beacons is the decoupling; that
+    /// two names give different seeds is what stops the first from being satisfied by a constant.
+    #[test]
+    fn the_networks_name_is_independent_of_the_beacon_it_runs() {
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        let name = NetworkId::from_seed(b"one-network");
+        let (_x, first) = deal(&[0x44; 32], 2, 3, &mut DeterministicRng::new(b"beacon-one")).unwrap();
+        let (_y, second) = deal(&[0x55; 32], 2, 3, &mut DeterministicRng::new(b"beacon-two")).unwrap();
+        assert_ne!(first.to_bytes(), second.to_bytes(), "two genuinely different beacons, or this proves nothing");
+
+        let before = BeaconParams { network_id: name, commitment: first, threshold: 2, share: None, authority: None };
+        let after = BeaconParams { network_id: name, commitment: second, threshold: 2, share: None, authority: None };
+        assert_eq!(
+            before.genesis_seed().as_bytes(),
+            after.genesis_seed().as_bytes(),
+            "the beacon was replaced and the network kept its name — this is what a rotation needs, and what \
+             hashing the commitment made impossible without re-seating every node",
+        );
+
+        // And the name still separates networks, or the decoupling above would be satisfied by a constant.
+        let elsewhere = NetworkId::from_seed(b"another-network");
+        assert_ne!(genesis_seed(&name).as_bytes(), genesis_seed(&elsewhere).as_bytes());
     }
 
     #[tokio::test]
@@ -1957,10 +2053,11 @@ mod tests {
         use fanos_vrf::vss::{DeterministicRng, deal};
 
         let (_s, commitment) = deal(&[0x33; 32], 2, 3, &mut DeterministicRng::new(b"bound-net")).unwrap();
-        let expected = genesis_seed(&commitment);
+        let network_id = NetworkId::from_seed(b"bound-net");
+        let expected = genesis_seed(&network_id);
         let node = Node::start::<F2>(NodeConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
-            beacon: Some(BeaconParams { commitment, threshold: 2, share: None, authority: None }),
+            beacon: Some(BeaconParams { network_id, commitment, threshold: 2, share: None, authority: None }),
             ..NodeConfig::default()
         })
         .await

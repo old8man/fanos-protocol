@@ -93,9 +93,13 @@ pub struct CellComposition {
 }
 
 impl CellComposition {
-    /// The genesis seed of the network this composition describes — derived from the beacon commitment it
-    /// already carries, so it cannot disagree with the beacon this node runs
+    /// The genesis seed of the network this composition describes — read from the `network_id` its beacon
+    /// parameters carry, so it cannot disagree with the network this node was provisioned onto
     /// ([`BeaconParams::genesis_seed`](crate::config::BeaconParams::genesis_seed)).
+    ///
+    /// Without a beacon there is no network name to read, so the shared constant stands: a pinned cell with
+    /// no beacon runs no epoch clock and draws no coordinates against a seed, which is the pre-beacon
+    /// behaviour this deliberately preserves.
     #[must_use]
     pub fn genesis_seed(&self) -> BeaconSeed {
         self.beacon.as_ref().map_or(BeaconSeed::GENESIS, BeaconParams::genesis_seed)
