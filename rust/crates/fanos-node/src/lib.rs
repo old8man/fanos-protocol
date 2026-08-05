@@ -194,6 +194,7 @@ pub(crate) fn note_publish(
 }
 
 pub mod bound;
+pub mod keygen;
 pub mod cell_node;
 pub mod config;
 pub mod diaulos;

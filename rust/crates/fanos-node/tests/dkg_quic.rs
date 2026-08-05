@@ -21,7 +21,9 @@ use std::time::Duration;
 use fanos_field::F2;
 use fanos_geometry::{Plane, Point};
 use fanos_keygen::DkgNode;
+use fanos_node::keygen::{DkgCeremony, OutcomeSlot};
 use fanos_quic::spawn_cell;
+use fanos_vrf::vss::verify_share;
 use fanos_runtime::{Command, Duration as EngineDuration, Notification};
 
 mod common;
@@ -116,6 +118,101 @@ async fn seven_founders_run_a_dkg_over_real_quic_and_agree_on_one_joint_key() {
     );
     // Not vacuous: an all-zero aggregate would satisfy agreement while being no group element at all.
     assert_ne!(first, [0u8; 32], "the joint key is a real group element, not a default");
+
+    for n in cell.nodes {
+        n.shutdown();
+    }
+}
+
+/// **The ceremony's output reaches the file, and the share never touches a channel.**
+///
+/// The DKG agreeing is only half a founding: what an operator needs is a provisioning file, and the two
+/// values that go in it — `final_share()` and `aggregate_commitment()` — live on the engine, which the
+/// driver owns the moment it is spawned. The obvious route is to widen `Notification::DkgComplete`, and it
+/// is the wrong one: that stream is a `broadcast` every subscriber receives, so a beacon share on it is
+/// handed to every present and future reader of a telemetry channel.
+///
+/// `DkgCeremony` writes the outcome into a cell the ceremony already owns, at the one step it becomes true.
+/// This asserts the whole chain a `fanos keygen` verb will stand on: every founder recovers an outcome, all
+/// seven commitments are identical, **each founder's own share verifies against that shared commitment**,
+/// and the result assembles into a `BeaconParams` that round-trips through the provisioning format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_founder_recovers_its_share_and_the_cell_agrees_on_one_commitment() {
+    let _serial = common::serial_cell().await;
+
+    let slots: Vec<OutcomeSlot> = (0..7).map(|_| DkgCeremony::<F2>::slot()).collect();
+    let cell = {
+        let slots = slots.clone();
+        spawn_cell::<F2>(move |coord: Point<F2>| {
+            let i = (0..Plane::<F2>::N as usize)
+                .find(|&k| Point::<F2>::at(k) == coord)
+                .expect("every spawned point is a plane point");
+            let node = DkgNode::<F2>::new(coord, THRESHOLD, secret_of(i), nonce_of(i))
+                .with_deadlines(EngineDuration::from_millis(6_000), EngineDuration::from_millis(6_000));
+            Box::new(DkgCeremony::new(node, slots[i].clone()))
+        })
+        .await
+        .expect("assemble cell")
+    };
+
+    let mut streams: Vec<_> = cell.nodes.iter().map(|n| n.client().subscribe()).collect();
+    for node in &cell.nodes {
+        assert!(node.command(Command::StartHeartbeat), "every founder begins dealing");
+    }
+    for stream in &mut streams {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match stream.recv().await {
+                    Ok(Notification::DkgComplete(_)) => return Some(()),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .expect("a founder must complete within the window")
+        .expect("the node must not shut down mid-ceremony");
+    }
+
+    let outcomes: Vec<_> = slots
+        .iter()
+        .map(|s| s.lock().unwrap().clone().expect("a completed founder must have delivered its outcome"))
+        .collect();
+    assert_eq!(outcomes.len(), 7);
+
+    let commitment = outcomes[0].commitment.to_bytes();
+    for (i, o) in outcomes.iter().enumerate() {
+        assert_eq!(
+            o.commitment.to_bytes(),
+            commitment,
+            "founder {i} recovered a different commitment — the file it would write names another beacon"
+        );
+        // The half that makes the file usable rather than merely present: a share that does not verify
+        // against the commitment beside it produces a node that floods partials nobody can combine.
+        assert!(
+            verify_share(&o.share, &o.commitment),
+            "founder {i}'s own share must verify against the commitment it will write next to it"
+        );
+    }
+    // Distinct shares — seven copies of one share would also satisfy everything above and would mean the
+    // DKG had distributed nothing.
+    let mut share_bytes: Vec<[u8; 33]> = outcomes.iter().map(|o| o.share.to_bytes()).collect();
+    share_bytes.sort_unstable();
+    share_bytes.dedup();
+    assert_eq!(share_bytes.len(), 7, "each founder holds its OWN share, or nothing was distributed");
+
+    // And it assembles into the provisioning file a founder actually writes.
+    let params = fanos_node::config::BeaconParams {
+        network_id: fanos_node::NetworkId::from_seed(b"ceremony-under-test"),
+        commitment: outcomes[0].commitment.clone(),
+        threshold: THRESHOLD,
+        share: Some(outcomes[0].share.clone()),
+        authority: None,
+    };
+    let back = fanos_node::config::BeaconParams::from_config_str(&params.to_config_string())
+        .expect("a ceremony's output must round-trip through the provisioning format");
+    assert_eq!(back.threshold, THRESHOLD);
+    assert_eq!(back.commitment.to_bytes(), commitment);
 
     for n in cell.nodes {
         n.shutdown();
