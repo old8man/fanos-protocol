@@ -137,8 +137,30 @@ pub fn diagnose(obs: &Observation) -> Verdict {
             }
             Verdict::Healthy
         }
-        // Three or more faults saturate the single-cell decoder — escalate to the parent.
-        Fault::Escalate(flags) => Verdict::Escalate(flags),
+        // Three or more faults saturate the single-cell decoder. **Ask the partition sensor before
+        // escalating**, because this arm is exactly what one side of a split sees.
+        //
+        // A partition, viewed from either side, *is* a set of unreachable nodes — so gating the sensor on
+        // `degraded == 0` (as the `Healthy` arm alone did) meant it could only fire while the cut was so
+        // soft that every node still corroborated, which is the least interesting case. The gap was hidden
+        // by a corroboration quorum too weak to notice a 92 %-loss cut; deriving that quorum (#107) exposed
+        // it, and a `SoftPartition` experiment that used to report `Partition` began reporting node faults.
+        //
+        // This does **not** overturn the existing rule that "a disconnection explained by a down node is
+        // routed to the crash path, never counted as a partition" (spec §6.5). That rule is about a
+        // *localizable* fault, and it still holds: `Fault::Single` and `Fault::Pair` fall through to
+        // `Localized` untouched. The discriminator the rule needs is precisely the one `locate` already
+        // computes — **one or two down is a crash; more down than the decoder can place, on a graph that is
+        // also disconnected, is a cut** — and that is what this arm now says.
+        Fault::Escalate(flags) => {
+            if obs
+                .healthy_lines
+                .is_some_and(|lines| !partition::is_connected(lines))
+            {
+                return Verdict::Partition;
+            }
+            Verdict::Escalate(flags)
+        }
         fault => Verdict::Localized(fault),
     }
 }
