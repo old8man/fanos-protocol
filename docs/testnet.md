@@ -536,9 +536,24 @@ ever holding the whole secret.
 
 ### What does not exist
 
-* **No CLI verb.** `bin/fanos.rs`'s dispatch table has `node`, `proxy`, `host`, `message`, `validator`,
-  `pay`, `vpn`, `init`, `start`/`stop`/`restart`, `uninstall`, `status`, `id`, `beacon-deal`,
-  `ingress-deal`, `taxis-deal`, `resolve`, `help` — nothing named `keygen` or `dkg`.
+* ~~**No CLI verb.**~~ **CLOSED 2026-08-05 — `fanos keygen` exists.**
+
+  `fanos keygen --roster FILE --threshold T --out FILE` runs the ceremony with the other founders and writes
+  this operator's `.beacon`. Each founder draws its own secret locally and never transmits it whole, so no
+  party holds the beacon key at any moment — which is the whole difference from `beacon-deal`.
+
+  The roster is the `x:y:z@host:port` seed form every other verb already speaks, one line per founder,
+  **including this node**: a ceremony is defined by its whole participant set, and a file omitting its own
+  author describes a different one. Every founder must hold the identical file, because **the network's name
+  is derived from it** — sorted, so a reordered file is the same network (a ceremony is a set), and never
+  from the DKG's own output, which would tie the network's identity to the beacon's key material and make
+  that beacon unretirable (#98).
+
+  Phase deadlines are 30 s here against the simulator's 1.5: these run over real TLS handshakes between
+  machines you do not control, and a complaint round that closes before an honest share arrives looks
+  exactly like a Byzantine dealer. The overall wait is bounded and its timeout names what to check.
+
+  The recovery authority remains a **separate** step, and the verb says so when it succeeds — see §3.1a.
 
   *(Half of this closed 2026-08-05. "`DkgNode` has never sent a real frame over real QUIC" was true and is
   not any more: `crates/fanos-node/tests/dkg_quic.rs` stands up seven `DkgNode`s on the shipped mutual-TLS
