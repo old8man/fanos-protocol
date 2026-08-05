@@ -538,10 +538,17 @@ ever holding the whole secret.
 
 * **No CLI verb.** `bin/fanos.rs`'s dispatch table has `node`, `proxy`, `host`, `message`, `validator`,
   `pay`, `vpn`, `init`, `start`/`stop`/`restart`, `uninstall`, `status`, `id`, `beacon-deal`,
-  `ingress-deal`, `taxis-deal`, `resolve`, `help` — nothing named `keygen` or `dkg`. `DkgNode` has never
-  been instantiated outside `fanos-sim`'s test harness: never run as its own OS process, never sent a real
-  frame over real QUIC between two machines. It has never been wired the way `spawn_taxis` or
-  `spawn_rendezvous_host` wire their engines onto a real transport.
+  `ingress-deal`, `taxis-deal`, `resolve`, `help` — nothing named `keygen` or `dkg`.
+
+  *(Half of this closed 2026-08-05. "`DkgNode` has never sent a real frame over real QUIC" was true and is
+  not any more: `crates/fanos-node/tests/dkg_quic.rs` stands up seven `DkgNode`s on the shipped mutual-TLS
+  transport via `spawn_cell` — each holding a secret the others never see — and asserts they land on the
+  **same** joint key, since a DKG that merely completes proves nothing and two aggregates would produce a
+  beacon whose partials never combine. Falsified both ways: withholding one founder's start fails it on the
+  timeout; a founder on a foreign session nonce does **not**, because the aggregate is summed over the
+  qualified set, so a bad dealer changes which key everyone lands on and not whether they agree.*
+
+  *What remains is genuinely the verb and the choreography below — the transport question is answered.)*
 * **No provisioning-file writer for a DKG run's output.** `BeaconParams::to_config_string()` — the format
   every anchor file uses — already exists and needs no changes; nothing currently calls it from a
   `DkgNode`'s `final_share()` / `aggregate_commitment()`.
