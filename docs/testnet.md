@@ -101,7 +101,7 @@ This draws a fresh secret from OS entropy, Shamir-splits it 5-of-7 (illustrative
 5-of-7 consensus quorum), and writes:
 
 * `anchor-1.beacon` … `anchor-7.beacon` — one per founding node, each carrying that node's secret share
-* `consumer.beacon` — the public commitment and threshold only, for a node that should track the live
+* `consumer.beacon` — the network's name, public commitment, threshold and authority verifiers, for a node that should track the live
   epoch without being an anchor (a joining node later, §4)
 * `recovery-authority-1.key` … `recovery-authority-7.key` — **one per founder, and this is the point.**
   Together they authorize a future reshare or re-genesis of the beacon (the way out of an anchor-loss
@@ -385,8 +385,15 @@ different port from the overlay node if both run on the same host.
 
 A joining operator needs, from any existing member: two or three bootstrap seeds, and — if they intend to
 relay — the cell's beacon material. Since they aren't one of the original anchors, they get the founder's
-`consumer.beacon` (public commitment + threshold, no share): enough to verify and adopt the live epoch,
-not to contribute a partial. If the testnet runs a non-default `--plane-order`, they need that too, and it
+`consumer.beacon` (network name, public commitment, threshold and authority verifiers — no share): enough
+to verify and adopt the live epoch, not to contribute a partial.
+
+**Copy the file, never retype it.** `network_id` is this network's public name and is what epoch 0's
+coordinates are drawn against; two members whose files differ by one byte seat themselves in different
+coordinate spaces and cannot verify each other at genesis. It is minted once per ceremony and is
+deliberately *not* derivable from anything else in the file — a beacon-derived name would tie the network's
+identity to the beacon's key material and make that beacon unretirable (#98). A file missing the key is
+refused rather than defaulted. If the testnet runs a non-default `--plane-order`, they need that too, and it
 must match exactly.
 
 ```sh
