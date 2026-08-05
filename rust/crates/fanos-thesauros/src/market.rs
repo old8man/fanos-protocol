@@ -142,12 +142,9 @@ impl Deal {
     /// audit_period`, and `passed` is how many did. The difference is arithmetic on state the deal already
     /// holds — it needed exposing, not inventing.
     ///
-    /// **This deliberately stops short of acting on it**, because acting is a policy question with no
-    /// derivation behind it. Payment is linear in `passed`, so a provider can still earn every remaining
-    /// period right up to the deadline: there is no height at which continuing becomes *impossible*, only one
-    /// at which a consumer stops being willing to wait. That threshold belongs in the incentive design
-    /// (`docs/design-incentive-equilibrium.md`), and it cannot be set at all until misses are countable —
-    /// which is what this is for.
+    /// It stopped short of acting on it while the threshold had no derivation. It has one now — see
+    /// [`abandonment_threshold`](Self::abandonment_threshold) — so [`is_abandoned`](Self::is_abandoned)
+    /// reads this and the ledger acts.
     ///
     /// `None` for a clock-less deal (engine use / tests), which has no anchor to measure from.
     #[must_use]
@@ -158,6 +155,58 @@ impl Deal {
         }
         let elapsed = height.saturating_sub(open) / audit_period;
         Some(elapsed.min(self.params.duration).saturating_sub(self.passed))
+    }
+
+    /// How many **consecutive** missed audits are evidence of abandonment rather than of a bad hour.
+    ///
+    /// `lambda_bits`, and the equality is the derivation rather than a coincidence.
+    ///
+    /// A provider reachable at all has a *usable* channel, and usable means it delivers more than half of
+    /// what is sent — the same ½ the overlay independently uses to call a line cut (`LINE_CUT_LOSS`), reached
+    /// here from the definition rather than imported, because a channel that loses most of its traffic is not
+    /// a channel. So an honest provider misses any one audit with probability at most ½, and `m` consecutive
+    /// misses have probability at most `2^-m`: **each miss is exactly one bit of evidence.**
+    ///
+    /// How many bits are enough is already decided and already priced. `lambda_bits` is the audit soundness
+    /// the deal was quoted against — the improbability at which this market agrees to call a claim proven.
+    /// Concluding "gone" from silence is the same kind of claim in the other direction, so it earns the same
+    /// bar, and `(1/2)^m ≤ 2^-λ` gives `m ≥ λ`. Choosing anything else would mean this market believed
+    /// abandonment on weaker evidence than it believes possession, or demanded stronger — and neither has an
+    /// argument behind it.
+    ///
+    /// Nothing new is introduced: both inputs were already in the deal, one of them literally recorded as
+    /// "the audit soundness parameter the price was set against".
+    #[must_use]
+    pub const fn abandonment_threshold(&self) -> u64 {
+        self.params.lambda_bits as u64
+    }
+
+    /// Whether the provider has gone silent long enough to be treated as gone (spec AT-H2).
+    ///
+    /// **Consecutive** is what the threshold is derived against, and `missed_audits` counts *cumulative*
+    /// misses — the two differ for a provider that proves intermittently. Consecutive is the stricter and
+    /// the correct one here: a provider that answers one audit in three is degraded, not absent, and taking
+    /// its deal away is a pricing question rather than an abandonment one.
+    ///
+    /// A deal shorter than its own threshold can never reach it, and that is right rather than a gap: the
+    /// term ends first and `finalize_if_lapsed` refunds the remainder, which is the same outcome one epoch
+    /// later.
+    #[must_use]
+    pub fn is_abandoned(&self, height: u64, audit_period: u64) -> bool {
+        let Some(open) = self.open_height else { return false };
+        if audit_period == 0 {
+            return false;
+        }
+        // **Consecutive, and measured from the last proof rather than from the count of them.** The obvious
+        // expression is `elapsed − passed`, which is *cumulative* misses: for a provider that proves every
+        // other period it grows without bound and would eventually terminate a deal that is being honoured
+        // at half rate. That is a pricing question, not an abandonment one. The run of silence is the time
+        // since the last settlement — or since the deal opened, for a provider that never proved at all.
+        let since = self.last_height.unwrap_or(open);
+        let silent = height.saturating_sub(since) / audit_period;
+        // Capped at the term for the same reason `missed_audits` caps: past the deadline the deal is the
+        // lapse path's business, and a silence longer than the deal cannot be evidence about the deal.
+        silent.min(self.params.duration) >= self.abandonment_threshold()
     }
 
     /// Open a deal without a clock (engine use / tests). `None` if the duration is zero (a deal must run at least
@@ -545,6 +594,48 @@ mod tests {
     /// Asserts the arithmetic in all three regimes, because a counter that is wrong in one of them is worse
     /// than none: a provider proving on cadence must show zero, a silent one must accumulate, and the count
     /// must never exceed the deal's own duration however long the chain runs past the deadline.
+    /// **The threshold is `lambda_bits` because each miss is one bit** (AT-H2 early termination).
+    ///
+    /// A reachable provider's channel is usable, and usable means it delivers more than half of what is
+    /// sent — so an honest miss has probability at most ½ and `m` of them in a row cost `2^-m`. The market
+    /// already fixed how improbable a thing must be before it is believed: `lambda_bits`, the soundness the
+    /// price was quoted against. Concluding "gone" earns the same bar, so `m = λ`.
+    ///
+    /// The second half is what keeps the rule honest. Silence is measured **consecutively**, from the last
+    /// proof — `elapsed − passed` is *cumulative* and would eventually terminate a provider honouring the
+    /// deal at half rate, which is a pricing complaint and not an abandonment.
+    #[test]
+    fn a_provider_is_abandoned_after_lambda_silent_periods_but_never_for_proving_slowly() {
+        const PERIOD: u64 = 64;
+        let p = params(10_000, 200);
+        let lambda = u64::from(p.lambda_bits);
+        let mut deal = Deal::open_at(p, 100).expect("a long deal opens");
+        assert_eq!(deal.abandonment_threshold(), lambda, "the threshold is the priced soundness itself");
+
+        // Silent from the open: not abandoned one period short, abandoned at the threshold. Both halves, or
+        // a rule that fired immediately would satisfy the second assertion alone.
+        assert!(!deal.is_abandoned(100 + (lambda - 1) * PERIOD, PERIOD), "one bit short is not evidence");
+        assert!(deal.is_abandoned(100 + lambda * PERIOD, PERIOD), "λ bits of silence is");
+
+        // Now a provider that proves every other period, forever. Cumulative misses grow without bound; the
+        // run of silence never exceeds one period, so it is never abandoned — which is the whole point of
+        // measuring from the last proof rather than counting the gaps.
+        let mut slow = Deal::open_at(params(10_000, 200), 100).expect("a long deal opens");
+        for i in 1..=(2 * lambda + 4) {
+            let h = 100 + i * 2 * PERIOD;
+            assert!(slow.settle_epoch(h, true, PERIOD).is_some(), "a passing proof settles at {h}");
+            assert!(
+                !slow.is_abandoned(h + PERIOD, PERIOD),
+                "a provider proving at half rate is degraded, not absent (period {i})"
+            );
+        }
+        assert!(
+            slow.missed_audits(100 + (2 * lambda + 4) * 2 * PERIOD, PERIOD).is_some_and(|m| m > lambda),
+            "and its CUMULATIVE misses did pass the threshold, which is what the naive rule would have used"
+        );
+        let _ = &mut deal;
+    }
+
     #[test]
     fn a_silent_provider_accumulates_countable_missed_audits() {
         const PERIOD: u64 = 64;
