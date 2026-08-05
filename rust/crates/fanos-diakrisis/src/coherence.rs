@@ -32,8 +32,15 @@
 //! onto a few nodes** — which is what makes `Alarm::Integration` a centralization detector. A correlation
 //! matrix sits exactly on the boundary of that inequality, so on the matrices a running node builds, the
 //! implication closes and the detector has nothing left to detect. Normalising every node's activity to
-//! unit variance is what throws the concentration away; recovering it needs a *covariance* self-model, and
-//! that is filed separately rather than smuggled in here.
+//! unit variance is what throws the concentration away.
+//!
+//! **Closed (#104), and the fix is the same formula rather than a new one.** A [`CoherenceMatrix`] now
+//! carries the **activity shares** `d_i = var_i / Σ var_j` beside the correlation, so `γ_ij = √(d_i d_j)·c_ij`
+//! and the diagonal is `d` rather than `1/N`. Then `Σγ_ii² = Σd_i²`, `Φ = Σ_{i≠j}d_i d_j c_ij² / Σd_i²` and
+//! `P = Σd_i²·(1 + Φ)` — which collapse to the previous expressions **exactly** at `d_i = 1/N`. A cell whose
+//! members are equally active therefore reads precisely as it did before; the numbers differ only where the
+//! old ones were blind, which is where one node carries the cell's behaviour. `Alarm::Integration` is now
+//! reachable from `from_signals`, and only from a genuinely concentrated cell.
 //!
 //! What remains genuinely two-dimensional is the gap between the off-diagonals' **RMS** `q` (which `Φ`
 //! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective`] reads). By
@@ -118,8 +125,19 @@ pub fn frobenius_sq_scalar(values: &[f64]) -> f64 {
 #[derive(Clone, Debug)]
 pub struct CoherenceMatrix {
     n: usize,
-    /// The correlation matrix `C`; `Γ_net = C / n`.
+    /// The correlation matrix `C`.
     c: Vec<f64>,
+    /// **Activity shares** `d_i = var_i / Σ var_j`, summing to 1 — the diagonal of the unit-trace `Γ`.
+    ///
+    /// `Γ_net = C / n` holds only when every node contributes the same variance. In general
+    /// `γ_ij = √(d_i d_j)·c_ij`, and the diagonal is `d`, not `1/n`. Carrying it is what makes
+    /// [`crate::window::Alarm::Integration`] reachable at all: that alarm reads `Φ < 1` with `P ≥ 2/N`,
+    /// which the `d_i = 1/n` idealisation makes **identically empty** (`P = (1+Φ)/N` forces
+    /// `P ≥ 2/N ⟺ Φ ≥ 1`). A detector the docs call the platform's earliest warning could not fire.
+    ///
+    /// Uniform shares reproduce the old numbers exactly, so this is the completion of the same formula
+    /// rather than a redefinition — it differs only where the old one was blind.
+    d: Vec<f64>,
 }
 
 impl CoherenceMatrix {
@@ -166,7 +184,11 @@ impl CoherenceMatrix {
         if eigs.first().is_some_and(|&min| min < -1e-9 * n as f64) {
             return None;
         }
-        Some(Self { n, c })
+        // A caller-supplied correlation matrix carries no variances, so activity is taken as uniform — the
+        // classical `Γ = C/n`. That is the honest default rather than an assumption: a matrix handed in
+        // without the signals behind it has no concentration to read.
+        let d = vec![1.0 / n.max(1) as f64; n];
+        Some(Self { n, c, d })
     }
 
     /// Build the correlation matrix from `n` per-node activity signals of equal length
@@ -209,7 +231,18 @@ impl CoherenceMatrix {
                 *c.get_mut(j * n + i)? = corr;
             }
         }
-        Some(Self { n, c })
+        // Activity shares from the same variances the correlation just divided out. A cell where one node
+        // carries most of the behavioural variance has a concentrated diagonal, which is exactly the
+        // centralization `Alarm::Integration` names — and exactly what normalising to unit variance throws
+        // away. A cell with no variance anywhere (every node idle) has no shares to speak of, so it falls
+        // back to uniform rather than to zeros, which would make every measure `NaN`.
+        let total: f64 = std.iter().map(|s| s * s).sum();
+        let d = if total > 1e-12 {
+            std.iter().map(|s| s * s / total).collect()
+        } else {
+            vec![1.0 / n as f64; n]
+        };
+        Some(Self { n, c, d })
     }
 
     /// An equicorrelated cell: unit diagonal, every off-diagonal equal to `r` (spec §2.7).
@@ -221,7 +254,10 @@ impl CoherenceMatrix {
                 *slot = 1.0;
             }
         }
-        Self { n, c }
+        // Equicorrelated names the *correlation* stratum; uniform activity is what makes it the classical
+        // `Γ = C/n`, and it is what every existing caller of this constructor means.
+        let d = vec![1.0 / n.max(1) as f64; n];
+        Self { n, c, d }
     }
 
     /// The number of nodes `N`.
@@ -245,9 +281,23 @@ impl CoherenceMatrix {
         if nf <= 0.0 {
             return Measures { phi: 0.0, purity: 0.0, reflection: 0.0, dispersion: 0.0 };
         }
-        let frob = frobenius_sq(&self.c); // Σ C_ij², computed once
-        let purity = frob / (nf * nf); // Tr(Γ²)
-        let phi = (frob - nf) / nf; // Σ_{i≠j}γ_ij² / Σ_i γ_ii²
+        // `γ_ij = √(d_i d_j)·c_ij`, so `Σ_{i≠j}γ_ij² = Σ_{i≠j} d_i d_j c_ij²` and `Σ_i γ_ii² = Σ d_i²`.
+        // At uniform `d_i = 1/n` these collapse to `(Σ C_ij² − n)/n` and `1/n` — the previous expressions,
+        // exactly — so a cell whose nodes are equally active reads precisely as it did before.
+        let diag: f64 = self.d.iter().map(|x| x * x).sum();
+        let mut off = 0.0;
+        for i in 0..self.n {
+            for j in 0..self.n {
+                if i != j
+                    && let (Some(&di), Some(&dj), Some(&cij)) =
+                        (self.d.get(i), self.d.get(j), self.c.get(i * self.n + j))
+                {
+                    off += di * dj * cij * cij;
+                }
+            }
+        }
+        let phi = if diag > 0.0 { off / diag } else { 0.0 };
+        let purity = diag * (1.0 + phi); // Tr(Γ²) = Σd_i² + Σ_{i≠j}γ_ij²
         Measures {
             phi,
             purity,
@@ -381,7 +431,16 @@ impl CoherenceMatrix {
             }
             ri += 1;
         }
-        Some(Self { n: m, c })
+        // Dropping a node redistributes its activity share over the survivors — renormalised, not discarded,
+        // or the remaining cell would read as though it had lost the variance rather than the member.
+        let kept: Vec<f64> = (0..self.n).filter(|&i| i != q).filter_map(|i| self.d.get(i).copied()).collect();
+        let total: f64 = kept.iter().sum();
+        let d = if total > 1e-12 {
+            kept.iter().map(|x| x / total).collect()
+        } else {
+            vec![1.0 / m.max(1) as f64; m]
+        };
+        Some(Self { n: m, c, d })
     }
 
     /// Whether the cell is integrated (`Φ ≥ 1`).
@@ -455,6 +514,68 @@ pub fn purity_equicorrelated(n: usize, r: f64) -> f64 {
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
+
+    /// **`Alarm::Integration` was unreachable from any matrix a node could build** — the detector the docs
+    /// call the platform's earliest warning and its centralization sensor (#104).
+    ///
+    /// The proof is algebraic, not statistical. With a unit diagonal the old expressions were
+    /// `P = ΣC_ij²/N²` and `Φ = (ΣC_ij² − N)/N`, so `P ≡ (1 + Φ)/N` **identically** — and therefore
+    /// `P ≥ 2/N ⟺ Φ ≥ 1`. The alarm is `Φ < 1` **with** `P ≥ 2/N`: the empty set, on every input, forever.
+    /// `minima.rs` reached it only by hand-writing a `Γ` with a heterogeneous diagonal, which
+    /// `from_signals` could not produce, because normalising each node to unit variance is exactly what
+    /// discards the heterogeneity.
+    ///
+    /// The fix is the general formula rather than a new one: `γ_ij = √(d_i d_j)·c_ij` with `d` the activity
+    /// shares, collapsing to the old expressions at `d_i = 1/N`. So this test has two halves, and the second
+    /// is what stops the first from being bought with a behaviour change: **uniform activity must still read
+    /// exactly as before.**
+    #[test]
+    fn concentrated_activity_reaches_the_integration_alarm_and_uniform_activity_reads_as_before() {
+        let n = 7usize;
+        let len = 16usize;
+        let sig = |i: usize, scale: f64| -> Vec<f64> {
+            (0..len)
+                .map(|t| scale * f64::from((t as u32).wrapping_mul(0x9E37_79B1 ^ i as u32) % 97))
+                .collect()
+        };
+        // Uncorrelated activity with one node carrying almost all the variance: high `Tr(Γ²)` (the cell
+        // looks structured, because its mass sits in one place) and no integration at all. A centralized
+        // cell, which is what this alarm is named for.
+        let concentrated: Vec<Vec<f64>> =
+            (0..n).map(|i| sig(i, if i == 0 { 1000.0 } else { 1.0 })).collect();
+        let got = CoherenceMatrix::from_signals(&concentrated).expect("a well-formed matrix").measures();
+        assert!(got.phi < 1.0, "a centralized cell is not integrated: phi = {}", got.phi);
+        assert!(
+            got.purity >= 2.0 / n as f64,
+            "and it still scores structured, which is what makes the pair an alarm: P = {} vs {}",
+            got.purity,
+            2.0 / n as f64
+        );
+
+        // Uniform activity means equal **variance**, which is a stronger thing than "no scale factor" and is
+        // easy to get wrong: the first draft used the same generator with a per-node seed, whose variances
+        // differ by a few percent, and the general formula correctly disagreed with the old one. A rotation
+        // of one sequence is uniform exactly — same multiset per node, same variance, different correlations.
+        let base: Vec<f64> = (0..len).map(|t| f64::from((t as u32).wrapping_mul(0x9E37_79B1) % 97)).collect();
+        let uniform: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..len).filter_map(|t| base.get((t + i) % len).copied()).collect())
+            .collect();
+        let um = CoherenceMatrix::from_signals(&uniform).expect("a well-formed matrix").measures();
+        assert!(
+            (um.purity - (1.0 + um.phi) / n as f64).abs() < 1e-12,
+            "uniform activity must still give P = (1+phi)/N exactly: {} vs {}",
+            um.purity,
+            (1.0 + um.phi) / n as f64
+        );
+        // And there the alarm stays empty, which is correct rather than a residual gap: a cell whose members
+        // are equally active has no concentration to report, so firing would be a false positive.
+        assert_eq!(
+            um.phi < 1.0,
+            um.purity < 2.0 / n as f64,
+            "the two crossings coincide under uniform activity, as the algebra says"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -646,7 +767,7 @@ mod quarantine_experiment {
     /// over-coupling case — so they must not be filtered by the ingestion boundary (which is
     /// tested separately in `from_correlation_rejects_non_finite_out_of_range_and_non_psd_matrices`).
     fn wrap_raw(c: Vec<f64>, n: usize) -> CoherenceMatrix {
-        CoherenceMatrix { n, c }
+        CoherenceMatrix { n, c, d: vec![1.0 / n.max(1) as f64; n] }
     }
 
     /// A random symmetric, unit-diagonal `n×n` matrix (not necessarily PSD — see [`wrap_raw`]).

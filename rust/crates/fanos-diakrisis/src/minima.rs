@@ -330,6 +330,11 @@ pub fn correlation_for_integration(n: usize, phi: f64) -> f64 {
 ///
 /// So [`crate::window::Alarm::Integration`] is not a weaker structural alarm. It is the platform's
 /// **centralization detector**, and the only reading of it that is correct.
+///
+/// It was also, until #104, unreachable from anything a node built: `CoherenceMatrix` produced a *correlation*
+/// matrix, whose uniform diagonal sits exactly on the `diag ≥ 1/N` boundary and closes the implication in both
+/// directions. The concentrated `Γ` the test below hand-writes had no production counterpart. Carrying the
+/// activity shares restores it — see [`crate::coherence`]'s module documentation.
 #[must_use]
 pub fn viability_is_integration(n: usize, r: f64) -> bool {
     if n < 2 {
