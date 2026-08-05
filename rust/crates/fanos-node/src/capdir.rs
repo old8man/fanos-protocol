@@ -308,7 +308,7 @@ pub fn spawn_capability_publisher(
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use fanos_core::roles::{Role, RoleSet};
@@ -324,6 +324,71 @@ mod tests {
         assert!(a.starts_with(b"FANOS-v1/cap-desc/"), "domain-separated from every other store use");
         assert!(!a.starts_with(b"FANOS-v1/mix-key/"), "distinct domain tag from the mix directory");
         assert_eq!(a.len(), b"FANOS-v1/cap-desc/".len() + 12 + 8, "prefix ‖ 12-byte coord ‖ 8-byte epoch");
+    }
+
+    /// **A forged record raises `auth.rejected`, over real QUIC, and a valid one does not** (#115).
+    ///
+    /// #109 wired the counter and proved its pieces separately: `parse_advertisement` returns `None` exactly
+    /// on a tampered record (the test below), and a recorded station reaches the plane the CLI reads
+    /// (`fanos-quic`). What was never run is the composition — the thing an operator actually depends on.
+    ///
+    /// Driven at the real store because that is where the gap was: a unit test can only feed bytes to a
+    /// parser, and the claim is about a record *published at a live slot* being read back and refused. The
+    /// forged bytes go in through `put_ephemeral`, exactly as an attacker with store access would place them.
+    ///
+    /// The valid half is not decoration. A recorder that fired unconditionally would satisfy the forged
+    /// assertion alone, and an operator would learn to ignore a counter that is always moving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forged_advertisement_is_counted_and_a_valid_one_is_silent() {
+        use fanos_runtime::ports::stations::Station;
+        let _fixture = fanos_testkit::acquire_cell_fixture();
+
+        let cell = fanos_quic::spawn_cell::<F2>(|coord| {
+            Box::new(fanos_runtime::OverlayNode::<F2>::new(coord, fanos_runtime::Config::default()))
+        })
+        .await
+        .expect("assemble cell");
+        let client = cell.nodes[0].client();
+        let coord = cell.nodes[1].address();
+        let epoch = Epoch::new(3);
+        let sk = VrfSecret::from_seed([0x5A; 32]);
+        let id = NodeId([4; 32]);
+        let capability = cap();
+
+        // A record that fails its signature, published at the coordinate's real slot. Offset 72 is the
+        // offered-roles byte — `vrf_public(32) ‖ node_id(32) ‖ epoch(8)` — the same tamper the parser test
+        // uses, so the two agree on what "forged" means.
+        let mut forged = advertisement(&sk, id, epoch, capability);
+        forged[72] ^= 0xFF;
+        assert!(
+            client.put_ephemeral(cap_slot(coord, epoch), forged, DIRECTORY_SLOT_EPOCHS).await,
+            "the forged record must actually land, or the read below proves nothing"
+        );
+
+        assert!(client.driver_stations().is_empty(), "nothing has been refused yet");
+        assert_eq!(resolve_capability(&client, coord, epoch).await, None, "a forgery resolves to nothing");
+        let after = client.driver_stations();
+        assert_eq!(after.len(), 1, "exactly one refusal is recorded: {after:?}");
+        let o = &after[0];
+        assert_eq!(o.station, Station::AuthenticationRejected);
+        assert_eq!(o.line, Some(coord), "attributed to the slot's coordinate");
+        assert_eq!(o.tag, Some(crate::Gate::CapabilityAdvertisement.tag()), "and to the gate that refused");
+        assert_eq!(o.count, 1);
+
+        // A genuine record at a different epoch: resolves, and the plane does not move.
+        let good_epoch = Epoch::new(4);
+        let good = advertisement(&sk, id, good_epoch, capability);
+        assert!(client.put_ephemeral(cap_slot(coord, good_epoch), good, DIRECTORY_SLOT_EPOCHS).await);
+        assert_eq!(
+            resolve_capability(&client, coord, good_epoch).await,
+            Some((id, capability)),
+            "a valid record resolves"
+        );
+        assert_eq!(client.driver_stations(), after, "and adds nothing to the plane");
+
+        for n in cell.nodes {
+            n.shutdown();
+        }
     }
 
     #[test]
