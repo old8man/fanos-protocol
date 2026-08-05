@@ -161,6 +161,34 @@ pub enum FrameType {
 }
 
 impl FrameType {
+    /// Whether an **unknown** type in this dispatch group must abort rather than be skipped (spec §7.2).
+    ///
+    /// The spec, this module's header and `activation.rs` all state the rule — "unknown types are skipped by
+    /// `length`, unknown **critical** types abort with `UNSUPPORTED`" — and none of them said which types are
+    /// critical. Nothing implemented it, and [`WireError::UnknownCriticalFrame`] existed with no site that
+    /// could construct it: the concept was asserted in three places and was a `Display` arm.
+    ///
+    /// **The derivation.** Skipping is right when ignorance costs *availability*: an unread `LOOKUP` is a
+    /// missed read, an unread `TESSERA` a dropped circuit, an unread `APP` an application's problem. It is
+    /// wrong when ignorance costs *agreement* — when a quorum acts on a frame and a node that ignored it
+    /// carries on as though nothing happened. That is the membership group `0x1*` and only it: `BEACON`
+    /// rounds fix the epoch every coordinate, meeting point and roster derives from, and
+    /// `BEACON_RESHARE_*` retires the key material underneath them. A node that skips those does not fail —
+    /// it keeps serving, on a retired epoch, indistinguishably from a healthy one, which is the silent
+    /// divergence `activation.rs` documents as the failure shape this platform most needs to avoid.
+    ///
+    /// Aborting does not make an old node obey a frame it cannot parse; it makes it **stop participating**
+    /// instead of participating wrongly. That is the fail-closed half, and the reason criticality is not
+    /// merely redundant with capability negotiation: capabilities govern what a well-behaved peer *sends*,
+    /// this governs what an old node does when one arrives anyway.
+    ///
+    /// Judged on the **raw code's** group, because the whole case is a type this build cannot name.
+    #[must_use]
+    pub const fn group_is_critical(code: u64) -> bool {
+        // `0x1*` — Membership: BEACON, BEACON_PARTIAL, EPOCH_AGREE, BEACON_RESHARE_*, ANNOUNCE, DKG_*.
+        code >> 4 == 0x1
+    }
+
     /// The dispatch group (high nibble) of the type (spec §7.2).
     #[must_use]
     pub fn group(self) -> u8 {
@@ -313,6 +341,42 @@ pub fn decode_frame(buf: &[u8]) -> Result<(Frame<'_>, usize), WireError> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// **The criticality rule was asserted in three places and implemented in none.**
+    ///
+    /// The spec (§7.2), this module's header and `activation.rs` all say unknown types are skipped while
+    /// unknown *critical* types abort — and none of them said which are critical, nothing computed it, and
+    /// `WireError::UnknownCriticalFrame` existed with no site able to construct it. Every unknown frame was
+    /// therefore treated as skippable, including a future beacon round.
+    ///
+    /// Two halves, and the second is what stops the rule from being vacuous in the other direction: the
+    /// membership group must be critical, and **every other group must not be**. A predicate that called
+    /// everything critical would abort on an `APP` type from a newer application overlay, which is exactly
+    /// the forward compatibility `0x7*` exists to provide.
+    #[test]
+    fn only_the_membership_group_makes_an_unknown_type_fatal() {
+        // Codes this build does not name, one per group, chosen high in each range so no future allocation
+        // is presumed: the predicate reads the group, never the type.
+        for code in [0x0Fu64, 0x2F, 0x3F, 0x4F, 0x5F, 0x6F, 0x7F] {
+            assert!(
+                !FrameType::group_is_critical(code),
+                "{code:#04x}: skipping this costs availability, not agreement — aborting would break the \
+                 forward compatibility the length prefix exists to give"
+            );
+        }
+        for code in [0x10u64, 0x1F] {
+            assert!(
+                FrameType::group_is_critical(code),
+                "{code:#04x}: membership fixes the epoch every coordinate and roster derives from, so a node \
+                 that skips it keeps serving on a retired one, indistinguishable from a healthy node"
+            );
+        }
+        // And the rule is about the GROUP, not about whether this build happens to know the code: every
+        // membership type it *does* know is critical too, so a future sibling inherits the same answer.
+        for known in [FrameType::Beacon, FrameType::BeaconReshareCommit, FrameType::Announce] {
+            assert!(FrameType::group_is_critical(known.code()), "{known:?}");
+        }
+    }
 
     #[test]
     fn groups_match_high_nibble() {

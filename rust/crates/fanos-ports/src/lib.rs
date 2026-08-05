@@ -335,6 +335,22 @@ pub enum Escalation {
     /// "reroute around these" but re-provisioning the cell, and there is no parent-side channel for that
     /// yet. Reported here so an operator sees it; not forwarded as an empty node-set.
     CoherenceCollapse,
+    /// A peer sent a frame from the **membership group** this build cannot name (spec §7.2).
+    ///
+    /// The one group where skipping an unknown type costs *agreement* rather than availability: beacon
+    /// rounds fix the epoch every coordinate and roster derives from, and reshares retire the key material
+    /// underneath them. A node that skips those keeps serving on a retired epoch, indistinguishable from a
+    /// healthy one — so it says so instead, loudly, and an operator learns the cell is running mixed
+    /// releases before the divergence is measured in lost traffic.
+    ///
+    /// Carries the raw code, because the whole case is a type this build has no name for.
+    UnsupportedCritical {
+        /// The wire type code that could not be resolved. A `u64`, like the wire's own varint: a build that
+        /// cannot name the type equally cannot know it fits a byte.
+        type_code: u64,
+        /// The peer that sent it — which release is ahead, and where.
+        from: Triple,
+    },
 }
 
 /// An application-level notification (the engine → app direction).

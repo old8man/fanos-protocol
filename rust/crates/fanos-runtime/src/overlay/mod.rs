@@ -852,7 +852,19 @@ impl<F: Field> OverlayNode<F> {
                 // the evidence the station exists to carry, and records a skew observation with nothing in it.
                 // Caught by the test, which asserted the code and got `None`.
                 self.stations.record_tagged(Station::FrameTypeUnknown, Some(from), Some(frame.type_code), 1);
-                Vec::new()
+                // **Skippable or fatal, and the wire decides which** (spec §7.2). Skipping is right when
+                // ignorance costs availability; it is wrong when it costs agreement, which is the membership
+                // group and only it — a node that quietly drops a beacon round or a reshare keeps serving on
+                // a retired epoch, indistinguishable from a healthy one. The rule was stated in three places
+                // and implemented in none: `WireError::UnknownCriticalFrame` had no site that could build it.
+                if FrameType::group_is_critical(frame.type_code) {
+                    alloc::vec![Effect::Notify(Notification::Escalated(crate::ports::Escalation::UnsupportedCritical {
+                        type_code: frame.type_code,
+                        from,
+                    }))]
+                } else {
+                    Vec::new()
+                }
             }
         }
     }

@@ -129,6 +129,9 @@ fn note_desc(note: &Notification) -> String {
         Notification::Grey(c) => format!("Grey {}", fmt_coord(*c)),
         Notification::Escalated(Escalation::Faults(mask)) => format!("Escalated {mask:#09b}"),
         Notification::Escalated(Escalation::CoherenceCollapse) => "Escalated coherence-collapse".to_string(),
+        Notification::Escalated(Escalation::UnsupportedCritical { type_code, from }) => {
+            format!("Escalated unsupported-critical {type_code:#04x} from {}", fmt_coord(*from))
+        }
         Notification::Decoupled => "Decoupled".to_owned(),
         Notification::Bound => "Bound".to_owned(),
         Notification::Stored(k) => format!("Stored {}", short_digest(k)),
