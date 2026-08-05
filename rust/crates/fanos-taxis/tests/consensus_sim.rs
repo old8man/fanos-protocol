@@ -131,6 +131,12 @@ struct Cluster {
     /// (so every validator locks) while the COMMIT quorum does not (so the height never finalizes and the lock is never
     /// released). Every subsequent round's proposal is then a *different* block, which the locked validators refuse.
     drop_phase: Option<Phase>,
+    /// Suppress catch-up **snapshots** (`SyncResp`) while leaving every other message alone — the losing side
+    /// of the state-sync race, made deterministic. A validator recovering into a live cell is in a contest
+    /// between two ways of moving forward: adopt a certified snapshot, or walk the chain block by block. Only
+    /// the first restores the state it missed, and nothing arbitrates which arrives first, so the outcome was
+    /// a coin flip nothing could reproduce on purpose.
+    drop_sync_resp: bool,
     /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
     deaf_propose: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
@@ -187,6 +193,7 @@ impl Cluster {
             crashed: vec![false; N],
             withholding: BTreeSet::new(),
             da_delay: 0,
+            drop_sync_resp: false,
             samplers: (0..N).map(|i| Sampler::new(u8::try_from(i).unwrap_or(0))).collect(),
             dispersing: Vec::new(),
             drop_to: None,
@@ -224,6 +231,9 @@ impl Cluster {
                 // partition, and collect its outputs (the adoption's Committed) so `run` sees them.
                 Output::SendTo { to, msg } => {
                     let to = usize::from(to);
+                    if self.drop_sync_resp && matches!(msg, ConsensusMsg::SyncResp { .. }) {
+                        continue;
+                    }
                     if to < N && !self.crashed[to] && self.partition[idx] == self.partition[to] {
                         let input = self.msg_to_input(idx, &msg);
                         let outs = self.engines[to].step(input);
@@ -787,6 +797,72 @@ fn ssle_a_down_line_member_does_not_stall_the_round_the_window_expiry_finalizes(
     assert_ne!(usize::from(block.header.proposer), victim, "the crashed member did not lead");
     assert!(members.contains(&usize::from(block.header.proposer)), "the leader is a (live) line member");
     assert!(block.witness.is_some(), "still a witnessed round-0 block — the window expiry, not a view-change fallback");
+}
+
+#[test]
+fn losing_the_sync_race_must_not_leave_a_validator_at_the_cells_height_with_another_state() {
+    // The other side of `a_lagging_validator_state_syncs_...`, and the one that was never constructed. A
+    // recovering validator has TWO ways forward — adopt a certified snapshot, or walk the chain block by block
+    // — and only the first restores the state it missed. Nothing arbitrates which arrives first. This pins what
+    // must happen when the snapshot loses.
+    const LATE: usize = 6;
+    let mut c = Cluster::new(&genesis());
+    c.crashed[LATE] = true;
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 250, nonce: 0 }, b"race-tx");
+    c.submit_all(&tx);
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+    let live_height = c.engines[0].chain().next_height();
+    let live_root = c.engines[0].chain().state_root();
+    assert!(live_height >= 3, "the live cell advanced past a few heights");
+    assert_eq!(c.engines[0].chain().state().balance(&BOB), 250, "the cell executed the transfer");
+
+    // The snapshot never lands. Everything else — proposals, votes, commit certificates, bodies — flows.
+    c.drop_sync_resp = true;
+    c.crashed[LATE] = false;
+    // Six rounds, matching the drive above. The cell advances every round and the laggard does not, so the gap
+    // the assertions read only widens — more rounds buy seconds, not confidence, and each is a full PQ round.
+    for _ in 0..6 {
+        c.tick();
+        c.timeout();
+    }
+
+    let late_height = c.engines[LATE].chain().next_height();
+    let late_root = c.engines[LATE].chain().state_root();
+    let cell_height = c.engines[0].chain().next_height();
+    let cell_root = c.engines[0].chain().state_root();
+
+    // Observed today: the laggard stays at genesis — visibly stuck, which is the SAFE loss. It cannot walk the
+    // chain forward on its own because it can obtain no body for a height it never saw proposed, so without a
+    // snapshot it does not move at all. That is worth pinning, because the failure mode this test exists to
+    // forbid is the opposite one and the two are easy to conflate: stuck is loud and recoverable, level-and-wrong
+    // is silent and permanent.
+    assert!(
+        late_height < cell_height,
+        "with no snapshot the laggard should not have advanced at all, yet it reached {late_height} against \
+         the cell's {cell_height} — so it found another way forward, and the assertion below is now the whole \
+         guard rather than a backstop"
+    );
+    // THE PROPERTY. Reaching the cell's height while holding a different state is the one outcome that must be
+    // impossible, because it is indistinguishable from health by every quantity the validator itself checks:
+    // `maybe_request_sync` fires on `max_seen_height > height()`, so a validator that has closed the height gap
+    // is BY ITS OWN TEST not behind, and never asks again. Being stuck is fine — it is visible and it recovers.
+    // Being level and wrong is neither.
+    assert!(
+        !(late_height >= cell_height && late_root != cell_root),
+        "the late validator sits at the cell's height {cell_height} (its own {late_height}) with a DIFFERENT \
+         state root — alice={} bob={} against the cell's alice={} bob={}. It will never ask for catch-up \
+         again, because by height it is not behind. A validator that cannot move forward is recoverable; one \
+         that has moved forward wrongly is not.",
+        c.engines[LATE].chain().state().balance(&ALICE),
+        c.engines[LATE].chain().state().balance(&BOB),
+        c.engines[0].chain().state().balance(&ALICE),
+        c.engines[0].chain().state().balance(&BOB),
+    );
+    let _ = (live_root, live_height);
 }
 
 #[test]
