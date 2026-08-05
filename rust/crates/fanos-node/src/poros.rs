@@ -1247,10 +1247,21 @@ impl PorosHost {
         let descriptor = match recover(&shares, self.threshold, &self.binding.commitment()) {
             Recovery::BelowThreshold => return Vec::new(),
             Recovery::Recovered(descriptor, excluded) => {
-                if excluded.is_some() {
+                if let Some(x) = excluded {
                     // Recovered by dropping one share, so a share this host could not reject at arrival was
                     // wrong — the post-rotation case, where the per-share commitments are stale.
-                    self.stations.record(Station::ShareOffCommitment, None);
+                    //
+                    // **And it names the member**, which it did not (#52). `recover`'s one-fault fallback
+                    // finds the wrong share BY EXCLUSION — it is the `x` returned right here — and this
+                    // recorded `None`, throwing away the only attribution a rotated line has. The task said
+                    // a rotated line "detects corruption but cannot attribute it"; half of that was the
+                    // commitment scheme and half was a discarded value.
+                    //
+                    // A share index is a line position plus one, so the coordinate is a lookup. `None` only
+                    // if a share carried an `x` outside the roster, which the gather should not admit — and
+                    // recording it unattributed then is right rather than inventing a member.
+                    let member = usize::from(x).checked_sub(1).and_then(|i| self.line.get(i)).copied();
+                    self.stations.record(Station::ShareOffCommitment, member);
                 }
                 descriptor
             }
@@ -2565,6 +2576,24 @@ mod tests {
             1,
             "the excluded share is finally attributed — by exclusion, which is the only evidence a rotated \
              line has",
+        );
+
+        // **And "attributed" means it NAMES the member** (#52). This assertion checked a COUNT while its
+        // message claimed attribution, and the station recorded `None` — so a rotated line reported that
+        // *somebody* was wrong and nothing more, which is the half of this finding that was a discarded
+        // value rather than a commitment scheme. `recover`'s one-exclusion search already returns the `x` it
+        // dropped; a share index is a line position plus one, so the coordinate is a lookup.
+        let attributed: Vec<Option<Triple>> = combiner
+            .stations()
+            .observations()
+            .into_iter()
+            .filter(|o| o.station == Station::ShareOffCommitment && o.count > 0)
+            .map(|o| o.line)
+            .collect();
+        assert_eq!(
+            attributed,
+            vec![Some(line[2])],
+            "the forged share came from line[2], and that is the member the station must name"
         );
     }
 
