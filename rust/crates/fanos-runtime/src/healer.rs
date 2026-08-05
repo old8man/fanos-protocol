@@ -10,7 +10,7 @@
 //! index-addressed geometry take `<F>` per call.
 
 use crate::overlay::{
-    BEHAVIOR_WINDOW, Config, DECOUPLE_DECAY, DECOUPLE_DWELL, ENDPOINT_MIN_STALE, decouple_ceiling,
+    BEHAVIOR_WINDOW, Config, DECOUPLE_DECAY, BAND_DWELL, ENDPOINT_MIN_STALE, decouple_ceiling,
     ENDPOINT_WINDOW, PARTITION_DWELL, QUARANTINE_TTL, polar_gap_from_liveness,
 };
 use crate::ports::{Duration, Effect, Instant, Notification};
@@ -124,9 +124,15 @@ pub(crate) struct Healer {
     /// Dedup: currently escalated on a coherence collapse — so `Escalated` fires once on entry.
     escalated_coherence: bool,
     /// Consecutive self-driven diagnoses that read over-coupled (`Verdict::Systemic`); resets to 0 on any
-    /// non-over-coupled diagnosis. The `Decouple` shed only actuates once this reaches [`DECOUPLE_DWELL`] —
+    /// non-over-coupled diagnosis. The `Decouple` shed only actuates once this reaches [`BAND_DWELL`] —
     /// the hysteresis that keeps the now-continuous reflex from shedding on a transient reading (#122).
-    overcoupling_streak: u32,
+    /// Consecutive diagnoses of the SAME homeostat band, and which band that was — the hysteresis every
+    /// band branch is gated by (#100). See `BAND_DWELL`.
+    band_streak: u32,
+    last_band: Option<core::mem::Discriminant<BandControl>>,
+    /// The cell's own measured mean off-diagonal correlation from the last full-window diagnosis, or `None`
+    /// until it has one. See [`baseline_correlation`](Healer::baseline_correlation).
+    measured_correlation: Option<f64>,
     /// The most recent per-point relay-load sample (§6.7): the behavioural sample folded into the monitor
     /// each heartbeat, RETAINED here (the monitor consumes it, then `activity` is cleared) so a diagnosis can
     /// read the cell's current load vector for the projective load-balance prescription. All `N` points are
@@ -198,7 +204,9 @@ impl Healer {
             decoupling: 0.0,
             decoupled: false,
             escalated_coherence: false,
-            overcoupling_streak: 0,
+            band_streak: 0,
+            last_band: None,
+            measured_correlation: None,
             last_sample: [0.0; 7],
             rebalancing: false,
             endpoint_window: VecDeque::new(),
@@ -295,11 +303,44 @@ impl Healer {
         self.self_activity = 0;
     }
 
-    /// This node's **effective** equicorrelated correlation: the `healthy` baseline scaled down by the
-    /// current `decoupling` shed factor (audit C6). Everything that computes `Φ`/`P` from a scalar
-    /// correlation reads this, so a `Decouple` genuinely lowers the cell's integration.
+    /// **Hysteresis for every band branch, not only the over-coupled one** (#100): advance the streak of
+    /// consecutive diagnoses of the *same* band and report whether it has reached [`BAND_DWELL`].
+    ///
+    /// Any change of band restarts the count, and no band at all (a window not yet full) clears it. The
+    /// dwell is what makes the loop's confidence achievable: `control_confidence`'s derivation shows a
+    /// single-reading branch would need 34 standard errors — over four hours of history — where three
+    /// consecutive readings need 2.5 and 89 seconds.
+    ///
+    /// It used to count `Verdict::Systemic` from `diagnose`, which agrees with the homeostat only on the
+    /// over-coupled side: `diagnose` has no verdict for `Aggregate` or for a coherence collapse, and that is
+    /// exactly why the other two branches had no dwell to gate them.
+    fn advance_band_dwell(&mut self, band: Option<&BandControl>) -> bool {
+        let this_band = band.map(core::mem::discriminant);
+        self.band_streak = match (this_band, self.last_band) {
+            (Some(now), Some(before)) if now == before => self.band_streak.saturating_add(1),
+            (Some(_), _) => 1,
+            (None, _) => 0,
+        };
+        self.last_band = this_band;
+        self.band_streak >= BAND_DWELL
+    }
+
+    /// The correlation the shed is **actually reducing** — the cell's own measured mean off-diagonal
+    /// correlation once it has a self-model, and the configured `healthy` baseline only until then (#92).
+    ///
+    /// The shed answers a *measured* over-coupling; scaling a configured constant instead meant the
+    /// controller's model of what it had done bore no relation to what it was responding to. It also made
+    /// every cap look arbitrary: at `healthy = 0.45` the whole budget down to the floor is 0.042, while an
+    /// over-coupled cell is by definition above `hi = 0.577` and has four times that to give back.
+    pub(crate) fn baseline_correlation(&self, healthy: f64) -> f64 {
+        self.measured_correlation.unwrap_or(healthy)
+    }
+
+    /// This node's **effective** equicorrelated correlation: [`baseline_correlation`](Self::baseline_correlation)
+    /// scaled down by the current `decoupling` shed factor (audit C6). Everything that computes `Φ`/`P` from
+    /// a scalar correlation reads this, so a `Decouple` genuinely lowers the cell's integration.
     pub(crate) fn effective_correlation(&self, healthy: f64) -> f64 {
-        healthy * (1.0 - self.decoupling)
+        self.baseline_correlation(healthy) * (1.0 - self.decoupling)
     }
 
     /// Assemble the live `7×7` polar cross-attestation matrix (spec §6.4) for `diagnose`'s structural
@@ -576,7 +617,7 @@ impl Healer {
     /// Diagnose the sensed cell snapshot (`self_index, degraded, alive_count`, produced by the facade's
     /// liveness sensing) and actuate any healing — the DIAKRISIS reflex proper. Feeds the *measured*
     /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
-    /// runs the verdict→plan→actuate path (over-coupling gated by the [`DECOUPLE_DWELL`] hysteresis, #122),
+    /// runs the verdict→plan→actuate path (over-coupling gated by the [`BAND_DWELL`] hysteresis, #122),
     /// then the homeostat's re-integration/escalation bands, and finally the mandatory self-observation.
     #[allow(clippy::too_many_arguments)] // the sensed cell snapshot: index, degraded, alive, lines, config, epoch
     pub(crate) fn diagnose<F: Field>(
@@ -603,6 +644,16 @@ impl Healer {
         // the guard existed and was not installed. Below a full window the node has no self-model, which is
         // the honest state: `diagnose` keeps its liveness-only arm and the homeostat is not consulted.
         let measured = self.monitor.ready().then(|| self.monitor.coherence()).flatten();
+        // **The band verdict, computed once.** It gates the dwell, supplies the shed, and dispatches the
+        // re-integration/escalation arms below — three readers that used to call `control` twice with
+        // identical arguments and derive the third from a different signal entirely.
+        let band = measured.as_ref().map(|coherence| {
+            let m = coherence.measures();
+            self.homeostat.control(m.purity, coherence.mean_correlation(), coherence.n())
+        });
+        // What the shed is reducing, kept for the laws that run outside this diagnosis (#92).
+        self.measured_correlation =
+            measured.as_ref().map(fanos_diakrisis::CoherenceMatrix::mean_correlation);
         // The structural (Byzantine) check (spec §6.4 + §6.2): the live polar cross-attestation matrix,
         // assembled from gossiped `DiagAttest` reports (§98). `diagnose` runs the 14 free polar sum-rules
         // against it FIRST, ahead of the syndrome localizer — an equivocating mediator's own report is
@@ -642,14 +693,7 @@ impl Healer {
             healthy_lines: trusted_lines,
         });
 
-        // Hysteresis for the over-coupling shed (audit #122): count consecutive over-coupled diagnoses,
-        // resetting on any non-over-coupled one. `Decouple` actuates only once this reaches DECOUPLE_DWELL,
-        // so the now-continuous reflex sheds on *sustained* over-coupling, not a single transient reading.
-        self.overcoupling_streak = if matches!(verdict, fanos_diakrisis::Verdict::Systemic) {
-            self.overcoupling_streak.saturating_add(1)
-        } else {
-            0
-        };
+        let band_ready = self.advance_band_dwell(band.as_ref());
 
         let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
         if config.self_healing {
@@ -668,19 +712,16 @@ impl Healer {
             // Over-coupling actuation (`Decouple`) flows through this verdict→plan path, gated by the dwell
             // hysteresis above; `apply_healing_plan` raises the mutable decoupling state and dedups the
             // notification (audit C6/#122). Crash/Byzantine actions in the plan are never gated.
-            let decouple_ready = self.overcoupling_streak >= DECOUPLE_DWELL;
+            let decouple_ready = band_ready && matches!(band, Some(BandControl::Decouple { .. }));
             // **The shed comes from the homeostat, which is where the law is.** `control` returns a
             // `Decouple { effort }` proportional to the over-excursion; every other band contributes no
-            // shed. Read here, before actuation, so the effort actuates in the round it was computed for
-            // rather than the next one — the two paths used to be a round apart *and* the effort was thrown
-            // away entirely (#91).
-            let shed = measured.as_ref().map_or(0.0, |coherence| {
-                let m = coherence.measures();
-                match self.homeostat.control(m.purity, coherence.mean_correlation(), coherence.n()) {
-                    BandControl::Decouple { effort } => effort,
-                    _ => 0.0,
-                }
-            });
+            // shed. Read from the one band verdict computed above, so the effort actuates in the round it
+            // was computed for rather than the next one — the two paths used to be a round apart *and* the
+            // effort was thrown away entirely (#91).
+            let shed = match band {
+                Some(BandControl::Decouple { effort }) => effort,
+                _ => 0.0,
+            };
             effects.extend(self.apply_healing_plan::<F>(
                 now,
                 &plan,
@@ -693,15 +734,15 @@ impl Healer {
             // The homeostat covers the bands the Systemic verdict does not: **re-integration** once the
             // measured `Γ_net` is back in (or below) the band (Bind/Hold — decay the shed), and
             // **escalation** on a coherence *collapse* (`P ≤ 2/N`). Over-coupling is the verdict path's.
-            if let Some(coherence) = measured {
+            if let (Some(coherence), Some(band)) = (measured, band) {
                 let m = coherence.measures();
                 effects.extend(self.control_laws(now, epoch, m.purity, coherence.n(), degraded));
-                match self
-                    .homeostat
-                    .control(m.purity, coherence.mean_correlation(), coherence.n())
-                {
+                match band {
                     BandControl::Escalate => {
-                        if !self.escalated_coherence {
+                        // Gated by the same dwell as every other branch (#100): a collapse read once is a
+                        // reading, read three times running it is a state. The latch dedups repeats *within*
+                        // a collapse; the dwell is what stops the loop entering one on noise.
+                        if band_ready && !self.escalated_coherence {
                             self.escalated_coherence = true;
                             self.observer.note_healing();
                             effects.push(Effect::Notify(Notification::Escalated(0)));
@@ -732,7 +773,12 @@ impl Healer {
                         // derived response is `loadbalance::balance_exact(loads)` = the uniform mean, driving
                         // the hotspot into the whole cell at the projective contraction `λ₂ = 2/9`. `Hold` is
                         // the healthy in-band collective subject: clear the latch so a later Bind re-publishes.
-                        if matches!(band, BandControl::Bind { .. }) {
+                        //
+                        // Dwell-gated like the other two branches. `Bind` is the *noisier* side of the band —
+                        // the floor sits closer to a healthy cell's operating point than the ceiling does —
+                        // and it used to be the one branch that fired on a single reading, publishing a
+                        // cell-wide rebalance from one sample of a statistic whose error spans the band.
+                        if band_ready && matches!(band, BandControl::Bind { .. }) {
                             if !self.rebalancing {
                                 self.rebalancing = true;
                                 let loads = self.last_sample.map(|x| x.round() as u32);
@@ -794,7 +840,7 @@ impl Healer {
                 }
                 HealingAction::Decouple => {
                     // Real correlation-shedding (audit C6), gated by the dwell hysteresis (#122): only once
-                    // over-coupling has held for DECOUPLE_DWELL consecutive diagnoses do we raise the
+                    // over-coupling has held for BAND_DWELL consecutive diagnoses do we raise the
                     // mutable decoupling factor, lowering the effective correlation feeding `Φ` next round.
                     // Notify once on *entering* the shed regime (dedup), not each round.
                     //
@@ -806,7 +852,7 @@ impl Healer {
                     // collective-subject floor of 0.4082, so a single over-coupling response flipped the
                     // cell's self-model into the *under*-coupled band, whose answer is `Bind`.
                     if decouple_ready {
-                        let ceiling = decouple_ceiling(alive, healthy);
+                        let ceiling = decouple_ceiling(alive, self.baseline_correlation(healthy));
                         self.decoupling = (self.decoupling + shed).min(ceiling);
                         if !self.decoupled {
                             self.decoupled = true;

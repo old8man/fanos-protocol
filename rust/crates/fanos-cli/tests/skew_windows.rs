@@ -96,3 +96,42 @@ fn the_reply_key_ring_is_expressed_as_the_window_a_combiner_serves() {
          key that could never open anything, kept in memory. Found at: {line}",
     );
 }
+
+/// **The control loop's clock must be the platform's clock** — the same class of invariant as the windows
+/// above, and it needs enforcing for the same reason: the two halves live in crates that cannot see each
+/// other.
+///
+/// `fanos-runtime` derives its whole band-keeping loop — the control confidence, the observation window and
+/// the shed ceiling — from `HEARTBEATS_PER_EPOCH`, the platform's epoch expressed in that loop's own
+/// heartbeats. `DEFAULT_EPOCH_PERIOD` lives in `fanos-node`, one layer **above** the runtime, so the runtime
+/// cannot import it and holds the figure as a literal. Nothing but this check stops the two from drifting,
+/// and a drift is silent: both sides keep compiling, and the loop simply regulates against a period the
+/// network no longer has — a confidence derived for 1200 opportunities per epoch, applied to a network that
+/// gives it some other number.
+#[test]
+fn the_control_loops_epoch_is_the_platforms_epoch() {
+    let heartbeat_ms = constant("crates/fanos-runtime/src/overlay/mod.rs", "HEARTBEAT_PERIOD");
+    let epoch_secs = constant("crates/fanos-node/src/config.rs", "DEFAULT_EPOCH_PERIOD");
+    let claimed = constant("crates/fanos-runtime/src/overlay/mod.rs", "HEARTBEATS_PER_EPOCH");
+
+    assert_eq!(
+        epoch_secs * 1000 / heartbeat_ms,
+        claimed,
+        "HEARTBEATS_PER_EPOCH ({claimed}) must be the {epoch_secs}s epoch divided by the {heartbeat_ms}ms \
+         heartbeat — it is the denominator of the loop's derived control confidence, so a stale value is a \
+         confidence derived for a network that does not exist",
+    );
+
+    // **The self-model must fill inside an epoch.** The observation window is derived from the band's
+    // resolution, and the epoch is when the cell reconfigures — coordinates, rosters, roles. A window that
+    // took longer than an epoch to fill would leave the node permanently without a self-model, since it
+    // would never reach `ready()` before the thing it is modelling changed underneath it. 178 samples at
+    // 500 ms is 89 s against a 600 s epoch.
+    let window = constant("crates/fanos-runtime/src/overlay/mod.rs", "BEHAVIOR_WINDOW");
+    let fill_ms = window * heartbeat_ms;
+    assert!(
+        fill_ms * 4 <= epoch_secs * 1000,
+        "the behavioural window takes {fill_ms}ms to fill against a {epoch_secs}s epoch — a self-model that \
+         is not ready for most of an epoch is a self-model the loop never gets to use",
+    );
+}

@@ -119,3 +119,33 @@ pub(crate) fn powi(mut base: f64, mut exp: u32) -> f64 {
     }
     acc
 }
+
+/// The real `n`-th root `x^(1/n)` for `x ≥ 0` and `n ≥ 1`, as `exp(ln(x)/n)`.
+///
+/// The inverse of [`powi`], and needed for the same reason: a requirement stated over `n` *consecutive*
+/// observations — a dwell — is a product of `n` per-observation probabilities, so solving it for the
+/// per-observation figure is an `n`-th root. Dispatched like [`sqrt`]; `exp` is the one primitive the shim
+/// still lacked and this is its only caller.
+#[inline]
+#[must_use]
+pub(crate) fn nth_root(x: f64, n: u32) -> f64 {
+    if n == 0 || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    let y = ln(x) / f64::from(n);
+    #[cfg(feature = "std")]
+    {
+        y.exp()
+    }
+    #[cfg(all(not(feature = "std"), feature = "libm"))]
+    {
+        libm::exp(y)
+    }
+    #[cfg(all(not(feature = "std"), not(feature = "libm")))]
+    {
+        compile_error!("fanos-diakrisis on no_std requires the `libm` feature for exp")
+    }
+}
