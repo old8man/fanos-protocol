@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use fanos_aphantos::threshold::{member_partial, pad_onion, peel_onion_with_shares};
+use fanos_field::F2;
 use fanos_aphantos::{PeelOutcome, ThresholdSealed, sealed};
 use fanos_field::F31;
 use fanos_geometry::Point;
@@ -74,7 +75,7 @@ proptest! {
 
         // Structural parse, per-member decapsulation, and padding must all fail gracefully.
         let _ = ThresholdSealed::from_bytes(&bytes);
-        let _ = member_partial(&bytes, index, &secret);
+        let _ = member_partial::<F2>(&bytes, index, &secret);
         let _ = pad_onion(&bytes);
 
         // Reconstruction over attacker-chosen shares (arbitrary x, arbitrary-length y, possibly
@@ -83,6 +84,6 @@ proptest! {
             .into_iter()
             .map(|(x, y)| Share::new(x, y))
             .collect();
-        let _ = peel_onion_with_shares(&bytes, &shares);
+        let _ = peel_onion_with_shares::<F2>(&bytes, &shares);
     }
 }

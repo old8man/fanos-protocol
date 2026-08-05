@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use fanos_primitives::shamir::Share;
 use fanos_primitives::hash_labeled;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret};
+use fanos_geometry::{Field, Plane};
 use fanos_threshold::{NONCE_LEN, ThresholdError, ThresholdSealed};
 
 use crate::slots;
@@ -188,7 +189,7 @@ pub fn seal_onion(
             line_size,
         ));
     }
-    Ok(slots::Packet::new(slots::slot_len(line_size), header, block).to_bytes())
+    Ok(slots::Packet::new(line_size, header, block).to_bytes())
 }
 
 /// `(threshold − 1) · 32` bytes of deterministic sharing randomness from a seed.
@@ -203,13 +204,11 @@ fn sharing_randomness(seed: &[u8], threshold: u8) -> Vec<u8> {
 /// current hop line — reconstruct the layer key and reveal the routing command. Returns whether to
 /// forward the inner onion to the next line or deliver the payload. Fewer than `threshold` members
 /// (or wrong secrets) fail with [`ThresholdError::Aead`].
-pub fn peel_onion(
+pub fn peel_onion<F: Field>(
     onion: &[u8],
     members: &[(usize, &HybridKemSecret)],
 ) -> Result<ThresholdPeel, ThresholdError> {
-    let packet = slots::Packet::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
-    let sealed = ThresholdSealed::from_bytes(packet.slot(0).ok_or(ThresholdError::Malformed)?)
-        .ok_or(ThresholdError::Malformed)?;
+    let (packet, sealed) = open_slot0::<F>(onion)?;
     let shares: Vec<Share> = members
         .iter()
         .filter_map(|(i, sk)| sealed.member_share(*i, sk))
@@ -220,14 +219,30 @@ pub fn peel_onion(
 /// Peel one threshold hop from **already-gathered member shares** (the form an autonomous combiner
 /// uses: it collects `≥ threshold` `PartialDec` replies, then peels). Fewer than `threshold` shares
 /// fail with [`ThresholdError::Aead`].
-pub fn peel_onion_with_shares(
+pub fn peel_onion_with_shares<F: Field>(
     onion: &[u8],
     shares: &[Share],
 ) -> Result<ThresholdPeel, ThresholdError> {
-    let packet = slots::Packet::from_bytes(onion).ok_or(ThresholdError::Malformed)?;
+    let (packet, sealed) = open_slot0::<F>(onion)?;
+    peel_packet(packet, &sealed, shares)
+}
+
+/// Parse `onion` against **this node's own plane** and open slot 0 with its framing checked against that plane.
+///
+/// Both halves matter. The split comes from `Plane::<F>::LINE_SIZE` — a relay must already know its line size to hold a
+/// threshold share at all, so nothing is gained by letting the packet say. And the seal's own declared member count,
+/// now the *only* place a width appears on the wire, stops being a source and becomes **evidence**: derived here,
+/// declared there, compared. A circuit built for another plane order fails at the first hop with `Malformed`, rather
+/// than being mis-split and failing obscurely inside an AEAD several steps later.
+fn open_slot0<F: Field>(onion: &[u8]) -> Result<(slots::Packet, ThresholdSealed), ThresholdError> {
+    let line_size = Plane::<F>::LINE_SIZE as usize;
+    let packet = slots::Packet::from_bytes(onion, line_size).ok_or(ThresholdError::Malformed)?;
     let sealed = ThresholdSealed::from_bytes(packet.slot(0).ok_or(ThresholdError::Malformed)?)
         .ok_or(ThresholdError::Malformed)?;
-    peel_packet(packet, &sealed, shares)
+    if sealed.member_count() != line_size {
+        return Err(ThresholdError::Malformed);
+    }
+    Ok((packet, sealed))
 }
 
 /// Process one hop of a fixed-slot packet: open slot 0, strip one payload layer, and hand on a packet of **identical**
@@ -259,8 +274,8 @@ fn peel_packet(
             let next = fanos_geometry::decode_triple(operand.get(..12).ok_or(ThresholdError::Malformed)?)
                 .ok_or(ThresholdError::Malformed)?;
             // Framed like a real slot, or a relay counts the parseable slots and reads off the remaining depth.
-            let line_size = slots::line_size_of(packet.slot_len).ok_or(ThresholdError::Malformed)?;
-            packet.shift_in(&slots::filler_slot(&pkey, line_size));
+            let filler = slots::filler_slot(&pkey, packet.line_size);
+            packet.shift_in(&filler);
             Ok(ThresholdPeel::Forward { next, onion: packet.to_bytes() })
         }
         _ => Err(ThresholdError::Malformed),
@@ -272,14 +287,14 @@ fn peel_packet(
 /// canonical `points_on` ordering (the order the layer was sealed in). Returns `None` if the slot is
 /// not this member's or is tampered.
 #[must_use]
-pub fn member_partial(
+pub fn member_partial<F: Field>(
     onion: &[u8],
     member_index: usize,
     secret: &HybridKemSecret,
 ) -> Option<Share> {
     // Slot 0 is always this hop's — every hop shifts the header, so a member never searches for its slot.
-    let packet = slots::Packet::from_bytes(onion)?;
-    ThresholdSealed::from_bytes(packet.slot(0)?)?.member_share(member_index, secret)
+    let (_, sealed) = open_slot0::<F>(onion).ok()?;
+    sealed.member_share(member_index, secret)
 }
 
 #[cfg(test)]
@@ -287,6 +302,7 @@ pub fn member_partial(
 mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
+    use fanos_field::{F2, F4, F5, F7};
     use fanos_threshold::{THRESHOLD_ONION_LEN, pad_onion};
 
     fn line(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {
@@ -311,7 +327,7 @@ mod tests {
             lines.iter().map(|l| l.iter().map(|(_, p)| p).collect()).collect();
         let hop_lines: Vec<HopLine<'_>> = (0..hops)
             .map(|h| HopLine {
-                line: Point::<fanos_field::F2>::at(h % 7).coords(),
+                line: Point::<F2>::at(h % 7).coords(),
                 members: pubs.get(h).map_or(&[][..], Vec::as_slice),
             })
             .collect();
@@ -331,9 +347,9 @@ mod tests {
         for hop in lines.iter().take(2) {
             let partials: Vec<Share> = [0usize, 1]
                 .iter()
-                .filter_map(|&i| hop.get(i).and_then(|(sk, _)| member_partial(&current, i, sk)))
+                .filter_map(|&i| hop.get(i).and_then(|(sk, _)| member_partial::<F2>(&current, i, sk)))
                 .collect();
-            match peel_onion_with_shares(&current, &partials).unwrap() {
+            match peel_onion_with_shares::<F2>(&current, &partials).unwrap() {
                 ThresholdPeel::Forward { onion: inner, .. } => {
                     sizes.push(inner.len());
                     current = inner;
@@ -347,7 +363,7 @@ mod tests {
         }
         assert_eq!(
             first,
-            slots::PREAMBLE_LEN + slots::header_len(3) + slots::payload_len(3).unwrap(),
+            slots::header_len(3) + slots::payload_len(3).unwrap(),
             "and the width is the plane's, not an accident of this payload"
         );
         assert_eq!(first, THRESHOLD_ONION_LEN, "which is the bucket the previous layout already paid for");
@@ -359,10 +375,13 @@ mod tests {
         // The autonomous-combiner form: each line member computes its `member_partial`, a combiner
         // collects >= t of them and peels via `peel_onion_with_shares`.
         let t = 3u8;
+        // A 5-point line is `PG(2, 4)`, so the peel runs on `F4` — the plane whose line size this circuit was
+        // built for. The pairing used to be free: the packet declared its own width, so a Fano relay would parse a
+        // 5-wide packet and only fail later, inside an AEAD. It is now a type error to peel on the wrong plane.
         let kps = line(5, 55);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         let hop = HopLine {
-            line: Point::<fanos_field::F2>::at(1).coords(),
+            line: Point::<F4>::at(1).coords(),
             members: &pubs,
         };
         let onion = seal_onion(&[hop], t, b"deliver me", b"seed").unwrap();
@@ -370,15 +389,15 @@ mod tests {
         // Members 0,2,4 each independently produce their partial share.
         let partials: Vec<Share> = [0usize, 2, 4]
             .iter()
-            .map(|&i| member_partial(&onion, i, &kps[i].0).unwrap())
+            .map(|&i| member_partial::<F4>(&onion, i, &kps[i].0).unwrap())
             .collect();
         // A combiner with those t partials peels the hop.
-        match peel_onion_with_shares(&onion, &partials).unwrap() {
+        match peel_onion_with_shares::<F4>(&onion, &partials).unwrap() {
             ThresholdPeel::Deliver { payload, .. } => assert_eq!(payload, b"deliver me"),
             ThresholdPeel::Forward { .. } => panic!("single hop should deliver"),
         }
         // A member decapsulating the wrong slot gets nothing (index 0 with member 2's secret).
-        assert!(member_partial(&onion, 0, &kps[2].0).is_none());
+        assert!(member_partial::<F4>(&onion, 0, &kps[2].0).is_none());
     }
 
     #[test]
@@ -441,7 +460,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(h, members)| HopLine {
-                line: Point::<fanos_field::F2>::at(h).coords(),
+                line: Point::<F2>::at(h).coords(),
                 members,
             })
             .collect();
@@ -462,7 +481,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
-            match peel_onion(&onion, &members).unwrap() {
+            match peel_onion::<F2>(&onion, &members).unwrap() {
                 ThresholdPeel::Forward { onion: inner, .. } => {
                     // Re-pad the inner onion as the router does: every hop's packet is the same size.
                     onion = inner;
@@ -487,7 +506,7 @@ mod tests {
         let lines: Vec<Vec<(HybridKemSecret, HybridKemPublic)>> =
             (0..3).map(|h| line(3, base + h as u8)).collect();
         let hop_lines: Vec<fanos_geometry::Triple> =
-            (0..3).map(|h| Point::<fanos_field::F2>::at(h).coords()).collect();
+            (0..3).map(|h| Point::<F2>::at(h).coords()).collect();
         (lines, hop_lines)
     }
 
@@ -515,7 +534,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
-            match peel_onion(&onion, &members).unwrap() {
+            match peel_onion::<F2>(&onion, &members).unwrap() {
                 ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
                 ThresholdPeel::Deliver { holonomy, .. } => {
                     delivered = Some(holonomy);
@@ -529,7 +548,7 @@ mod tests {
         assert!(verify_delivery(&hop_lines, seed, holonomy).is_ok());
         // A substituted hop line is rejected — the authenticator caught the tamper (S1-M1).
         let mut substituted = hop_lines.clone();
-        substituted[1] = fanos_geometry::Point::<fanos_field::F2>::at(4).coords();
+        substituted[1] = fanos_geometry::Point::<F2>::at(4).coords();
         assert_eq!(verify_delivery(&substituted, seed, holonomy), Err(ThresholdError::HolonomyFail));
         // A reordered path is rejected (the ratchet is order-sensitive).
         let reordered = alloc::vec![hop_lines[1], hop_lines[0], hop_lines[2]];
@@ -570,7 +589,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (sk, _))| (i, sk))
                 .collect();
-            match peel_onion(&onion, &members).unwrap() {
+            match peel_onion::<F2>(&onion, &members).unwrap() {
                 ThresholdPeel::Forward { onion: inner, .. } => onion = inner,
                 ThresholdPeel::Deliver { holonomy, .. } => {
                     assert_eq!(holonomy, tag, "the delivered tag is the sealed authenticator");
@@ -581,14 +600,68 @@ mod tests {
         panic!("onion never delivered");
     }
 
+    /// A circuit built on one plane is refused on every other — loudly, before a secret is touched (#112).
+    ///
+    /// Nothing in the bytes says which plane they are for. The total is [`THRESHOLD_ONION_LEN`] on *every* plane, so
+    /// length cannot tell; the layout used to declare `slots ‖ slot_len` in a cleartext preamble instead, which both let
+    /// a foreign relay parse the packet at the sender's split and published the sender's cell order at a fixed offset
+    /// for anyone sorting traffic. Now the split is the reader's own `Plane::<F>::LINE_SIZE`, cross-checked against the
+    /// only width still on the wire — the seal's declared member count — so a mismatch is `Malformed`.
+    ///
+    /// Both directions are needed and they fail differently: a **narrower** reader slices a short slot 0 that cannot
+    /// decode at all, while a **wider** one slices a long slot 0 that decodes fine (`ThresholdSealed::from_bytes`
+    /// tolerates trailing bytes) and is caught only by the member-count comparison. Testing one direction would leave
+    /// the other's guard unexercised.
+    ///
+    /// Deleting that comparison turns the `member_partial::<F5>` line below red while the `peel_onion::<F5>` line stays
+    /// green — and `member_partial` is the case that matters. A full peel happens to fail anyway, because a wider
+    /// reader also splits the *payload* in the wrong place; but `member_partial` is what a line member runs on arrival,
+    /// and without the guard it would hand back a genuine decryption share for a packet from a plane it has no business
+    /// touching. That is a cross-plane decryption oracle, not a parse error.
+    #[test]
+    fn a_packet_from_another_plane_is_refused_at_the_first_hop() {
+        use fanos_geometry::Point;
+        let t = 3u8;
+        let kps = line(5, 77); // a 5-point line: PG(2, 4)
+        let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
+        let hop = HopLine {
+            line: Point::<F4>::at(2).coords(),
+            members: &pubs,
+        };
+        let onion = seal_onion(&[hop], t, b"not for you", b"cross-plane").unwrap();
+        let members: Vec<(usize, &HybridKemSecret)> = kps
+            .iter()
+            .take(usize::from(t))
+            .enumerate()
+            .map(|(i, (sk, _))| (i, sk))
+            .collect();
+
+        // On its own plane it peels — without this the refusals below would prove nothing.
+        assert!(matches!(
+            peel_onion::<F4>(&onion, &members).unwrap(),
+            ThresholdPeel::Deliver { .. }
+        ));
+        assert!(member_partial::<F4>(&onion, 0, &kps[0].0).is_some());
+
+        // Narrower reader (Fano, 3): slot 0 is short and does not decode.
+        assert_eq!(peel_onion::<F2>(&onion, &members), Err(ThresholdError::Malformed));
+        // Wider readers (6 and 8): slot 0 decodes, and only the member-count check rejects it.
+        assert_eq!(peel_onion::<F5>(&onion, &members), Err(ThresholdError::Malformed));
+        assert_eq!(peel_onion::<F7>(&onion, &members), Err(ThresholdError::Malformed));
+        assert!(member_partial::<F5>(&onion, 0, &kps[0].0).is_none());
+        assert!(member_partial::<F7>(&onion, 0, &kps[0].0).is_none());
+    }
+
     #[test]
     fn below_threshold_members_cannot_peel_a_hop() {
         use fanos_geometry::Point;
         let t = 4u8;
+        // A 6-point line is `PG(2, 5)`; peel on the matching plane, or the packet is refused for its shape before
+        // the threshold is ever tested and this test would pass for the wrong reason.
         let kps = line(6, 30);
         let members_pub: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         let hop = HopLine {
-            line: Point::<fanos_field::F2>::at(0).coords(),
+            line: Point::<F5>::at(0).coords(),
             members: &members_pub,
         };
         let onion = seal_onion(&[hop], t, b"secret", b"s").unwrap();
@@ -599,7 +672,7 @@ mod tests {
             .enumerate()
             .map(|(i, (sk, _))| (i, sk))
             .collect();
-        assert_eq!(peel_onion(&onion, &too_few), Err(ThresholdError::Aead));
+        assert_eq!(peel_onion::<F5>(&onion, &too_few), Err(ThresholdError::Aead));
     }
 
     #[test]
@@ -625,7 +698,7 @@ mod tests {
         use fanos_geometry::Point;
         let kps = line(3, 0x9E);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
-        let line_coord = Point::<fanos_field::F2>::at(1).coords();
+        let line_coord = Point::<F2>::at(1).coords();
 
         // An empty circuit has no hop to seal.
         assert!(matches!(

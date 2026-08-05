@@ -76,7 +76,7 @@ fn the_cpu_cost_of_a_share_gather_is_measured_and_reported() {
     // --- C_partial: what a member pays to answer ONE share request. ---
     let start = Instant::now();
     for _ in 0..PARTIALS {
-        let share = member_partial(&onion, 1, &members[1].0);
+        let share = member_partial::<F2>(&onion, 1, &members[1].0);
         assert!(share.is_some(), "the probe onion must yield member 1's share");
     }
     let c_partial = start.elapsed() / PARTIALS;

@@ -653,8 +653,19 @@ this is a layout change, not a padding change.
 ### The layout
 
 ```text
-onion = slots(2) ‖ slot_len(4) ‖ slot[0] ‖ … ‖ slot[D-1] ‖ payload_block
+onion = slot[0] ‖ … ‖ slot[D-1] ‖ payload_block
 ```
+
+**Nothing on the wire describes the packet.** `D` and the slot width are both functions of the plane's line size, and a
+relay must already know that to hold a threshold share of a hop line at all — so the layout carries no preamble. It used
+to open with `slots(2) ‖ slot_len(4)`, defended as "network parameters, not circuit facts". That is true of the depth
+*ceiling* and beside the point: those fields were also a cleartext declaration of the **sender's cell order** at a fixed
+offset, which sorts traffic into per-plane anonymity sets for free and cannot be read out of the length, since the total
+is the same bucket on every plane. The reader now derives the split from its own `Plane::<F>::LINE_SIZE` and checks it
+against the one width still on the wire — the seal's declared member count. A foreign-plane packet is refused, which
+costs nothing: each slot is threshold-sealed to a line of the sender's size, so such a relay could never have been a hop
+on that circuit. The load-bearing case is `member_partial`, where without the check a line member would return a genuine
+decryption share for a packet from a plane it has no business touching (#112).
 
 Each hop reads **slot 0**, shifts the array one slot left, appends a pseudorandom filler slot, and strips one
 size-preserving layer from the payload block. Slot `k` as built is hop `k`'s, and after `k` shifts it has arrived at
@@ -702,7 +713,7 @@ construction rather than a step a forwarder could omit, and under the nested lay
 between a relay and its depth.
 
 **A payload budget the nested layout did not have.** A fixed array reserves all `D` slots even for a one-hop circuit, so
-payload capacity is `THRESHOLD_ONION_LEN − PREAMBLE_LEN − D × slot_len` rather than most of the cell. This is not
+payload capacity is `THRESHOLD_ONION_LEN − D × slot_len` rather than most of the cell. This is not
 hypothetical: at budget-filling depth it was 2 444 B, which is *smaller than structures this protocol nests inside an onion
 payload* (sealing to a 3-member line alone costs 3 × 1 169 = 3 507 B), and it broke every full anonymous session while a
 single forward onion still delivered. `TARGET_DEPTH` is what makes it fit.

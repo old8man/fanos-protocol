@@ -14,16 +14,21 @@
 //! ## The layout
 //!
 //! ```text
-//! onion = slots(2) ‖ slot_len(4) ‖ slot[0] ‖ … ‖ slot[D-1] ‖ payload_block
+//! onion = slot[0] ‖ … ‖ slot[D-1] ‖ payload_block
 //! ```
 //!
 //! Every hop reads **slot 0**, shifts the array one slot left, and appends a pseudorandom slot — so the header is always
 //! `D` slots wide and the packet is byte-identical in size at every hop. Slot `k` as built is hop `k`'s, and after `k`
 //! shifts it has arrived at position 0.
 //!
-//! The two cleartext preamble fields are network parameters, not circuit facts: `slots` is the *maximum* depth `D`, the
-//! same for every packet, and `slot_len` follows from the plane's line size. Neither reveals the actual depth `h`, which is
-//! what the leak was.
+//! **Nothing describes the packet but the packet.** `D` and the slot width are functions of the plane's line size, and a
+//! relay must already know that to hold a threshold share of a hop line at all — so the layout carries no preamble. It
+//! used to open with `slots(2) ‖ slot_len(4)`, defended as "network parameters, not circuit facts". True of the depth
+//! *ceiling*, and beside the point: the fields were also a cleartext declaration of the sender's cell order at a fixed
+//! offset, which sorts traffic into per-plane anonymity sets for free and cannot be seen in the length, since the total
+//! is the same bucket on every plane. Derived at the reader instead, and cross-checked against the seal's own declared
+//! member count, a foreign-plane packet fails to parse — which costs nothing, because each slot is threshold-sealed to a
+//! line of the *sender's* size, so such a relay could never have been a hop on that circuit.
 //!
 //! ## Why this is simpler than textbook Sphinx
 //!
@@ -86,7 +91,7 @@ pub const TARGET_DEPTH: usize = 3;
 #[must_use]
 pub const fn depth_for(line_size: usize) -> usize {
     // `n` slots fit in the bucket; one is reserved for the payload, so `n - 1` may carry hops.
-    match (THRESHOLD_ONION_LEN - PREAMBLE_LEN).checked_div(slot_len(line_size)) {
+    match THRESHOLD_ONION_LEN.checked_div(slot_len(line_size)) {
         Some(0) | None => 0,
         Some(n) if n - 1 < TARGET_DEPTH => n - 1,
         Some(_) => TARGET_DEPTH,
@@ -140,33 +145,30 @@ pub const fn header_len(line_size: usize) -> usize {
 /// silently truncated packet.
 #[must_use]
 pub const fn payload_len(line_size: usize) -> Option<usize> {
-    match THRESHOLD_ONION_LEN.checked_sub(header_len(line_size) + PREAMBLE_LEN) {
+    match THRESHOLD_ONION_LEN.checked_sub(header_len(line_size)) {
         Some(n) if n > 4 => Some(n),
         _ => None,
     }
 }
 
-/// `slots(2) ‖ slot_len(4)`.
-pub const PREAMBLE_LEN: usize = 6;
-
-/// The line size a slot of `slot_len` bytes implies — the inverse of [`slot_len`].
-///
-/// A hop needs it to frame the filler it appends, and it must come from the packet rather than from configuration: the
-/// packet's declared width is what its peers will parse against.
-#[must_use]
-pub const fn line_size_of(slot_len: usize) -> Option<usize> {
-    match slot_len.checked_sub(NONCE_LEN + 2 + 4 + CMD_LEN + AEAD_TAG_LEN) {
-        Some(rest) if rest % SEALED_SHARE_LEN == 0 => Some(rest / SEALED_SHARE_LEN),
-        _ => None,
-    }
-}
-
 /// A parsed packet: the slot array and the payload block, both at their fixed widths.
+///
+/// **The plane is not on the wire.** Both widths are functions of the line size, and the line size is a property of the
+/// *reader's own plane* — a relay must already know it to hold a threshold share of a hop line at all. Declaring them
+/// in a cleartext preamble was therefore never necessary, and cost two things:
+///
+/// * a relay on plane `A` would happily parse a packet built for plane `B`, instead of rejecting bytes it could not
+///   possibly be a hop for;
+/// * the sender's cell order sat in the clear at a fixed offset, so a passive observer could sort traffic by it. In a
+///   deployment running more than one order that is an anonymity-set partition along a line no user chose — and it is
+///   invisible from length alone, since the total is [`THRESHOLD_ONION_LEN`] on *every* plane.
+///
+/// Derived locally instead, a foreign-plane packet fails to parse. That is the correct outcome rather than a
+/// regression: each slot is threshold-sealed to a line of the **sender's** size, so a relay on another plane could
+/// never have been a hop on that circuit. The six bytes go back to the payload.
 pub struct Packet {
-    /// Number of slots in the header — always [`depth_for`] the plane's line size in a well-formed packet.
-    pub slots: usize,
-    /// Bytes per slot, fixed by the plane's line size.
-    pub slot_len: usize,
+    /// Points per line on **this node's plane** (`q + 1`) — the one parameter both widths derive from.
+    pub line_size: usize,
     /// The `slots × slot_len` header.
     pub header: Vec<u8>,
     /// The constant-width payload block.
@@ -176,40 +178,53 @@ pub struct Packet {
 impl Packet {
     /// Assemble a packet from its header and payload block.
     #[must_use]
-    pub fn new(slot_len: usize, header: Vec<u8>, payload: Vec<u8>) -> Self {
-        Self { slots: header.len().checked_div(slot_len).unwrap_or(0), slot_len, header, payload }
+    pub fn new(line_size: usize, header: Vec<u8>, payload: Vec<u8>) -> Self {
+        Self { line_size, header, payload }
     }
 
-    /// Serialize to the wire form.
+    /// Bytes per slot on this packet's plane.
+    #[must_use]
+    pub const fn slot_len(&self) -> usize {
+        slot_len(self.line_size)
+    }
+
+    /// Number of slots the header holds — [`depth_for`] this plane in a well-formed packet.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.header.len().checked_div(self.slot_len()).unwrap_or(0)
+    }
+
+    /// Serialize to the wire form: `header ‖ payload`, and nothing else.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PREAMBLE_LEN + self.header.len() + self.payload.len());
-        out.extend_from_slice(&u16::try_from(self.slots).unwrap_or(u16::MAX).to_be_bytes());
-        out.extend_from_slice(&u32::try_from(self.slot_len).unwrap_or(u32::MAX).to_be_bytes());
+        let mut out = Vec::with_capacity(self.header.len() + self.payload.len());
         out.extend_from_slice(&self.header);
         out.extend_from_slice(&self.payload);
         out
     }
 
-    /// Parse the wire form, or `None` if the preamble disagrees with the bytes present.
+    /// Split the wire form at the header width **this plane** implies, or `None` if the bytes are not a packet of this
+    /// plane's shape.
     ///
-    /// Checked rather than trusted: these bytes arrive from the network, and a packet whose declared shape does not match
-    /// its length is exactly the shape an attacker submits to make a peel read out of bounds.
+    /// Still checked rather than trusted — but the width now comes from the reader, so the check finally means
+    /// something: previously the packet supplied both the claim and the evidence for it, which is no check at all. The
+    /// exact-length test is what a constant-width layout is *for*, and it makes a truncated packet fail here rather
+    /// than inside a peel.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let slots = usize::from(u16::from_be_bytes(bytes.get(..2)?.try_into().ok()?));
-        let slot_len = usize::try_from(u32::from_be_bytes(bytes.get(2..PREAMBLE_LEN)?.try_into().ok()?)).ok()?;
-        let header_bytes = slots.checked_mul(slot_len)?;
-        let header = bytes.get(PREAMBLE_LEN..PREAMBLE_LEN.checked_add(header_bytes)?)?.to_vec();
-        let payload = bytes.get(PREAMBLE_LEN + header_bytes..)?.to_vec();
-        Some(Self { slots, slot_len, header, payload })
+    pub fn from_bytes(bytes: &[u8], line_size: usize) -> Option<Self> {
+        if bytes.len() != THRESHOLD_ONION_LEN {
+            return None;
+        }
+        let header = bytes.get(..header_len(line_size))?.to_vec();
+        let payload = bytes.get(header_len(line_size)..)?.to_vec();
+        Some(Self { line_size, header, payload })
     }
 
     /// Slot `i`, or `None` if out of range.
     #[must_use]
     pub fn slot(&self, i: usize) -> Option<&[u8]> {
-        let start = i.checked_mul(self.slot_len)?;
-        self.header.get(start..start.checked_add(self.slot_len)?)
+        let start = i.checked_mul(self.slot_len())?;
+        self.header.get(start..start.checked_add(self.slot_len())?)
     }
 
     /// Shift the header one slot left and append `filler`, keeping the width exactly constant.
@@ -217,12 +232,14 @@ impl Packet {
     /// This is what makes the packet unreadable as a depth counter: the hop that just consumed slot 0 hands on a header of
     /// the same `slots × slot_len` bytes it received.
     pub fn shift_in(&mut self, filler: &[u8]) {
-        if self.slot_len == 0 || self.header.len() < self.slot_len {
+        let width = self.slot_len();
+        let slots = self.slots();
+        if width == 0 || self.header.len() < width {
             return;
         }
-        self.header.drain(..self.slot_len);
+        self.header.drain(..width);
         self.header.extend_from_slice(filler);
-        self.header.truncate(self.slots * self.slot_len);
+        self.header.truncate(slots * width);
     }
 }
 
@@ -304,8 +321,14 @@ mod tests {
         // fixed budget, where the nested layout let a sender exceed both and leak instead.
         // Every plane's header fits its own budget, and the depth it can carry is the legible trade the layout makes.
         for line_size in [3usize, 4, 5, 6, 8] {
-            assert!(header_len(line_size) + PREAMBLE_LEN <= THRESHOLD_ONION_LEN, "line {line_size}: header fits");
+            assert!(header_len(line_size) <= THRESHOLD_ONION_LEN, "line {line_size}: header fits");
             assert!(payload_len(line_size).is_some(), "line {line_size}: a payload block remains");
+            // Header and payload partition the budget *exactly* — there is nothing else on the wire, on any plane.
+            assert_eq!(
+                header_len(line_size) + payload_len(line_size).unwrap(),
+                THRESHOLD_ONION_LEN,
+                "line {line_size}: the two blocks are the whole packet"
+            );
         }
         // The target depth where the plane affords it, less where it does not.
         // Every supported plane must leave room for one nested threshold seal, which is the largest thing the protocol puts
@@ -345,8 +368,8 @@ mod tests {
     #[test]
     fn a_shift_keeps_the_header_exactly_as_wide() {
         // The property the whole layout exists for. Whatever a hop consumes, it hands on the same number of bytes.
-        let sl = 8usize;
-        let mut p = Packet::new(sl, alloc::vec![7u8; 4 * sl], alloc::vec![1u8; 100]);
+        let sl = slot_len(3);
+        let mut p = Packet::new(3, alloc::vec![7u8; 4 * sl], alloc::vec![1u8; 100]);
         let before = (p.header.len(), p.payload.len());
         for _ in 0..6 {
             p.shift_in(&alloc::vec![9u8; sl]);
@@ -355,22 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_round_trips_and_a_lying_preamble_is_refused() {
-        let sl = 16usize;
-        let p = Packet::new(sl, alloc::vec![3u8; 4 * sl], alloc::vec![4u8; 64]);
+    fn a_packet_round_trips_and_the_wire_names_no_plane() {
+        let line_size = 3usize;
+        let header = alloc::vec![3u8; header_len(line_size)];
+        let payload = alloc::vec![4u8; payload_len(line_size).unwrap()];
+        let p = Packet::new(line_size, header.clone(), payload.clone());
         let bytes = p.to_bytes();
-        let back = Packet::from_bytes(&bytes).expect("round trip");
-        assert_eq!((back.slots, back.slot_len), (4, sl));
-        assert_eq!(back.header, p.header);
-        assert_eq!(back.payload, p.payload);
-        // A preamble claiming more header than the packet holds must not read past the end.
-        let mut lying = bytes.clone();
-        lying[0..2].copy_from_slice(&u16::to_be_bytes(9999));
-        assert!(Packet::from_bytes(&lying).is_none(), "a header wider than the packet is refused");
-        // And one that overflows the multiply.
-        let mut overflow = bytes;
-        overflow[2..6].copy_from_slice(&u32::to_be_bytes(u32::MAX));
-        assert!(Packet::from_bytes(&overflow).is_none(), "an overflowing slot width is refused");
+
+        let back = Packet::from_bytes(&bytes, line_size).expect("round trip");
+        assert_eq!((back.slots(), back.slot_len()), (depth_for(line_size), slot_len(line_size)));
+        assert_eq!(back.header, header);
+        assert_eq!(back.payload, payload);
+
+        // **Nothing on the wire says which plane this is.** The layout used to open with `slots(2) ‖ slot_len(4)`, so
+        // the sender's cell order sat in the clear at a fixed offset and a passive observer could sort traffic by it —
+        // a partition of the anonymity set along a line no user chose, invisible from length alone because the total is
+        // the same bucket on every plane. The packet is now the two blocks and nothing else.
+        assert_eq!(bytes.len(), header.len() + payload.len(), "the wire is header ‖ payload, and nothing else");
+        assert_eq!(&bytes[..header.len()], &header[..], "no preamble precedes the header");
+        assert_eq!(bytes.len(), THRESHOLD_ONION_LEN, "and it is exactly the budget, on every plane");
+
+        // A reader on another plane splits the same bytes elsewhere. That is precisely why the split must be the
+        // *reader's* and then be checked against the seal (`open_slot0`): the packet can no longer dictate it, so a
+        // foreign-plane circuit fails loudly instead of being mis-parsed into a peel.
+        let foreign = Packet::from_bytes(&bytes, 5).expect("same total width, different plane");
+        assert_ne!(foreign.header.len(), back.header.len(), "the split is the reader's, not the packet's");
+
+        // Constant width is the layout's premise, so anything else is refused here rather than inside a peel.
+        assert!(Packet::from_bytes(&bytes[..bytes.len() - 1], line_size).is_none(), "a truncated packet is refused");
+        let mut over = bytes;
+        over.push(0);
+        assert!(Packet::from_bytes(&over, line_size).is_none(), "an over-long packet is refused");
     }
 
     #[test]

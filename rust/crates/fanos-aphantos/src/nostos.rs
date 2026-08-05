@@ -254,6 +254,7 @@ mod tests {
 
     use super::*;
     use crate::threshold_onion::{ThresholdPeel, member_partial, peel_onion, peel_onion_with_shares};
+    use fanos_field::F2;
 
     /// A line of `n` KEM keypairs (a stand-in for a directory of the line's members).
     fn line_members(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {
@@ -392,7 +393,7 @@ mod tests {
             .enumerate()
             .map(|(i, (sk, _))| (i, sk))
             .collect();
-        let inner_onion = match peel_onion(&onion, &mix_secrets).unwrap() {
+        let inner_onion = match peel_onion::<F2>(&onion, &mix_secrets).unwrap() {
             ThresholdPeel::Forward { onion, .. } => crate::threshold::pad_onion(&onion).unwrap(),
             ThresholdPeel::Deliver { .. } => panic!("the first hop forwards, it does not deliver"),
         };
@@ -400,9 +401,9 @@ mod tests {
         // The delivery line's members gather partials; the combiner peels the final layer and gets
         // only the END-TO-END CIPHERTEXT (the dead-drop), which it multicasts to points_on(L).
         let partials: Vec<_> = (0..usize::from(t))
-            .map(|i| member_partial(&inner_onion, i, &drop[i].0).unwrap())
+            .map(|i| member_partial::<F2>(&inner_onion, i, &drop[i].0).unwrap())
             .collect();
-        let delivered = match peel_onion_with_shares(&inner_onion, &partials).unwrap() {
+        let delivered = match peel_onion_with_shares::<F2>(&inner_onion, &partials).unwrap() {
             ThresholdPeel::Deliver { payload, .. } => payload,
             ThresholdPeel::Forward { .. } => panic!("the final hop delivers"),
         };
@@ -467,7 +468,7 @@ mod tests {
             .enumerate()
             .map(|(i, (sk, _))| (i, sk))
             .collect();
-        assert_eq!(peel_onion(&onion, &too_few), Err(ThresholdError::Aead));
+        assert_eq!(peel_onion::<F7>(&onion, &too_few), Err(ThresholdError::Aead));
     }
 
     /// The end-to-end seal is opaque to the delivery line even with the full onion in hand: the

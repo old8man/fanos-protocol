@@ -549,7 +549,7 @@ impl<F: Field> ThresholdRouter<F> {
         // answer — a routine loss then becomes an expiry, and until this counter existed nothing said why.
         match self.my_index(line) {
             None => {} // not a member of this line: there is no own share to seed, and that is not a fault
-            Some(i) => match self.onion.secrets().find_map(|sk| threshold::member_partial(&onion, i, sk)) {
+            Some(i) => match self.onion.secrets().find_map(|sk| threshold::member_partial::<F>(&onion, i, sk)) {
                 Some(share) => shares.push(share),
                 None => self.stations.record(Station::GatherSelfShareMissing, Some(line)),
             },
@@ -608,7 +608,7 @@ impl<F: Field> ThresholdRouter<F> {
         let Some(share) = self
             .onion
             .secrets()
-            .find_map(|sk| threshold::member_partial(onion, i, sk))
+            .find_map(|sk| threshold::member_partial::<F>(onion, i, sk))
         else {
             // A member of the line that cannot compute its own share: the layer was sealed to a key
             // this node no longer holds — **epoch/key skew between members**, otherwise invisible, and
@@ -702,7 +702,7 @@ impl<F: Field> ThresholdRouter<F> {
         }
         let line = pending.line;
         let armed_at = pending.armed_at;
-        let peel = peel_best_subset(&pending.onion, &pending.shares, self.threshold)?;
+        let peel = peel_best_subset::<F>(&pending.onion, &pending.shares, self.threshold)?;
         self.pending.remove(&req_id); // the hop is resolved — evict the in-flight state
         self.remember_resolved(req_id, Resolved::Peeled);
         // One completed gather is one latency sample, and it contains `RTT + C_partial + Q` together —
@@ -793,18 +793,18 @@ impl<F: Field> ThresholdRouter<F> {
 /// first successful outcome. Honest operation succeeds on the first (all-honest) subset; when up to
 /// `t − 1` forged shares are interleaved, other subsets are tried, bounded by [`MAX_PEEL_ATTEMPTS`] so
 /// the search can never be turned into a CPU-exhaustion vector.
-fn peel_best_subset(onion: &[u8], shares: &[Share], threshold: usize) -> Option<ThresholdPeel> {
+fn peel_best_subset<F: Field>(onion: &[u8], shares: &[Share], threshold: usize) -> Option<ThresholdPeel> {
     if threshold == 0 || shares.len() < threshold {
         return None;
     }
     let mut chosen: Vec<usize> = Vec::with_capacity(threshold);
     let mut attempts = 0usize;
-    peel_search(onion, shares, threshold, 0, &mut chosen, &mut attempts)
+    peel_search::<F>(onion, shares, threshold, 0, &mut chosen, &mut attempts)
 }
 
 /// Recursive helper for [`peel_best_subset`]: extend `chosen` with distinct-`x` share indices until it
 /// reaches `threshold`, trying a peel at each complete subset.
-fn peel_search(
+fn peel_search<F: Field>(
     onion: &[u8],
     shares: &[Share],
     threshold: usize,
@@ -818,7 +818,7 @@ fn peel_search(
             .iter()
             .filter_map(|&i| shares.get(i).cloned())
             .collect();
-        return threshold::peel_onion_with_shares(onion, &subset).ok();
+        return threshold::peel_onion_with_shares::<F>(onion, &subset).ok();
     }
     for i in start..shares.len() {
         if *attempts >= MAX_PEEL_ATTEMPTS {
@@ -835,7 +835,7 @@ fn peel_search(
             continue;
         }
         chosen.push(i);
-        if let Some(peel) = peel_search(onion, shares, threshold, i + 1, chosen, attempts) {
+        if let Some(peel) = peel_search::<F>(onion, shares, threshold, i + 1, chosen, attempts) {
             return Some(peel);
         }
         chosen.pop();
@@ -1274,7 +1274,7 @@ mod tests {
         );
 
         // The honest member-1 reply (the real partial) and a forgery at the same index with mangled y.
-        let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
+        let honest1 = member_partial::<F2>(&onion, 1, m1.secret()).unwrap();
         let forged = Share::new(honest1.x(), honest1.y().iter().map(|b| b ^ 0xFF).collect());
         assert_ne!(
             forged.y(),
@@ -1347,7 +1347,7 @@ mod tests {
                 Instant(0),
                 Input::Message { from: [9, 9, 9], frame: launch_frame(line_coord, &onion) },
             );
-            let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
+            let honest1 = member_partial::<F2>(&onion, 1, m1.secret()).unwrap();
             let e = router.step(
                 Instant(1),
                 Input::Message { from: members[1], frame: encode_rep(0, &honest1) },
@@ -1567,7 +1567,7 @@ mod tests {
             Instant(0),
             Input::Message { from: [9, 9, 9], frame: launch_frame(l, &onion) },
         );
-        let honest1 = member_partial(&onion, 1, m1.secret()).unwrap();
+        let honest1 = member_partial::<F2>(&onion, 1, m1.secret()).unwrap();
         let effects = router.step(
             Instant(1),
             Input::Message { from: members[1], frame: encode_rep(0, &honest1) },
@@ -1747,7 +1747,7 @@ mod tests {
             router.step(Instant(now), Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) });
             let req_id = router.seq - 1;
             let other = 1 - me_idx; // any other line member's honest partial completes t = 2
-            let honest = member_partial(&onion, other, ratchets[other].secret()).unwrap();
+            let honest = member_partial::<F2>(&onion, other, ratchets[other].secret()).unwrap();
             now += two_ms;
             router.step(
                 Instant(now),
@@ -1816,7 +1816,7 @@ mod tests {
                 Input::Message { from: [9, 9, 9], frame: launch_frame(line, &onion) },
             );
             let req_id = router.seq - 1;
-            let honest = member_partial(&onion, 1, ratchets[1].secret()).unwrap();
+            let honest = member_partial::<F2>(&onion, 1, ratchets[1].secret()).unwrap();
             now += step_ns;
             router.step(
                 Instant(now),
@@ -2032,7 +2032,7 @@ mod tests {
         );
         router.step(Instant(0), Input::Message { from: [9, 9, 9], frame: launch_frame(l, &onion) });
         let other_idx = (0..3).find(|&i| i != alt_idx).unwrap();
-        let honest = member_partial(&onion, other_idx, ratchets[other_idx].secret()).unwrap();
+        let honest = member_partial::<F2>(&onion, other_idx, ratchets[other_idx].secret()).unwrap();
         let effects = router.step(
             Instant(1),
             Input::Message { from: members[other_idx], frame: encode_rep(0, &honest) },
