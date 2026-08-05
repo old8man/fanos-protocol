@@ -117,7 +117,45 @@ consumer and would be the thing that finally exercises it.
 
 ---
 
-## 4. Privacy is a class per log, declared once, and it is the honest part
+## 4. Two dials, not one — and encryption is never on a dial
+
+Before the classes, the structure they sit in, because conflating these two is the mistake that makes people
+believe "fast" must mean "exposed":
+
+* **Confidentiality is not negotiable and is not a setting.** End-to-end encryption, forward secrecy and PQ
+  hybrid key exchange are on at *every* point of the speed dial, including the fastest. There is no mode in
+  which the network reads your content. Turning that into an option would be the single worst decision this
+  design could make, because an option is a thing that gets defaulted off, mis-set, or asked for by a
+  government.
+* **Network anonymity is a dial, and it costs latency and cover traffic.** What varies is who can learn
+  *that you spoke, to whom, and when* — not what you said.
+
+So the lane is a **hop count `h` plus a cover rate**, and the honest table is:
+
+| `h` | what stands between | who could link the pair | latency | fits |
+|---|---|---|---|---|
+| **0** | nothing | the two parties themselves | best possible | media, bulk transfer, public feeds |
+| **1** | one line (`q+1`, threshold `t`) | `t` colluding members of *that* line | one relay | calls, live streams |
+| **2** | two lines | `t` on **each** of two specific lines | two gathers | messaging, most of the product |
+| **3+** | three lines | as `h = 2`, plus resistance to walking the path | three gathers | the strongest setting |
+
+**A hop here is a line, not a node, and that changes the arithmetic.** Tor needs three hops because a hop is
+one machine that knows both its neighbours. Here a hop falls only when `t = ⌈2(q+1)/3⌉` of its members
+collude — and on the base cell the platform already proves something stronger: *two points lie on exactly one
+line*, so within the tolerated fault budget **at most one hop can ever be captured**, and one hop cannot be
+both ends of a circuit. First-and-last correlation is structurally impossible there, at any `h ≥ 2`.
+
+**Which makes the shipped depth a chosen constant, and it should not be.** `TARGET_DEPTH = 3` is documented
+as "the depth that actually buys anonymity (**it is what Tor uses**)" — a value justified by citing a system
+whose hop is a different object. The platform's own standing rule is that a chosen constant where a
+derivation is possible is a defect, and a derivation is possible here: the required depth is a function of
+`q`, `t` and `f`, and it should be computed rather than inherited. Filed; see the task register.
+
+Each of the four classes below then names *what is hidden*; the dial above names *what is paid for it*. They
+are orthogonal, and a product that offers only one of them is the reason people believe privacy and speed
+are opposed.
+
+## 4a. Privacy is a class per log, declared once, and it is the honest part
 
 Here is where a product either tells the truth or sells a feeling. There is no configuration in which
 everything is free: the platform's own substrate document derives the trilemma, and the costs are real.
