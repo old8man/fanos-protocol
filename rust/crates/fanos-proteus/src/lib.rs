@@ -34,7 +34,7 @@ pub mod shaper;
 
 pub use bridge::{bridge_line, client_bridge_lines, reachable_fraction};
 pub use codec::MorphCodec;
-pub use controller::MorphController;
+pub use controller::{DEFAULT_TRIP, MorphController};
 pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
 pub use obfuscate::{deobfuscate, obfuscate};

@@ -144,7 +144,20 @@ impl ProteusConfig {
         }
         match self.environment {
             Some(env) => {
-                let controller = MorphController::new(env);
+                // **No plugged codec here** (that branch returned above), so the controller is built
+                // knowing it: the four cover-protocol morphs are dropped from its walk instead of being
+                // rotated into and silently rendered as polymorph under a cover-protocol shaping profile
+                // (#113). For `dpi-corporate`, `sni-filter` and `deep-censorship` that leaves a chain of
+                // one, which is the true state and the operator's cue to plug a transport.
+                let controller = MorphController::with_trip_and_codec(env, fanos_proteus::DEFAULT_TRIP, false);
+                if !controller.has_fallback() {
+                    tracing::warn!(
+                        environment = env.name(),
+                        morph = ?controller.current(),
+                        "no morph fallback: this build honours one obfuscation mode in this environment, so \
+                         a censor that learns it has no successor to defeat — plug a MorphCodec transport"
+                    );
+                }
                 let shaper = ProteusShaper::with_morph(self.secret, epoch, controller.current());
                 (Arc::new(RwLock::new(shaper)), Some(Arc::new(Mutex::new(controller))))
             }
@@ -164,7 +177,12 @@ fn apply_outcome(shaper: &Shaper, controller: &MaybeController, success: bool) {
     let Some(ctl) = controller else { return };
     let rotated = ctl.lock().unwrap_or_else(PoisonError::into_inner).record(success);
     if let (Some(morph), Some(s)) = (rotated, shaper) {
-        s.write().unwrap_or_else(PoisonError::into_inner).set_morph(morph);
+        // The controller only ever proposes a morph from its *effective* chain, so a refusal here would
+        // mean the two disagree about what this build can honour — report it rather than continue on a
+        // morph nobody chose (#113).
+        if !s.write().unwrap_or_else(PoisonError::into_inner).set_morph(morph) {
+            tracing::warn!(?morph, "morph rotation refused by the shaper — no codec for a cover protocol");
+        }
     }
 }
 
@@ -3099,20 +3117,55 @@ mod tests {
             Epoch::ZERO,
             Morph::Polymorph,
         ))));
-        let controller: MaybeController = Some(Arc::new(Mutex::new(MorphController::with_trip(
-            Environment::DeepCensorship,
-            1,
-        ))));
+        // **With a codec plugged**, so the cover-protocol morphs in the chain are real. Without one they are
+        // not in the controller's walk at all (#113), and the second half of this test is what says so.
+        let controller: MaybeController = Some(Arc::new(Mutex::new(
+            MorphController::with_trip_and_codec(Environment::DeepCensorship, 1, true),
+        )));
         let morph = || shaper.as_ref().unwrap().read().unwrap().morph();
 
         // A success is a breaker reset — the morph is unchanged.
         apply_outcome(&shaper, &controller, true);
         assert_eq!(morph(), Morph::Polymorph);
-        // Each failure (trip = 1) walks the DeepCensorship chain, installing the new morph on the shaper.
+        // Each failure (trip = 1) walks the DeepCensorship chain. The shaper still refuses to *install* a
+        // cover-protocol morph without its own codec — the two halves are separately guarded — so the
+        // assertion here is on the controller's walk, which is what the fallback logic owns.
         apply_outcome(&shaper, &controller, false);
-        assert_eq!(morph(), Morph::Fronted, "Polymorph → Fronted");
+        assert_eq!(
+            controller.as_ref().unwrap().lock().unwrap().current(),
+            Morph::Fronted,
+            "Polymorph → Fronted",
+        );
         apply_outcome(&shaper, &controller, false);
-        assert_eq!(morph(), Morph::Webrtc, "Fronted → Webrtc");
+        assert_eq!(
+            controller.as_ref().unwrap().lock().unwrap().current(),
+            Morph::Webrtc,
+            "Fronted → Webrtc",
+        );
+    }
+
+    /// **A stock build does not rotate at all, because it has nowhere to rotate to** (#113).
+    ///
+    /// This is the shape the fix exists for: the policy chain for `deep-censorship` names three morphs, two
+    /// of which need a plugged `MorphCodec`. Rotating into them used to apply the polymorph codec under a
+    /// cover-protocol shaping profile, so the node emitted the same codec three times while reporting that
+    /// it was trying domain-fronting and WebRTC.
+    #[test]
+    fn a_stock_build_has_no_morph_fallback_and_stays_on_the_one_it_can_honour() {
+        let shaper: Shaper = Some(Arc::new(RwLock::new(ProteusShaper::with_morph(
+            b"s".to_vec(),
+            Epoch::ZERO,
+            Morph::Polymorph,
+        ))));
+        let ctl = MorphController::with_trip_and_codec(Environment::DeepCensorship, 1, false);
+        assert!(!ctl.has_fallback(), "no codec ⇒ nowhere to go, and the driver logs exactly this");
+        let controller: MaybeController = Some(Arc::new(Mutex::new(ctl)));
+        let morph = || shaper.as_ref().unwrap().read().unwrap().morph();
+
+        for _ in 0..4 {
+            apply_outcome(&shaper, &controller, false);
+            assert_eq!(morph(), Morph::Polymorph, "the wire transform never changes, and now nothing claims it did");
+        }
     }
 
     #[test]

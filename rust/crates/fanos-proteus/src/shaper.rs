@@ -122,12 +122,25 @@ impl ProteusShaper {
     /// switching *among* them changes only the size/timing profile — a peer keeps decoding with no
     /// renegotiation. Switching to or from `Plain` changes the codec itself and needs both ends to agree
     /// (§7.4 HELLO capability negotiation). The packet counter and epoch shape are unchanged.
-    pub fn set_morph(&mut self, morph: Morph) {
+    pub fn set_morph(&mut self, morph: Morph) -> bool {
+        // **A cover-protocol morph without a plugged codec is refused, not approximated.** The "Parrot is
+        // Dead" rule keeps the four tunnels out of the core, so honouring one needs a `MorphCodec`. Before
+        // this, selecting `Fronted` applied the *polymorph* codec under a CDN-ish shaping profile: the
+        // auto-fallback could walk `Polymorph → Fronted → Webrtc` emitting the same codec three times while
+        // the operator's configuration said domain-fronting and WebRTC. Rotation defeats a size/timing
+        // detector and cannot defeat a codec-level one, and nothing distinguished the two cases.
+        //
+        // Returns whether the morph was installed, so a caller that cares (the auto-fallback does) can tell
+        // a real rotation from a request it cannot honour.
+        if morph.requires_codec() {
+            return false;
+        }
         self.morph = morph;
         self.profile = ShapingProfile::for_morph(morph);
         // Switching to a built-in morph drops any pluggable codec: a shaper is either codec-driven or
         // built-in-morph-driven, never both.
         self.codec = None;
+        true
     }
 
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
@@ -235,18 +248,21 @@ mod tests {
 
     #[test]
     fn set_morph_swaps_the_profile_but_still_decodes() {
-        // Rotating among codec-using morphs (the auto-fallback path) keeps a peer decoding: a frame shaped
-        // after a switch to the size+timing TLS morph still strips back under the original Polymorph shaper.
+        // Rotating among the morphs a stock build can honour keeps a peer decoding: they share one codec,
+        // so only the size/timing profile moves. **That sharing is also why a rotation into a
+        // cover-protocol morph would be theatre** — it changes nothing a codec-level censor observes — which
+        // is why `set_morph` now refuses those outright (#113) and this test uses `Plain`, a morph the core
+        // really implements.
         let mut sender = ProteusShaper::new(b"s".to_vec(), Epoch::new(4));
         let receiver = ProteusShaper::new(b"s".to_vec(), Epoch::new(4));
-        sender.set_morph(Morph::TlsTunnel);
-        assert_eq!(sender.morph(), Morph::TlsTunnel);
+        assert!(!sender.set_morph(Morph::MasqueH3), "a cover-protocol morph needs a plugged codec");
+        assert_eq!(sender.morph(), Morph::Polymorph, "and the refusal leaves the honourable morph in place");
+
         let shaped = sender.shape(b"post-rotation frame");
-        assert!(shaped.wire.len() >= 1200, "the TLS profile pads into its size band");
         assert_eq!(
             receiver.inbound(&shaped.wire).as_deref(),
             Some(&b"post-rotation frame"[..]),
-            "a peer on the old morph still decodes — the codec is shared"
+            "a peer on the same morph decodes — the codec is shared"
         );
     }
 

@@ -4,6 +4,8 @@
 //! next when a morph starts failing (detected by the DIAKRISIS health loop). The flagship is
 //! `polymorph` — "look like nothing", not imitation (the "Parrot is Dead" lesson).
 
+use alloc::vec::Vec;
+
 /// A PROTEUS obfuscation mode (spec §13.3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Morph {
@@ -29,6 +31,23 @@ impl Morph {
     pub fn removes_signature(self) -> bool {
         matches!(self, Self::Polymorph)
     }
+
+    /// Whether this morph can only be honoured by a **plugged [`MorphCodec`]** — the four cover-protocol
+    /// tunnels.
+    ///
+    /// Per the "Parrot is Dead" rule the core does not, and must not, fabricate a cover protocol's
+    /// handshake: `tls-tunnel`, `masque-h3`, `fronted` and `webrtc` have to run through a *real* stack, so
+    /// the core exposes the SPI and ships no implementation. That makes them **unavailable** on a stock
+    /// build, and the distinction is load-bearing rather than cosmetic: selecting one without a codec used
+    /// to apply the polymorph transform under a cover-protocol *shaping profile*, so an auto-fallback could
+    /// rotate `Polymorph → Fronted → Webrtc` and emit the same codec three times while an operator's
+    /// configuration said it was trying domain-fronting and WebRTC. Rotation defeats a size/timing detector
+    /// and cannot defeat a codec-level one; a chain of three unavailable morphs is a chain of one.
+    #[must_use]
+    pub fn requires_codec(self) -> bool {
+        self.imitates()
+    }
+
 
     /// Whether the morph imitates / tunnels through a cover protocol.
     #[must_use]
@@ -101,6 +120,23 @@ impl Environment {
     #[must_use]
     pub fn preferred_morph(self) -> Morph {
         self.chain().first().copied().unwrap_or(Morph::Polymorph)
+    }
+
+    /// The chain filtered to the morphs this build can actually honour — [`Morph::requires_codec`] entries
+    /// are dropped unless a codec is plugged (`has_codec`).
+    ///
+    /// **This is the chain an operator's node really has**, and it is usually shorter than [`chain`](Self::chain):
+    /// with no plugged codec, `dpi-corporate` and `deep-censorship` collapse from three morphs to one, and
+    /// `sni-filter`'s *preferred* morph is unavailable so the node never runs the transport its environment
+    /// names. Reporting the effective chain is what turns "plug a codec" from something an operator has to
+    /// infer into something the node can tell them.
+    #[must_use]
+    pub fn effective_chain(self, has_codec: bool) -> Vec<Morph> {
+        self.chain()
+            .iter()
+            .copied()
+            .filter(|m| has_codec || !m.requires_codec())
+            .collect()
     }
 
     /// The next morph to try after `failed` fails, or `None` if the chain is exhausted
