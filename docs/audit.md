@@ -3499,3 +3499,102 @@ It also hides the migration cost: swapping to `pqvss` changes the commitment, wh
   it is per-epoch rather than per-request*, which is exactly the amplification argument that rules it out of
   the serving path.
 - **#93/#95** stand as recorded in §7 of the previous pass.
+
+# The homeostat, derived (2026-08-05, third pass) — a controller that could not see its own boundary
+
+Follows the second pass's §2. What was filed there as three findings turned out to be one derivation chain,
+and closing it exposed a test that had been green for a reason that no longer existed.
+
+## §1. The instrument could not resolve the band, at any operating point inside it
+
+`BehaviorMonitor` kept `BEHAVIOR_WINDOW = 8` samples at a 500 ms heartbeat — **four seconds of history**.
+Fisher's intraclass standard error for the mean off-diagonal correlation is
+
+```text
+SE(r̂) ≈ (1 − r)·(1 + (n−1)·r) · √( 2 / (n(n−1)(W−1)) )
+```
+
+which at `n = 7, W = 8` is `≈ 0.168`, against a collective-subject band `(1/√6, √(2/6)] = (0.4082, 0.5774]`
+that is **0.169 wide**. The factor `(1−r)(1+(n−1)r)` is nearly flat across the band (its vertex, `5/12`, is
+inside it), so this held at *every* operating point a collective subject can occupy — the finding never
+depended on the configured `healthy_correlation = 0.45`.
+
+The window's own justification was a memory bound: *"the self-model memory is `7 × this`"*. It does not
+bind — 448 bytes at `W = 8`, 10 KB at the derived window.
+
+**The formula is a claim about the shipped estimator, so it is measured.** `mean_correlation()` is the mean
+of pairwise Pearson correlations, not the ANOVA intraclass estimator; a Monte-Carlo test drives the shipped
+path at four `(n, W, ρ)` points and requires the closed form within 25 %, because the window is derived by
+squaring it.
+
+## §2. One derivation chain, from periods the platform already fixes
+
+```text
+(BAND_DWELL, HEARTBEAT_PERIOD, DEFAULT_EPOCH_PERIOD)  →  z  →  window  →  shed ceiling
+```
+
+**The confidence `z` is derived, not declared.** The requirement: *the loop must actuate on its own
+measurement noise less often than the system reconfigures itself.* The epoch is the only period in the
+platform that can be stated against without inventing a target — it is when coordinates, rosters,
+directories and roles all change anyway. Distribution-free by **Cantelli** rather than by assuming
+normality (behavioural samples are counts): with `R = heartbeats_per_epoch / d` opportunities per epoch,
+`R·(1+z²)^{−d} ≤ 1` inverts to `z = √(R^(1/d) − 1) ≈ 2.52`.
+
+**The dwell is a feasibility condition, not a hardening measure**, and the derivation is where that becomes
+visible: at `d = 1` the same requirement asks for `z = √1199 ≈ 34.6`, whose resolving window is **over four
+hours**. A branch that actuates on a single reading cannot be made sound by observing longer. `Bind` and
+`Escalate` had no dwell while `Decouple` did — and `Bind` is the *noisier* side, since the floor sits closer
+to a healthy cell's operating point than the ceiling does. All three now share `BAND_DWELL`, counted on the
+homeostat's own band rather than on `diagnose`'s verdict, which only ever had an opinion about over-coupling.
+
+**The window follows.** `resolving_window` inverts "`z` standard errors fit inside the band's half-width":
+`W − 1 ≥ 8z²g(n)²/(n(n−1)(hi−lo)²)`, giving **178** — about 89 s. That the answer is minutes rather than
+seconds is the finding, not a cost: the regulated quantity is structural, inside a 600 s epoch, and **a
+controller cannot respond faster than the precision it needs allows it to measure.**
+
+**The shed ceiling follows from both.** `d_max × 0.5` made the safety setback a fraction of the budget while
+the estimator error it covers is independent of it; it is now `d_safe = 1 − (lo + z·SE)/r`, collapsing to
+the old `d_max` as `SE → 0`. And its argument is the **measured** correlation the shed is reducing, not the
+configured baseline — a shed only ever runs on an over-coupled reading, so measuring the budget from 0.45
+(a value *inside* the band, where the answer is `Hold`) reported 0.042 where an over-coupled cell has four
+times that. At the retired window `lo + z·SE` sat above `healthy` itself, so the honest ceiling was zero:
+not a regression, the correct reading of an instrument that could not see the boundary.
+
+`control_confidence` is a **function, not a constant**, so no literal can drift. The window and the epoch
+figure are literals only because `exp`/`sqrt` are not `const`, and both are recomputed by ratchets —
+including a new cross-crate one tying `HEARTBEATS_PER_EPOCH` to `DEFAULT_EPOCH_PERIOD`, which lives a layer
+above `fanos-runtime`. Falsified by moving the heartbeat to 400 ms.
+
+## §3. A test that was passing for a reason that stopped existing
+
+`a_differential_flood_drives_the_under_coupled_band_and_emits_a_rebalance_prescription` claimed to drive the
+§6.7 DDoS response by flooding every node with an *independent* amount. Measured at the derived window that
+gives `purity = 0.2465 ≤ 2/7`, so `Homeostat::control` returns **`Escalate`** — a coherence collapse — and
+never `Bind`. It was green at eight samples only because small-sample noise inflated the correlations past
+`p_crit`.
+
+`Bind` is `Φ > 1` **and** `mean r ≤ lo`: RMS above the floor with the mean below it, which by Cauchy–Schwarz
+is **dispersion among the pairs**, not weak coupling. That is the hotspot signature the response answers —
+part of the cell locked onto one target, the rest untouched. A block of `k` perfectly-correlated nodes in a
+cell of 7 gives `mean = C(k,2)/21` and `Φ = 2·C(k,2)/7`, so the band needs `4 ≤ C(k,2) ≤ 8`, i.e. **exactly
+`k = 4`** — three or fewer collapses, five or more is simply over-coupled. The rewritten test drives that
+block and the prescription fires.
+
+The general lesson is the one the previous pass recorded from the other direction: **fixing an instrument
+re-opens every verdict that instrument produced.** A green test is evidence about the code *and* about the
+measurement it was read through.
+
+## §4. What the pass leaves open
+
+- **#101** — `Φ`, `P` and `R` are bijections of one scalar under a unit diagonal, so the runtime's verdict is
+  `Φ ∈ (1, 2]` in six vocabularies; the genuinely independent second quantity is the pairwise dispersion the
+  `Bind` branch silently turns on, and it is still unnamed and unplotted. Note it is already *derivable* from
+  the exported `CoherenceFrame`: `n = (1+Φ)/P` and `v = Φ/(n−1) − r²`, which is itself a demonstration of the
+  collapse.
+- **#103** — `Notification::Escalated(u8)` carries a fault *mask* from the liveness path and a literal `0`
+  from the coherence path. The two are distinguishable only by an undocumented convention, and the CLI logs
+  the mask as `count`.
+- **An idle cell escalates.** With no relay traffic every signal has zero variance, so every off-diagonal is
+  `0`, `P = 1/n < 2/n` and the homeostat reports a collapse. Mathematically honest (`Φ = 0` is genuinely not
+  integrated) and now latched behind the dwell, but it should be a deliberate decision rather than an
+  inherited one.
