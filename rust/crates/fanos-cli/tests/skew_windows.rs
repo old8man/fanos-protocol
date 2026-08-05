@@ -97,37 +97,38 @@ fn the_reply_key_ring_is_expressed_as_the_window_a_combiner_serves() {
     );
 }
 
-/// **The control loop's clock must be the platform's clock** — the same class of invariant as the windows
-/// above, and it needs enforcing for the same reason: the two halves live in crates that cannot see each
-/// other.
+/// **The control loop's epoch must be the node's epoch** — and the check is now about *wiring*, not about
+/// two literals agreeing.
 ///
-/// `fanos-runtime` derives its whole band-keeping loop — the control confidence, the observation window and
-/// the shed ceiling — from `HEARTBEATS_PER_EPOCH`, the platform's epoch expressed in that loop's own
-/// heartbeats. `DEFAULT_EPOCH_PERIOD` lives in `fanos-node`, one layer **above** the runtime, so the runtime
-/// cannot import it and holds the figure as a literal. Nothing but this check stops the two from drifting,
-/// and a drift is silent: both sides keep compiling, and the loop simply regulates against a period the
-/// network no longer has — a confidence derived for 1200 opportunities per epoch, applied to a network that
-/// gives it some other number.
+/// The band-keeping loop's confidence and observation window are derived from `epoch_period / heartbeat`
+/// ([`fanos_runtime::Config::behavior_window`]). Those used to be module constants with the epoch written
+/// out as `1200.0`, guarded here by comparing that literal against `DEFAULT_EPOCH_PERIOD`. **That guard was
+/// weaker than it looked**: it compared two defaults, while a node whose operator sets a different
+/// `epoch_period` still got a loop derived for 600 s — silently, because both literals still agreed with
+/// each other.
+///
+/// The derivation now reads `Config::epoch_period`, so what has to be enforced is that `fanos-node` puts its
+/// own configured epoch there. That is one line in `Node::start`, and this asserts it exists: delete it and
+/// the reflex silently reverts to the default epoch on every non-default deployment.
 #[test]
-fn the_control_loops_epoch_is_the_platforms_epoch() {
-    let heartbeat_ms = constant("crates/fanos-runtime/src/overlay/mod.rs", "HEARTBEAT_PERIOD");
-    let epoch_secs = constant("crates/fanos-node/src/config.rs", "DEFAULT_EPOCH_PERIOD");
-    let claimed = constant("crates/fanos-runtime/src/overlay/mod.rs", "HEARTBEATS_PER_EPOCH");
-
-    assert_eq!(
-        epoch_secs * 1000 / heartbeat_ms,
-        claimed,
-        "HEARTBEATS_PER_EPOCH ({claimed}) must be the {epoch_secs}s epoch divided by the {heartbeat_ms}ms \
-         heartbeat — it is the denominator of the loop's derived control confidence, so a stale value is a \
-         confidence derived for a network that does not exist",
+fn the_node_passes_its_own_epoch_into_the_control_loop() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let node = std::fs::read_to_string(root.join("crates/fanos-node/src/node.rs")).unwrap();
+    assert!(
+        node.contains("epoch_period: fanos_runtime::Duration("),
+        "Node::start must set OverlayConfig::epoch_period from the node's own config — without it the \
+         band-keeping loop derives its confidence and window for an epoch this network does not have",
+    );
+    assert!(
+        node.contains("config.epoch_period.as_nanos()"),
+        "…and it must be the *configured* epoch, not another literal",
     );
 
-    // **The self-model must fill inside an epoch.** The observation window is derived from the band's
-    // resolution, and the epoch is when the cell reconfigures — coordinates, rosters, roles. A window that
-    // took longer than an epoch to fill would leave the node permanently without a self-model, since it
-    // would never reach `ready()` before the thing it is modelling changed underneath it. 178 samples at
-    // 500 ms is 89 s against a 600 s epoch.
-    let window = constant("crates/fanos-runtime/src/overlay/mod.rs", "BEHAVIOR_WINDOW");
+    // The self-model must still fill well inside an epoch at the shipped defaults, or a node never reaches
+    // `ready()` before the cell it is modelling reconfigures. 178 samples × 500 ms = 89 s against 600 s.
+    let heartbeat_ms = constant("crates/fanos-runtime/src/overlay/mod.rs", "HEARTBEAT_PERIOD");
+    let epoch_secs = constant("crates/fanos-node/src/config.rs", "DEFAULT_EPOCH_PERIOD");
+    let window = fanos_runtime::Config::default().behavior_window() as u64;
     let fill_ms = window * heartbeat_ms;
     assert!(
         fill_ms * 4 <= epoch_secs * 1000,

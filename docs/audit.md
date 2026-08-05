@@ -3598,3 +3598,88 @@ measurement it was read through.
   `0`, `P = 1/n < 2/n` and the homeostat reports a collapse. Mathematically honest (`Φ = 0` is genuinely not
   integrated) and now latched behind the dwell, but it should be a deliberate decision rather than an
   inherited one.
+
+# 2026-08-05, fourth pass — naming the second dimension, splitting an overloaded signal, and a config that never travelled
+
+## §1. `Φ`, `P`, `R` are one scalar; the second dimension is dispersion (#101 closed)
+
+`from_correlation` enforces an **exact** unit diagonal, so `Σγ_ii² = 1/N` is pinned and, with `s = Σ_ij C_ij²`,
+`Φ = s/N − 1`, `P = s/N²`, `R = N/s` are bijections: `P = (1+Φ)/N`, `R = 1/(1+Φ)`. Hence `Φ ≥ 1 ⟺ P > 2/N`
+and `R ≥ 1/3 ⟺ Φ ≤ 2` — the whole scalar verdict is `Φ ∈ (1, 2]`, in six vocabularies.
+
+This is **stronger** than `minima::viability_is_integration`, which is stated for the equicorrelated stratum;
+asserted here on deliberately non-equicorrelated matrices, because the unit diagonal is all it needs.
+
+The genuinely independent second quantity is `Measures::dispersion` = `q² − m²`, the variance of the
+off-diagonal correlations (`q` their RMS, which `Φ` reads; `m` their mean, which `classify_collective` reads).
+**It is what the under-coupled band turns on**: `Bind` is `q > lo ≥ m`, unreachable at zero dispersion, which
+is a load hotspot rather than weak coupling. Exported through `CoherenceFrame::dispersion()` with **no new
+wire field** — `N = (1+Φ)/P` falls out of the frame, which is itself a demonstration of the collapse.
+
+Operationally: an `Aggregate` cell with zero dispersion is coming apart uniformly; the same regime with high
+dispersion is a hotspot. Opposite responses, and the regime alone cannot tell them apart.
+
+Filed as **#104**: `Alarm::Integration` is documented as "the platform's centralization detector" and **cannot
+fire alone on any matrix a node builds**, because normalising each node to unit variance is exactly what
+discards concentration. Recovering it needs a covariance self-model, which changes what every threshold means.
+
+## §2. One notification, two causes, and an empty request to the parent (#103 closed)
+
+`Notification::Escalated(u8)` carried a Fano fault mask from the liveness plan and a literal `0` from the
+coherence band. The split into `Escalation::{Faults, CoherenceCollapse}` exposed a functional no-op, not only
+an observability wart: `OverlayNode` forwards every escalation to the parent via `escalate_to_parent(mask)` —
+*"help me with these members"* — so a coherence collapse sent the parent an **empty node-set**, on the one
+path T-104 §5 calls the point of no return. Only `Faults` is forwarded now; the collapse is reported and not
+disguised as a node-set. The CLI had been logging the mask as `count`.
+
+## §3. The control loop was derived against an epoch the node never passed down (#108)
+
+#99's derivation reads `epoch / heartbeat`. `fanos-node` owns `DEFAULT_EPOCH_PERIOD` and sits above
+`fanos-runtime`, so the runtime held `HEARTBEATS_PER_EPOCH = 1200.0` with a ratchet comparing it to
+`DEFAULT_EPOCH_PERIOD / HEARTBEAT_PERIOD`. **The ratchet compared two defaults** — while `Node::start` built
+`OverlayConfig::default()` and never passed its own `epoch_period` at all. An operator setting a different
+epoch got a reflex derived for 600 s, silently, because both literals still agreed with each other.
+
+`Config` now carries `epoch_period`, and the three derived quantities are **methods** on it, so
+`Config { epoch_period: X, ..default() }` cannot leave a stale window beside a fresh epoch. The ratchet was
+rewritten from comparing literals to asserting the wiring, and falsified by deleting it.
+
+**The simulator half is the reusable part.** Two scenarios drove a fixed number of rounds encoding
+`BEHAVIOR_WINDOW = 8` — a constant `fanos-sim` cannot see — and went red when the derivation landed. They now
+configure a **short epoch** and derive their length from `config().behavior_window()`: the same derivation at
+a scale a test can afford, rather than a patched constant. Only possible because the window stopped being
+compile-time. A scenario that restates a production number by hand stops testing the mechanism the moment the
+number moves.
+
+## §4. Four findings from two mechanical sweeps
+
+**Discarded failure results** (`let _ =` / `.ok();`, 270 sites, 173 after filtering to security/state-relevant,
+of which all but three were `write!` into a `String`):
+
+- **#105** — `HybridChain::execute` is public, has **no production caller** (its only use is its own test), and
+  bypasses `apply_block` and therefore the conservation check #94 installed, the parallel executor, and the
+  `ExecOutcome`. It is the *more obvious name*, beside the correct one. An unwired wrong door is an
+  opportunity to close it before a driver arrives.
+- **#106 HIGH** — `Client::put_ephemeral` returns whether the write landed, and **all eight directory
+  publishers drop it**. The refusing side is instrumented (#96's `StoreAtCapacity`); the node that is
+  *disappearing from every roster* has no signal at all. Republishing each epoch bounds a transient failure and
+  does nothing for a persistent one — which is exactly #59.
+- Checked and cleared: `obolos/state.rs`'s discarded `tree.append` (the capacity check runs eleven lines above
+  the loop, with a comment saying why).
+
+**Collections that grow with no removal** — and the sweep itself is the lesson. It first reported **0
+findings**; asserting the denominator showed **0 fields examined** (a regex missing `re.MULTILINE`). The
+all-clear was fabricated. Fixed: 208 fields, 38 insert+removal pairs (proving both halves are visible), 46
+growing with no removal, of which one mattered:
+
+- **#107 HIGH** — `coord_alive` counts `witnessed[coord].values()` with **no check that the witness is a cell
+  member**, and `apply_health_view` is called unconditionally. So any admitted coordinate in the network
+  counts toward a Byzantine liveness quorum, and the fabricator-catching mechanism can only quarantine
+  members. Worse, `corroboration_quorum = 2` tolerates `quorum − 1 = 1` liar against a cell budget of `f = 2`
+  — **exactly #50**, fixed in its sibling and left standing here. Holding a dead node believed-alive stops the
+  reroute and the shard regeneration, so redundancy drains while every node reports health. Two sibling
+  stores (`Healer::attested`, `loss_reports`) share the write-looser-than-read shape; one of them documents a
+  bound — *"Bounded by the cell size"* — that is false as written.
+
+**A zero is the most dangerous count**: a non-zero one invites scrutiny, a zero invites relief. Print
+`examined / both-halves-seen / flagged` on the same line as the finding, always.

@@ -27,6 +27,9 @@ fanos-core = { workspace = true, features = ["std"] }
 # Parse the language-agnostic conformance vectors so the Rust impl is pinned to them directly
 # (the interop contract cannot silently drift from the code).
 serde_json = "1"
+# The band-keeping loop's window is a *derivation* on `Config`, not a literal, so the cross-crate ratchet
+# has to evaluate it rather than scrape it (`skew_windows.rs`).
+fanos-runtime = { path = "../fanos-runtime" }
 
 [lints]
 workspace = true

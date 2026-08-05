@@ -11,6 +11,13 @@ fn config() -> Config {
     Config {
         heartbeat: Duration::from_millis(500),
         liveness_timeout: Duration::from_millis(1600),
+        // **A short epoch, and therefore a short observation window — by the same derivation, not around it.**
+        // `Config::behavior_window` is `resolving_window(7, control_confidence(dwell, epoch/heartbeat))`, so a
+        // scenario that wants to reach the homeostat inside a few dozen rounds says so by configuring the
+        // epoch it is simulating. The production 600 s epoch derives 178 samples; 20 s derives 40. Restating
+        // the window as a literal here is what broke when the derivation landed — the scenario was sized for
+        // a constant it could not see.
+        epoch_period: Duration::from_millis(20_000),
         ..Config::default()
     }
 }
@@ -104,7 +111,7 @@ fn a_common_mode_flood_makes_the_homeostat_shed_without_crashing() {
     // (Decouple) in each, preserving availability by shedding rather than crashing.
     let mut cluster = Cluster::new(1, config(), 10);
     cluster.run_for(Duration::from_millis(1200));
-    let report = run_experiment(&mut cluster, Experiment::Flood { fraction: 1.0, bursts: 2 }, 16, step());
+    let report = run_experiment(&mut cluster, Experiment::Flood { fraction: 1.0, bursts: 2 }, config().behavior_window() + 6, step());
 
     assert!(report.before.is_healthy(), "starts healthy");
     assert_eq!(report.after.alive, 70, "a flood is shed, not survived by crashing — every node stays up");

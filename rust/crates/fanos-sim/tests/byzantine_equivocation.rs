@@ -17,7 +17,8 @@ use fanos_diakrisis::Verdict;
 use fanos_field::F2;
 use fanos_geometry::fano;
 use fanos_runtime::{
-    Command, Config, Duration, Effect, Engine, Input, Instant, Notification, OverlayNode, Triple,
+    Command, Config, Duration, Effect, Engine, Escalation, Input, Instant, Notification, OverlayNode,
+    Triple,
 };
 use fanos_sim::{Sim, spawn_cell};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
@@ -147,7 +148,7 @@ fn an_equivocating_mediator_is_localized_by_the_live_polar_check() {
         report
             .notifications
             .iter()
-            .any(|o| matches!(&o.note, Notification::Escalated(mask) if mask & (1 << liar) != 0)),
+            .any(|o| matches!(&o.note, Notification::Escalated(Escalation::Faults(mask)) if mask & (1 << liar) != 0)),
         "the equivocator's residue is escalated to the parent for re-provisioning"
     );
 

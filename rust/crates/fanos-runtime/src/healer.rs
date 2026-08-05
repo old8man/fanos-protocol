@@ -10,10 +10,10 @@
 //! index-addressed geometry take `<F>` per call.
 
 use crate::overlay::{
-    BEHAVIOR_WINDOW, Config, DECOUPLE_DECAY, BAND_DWELL, ENDPOINT_MIN_STALE, decouple_ceiling,
+    Config, DECOUPLE_DECAY, BAND_DWELL, ENDPOINT_MIN_STALE, decouple_ceiling,
     ENDPOINT_WINDOW, PARTITION_DWELL, QUARANTINE_TTL, polar_gap_from_liveness,
 };
-use crate::ports::{Duration, Effect, Instant, Notification};
+use crate::ports::{Duration, Effect, Escalation, Instant, Notification};
 
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
@@ -130,6 +130,11 @@ pub(crate) struct Healer {
     /// band branch is gated by (#100). See `BAND_DWELL`.
     band_streak: u32,
     last_band: Option<core::mem::Discriminant<BandControl>>,
+    /// The loop's derived resolution, from [`Config::control_confidence`] — kept because the shed ceiling
+    /// needs it at actuation time and the config is not threaded that far down.
+    control_confidence: f64,
+    /// The observation window this node was configured for, from [`Config::behavior_window`].
+    behavior_window: usize,
     /// The cell's own measured mean off-diagonal correlation from the last full-window diagnosis, or `None`
     /// until it has one. See [`baseline_correlation`](Healer::baseline_correlation).
     measured_correlation: Option<f64>,
@@ -180,14 +185,14 @@ impl Healer {
 
     /// Create the reflex with the given self-observer (built by the facade, which knows the cell id and
     /// window). Monitor/homeostat take their base-cell defaults; all healing state starts empty.
-    pub(crate) fn new(observer: SelfObserver) -> Self {
+    pub(crate) fn new(observer: SelfObserver, behavior_window: usize, control_confidence: f64) -> Self {
         Self {
             attested: BTreeMap::new(),
             reroute: BTreeMap::new(),
             repaired: BTreeSet::new(),
             quarantined: BTreeMap::new(),
             observer,
-            monitor: BehaviorMonitor::new(7, BEHAVIOR_WINDOW),
+            monitor: BehaviorMonitor::new(7, behavior_window),
             homeostat: Homeostat::conservative(),
             admission: AdmissionController::new(),
             last_purity: None,
@@ -206,6 +211,8 @@ impl Healer {
             escalated_coherence: false,
             band_streak: 0,
             last_band: None,
+            control_confidence,
+            behavior_window,
             measured_correlation: None,
             last_sample: [0.0; 7],
             rebalancing: false,
@@ -745,7 +752,7 @@ impl Healer {
                         if band_ready && !self.escalated_coherence {
                             self.escalated_coherence = true;
                             self.observer.note_healing();
-                            effects.push(Effect::Notify(Notification::Escalated(0)));
+                            effects.push(Effect::Notify(Notification::Escalated(Escalation::CoherenceCollapse)));
                         }
                     }
                     BandControl::Decouple { .. } => {
@@ -852,7 +859,8 @@ impl Healer {
                     // collective-subject floor of 0.4082, so a single over-coupling response flipped the
                     // cell's self-model into the *under*-coupled band, whose answer is `Bind`.
                     if decouple_ready {
-                        let ceiling = decouple_ceiling(alive, self.baseline_correlation(healthy));
+                        let ceiling =
+                            decouple_ceiling(alive, self.baseline_correlation(healthy), self.behavior_window, self.control_confidence);
                         self.decoupling = (self.decoupling + shed).min(ceiling);
                         if !self.decoupled {
                             self.decoupled = true;
@@ -861,7 +869,7 @@ impl Healer {
                     }
                 }
                 HealingAction::Escalate { unrecoverable } => {
-                    effects.push(Effect::Notify(Notification::Escalated(unrecoverable)));
+                    effects.push(Effect::Notify(Notification::Escalated(Escalation::Faults(unrecoverable))));
                 }
             }
         }

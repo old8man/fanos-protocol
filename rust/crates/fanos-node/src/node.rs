@@ -904,7 +904,18 @@ impl Node {
                 // level 0 by the proof-of-coordinate HELLO + descriptor signature rather than the hash chain
                 // (which would reject every legitimate VRF announcement, audit C3).
                 let what = crate::composition::CellComposition {
-                    overlay: OverlayConfig { vrf_coordinates: true, ..OverlayConfig::default() },
+                    // **This node's own epoch, not the runtime's default.** The band-keeping loop derives its
+                    // control confidence and observation window from the epoch (`Config::behavior_window`),
+                    // so a deployment that sets a different `epoch_period` must have that reach the reflex —
+                    // otherwise the loop is tuned for an epoch this network does not have, and nothing says
+                    // so because both halves still agree with themselves.
+                    overlay: OverlayConfig {
+                        vrf_coordinates: true,
+                        epoch_period: fanos_runtime::Duration(
+                            u64::try_from(config.epoch_period.as_nanos()).unwrap_or(u64::MAX),
+                        ),
+                        ..OverlayConfig::default()
+                    },
                     admission,
                     beacon: beacon.clone(),
                     relay,

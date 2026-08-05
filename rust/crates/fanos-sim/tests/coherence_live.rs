@@ -34,13 +34,27 @@ fn homeostasis_config() -> Config {
     Config {
         heartbeat: Duration::from_millis(500),
         liveness_timeout: Duration::from_millis(1600),
+        // **A short epoch, and therefore a short observation window — by the same derivation, not around it.**
+        // `Config::behavior_window` is `resolving_window(7, control_confidence(dwell, epoch/heartbeat))`, so a
+        // scenario that wants to reach the homeostat inside a few dozen rounds says so by configuring the
+        // epoch it is simulating. The production 600 s epoch derives 178 samples; 20 s derives 40. Restating
+        // the window as a literal here is what broke when the derivation landed — the scenario was sized for
+        // a constant it could not see.
+        epoch_period: Duration::from_millis(20_000),
         ..Config::default()
     }
 }
 
-/// Number of heartbeat windows of flood to drive — a full behavioural window (`BEHAVIOR_WINDOW = 8`) plus
-/// slack, so the monitor's rolling window is entirely flood samples when the homeostat reads it.
-const FLOOD_WINDOWS: usize = 12;
+/// Number of heartbeat windows of flood to drive: a **full** behavioural window plus the dwell and slack, so
+/// the monitor's rolling window is entirely flood samples when the homeostat first reads it.
+///
+/// Derived from the config rather than restated. It used to be the literal `12`, with a comment naming
+/// `BEHAVIOR_WINDOW = 8` — a constant this crate cannot see, so when the window became a derivation the
+/// scenario silently stopped filling it and the assertions below went red. A scenario that encodes a
+/// production number by hand is a scenario that stops testing the mechanism the moment the number moves.
+fn flood_windows() -> usize {
+    homeostasis_config().behavior_window() + 6
+}
 
 /// How many `Route` relays the victim actually received (from the report's delivery notifications) — used
 /// to prove the control's negative is *not* vacuous: the same substantial volume arrives in both cases,
@@ -52,7 +66,7 @@ fn routes_delivered_to(sim: &Sim, victim: Triple) -> usize {
         .count()
 }
 
-/// Drive `FLOOD_WINDOWS` heartbeat windows of routed flood into `victim_idx`, where `bursts(w, peer)`
+/// Drive `flood_windows()` heartbeat windows of routed flood into `victim_idx`, where `bursts(w, peer)`
 /// gives how many `Route` frames Fano peer `peer` relays to the victim in window `w`. Then diagnose the
 /// victim and return the settled `Sim` for the caller to inspect. Every peer's frames for a window are
 /// injected together, so — whatever the per-window sampling phase — they land as one common event, which
@@ -64,7 +78,7 @@ fn run_flood(seed: u64, victim_idx: usize, bursts: impl Fn(usize, usize) -> u32)
     sim.run_for(Duration::from_millis(1000)); // settle to steady state (no Route traffic yet)
 
     let victim = cell[victim_idx];
-    for w in 0..FLOOD_WINDOWS {
+    for w in 0..flood_windows() {
         for (peer_idx, &peer) in cell.iter().enumerate() {
             if peer_idx == victim_idx {
                 continue;

@@ -11,6 +11,37 @@
 //! Because `C` has unit diagonal, every measure reduces to the Frobenius sum-of-squares of
 //! `C`, which is computed with a `portable_simd` kernel (scalar-verified) so large monitor
 //! cells stay cheap. No `Γ` is ever materialised.
+//!
+//! # The three measures are one number, and the second dimension is dispersion
+//!
+//! [`CoherenceMatrix::from_correlation`] enforces an **exact** unit diagonal, so `Σ_i γ_ii² = 1/N` is
+//! pinned. Writing `s = Σ_ij C_ij²`:
+//!
+//! ```text
+//! Φ = s/N − 1        P = s/N²        R = N/s
+//! ```
+//!
+//! — all three strictly monotone in the one scalar `s`, hence **bijections of one another**:
+//! `P = (1 + Φ)/N` and `R = 1/(1 + Φ)`. The thresholds coincide accordingly: `Φ ≥ 1 ⟺ P > 2/N`, and
+//! `R ≥ 1/3 ⟺ Φ ≤ 2`, so the whole scalar verdict this crate produces is **`Φ ∈ (1, 2]`**, stated in three
+//! vocabularies here and three more in [`crate::window`].
+//!
+//! This is *stronger* than the equicorrelated result in [`crate::minima::viability_is_integration`], and
+//! deliberately so. That function's doc reasons about a general trace-1 `Γ`, where `Σγ_ii² ≥ 1/N` is an
+//! inequality: there `Φ > 1 ⟹ P > 2/N` one way only, and the converse fails when coherence **concentrates
+//! onto a few nodes** — which is what makes `Alarm::Integration` a centralization detector. A correlation
+//! matrix sits exactly on the boundary of that inequality, so on the matrices a running node builds, the
+//! implication closes and the detector has nothing left to detect. Normalising every node's activity to
+//! unit variance is what throws the concentration away; recovering it needs a *covariance* self-model, and
+//! that is filed separately rather than smuggled in here.
+//!
+//! What remains genuinely two-dimensional is the gap between the off-diagonals' **RMS** `q` (which `Φ`
+//! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective`] reads). By
+//! Cauchy–Schwarz `m² ≤ q²`, with equality exactly on the equicorrelated stratum, so
+//! [`Measures::dispersion`] `v = q² − m²` is the second coordinate. It is not a curiosity: the
+//! under-coupled `Bind` band is `q > lo ≥ m`, which is *unreachable at `v = 0`* — the band exists only for
+//! a cell that couples **unevenly**, which is precisely a load hotspot, and precisely what the §6.7
+//! rebalance answers.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,15 +71,26 @@ pub const R_TH: f64 = 1.0 / 3.0;
 /// The integration threshold `Φ_th = 1` (spec §2.7).
 pub const PHI_TH: f64 = 1.0;
 
-/// The three coherence measures read together in one pass (see [`CoherenceMatrix::measures`]).
+/// The coherence measures read together (see [`CoherenceMatrix::measures`]).
+///
+/// **`phi`, `purity` and `reflection` carry one degree of freedom between them**, not three — see the
+/// module documentation. [`dispersion`](Self::dispersion) is the second, and it is the one the
+/// under-coupled band actually turns on.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Measures {
     /// Integration `Φ` (threshold `1`).
     pub phi: f64,
-    /// Structuredness `P = Tr(Γ²)` (threshold `2/N`).
+    /// Structuredness `P = Tr(Γ²)` (threshold `2/N`). A bijection of `phi`: `P = (1 + Φ)/N`.
     pub purity: f64,
-    /// Reflection `R = 1/(N·P)` (threshold `1/3`).
+    /// Reflection `R = 1/(N·P)` (threshold `1/3`). Also a bijection of `phi`: `R = 1/(1 + Φ)`.
     pub reflection: f64,
+    /// **Pairwise dispersion** `v = q² − m²` — the variance of the off-diagonal correlations, where `q` is
+    /// their RMS (`Φ = (N−1)q²`) and `m` their mean (what `classify_collective` reads).
+    ///
+    /// The genuinely independent second dimension. Zero exactly on the equicorrelated stratum, and strictly
+    /// positive whenever the cell couples unevenly — which is the load-hotspot signature the §6.7 response
+    /// answers, and the only way `BandControl::Bind` is reachable at all.
+    pub dispersion: f64,
 }
 
 /// Sum of squares of all entries of a slice (the Frobenius norm squared), via `portable_simd`.
@@ -188,33 +230,50 @@ impl CoherenceMatrix {
         self.n
     }
 
-    /// All three scalar measures (`Φ`, `P`, `R`) from a **single** Frobenius pass over `C`.
+    /// Every scalar measure from **two** O(n²) passes over `C` — a Frobenius one and a plain sum.
     ///
-    /// Because `Γ = C/n` with unit-diagonal `C`, every measure reduces to `frob = Σ C_ij²`:
-    /// `P = frob/n²`, `Φ = (frob − n)/n` (`= Σ_{i≠j}γ_ij² ÷ Σ_i γ_ii²`), and `R = 1/(N·P) = n/frob`.
+    /// Because `Γ = C/n` with unit-diagonal `C`, `Φ`, `P` and `R` all reduce to `frob = Σ C_ij²`:
+    /// `P = frob/n²`, `Φ = (frob − n)/n` (`= Σ_{i≠j}γ_ij² ÷ Σ_i γ_ii²`), and `R = 1/(N·P) = n/frob` — which
+    /// is exactly why they are bijections of one another and why one pass used to be enough. The second
+    /// pass is the off-diagonal **mean**, and the gap between it and the RMS is
+    /// [`dispersion`](Measures::dispersion), the only quantity here that `frob` does not already determine.
     /// Prefer this to calling [`phi`](Self::phi)/[`purity`](Self::purity)/[`reflection`](Self::reflection)
     /// separately — each of those repeats the same O(n²) SIMD pass.
     #[must_use]
     pub fn measures(&self) -> Measures {
         let nf = self.n as f64;
         if nf <= 0.0 {
-            return Measures {
-                phi: 0.0,
-                purity: 0.0,
-                reflection: 0.0,
-            };
+            return Measures { phi: 0.0, purity: 0.0, reflection: 0.0, dispersion: 0.0 };
         }
         let frob = frobenius_sq(&self.c); // Σ C_ij², computed once
         let purity = frob / (nf * nf); // Tr(Γ²)
+        let phi = (frob - nf) / nf; // Σ_{i≠j}γ_ij² / Σ_i γ_ii²
         Measures {
-            phi: (frob - nf) / nf, // Σ_{i≠j}γ_ij² / Σ_i γ_ii²
+            phi,
             purity,
             reflection: if purity > 0.0 {
                 1.0 / (nf * purity)
             } else {
                 0.0
             },
+            // `Φ = (n−1)·q²` gives the RMS of the off-diagonals; the mean is the second pass. Clamped at
+            // zero because Cauchy–Schwarz makes `m² ≤ q²` exact, so a negative here would be rounding.
+            dispersion: if self.n >= 2 {
+                let m = self.mean_correlation();
+                (phi / (nf - 1.0) - m * m).max(0.0)
+            } else {
+                0.0
+            },
         }
+    }
+
+    /// **Pairwise dispersion** `v = q² − m²`: the variance of the off-diagonal correlations.
+    ///
+    /// The second degree of freedom in the self-model, and the one that decides which *under*-coupled
+    /// answer a cell gets. See [`Measures::dispersion`] and the module documentation.
+    #[must_use]
+    pub fn dispersion(&self) -> f64 {
+        self.measures().dispersion
     }
 
     /// Integration `Φ = Σ_{i≠j}|γ_ij|² / Σ_i γ_ii²` (spec §2.7). `Φ ≥ 1` ⇒ integrated.
@@ -394,9 +453,79 @@ pub fn purity_equicorrelated(n: usize, r: f64) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_three_measures_are_bijections_of_one_scalar() {
+        // The identity the module documents, asserted on matrices that are NOT equicorrelated — the point
+        // being that this needs no stratum, only the unit diagonal `from_correlation` enforces. If it ever
+        // stopped holding, `Measures` would have gained a third degree of freedom and every threshold
+        // stated in one vocabulary would need re-reading in the others.
+        let cases: [(usize, Vec<f64>); 3] = [
+            (3, vec![1.0, 0.9, 0.1, 0.9, 1.0, 0.2, 0.1, 0.2, 1.0]),
+            (3, vec![1.0, -0.4, 0.5, -0.4, 1.0, 0.0, 0.5, 0.0, 1.0]),
+            (4, vec![
+                1.0, 0.8, 0.0, 0.1, 0.8, 1.0, 0.1, 0.0, 0.0, 0.1, 1.0, 0.7, 0.1, 0.0, 0.7, 1.0,
+            ]),
+        ];
+        for (n, c) in cases {
+            let m = CoherenceMatrix::from_correlation(c, n).expect("a valid correlation matrix").measures();
+            let nf = n as f64;
+            assert!((m.purity - (1.0 + m.phi) / nf).abs() < 1e-12, "P = (1+Φ)/N");
+            assert!((m.reflection - 1.0 / (1.0 + m.phi)).abs() < 1e-12, "R = 1/(1+Φ)");
+            // …and therefore the two thresholds are one threshold, in either direction.
+            assert_eq!(m.phi >= 1.0, m.purity >= p_crit(n), "Φ ≥ 1 ⟺ P ≥ 2/N, with no stratum assumed");
+            assert_eq!(m.phi <= 2.0, m.reflection >= R_TH, "Φ ≤ 2 ⟺ R ≥ 1/3");
+        }
+    }
+
+    #[test]
+    fn dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs() {
+        use crate::window::{CollectiveState, classify_collective, collective_subject_window};
+
+        // Zero exactly on the equicorrelated stratum — where the three measures really do say everything.
+        for &r in &[0.0, 0.3, 0.45, 0.8] {
+            let g = CoherenceMatrix::equicorrelated(7, r);
+            assert!(g.dispersion() < 1e-12, "an equicorrelated cell has no dispersion (r={r})");
+        }
+
+        // **The band that needs it.** A block of `k` perfectly-correlated nodes in a cell of 7 gives
+        // `mean = C(k,2)/21` and `Φ = 2·C(k,2)/7`; `Bind` is `Φ > 1` with `mean ≤ lo`, which the arithmetic
+        // satisfies only at `k = 4`. Built here rather than asserted about, so the claim is checked and not
+        // merely restated.
+        let block = |k: usize| {
+            let n = 7;
+            let mut c = vec![0.0; n * n];
+            for i in 0..n {
+                c[i * n + i] = 1.0;
+                for j in 0..n {
+                    if i != j && i < k && j < k {
+                        c[i * n + j] = 1.0;
+                    }
+                }
+            }
+            CoherenceMatrix::from_correlation(c, n).expect("a block matrix is PSD")
+        };
+        let (lo, _) = collective_subject_window(7);
+        for k in 2..=6usize {
+            let g = block(k);
+            let m = g.measures();
+            let binds = m.phi > 1.0 && classify_collective(g.mean_correlation(), 7) == CollectiveState::Aggregate;
+            assert_eq!(
+                binds,
+                k == 4,
+                "k={k}: Φ={:.3} mean={:.3} (lo={lo:.3}) — the under-coupled band is reachable at exactly \
+                 one block size, and a cell in it necessarily has dispersion",
+                m.phi,
+                g.mean_correlation(),
+            );
+            if binds {
+                assert!(m.dispersion > 0.0, "k={k}: `Bind` is unreachable at zero dispersion");
+            }
+        }
+    }
 
     #[test]
     fn from_correlation_rejects_non_finite_out_of_range_and_non_psd_matrices() {

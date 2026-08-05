@@ -38,7 +38,7 @@ pub use fanos_ports as ports;
 pub use fanos_stream as stream;
 
 pub use overlay::{Config, MAX_STORE_ENTRIES, OverlayNode, QUARANTINE_TTL};
-pub use ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+pub use ports::{Command, Duration, Effect, Engine, Escalation, Input, Instant, Notification, TimerToken};
 
 // Re-export the wire address type so drivers and apps speak the same coordinates.
 pub use fanos_geometry::Triple;

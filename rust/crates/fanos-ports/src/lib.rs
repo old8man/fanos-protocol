@@ -313,6 +313,30 @@ pub enum Effect {
 /// fell off the end, which is exactly the reading a controller needs to retire it.
 pub const ROLE_COUNT: usize = 6;
 
+/// **Why** a cell escalated (see [`Notification::Escalated`]).
+///
+/// The two causes are unrelated and want opposite responses, and they used to travel as one `u8` whose only
+/// distinguishing feature was that the coherence case passed a literal `0`. That is a convention a reader
+/// has to reverse-engineer — and the CLI, reading the field as a count, logged the mask as one.
+///
+/// It also hid a no-op: the facade forwards an escalation to the parent cell as *a set of nodes to help
+/// with*, so a coherence collapse was sending the parent an empty set. Only [`Escalation::Faults`] is a
+/// node-set, and only it is forwarded that way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Escalation {
+    /// More faults than the cell can localize or repair (a hyperoval stopping set, or beyond the
+    /// `Φ`-budget): the Fano mask of the nodes it could not recover (spec §6.3, §6.7). Always non-empty —
+    /// the localizer escalates only at three or more faults.
+    Faults(u8),
+    /// The cell's **behavioural coherence collapsed** (`Φ ≤ 1`, equivalently `P ≤ 2/N`): it is no longer an
+    /// integrated whole, and T-104 §5 puts that past the point of no return without external support.
+    ///
+    /// **No node is implicated**, which is exactly why it cannot travel as a fault mask: the answer is not
+    /// "reroute around these" but re-provisioning the cell, and there is no parent-side channel for that
+    /// yet. Reported here so an operator sees it; not forwarded as an empty node-set.
+    CoherenceCollapse,
+}
+
 /// An application-level notification (the engine → app direction).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Notification {
@@ -497,9 +521,10 @@ pub enum Notification {
     /// degradation, not a lie, so it is *reported* for observability (and left to higher-layer rerouting),
     /// never quarantined — a possibly-honest slow node must not be punished.
     Grey(Triple),
-    /// Self-healing: the local cell could not recover the listed Fano nodes (a hyperoval stopping
-    /// set, or beyond the `Φ`-budget) and escalated them to the parent cell (spec §6.3, §6.7).
-    Escalated(u8),
+    /// Self-healing: the local cell needs external support. [`Escalation`] says **which question it
+    /// failed**, because the two answers are different operator actions and used to arrive as one event
+    /// distinguishable only by a magic zero.
+    Escalated(Escalation),
     /// Self-healing: the cascade early-warning fired while every node was still live; the cell
     /// pre-emptively shed correlation to restore headroom (spec §2.7, §6.5).
     Decoupled,

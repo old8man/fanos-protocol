@@ -21,7 +21,7 @@ use fanos_geometry::{HierAddr, Plane, Point, Triple};
 use fanos_wire::FrameType;
 
 use super::{ESCALATE_TTL, OverlayNode, encode};
-use crate::ports::{Effect, Notification};
+use crate::ports::{Effect, Escalation, Notification};
 use crate::router::HierRoute;
 
 impl<F: Field> OverlayNode<F> {
@@ -199,7 +199,7 @@ impl<F: Field> OverlayNode<F> {
             let aggregate = parent.degraded_mask();
             let up = if ttl > 0 { self.escalate_up(aggregate, ttl - 1) } else { Vec::new() };
             if up.is_empty() {
-                effects.push(Effect::Notify(Notification::Escalated(aggregate)));
+                effects.push(Effect::Notify(Notification::Escalated(Escalation::Faults(aggregate))));
             } else {
                 effects.extend(up);
             }

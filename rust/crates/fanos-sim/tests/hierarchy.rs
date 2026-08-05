@@ -8,7 +8,7 @@
 
 use fanos_core::{ChildSummary, ParentCell};
 use fanos_field::F2;
-use fanos_runtime::{Command, Config, Duration, Notification};
+use fanos_runtime::{Command, Config, Duration, Escalation, Notification};
 use fanos_sim::{Sim, spawn_cell};
 
 /// Find a hyperoval point-mask (four points, no three collinear).
@@ -49,7 +49,7 @@ fn a_child_escalation_is_consumed_and_healed_by_the_parent_tier() {
         .notifications
         .iter()
         .find_map(|o| match o.note {
-            Notification::Escalated(m) => Some(m),
+            Notification::Escalated(Escalation::Faults(m)) => Some(m),
             _ => None,
         })
         .expect("the child cell escalated an irrecoverable residue");

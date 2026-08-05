@@ -22,7 +22,7 @@ use fanos_diakrisis::healing::max_reroute_depth;
 use fanos_diakrisis::{Fault, HealingAction, Verdict};
 use fanos_field::F2;
 use fanos_geometry::fano;
-use fanos_runtime::{Command, Config, Duration, Notification};
+use fanos_runtime::{Command, Config, Duration, Notification, Escalation};
 use fanos_sim::{Sim, spawn_cell};
 
 /// A hyperoval point-mask (four points, no three collinear) — an irrecoverable stopping set (V20), the
@@ -57,7 +57,7 @@ fn real_escalation_residue(seed: u64) -> u8 {
         .notifications
         .iter()
         .find_map(|o| match o.note {
-            Notification::Escalated(m) => Some(m),
+            Notification::Escalated(Escalation::Faults(m)) => Some(m),
             _ => None,
         })
         .expect("a hyperoval-crashed cell escalates an irrecoverable residue")

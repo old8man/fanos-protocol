@@ -30,11 +30,11 @@ use fanos_node::{
 // Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
 #[cfg(feature = "vpn")]
 use fanos_node::StaticResolver;
-use fanos_runtime::Notification;
+use fanos_runtime::{Escalation, Notification};
 use fanos_vrf::vss::{DeterministicRng, deal};
 use tokio::io::{DuplexStream, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -2927,7 +2927,12 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
         Notification::Rerouted { around, via } => info!(?around, ?via, "rerouted (self-heal)"),
         Notification::Repaired(p) => info!(node = ?p, "shard repaired"),
         Notification::Quarantined(p) => info!(node = ?p, "member quarantined"),
-        Notification::Escalated(n) => info!(count = n, "escalated to parent cell"),
+        Notification::Escalated(Escalation::Faults(mask)) => {
+            info!(nodes = format!("{mask:#09b}"), "escalated unrecoverable nodes to the parent cell");
+        }
+        Notification::Escalated(Escalation::CoherenceCollapse) => {
+            warn!("behavioural coherence collapsed (Phi <= 1) — the cell needs re-provisioning, not a reroute");
+        }
         Notification::Decoupled => info!("cascade pre-empted (decoupled)"),
         other => info!(event = ?other, "engine event"),
     }

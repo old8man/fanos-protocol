@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use fanos_runtime::ports::stations::GatherHealth;
-use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, TimerToken, Triple};
+use fanos_runtime::{Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
 use fanos_diakrisis::Verdict;
@@ -127,7 +127,8 @@ fn note_desc(note: &Notification) -> String {
         Notification::Repaired(c) => format!("Repaired {}", fmt_coord(*c)),
         Notification::Quarantined(c) => format!("Quarantined {}", fmt_coord(*c)),
         Notification::Grey(c) => format!("Grey {}", fmt_coord(*c)),
-        Notification::Escalated(mask) => format!("Escalated {mask:#09b}"),
+        Notification::Escalated(Escalation::Faults(mask)) => format!("Escalated {mask:#09b}"),
+        Notification::Escalated(Escalation::CoherenceCollapse) => "Escalated coherence-collapse".to_string(),
         Notification::Decoupled => "Decoupled".to_owned(),
         Notification::Bound => "Bound".to_owned(),
         Notification::Stored(k) => format!("Stored {}", short_digest(k)),

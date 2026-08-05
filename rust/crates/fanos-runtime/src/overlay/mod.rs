@@ -66,61 +66,17 @@ pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 
 /// The reflex's sampling period — one behavioural sample, one diagnosis, one control decision.
 ///
-/// It is the loop's **quantum**, and every derived quantity below is expressed in it: the observation
-/// window is a count of these, the dwell is a count of these, and [`HEARTBEATS_PER_EPOCH`] is the epoch
-/// divided by it. Named rather than written inline in `Config::default` so the cross-crate ratchet in
-/// `fanos-cli/tests/skew_windows.rs` can read it, and so the three constants that depend on it are visibly
-/// downstream of one number instead of three copies of it.
-///
-/// The binding constraint on its *value* is stated and checked there: `BEHAVIOR_WINDOW × this` must fill
-/// well inside `DEFAULT_EPOCH_PERIOD`, or the node never has a self-model before the cell it is modelling
-/// reconfigures. At 178 × 500 ms = 89 s against a 600 s epoch there is a factor of nearly seven in hand.
+/// The default for [`Config::heartbeat`], and the loop's **quantum**: the observation window is a count of
+/// these, the dwell is a count of these, and the epoch divided by this is what the control confidence is
+/// derived against.
 pub(crate) const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
 
-/// The platform's epoch, measured in this loop's own heartbeats: `DEFAULT_EPOCH_PERIOD / HEARTBEAT_PERIOD`
-/// = `600 s / 500 ms`.
+/// The default epoch, matching `fanos_node::config::DEFAULT_EPOCH_PERIOD`.
 ///
-/// Here rather than imported because `fanos-node` (which owns `DEFAULT_EPOCH_PERIOD`) sits *above* this
-/// crate; `fanos-cli/tests/skew_windows.rs`'s sibling ratchet is what keeps the two from drifting, in the
-/// same way the clock-skew windows were made one system (#70).
-pub(crate) const HEARTBEATS_PER_EPOCH: f64 = 1200.0;
-
-/// The band-keeping loop's **control confidence** `z`, in standard errors — derived, not chosen, by
-/// [`fanos_diakrisis::window::control_confidence`] from [`BAND_DWELL`] and [`HEARTBEATS_PER_EPOCH`]:
-/// the smallest `z` at which the loop actuates on its own measurement noise less than once per epoch.
-///
-/// One declared quantity now stands where three chosen ones did — this, the window below, and the shed's
-/// safety margin in [`decouple_ceiling`] all move together with the plane, the dwell and the clock.
-///
-/// A function rather than a constant **because there is then no literal to drift**: the derivation needs
-/// `exp`, which is not `const`, and a written-out value would be a number that merely used to be derived.
-/// It is evaluated once per shed actuation, which is nothing.
-pub(crate) fn control_confidence() -> f64 {
-    fanos_diakrisis::window::control_confidence(BAND_DWELL as usize, HEARTBEATS_PER_EPOCH)
-}
-
-/// The behavioural-coherence observation window, in heartbeat samples: the cell's `Γ_net` is read from the
-/// last this-many per-node relay-activity samples.
-///
-/// # It is a resolution, not a memory bound
-///
-/// The value used to be `8` — four seconds of history — justified by "the self-model memory is `7 × this`".
-/// That bound does not bind: `7 × 8` doubles is **448 bytes**, and the derived window below is 10 KB.
-/// Meanwhile the estimator's standard error at `W = 8` is `≈ 0.168` against a collective-subject band
-/// `(0.4082, 0.5774]` that is `0.169` **wide** — and because `(1−r)(1+(n−1)r)` is nearly flat across the
-/// band, that held at *every* operating point inside it. The homeostat was regulating against three
-/// boundaries none of which its instrument could resolve.
-///
-/// [`resolving_window`](fanos_diakrisis::window::resolving_window) inverts the requirement — `z` standard
-/// errors must fit inside the band's half-width — and at `n = 7` with [`control_confidence()`] gives **178**,
-/// about 89 s at a 500 ms heartbeat. That the answer is a minute and a half rather than four seconds is the
-/// finding, not a cost: the regulated quantity is a structural property of a cell inside a 600 s epoch, and
-/// **a controller cannot respond faster than the precision it needs allows it to measure.**
-///
-/// A node therefore has no coherence self-model for its first 178 heartbeats. That is the honest state, and
-/// strictly better than the alternative it replaces — a two-sample correlation is `±1` by construction, and
-/// acting on one is acting on nothing (#102).
-pub(crate) const BEHAVIOR_WINDOW: usize = 178;
+/// A default, not a constant the loop reads: the loop reads [`Config::epoch_period`], because an operator
+/// who sets a different epoch must get a control loop derived for **their** epoch. See
+/// [`Config::behavior_window`].
+pub(crate) const EPOCH_PERIOD: Duration = Duration::from_millis(600_000);
 
 /// Homeostatic **decoupling** control (audit C6). `Decouple` must actually lower the cell's integration,
 /// not merely notify: the node carries a mutable shed factor that scales its effective correlation down,
@@ -182,14 +138,14 @@ pub(crate) const DECOUPLE_DECAY: f64 = decouple_decay();
 ///
 /// Clamped to `[0, 1)`: a baseline already at or below the effective floor admits no shed, which is the
 /// honest answer rather than a negative one.
-pub(crate) fn decouple_ceiling(n: usize, healthy: f64) -> f64 {
+pub(crate) fn decouple_ceiling(n: usize, healthy: f64, window: usize, z: f64) -> f64 {
     if n < 2 || healthy <= 0.0 {
         return 0.0;
     }
     // The floor and the estimator's error both come from DIAKRISIS rather than being re-derived here, so a
     // change to the band or to the window moves this ceiling with it instead of leaving copies to drift.
     let lo = fanos_diakrisis::coherence::systemic_correlation(n);
-    let setback = control_confidence() * fanos_diakrisis::window::band_stderr(n, BEHAVIOR_WINDOW);
+    let setback = z * fanos_diakrisis::window::band_stderr(n, window);
     (1.0 - (lo + setback) / healthy).clamp(0.0, 1.0)
 }
 
@@ -293,6 +249,13 @@ pub const QUARANTINE_TTL: Duration = Duration::from_millis(60_000);
 pub struct Config {
     /// Interval between heartbeat rounds.
     pub heartbeat: Duration,
+    /// This network's epoch — how often coordinates, rosters, directories and roles all turn over.
+    ///
+    /// The band-keeping loop is derived against it (see [`behavior_window`](Self::behavior_window)), so it
+    /// must be the epoch the node's driver actually runs. `fanos-node` sets it from its own
+    /// `epoch_period`; a simulation that runs a short epoch gets a correspondingly short window, which is
+    /// the same derivation rather than a shortcut around it.
+    pub epoch_period: Duration,
     /// A peer unheard-from for longer than this is considered degraded.
     pub liveness_timeout: Duration,
     /// The healthy mean inter-node correlation `r` used to estimate the cell's integration `Φ`
@@ -339,10 +302,64 @@ pub struct Config {
     pub vrf_coordinates: bool,
 }
 
+impl Config {
+    /// This deployment's epoch in the reflex's own heartbeats — the denominator of the control confidence.
+    ///
+    /// `1.0` (a single opportunity) when either period is degenerate, so a misconfiguration produces a
+    /// refusing derivation rather than a plausible one.
+    #[must_use]
+    pub fn heartbeats_per_epoch(&self) -> f64 {
+        if self.heartbeat.0 == 0 || self.epoch_period.0 == 0 {
+            return 1.0;
+        }
+        self.epoch_period.0 as f64 / self.heartbeat.0 as f64
+    }
+
+    /// The band-keeping loop's **control confidence** `z`, in standard errors — derived, not chosen: the
+    /// smallest `z` at which the loop actuates on its own measurement noise less than once per epoch
+    /// ([`fanos_diakrisis::window::control_confidence`], distribution-free by Cantelli).
+    ///
+    /// One derived quantity now stands where three chosen ones did — this, the window, and the shed's safety
+    /// margin in [`decouple_ceiling`] — and all three move with the plane, the dwell and this node's clock.
+    #[must_use]
+    pub fn control_confidence(&self) -> f64 {
+        fanos_diakrisis::window::control_confidence(BAND_DWELL as usize, self.heartbeats_per_epoch())
+    }
+
+    /// The behavioural-coherence observation window, in heartbeat samples: the cell's `Γ_net` is read from
+    /// the last this-many per-node relay-activity samples.
+    ///
+    /// # It is a resolution, not a memory bound
+    ///
+    /// It used to be a constant `8` — four seconds — justified by "the self-model memory is `7 × this`".
+    /// That bound does not bind: `7 × 8` doubles is **448 bytes**. Meanwhile the estimator's standard error
+    /// at `W = 8` is `≈ 0.168` against a collective-subject band `(0.4082, 0.5774]` that is `0.169` **wide**,
+    /// and because `(1−r)(1+(n−1)r)` is nearly flat across the band that held at *every* operating point
+    /// inside it. The homeostat was regulating against boundaries its instrument could not resolve.
+    ///
+    /// [`resolving_window`](fanos_diakrisis::window::resolving_window) inverts the requirement — `z` standard
+    /// errors must fit inside the band's half-width — giving **178** at the shipped 600 s epoch and 500 ms
+    /// heartbeat, about 89 s of history. That the answer is a minute and a half rather than four seconds is
+    /// the finding, not a cost: the regulated quantity is structural, inside an epoch, and **a controller
+    /// cannot respond faster than the precision it needs allows it to measure.**
+    ///
+    /// A node therefore has no coherence self-model for its first `W` heartbeats. That is the honest state,
+    /// and strictly better than what it replaces — a two-sample correlation is `±1` by construction, and
+    /// acting on one is acting on nothing (#102).
+    ///
+    /// Floored at `2`, below which a correlation is undefined.
+    #[must_use]
+    pub fn behavior_window(&self) -> usize {
+        // The base cell's point count — the `n` the band and the estimator are both stated for.
+        fanos_diakrisis::window::resolving_window(7, self.control_confidence()).max(2)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             heartbeat: HEARTBEAT_PERIOD,
+            epoch_period: EPOCH_PERIOD,
             liveness_timeout: Duration::from_millis(1600),
             healthy_correlation: 0.45,
             self_healing: true,
@@ -576,7 +593,7 @@ impl<F: Field> OverlayNode<F> {
             self_index,
             cell_members: None,
             parent_cell: None,
-            healer: Healer::new(observer),
+            healer: Healer::new(observer, config.behavior_window(), config.control_confidence()),
             witnessed: BTreeMap::new(),
             loss_reports: BTreeMap::new(),
             grey_reported: None,
@@ -1220,7 +1237,9 @@ impl<F: Field> OverlayNode<F> {
         let escalations: Vec<u8> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Notify(Notification::Escalated(mask)) => Some(*mask),
+                // Only a node-set is forwardable: `escalate_to_parent` asks the parent to help with
+                // *these members*, and a coherence collapse names none. It used to send an empty set.
+                Effect::Notify(Notification::Escalated(crate::ports::Escalation::Faults(mask))) => Some(*mask),
                 _ => None,
             })
             .collect();
@@ -2122,7 +2141,7 @@ mod tests {
         // heartbeats 2–4 and the shed actuates less than halfway to a full window.
         //
         // The property is therefore a *timing* one: the first coherence-driven notification must not appear
-        // before the window has `BEHAVIOR_WINDOW` samples. Asserted as the index it first fires at, not as a
+        // before the window has `Config::default().behavior_window()` samples. Asserted as the index it first fires at, not as a
         // boolean, so a run that never fires at all cannot pass by silence — the second assertion is what
         // makes the first one mean something.
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
@@ -2130,7 +2149,7 @@ mod tests {
 
         let mut t = 1u64;
         let mut first_verdict: Option<usize> = None;
-        for w in 0..(BEHAVIOR_WINDOW + 4) {
+        for w in 0..(Config::default().behavior_window() + 4) {
             let bursts = (w % 3) + 1; // identical across peers → perfectly correlated at every window length
             for i in 1..7usize {
                 let from = Point::<F2>::at(i).coords();
@@ -2163,7 +2182,7 @@ mod tests {
              about *when* one appears",
         );
         assert!(
-            at + 1 >= BEHAVIOR_WINDOW,
+            at + 1 >= Config::default().behavior_window(),
             "a coherence verdict escaped at heartbeat {} with only {} samples: below a full window the \
              correlation matrix is degenerate, and acting on it is acting on nothing",
             at + 1,
@@ -2182,7 +2201,7 @@ mod tests {
 
         let mut t = 1u64;
         let mut decoupled = false;
-        for w in 0..(BEHAVIOR_WINDOW + 2) {
+        for w in 0..(Config::default().behavior_window() + 2) {
             let bursts = (w % 3) + 1; // varying, but identical across all peers → correlated in lockstep
             for i in 1..7usize {
                 let from = Point::<F2>::at(i).coords();
@@ -2281,7 +2300,7 @@ mod tests {
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let mut t = 1u64;
         let mut rebalanced = false;
-        for w in 0..(BEHAVIOR_WINDOW + 6) {
+        for w in 0..(Config::default().behavior_window() + 6) {
             let hot = (w % 5) + 1; // the block's shared load, varying so a correlation is defined
             for i in 1..7usize {
                 let from = Point::<F2>::at(i).coords();
@@ -2331,7 +2350,7 @@ mod tests {
             .effective_correlation(Config::default().healthy_correlation); // healthy_correlation, before any shed
         let mut decoupled_beats = 0usize;
         let mut systemic_seen = false;
-        for w in 0..(BEHAVIOR_WINDOW + 2) {
+        for w in 0..(Config::default().behavior_window() + 2) {
             let bursts = (w % 3) + 1; // common-mode: every peer relays in lockstep
             for i in 1..7usize {
                 let from = Point::<F2>::at(i).coords();
@@ -2436,7 +2455,7 @@ mod tests {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
         node.step(Instant(0), Input::Command(Command::StartHeartbeat));
         let mut t = 1u64;
-        for _ in 0..(BEHAVIOR_WINDOW + 4) {
+        for _ in 0..(Config::default().behavior_window() + 4) {
             node.step(Instant(t), Input::Timer(HEARTBEAT));
             t += 1;
         }
@@ -3046,6 +3065,7 @@ mod tests {
     /// whole budget.
     #[test]
     fn the_shed_ceiling_tracks_the_plane_and_leaves_the_cell_a_collective_subject() {
+        let (w, z) = (Config::default().behavior_window(), Config::default().control_confidence());
         // **The argument is the MEASURED correlation the shed is reducing, not a configured baseline** (#92).
         // A shed only ever runs on an over-coupled reading, so the input is above `hi = √(2/(n−1))`; feeding
         // it `healthy_correlation = 0.45` — which is *inside* the band, where the answer is `Hold` — was the
@@ -3054,7 +3074,7 @@ mod tests {
         for n in [7usize, 21, 57, 993] {
             let (lo, hi) = fanos_diakrisis::window::collective_subject_window(n);
             let measured = hi * 1.2; // an over-coupled cell: the only state that sheds
-            let d = decouple_ceiling(n, measured);
+            let d = decouple_ceiling(n, measured, Config::default().behavior_window(), Config::default().control_confidence());
             let modelled = measured * (1.0 - d);
             assert!(
                 modelled > lo,
@@ -3065,7 +3085,7 @@ mod tests {
             // And it stops at the *derived* floor — `lo` plus the estimator's own error at the shipped
             // window — rather than at `lo` itself, because the band is a threshold on a measured quantity
             // and arriving exactly at it means arriving inside its error.
-            let setback = control_confidence() * fanos_diakrisis::window::band_stderr(n, BEHAVIOR_WINDOW);
+            let setback = Config::default().control_confidence() * fanos_diakrisis::window::band_stderr(n, Config::default().behavior_window());
             assert!(
                 (modelled - (lo + setback)).abs() < 1e-9,
                 "n={n}: a full shed must land on the derived floor lo+z·SE = {:.4}, not on {modelled:.4}",
@@ -3076,7 +3096,7 @@ mod tests {
         // It really does move with the plane: a larger cell has a lower floor and therefore more room. Taken
         // at one fixed correlation so the comparison is about the plane and not about the input.
         assert!(
-            decouple_ceiling(993, 0.8) > decouple_ceiling(7, 0.8),
+            decouple_ceiling(993, 0.8, w, z) > decouple_ceiling(7, 0.8, w, z),
             "the budget grows as the floor 1/√(n−1) falls — which is why one constant cannot serve every plane"
         );
 
@@ -3084,11 +3104,11 @@ mod tests {
         // now includes a cell sitting at the configured baseline, which is exactly right: an in-band cell is
         // `Hold`, and a controller with nothing to correct must spend nothing.
         assert!(
-            decouple_ceiling(7, 0.40) <= f64::EPSILON,
+            decouple_ceiling(7, 0.40, w, z) <= f64::EPSILON,
             "a correlation below the floor has no budget to spend"
         );
         assert!(
-            decouple_ceiling(1, 0.8) <= f64::EPSILON,
+            decouple_ceiling(1, 0.8, w, z) <= f64::EPSILON,
             "a degenerate cell has no correlation window"
         );
     }
@@ -3098,7 +3118,7 @@ mod tests {
     /// The chain is `(dwell, heartbeat, epoch) → z → window → shed ceiling`. Each link is a literal only
     /// because the derivation needs `exp`/`sqrt`, which are not `const`; this is what makes a literal that
     /// drifts from its derivation fail rather than merely continue to look plausible. Three chosen numbers
-    /// (`BEHAVIOR_WINDOW = 8`, `DECOUPLE_MARGIN = 0.5`, and a dwell on one branch of three) became one
+    /// (`Config::default().behavior_window() = 8`, `DECOUPLE_MARGIN = 0.5`, and a dwell on one branch of three) became one
     /// declared period and one derived confidence.
     #[test]
     fn the_control_loop_constants_are_derived() {
@@ -3108,18 +3128,18 @@ mod tests {
         // read 1200. `fanos-cli/tests/skew_windows.rs` holds the other half, against `DEFAULT_EPOCH_PERIOD`.
         let heartbeat_nanos = Config::default().heartbeat.0 as f64;
         assert!(
-            (HEARTBEATS_PER_EPOCH * heartbeat_nanos - 600.0 * 1e9).abs() < 1.0,
-            "HEARTBEATS_PER_EPOCH × the heartbeat must be the 600 s epoch, not a free number",
+            (Config::default().heartbeats_per_epoch() * heartbeat_nanos - 600.0 * 1e9).abs() < 1.0,
+            "Config::default().heartbeats_per_epoch() × the heartbeat must be the 600 s epoch, not a free number",
         );
 
-        let z = fanos_diakrisis::window::control_confidence(BAND_DWELL as usize, HEARTBEATS_PER_EPOCH);
+        let z = fanos_diakrisis::window::control_confidence(BAND_DWELL as usize, Config::default().heartbeats_per_epoch());
         assert!(
-            (z - control_confidence()).abs() < 1e-12,
+            (z - Config::default().control_confidence()).abs() < 1e-12,
             "the runtime's confidence must be exactly DIAKRISIS's derivation from the same inputs",
         );
         assert_eq!(
-            resolving_window(7, control_confidence()),
-            BEHAVIOR_WINDOW,
+            resolving_window(7, Config::default().control_confidence()),
+            Config::default().behavior_window(),
             "the window is the one that resolves the band at the derived confidence",
         );
 
@@ -3127,9 +3147,9 @@ mod tests {
         // bound being met and not a number being asserted about itself.
         let (lo, hi) = fanos_diakrisis::window::collective_subject_window(7);
         let half = (hi - lo) / 2.0;
-        assert!(control_confidence() * fanos_diakrisis::window::band_stderr(7, BEHAVIOR_WINDOW) <= half);
+        assert!(Config::default().control_confidence() * fanos_diakrisis::window::band_stderr(7, Config::default().behavior_window()) <= half);
         assert!(
-            control_confidence() * fanos_diakrisis::window::band_stderr(7, BEHAVIOR_WINDOW - 1) > half,
+            Config::default().control_confidence() * fanos_diakrisis::window::band_stderr(7, Config::default().behavior_window() - 1) > half,
             "one sample short of the derived window must fail to resolve, or the window is slack",
         );
 

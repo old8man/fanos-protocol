@@ -190,6 +190,36 @@ impl CoherenceFrame {
         self.verdict & INTEGRATED_BIT != 0
     }
 
+    /// **Pairwise dispersion** `v = q² − m²` — the variance of the cell's off-diagonal correlations, where
+    /// `q` is their RMS and `m` the reported [`mean_r`](Self::mean_r).
+    ///
+    /// It needs **no field of its own**, and the reason is the finding it exposes: `Φ`, `P` and `R` are
+    /// bijections of a single scalar on any unit-diagonal correlation matrix, so the cell size falls out of
+    /// the frame as `N = (1 + Φ)/P` and the RMS as `q² = Φ/(N − 1)`. Three of this frame's four coherence
+    /// numbers carry one degree of freedom between them; the fourth, `mean_r`, is what makes the pair
+    /// two-dimensional, and this is that second dimension read out.
+    ///
+    /// Worth watching rather than inferring: a cell in the under-coupled `Aggregate` regime with **zero**
+    /// dispersion is coming apart uniformly, while the same regime with high dispersion is a **load
+    /// hotspot** — one part of the cell locked onto a target, the rest untouched. The two want opposite
+    /// operator responses and the regime alone cannot tell them apart.
+    ///
+    /// `0.0` for a degenerate frame (no cell size recoverable, or rounding below zero — Cauchy–Schwarz makes
+    /// `m² ≤ q²` exact, so a negative here is never real).
+    #[must_use]
+    pub fn dispersion(&self) -> f32 {
+        let (phi, purity) = (f64::from(self.phi), f64::from(self.purity));
+        if purity <= 0.0 {
+            return 0.0;
+        }
+        let n = (1.0 + phi) / purity;
+        if n < 2.0 || !n.is_finite() {
+            return 0.0;
+        }
+        let m = f64::from(self.mean_r);
+        finite(((phi / (n - 1.0)) - m * m).max(0.0) as f32)
+    }
+
     /// Whether the syndrome localizes a fault (`syndrome != 0`).
     #[must_use]
     pub fn is_faulted(&self) -> bool {
@@ -231,6 +261,44 @@ mod tests {
         // A collective-subject cell (r = 0.5 ∈ (1/√6, 1/√3]) with point 0 faulted.
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
         CoherenceFrame::observe(CellId([0x11; 16]), 42, &matrix, 0b0000_0001, 0.5, -1, 3)
+    }
+
+    #[test]
+    fn the_frame_recovers_the_dispersion_it_never_carried() {
+        // The frame has no dispersion field and does not need one: `Φ`, `P` and `R` are bijections of one
+        // scalar, so the cell size falls out as `N = (1+Φ)/P` and the RMS as `q² = Φ/(N−1)`. Checked against
+        // the matrix's own figure — if the identity ever stopped holding, this readout would silently start
+        // reporting a different quantity under the same name.
+        //
+        // Both an equicorrelated cell (dispersion exactly zero) and a hotspot block (dispersion strictly
+        // positive), because a readout that returned zero unconditionally would pass the first alone.
+        let mut block = alloc::vec![0.0; 49];
+        for i in 0..7 {
+            block[i * 7 + i] = 1.0;
+            for j in 0..7 {
+                if i != j && i < 4 && j < 4 {
+                    block[i * 7 + j] = 1.0;
+                }
+            }
+        }
+        let cases = [
+            CoherenceMatrix::equicorrelated(7, 0.5),
+            CoherenceMatrix::from_correlation(block, 7).expect("a block matrix is PSD"),
+        ];
+        for matrix in cases {
+            let frame = CoherenceFrame::observe(CellId([0x22; 16]), 1, &matrix, 0, 0.5, -1, 0);
+            let expected = matrix.dispersion() as f32;
+            assert!(
+                (frame.dispersion() - expected).abs() < 1e-4,
+                "the frame's derived dispersion {} must be the matrix's {expected}",
+                frame.dispersion(),
+            );
+        }
+        // …and the two cases really are different, so the comparison above has content.
+        let flat = CoherenceFrame::observe(
+            CellId([0x22; 16]), 1, &CoherenceMatrix::equicorrelated(7, 0.5), 0, 0.5, -1, 0,
+        );
+        assert!(flat.dispersion() < 1e-6, "an equicorrelated cell reads zero dispersion");
     }
 
     #[test]
