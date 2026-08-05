@@ -268,11 +268,23 @@ counter increments, which §7 already says is not the criterion.
 **Derived.** The station enumeration (it is the code's own discard sites). The cardinality bound (`q² + q + 1`
 lines is the geometry). The prohibition on cross-hop tokens (it reopens the tagging channel `onion_tamper.rs`
 proves closed). That the load sensor must read the data-path plane (the coherence plane measures health, and a
-role setpoint is a function of demand).
+role setpoint is a function of demand). **The observation window length** — `resolving_window(n, z)` inverts
+"`z` standard errors of the mean-correlation estimator fit inside the collective-subject band's half-width",
+with `z` itself derived distribution-free (Cantelli) from the dwell and the epoch as the smallest confidence at
+which the loop actuates on its own noise less than once per epoch. 178 samples at the shipped periods, and a
+function of `Config::epoch_period` rather than a constant, so it follows a deployment's own clock.
 
-**Chosen, and each needs a derivation before it ships.** The observation window length. The retention depth in
-`history`. The DP `ε` for counter export — the *sensitivity* must be derived per counter family as `Δr = 1/21` was
-for the coherence frame, and until it is, counter export stays local-only.
+> **What a derived window trades against, because a reader re-deriving it for another deployment needs to
+> know.** Not memory — `n × W` doubles is 10 KB. The **loop's time constant**: 178 samples at a 500 ms
+> heartbeat is 89 s before a node has any self-model at all. A controller cannot respond faster than the
+> precision it needs allows it to measure, and the window is where that appears. Shortening it means either
+> accepting a wider band (a weaker claim) or a longer dwell (a slower actuation) — the three move together.
+
+**Chosen, and each needs a derivation before it ships.** The retention depth in `history` — the same *kind* of
+question the window turned out to be (how much past is needed to say something with confidence), so the
+derivation that closed the window is the first lever to try on it. The DP `ε` for counter export — the
+*sensitivity* must be derived per counter family as `Δr = 1/21` was for the coherence frame, and until it is,
+counter export stays local-only.
 
 **Unproven, and the honest frontier.** That aggregate-by-structure counters leak nothing useful to an adversary
 who also observes traffic. R1–R3 forbid the obvious channels, but a *rate* keyed by line is still a signal, and a
