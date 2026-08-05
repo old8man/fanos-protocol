@@ -362,6 +362,68 @@ pub fn ingress_walk<F: Field>(
 /// Domain separator for the [`ingress_walk`] permutation.
 const INGRESS_WALK_LABEL: &str = "FANOS-v1/poros-ingress-walk";
 
+/// Domain separator for the [`reshare_contributors`] subset draw.
+const RESHARE_SUBSET_LABEL: &str = "FANOS-v1/poros-reshare-subset";
+
+/// The **canonical contributor subset** of a rotation into `target_epoch`: the old-line share indices
+/// (`x`, one-based) whose sub-shares every incoming member must combine — *the same ones at every member*.
+///
+/// # Why the subset cannot be whoever answers first
+///
+/// Old member `k` re-splits its share `y_k` under a **fresh random** polynomial `g_k` with `g_k(0) = y_k`,
+/// so a new member combining subset `A` lands on `y'_j = Σ_{k∈A} λ^A_k·g_k(x'_j) = h_A(x'_j)` where
+/// `h_A := Σ_{k∈A} λ^A_k·g_k`. Every `h_A` satisfies `h_A(0) = S` — that is what makes resharing work — but
+/// the `g_k` are independent, so **`h_A` and `h_B` agree at 0 and nowhere else**. Two members that combined
+/// different subsets therefore hold evaluations of two different polynomials, and interpolating across them
+/// yields neither's constant term: the rotated line cannot reconstruct its own descriptor. `shamir`'s own
+/// contract says as much — *"every new member using the same `old_xs` subset lands on one consistent new
+/// polynomial"*.
+///
+/// This is not a Byzantine case. Every outgoing member emits (`spawn_ingress_rotation`), so adopting on the
+/// first `threshold` to arrive lets ordinary network jitter hand each member a different subset; at the Fano
+/// line (`n = 3`, `t = 2`) three independent races agree only about one time in nine.
+///
+/// # Why a derivation rather than agreement
+///
+/// Every proactive-resharing protocol needs the committee agreed before combining. `fanos-keygen`'s beacon
+/// reshare gets it from an authenticated trigger that **names** `contributors`; POROS has no authority to
+/// sign one, so it takes the other route already used for both rosters — a pure function of
+/// `(community, target_epoch, old_line)`, which is exactly the shared state `rotation_rosters` is derived
+/// from, so no round trip and no I/O. Fisher–Yates over a domain-separated XOF, eight bytes per swap for the
+/// width reason argued at [`ingress_walk`].
+///
+/// Returns the chosen indices **sorted**, or empty when no valid subset exists (an empty/oversized line, a
+/// threshold above the roster) — fail-closed, because arming a rotation that cannot complete is worse than
+/// not arming one.
+fn reshare_contributors(
+    community: &[u8],
+    target_epoch: Epoch,
+    old_line: &[Triple],
+    threshold: usize,
+) -> Vec<u8> {
+    let n = old_line.len();
+    if n == 0 || threshold == 0 || threshold > n || u8::try_from(n).is_err() {
+        return Vec::new();
+    }
+    let mut xs: Vec<u8> = (1..=n).map(|i| i as u8).collect();
+    let mut key = Vec::with_capacity(community.len() + 8 + n * TRIPLE_WIRE_LEN);
+    key.extend_from_slice(community);
+    key.extend_from_slice(&target_epoch.to_be_bytes());
+    for coord in old_line {
+        key.extend_from_slice(&encode_triple(*coord));
+    }
+    let mut stream = alloc_zeroed_swaps(n);
+    fanos_primitives::hash::hash_xof(RESHARE_SUBSET_LABEL, &key, &mut stream);
+    for i in (1..n).rev() {
+        let chunk = stream.get(i * 8..i * 8 + 8).and_then(|b| b.try_into().ok()).unwrap_or([0u8; 8]);
+        let j = (u64::from_be_bytes(chunk) % (i as u64 + 1)) as usize;
+        xs.swap(i, j);
+    }
+    xs.truncate(threshold);
+    xs.sort_unstable();
+    xs
+}
+
 /// A zeroed byte buffer sized for one 8-byte draw per Fisher–Yates swap.
 fn alloc_zeroed_swaps(members: usize) -> Vec<u8> {
     vec![0u8; members.saturating_mul(8)]
@@ -786,6 +848,10 @@ struct RotationCtx {
     new_line: Vec<Triple>,
     old_line: Vec<Triple>,
     my_new_x: u8,
+    /// The canonical contributor indices this rotation combines — see [`reshare_contributors`]. Sorted, and
+    /// the *only* old members whose sub-shares are gathered: a rotation that combined whoever answered first
+    /// would leave each member on a different polynomial.
+    contributors: Vec<u8>,
     gather: BTreeMap<u8, Share>,
 }
 
@@ -989,18 +1055,40 @@ impl PorosHost {
     /// `ingress_line(community, epoch, beacon)` (no I/O) — `new_line` at `target_epoch`, `old_line` at the
     /// current epoch — and calls this before the contributions arrive. `old_line` is the roster whose position
     /// `x-1` a sub-share claiming index `x` must have arrived FROM (sender authentication).
+    ///
+    /// The **contributor subset is fixed here**, by [`reshare_contributors`], and not by whoever answers
+    /// first: every incoming member must combine the *same* old members or they land on different
+    /// polynomials and the rotated line cannot reconstruct. A roster that admits no valid subset arms
+    /// nothing, which is the honest state rather than a rotation that can never complete.
     pub fn begin_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>, old_line: Vec<Triple>) {
         if let Some(my_new_x) = self.my_x_in(&new_line) {
-            self.rotation =
-                Some(RotationCtx { target_epoch, new_line, old_line, my_new_x, gather: BTreeMap::new() });
+            let contributors =
+                reshare_contributors(&self.community, target_epoch, &old_line, self.threshold);
+            if contributors.is_empty() {
+                return;
+            }
+            self.rotation = Some(RotationCtx {
+                target_epoch,
+                new_line,
+                old_line,
+                my_new_x,
+                contributors,
+                gather: BTreeMap::new(),
+            });
         }
     }
 
     /// A reshare sub-share arrived from transport source `from`: authenticate it to its genuine old member
-    /// (`from` must be `old_line[old_x-1]`), and if it belongs to the active rotation and opens under this
-    /// host's KEM secret, gather it (first-writer-wins per old member). Once a threshold of distinct old
-    /// members' sub-shares are in, combine them into the rotated share and [`adopt`](Self::adopt) the new
-    /// epoch/line.
+    /// (`from` must be `old_line[old_x-1]`), and if it belongs to the active rotation, names a **canonical
+    /// contributor** and opens under this host's KEM secret, gather it (first-writer-wins per old member).
+    /// Once *every* contributor in that subset has arrived, combine them into the rotated share and
+    /// [`adopt`](Self::adopt) the new epoch/line.
+    ///
+    /// A sub-share from an old member outside the subset is dropped rather than gathered — every outgoing
+    /// member emits, so this is the ordinary case, not an attack. The emitting side is deliberately left
+    /// permissive: it computes its roster by a different path than the receiver's `old_line`, and a sender
+    /// that filtered on its own view would silently stop a rotation the moment the two disagreed, whereas an
+    /// unfiltered sender merely spends `n − t` sets of frames a receiver ignores.
     ///
     /// Sender authentication closes the spoof hole: a `PorosReshare` from any coordinate other than the old
     /// member it claims (`old_x`) is dropped, so an outsider cannot inject a sub-share. A *genuine but
@@ -1009,7 +1097,6 @@ impl PorosHost {
     /// corruption is fail-safe (detected at serve, never a wrong descriptor). Robust recovery from such a
     /// Byzantine contributor (attribute + retry a different old-member subset) is the VSS follow-on.
     fn on_reshare(&mut self, from: Triple, target_epoch: Epoch, old_x: u8, sealed: &SealedShare) -> Vec<Effect> {
-        let threshold = self.threshold;
         let Some(secret) = self.kem_secret.as_ref() else {
             return Vec::new(); // serve-only host: cannot open sealed sub-shares
         };
@@ -1024,16 +1111,25 @@ impl PorosHost {
         if usize::from(old_x).checked_sub(1).and_then(|i| ctx.old_line.get(i)) != Some(&from) {
             return Vec::new();
         }
+        // Only the canonical subset is gathered: combining whoever arrived first puts each member on a
+        // different polynomial (see `reshare_contributors`).
+        if !ctx.contributors.contains(&old_x) {
+            return Vec::new();
+        }
         let Some(sub) = open_service_share(sealed, secret) else {
             return Vec::new(); // not addressed to us, or tampered
         };
         ctx.gather.entry(old_x).or_insert(sub);
-        if ctx.gather.len() < threshold {
-            return Vec::new(); // still gathering
-        }
-        // A threshold of old members contributed: combine into this host's rotated share.
-        let old_xs: Vec<u8> = ctx.gather.keys().copied().collect();
-        let subs: Vec<Share> = ctx.gather.values().cloned().collect();
+        // Every contributor, not a count: the subset is what makes the new shares interpolate.
+        let Some(subs) = ctx
+            .contributors
+            .iter()
+            .map(|x| ctx.gather.get(x).cloned())
+            .collect::<Option<Vec<Share>>>()
+        else {
+            return Vec::new(); // still gathering the canonical subset
+        };
+        let old_xs: Vec<u8> = ctx.contributors.clone();
         let my_new_x = ctx.my_new_x;
         let new_line = ctx.new_line.clone();
         let Some(new_share) = combine_descriptor_reshares(my_new_x, &subs, &old_xs) else {
@@ -1863,6 +1959,79 @@ mod tests {
     }
 
     #[test]
+    fn two_old_subsets_reshare_to_two_different_polynomials() {
+        // **Why the contributor subset must be canonical, stated as the mathematical fact it is.** Each old
+        // member re-splits under a *fresh random* polynomial `g_k`, so the combined `h_A = Σ_{k∈A} λ^A_k·g_k`
+        // depends on `A` everywhere except at 0 — where every `h_A` equals the secret, which is what makes
+        // resharing work and also what makes the divergence invisible until reconstruction. A new member that
+        // combined `{1,2}` while its neighbour combined `{2,3}` holds a point of a different curve, and the
+        // line cannot interpolate across them. This test is the reason `reshare_contributors` exists.
+        let desc = descriptor(8);
+        let secret_len = desc.to_bytes().len();
+        let (t, n) = (2u8, 3u8);
+        let dealt =
+            shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
+        let old_shares = dealt.shares;
+
+        // Every old member contributes, as production does.
+        let contributions: Vec<Vec<Share>> = old_shares
+            .iter()
+            .enumerate()
+            .map(|(k, s)| {
+                let rnd: Vec<u8> = (0..secret_len).map(|i| ((i * 37 + k * 89 + 11) % 251) as u8).collect();
+                reshare_descriptor_share(s, t, n, &rnd).expect("a valid resharing contribution")
+            })
+            .collect();
+
+        // New member 1 combines two DIFFERENT old subsets. Same member, same position, same inputs otherwise.
+        let combine = |subset: &[usize]| {
+            let subs: Vec<Share> = subset.iter().map(|&k| contributions[k][0].clone()).collect();
+            let xs: Vec<u8> = subset.iter().map(|&k| old_shares[k].x()).collect();
+            combine_descriptor_reshares(1, &subs, &xs).expect("a valid combined share")
+        };
+        assert_ne!(
+            combine(&[0, 1]).y(),
+            combine(&[1, 2]).y(),
+            "two old subsets must give the SAME member two different rotated shares — if this ever became \
+             an equality the canonical-subset rule would be unnecessary, and the reason for it would have \
+             silently stopped being true",
+        );
+    }
+
+    #[test]
+    fn the_contributor_subset_is_the_same_at_every_member_and_moves_with_the_epoch() {
+        // The property `on_reshare` depends on: every member derives the identical subset from state they all
+        // already hold, with no round trip. Plus the two things that make it usable — it is a real subset of
+        // the right size, and it is not the same subset every epoch (a permanently-silent contributor must not
+        // block every rotation for ever; a fresh draw each epoch is what retries around it).
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+        let community = b"a-community".to_vec();
+
+        let at = |e: u64| reshare_contributors(&community, Epoch::new(e), &line, 2);
+        assert_eq!(at(7), at(7), "the draw is deterministic — every member lands on the same subset");
+        assert_eq!(at(7).len(), 2, "exactly the threshold: the smallest set that reconstructs");
+        assert!(at(7).iter().all(|x| (1..=3).contains(x)), "indices are one-based positions in the old line");
+        assert!(at(7).windows(2).all(|w| w[0] < w[1]), "sorted, so the pairing with sub-shares is unambiguous");
+
+        // A different community, or a different old roster, is a different draw — the subset is bound to the
+        // rotation it belongs to and cannot be replayed from another one.
+        assert_ne!(
+            (0..64).map(&at).collect::<Vec<_>>(),
+            (0..64).map(|e| reshare_contributors(b"other", Epoch::new(e), &line, 2)).collect::<Vec<_>>(),
+            "a different community draws differently",
+        );
+        // Over many epochs every subset is reached, so a down member is routed around within a few epochs
+        // rather than blocking the line permanently. C(3,2) = 3 subsets; 64 draws must find all of them.
+        let seen: BTreeSet<Vec<u8>> = (0..64).map(at).collect();
+        assert_eq!(seen.len(), 3, "the draw covers every {{t}}-subset, so no member is a permanent gate");
+
+        // Fail-closed on a roster that admits no subset, rather than arming a rotation that cannot complete.
+        assert!(reshare_contributors(&community, Epoch::new(1), &line, 4).is_empty(), "threshold above the line");
+        assert!(reshare_contributors(&community, Epoch::new(1), &[], 2).is_empty(), "no old line at all");
+        assert!(reshare_contributors(&community, Epoch::new(1), &line, 0).is_empty(), "a zero threshold");
+    }
+
+    #[test]
     fn sealed_resharing_keeps_sub_shares_confidential_end_to_end() {
         use fanos_pqcrypto::SeedRng;
 
@@ -1963,8 +2132,10 @@ mod tests {
             })
             .collect();
 
-        // A threshold subset of the old line (members 0, 1) each emit their sealed reshare contributions.
-        for (i, &from) in old_line.iter().enumerate().take(usize::from(t)) {
+        // EVERY old member emits, as production does — the driver's rule is "only an OUTGOING member emits",
+        // and all of them are outgoing. Each host keeps the canonical subset and drops the rest; a test that
+        // emitted from exactly `t` would be choosing the subset for the engine.
+        for (i, &from) in old_line.iter().enumerate() {
             let key_rnd = vec![0x10u8 + i as u8; secret_len * usize::from(t - 1) + 8];
             let effects = old_host(i).emit_reshare(new_epoch, &new_line, &new_keys, &key_rnd, &[0xB0, i as u8]);
             assert_eq!(effects.len(), new_line.len(), "one reshare frame per new member");
@@ -2060,16 +2231,29 @@ mod tests {
         let dealt = shard_descriptor(&desc, t, n, &vec![0x5Au8; secret_len * usize::from(t - 1) + 8]).unwrap();
         let (shares, binding) = (dealt.shares, dealt.binding);
 
-        // Old member 0 is honest; old member 1 is Byzantine — it holds a CORRUPTED share (flipped bytes), so its
-        // reshare contribution poisons the combination.
-        let honest0 = PorosHost::new(old_line[0], shares[0].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+        // The Byzantine member is chosen to be one the rotation actually *combines*: only the canonical
+        // contributor subset is gathered, so corrupting a member outside it would poison nothing and this
+        // test would pass while proving less than it claims. Derived rather than hard-coded, so a future
+        // change to the draw cannot silently defang it.
+        let contributors = reshare_contributors(b"c", new_epoch, &old_line, usize::from(t));
+        let byz_i = usize::from(contributors[0]) - 1;
+
+        // Every old member emits (production's rule); the one at `byz_i` holds a CORRUPTED share (flipped
+        // bytes), so its contribution poisons every combination that includes it.
+        let old_hosts: Vec<PorosHost> = (0..usize::from(n))
+            .map(|i| {
+                let share = if i == byz_i {
+                    let mut bad_y = shares[i].y().to_vec();
+                    bad_y[0] ^= 0xFF;
+                    Share::new(shares[i].x(), bad_y)
+                } else {
+                    shares[i].clone()
+                };
+                PorosHost::new(old_line[i], share, binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
                 Sybil::Uncapped,
-            );
-        let mut bad_y = shares[1].y().to_vec();
-        bad_y[0] ^= 0xFF;
-        let byz1 = PorosHost::new(old_line[1], Share::new(shares[1].x(), bad_y), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
-                Sybil::Uncapped,
-            );
+            )
+            })
+            .collect();
 
         let new_kp: Vec<(HybridKemSecret, HybridKemPublic)> =
             (0..3).map(|j| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8]))).collect();
@@ -2087,8 +2271,8 @@ mod tests {
             })
             .collect();
 
-        // Route both old members' contributions (honest 0 + Byzantine 1) to the new line.
-        for (host, i) in [(&honest0, 0usize), (&byz1, 1usize)] {
+        // Route every old member's contribution to the new line; the hosts keep the canonical subset.
+        for (i, host) in old_hosts.iter().enumerate() {
             let frames = host.emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x10u8 + i as u8; secret_len + 8], &[0xB0, i as u8]);
             for e in frames {
                 if let Effect::Send { to, frame } = e {
@@ -2118,9 +2302,13 @@ mod tests {
         );
 
         // Control: an UNcorrupted rotation of the same committed line DOES serve (the guard is not over-eager).
-        let honest1 = PorosHost::new(old_line[1], shares[1].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
+        let good_old_hosts: Vec<PorosHost> = (0..usize::from(n))
+            .map(|i| {
+                PorosHost::new(old_line[i], shares[i].clone(), binding.clone(), old_line.clone(), usize::from(t), b"c".to_vec(), old_epoch, beacon, 4,
                 Sybil::Uncapped,
-            );
+            )
+            })
+            .collect();
         let mut good_hosts: Vec<PorosHost> = (0..3)
             .map(|j| {
                 let secret = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0x99, j as u8])).0;
@@ -2132,7 +2320,7 @@ mod tests {
                 h
             })
             .collect();
-        for (host, i) in [(&honest0, 0usize), (&honest1, 1usize)] {
+        for (i, host) in good_old_hosts.iter().enumerate() {
             let frames = host.emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x20u8 + i as u8; secret_len + 8], &[0xC0, i as u8]);
             for e in frames {
                 if let Effect::Send { to, frame } = e {

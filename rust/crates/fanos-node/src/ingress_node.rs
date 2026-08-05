@@ -405,16 +405,30 @@ mod tests {
         for n in &mut new_nodes {
             n.arm_rotation(new_epoch, new_coords.clone(), old_coords.clone());
         }
-        // A threshold subset of the old line emits sealed reshare frames; route them to the new line.
-        for (i, &from) in old_coords.iter().enumerate().take(t) {
+        // **Every** outgoing member emits, because that is what production does — `spawn_ingress_rotation`
+        // says "Only an OUTGOING member emits" and all `n` of them are outgoing. Collect first and deliver
+        // second, so each new member can be handed the contributions in a *different* order.
+        let mut inbox: Vec<Vec<(Triple, Vec<u8>)>> = vec![Vec::new(); new_coords.len()];
+        for (i, &from) in old_coords.iter().enumerate() {
             let key_rnd = vec![0x20u8 + i as u8; secret_len * (t - 1) + 8];
             let frames = old_node(i).emit_reshares(new_epoch, &new_coords, &new_keys, &key_rnd, &[0xC0, i as u8]);
             assert_eq!(frames.len(), new_coords.len(), "one reshare frame per new member");
             for e in frames {
                 if let Effect::Send { to, frame } = e {
                     let j = new_coords.iter().position(|c| *c == to).unwrap();
-                    new_nodes[j].step(Instant(0), Input::Message { from, frame });
+                    inbox[j].push((from, frame));
                 }
+            }
+        }
+        // **The arrival race, made deterministic.** Member `j` sees the contributions rotated by `j`, so the
+        // first two to reach each member are `{1,2}`, `{2,3}`, `{3,1}` — three *different* subsets. An engine
+        // that combined whoever answered first would put the three members on three different polynomials
+        // (they agree only at 0), and the SERVE below could not succeed; the earlier form of this test emitted
+        // from exactly `t` members, which made the subset unique by construction and could never see it.
+        for (j, mut msgs) in inbox.into_iter().enumerate() {
+            msgs.rotate_left(j % old_coords.len());
+            for (from, frame) in msgs {
+                new_nodes[j].step(Instant(0), Input::Message { from, frame });
             }
         }
         // Every new node adopted the new epoch (the composite exposed it via `host_epoch`).
