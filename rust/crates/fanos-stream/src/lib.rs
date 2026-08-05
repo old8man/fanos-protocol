@@ -306,7 +306,10 @@ impl StreamSender {
     /// The total number of segments ever sealed (reclaimed + in-flight) — the sequence space, used as
     /// the send-window upper bound and the FIN-bearing last sequence.
     fn total(&self) -> u32 {
-        self.base + self.segments.len() as u32
+        // `segments` holds only the in-flight window, which `with_send_window`/`SACK_WIDTH` bound far below
+        // `u32::MAX`; saturating rather than wrapping so a bound that ever moved would stall the sequence
+        // space loudly instead of aliasing an old sequence onto a new one (#110).
+        self.base.saturating_add(u32::try_from(self.segments.len()).unwrap_or(u32::MAX))
     }
 
     /// Open a stream carrying a complete `payload` (one-shot / whole-message convenience): equivalent
@@ -706,7 +709,9 @@ impl StreamReceiver {
                 sack |= 1u64 << i;
             }
         }
-        let held = self.received.len() as u32;
+        // Bounded by `recv_window` (itself clamped to `SACK_WIDTH`), so the conversion cannot lose a
+        // reorder buffer's worth of segments; saturating for the same reason as `total` (#110).
+        let held = u32::try_from(self.received.len()).unwrap_or(u32::MAX);
         Ack {
             cumulative: self.next,
             sack,

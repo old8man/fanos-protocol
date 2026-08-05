@@ -94,6 +94,41 @@ cast_sign_loss = "allow"
 cast_precision_loss = "allow"   # small counts (n ≤ cell size) cast to f64; no real loss
 cast_possible_wrap = "allow"    # bounded small indices/exponents
 similar_names = "allow"
+# **The narrowing-cast allowances above are owed work, and their reason is narrower than their scope**
+# (#110). "FANOS deliberately truncates in field reduction" is true of `fanos-field`, `fanos-primitives`,
+# the crypto crates and the wire codecs, where narrowing into a fixed width *is* the specified operation.
+# It has nothing to do with the length and count casts it also covers elsewhere, where a prefix that wraps
+# encodes two different values identically and the decoder reads a short buffer — #75's "one frame type,
+# two encodings", with the ambiguity created by arithmetic instead of by a second implementation.
+#
+# Measured by removing them: **~90 sites across ~20 crates**, of which the dangerous class — a length or
+# count crossing the wire — is small and has been fixed at the site with the bound named:
+# `fanos-stream::total`/`Ack::held`, `fanos-diaulos::frame`, `fanos-cli`, `fanos-code::hamming`,
+# `fanos-ergon`, `fanos-testkit`, `fanos-thesauros`, `fanos-vpn`, `fanos-proxy`, and — the one that
+# mattered — **`fanos-keygen`'s beacon reshare trigger, whose roster length fields now refuse rather than
+# wrap**, because two members reading two different contributor sets from bytes that verify is the single
+# failure that authenticated message exists to prevent.
+#
+# What remains is quantisation (`loss × 255`), plane-bounded indices, and test harnesses. Scoping the lint
+# per crate was attempted and abandoned in the same session: done crate-by-crate it reproduces exactly this
+# defect at crate granularity — twenty near-identical exemptions, each as unread as one global line. Doing
+# it properly means per-site bounds, which is #110's own work and not a side effect of another task.
+#
+# **Narrowing casts are NOT allowed workspace-wide.** They used to be, justified by "FANOS deliberately
+# truncates in field reduction" — a statement that is true of `fanos-field`, `fanos-primitives` and the
+# crypto crates, and has nothing to do with the twenty-two length casts it also covered in `fanos-taxis`,
+# `fanos-onoma`, `fanos-dromos`, `fanos-threshold`, `fanos-stream`, `fanos-diaulos`, `fanos-core` and
+# `fanos-angelos`. Every one of those was safe, but safe *by an invariant maintained somewhere else* rather
+# than by the compiler — the shape that let an opt-in Sybil cap ship switched off (#76) and a workspace
+# proxy gate pass vacuously for its whole life.
+#
+# The failure a narrowing length cast produces is not a panic but a **canonical-encoding break**: a length
+# prefix that wraps encodes two different values identically and the decoder reads a short buffer, which is
+# #75's "one frame type, two encodings" with the ambiguity created by arithmetic instead of by a second
+# implementation. The tree's own idiom is already `u8::try_from(..)` with an explicit refusal
+# (`fanos-calypso::deal_service_key`, `PorosHost::emit_reshare`), so a site that genuinely needs the cast
+# carries a local `#[expect(..)]` **naming the bound** — which makes the invariant visible where it is
+# relied on. The crates whose reason it actually is re-allow these in their own `[lints]` block.
 doc_markdown = "allow"
 inline_always = "allow"
 many_single_char_names = "allow" # dense numerical kernels use math-style names

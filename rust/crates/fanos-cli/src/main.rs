@@ -58,7 +58,9 @@ fn binomial_tail(n: u32, t: u32, f: f64) -> f64 {
         for i in 0..k {
             coeff = coeff * f64::from(n - i) / f64::from(i + 1);
         }
-        sum += coeff * f.powi(k as i32) * (1.0 - f).powi((n - k) as i32);
+        // `k` and `n − k` are binomial indices bounded by the cell size, so both fit an `i32` exactly.
+        let (kk, nk) = (i32::try_from(k).unwrap_or(i32::MAX), i32::try_from(n - k).unwrap_or(i32::MAX));
+        sum += coeff * f.powi(kk) * (1.0 - f).powi(nk);
     }
     sum
 }
@@ -281,7 +283,8 @@ fn demo() {
 
     let secret = b"NYX line private key";
     let rnd: Vec<u8> = (0..5 * secret.len())
-        .map(|i| (i as u8).wrapping_mul(97).wrapping_add(3))
+        // A deterministic filler byte per index: the wrap IS the generator, so it is written as one.
+        .map(|i| u8::try_from(i % 256).unwrap_or(0).wrapping_mul(97).wrapping_add(3))
         .collect();
     let shares = split(secret, 6, 8, &rnd).unwrap();
     let recovered = reconstruct(&shares[1..7]).unwrap();

@@ -241,7 +241,11 @@ fn checksum(data: &[u8]) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !(sum as u16)
+    // The loop above folds every carry back in, so `sum` is already 16-bit here — the narrowing *is*
+    // RFC 1071's fold, not a lost length.
+    #[expect(clippy::cast_possible_truncation, reason = "the carry fold above leaves sum < 2^16")]
+    let folded = sum as u16;
+    !folded
 }
 
 #[cfg(test)]

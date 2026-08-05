@@ -68,7 +68,7 @@ pub fn require_quiet_host(what: &str) {
         "INCONCLUSIVE (cpu share {share:.2} < {QUIET_ENOUGH} after {QUIET_RETRIES} re-measurements over \
          {}s): this run cannot measure {what} — a starved host and a defect look the same here. Re-run with \
          nothing else on the box; do not read this as a failure of the property.",
-        QUIET_RETRIES * QUIET_RETRY_WAIT.as_secs() as u32,
+        QUIET_RETRIES * u32::try_from(QUIET_RETRY_WAIT.as_secs()).unwrap_or(u32::MAX),
     );
 }
 

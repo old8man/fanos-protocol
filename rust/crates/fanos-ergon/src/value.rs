@@ -90,6 +90,9 @@ impl Value {
     /// The one place narrowing happens, so a host rule never has to decide what a too-large amount means.
     pub const fn as_u64(&self) -> Result<u64, Fault> {
         match self {
+            // The guard is the proof: `try_from` is not `const`, so the narrowing is written out with the
+            // bound it relies on immediately to its left rather than left to a workspace-wide allowance.
+            #[expect(clippy::cast_possible_truncation, reason = "guarded by `*n <= u64::MAX` on this arm")]
             Self::Int(n) if *n <= u64::MAX as u128 => Ok(*n as u64),
             Self::Int(_) => Err(Fault::Overflow),
             Self::Bytes32(_) | Self::Bytes(_) | Self::Record(_) => Err(Fault::TypeMismatch),

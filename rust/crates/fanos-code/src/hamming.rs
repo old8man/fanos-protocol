@@ -124,7 +124,8 @@ mod tests {
             let mut expect = 0u8;
             for i in 0..7 {
                 if word & (1 << i) != 0 {
-                    expect ^= (i + 1) as u8;
+                    // `i < 7`, so `i + 1` is a Hamming position in `1..=7` and fits a byte exactly.
+                    expect ^= u8::try_from(i + 1).unwrap_or(u8::MAX);
                 }
             }
             assert_eq!(syndrome(word), expect, "word {word:#09b}");

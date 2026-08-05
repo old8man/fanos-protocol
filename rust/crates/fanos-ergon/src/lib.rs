@@ -876,7 +876,12 @@ mod tests {
         // D_MAX is a theorem, so the theorem is checked here rather than the constant being asserted against itself.
         // P_crit^[m] = P_crit · 3^(m-1)/(m+1) with P_crit = 2/7 (SYNARC-Ω Theorem K.5).
         let p_crit = 2.0_f64 / 7.0;
-        let ladder = |m: u32| p_crit * 3.0_f64.powi(m as i32 - 1) / f64::from(m + 1);
+        // `m` is a holonic order (1..=4 below), so the conversion is exact; written with the bound rather
+        // than leaning on a workspace-wide allowance (#110).
+        let ladder = |m: u32| {
+            let order = i32::try_from(m).unwrap_or(i32::MAX);
+            p_crit * 3.0_f64.powi(order - 1) / f64::from(m + 1)
+        };
 
         assert!((ladder(1) - 1.0 / 7.0).abs() < 1e-12, "order 1 is the maximally mixed purity — free");
         assert!((ladder(2) - 2.0 / 7.0).abs() < 1e-12, "order 2 is baseline");

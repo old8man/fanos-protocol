@@ -482,7 +482,10 @@ mod tests {
                 earned += amount;
             }
         }
-        let honest_payoff = earned as i64 - (cost_per_epoch * duration) as i64;
+        // Both sides are small test quantities (a price and `c·D` over a handful of epochs), so the
+        // conversion is exact; `try_from` states that rather than leaving it to a workspace allowance.
+        let honest_payoff =
+            i64::try_from(earned).unwrap() - i64::try_from(cost_per_epoch * duration).unwrap();
         assert_eq!(honest_payoff, 200, "honest net = price − c·D > 0");
         // Cheating: earns nothing (no cost, but no income, and reputation decays — modeled by the role layer).
         let mut cheat = Deal::open(params(price, duration)).unwrap();

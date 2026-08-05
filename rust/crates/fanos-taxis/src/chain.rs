@@ -110,11 +110,6 @@ impl<S: StateMachine> Chain<S> {
         self.state.apply_block_reward(beneficiaries, amount);
     }
 
-    /// Execute one transaction against the state (applied in committed order after its block finalizes).
-    pub fn execute(&mut self, tx: &Transaction) {
-        let _ = self.state.apply(tx);
-    }
-
     /// Execute a whole block's transactions through [`StateMachine::apply_block`], so a state machine with a parallel
     /// executor is actually used on the live path.
     pub fn execute_block(&mut self, txs: &[Transaction]) -> Vec<ExecOutcome> {
@@ -179,7 +174,14 @@ mod tests {
         state.credit(ALICE, 100);
         let mut chain = Chain::new(state);
         let root0 = chain.state_root();
-        chain.execute(&Transfer { from: ALICE, to: BOB, amount: 25, nonce: 0 }.into_tx());
+        // Through `execute_block`, which is the only execution door: it runs the state machine's
+        // `apply_block` (the parallel executor and the conservation check #94 installed), and it
+        // returns the outcome instead of discarding it.
+        assert_eq!(
+            chain.execute_block(&[Transfer { from: ALICE, to: BOB, amount: 25, nonce: 0 }.into_tx()]),
+            alloc::vec![ExecOutcome::Applied],
+            "the transfer applies, and the caller is told so",
+        );
         assert_ne!(chain.state_root(), root0);
         assert_eq!(chain.state().balance(&BOB), 25);
     }

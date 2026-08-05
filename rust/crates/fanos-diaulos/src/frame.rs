@@ -57,7 +57,9 @@ impl Frame {
                 out.extend_from_slice(&s.stream_id.to_be_bytes());
                 out.extend_from_slice(&s.seq.to_be_bytes());
                 out.push(u8::from(s.fin));
-                out.extend_from_slice(&(len as u16).to_be_bytes());
+                // `len` is capped at `MAX_SEGMENT` by the caller, so the prefix cannot wrap; saturating
+                // states the bound rather than leaning on a workspace allowance (#110).
+                out.extend_from_slice(&u16::try_from(len).unwrap_or(u16::MAX).to_be_bytes());
                 out.extend_from_slice(s.data.get(..len).unwrap_or(&[]));
                 out
             }

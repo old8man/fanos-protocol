@@ -296,17 +296,23 @@ impl<F: Field> BeaconNode<F> {
         contributors: &[u8],
         new_indices: &[u8],
     ) -> Vec<u8> {
+        // A roster too large to describe in the frame's one-byte length fields yields **no trigger** rather
+        // than a wrapped one: two members reading two different contributor sets from bytes that verify is
+        // the one failure this authenticated message exists to prevent (#110). Unreachable at every
+        // supported plane order, and present so it cannot become reachable in silence.
         reshare_trigger_frame(authority, generation, new_threshold, contributors, new_indices)
+            .unwrap_or_default()
     }
 
     /// This node's beacon holder index — its Fano point index `+ 1` (the [`VssShare`] convention: the anchor
-    /// at point `i` holds share index `i + 1`). Used to tell whether this node is a target new holder of a
+    /// at point `i` holds share index `i + 1`).expect("a test roster fits the frame"). Used to tell whether this node is a target new holder of a
     /// reshare and to combine its own sub-shares. `0` if the coord is not a plane point (never, for a member).
     fn beacon_index(&self) -> u8 {
         let me = self.coord.coords();
+        // `i < self.n`, a plane point index, so `i + 1` is a share index in `1..=n` and fits a byte.
         (0..self.n)
             .find(|&i| Point::<F>::at(i).coords() == me)
-            .map_or(0, |i| (i + 1) as u8)
+            .map_or(0, |i| u8::try_from(i + 1).unwrap_or(u8::MAX))
     }
 
     /// Whether every entry of `indices` is a valid, distinct holder index: 1-based, `≤ n`, and appearing
@@ -494,7 +500,11 @@ impl<F: Field> BeaconNode<F> {
             self.rejects.reshare_no_authority = self.rejects.reshare_no_authority.saturating_add(1);
             return Vec::new(); // no trust root ⇒ no authenticated reshare is possible
         };
-        let params = reshare_trigger_params(generation, new_threshold, &contributors, &new_indices);
+        let Some(params) = reshare_trigger_params(generation, new_threshold, &contributors, &new_indices)
+        else {
+            self.rejects.reshare_no_authority = self.rejects.reshare_no_authority.saturating_add(1);
+            return Vec::new(); // a roster the frame's length fields cannot describe was never signed
+        };
         if !authority_quorum_verifies(&authority, &reshare_trigger_signing_message(&params), &sigs) {
             // **The §2.1 attack, counted.** The 2-anchor coalition that could have reconstructed the beacon
             // master key is refused here — and until now, refused in silence, so the attempt left no trace
@@ -882,15 +892,20 @@ const RESHARE_TRIGGER_SIG_LABEL: &[u8] = b"FANOS-v1/beacon-reshare-trigger";
 /// The canonical parameter encoding of a reshare trigger — the bytes the authority signs, and the frame's
 /// prefix before the trailing signature: `generation(8) ‖ new_threshold(1) ‖ n_contrib(1) ‖ contributors ‖
 /// n_new(1) ‖ new_indices`.
-fn reshare_trigger_params(generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
+fn reshare_trigger_params(generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Option<Vec<u8>> {
     let mut body = Vec::with_capacity(8 + 2 + contributors.len() + 1 + new_indices.len());
     body.extend_from_slice(&generation.to_be_bytes());
-    body.push(new_threshold as u8);
-    body.push(contributors.len() as u8);
+    // **Length prefixes refuse rather than wrap.** This body is what the beacon's authority signs, and what
+    // every member re-derives to agree on the contributor set — a length that wrapped would let two members
+    // read two different sets from bytes that verify, which is the one failure this message exists to
+    // prevent. A cell has far fewer than 255 members at every supported plane order, so the refusal is
+    // unreachable in practice and present so that it cannot become reachable silently (#110).
+    body.push(u8::try_from(new_threshold).ok()?);
+    body.push(u8::try_from(contributors.len()).ok()?);
     body.extend_from_slice(contributors);
-    body.push(new_indices.len() as u8);
+    body.push(u8::try_from(new_indices.len()).ok()?);
     body.extend_from_slice(new_indices);
-    body
+    Some(body)
 }
 
 /// The message the authority signs and every anchor verifies: `LABEL ‖ params`.
@@ -905,8 +920,8 @@ fn reshare_trigger_signing_message(params: &[u8]) -> Vec<u8> {
 /// `authority` over `LABEL ‖ params` — so an unauthenticated (forged) trigger is rejected before any anchor
 /// deals a sub-share (audit §2.1). The frame self-floods with its signature, so every downstream anchor
 /// re-verifies the same authorization.
-fn reshare_trigger_frame(authority: &[(u8, &HybridSigSecret)], generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Vec<u8> {
-    let params = reshare_trigger_params(generation, new_threshold, contributors, new_indices);
+fn reshare_trigger_frame(authority: &[(u8, &HybridSigSecret)], generation: u64, new_threshold: usize, contributors: &[u8], new_indices: &[u8]) -> Option<Vec<u8>> {
+    let params = reshare_trigger_params(generation, new_threshold, contributors, new_indices)?;
     let message = reshare_trigger_signing_message(&params);
     let mut signed: Vec<(u8, HybridSignature)> = Vec::new();
     for (index, sk) in authority {
@@ -916,12 +931,12 @@ fn reshare_trigger_frame(authority: &[(u8, &HybridSigSecret)], generation: u64, 
     }
     signed.sort_by_key(|(i, _)| *i);
     let mut body = params;
-    body.push(signed.len() as u8);
+    body.push(u8::try_from(signed.len()).ok()?);
     for (index, sig) in &signed {
         body.push(*index);
         body.extend_from_slice(&sig.to_bytes());
     }
-    encode(FrameType::BeaconReshareTrigger, &body)
+    Some(encode(FrameType::BeaconReshareTrigger, &body))
 }
 
 /// Whether `sigs` is a **quorum of distinct authority members** each signing `message`.
@@ -1495,7 +1510,7 @@ mod tests {
         // 3..6); new threshold t'=3. A coordinator broadcasts the trigger to the whole cell.
         let contributors = [4u8, 5, 6, 7];
         let new_indices = [4u8, 5, 6, 7];
-        let trigger = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &contributors, &new_indices);
+        let trigger = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &contributors, &new_indices).expect("a test roster fits the frame");
         let initial: Vec<(usize, Vec<u8>)> = (0..N).map(|k| (k, trigger.clone())).collect();
         route(&mut nodes, initial, &[]);
 
@@ -1550,11 +1565,11 @@ mod tests {
 
         // The §2.1 exploit — a 2-coalition names new_threshold=2 at its own indices {5,6} — but SIGNED BY THE
         // ATTACKER, not the authority. It is refused, so no honest anchor deals a sub-share. This is the fix.
-        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &impostor_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &impostor_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6]).expect("a test roster fits the frame")).is_empty(),
             "a foreign-signed (unauthenticated) reshare trigger is refused — the 2-coalition exfil is closed");
         assert_eq!(victim.reshare_gen(), 0, "and does not adopt it");
         // Tampering a validly-signed trigger (corrupt a trailing signature byte) also fails verification.
-        let mut tampered = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]);
+        let mut tampered = reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]).expect("a test roster fits the frame");
         if let Some(b) = tampered.last_mut() {
             *b ^= 0xFF;
         }
@@ -1596,7 +1611,7 @@ mod tests {
         let mut rootless =
             BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
         assert!(
-            recv(&mut rootless, reshare_trigger_frame(&[(0, &authority_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6])).is_empty(),
+            recv(&mut rootless, reshare_trigger_frame(&[(0, &authority_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6]).expect("a test roster fits the frame")).is_empty(),
             "a cell with no recovery authority cannot reshare at all"
         );
         assert_eq!(rootless.rejects().reshare_no_authority, 1, "and says so as a provisioning gap");
@@ -1604,15 +1619,15 @@ mod tests {
 
         // Even correctly AUTHORITY-signed, the defence-in-depth guards still refuse: a degree-0 (threshold-1)
         // reshare, an out-of-range or duplicate new index, and a far-future generation.
-        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 1, &[1, 2, 3, 4], &[5])).is_empty(),
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 1, &[1, 2, 3, 4], &[5]).expect("a test roster fits the frame")).is_empty(),
             "the MIN_RESHARE_THRESHOLD floor refuses a degree-0 reshare even from the authority");
-        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 6, 99])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 5, 6])).is_empty());
-        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6])).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 6, 99]).expect("a test roster fits the frame")).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[5, 5, 6]).expect("a test roster fits the frame")).is_empty());
+        assert!(recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1_000_000, 3, &[1, 2, 3, 4], &[4, 5, 6]).expect("a test roster fits the frame")).is_empty());
         assert_eq!(victim.reshare_gen(), 0, "no refused trigger advanced any state");
 
         // A well-formed reshare correctly signed by the authority is honored.
-        assert!(!recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7])).is_empty(),
+        assert!(!recv(&mut victim, reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[4, 5, 6, 7]).expect("a test roster fits the frame")).is_empty(),
             "a legitimate authority-signed reshare is still dealt");
     }
 
