@@ -1,0 +1,84 @@
+//! **Every directory publish reports whether it landed** (#106) — a source ratchet plus the label table.
+//!
+//! All ten `publish_*` functions returned their `bool` faithfully; every per-epoch republish loop dropped it.
+//! A node whose writes were failing kept running and believing otherwise, while it fell out of the mixdir (so
+//! no circuit could route through it), the capability roster (so no role could be assigned to it), the exit
+//! directory and the load balancer's input — all silently.
+//!
+//! The recorder lives *inside* each publisher rather than at the ten callers, so the eleventh caller cannot
+//! forget it. What the eleventh *publisher* could forget is calling it at all, which is what this ratchet is
+//! for: a `put_ephemeral` in this crate that no `note_publish` follows is a new silent directory.
+
+use std::path::Path;
+
+use fanos_node::Directory;
+
+/// Read every `.rs` under `crates/fanos-node/src`, as `(path, text)`.
+fn sources() -> Vec<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                out.push((p.display().to_string(), text));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(), &mut out);
+    out
+}
+
+/// Every `put_ephemeral` in this crate is followed by a `note_publish` in the same function.
+///
+/// Approximated by "within the next 6 lines", which is what the shape allows: each site is
+/// `let landed = client.put_ephemeral(..).await;` then the report. The window is deliberately tight — a
+/// generous one would pass on a `note_publish` belonging to a different publisher further down the file.
+#[test]
+fn every_directory_publish_in_this_crate_reports_whether_it_landed() {
+    let mut sites = 0usize;
+    let mut silent: Vec<String> = Vec::new();
+    for (path, text) in sources() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            // The definition itself, and doc comments naming it, are not call sites.
+            if !line.contains(".put_ephemeral(") || line.trim_start().starts_with("//") {
+                continue;
+            }
+            sites += 1;
+            let window = lines.get(i..lines.len().min(i + 7)).unwrap_or_default().join("\n");
+            if !window.contains("note_publish") {
+                silent.push(format!("{path}:{}", i + 1));
+            }
+        }
+    }
+    // The denominator is a claim about the scan before it is a claim about the code: a regex that matched
+    // nothing would report "no silent publishers" and mean "I did not look".
+    assert!(sites >= 10, "the scan found only {sites} publish sites — it is not looking where it thinks");
+    assert!(silent.is_empty(), "these directory publishes drop their outcome silently: {silent:#?}");
+}
+
+/// The tag an operator reads is stable and unambiguous.
+///
+/// Written out in `Directory::tag` rather than taken from variant order, so that reordering the enum — a
+/// thing a later edit does without thinking — cannot renumber a counter an operator is watching.
+#[test]
+fn directory_tags_and_names_are_unique_and_pinned() {
+    let mut tags: Vec<u64> = Directory::ALL.iter().map(|d| d.tag()).collect();
+    let mut names: Vec<&str> = Directory::ALL.iter().map(|d| d.name()).collect();
+    let (n_tags, n_names) = (tags.len(), names.len());
+    tags.sort_unstable();
+    tags.dedup();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(tags.len(), n_tags, "two directories share a tag, so their counters would merge");
+    assert_eq!(names.len(), n_names, "two directories share a name");
+    // Pinned values, not just distinct ones: an operator's dashboard reads these numbers.
+    assert_eq!(Directory::MixKey.tag(), 0);
+    assert_eq!(Directory::Health.tag(), 7);
+    assert_eq!(Directory::ALL.len(), 8, "a new directory must be added to ALL, or it is invisible to readers");
+}

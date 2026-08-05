@@ -66,13 +66,14 @@ pub async fn publish_bound_mix_key(
     public: &HybridKemPublic,
 ) -> bool {
     let (id, vrf_public, vrf_proof) = proof;
-    client
+    let landed = client
         .put_ephemeral(
             mix_key_slot(client.address(), epoch),
             Entitlement::encode(id, vrf_public, vrf_proof, &public.encode()),
             DIRECTORY_SLOT_EPOCHS,
         )
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::MixKey, epoch, landed)
 }
 
 /// The overlay store slot a node's per-epoch onion key is published at — domain-separated from every
@@ -97,9 +98,10 @@ pub async fn publish_mix_key(
     epoch: Epoch,
     public: &HybridKemPublic,
 ) -> bool {
-    client
+    let landed = client
         .put_ephemeral(mix_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS)
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::MixKey, epoch, landed)
 }
 
 /// Resolve the onion public key published by the node at `coord` for `epoch`, or `None` if none is

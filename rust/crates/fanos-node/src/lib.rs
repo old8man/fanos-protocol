@@ -32,6 +32,114 @@
 /// side of the same rotation.
 pub(crate) const DIRECTORY_SLOT_EPOCHS: u32 = 1;
 
+/// Which `(coordinate, epoch)` directory a publish belongs to — the sub-kind
+/// [`Station::DirectoryPublishFailed`] is counted under.
+///
+/// Named rather than aggregated because the consequence differs: losing the mix key makes this node
+/// unroutable for the epoch, losing the capability record makes it unassignable, losing the load report makes
+/// its work invisible to the balancer. One number cannot say which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Directory {
+    /// Per-epoch onion public (`mixdir`) — a relay missing here cannot be a circuit hop.
+    MixKey,
+    /// Capability advertisement (`capdir`) — the roster the role controller assigns from.
+    Capability,
+    /// Per-role load report (`loaddir`) — the balancer's input.
+    Load,
+    /// Exit service key (`exit`) — a clearnet exit missing here cannot be selected.
+    ExitKey,
+    /// POROS ingress KEM public (`ingressdir`).
+    IngressKey,
+    /// Coherence telemetry frame (`telemetry_dir`).
+    Coherence,
+    /// Cross-cell execution certificate (`crosscell_dir`) — what a parent anchors finality on.
+    Checkpoint,
+    /// Cross-cell health report (`crosscell_dir`).
+    Health,
+}
+
+impl Directory {
+    /// Every directory, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[
+        Self::MixKey,
+        Self::Capability,
+        Self::Load,
+        Self::ExitKey,
+        Self::IngressKey,
+        Self::Coherence,
+        Self::Checkpoint,
+        Self::Health,
+    ];
+
+    /// The discriminant carried in [`Observation::tag`](fanos_runtime::ports::stations::Observation::tag).
+    ///
+    /// Written out rather than an `as` cast on the discriminant, so the wire-visible numbering is a decision
+    /// in the source instead of a consequence of variant order — reordering the enum must not renumber an
+    /// operator's counters.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::MixKey => 0,
+            Self::Capability => 1,
+            Self::Load => 2,
+            Self::ExitKey => 3,
+            Self::IngressKey => 4,
+            Self::Coherence => 5,
+            Self::Checkpoint => 6,
+            Self::Health => 7,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MixKey => "mix_key",
+            Self::Capability => "capability",
+            Self::Load => "load",
+            Self::ExitKey => "exit_key",
+            Self::IngressKey => "ingress_key",
+            Self::Coherence => "coherence",
+            Self::Checkpoint => "checkpoint",
+            Self::Health => "health",
+        }
+    }
+}
+
+/// Pass a directory publish's outcome through, recording the failures where an operator will see them.
+///
+/// **Called inside each `publish_*`, not at their callers, and that is the point.** All ten returned their
+/// `bool` faithfully and every per-epoch republish loop dropped it, so a node falling out of every roster was
+/// the last to know (#106). Putting the record at the ten callers would fix the ten that exist and leave the
+/// eleventh to remember — the same reasoning that clamps `record_tagged`'s tag at its one choke point.
+///
+/// There is **no retry and no tolerance to spend**, and that is derived: [`DIRECTORY_SLOT_EPOCHS`] is 1, so a
+/// slot outlives its own epoch by exactly the one-epoch grace a lagging reader needs and no more. A reader on
+/// the current epoch derives the current key and finds nothing. One dropped write and the node is simply not
+/// in that directory — there is no window in which a failure is harmless, so every one is recorded.
+pub(crate) fn note_publish(
+    client: &fanos_quic::Client,
+    directory: Directory,
+    epoch: Epoch,
+    landed: bool,
+) -> bool {
+    if !landed {
+        let coord = client.address();
+        client.record_station(
+            fanos_runtime::ports::stations::Station::DirectoryPublishFailed,
+            Some(coord),
+            Some(directory.tag()),
+        );
+        tracing::warn!(
+            directory = directory.name(),
+            epoch = ?epoch,
+            coord = ?coord,
+            "directory publish did not land — this node is absent from that roster for this epoch"
+        );
+    }
+    landed
+}
+
 pub mod bound;
 pub mod cell_node;
 pub mod config;

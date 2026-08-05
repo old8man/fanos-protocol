@@ -436,12 +436,23 @@ async fn serve_control<N: Controllable>(
 /// Drains until a [`Notification::DataPath`] arrives, because `Observe` also raises the coherence observation
 /// and the two share the stream. `Lagged` is retried rather than treated as failure: the drop is of *other*
 /// notifications, and the one being waited for may still be ahead.
-async fn read_data_path(notes: &mut tokio::sync::broadcast::Receiver<Notification>, epoch: u64) -> String {
+async fn read_data_path(
+    notes: &mut tokio::sync::broadcast::Receiver<Notification>,
+    driver: Vec<fanos_runtime::ports::stations::Observation>,
+    epoch: u64,
+) -> String {
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match tokio::time::timeout_at(deadline, notes.recv()).await {
             Ok(Ok(Notification::DataPath { stations, gather })) => {
-                return fanos_node::admin::render_data_path(&stations, gather, epoch);
+                // **Two planes, one answer.** The engine counts what stops inside it; the driver counts what
+                // stops on its own side of the seam — a directory publish whose ack never came, which the
+                // engine cannot see (#106). Reporting only the engine's would tell an operator "nothing has
+                // been discarded" while this node was quietly absent from every roster. Same fold the
+                // contract already asks of any composite that forwards `Observe` to more than one place.
+                let merged =
+                    fanos_runtime::ports::stations::merge_observations(stations.into_iter().chain(driver));
+                return fanos_node::admin::render_data_path(&merged, gather, epoch);
             }
             Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
@@ -552,7 +563,7 @@ fn answer_control<N: Controllable>(
                 // Subscribe *before* issuing, or the answer can land in the gap between the two.
                 let asked = client.command(fanos_node::Command::Observe);
                 let body = if asked {
-                    read_data_path(&mut notes, epoch.get()).await
+                    read_data_path(&mut notes, client.driver_stations(), epoch.get()).await
                 } else {
                     "the engine is not accepting commands\n".to_owned()
                 };

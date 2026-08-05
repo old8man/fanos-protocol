@@ -134,9 +134,10 @@ pub async fn publish_ingress_key(
     epoch: Epoch,
     public: &HybridKemPublic,
 ) -> bool {
-    client
+    let landed = client
         .put_ephemeral(ingress_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS)
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::IngressKey, epoch, landed)
 }
 
 /// Resolve one incoming line member's ingress KEM public for `epoch`.

@@ -28,6 +28,7 @@ use fanos_field::Field;
 use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
 use fanos_proteus::{Environment, Morph, MorphCodec, MorphController, ProteusShaper};
+use fanos_runtime::ports::stations::{Observation, Station, Stations};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
@@ -454,6 +455,15 @@ pub struct NodeHandle {
     /// forever, from the first reshuffle onward. That is a defect in the shipped reshuffle, not only in probing: an
     /// operator surface that names a node's position must name where it actually is.
     addr: Arc<Mutex<Triple>>,
+    /// The **driver's own** data-path readings, merged into the engine's when `Observe` is answered.
+    ///
+    /// Some work stops on this side of the seam and the engine never learns of it: a directory publish whose
+    /// ack times out is the case that mattered (#106). The contract already says what to do with two planes —
+    /// "every composite that forwards `Observe` to more than one place owes the same fold"
+    /// ([`fanos_runtime::ports::fold_data_path`]) — and a node is exactly such a composite once the driver
+    /// observes anything at all. Shared, not copied, so every `Client` a publisher clones writes to the one
+    /// plane an operator reads.
+    stations: Arc<Mutex<Stations>>,
     local_addr: SocketAddr,
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
@@ -572,6 +582,7 @@ impl NodeHandle {
     pub fn client(&self) -> Client {
         Client {
             addr: self.addr.clone(),
+            stations: self.stations.clone(),
             input_tx: self.input_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
             events_tx: self.events_tx.clone(),
@@ -639,6 +650,8 @@ enum Control {
 pub struct Client {
     /// The node's live coordinate — the same shared cell [`NodeHandle`] holds, not a copy of it.
     addr: Arc<Mutex<Triple>>,
+    /// The driver's data-path plane — the same shared cell [`NodeHandle`] holds.
+    stations: Arc<Mutex<Stations>>,
     input_tx: mpsc::Sender<Input>,
     ctrl_tx: mpsc::UnboundedSender<Control>,
     events_tx: broadcast::Sender<Notification>,
@@ -647,6 +660,23 @@ pub struct Client {
 }
 
 impl Client {
+    /// Record one **driver-side** discard on this node's data-path plane, at `line`, under `tag`.
+    ///
+    /// For work that stops before or after the engine, so the engine cannot count it. The engine's own plane
+    /// is untouched; the two are merged when `Observe` is answered ([`Self::driver_stations`]).
+    pub fn record_station(&self, station: Station, line: Option<Triple>, tag: Option<u64>) {
+        self.stations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_tagged(station, line, tag, 1);
+    }
+
+    /// This node's driver-side readings, to be folded into the engine's answer to `Observe`.
+    #[must_use]
+    pub fn driver_stations(&self) -> Vec<Observation> {
+        self.stations.lock().unwrap_or_else(PoisonError::into_inner).observations()
+    }
+
     /// This node's overlay coordinate, as of now — the same shared cell [`NodeHandle::address`] reads.
     #[must_use]
     pub fn address(&self) -> Triple {
@@ -1664,6 +1694,7 @@ fn spawn_inner(
 
     Ok(NodeHandle {
         addr: seat,
+        stations: Arc::new(Mutex::new(Stations::new())),
         local_addr,
         input_tx,
         ctrl_tx,
@@ -2653,6 +2684,48 @@ mod tests {
     use crate::identity::verifiable_coordinate;
     use fanos_field::F2;
 
+    /// The driver's plane records what the engine cannot see, and every `Client` clone writes to the one
+    /// plane an operator reads (#106).
+    ///
+    /// The sharing is the load-bearing half. Each directory publisher holds its own `Client` clone, so a
+    /// per-clone plane would give eight private counters and an `Observe` that reports whichever one the CLI
+    /// happened to hold — which is indistinguishable from a healthy node.
+    #[test]
+    fn the_driver_plane_is_shared_across_client_clones_and_reads_back() {
+        let (input_tx, _input_rx) = mpsc::channel::<Input>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
+        let (events_tx, _events_rx) = broadcast::channel::<Notification>(8);
+        let coord: Triple = [1, 0, 1];
+        let client = Client {
+            addr: Arc::new(Mutex::new(coord)),
+            stations: Arc::new(Mutex::new(Stations::new())),
+            input_tx,
+            ctrl_tx,
+            events_tx,
+            beacons: tokio::sync::watch::channel(None).1,
+            genesis: BeaconSeed::GENESIS,
+        };
+
+        // Silent until something stops. A plane that reports counts before any work failed would make
+        // "nothing has fired" meaningless, which is the whole value of the verb.
+        assert!(client.driver_stations().is_empty(), "a node that has dropped nothing reports nothing");
+
+        // A publisher's clone records; the CLI's original reads it.
+        let publisher = client.clone();
+        publisher.record_station(Station::DirectoryPublishFailed, Some(coord), Some(3));
+        publisher.record_station(Station::DirectoryPublishFailed, Some(coord), Some(3));
+        publisher.record_station(Station::DirectoryPublishFailed, Some(coord), Some(5));
+
+        let seen = client.driver_stations();
+        assert_eq!(seen.len(), 2, "two directories failed, not two-or-three counts: {seen:?}");
+        let by_tag: Vec<(Option<u64>, u64)> = seen.iter().map(|o| (o.tag, o.count)).collect();
+        assert_eq!(by_tag, vec![(Some(3), 2), (Some(5), 1)], "counts accumulate per directory");
+        assert!(
+            seen.iter().all(|o| o.station == Station::DirectoryPublishFailed && o.line == Some(coord)),
+            "and each names the coordinate that went missing"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "heavy real-node fixture, superseded by fanos-sim's fabric suite — see the note above"]
     async fn the_fabric_seam_carries_real_node_traffic() {
@@ -2841,6 +2914,7 @@ mod tests {
         let (events_tx, _events_rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
             addr: Arc::new(Mutex::new(genesis_coord)),
+            stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),
@@ -2935,6 +3009,7 @@ mod tests {
         let (events_tx, _rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
             addr: Arc::new(Mutex::new(genesis_coord)),
+            stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
             ctrl_tx,
             events_tx: events_tx.clone(),

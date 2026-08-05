@@ -351,9 +351,10 @@ pub async fn publish_exit_key(
     public: &HybridKemPublic,
     credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
 ) -> bool {
-    client
+    let landed = client
         .put_ephemeral(exit_key_slot(coord, epoch), exit_record(public, credential), DIRECTORY_SLOT_EPOCHS)
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::ExitKey, epoch, landed)
 }
 
 /// Resolve the exit service key published by the node at `coord` for `epoch`, or `None` if none is

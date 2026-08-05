@@ -118,13 +118,14 @@ pub async fn publish_capability(
     node_id: NodeId,
     capability: Capability,
 ) -> bool {
-    client
+    let landed = client
         .put_ephemeral(
             cap_slot(coord, epoch),
             advertisement(vrf_secret, node_id, epoch, capability),
             DIRECTORY_SLOT_EPOCHS,
         )
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::Capability, epoch, landed)
 }
 
 /// Resolve and verify the capability the node at `coord` advertised for `epoch`, or `None` if none is
@@ -228,7 +229,8 @@ pub fn spawn_capability_publisher(
                     Some(prove) => bound_advertisement(&prove(epoch, &seed), &vrf_secret, node_id, epoch, capability),
                     None => advertisement(&vrf_secret, node_id, epoch, capability),
                 };
-                client.put_ephemeral(cap_slot(coord, epoch), bytes, DIRECTORY_SLOT_EPOCHS).await
+                let landed = client.put_ephemeral(cap_slot(coord, epoch), bytes, DIRECTORY_SLOT_EPOCHS).await;
+                crate::note_publish(&client, crate::Directory::Capability, epoch, landed)
             }
         };
         publish(epoch, seed).await;

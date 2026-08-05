@@ -240,6 +240,20 @@ pub enum Station {
     /// line is the case that reaches it, because resharing invalidates the dealt per-share commitments and
     /// leaves only the descriptor commitment to check against.
     DescriptorUnrecoverable,
+
+    /// A `(coordinate, epoch)` directory publish did not land — the node is **absent from that roster for
+    /// that epoch**, and until this station existed it was the last to know.
+    ///
+    /// Not a soft failure with a retry behind it. `DIRECTORY_SLOT_EPOCHS = 1`, derived from the one-epoch
+    /// grace a reader running behind needs, so a slot outlives its own epoch and no further: the previous
+    /// publish is already dead to anyone reading the current epoch's key. **One dropped write and the node is
+    /// simply not in that directory** — unroutable through the mixdir, unassignable from the capability
+    /// roster, unselectable as an exit, invisible to load balancing — while it keeps running and believing
+    /// otherwise. There is no window in which a failure is harmless, so every one is recorded.
+    ///
+    /// [`Observation::tag`] carries which directory, since the consequence differs by directory and an
+    /// aggregate count cannot say whether a node lost its onion key or its load report.
+    DirectoryPublishFailed,
 }
 
 impl Station {
@@ -269,6 +283,7 @@ impl Station {
         Self::AdmissionNoCapacity,
         Self::ShareOffCommitment,
         Self::DescriptorUnrecoverable,
+        Self::DirectoryPublishFailed,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
         Self::StoreAtCapacity,
@@ -305,6 +320,7 @@ impl Station {
             Self::AdmissionNoCapacity => "admission.no_capacity",
             Self::ShareOffCommitment => "share.off_commitment",
             Self::DescriptorUnrecoverable => "descriptor.unrecoverable",
+            Self::DirectoryPublishFailed => "directory.publish_failed",
         }
     }
 }
@@ -386,8 +402,10 @@ pub struct Observation {
     /// "this discard is not attributable to a line" (a frame that failed to decode before its line could
     /// be read, say), and keeping it distinct stops an unattributed count from being read as a line's.
     pub line: Option<Triple>,
-    /// The wire **type code** the frame carried, where the site read one — the second half of the skew
-    /// question (`design-upgrade.md` §4 asks for decode failures "counted per tag, per line").
+    /// A small **site-defined discriminant**: which sub-kind of this station fired. Its meaning belongs to
+    /// the station, not to this field — the frame stations put the wire **type code** here (the second half
+    /// of the skew question, which `design-upgrade.md` §4 asks be "counted per tag, per line"), and
+    /// [`Station::DirectoryPublishFailed`] puts which directory failed to publish.
     ///
     /// `None` where the site has no tag to report, which is most of them: a gather that expired stopped for
     /// reasons that have nothing to do with a frame type. Kept `Option` rather than defaulted to `0` for the
@@ -652,6 +670,7 @@ mod tests {
                 Station::AdmissionNoCapacity => listed(Station::AdmissionNoCapacity),
                 Station::ShareOffCommitment => listed(Station::ShareOffCommitment),
                 Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
+                Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
             }
         }
         // And no variant is listed twice, which would double-count it in any enumeration.

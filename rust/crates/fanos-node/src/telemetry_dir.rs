@@ -138,9 +138,10 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
         return false;
     };
     let bytes = frame.export(budget, &mut rng);
-    client
+    let landed = client
         .put_ephemeral(coherence_slot(client.address(), epoch), bytes.to_vec(), DIRECTORY_SLOT_EPOCHS)
-        .await
+        .await;
+    crate::note_publish(client, crate::Directory::Coherence, epoch, landed)
 }
 
 /// Resolve the coherence frame the node at `coord` published for `epoch`.

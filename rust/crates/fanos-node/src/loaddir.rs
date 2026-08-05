@@ -92,7 +92,10 @@ pub async fn publish_load(
     load: Demand,
     credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
 ) -> bool {
-    client.put_ephemeral(load_slot(coord, epoch), load_record(load, credential), DIRECTORY_SLOT_EPOCHS).await
+    let landed = client
+        .put_ephemeral(load_slot(coord, epoch), load_record(load, credential), DIRECTORY_SLOT_EPOCHS)
+        .await;
+    crate::note_publish(client, crate::Directory::Load, epoch, landed)
 }
 
 /// The bytes a load report is stored as: the bare per-role figures, or those inside the coordinate-bound
