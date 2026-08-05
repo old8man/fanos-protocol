@@ -153,16 +153,21 @@ where
         // own words latency — and on a saturated box latency is the box. So this declines to conclude rather
         // than reporting a defect it cannot distinguish from contention.
         if started.elapsed() > HANG_CEILING {
+            // `host_cpu_share` is **availability**, `cores / load` — not busy-ness. I had the comparison and
+            // the wording inverted on the first attempt, and the guard's own output caught it: it declared a
+            // host at 0.70 "busy, which is quiet" and asserted anyway. Below `QUIET_ENOUGH` this process
+            // cannot expect half a core, so every deadline competes with an equal amount of foreign work.
             let share = host_cpu_share();
             assert!(
-                share < QUIET_ENOUGH,
-                "{what}: INCONCLUSIVE — still changing at the {HANG_CEILING:?} ceiling on a host that is \
-                 {share:.2} busy, which is quiet, so this is the system and not the machine. Last seen: {last}"
+                share >= QUIET_ENOUGH,
+                "{what}: INCONCLUSIVE — still changing at the {HANG_CEILING:?} ceiling with {share:.2} of a \
+                 core available, which is quiet enough to conclude, so this is the system and not the \
+                 machine. Last seen: {last}"
             );
             eprintln!(
-                "{what}: DECLINED — the ceiling was reached on a host {share:.2} busy (quiet is < \
-                 {QUIET_ENOUGH:.2}), so this measures the machine. Re-run it alone before believing \
-                 anything. Last seen: {last}"
+                "{what}: DECLINED — the ceiling was reached with only {share:.2} of a core available \
+                 (quiet needs >= {QUIET_ENOUGH:.2}), so this measures the machine. Re-run it alone before \
+                 believing anything. Last seen: {last}"
             );
             return;
         }
