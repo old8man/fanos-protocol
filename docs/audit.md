@@ -3405,3 +3405,97 @@ test that drives a call production cannot make.
 The rule this earns: **before writing "nothing handles X", read the file around the function, not only its
 callers.** The remedy is routinely present under a different name — the same lesson `canonical-addressee-family`
 records from the other direction.
+
+# Audit pass 2026-08-05 (second) — resharing needs an agreed committee, and a controller needs to see its own boundary
+
+Read-only, while a full verification held the tree. Four findings and three re-classifications; one CRITICAL
+fixed the same day.
+
+## §1. CRITICAL (fixed, `61b9061`) — a POROS rotation combined whoever answered first
+
+`PorosHost::on_reshare` adopted on `gather.len() >= threshold`. Old member `k` re-splits its share under a
+**fresh random** polynomial `g_k`, so a member combining subset `A` lands on `h_A = Σ_{k∈A} λ^A_k·g_k` —
+every `h_A` passes through the secret at 0, and no two agree anywhere else. `spawn_ingress_rotation` has
+*every* outgoing member emit, so three new members raced three senders independently and agreed about one
+time in nine. The other eight left the rotated line holding points of three different curves: unable to
+reconstruct its own descriptor, fail-safe but dead, and dead again at the next epoch. **No Byzantine member
+required.**
+
+The invariant was written down all along, in the primitive's own contract (`shamir::combine_contributions`:
+*"every new member using the same `old_xs` subset lands on one consistent new polynomial"*), and the sibling
+subsystem already honours it — `fanos-keygen`'s beacon reshare waits for *"the identical, trigger-named
+contributor set… (deterministic agreement)"*. POROS has no authority to sign a trigger, so it now **derives**
+what the beacon is told: a Fisher–Yates draw over `(community, target_epoch, old_line)`, the same shared state
+both rosters already come from.
+
+Why it survived: both rotation tests emitted from exactly `t` members, making the subset unique by
+construction. A test that pins the very degree of freedom production varies cannot fail. They now emit from
+all `n`, and the composite test hands each member a different arrival order.
+
+## §2. The homeostat cannot resolve any of the boundaries it controls against (open, #99–#101)
+
+`BehaviorMonitor` keeps `BEHAVIOR_WINDOW = 8` samples at a 500 ms heartbeat — **four seconds of history** —
+and the intraclass standard error of the mean correlation is then `≈ 0.168`, while the whole
+collective-subject band `(1/√6, √(2/6)]` is `0.169` wide. In σ, from the configured `healthy = 0.45`: the
+floor is `0.25 σ` away, the ceiling `0.76 σ`, and the shed's safety setback `0.12 σ`.
+
+Three consequences, filed separately because they have different fixes:
+
+- **#99** — the window is the root. Its stated justification is a memory bound that does not bind (448 bytes
+  against 25 KB). Requiring the estimator to resolve the distance to the floor at `z` σ gives `W ≥ 115`
+  (`z = 1`) or `454` (`z = 2`), i.e. 1–4 minutes of history — which is the *right* timescale for a structural
+  property inside a 600 s epoch. The cost is the loop's time constant, not memory: a controller cannot respond
+  faster than the precision it needs allows it to measure.
+- **#92** — the shed's margin has the wrong shape. `d_max × 0.5` makes the safety setback proportional to the
+  headroom, while the thing it must cover (estimator error) is independent of it. The derived form is
+  additive in correlation units: `d_safe = 1 − (lo + z·SE(r̂))/healthy`, which collapses to the existing
+  `d_max` as `SE → 0`.
+- **#100** — the hysteresis is one-sided. `Decouple` waits `DECOUPLE_DWELL = 3` consecutive diagnoses;
+  `Bind` fires a cell-wide `Rebalance` on the first, and `Bind` is the **noisier** side (≈40 % against 22 %
+  per heartbeat on a healthy cell). `Escalate` has no dwell either. The one guarded threshold is the one
+  furthest from the operating point.
+
+## §3. Φ, P and R are one scalar (open, #101)
+
+`from_correlation` enforces an exact unit diagonal, so `Σγ_ii² = 1/n` is pinned and, with
+`s := Σ_ij C_ij²` (the `frobenius_sq` the code already computes once and derives all three from):
+
+```text
+Φ = s/n − 1        P = s/n²        R = n/s
+```
+
+Hence `Φ ≥ 1 ⟺ P > 2/N ⟺ r > lo` and `R ≥ 1/3 ⟺ r ≤ hi`: **the entire runtime coherence verdict is
+`Φ ∈ (1, 2]`, stated in six vocabularies.** `fanos-holarch` records the one-way half of this (*"V1 is a
+derived guard rather than a fourth independent constraint"*) — but its `Γ` is trace-1 with a *varying*
+diagonal, so there the implication really is one-way; pinning the diagonal turns it into a bijection.
+
+The genuinely independent second quantity is the gap between the **mean** off-diagonal correlation and the
+**RMS** one, i.e. the dispersion among pairs — which is what `Bind` is silently detecting (high RMS, low mean
+= some pairs coupled and others not = the load-hotspot signature its §6.7 response answers). The design is
+right; nothing says so, and the quantity it turns on is never named or plotted.
+
+## §4. The beacon commitment carries two roles with opposite lifetimes (open, #98)
+
+`commitment.coeffs[0] = x·G` is a Feldman commitment to the beacon's long-term secret **and** the network's
+public name (`genesis_seed = H(label ‖ commitment)`). Role 1 demands eternal publication; role 2 demands the
+opposite. The classical beacon is a documented `[P]`, but the consequence that follows from *this* pairing is
+not: archive one config file today, and post-quantum `seed(epoch) = H(x·M(epoch))` recomputes **every past
+epoch** — and with it every meeting point and every ingress roster, for the whole recorded history. That is a
+different blast radius from the platform's other classical interims, which are per-node and forward-looking.
+It also hides the migration cost: swapping to `pqvss` changes the commitment, which renames the network.
+
+## §5. Three tasks re-classified rather than worked
+
+- **#66** (collapse TAXIS's third phase) — the premise is right and the remedy is not engineering. Every
+  2-phase BFT construction collapses the round by *aggregating* a quorum into one constant-size certificate;
+  `Certificate` carries `votes: Vec<SignedVote>` and `fanos-pqcrypto` has no aggregate or threshold signature.
+  Blocked on the same field-wide gap as #67. What *is* available without it: measure the round-trip against
+  the block period first, and look at overlapping the anti-MEV reveal with the commit phase, which no BFT
+  result forbids.
+- **#52** (verified resharing) — the opposite correction: **not** blocked on new cryptography. Equivocation
+  across new members is catchable with the hash commitments already in the tree, and the dealer-side lie is
+  answered by the per-epoch round `poros.rs` already designs — reconstruct once against the descriptor
+  commitment, then republish per-share commitments; on a mismatch the `C(n,t)` search is affordable *because
+  it is per-epoch rather than per-request*, which is exactly the amplification argument that rules it out of
+  the serving path.
+- **#93/#95** stand as recorded in §7 of the previous pass.
