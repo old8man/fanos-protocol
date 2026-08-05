@@ -1,7 +1,7 @@
 # Real-time media, and the network beneath it
 
 **Status: design, 2026-08-05. Nothing here is built.** Companion to `docs/design-application.md`, which
-defines the four privacy classes this document is organised around.
+defines the hop dial (§4) and the privacy classes (§4a) this document is organised around.
 
 Controlling every layer is the reason this can be done well — the codec, the transport, the placement and the
 anonymity substrate are normally four organisations with four incentives. It is also the reason it must be
@@ -18,7 +18,7 @@ ITU-T G.114 is the reference: one-way mouth-to-ear ≤ **150 ms** preserves natu
 tolerable with visible turn-taking damage, and beyond 400 ms speakers begin to collide. That budget is not
 negotiable by engineering; it is a property of people.
 
-Now count what an Ω3 path costs. A threshold onion hop is **not a forward** — it is a gather: the packet
+Now count what a full-anonymity path costs. A threshold onion hop is **not a forward** — it is a gather: the packet
 reaches a line, `t = ⌈2(q+1)/3⌉` of its `q+1` members compute partial decryptions, and a combiner waits for
 `t` of them before anything moves. So each hop is at least one intra-line round trip, and the hop completes
 on the **slowest of `t` responders**, not the average.
@@ -39,7 +39,7 @@ that exists this section states a structural argument, and structural arguments 
 
 ---
 
-## 2. What is actually possible, per class
+## 2. What is actually possible, per setting
 
 Read this against the hop dial of `design-application.md` §4: **encryption is on at every row**, including
 the fastest. What the rows differ in is who can learn that a call happened.
@@ -61,7 +61,7 @@ requirements**: signalling is small, rare, and latency-tolerant; media is large,
 Treating them as one channel is why existing products leak.
 
 * **The introduction is anonymous.** `Offer` / `Answer` are effects on the room's log (§3 of the application
-  design), so they ride whatever class the room has — including Ω3. *Who called whom, and when,* is the
+  design), so they ride whatever setting the room has — including the deepest. *Who called whom, and when,* is the
   metadata that matters most, it is small, and it is exactly what the mixnet is good at.
 * **The stream is relayed by a line, not a node.** The relay is `q + 1` members chosen by the geometry, and
   it rotates with the epoch. So no single machine sees a whole call, and none of them holds a long-term
