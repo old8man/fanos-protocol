@@ -303,11 +303,47 @@ async fn a_validator_joining_late_reaches_the_cells_executed_state() {
     // Now the seventh joins, at genesis, into a cell that has moved on.
     handles.push(spawn_taxis::<F2, Accounts>(cell.nodes[LATE].client(), params_for(LATE, late_keys)));
 
+    // The wait reports BOTH SIDES of the catch-up, because "the late validator is still at balance 0" names
+    // the symptom and not the half that failed. `asks` is whether it knows it is behind and said so;
+    // `answers` is what a settled peer replied with, as `(snapshot, commit-cert, nothing)`; `taken` and
+    // `certs` are what it actually adopted. A run that stalls with asks>0 and answers all-zero is a serving
+    // failure; asks=0 is a detection failure; answers>0 with taken=0 is an adoption failure. One counter
+    // would have pointed at whichever half was cheapest to blame.
     common::converge("the late validator catches up to the cell it never saw", || async {
         let Some((height, state)) = handles[LATE].snapshot().await else {
             return (false, "late:down".to_owned());
         };
-        (height >= 1 && state.balance(&BOB) == 100, format!("late:h{height}/b{}", state.balance(&BOB)))
+        let mut note = format!(
+            "late:h{height}/alice{}/bob{}/root{:02x?}",
+            state.balance(&ALICE),
+            state.balance(&BOB),
+            &fanos_taxis::state::StateMachine::state_root(&state)[..3]
+        );
+        if let Some((ph, pstate)) = handles[0].snapshot().await {
+            let _ = write!(
+                note,
+                " | peer0:h{ph}/alice{}/bob{}/root{:02x?}",
+                pstate.balance(&ALICE),
+                pstate.balance(&BOB),
+                &fanos_taxis::state::StateMachine::state_root(&pstate)[..3]
+            );
+        }
+        if let Some(p) = handles[LATE].probe().await {
+            let c = &p.consensus;
+            let _ = write!(
+                note,
+                " eng_h={} await={:?} asks={} taken={} certs={} seen={} cc_rej={:?} vote_rej={:?}",
+                c.height, c.awaiting_body, c.sync_asks, c.sync_taken, c.cert_taken, c.max_seen_height,
+                c.cc_rejects, c.vote_rejects
+            );
+        }
+        if let Some(p) = handles[0].probe().await {
+            let _ = write!(note, " peer0:h{} answers={:?}", p.consensus.height, p.consensus.sync_answers);
+        }
+        if std::env::var_os("FANOS_TRACE_LATE").is_some() {
+            eprintln!("TRACE {note}");
+        }
+        (height >= 1 && state.balance(&BOB) == 100, note)
     })
     .await;
 
