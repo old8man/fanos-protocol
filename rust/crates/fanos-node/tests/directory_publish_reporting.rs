@@ -13,7 +13,15 @@ use std::path::Path;
 
 use fanos_node::{Directory, Gate};
 
-/// Read every `.rs` under `crates/fanos-node/src`, as `(path, text)`.
+/// Read every `.rs` under `crates/fanos-node/src`, **truncated at its test module**, as `(path, text)`.
+///
+/// The cut matters and was learned by the guard firing on itself. `#115`'s end-to-end test publishes forged
+/// bytes at a real slot with a bare `put_ephemeral` — deliberately, because placing a record an attacker
+/// would place is the whole point, and reporting it would be reporting on behalf of a node that never sent
+/// it. A production publisher and a test placing a record are different acts that happen to share a call,
+/// so the scan must distinguish them by where they live.
+///
+/// A false positive is the right direction for this to fail in, and it did.
 fn sources() -> Vec<(String, String)> {
     fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -24,7 +32,8 @@ fn sources() -> Vec<(String, String)> {
             } else if p.extension().is_some_and(|x| x == "rs")
                 && let Ok(text) = std::fs::read_to_string(&p)
             {
-                out.push((p.display().to_string(), text));
+                let production = text.find("#[cfg(test)]").map_or(text.as_str(), |i| &text[..i]);
+                out.push((p.display().to_string(), production.to_owned()));
             }
         }
     }

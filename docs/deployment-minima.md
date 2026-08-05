@@ -244,8 +244,21 @@ The memory ceiling is a sum of explicit caps rather than an empirical guess. The
 | `SEEN_TX_CAP` | 8192 | transaction dedup (validator) |
 | `RECENT_BODY_CAP` | 64 | finalized bodies kept to help a lagging peer |
 
-Worst-case store: `4096 × ⌈64 KiB / 3⌉ ≈ **85 MB**` of shards on a node holding one shard per key; a *sparse*
-cell holds several shards per key and scales that up by the number of points it covers.
+Worst-case store: **`4096 × 64 KiB = 256 MiB` exactly.**
+
+**This was stated as `4096 × ⌈64 KiB / 3⌉ ≈ 85 MB` and that was wrong, in the one number an operator sizes
+RAM against.** The `/3` assumed `MAX_VALUE_LEN` caps the *reconstructed value* while a node holds one shard
+of it — but the cap is applied to the body of the `PUBLISH_SHARD` frame, which is the shard itself.
+`fanos-runtime`'s own `an_oversize_published_value_is_refused` publishes a shard of exactly `MAX_VALUE_LEN`
+and asserts it is **stored**. An attacker floods full-size shards directly; nothing makes them a third of
+anything.
+
+The consequence is the recommendation below: at 85 MB the store fits comfortably inside the 256 MB suggested
+for a relay/storage node, and at 256 MiB it *is* that budget with nothing left for the rest of the process.
+Either the cap or the recommendation has to move — see the note on the role table.
+
+A *sparse* cell holds several shards per key, which scales the typical case up by the number of points it
+covers; it does not change this ceiling, which is already per-key-per-node.
 
 ### Recommended, by role
 
@@ -253,7 +266,7 @@ Estimates from the measurements plus the caps — not measured under load, and m
 
 | role | RAM | CPU | disk | network |
 |---|---|---|---|---|
-| **relay / storage** (the default) | 256 MB | 1 core | 1 GB | any stable link; cover traffic is constant-rate, so budget for it |
+| **relay / storage** (the default) | 256 MB — **but see the correction above** | 1 core | 1 GB | any stable link; cover traffic is constant-rate, so budget for it |
 | **validator** (TAXIS) | 512 MB | 2 cores | 2 GB | consensus is chatty per round; latency matters more than bandwidth |
 | **shielded-pool user** (OBOLOS) | 2 GB | 4 cores | — | **the heavy case**: a zero-knowledge proof at real parameters takes **~40 s on a release build**, and far longer unoptimised |
 
