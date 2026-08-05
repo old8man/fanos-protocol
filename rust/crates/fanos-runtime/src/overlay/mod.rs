@@ -64,6 +64,27 @@ use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notificati
 /// The single heartbeat timer token.
 pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 
+/// The base cell's point count, `q² + q + 1` at `q = 2` — the `n` every quorum and every band in this
+/// module is stated for.
+pub(crate) const CELL_POINTS: usize = 7;
+
+/// The Byzantine fault budget of a cell of `n` nodes: `f = ⌊(n − 1)/3⌋`.
+pub(crate) const fn fault_budget(n: usize) -> usize {
+    n.saturating_sub(1) / 3
+}
+
+/// The **corroboration quorum** for a cell of `n` nodes — see [`Config::corroboration_quorum`] for the
+/// two-sided derivation. `f + 1`, which at Fano is simultaneously the safety floor and the liveness ceiling.
+///
+/// Clamped to at least `1` so a degenerate cell still requires *someone* to vouch, and to at most the
+/// witnesses that can exist (`n − 2`), so a plane too small to satisfy both constraints fails closed on the
+/// liveness side rather than demanding a quorum no honest cell can reach.
+pub(crate) const fn corroboration_quorum(n: usize) -> usize {
+    let safety = fault_budget(n) + 1;
+    let available = n.saturating_sub(2);
+    if safety > available && available >= 1 { available } else if safety < 1 { 1 } else { safety }
+}
+
 /// The reflex's sampling period — one behavioural sample, one diagnosis, one control decision.
 ///
 /// The default for [`Config::heartbeat`], and the loop's **quantum**: the observation window is a count of
@@ -265,9 +286,28 @@ pub struct Config {
     /// Whether the node acts on its diagnosis (reroute / repair / escalate). On by default; the
     /// reflexive loop *senses and acts* (spec §6.9). Set `false` for a sense-only node.
     pub self_healing: bool,
-    /// How many *distinct* witnesses must corroborate a peer's liveness before it is believed on
-    /// gossip alone (own direct observation is always trusted). Tolerates up to `quorum − 1`
-    /// Byzantine liars falsely vouching for a dead node (spec §6.4). Default `2`.
+    /// How many *distinct* **cell-member** witnesses must corroborate a peer's liveness before it is
+    /// believed on gossip alone (own direct observation is always trusted).
+    ///
+    /// # It has exactly one admissible value, and the shipped default used to be below it
+    ///
+    /// This path is the fallback for a peer this node cannot see *directly*, so the witnesses available are
+    /// the cell minus the subject and minus this node: `n − 2`. Two constraints bracket the quorum:
+    ///
+    /// * **safety** — forging liveness must cost more than the tolerated coalition: `Q ≥ f + 1`;
+    /// * **liveness** — the honest witnesses alone must be able to supply it: `Q ≤ n − 2 − f`.
+    ///
+    /// At the Fano cell (`n = 7`, `f = 2`) both meet at **3**: one lower and a tolerated coalition forges,
+    /// one higher and an honest cell cannot corroborate. It was `2`, which tolerates `Q − 1 = 1` liar
+    /// against a budget of `f = 2` — the same defect as #50 in the sibling reflexive quorum, fixed there and
+    /// left standing here. (Feasible in general iff `2f ≤ n − 3`; Fano is the equality case, as it is for
+    /// the liveness spare in #47.)
+    ///
+    /// `spec/protocol.md` §6.4 calls this "a plain corroboration quorum that merely counts vouchers" and the
+    /// VOUCH/DENY endpoint detector *"strictly stronger"* — which stays true at `Q = 3`, since the judge
+    /// tolerates `⌈(N−1)/2⌉ = 3` fabricators against this quorum's `Q − 1 = 2`. But the judge adjudicates
+    /// after the fact; **this** predicate is what `coord_alive` decides on, so it has to be sized correctly
+    /// on its own.
     pub corroboration_quorum: usize,
     /// How long a `Get` waits for a replica's `Value` answer before falling back to the next
     /// replica on the responsible point's line (spec §L4 read repair). Only bounds the latency of
@@ -363,7 +403,7 @@ impl Default for Config {
             liveness_timeout: Duration::from_millis(1600),
             healthy_correlation: 0.45,
             self_healing: true,
-            corroboration_quorum: 2,
+            corroboration_quorum: corroboration_quorum(CELL_POINTS),
             read_timeout: Duration::from_millis(1600),
             require_self_certified_membership: false,
             require_admission: false,
@@ -756,7 +796,12 @@ impl<F: Field> OverlayNode<F> {
                     peer.reported_down = false;
                 }
                 self.healer.clear_healing(from);
-                self.healer.apply_diag_attest(now, from, frame.body);
+                // Member-only, like its two sibling diagnostics: `attested_pairwise_rates` reads this store
+                // for the seven cell coordinates alone, so a non-member's row could never be read and would
+                // never be evicted either.
+                if self.cell_position(from).is_some() {
+                    self.healer.apply_diag_attest(now, from, frame.body);
+                }
                 Vec::new()
             }
             Some(FrameType::DiagLoss) => {
@@ -2130,6 +2175,107 @@ mod tests {
             "gossips its measured loss vector to all 6 neighbours (§6.3)"
         );
         assert_eq!(arms, 1, "re-arms the heartbeat");
+    }
+
+    /// **A liveness quorum drawn from outside the cell is not a quorum** (#107).
+    ///
+    /// `coord_alive` falls back to counting distinct fresh witnesses for a peer it cannot see directly. The
+    /// count is sized against *this cell's* fault budget, so the set it is drawn from has to be this cell —
+    /// otherwise forging liveness costs `Q` admitted identities **anywhere**, needs no cell seat at all, and
+    /// the vouch-fabricator judge that backs the quorum up cannot reach the forgers, because it quarantines
+    /// members.
+    ///
+    /// Holding a dead node believed-alive is the availability attack this predicate exists to prevent: the
+    /// cell does not reroute around it and does not regenerate its shards, so the erasure store loses
+    /// redundancy while every node reports health.
+    #[test]
+    fn only_cell_members_can_witness_a_peers_liveness() {
+        /// A `HealthView` body claiming a fresh direct observation of every cell point.
+        fn vouch_for_all() -> Vec<u8> {
+            let mut body = Vec::with_capacity(14);
+            for _ in 0..7 {
+                body.extend_from_slice(&1u16.to_le_bytes()); // observed 1 ms ago
+            }
+            body
+        }
+
+        // **Past the startup grace, and the vouches fresh inside it.** `coord_alive` assumes an entirely
+        // unobserved peer is alive for one `liveness_timeout` after start — so a `now` inside that window
+        // makes *every* branch return true and the test vacuous. Deliver at `SENT` and judge a nanosecond
+        // later: the grace has expired (5 s > 1.6 s) while the vouches are 1 ms old.
+        const SENT: Instant = Instant(5_000_000_000);
+
+        let target = Point::<F2>::at(3).coords();
+        let now = Instant(SENT.as_nanos() + 1);
+        let quorum = Config::default().corroboration_quorum;
+
+        // Outsiders: coordinates that are NOT points of this cell. `F2`'s plane has exactly 7, so anything
+        // past them is a stranger — which on a hierarchical transport is an ordinary, reachable peer.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        for k in 0..(quorum + 2) {
+            let outsider: Triple = [200 + k as u32, 1, 1];
+            assert!(node.cell_position(outsider).is_none(), "the test's outsider must not be a cell member");
+            node.step(
+                SENT,
+                Input::Message { from: outsider, frame: encode(FrameType::DiagGossip, &vouch_for_all()) },
+            );
+        }
+        assert!(
+            !node.coord_alive(target, now),
+            "{} strangers vouching must not make a peer this node cannot see read as alive — the quorum is \
+             sized against the CELL's fault budget, so drawing it from outside the cell voids the sizing",
+            quorum + 2,
+        );
+
+        // The falsification: the identical vouches from genuine cell members DO corroborate. Without this
+        // the assertion above would pass on a node that simply never believes anybody.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        for i in 1..=quorum {
+            let member = Point::<F2>::at(i).coords();
+            assert!(node.cell_position(member).is_some(), "a cell point must be a member");
+            node.step(
+                SENT,
+                Input::Message { from: member, frame: encode(FrameType::DiagGossip, &vouch_for_all()) },
+            );
+        }
+        assert!(node.coord_alive(target, now), "a quorum of genuine members does corroborate");
+
+        // And one short of the quorum does not — so the count is load-bearing, not decorative.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        for i in 1..quorum {
+            let member = Point::<F2>::at(i).coords();
+            node.step(
+                SENT,
+                Input::Message { from: member, frame: encode(FrameType::DiagGossip, &vouch_for_all()) },
+            );
+        }
+        assert!(!node.coord_alive(target, now), "one witness short of the quorum must not corroborate");
+    }
+
+    /// **The corroboration quorum has exactly one admissible value at Fano**, and it is derived from both
+    /// sides rather than chosen (#107).
+    #[test]
+    fn the_corroboration_quorum_is_bracketed_from_both_sides() {
+        let n = CELL_POINTS;
+        let f = fault_budget(n);
+        let q = corroboration_quorum(n);
+        assert_eq!((n, f, q), (7, 2, 3), "the Fano cell: n = 7, f = 2, and the quorum is f + 1");
+        assert_eq!(Config::default().corroboration_quorum, q, "the default is the derivation, not a literal");
+
+        // Safety: forging must cost MORE than the tolerated coalition. A quorum of `f` would let exactly the
+        // budget the cell already tolerates fabricate liveness — which was the shipped state at `Q = 2`.
+        assert!(q > f, "a tolerated coalition of {f} must not be able to forge liveness");
+        // Liveness: the honest witnesses alone must be able to supply it. Available witnesses are the cell
+        // minus the subject and minus this node.
+        assert!(q <= n - 2 - f, "an honest cell must be able to reach the quorum with {f} members faulty");
+        // Together those two pin it: at Fano the bracket is empty for every other value.
+        assert_eq!(f + 1, n - 2 - f, "at Fano the safety floor and the liveness ceiling coincide");
+
+        // It moves with the plane rather than being a constant, and stays inside its own bracket there too.
+        for n in [7usize, 13, 21, 57] {
+            let (f, q) = (fault_budget(n), corroboration_quorum(n));
+            assert!(q > f && q <= n - 2 - f, "n={n}: quorum {q} must sit inside [{}, {}]", f + 1, n - 2 - f);
+        }
     }
 
     #[test]

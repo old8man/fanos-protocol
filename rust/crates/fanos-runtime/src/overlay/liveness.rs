@@ -171,6 +171,13 @@ impl<F: Field> OverlayNode<F> {
     /// grey-detection matrix assembly ([`grey_rate_matrix`](Self::grey_rate_matrix)). Malformed (short) bodies
     /// are ignored.
     pub(super) fn apply_diag_loss(&mut self, now: Instant, from: Triple, body: &[u8]) {
+        // Member-only, for the same reason and with the same effect as `apply_health_view`: the grey matrix
+        // reads this for cell members alone, so a non-member's row is written, never read, and never
+        // evicted. Filtering here is also what makes the field's own doc — "Bounded by the cell size" —
+        // true rather than aspirational.
+        if self.cell_position(from).is_none() {
+            return;
+        }
         if let Some(slice) = body.get(..7)
             && let Ok(row) = <[u8; 7]>::try_from(slice)
         {
@@ -183,6 +190,15 @@ impl<F: Field> OverlayNode<F> {
     /// vouched for it. Keeping witnesses distinct is what makes the quorum Byzantine-robust — a lone
     /// liar is one entry, not a majority.
     pub(super) fn apply_health_view(&mut self, now: Instant, from: Triple, body: &[u8]) {
+        // **Only a cell member may witness.** The count below is a Byzantine quorum sized against this
+        // cell's fault budget `f`; drawing it from a set larger than the cell voids the sizing, because an
+        // adversary would not need cell seats at all — any admitted coordinate anywhere would do, and the
+        // vouch-fabricator judge that backs this up can only quarantine *members*. The readers already
+        // apply exactly this predicate (`attested_pairwise_rates` and the grey matrix read only
+        // `cell_coord(k)`, `k < 7`); the write was the looser half.
+        if self.cell_position(from).is_none() {
+            return;
+        }
         for i in 0..7usize {
             let (Some(&lo), Some(&hi)) = (body.get(i * 2), body.get(i * 2 + 1)) else {
                 break;
