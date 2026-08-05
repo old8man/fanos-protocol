@@ -2086,6 +2086,11 @@ mod tests {
     }
 
     /// Decode a `CellEscalate` send into `(target, [child, residue, ttl])`, else `None`.
+    ///
+    /// The child index is two bytes on the wire (#110): one aliased any index above 255 onto a different,
+    /// *valid* child on a wide plane. Narrowed back to `u8` here only because every test in this module runs
+    /// on the Fano base cell, where 7 points cannot reach that — and asserted, so a later test on a wider
+    /// plane fails loudly here instead of comparing the wrong number.
     fn cell_escalate(e: &Effect) -> Option<(Triple, [u8; 3])> {
         let Effect::Send { to, frame } = e else { return None };
         let (f, _) = decode_frame(frame).ok()?;
@@ -2093,7 +2098,11 @@ mod tests {
             return None;
         }
         match f.body {
-            [c, r, t] => Some((*to, [*c, *r, *t])),
+            [hi, lo, r, t] => {
+                let child = u16::from_be_bytes([*hi, *lo]);
+                let child = u8::try_from(child).expect("this module's tests are base-cell only");
+                Some((*to, [child, *r, *t]))
+            }
             _ => None,
         }
     }
@@ -2130,7 +2139,7 @@ mod tests {
         // ACTED ON, not merely counted." (⌊log₉81⌋ = 2 affordable coarse hops.)
         let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
         parent.healer.last_phi = 81.0;
-        let frame = encode(FrameType::CellEscalate, &[3u8, 0b0010, ESCALATE_TTL]);
+        let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
         let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
         assert!(
             effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { around, .. }) if *around == Point::<F2>::at(3).coords())),
@@ -2147,7 +2156,7 @@ mod tests {
         // With no coarse budget (Φ = 1 ⇒ ⌊log₉1⌋ = 0) and no grandparent, a top-cell parent cannot absorb the
         // child escalation → it emits a terminal `Escalated` (external help), and does NOT reroute.
         let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default()); // last_phi defaults to 1.0
-        let frame = encode(FrameType::CellEscalate, &[3u8, 0b0010, ESCALATE_TTL]);
+        let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
         let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
         assert!(
             effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Escalated(_)))),

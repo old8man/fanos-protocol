@@ -157,7 +157,7 @@ impl<F: Field> OverlayNode<F> {
                 targets.push(next); // never escalate to ourselves
             }
         }
-        let frame = encode(FrameType::CellEscalate, &[child_index as u8, residue, ttl]);
+        let frame = encode(FrameType::CellEscalate, &encode_cell_escalate(child_index, residue, ttl));
         targets.into_iter().map(|to| self.routed_send(to, frame.clone())).collect()
     }
 
@@ -167,18 +167,18 @@ impl<F: Field> OverlayNode<F> {
     /// grandparent (bounded by `ttl`), else emit a terminal `Escalated` (external help). This is the DIAKRISIS
     /// decoder recursing one stratum up: a child cell is one "node" of the parent Fano cell (§6.3, R-C2).
     pub(super) fn on_cell_escalate(&mut self, body: &[u8]) -> Vec<Effect> {
-        let &[child_index, residue, ttl] = body else {
+        let Some((child_index, residue, ttl)) = decode_cell_escalate(body) else {
             return Vec::new();
         };
         let Some(self_index) = self.self_index else {
             return Vec::new(); // off the base cell — the coarse index geometry does not apply
         };
-        if usize::from(child_index) >= Plane::<F>::N as usize || usize::from(child_index) == self_index {
+        if child_index >= Plane::<F>::N as usize || child_index == self_index {
             return Vec::new(); // a nonsensical child, or ourselves
         }
         let phi = self.healer.last_phi();
         let parent = self.parent_cell.get_or_insert_with(|| ParentCell::new(self_index));
-        parent.observe(usize::from(child_index), ChildSummary::escalated(residue));
+        parent.observe(child_index, ChildSummary::escalated(residue));
         let parent = *parent; // Copy out — end the mutable borrow of `self` before escalating further
 
         let mut effects = Vec::new();
@@ -192,7 +192,7 @@ impl<F: Field> OverlayNode<F> {
                     via: self.cell_coord(via),
                 }));
             }
-            effects.push(Effect::Notify(Notification::Repaired(self.cell_coord(usize::from(child_index)))));
+            effects.push(Effect::Notify(Notification::Repaired(self.cell_coord(child_index))));
         } else {
             // The parent tier cannot absorb within its own Φ-budget: hand the AGGREGATE coarse residue up to
             // the grandparent if there is one (bounded), else terminal — external help required.
@@ -205,5 +205,70 @@ impl<F: Field> OverlayNode<F> {
             }
         }
         effects
+    }
+}
+
+/// The `CellEscalate` body: `child_index(2, big-endian) ‖ residue(1) ‖ ttl(1)`.
+///
+/// **Two bytes, because one silently named the wrong cell.** The index is a point of the parent plane and
+/// ranges over `0..Plane::N` — `993` at the supported `--plane-order 31` — while the body wrote
+/// `child_index as u8`. Above 255 that truncates to a value the receiver's own bounds check *accepts*,
+/// because `224 < 993` is a perfectly ordinary child: an escalation about cell 992 arrived as one about cell
+/// 224 and the parent-tier reflex installed coarse reroutes around an innocent sibling. Not a parse failure
+/// and not an attack — an attacker could already name any child — but honest fault handling lying about
+/// which cell failed, in the one path that exists to answer that question.
+///
+/// `u16` is exact rather than generous: the largest plane this platform accepts is `PG(2, 31)` with 993
+/// points, and a width that merely *happens* to fit today is the same defect one order later.
+fn encode_cell_escalate(child_index: usize, residue: u8, ttl: u8) -> [u8; 4] {
+    let idx = u16::try_from(child_index).unwrap_or(u16::MAX).to_be_bytes();
+    [idx[0], idx[1], residue, ttl]
+}
+
+/// The inverse. `None` on any other length, so a body from a build that used the one-byte form is refused
+/// rather than mis-read — three bytes and four are different messages, and reading one as the other is
+/// exactly what this replaced.
+fn decode_cell_escalate(body: &[u8]) -> Option<(usize, u8, u8)> {
+    let &[hi, lo, residue, ttl] = body else { return None };
+    Some((usize::from(u16::from_be_bytes([hi, lo])), residue, ttl))
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+mod escalate_body_tests {
+    use super::{decode_cell_escalate, encode_cell_escalate};
+    use fanos_field::{F2, F31};
+    use fanos_geometry::Plane;
+
+    /// **A child index above 255 named a different, innocent cell** (#110).
+    ///
+    /// The body wrote `child_index as u8`. The index ranges over `0..Plane::N`, which is **993** at the
+    /// supported `--plane-order 31`, so 992 arrived as 224 — and the receiver's bounds check *accepts* it,
+    /// because 224 is an ordinary child. The parent-tier reflex then installed coarse reroutes around a cell
+    /// that had not failed. No parse error, no attack (an adversary could already name any child): honest
+    /// fault handling lying about which cell failed, in the path whose only job is to answer that.
+    #[test]
+    fn a_child_index_past_a_byte_survives_the_escalation_body() {
+        // The largest index the largest supported plane can produce.
+        let widest = Plane::<F31>::N as usize - 1;
+        assert!(widest > usize::from(u8::MAX), "the case only exists on a wide plane: {widest}");
+
+        let body = encode_cell_escalate(widest, 0x5A, 3);
+        let (child, residue, ttl) = decode_cell_escalate(&body).expect("its own body decodes");
+        assert_eq!(child, widest, "the index must survive the wire, not alias onto another child");
+        assert_eq!((residue, ttl), (0x5A, 3), "and the fields beside it must not shift");
+
+        // What the old form did, kept as the measurement rather than as prose.
+        assert_ne!(widest & 0xFF, widest, "one byte aliased {widest} onto {}", widest & 0xFF);
+        assert!((widest & 0xFF) < Plane::<F31>::N as usize, "onto a VALID child, which is why it was silent");
+
+        // The narrow plane is unchanged in meaning, which is what makes this safe to widen.
+        let base = Plane::<F2>::N as usize - 1;
+        assert_eq!(decode_cell_escalate(&encode_cell_escalate(base, 1, 1)).unwrap().0, base);
+
+        // Three bytes and four are different messages: a body from the one-byte form is refused, never
+        // re-read as the new shape.
+        assert!(decode_cell_escalate(&[0, 1, 2]).is_none(), "the old width does not decode as the new one");
+        assert!(decode_cell_escalate(&[]).is_none());
     }
 }
