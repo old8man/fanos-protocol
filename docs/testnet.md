@@ -632,8 +632,8 @@ meeting line from `(epoch, beacon)` independently, so the grace window is the th
 between them — and the window is now derived and unit-tested, but the composition of host + client + relay
 across a live `BeaconReady` is not.
 
-**The L4 store now survives a restart; the chain still does not.** This was "nothing a node stores survives a
-restart of the cell" in full until 2026-08-04 (#77) — six files in the shipped tree touched the filesystem at
+**The store and the chain both survive a restart now — the residual is what a snapshot period costs.** This
+was "nothing a node stores survives a restart of the cell" in full until 2026-08-04 (#77) — six files in the shipped tree touched the filesystem at
 all, the erasure store was three in-memory maps with no serialization, and `--data DIR` only placed the
 control socket.
 
