@@ -333,6 +333,12 @@ impl BeaconRound {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + 1 + self.partials.len() * PARTIAL_LEN);
         out.extend_from_slice(&self.epoch.to_be_bytes());
+        // **Safe, and the bound is upstream rather than here** — the same shape as the `CellEscalate` child
+        // index that was NOT safe (#110), so it is worth saying which side of that line this falls on. A
+        // round only ever holds exactly `threshold` partials (`assemble` breaks at it), and a threshold
+        // cannot exceed the anchor count, which `fanos beacon-deal` refuses above 255 because a Shamir share
+        // index is a `u8`. So the count field can never truncate, and the reason is the share width rather
+        // than anything visible at this line.
         out.push(self.partials.len() as u8);
         for p in &self.partials {
             out.extend_from_slice(&p.to_bytes());
