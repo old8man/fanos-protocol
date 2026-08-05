@@ -255,7 +255,15 @@ mod scenarios {
     }
 
     #[test]
-    fn partition_is_flagged_as_a_systemic_event() {
+    /// A cut surfaces as an **escalation**, not as `Verdict::Partition` — and that is correct, not a gap.
+    ///
+    /// From either side a cut is a set of silent coordinates, which is exactly what a mass crash is. The two
+    /// hand a node the identical `degraded` and `healthy_lines`
+    /// (`fanos_diakrisis::tests::a_mass_crash_and_one_side_of_a_cut_are_the_same_observation`), so no
+    /// single-node verdict can separate them. Escalating hands the decision to the parent, the only observer
+    /// that sees both sides. Making this arm answer `Partition` instead was tried and reverted: it relabelled
+    /// every three-node crash, so a cell that had lost three members stopped escalating for repair.
+    fn a_cut_surfaces_as_an_escalation_because_one_node_cannot_tell_it_from_a_mass_crash() {
         let (mut sim, cell) = established_cell(6);
         // Split the cell 4 | 3.
         let group_a: BTreeSet<Triple> = [cell[0], cell[1], cell[2], cell[3]].into_iter().collect();
@@ -264,7 +272,7 @@ mod scenarios {
         sim.run_for(Duration::from_millis(3000));
         sim.inject_all(&Command::Diagnose);
         sim.settle();
-        // With ≥3 peers unreachable across the cut, nodes escalate — a partition/systemic event.
+        // With ≥3 peers unreachable across the cut, the decoder saturates and nodes escalate.
         assert!(
             sim.report()
                 .verdicts()

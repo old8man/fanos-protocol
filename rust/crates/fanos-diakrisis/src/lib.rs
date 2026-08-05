@@ -137,30 +137,27 @@ pub fn diagnose(obs: &Observation) -> Verdict {
             }
             Verdict::Healthy
         }
-        // Three or more faults saturate the single-cell decoder. **Ask the partition sensor before
-        // escalating**, because this arm is exactly what one side of a split sees.
+        // Three or more faults saturate the single-cell decoder: escalate to the parent (spec §6.3).
         //
-        // A partition, viewed from either side, *is* a set of unreachable nodes — so gating the sensor on
-        // `degraded == 0` (as the `Healthy` arm alone did) meant it could only fire while the cut was so
-        // soft that every node still corroborated, which is the least interesting case. The gap was hidden
-        // by a corroboration quorum too weak to notice a 92 %-loss cut; deriving that quorum (#107) exposed
-        // it, and a `SoftPartition` experiment that used to report `Partition` began reporting node faults.
+        // **This arm must not consult the partition sensor, and the reason is an impossibility rather than a
+        // preference.** A cut, seen from one side, *is* a set of silent coordinates — and so is a mass crash.
+        // A node holds only its own `degraded` and `healthy_lines`, and those are **equal** in the two
+        // worlds: `a_mass_crash_and_one_side_of_a_cut_are_the_same_observation` builds both from their
+        // causes and shows they coincide. No function of a single [`Observation`] can separate them, so any
+        // arm that tries is choosing one label for both.
         //
-        // This does **not** overturn the existing rule that "a disconnection explained by a down node is
-        // routed to the crash path, never counted as a partition" (spec §6.5). That rule is about a
-        // *localizable* fault, and it still holds: `Fault::Single` and `Fault::Pair` fall through to
-        // `Localized` untouched. The discriminator the rule needs is precisely the one `locate` already
-        // computes — **one or two down is a crash; more down than the decoder can place, on a graph that is
-        // also disconnected, is a cut** — and that is what this arm now says.
-        Fault::Escalate(flags) => {
-            if obs
-                .healthy_lines
-                .is_some_and(|lines| !partition::is_connected(lines))
-            {
-                return Verdict::Partition;
-            }
-            Verdict::Escalate(flags)
-        }
+        // It was tried (#114), on the true premise that the sensor is nearly unreachable while gated on
+        // `degraded == 0` — it could then only fire for a cut so soft that every node still corroborated.
+        // The fix consulted the sensor here, and relabelled **every three-node crash as `Partition`**, which
+        // is worse than the gap: a cell that has lost three members stops escalating for repair. Measured
+        // afterwards, not predicted — `three_crashes_escalate` reported `Partition` on all four survivors.
+        //
+        // The discrimination is real, but the evidence for it is **cross-node** and this function has none:
+        // on a cut the far side is alive and holds the complementary view, while a crashed node holds
+        // nothing. Only an observer that sees both sides can tell — which is precisely what escalating to
+        // the parent cell is for, and why `Escalate` is the honest verdict rather than a weaker one. The
+        // narrower rule of §6.5 is untouched: `Single` and `Pair` still fall through to `Localized`.
+        Fault::Escalate(flags) => Verdict::Escalate(flags),
         fault => Verdict::Localized(fault),
     }
 }
@@ -253,6 +250,66 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(diagnose(&resilient), Verdict::Healthy);
+    }
+
+    /// A line is healthy to an observer exactly when it holds no coordinate that observer has gone silent on.
+    fn healthy_lines_given_silent(silent: u8) -> u8 {
+        let mut mask = 0u8;
+        for l in 0..7 {
+            if fanos_geometry::fano::INCIDENCE[l] & silent == 0 {
+                mask |= 1 << l;
+            }
+        }
+        mask
+    }
+
+    /// What a node observes when the points in `stopped` **crash**: it stops hearing from exactly those.
+    fn observed_after_crashes(stopped: u8) -> Observation {
+        Observation {
+            degraded: stopped,
+            healthy_lines: Some(healthy_lines_given_silent(stopped)),
+            ..Default::default()
+        }
+    }
+
+    /// What a node on the `mine` side of a **cut** observes: it stops hearing from everything across it.
+    fn observed_across_a_cut(mine: u8) -> Observation {
+        let far_side = !mine & 0x7F;
+        Observation {
+            degraded: far_side,
+            healthy_lines: Some(healthy_lines_given_silent(far_side)),
+            ..Default::default()
+        }
+    }
+
+    /// **A mass crash and one side of a cut are the same observation** — so `diagnose` must not claim to
+    /// tell them apart (#114).
+    ///
+    /// Two different worlds, built here from their two different causes: points 0, 1 and 2 crash, or the
+    /// cell is cut `{0,1,2} | {3,4,5,6}` and this node sits on the larger side. A node holds only its own
+    /// silence record and its line-health mask, and both worlds hand it the *identical* pair. Any function
+    /// of a single [`Observation`] therefore returns the same verdict for both, and an arm that consults the
+    /// partition sensor here does not gain a discrimination — it just relabels every mass crash.
+    ///
+    /// That is not hypothetical: it shipped, and stopped a three-crash cell from escalating for repair. The
+    /// evidence that separates the two is **cross-node** (on a cut the far side is alive and holds the
+    /// complementary view), which is what escalating to the parent exists to reach.
+    #[test]
+    fn a_mass_crash_and_one_side_of_a_cut_are_the_same_observation() {
+        let crashed = observed_after_crashes(0b000_0111);
+        let cut = observed_across_a_cut(0b111_1000);
+        assert_eq!(crashed.degraded, cut.degraded, "the same three coordinates fall silent");
+        assert_eq!(crashed.healthy_lines, cut.healthy_lines, "and the same lines survive");
+        assert_eq!(diagnose(&crashed), diagnose(&cut), "so one node cannot return different verdicts");
+
+        // The graph really is disconnected here — otherwise the arm this pins would never have been
+        // reachable and the test would prove nothing about it.
+        assert!(
+            !partition::is_connected(crashed.healthy_lines.unwrap()),
+            "the survivors' line graph must actually be cut, or the sensor is not being exercised"
+        );
+        // And the verdict is the honest one: saturated decoder, hand it up (spec §6.3).
+        assert!(matches!(diagnose(&crashed), Verdict::Escalate(_)));
     }
 
     #[test]
