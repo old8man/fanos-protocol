@@ -155,16 +155,22 @@ circuit — **end-to-end deanonymization is impossible at the default plane**. A
 hops — 80 % at `q = 7`, effectively every one at `q = 31` — so **the MIX lane's guarantee is gone above the
 default plane** under the platform's own fault assumption.
 
-**This inverts the sizing advice.** Raising `q` buys a larger anonymity *set* and destroys hop strength, so
-today the plane-order knob cannot be used for anonymity at all. The fix is derived and changes nothing at the
-default — `t = ⌈2(q+1)/3⌉` evaluates to `2` at `q = 2` — and with it hop capture falls as the plane grows
-instead of rising to certainty. Recorded as `docs/audit.md` E7 (HIGH, open); full working in
-`docs/design-anonymity-substrate.md` §4a.
+**That inverted the sizing advice, and it is fixed.** With a constant threshold, raising `q` bought a larger
+anonymity *set* and destroyed hop strength, so the plane-order knob could not be used for anonymity at all.
+The threshold is now derived — `t = ⌈2(q+1)/3⌉`, a `const fn` of the line size (`fanos-node::mix_threshold`)
+— which evaluates to `2` at `q = 2`, so **the default plane is unchanged**, and with it hop capture falls as
+the plane grows instead of rising to certainty. Closed as `docs/audit.md` E7 (2026-07-29) and pinned by a
+test that also fails at `t−1`; full working in `docs/design-anonymity-substrate.md` §4a.
+
+**So the sizing advice now reads the other way: above Fano, a wider plane buys anonymity in both dimensions
+at once** — a larger set *and* a stronger hop. What remains true is the caution below about the plane order
+being a cell-wide constant every operator must agree on, and about `q = 3`/`q = 4` being poor choices for
+liveness reasons that have nothing to do with anonymity (§"Plane order").
 
 | cell | anonymity floor `1/K` | deanonymization at tolerated `f` | faults absorbed |
 |---|---|---|---|
 | 7 (Fano), `t = 2` | 1/7 — testbed only | **0** | 2 |
-| 993 (`q = 31`), `t = 2` — the old constant | 1/993 | **≈1.0 — no anonymity** | 291 |
+| 993 (`q = 31`), `t = 2` — **the old constant, no longer shipped** | 1/993 | **≈1.0 — no anonymity** | 291 |
 | 993, with `t = ⌈2(q+1)/3⌉ = 22` | 1/993 — credible | ~0 | 291 |
 
 **Seating improves with the plane, which the sizing advice above does not say.** A node's coordinate is a

@@ -338,12 +338,21 @@ exponentially-safer *line-level threshold* budget, letting the anonymity lane ru
 frontier** (minimum latency the pure `βℓ` bound allows) instead of the inflated Anytrust penalty. This is a
 Chernoff design derivation, not yet a published theorem; T4 is to formalize it.
 
-## 4a. The hop threshold is a constant, and it must not be
+## 4a. The hop threshold was a constant, and it must not be — **RESOLVED 2026-07-29**
+
+> **Status.** Closed: the threshold is now `pub const fn mix_threshold(line_size) = ⌈2(q+1)/3⌉`
+> (`fanos-node/src/node.rs`), and `DEFAULT_MIX_THRESHOLD = mix_threshold(3)` is the shipped `2` — so the
+> default plane is byte-for-byte unchanged and `q ≥ 7` regains its guarantee. Pinned by a test that also
+> fails at `t−1`, so the derivation cannot silently weaken. `docs/audit.md` E7 carries the record.
+>
+> **The derivation below is kept in full, and deliberately.** It is what makes the fix trustworthy rather
+> than a value someone chose, and a section that recorded only the answer would leave the next reader unable
+> to check it. Read the present tense that follows as describing the state this closed.
 
 §4 argues a hop is broken only if `≥ t` of its `q+1` members are corrupt, so `P_break ≤ exp(−(q+1)·D(τ‖f))` is
 exponentially small in `q`. The argument is sound **and its premise is that `τ = t/(q+1)` stays fixed as `q`
-grows.** It does not. `MIX_THRESHOLD = 2` is a `usize` constant (`fanos-node/src/node.rs:42`) handed to
-`ThresholdRouter::<F>::new` for every field `F`, so `τ` *collapses* with the plane: `0.667 → 0.400 → 0.250 →
+grows.** With a constant it does not: `MIX_THRESHOLD = 2` was a `usize` constant handed to
+`ThresholdRouter::<F>::new` for every field `F`, so `τ` *collapsed* with the plane: `0.667 → 0.400 → 0.250 →
 0.062`.
 
 ### What deanonymizes, and what actually happens
