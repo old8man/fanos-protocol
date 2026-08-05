@@ -631,7 +631,19 @@ impl HybridLedger {
         let height = self.height;
         let mut refunds: Vec<([u8; 32], u64)> = Vec::new();
         for deal in self.storage.deals.values_mut() {
-            if let Some(refund) = deal.finalize_if_lapsed(height, AUDIT_PERIOD)
+            // **Two ways for an active deal to end, one refund path.** The deadline is the patient one; the
+            // abandonment threshold is what closes AT-H2's remaining half, so a provider that stops proving
+            // on day one no longer locks the consumer's escrow for the entire term. Tried first because it
+            // can only fire strictly before the deadline — a deal past its deadline is lapsed, whatever its
+            // silence, and letting the earlier trigger win keeps the two from racing on the same block.
+            //
+            // Deterministic, which it must be to sit inside `apply_block`: every input is replicated state
+            // (`height`, `AUDIT_PERIOD`, the deal's own fields), so every validator terminates the same set
+            // at the same height and the state root stays identical.
+            let ended = deal
+                .terminate_if_abandoned(height, AUDIT_PERIOD)
+                .or_else(|| deal.finalize_if_lapsed(height, AUDIT_PERIOD));
+            if let Some(refund) = ended
                 && refund > 0
             {
                 refunds.push((deal.params().consumer, refund));
@@ -2162,6 +2174,67 @@ mod tests {
         let waves = schedule(&parallel.access_lists(&txs));
         assert_eq!(crate::scheduler::width(&waves), 3, "the three independent transfers run in parallel");
         assert_eq!(waves.len(), 2, "the conflicting fourth transfer is a second wave");
+    }
+
+    /// **A provider that stops proving no longer locks the escrow for the whole term** (audit AT-H2's
+    /// remaining half).
+    ///
+    /// The deadline path above is the patient one and was all there was: a long deal held the consumer's
+    /// capital until `open + duration·AUDIT_PERIOD` however early the provider went silent. Termination now
+    /// also fires at `abandonment_threshold` = `lambda_bits` consecutive silent periods, which is derived —
+    /// a usable channel loses at most half, so each miss is one bit, and the market already priced how many
+    /// bits make a claim believable.
+    ///
+    /// The assertion that matters is **strictly before**: a rule that merely refunded at the deadline would
+    /// satisfy any test that only checked the money came back.
+    #[test]
+    fn a_silent_provider_releases_the_escrow_long_before_the_term_ends() {
+        use crate::storage::AUDIT_PERIOD;
+        use fanos_thesauros::{Cid, DealParams};
+        let (consumer_sk, consumer_vk, consumer) = account(3);
+        let (_p, _pv, provider) = account(4);
+        let mut tokens = TokenLedger::new();
+        tokens.credit(consumer, 1_000_000);
+        let mut ledger = HybridLedger::new(tokens);
+        ledger.begin_block(10);
+        // A term far longer than the evidence threshold, which is the case the deadline path handled badly.
+        let lambda: u32 = 8;
+        let duration: u64 = 500;
+        let params = DealParams {
+            cid: Cid::new([2u8; 32]),
+            size: 4096,
+            duration,
+            replication: 3,
+            lambda_bits: lambda,
+            f_tol_permille: 100,
+            k: 3,
+            price: 500,
+            provider,
+            consumer,
+        };
+        let payment = SignedTransfer::sign(
+            Transfer { from: consumer, to: STORAGE_ESCROW, amount: 500, nonce: 0 },
+            &consumer_sk,
+            consumer_vk,
+        );
+        assert_eq!(
+            ledger.apply(&Transaction::new(HybridLedger::storage_payload(&StorageTx::Open { params, payment }))),
+            ExecOutcome::Applied
+        );
+        assert_eq!(ledger.storage_escrow(), 500);
+
+        let terminates_at = 10 + u64::from(lambda) * AUDIT_PERIOD;
+        let deadline = 10 + duration * AUDIT_PERIOD;
+        assert!(terminates_at < deadline, "the whole point is that this fires first");
+
+        ledger.begin_block(terminates_at - 1);
+        assert_eq!(ledger.storage_escrow(), 500, "one bit short of the threshold, the deal still runs");
+
+        ledger.begin_block(terminates_at);
+        assert_eq!(ledger.storage_escrow(), 0, "λ silent periods end it");
+        assert_eq!(ledger.tokens().balance(&consumer), 1_000_000, "and the consumer has the escrow back");
+        // Strictly before, by a wide margin: the deadline path would have held it 492 periods longer.
+        assert!(ledger.height() < deadline, "released at {} , deadline {deadline}", ledger.height());
     }
 
     #[test]

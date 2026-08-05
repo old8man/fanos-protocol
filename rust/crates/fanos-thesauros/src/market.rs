@@ -403,6 +403,33 @@ impl Deal {
         self.params.duration.saturating_sub(self.passed)
     }
 
+    /// Terminate the deal **early** if the provider has gone silent past
+    /// [`abandonment_threshold`](Self::abandonment_threshold), returning the consumer's refund (audit AT-H2).
+    ///
+    /// The half of AT-H2 that was missing: `finalize_if_lapsed` already refunds, but only at
+    /// `open_height + duration·audit_period`, so a provider that stopped proving on day one still locked the
+    /// consumer's escrow for the whole term. Same refund arithmetic and same terminal transition as the lapse
+    /// path — only the trigger differs, which is the point: one way for an active deal to end with money
+    /// moving, reached by two conditions.
+    ///
+    /// `None` when the deal has no clock, is not active, or the provider has not been silent long enough. A
+    /// deal whose term is shorter than its own threshold therefore never takes this path and ends at the
+    /// deadline instead, which is the same outcome one epoch later.
+    ///
+    /// **Deterministic across validators**, which it must be to sit inside block execution: every input —
+    /// `height`, `audit_period`, and the deal's own replicated fields — is state every node already agrees
+    /// on, and nothing here reads a clock, a random source or a local view.
+    #[must_use]
+    pub fn terminate_if_abandoned(&mut self, height: u64, audit_period: u64) -> Option<u64> {
+        if self.state != DealState::Active || !self.is_abandoned(height, audit_period) {
+            return None;
+        }
+        let refund = self.params.price.saturating_sub(self.released);
+        self.released = self.params.price;
+        self.state = DealState::Completed;
+        Some(refund)
+    }
+
     /// Auto-complete the deal if its audit deadline has passed with epochs still unproven. At
     /// `open_height + duration·audit_period` an `Active` deal is marked `Completed` and its unproven escrow (the
     /// slices for epochs never proven) is returned to the consumer — so a provider that stops proving stops
