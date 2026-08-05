@@ -254,6 +254,19 @@ pub enum Station {
     /// [`Observation::tag`] carries which directory, since the consequence differs by directory and an
     /// aggregate count cannot say whether a node lost its onion key or its load report.
     DirectoryPublishFailed,
+
+    /// A message was **rejected by an authentication gate** — a signature that did not verify, a sender that
+    /// was not who it claimed, an epoch that was not this one.
+    ///
+    /// A refused forgery and a message that never arrived produce the identical observable: nothing happens.
+    /// So a cell under a sustained forgery attempt looks exactly like a quiet cell, and the one moment an
+    /// operator most needs evidence is the one where the code silently returns. Every gate is a place an
+    /// attacker is *known* to be probing — that is what the gate is for — so a rejection is the most
+    /// informative event the node ever discards.
+    ///
+    /// [`Observation::tag`] carries which gate, since "someone is forging host registrations" and "someone is
+    /// forging capability advertisements" are different attacks with different responses.
+    AuthenticationRejected,
 }
 
 impl Station {
@@ -284,6 +297,7 @@ impl Station {
         Self::ShareOffCommitment,
         Self::DescriptorUnrecoverable,
         Self::DirectoryPublishFailed,
+        Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
         Self::StoreAtCapacity,
@@ -321,6 +335,7 @@ impl Station {
             Self::ShareOffCommitment => "share.off_commitment",
             Self::DescriptorUnrecoverable => "descriptor.unrecoverable",
             Self::DirectoryPublishFailed => "directory.publish_failed",
+            Self::AuthenticationRejected => "auth.rejected",
         }
     }
 }
@@ -671,6 +686,7 @@ mod tests {
                 Station::ShareOffCommitment => listed(Station::ShareOffCommitment),
                 Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
                 Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
+                Station::AuthenticationRejected => listed(Station::AuthenticationRejected),
             }
         }
         // And no variant is listed twice, which would double-count it in any enumeration.

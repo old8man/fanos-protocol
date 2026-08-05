@@ -132,7 +132,34 @@ pub async fn publish_capability(
 /// published, the lookup times out, or the advertisement fails authentication.
 pub async fn resolve_capability(client: &Client, coord: Coord, epoch: Epoch) -> Option<(NodeId, Capability)> {
     let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(cap_slot(coord, epoch))).await.ok()??;
-    parse_advertisement(&bytes, epoch)
+    note_authentication(client, coord, crate::Gate::CapabilityAdvertisement, parse_advertisement(&bytes, epoch))
+}
+
+/// Pass an authentication outcome through, counting the refusals (#109).
+///
+/// **A rejected forgery and an absent message are the same silence**, and every gate is a place an attacker
+/// is known to be probing — so a cell under attack looks exactly like a quiet one. `bytes` were present here:
+/// something *was* published at this slot and failed its check, which is a different fact from nothing being
+/// published, and the only one of the two that names an adversary.
+fn note_authentication<T>(
+    client: &Client,
+    coord: Coord,
+    gate: crate::Gate,
+    parsed: Option<T>,
+) -> Option<T> {
+    if parsed.is_none() {
+        client.record_station(
+            fanos_runtime::ports::stations::Station::AuthenticationRejected,
+            Some(coord),
+            Some(gate.tag()),
+        );
+        tracing::warn!(
+            gate = gate.name(),
+            coord = ?coord,
+            "a published record failed authentication — someone is writing records they cannot sign"
+        );
+    }
+    parsed
 }
 
 /// The role-assignment **roster** of the base cell of plane `F`: every one of its `N` points — the same
@@ -177,11 +204,23 @@ async fn read_capability<F: Field>(
 ) -> Read<(NodeId, Capability)> {
     let slot = cap_slot(coord, epoch);
     match tokio::time::timeout(STORE_TIMEOUT, client.get(slot)).await {
-        // Completed: present-and-valid, or a definite negative (absent, malformed, or failing authentication).
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
-            Some(seed) => parse_bound_advertisement::<F>(&b, coord, epoch, &seed),
-            None => parse_advertisement(&b, epoch),
-        })),
+        // Completed. The **caller's** answer is `Absent` either way — there is no usable capability at this
+        // slot whether nothing was published or something unsignable was — and that is right: `Read`'s three
+        // values are about what the reader may conclude, not about why. What was wrong is that the *reason*
+        // died here too (#109). Nothing published is a quiet slot; something published that fails its
+        // signature names an adversary, and only one of the two is worth waking someone for. So the branch
+        // splits, the verdict stays, and the evidence goes to the data-path plane instead of the floor.
+        Ok(None) => Read::Absent,
+        Ok(Some(b)) => {
+            let (gate, parsed) = match beacon {
+                Some(seed) => (
+                    crate::Gate::BoundCapabilityAdvertisement,
+                    parse_bound_advertisement::<F>(&b, coord, epoch, &seed),
+                ),
+                None => (crate::Gate::CapabilityAdvertisement, parse_advertisement(&b, epoch)),
+            };
+            Read::found_or_absent(note_authentication(client, coord, gate, parsed))
+        }
         Err(_) => Read::Unknown,
     }
 }

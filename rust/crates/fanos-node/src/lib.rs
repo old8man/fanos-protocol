@@ -106,6 +106,59 @@ impl Directory {
     }
 }
 
+/// Which authentication gate refused a message — the sub-kind
+/// [`Station::AuthenticationRejected`](fanos_runtime::ports::stations::Station::AuthenticationRejected) is
+/// counted under.
+///
+/// Named rather than aggregated because the attacks differ and so do the responses: forged host registrations
+/// are someone trying to hijack a hidden service's meeting point, forged capability advertisements are someone
+/// trying to be assigned a role they have no entitlement to, and a misattributed reshare sub-share is a line
+/// member trying to steer a rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// A POROS reshare sub-share that did not come from the outgoing member whose index it claimed.
+    ReshareSubShare,
+    /// A rendezvous host registration whose signature or epoch did not verify.
+    HostRegistration,
+    /// A capability advertisement that failed its signature or epoch check.
+    CapabilityAdvertisement,
+    /// A **coordinate-bound** capability advertisement that failed entitlement, identity or signature.
+    BoundCapabilityAdvertisement,
+}
+
+impl Gate {
+    /// Every gate, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[
+        Self::ReshareSubShare,
+        Self::HostRegistration,
+        Self::CapabilityAdvertisement,
+        Self::BoundCapabilityAdvertisement,
+    ];
+
+    /// The discriminant carried in `Observation::tag`, written out for the same reason
+    /// [`Directory::tag`] is: variant order must not renumber an operator's counters.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::ReshareSubShare => 0,
+            Self::HostRegistration => 1,
+            Self::CapabilityAdvertisement => 2,
+            Self::BoundCapabilityAdvertisement => 3,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ReshareSubShare => "reshare_sub_share",
+            Self::HostRegistration => "host_registration",
+            Self::CapabilityAdvertisement => "capability_advertisement",
+            Self::BoundCapabilityAdvertisement => "bound_capability_advertisement",
+        }
+    }
+}
+
 /// Pass a directory publish's outcome through, recording the failures where an operator will see them.
 ///
 /// **Called inside each `publish_*`, not at their callers, and that is the point.** All ten returned their

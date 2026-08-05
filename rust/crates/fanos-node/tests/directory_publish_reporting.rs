@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use fanos_node::Directory;
+use fanos_node::{Directory, Gate};
 
 /// Read every `.rs` under `crates/fanos-node/src`, as `(path, text)`.
 fn sources() -> Vec<(String, String)> {
@@ -81,4 +81,31 @@ fn directory_tags_and_names_are_unique_and_pinned() {
     assert_eq!(Directory::MixKey.tag(), 0);
     assert_eq!(Directory::Health.tag(), 7);
     assert_eq!(Directory::ALL.len(), 8, "a new directory must be added to ALL, or it is invisible to readers");
+}
+
+/// The gate an operator reads is stable and unambiguous, for the same reason a directory's tag is (#109).
+#[test]
+fn gate_tags_and_names_are_unique_and_pinned() {
+    let mut tags: Vec<u64> = Gate::ALL.iter().map(|g| g.tag()).collect();
+    let mut names: Vec<&str> = Gate::ALL.iter().map(|g| g.name()).collect();
+    let (n_tags, n_names) = (tags.len(), names.len());
+    tags.sort_unstable();
+    tags.dedup();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(tags.len(), n_tags, "two gates share a tag, so two different attacks would merge into one count");
+    assert_eq!(names.len(), n_names, "two gates share a name");
+    assert_eq!(Gate::ReshareSubShare.tag(), 0);
+    assert_eq!(Gate::BoundCapabilityAdvertisement.tag(), 3);
+    assert_eq!(Gate::ALL.len(), 4, "a new gate must be added to ALL, or it is invisible to readers");
+}
+
+/// A `Directory` tag and a `Gate` tag are read under **different** stations, so they may collide freely —
+/// pinned here so a later reader does not "fix" a collision that is not one, and so the two tables stay
+/// separately meaningful rather than drifting into one shared numbering nobody maintains.
+#[test]
+fn directory_and_gate_tags_live_in_separate_namespaces() {
+    let shared: Vec<u64> =
+        Directory::ALL.iter().map(|d| d.tag()).filter(|t| Gate::ALL.iter().any(|g| g.tag() == *t)).collect();
+    assert!(!shared.is_empty(), "the two tables overlap by construction; if they stopped, this test is stale");
 }

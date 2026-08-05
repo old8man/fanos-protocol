@@ -1109,6 +1109,14 @@ impl PorosHost {
         // Sender authentication: the sub-share must have arrived FROM the old member it claims to be (index
         // `old_x` = position `old_x - 1` in the outgoing roster). Rejects a spoofed/misattributed contribution.
         if usize::from(old_x).checked_sub(1).and_then(|i| ctx.old_line.get(i)) != Some(&from) {
+            // A refused forgery and a sub-share that never arrived are the same silence, and this gate is
+            // where an attacker is *known* to be probing — so the rejection is counted (#109).
+            self.stations.record_tagged(
+                Station::AuthenticationRejected,
+                Some(from),
+                Some(crate::Gate::ReshareSubShare.tag()),
+                1,
+            );
             return Vec::new();
         }
         // Only the canonical subset is gathered: combining whoever arrived first puts each member on a

@@ -169,6 +169,16 @@ impl<F: Field> RendezvousRelay<F> {
         // *this* epoch looks up, so refusing it costs nothing that was ever reachable.
         let epoch = self.router.onion_epoch();
         if !reg.verify(epoch) {
+            // Counted, or a relay under a sustained registration-forgery attempt is indistinguishable from a
+            // relay nobody is using (#109). Unattributed: a registration that fails to verify has no
+            // authenticated origin, and inventing one would put fabricated evidence against a coordinate into
+            // the plane built to end exactly that.
+            self.stations.record_tagged(
+                Station::AuthenticationRejected,
+                None,
+                Some(crate::Gate::HostRegistration.tag()),
+                1,
+            );
             return Vec::new();
         }
         let service_tag = reg.service_tag;
