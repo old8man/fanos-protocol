@@ -69,6 +69,15 @@ pub struct Observation {
     pub pairwise_rates: Option<[[f64; 7]; 7]>,
     /// Optional coherence matrix for the global mean-correlation cascade monitor.
     pub coherence: Option<CoherenceMatrix>,
+    /// Optional 7-bit mask of points this node still hears from **at all** — one fresh sighting, direct or
+    /// witnessed, with no corroboration quorum required.
+    ///
+    /// Deliberately a weaker predicate than the aliveness that produces `degraded`, and the pair is what
+    /// separates a cut from a crash: **one witness proves an endpoint exists, a quorum proves it is
+    /// reliable.** A node behind an incipient lossy cut answers a fraction of its probes, so it is not alive
+    /// enough to route through and is still plainly there; a crashed node answers none. No threshold is
+    /// involved — it is a count of sightings, not a loss rate — so there is no constant here to get wrong.
+    pub responsive: Option<u8>,
     /// Optional 7-bit mask of healthy lines for the connectivity (partition) check. A cell is
     /// partitioned only when it actually disconnects (Fiedler `λ₂ = 0`), *not* merely when it
     /// is weakly correlated — low correlation is the resilient/diversified regime (§2.7).
@@ -157,7 +166,32 @@ pub fn diagnose(obs: &Observation) -> Verdict {
         // nothing. Only an observer that sees both sides can tell — which is precisely what escalating to
         // the parent cell is for, and why `Escalate` is the honest verdict rather than a weaker one. The
         // narrower rule of §6.5 is untouched: `Single` and `Pair` still fall through to `Localized`.
-        Fault::Escalate(flags) => Verdict::Escalate(flags),
+        Fault::Escalate(flags) => {
+            // **A cut severs connectivity between endpoints that are still there; a crash removes the
+            // endpoints.** That is the whole discrimination, and it is decidable here — but only with the
+            // extra signal, which is why the first attempt failed. Asking the connectivity sensor alone
+            // (#114, `a808d76`) relabelled every mass crash as a partition, because a hard cut and a mass
+            // crash present *identical* observations
+            // (`a_mass_crash_and_one_side_of_a_cut_are_the_same_observation`, still true and still pinned).
+            //
+            // A **lossy** cut is the third case and is not identical to either: its nodes keep answering a
+            // fraction of their probes. So the question is not "is the graph disconnected" but "is it the
+            // graph that failed, or the nodes" — and `responsive` answers exactly that, with no threshold,
+            // from sightings the node already collects.
+            //
+            // A hard cut still reads `Escalate`, and that remains correct rather than a residual gap: from
+            // one side it is indistinguishable from a crash, so the honest move is to hand it to the parent,
+            // the only observer that sees both halves (spec §6.3).
+            let endpoints_survive = obs.responsive.is_some_and(|r| obs.degraded & !r == 0);
+            if endpoints_survive
+                && obs
+                    .healthy_lines
+                    .is_some_and(|lines| !partition::is_connected(lines))
+            {
+                return Verdict::Partition;
+            }
+            Verdict::Escalate(flags)
+        }
         fault => Verdict::Localized(fault),
     }
 }
@@ -174,6 +208,7 @@ mod tests {
             pairwise_rates: Some(polar::line_rates_to_pair_rates([1.0; 7])),
             coherence: Some(CoherenceMatrix::equicorrelated(7, 0.2)),
             healthy_lines: Some(0x7F),
+            responsive: Some(0x7F),
         };
         assert_eq!(diagnose(&obs), Verdict::Healthy);
     }
@@ -263,21 +298,37 @@ mod tests {
         mask
     }
 
-    /// What a node observes when the points in `stopped` **crash**: it stops hearing from exactly those.
+    /// What a node observes when the points in `stopped` **crash**: it stops hearing from exactly those, and
+    /// hears nothing further from them ever — they are gone, not quiet.
     fn observed_after_crashes(stopped: u8) -> Observation {
         Observation {
             degraded: stopped,
             healthy_lines: Some(healthy_lines_given_silent(stopped)),
+            responsive: Some(!stopped & 0x7F),
             ..Default::default()
         }
     }
 
-    /// What a node on the `mine` side of a **cut** observes: it stops hearing from everything across it.
+    /// What a node on the `mine` side of a **hard cut** observes: nothing at all crosses it.
     fn observed_across_a_cut(mine: u8) -> Observation {
         let far_side = !mine & 0x7F;
         Observation {
             degraded: far_side,
             healthy_lines: Some(healthy_lines_given_silent(far_side)),
+            responsive: Some(mine & 0x7F),
+            ..Default::default()
+        }
+    }
+
+    /// What a node observes across a **lossy** cut: the far side is too lossy to route through, and is still
+    /// audibly there — the incipient split the §6.5 sensor exists to catch.
+    fn observed_across_a_lossy_cut(mine: u8) -> Observation {
+        let far_side = !mine & 0x7F;
+        Observation {
+            degraded: far_side,
+            healthy_lines: Some(healthy_lines_given_silent(far_side)),
+            // Every point still lands a probe within the window: nothing has crashed.
+            responsive: Some(0x7F),
             ..Default::default()
         }
     }
@@ -294,10 +345,38 @@ mod tests {
     /// That is not hypothetical: it shipped, and stopped a three-crash cell from escalating for repair. The
     /// evidence that separates the two is **cross-node** (on a cut the far side is alive and holds the
     /// complementary view), which is what escalating to the parent exists to reach.
+    /// **A lossy cut IS separable from a mass crash, and that is the third case.**
+    ///
+    /// The hard cut below is not — it and a mass crash hand a node identical evidence. A *lossy* cut does
+    /// not: its far side keeps landing probes, so the endpoints are demonstrably still there and only the
+    /// graph between them has failed. That is the definition of a partition, and it is decidable with no
+    /// threshold at all, from a count of sightings.
+    ///
+    /// This is what `degraded == 0` used to approximate and what deriving the corroboration quorum (#107)
+    /// broke: a 92 %-loss node stopped being counted alive, so the sensor's own case stopped reaching it.
+    #[test]
+    fn a_lossy_cut_is_a_partition_while_the_same_shape_of_crash_is_not() {
+        let mine = 0b111_1000u8;
+        let lossy = observed_across_a_lossy_cut(mine);
+        let crashed = observed_after_crashes(!mine & 0x7F);
+
+        // Same degraded set, same line mask — the two differ ONLY in whether the far side still answers.
+        assert_eq!(lossy.degraded, crashed.degraded);
+        assert_eq!(lossy.healthy_lines, crashed.healthy_lines);
+        assert_ne!(lossy.responsive, crashed.responsive, "the one signal that separates them");
+
+        assert_eq!(diagnose(&lossy), Verdict::Partition, "endpoints alive, graph cut ⇒ a partition");
+        assert!(
+            matches!(diagnose(&crashed), Verdict::Escalate(_)),
+            "endpoints gone ⇒ a crash the decoder cannot place, which is an escalation, not a cut"
+        );
+    }
+
     #[test]
     fn a_mass_crash_and_one_side_of_a_cut_are_the_same_observation() {
         let crashed = observed_after_crashes(0b000_0111);
         let cut = observed_across_a_cut(0b111_1000);
+        assert_eq!(crashed.responsive, cut.responsive, "and the same points are audible in both");
         assert_eq!(crashed.degraded, cut.degraded, "the same three coordinates fall silent");
         assert_eq!(crashed.healthy_lines, cut.healthy_lines, "and the same lines survive");
         assert_eq!(diagnose(&crashed), diagnose(&cut), "so one node cannot return different verdicts");

@@ -1262,12 +1262,14 @@ impl<F: Field> OverlayNode<F> {
         // consults it only in the all-alive branch and behind a persistence dwell, so this is safe to pass
         // every round.
         let healthy_lines = self.partition_healthy_lines(now);
+        let responsive = self.responsive_mask(now);
         let mut effects = self.healer.diagnose::<F>(
             now,
             self_index,
             degraded,
             alive_count,
             Some(healthy_lines),
+            Some(responsive),
             &self.config,
             self.epoch,
         );
@@ -1305,6 +1307,41 @@ impl<F: Field> OverlayNode<F> {
         // a lie, so it is never quarantined). Deduped to fire once per grey episode.
         effects.extend(self.detect_grey(now));
         effects
+    }
+
+    /// The points this node still hears from **at all**: bit `i` set ⇔ some fresh sighting of cell point `i`
+    /// exists, direct or witnessed, with **no corroboration quorum required**.
+    ///
+    /// The weaker half of a deliberate pair. [`coord_alive`](Self::coord_alive) asks whether a point is
+    /// reliable enough to route through, and sizes its witness count against the cell's Byzantine budget;
+    /// this asks only whether the point is *there*. **One witness proves an endpoint exists, a quorum proves
+    /// it is dependable** — and the difference between those two questions is exactly the difference between
+    /// a lossy cut and a crash, which is what `diagnose` needs to tell a `Partition` from an `Escalate`.
+    ///
+    /// A count of sightings, never a loss rate, so no threshold appears here to be got wrong: a node behind a
+    /// 92 %-loss cut still lands a probe within the window; a crashed one lands none, ever.
+    ///
+    /// Self always reads responsive — a node that could not hear itself would report its own coordinate as a
+    /// crashed endpoint and turn every real cut into an escalation.
+    fn responsive_mask(&self, now: Instant) -> u8 {
+        let timeout = self.config.liveness_timeout;
+        let mut mask = 0u8;
+        for i in 0..7usize {
+            let coord = self.cell_coord(i);
+            let heard = coord == self.coord.coords()
+                || self
+                    .peers
+                    .get(&coord)
+                    .and_then(|p| p.last_seen)
+                    .is_some_and(|seen| now.since(seen) <= timeout)
+                || self.witnessed.get(&coord).is_some_and(|w| {
+                    w.values().any(|&seen| now.since(seen) <= timeout)
+                });
+            if heard {
+                mask |= 1u8 << i;
+            }
+        }
+        mask
     }
 
     /// The §6.5 healthy-line mask: bit `l` set ⇔ Fano line `l` carries live connectivity, i.e. its **worst**

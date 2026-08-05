@@ -634,6 +634,7 @@ impl Healer {
         degraded: u8,
         alive_count: usize,
         healthy_lines: Option<u8>,
+        responsive: Option<u8>,
         config: &Config,
         epoch: Epoch,
     ) -> Vec<Effect> {
@@ -677,13 +678,20 @@ impl Healer {
         // connected so no premature `Verdict::Partition` escapes. Partition-resistance (one lossy line still
         // reads λ₂=4) means only a sustained lossy line-COVER — a real incipient split, nodes still alive —
         // ever reaches the verdict.
-        // A partition candidate is only meaningful when the cell is ALL-ALIVE: if any node is down
-        // (`degraded != 0`) the disconnection is explained by the crash and handled by the node-fault path, so
-        // it must NOT build the partition streak (else a crash+recovery churn would accumulate the streak and
-        // false-fire on the recovery transient). Only a sustained *all-alive* disconnection — a real incipient
-        // split, nodes still up — accumulates.
+        // A partition candidate is only meaningful while the **endpoints survive**: a disconnection explained
+        // by a node that is simply gone is a crash, the node-fault path owns it, and letting it build the
+        // streak would false-fire on a crash+recovery transient.
+        //
+        // `degraded == 0` was the approximation, and it was too strong in exactly the direction that mattered.
+        // It also excluded the case this sensor exists for — an incipient **lossy** cut, where a node is not
+        // reachable enough to route through and is still plainly answering. Deriving the corroboration quorum
+        // (#107) pushed such nodes over the degradation bar, and from that day the streak could never
+        // accumulate on a real soft split. `responsive` restores it without a threshold: every degraded point
+        // is still being heard from, so it is the graph that failed. When nothing is degraded this is
+        // trivially true, so the old condition is a special case of the new one.
+        let endpoints_survive = responsive.is_some_and(|r| degraded & !r == 0);
         let disconnected =
-            degraded == 0 && healthy_lines.is_some_and(|h| !partition::is_connected(h));
+            endpoints_survive && healthy_lines.is_some_and(|h| !partition::is_connected(h));
         self.partition_streak = if disconnected {
             self.partition_streak.saturating_add(1)
         } else {
@@ -698,6 +706,7 @@ impl Healer {
             pairwise_rates: Some(pairwise_rates),
             coherence: measured.clone(),
             healthy_lines: trusted_lines,
+            responsive,
         });
 
         let band_ready = self.advance_band_dwell(band.as_ref());
