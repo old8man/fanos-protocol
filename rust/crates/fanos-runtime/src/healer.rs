@@ -594,7 +594,15 @@ impl Healer {
         // (over-coupling) verdict fire on the same signal the homeostat acts on, so there is one
         // over-coupling authority, not a dormant liveness-only arm beside a separate behavioural check.
         // (Partition/cascade still need the global cross-attestation view, not this local sense alone.)
-        let measured = self.monitor.coherence();
+        // **Only from a full window.** `coherence()` yields a matrix as soon as every node has *two*
+        // samples, and a two-point Pearson correlation is `±1` exactly — two points always lie on a line. A
+        // freshly-started node would therefore read `Φ = 6` (every `|C_ij| = 1`) on its second heartbeat and
+        // hand the homeostat a verdict of `Decouple` or `Bind` drawn from a matrix that carries no
+        // information at all, before it has observed anything. `ready()` is the predicate written for exactly
+        // this — *"the point at which the coherence read is stable"* — and until now nothing called it, so
+        // the guard existed and was not installed. Below a full window the node has no self-model, which is
+        // the honest state: `diagnose` keeps its liveness-only arm and the homeostat is not consulted.
+        let measured = self.monitor.ready().then(|| self.monitor.coherence()).flatten();
         // The structural (Byzantine) check (spec §6.4 + §6.2): the live polar cross-attestation matrix,
         // assembled from gossiped `DiagAttest` reports (§98). `diagnose` runs the 14 free polar sum-rules
         // against it FIRST, ahead of the syndrome localizer — an equivocating mediator's own report is

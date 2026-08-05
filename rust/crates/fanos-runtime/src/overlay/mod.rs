@@ -2053,6 +2053,64 @@ mod tests {
     }
 
     #[test]
+    fn no_coherence_verdict_escapes_before_the_window_is_full() {
+        // **A two-point correlation is `±1` exactly** — two samples always lie on a line — so a node that
+        // read its self-model on the second heartbeat would see every `|C_ij| = 1`, i.e. `Φ = 6` and a mean
+        // correlation of 1, and hand the homeostat a confident `Decouple` drawn from a matrix carrying no
+        // information. Under the lockstep flood below that is exactly what happens: the dwell is satisfied by
+        // heartbeats 2–4 and the shed actuates less than halfway to a full window.
+        //
+        // The property is therefore a *timing* one: the first coherence-driven notification must not appear
+        // before the window has `BEHAVIOR_WINDOW` samples. Asserted as the index it first fires at, not as a
+        // boolean, so a run that never fires at all cannot pass by silence — the second assertion is what
+        // makes the first one mean something.
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+
+        let mut t = 1u64;
+        let mut first_verdict: Option<usize> = None;
+        for w in 0..(BEHAVIOR_WINDOW + 4) {
+            let bursts = (w % 3) + 1; // identical across peers → perfectly correlated at every window length
+            for i in 1..7usize {
+                let from = Point::<F2>::at(i).coords();
+                for _ in 0..bursts {
+                    node.step(Instant(t), Input::Message { from, frame: encode(FrameType::Route, b"x") });
+                    t += 1;
+                }
+            }
+            let hb = node.step(Instant(t), Input::Timer(HEARTBEAT));
+            // Only the homeostat's own outputs. `Escalated` is deliberately excluded: it is emitted both by
+            // the band's `Escalate` arm and by the liveness healing plan, so it cannot tell a coherence
+            // verdict from a peer going stale — which is a defect in its own right, not a signal this test
+            // can use.
+            let spoke = hb.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Notify(
+                        Notification::Decoupled | Notification::Bound | Notification::Rebalance { .. }
+                    )
+                )
+            });
+            if spoke && first_verdict.is_none() {
+                first_verdict = Some(w);
+            }
+            t += 1;
+        }
+
+        let at = first_verdict.expect(
+            "the flood must eventually produce a coherence verdict — otherwise this test proves nothing \
+             about *when* one appears",
+        );
+        assert!(
+            at + 1 >= BEHAVIOR_WINDOW,
+            "a coherence verdict escaped at heartbeat {} with only {} samples: below a full window the \
+             correlation matrix is degenerate, and acting on it is acting on nothing",
+            at + 1,
+            at + 1,
+        );
+    }
+
+    #[test]
     fn behavioural_over_coupling_drives_the_homeostat_to_decouple() {
         // The live homeostat runs on the MEASURED Γ_net (relay activity), not the liveness proxy. Feed a
         // common-mode flood: every peer relays the same lockstep-varying amount each window, so node 0's
