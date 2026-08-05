@@ -337,6 +337,17 @@ pub fn client_drop_line<F: Field>(
 /// Returns the offending line so the caller can say which, rather than that something was wrong.
 #[must_use]
 pub fn route_leaks(forward_circuit: &[Coord], reply_circuit: &[Coord], meeting: Coord) -> Option<Coord> {
+    // A leg with no neutral middle leaks whatever its two ends name, because **a hop learns both of its
+    // neighbours** — who sent to it (the transport authenticates the source) and where it forwards (peeling
+    // reveals the next hop). One intermediate is therefore not "shallower", it is the *same* hop holding both
+    // names with a hop's worth of ceremony around it. The table below cannot see this, because both names are
+    // then carried by one line rather than by two that happen to coincide.
+    if forward_circuit.len() < slots::MIN_FORWARD_DEPTH + 1 {
+        return forward_circuit.first().copied().or(Some(meeting));
+    }
+    if reply_circuit.len() < slots::MIN_REPLY_DEPTH + 1 {
+        return reply_circuit.first().copied().or(Some(meeting));
+    }
     let names_client = [forward_circuit.first(), reply_circuit.last()];
     // `H_d` is the last INTERMEDIATE hop, i.e. the one before the meeting line the circuit ends at.
     let h_d = forward_circuit.len().checked_sub(2).and_then(|i| forward_circuit.get(i));
@@ -453,22 +464,15 @@ pub fn anonymous_dial<R: CryptoRng>(
     // The gate, and it is unconditional. Everything above is an attempt to make the sound route the one that
     // gets built; this is the refusal to dial when it is not. Both halves are needed — a check with no
     // construction behind it would fail 43% of dials, and a construction with no check would trust a caller.
-    if forward_circuit.len() < slots::TARGET_DEPTH {
-        tracing::warn!(
-            depth = forward_circuit.len(),
-            required = slots::TARGET_DEPTH,
-            "refusing an anonymous dial: the forward circuit is too shallow to hide either endpoint. Its \
-             first hop is dialled by this node and its last learns the meeting line, so below the minimum \
-             those are ONE line and `t` corrupted members — the tolerated budget at Fano — name both ends."
-        );
-        return None;
-    }
     if let Some(line) = route_leaks(&forward_circuit, &reply_circuit, meeting) {
         tracing::warn!(
             ?line,
-            "refusing an anonymous dial: one line of this route names both this node and the service, so \
-             capturing it alone (`t` members, the tolerated budget at Fano) deanonymizes the session — where \
-             two distinct lines would cost `2t - 1` and exceed it."
+            forward = forward_circuit.len(),
+            reply = reply_circuit.len(),
+            "refusing an anonymous dial: one line of this route names both this node and the service — either \
+             because two positions coincide, or because a leg is too short to have a middle and its single \
+             hop holds both neighbours. Capturing that line alone costs `t` members, the tolerated budget at \
+             Fano, where two distinct lines would cost `2t - 1` and exceed it."
         );
         return None;
     }
@@ -682,21 +686,38 @@ mod tests {
     /// setting: `H_1` and `H_d` become one line, so `t` members — the tolerated budget at Fano — name both ends.
     #[test]
     fn a_circuit_too_shallow_to_hide_either_endpoint_names_both() {
-        let lines: Vec<Coord> = (0..7).map(|i| Line::<F2>::at(i).coords()).collect();
-        let meeting = lines[0];
-        let (h1, r1, d) = (lines[1], lines[2], lines[3]);
-        // Depth 1: the forward circuit is [H_1, M], so the hop the client dials is the hop that learns M.
+        let line = |i: usize| Line::<F2>::at(i).coords();
+        let meeting = line(0);
+        let (h1, h2, r1, r2, d) = (line(1), line(4), line(2), line(5), line(3));
+        let sound_reply = [r1, r2, d];
+
+        // FORWARD, depth 1: the circuit is [H_1, M], so the hop the client dials is the hop that learns M.
         let shallow = vec![h1, meeting];
         assert!(shallow.len() < slots::TARGET_DEPTH, "depth 1 is below the derived floor");
         assert_eq!(
-            route_leaks(&shallow, &[r1, d], meeting),
+            route_leaks(&shallow, &sound_reply, meeting),
             Some(h1),
             "at depth 1 the single intermediate is both the client's entry and the hop that learns the \
              meeting line, and the predicate must name it"
         );
-        // Depth 2 with the same endpoints is sound — so the refusal above is about the depth, not the lines.
-        let sound = vec![h1, lines[4], meeting];
-        assert_eq!(route_leaks(&sound, &[r1, d], meeting), None);
+        // Depth 0 is worse and must also be named: the client dials the meeting line itself.
+        assert_eq!(route_leaks(&[meeting], &sound_reply, meeting), Some(meeting));
+
+        // REPLY, depth 1, and this is the case a weaker derivation misses. `R_1` and `D` are DIFFERENT lines,
+        // so no pair of positions coincides and the intersection test sees nothing — but a hop learns both of
+        // its neighbours, so that single intermediate holds the service-side launcher and the client's drop
+        // line at once. It is the same leak with a hop's worth of ceremony around it.
+        let sound_forward = vec![h1, h2, meeting];
+        assert_ne!(r1, d, "the two reply positions are distinct, so only the depth rule can catch this");
+        assert_eq!(
+            route_leaks(&sound_forward, &[r1, d], meeting),
+            Some(r1),
+            "one reply intermediate is not a shallower reply path, it is a hop holding both names"
+        );
+
+        // Both legs at their floor, same endpoints: sound. So each refusal above is about that leg's depth
+        // rather than about the lines it was given.
+        assert_eq!(route_leaks(&sound_forward, &sound_reply, meeting), None);
     }
 
     #[test]

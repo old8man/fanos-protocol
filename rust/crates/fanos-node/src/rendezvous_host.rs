@@ -28,6 +28,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use fanos_aphantos::nostos::{ReplyKeys, select_drop_line};
+use fanos_aphantos::slots;
 use fanos_diaulos::StaticKeypair;
 use fanos_field::F2;
 use fanos_geometry::{Point, Triple};
@@ -466,11 +467,40 @@ async fn rotate_host(
             .all(|m| dir.get(m).is_some())
     })
     .coords();
+    // Every circuit below is laid AROUND `drop_line`, and around the meeting lines, for the reason
+    // `rendezvous::route_leaks` states: no line may hold both a name for this host and a name for the service
+    // it serves. Drawn from a per-epoch secret seed, so the paths are stable for the epoch the signed
+    // registration names, unpredictable to anyone without `host_secret`, and fresh at every turn.
+    let meetings = meeting_lines::<F2>(&service_public.encode(), epoch, &beacon);
+    let mut avoid = meetings.clone();
+    avoid.push(drop_line);
     // A fresh per-epoch dead-drop reply keypair (deterministic in secret+epoch), advertised in the
     // registration and handed to the accept loop to open forwarded requests.
     let (reply_keys, reply_pub) = ReplyKeys::generate(&epoch_seed(host_secret, epoch, b"reply"));
+    // The route the combiner forwards requests along. It used to be `vec![drop_line]` — depth 0 — so the
+    // member that peels a client request sealed it straight to this host's drop line, holding a service-name
+    // and a host-name at once.
+    //
+    // `slots::MIN_REPLY_DEPTH` intermediates, and note that ONE would not have been enough here even though
+    // it removes the depth-0 case: the launcher is a member of this service's meeting line, so it is itself
+    // service-naming, and a hop learns BOTH its neighbours. A single intermediate would learn the launcher
+    // (hence the service) and `drop_line` (hence this host, 1-of-(q+1)) — the same pair, one hop further out.
+    let mut fwd_rng = SeedRng::from_seed(&epoch_seed(host_secret, epoch, b"fwd-circuit"));
+    let mut forward_circuit =
+        crate::rendezvous::random_hops::<F2, _>(slots::MIN_REPLY_DEPTH, &avoid, &dir, &mut fwd_rng);
+    if forward_circuit.len() < slots::MIN_REPLY_DEPTH {
+        // A plane too crowded to lay even one intermediate cannot host anonymously this epoch. Failing here
+        // is the honest outcome: registering anyway would publish the drop line to every meeting member and
+        // still call itself a hidden service.
+        tracing::warn!(
+            "hidden service not registering this epoch: no line is free to carry its forward circuit, so a \
+             registration would hand the combiner this host's dead-drop line directly"
+        );
+        return;
+    }
+    forward_circuit.push(drop_line);
     let Some(reg) =
-        HostRegister::onion(identity, signer, epoch, reply_pub.encode(), vec![drop_line], threshold)
+        HostRegister::onion(identity, signer, epoch, reply_pub.encode(), forward_circuit, threshold)
     else {
         return;
     };
@@ -494,12 +524,27 @@ async fn rotate_host(
     // The same sealed frame serves all `q + 1` — each member runs its own gather over the identical onion and
     // binds. This is what makes silencing a meeting point cost the adversary a `q + 2 − t` quorum of its line
     // rather than one node.
-    for (i, meeting) in meeting_lines::<F2>(&service_public.encode(), epoch, &beacon).into_iter().enumerate() {
+    for (i, meeting) in meetings.iter().copied().enumerate() {
         let seed = epoch_seed(host_secret, epoch, &[b"reg".as_slice(), &(i as u32).to_be_bytes()].concat());
-        if let Some(fwd) = seal_host_register::<F2>(&[meeting], &dir, threshold, &reg, &seed) {
-            for member in line_member_coords::<F2>(meeting) {
-                client.command(Command::Emit { to: member, frame: fwd.frame.clone() });
-            }
+        let mut rng = SeedRng::from_seed(&epoch_seed(
+            host_secret,
+            epoch,
+            &[b"reg-circuit".as_slice(), &(i as u32).to_be_bytes()].concat(),
+        ));
+        let mut circuit =
+            crate::rendezvous::random_hops::<F2, _>(slots::MIN_FORWARD_DEPTH, &avoid, &dir, &mut rng);
+        if circuit.len() < slots::MIN_FORWARD_DEPTH {
+            continue;
+        }
+        circuit.push(meeting);
+        // ONE emission, at a salted member of the FIRST hop — not one per member of the meeting line. That
+        // loop was the leak: `Input::Message` carries a transport-authenticated source coordinate, so every
+        // member of every meeting line learned this host's address, which is precisely what a hidden service
+        // must not publish. The fan-out now happens inside the onion, at the last hop
+        // (`seal_host_register`'s dead-drop envelope), where a member of the meeting line does it on our
+        // behalf and this coordinate never appears.
+        if let Some(fwd) = seal_host_register::<F2>(&circuit, &dir, threshold, &reg, &seed) {
+            client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
         }
     }
     let _ = epoch_tx.send(HostEpoch { reply_keys, directory: dir });

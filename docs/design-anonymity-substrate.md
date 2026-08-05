@@ -266,15 +266,39 @@ operator `O` is treated exactly as a NOSTOS receiver:
    onion to `L_rdv`** carrying `{ service_tag, reply_pub_O, forward_route_O }` — where
    `service_tag = H("FANOS-v1/rdv-host" ‖ svc_pub ‖ epoch)` disambiguates services co-located at one gathering
    node, `reply_pub_O` is a fresh NOSTOS reply key, and `forward_route_O` is a threshold circuit ending at `L_O`.
-   The same sealed registration is emitted to **every member of `L_rdv`** (hardening §6.1b): a route binding is
-   state at whichever member gathers a request, client launches draw a per-onion member
-   (`combiner_for_salted`), and a member without the binding would answer a client with silence. The registration
-   is itself an onion, so no member learns more than `O`'s **line** `L_O` (`O` hidden `1`-of-`(q+1)`), never
+   The registration reaches **every member of `L_rdv`** (hardening §6.1b), because a route binding is state at
+   whichever member gathers a request, client launches draw a per-onion member (`combiner_for_salted`), and a
+   member without the binding would answer a client with silence.
+
+   **How it reaches them is load-bearing, and it was wrong until 2026-08-05.** `O` used to emit the sealed
+   frame to each member itself. `Input::Message` carries a source coordinate *the transport authenticates*, so
+   that loop published `c_O` to every member of every line derived from `O`'s own service key — while this
+   document, and `seal_host_register`'s own doc comment, claimed the combiner never learns it. The onion hid
+   the coordinate in its **payload**; the emission carried it on the **wire**.
+
+   Three things make the claim true rather than stated:
+
+   * **The fan-out is inside the onion.** The body rides a `deaddrop_envelope`, so the *last hop* multicasts to
+     `points_on(L_rdv)` — the same primitive a NOSTOS dead drop uses. The fan-out belongs at a member of the
+     destination line, which already knows that line, not at the origin, which must not be seen by it.
+   * **The circuit is a real one.** Two intermediates, `slots::MIN_FORWARD_DEPTH`, by the §depth derivation:
+     `[L_rdv]` puts `O` one transport hop from the line named after its own key, and `[H, L_rdv]` is no better
+     because `H` would see `c_O` *and* learn `L_rdv` when it peels.
+   * **The launch addressee is salted off `L_rdv`.** This is where line-counting stops applying. Capturing a
+     *hop* costs `t` members; learning the *launcher's* address costs nothing, because the transport
+     authenticates the source — exactly one node gets it for free. Two distinct lines meet in exactly one
+     point, so at `q = 2` one of the first hop's three members also sits on `L_rdv`, and a launch landing there
+     would hand one node both `c_O` and the registration naming the service. `seal_host_register` walks the
+     salt until the addressee is off `L_rdv`.
+
+   Only then is it true that no member learns more than `O`'s **line** `L_O` (`O` hidden `1`-of-`(q+1)`), never
    `c_O`. `O` **re-registers each epoch**, because `L_rdv` and `L_O` both rotate with the beacon.
 2. **Member-side forwarding** (`L_rdv → O`). When a client request peels out at a gathering member of `L_rdv` as
    an anonymous delivery, that member looks up the request's `service_tag`; if a host is registered, it
    **re-seals the entire client `Request` as a NOSTOS onion to `forward_route_O`** (`seal_nostos_reply` — the
-   same primitive that seals a client reply, §3) and emits it. `O`, a member of `L_O`, receives the dead-drop,
+   same primitive that seals a client reply, §3) and emits it. `forward_route_O` carries at least one
+   intermediate (`slots::MIN_REPLY_DEPTH`); it was `[L_O]` until 2026-08-05, so the forwarding member held a
+   service-name and a host-name at once, and `HostRegister.forward_circuit` had always been a *vector*. `O`, a member of `L_O`, receives the dead-drop,
    opens it with `reply_pub_O`'s secret, and now holds the client's `Request` verbatim: cookie, the client's own
    reply circuit, and the DIAULOS `ClientHello` sealed to `svc_pub`. A request whose tag matches no registered
    host falls through to a **local** delivery (unchanged), so a node that genuinely is a member of its own

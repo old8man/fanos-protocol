@@ -607,11 +607,28 @@ impl HostRegister {
 }
 
 /// Seal a [`HostRegister`] into a threshold onion routed through `meeting_circuit` — hop lines whose
-/// **last** is the service's [`meeting_line`] this epoch — so it peels out at the meeting combiner as an
-/// anonymous delivery the combiner recognizes by [`HOST_REGISTER_TAG`]. The registration itself is an
-/// onion, so the combiner never learns the operator's coordinate — only the dead-drop line inside
-/// `register.forward_circuit`. `seed` domain-separates the onion's key material (fresh per registration).
-/// `None` if the circuit is empty, a member key is missing, or sealing fails.
+/// **last** is the service's [`meeting_line`] this epoch — so it peels out there as an anonymous delivery
+/// every member recognizes by [`HOST_REGISTER_TAG`]. `seed` domain-separates the onion's key material
+/// (fresh per registration). `None` if the circuit is empty, a member key is missing, or sealing fails.
+///
+/// **The fan-out is inside the onion, and that is the point.** A registration has to reach *every* member of
+/// the meeting line, because a route binding is state at whichever member later gathers a client request
+/// (#55) and a member without it answers with silence. It used to reach them because the operator emitted the
+/// sealed frame to each of them **itself** — and `Input::Message` carries a source coordinate the transport
+/// authenticates, so every one of them learned the operator's address. The onion hid the coordinate in its
+/// payload while the emission carried it on the wire, and this function's own doc claimed the opposite.
+///
+/// So the body rides a [`deaddrop_envelope`](fanos_aphantos::nostos::deaddrop_envelope): the last hop
+/// recognizes the tag and multicasts to `points_on(L)` on the operator's behalf. The fan-out belongs at a
+/// member of the destination line, which already knows that line — not at the origin, which must not be seen
+/// by it. No new wire format; the same primitive a NOSTOS dead drop uses.
+///
+/// The circuit must therefore be a real one. `[meeting]` alone puts the operator one transport hop from the
+/// line derived from its own service key, and `[H, meeting]` is no better: `H` would see the operator's
+/// address *and* learn `meeting` when it peels. Two intermediates is the floor
+/// ([`slots::MIN_FORWARD_DEPTH`](fanos_aphantos::slots::MIN_FORWARD_DEPTH)) and it is the same derivation as
+/// the client's, because this is the same shape — a forward circuit from a party that must stay hidden to a
+/// destination derived from the service.
 #[must_use]
 pub fn seal_host_register<F: Field>(
     meeting_circuit: &[Triple],
@@ -620,11 +637,40 @@ pub fn seal_host_register<F: Field>(
     register: &HostRegister,
     seed: &[u8],
 ) -> Option<Forward> {
+    let (&meeting, _) = meeting_circuit.split_last()?;
+    if meeting_circuit.len() < fanos_aphantos::slots::TARGET_DEPTH {
+        return None;
+    }
     let mut body = Vec::with_capacity(HOST_REGISTER_TAG.len() + 32);
     body.extend_from_slice(HOST_REGISTER_TAG);
     body.extend_from_slice(&register.encode());
-    seal_forward::<F>(meeting_circuit, directory, threshold, &body, seed)
+    let envelope = fanos_aphantos::nostos::deaddrop_envelope(&body);
+    // The launch addressee must not be a member of the meeting line, and this is where the line-counting
+    // argument stops applying. Capturing a HOP costs `t` of its members; learning the LAUNCHER's address costs
+    // nothing — the transport authenticates the source, so exactly one node gets it for free. Two distinct
+    // lines meet in exactly one point, so at `q = 2` one of the first hop's three members also sits on the
+    // meeting line, and a launch that lands there hands one node both the operator's address and (via the
+    // multicast registration it is about to receive) the service it serves. One node, no threshold, no
+    // collusion.
+    //
+    // The seed is walked rather than the circuit redrawn: the addressee is `combiner_for_salted(first, onion)`,
+    // a function of the onion bytes, and every line meets the meeting line in a point — so no choice of first
+    // hop avoids this, only a choice of salt. `None` after the walk rather than a launch that leaks, and the
+    // odds make that unreachable in practice: `(1/q+1)^ATTEMPTS` at worst.
+    let members = line_member_coords::<F>(meeting);
+    (0..LAUNCH_SALT_ATTEMPTS).find_map(|i| {
+        let mut salted = seed.to_vec();
+        salted.extend_from_slice(&(i as u32).to_be_bytes());
+        let fwd = seal_forward::<F>(meeting_circuit, directory, threshold, &envelope, &salted)?;
+        (!members.contains(&fwd.combiner)).then_some(fwd)
+    })
 }
+
+/// How many salts [`seal_host_register`] may walk looking for a launch addressee off the meeting line.
+///
+/// Each try succeeds with probability `q/(q+1)` — `2/3` at Fano — so sixteen leaves a failure probability of
+/// about `2 x 10^-8`, and the walk is bounded so a degenerate directory cannot spin.
+const LAUNCH_SALT_ATTEMPTS: usize = 16;
 
 /// If `delivery` is a [`HOST_REGISTER_TAG`]-prefixed host registration, decode it; otherwise `None` (the
 /// combiner then treats the delivery as a client [`Request`]). Used at a meeting combiner to classify each
@@ -850,6 +896,97 @@ mod tests {
             ..genuine.clone()
         };
         assert!(!unsigned.verify(epoch), "a KEM-only identity cannot authenticate a registration, so it is refused");
+    }
+
+    /// A registration is never launched at the line it names, and cannot be.
+    ///
+    /// This is where hidden-service location privacy actually lives. `Input::Message` carries a source
+    /// coordinate the transport authenticates, so whoever this frame is emitted to learns the operator's
+    /// address — and the frame used to be emitted to every member of every meeting line, each derived from the
+    /// operator's own service key. The onion hid the coordinate in its payload while the emission carried it
+    /// on the wire.
+    #[test]
+    fn a_registration_is_never_launched_at_the_line_it_names() {
+        use fanos_field::F2;
+        use fanos_geometry::Line;
+        use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let mut rng = SeedRng::from_seed(&[0xA7, i]);
+            let (_s, public) = HybridKemSecret::generate(&mut rng);
+            dir.insert(fanos_geometry::Point::<F2>::at(usize::from(i)).coords(), public);
+        }
+        let line = |i: usize| Line::<F2>::at(i).coords();
+        let (meeting, h1, h2, drop) = (line(0), line(1), line(2), line(3));
+        let mut kem = SeedRng::from_seed(b"launch-svc");
+        let (_sec, svc_pub) = HybridKemSecret::generate(&mut kem);
+        let (identity, signer) = identity(b"launch-sign");
+        let epoch = Epoch::new(9);
+        let reg = HostRegister::onion(&identity, &signer, epoch, svc_pub.encode(), vec![h2, drop], 2)
+            .expect("the registration is nameable");
+
+        // THE PROPERTY, over many registrations rather than one: the frame lands on a member of the FIRST hop
+        // and never on a member of the meeting line. Measured across seeds, because a single seed would say
+        // nothing about the salt walk that enforces it.
+        let mut registration_body = HOST_REGISTER_TAG.to_vec();
+        registration_body.extend_from_slice(&reg.encode());
+        let meeting_members = line_member_coords::<F2>(meeting);
+        let mut naive_would_leak = 0u32;
+        // Enough to make the falsification below decisive at its ~1-in-3 rate, and no more: each trial is
+        // two PQ onion seals.
+        let trials = 120u32;
+        for i in 0..trials {
+            let seed = [b"launch".as_slice(), &i.to_be_bytes()].concat();
+            let fwd = seal_host_register::<F2>(&[h1, h2, meeting], &dir, 2, &reg, &seed)
+                .expect("a floor-depth circuit seals");
+            assert!(
+                line_member_coords::<F2>(h1).contains(&fwd.combiner),
+                "the launch lands on the first hop"
+            );
+            assert!(
+                !meeting_members.contains(&fwd.combiner),
+                "the launch must NOT land on the meeting line: the transport authenticates the source, so \
+                 that ONE member learns this operator's address for free — no threshold, no collusion — and \
+                 it is about to receive the multicast registration naming the service"
+            );
+            // What the unsalted launch would have done. Two distinct lines meet in exactly one point, so at
+            // q = 2 one of the first hop's three members sits on the meeting line and this is not rare.
+            let envelope = fanos_aphantos::nostos::deaddrop_envelope(&registration_body);
+            if let Some(naive) = seal_forward::<F2>(&[h1, h2, meeting], &dir, 2, &envelope, &seed)
+                && meeting_members.contains(&naive.combiner)
+            {
+                naive_would_leak += 1;
+            }
+        }
+        assert!(
+            naive_would_leak > trials / 10,
+            "only {naive_would_leak} of {trials} unsalted launches would have landed on the meeting line, so \
+             this test cannot see the defect the salt walk exists to remove"
+        );
+
+        // THE FAN-OUT MOVED INSIDE. Every member of the meeting line must end up holding the binding (#55).
+        // That used to be the operator's job, by emitting to each of them; now the body rides a dead-drop
+        // envelope so the LAST hop multicasts it, on the operator's behalf and without seeing it.
+        let peeled = fanos_aphantos::nostos::deaddrop_envelope(&registration_body);
+        let body = fanos_aphantos::nostos::parse_deaddrop(&peeled)
+            .expect("the registration rides a dead-drop envelope, which is what makes the last hop multicast");
+        assert!(
+            parse_host_register(body).is_some(),
+            "and what gets multicast is still a registration every member classifies the same way"
+        );
+
+        // THE FALSIFICATION, in the tree rather than performed once by hand: the circuits that leak are
+        // refused, so the assertions above are a constraint and not a description.
+        for short in [vec![meeting], vec![h1, meeting]] {
+            assert!(
+                seal_host_register::<F2>(&short, &dir, 2, &reg, b"seed").is_none(),
+                "a {}-hop registration circuit must be refused: with none the operator emits straight at the \
+                 line named after its own key, and with one that hop sees the operator AND learns the meeting \
+                 line when it peels",
+                short.len()
+            );
+        }
     }
 
     #[test]

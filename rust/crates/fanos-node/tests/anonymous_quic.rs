@@ -310,7 +310,11 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let mut spare = lines.iter().copied().filter(|&l| l != meeting && l != rp);
     let hop_to_l = spare.next().unwrap();
     let hop_to_l2 = spare.next().unwrap();
+    // TWO reply intermediates as well, and for the same reason rather than for symmetry's sake: a hop learns
+    // both its neighbours, so a single one would hold the service-side launcher and this client's drop line at
+    // once — a leak no intersection test can see, because those two positions are different lines.
     let hop_to_rp = spare.next().unwrap();
+    let hop_to_rp2 = spare.next().unwrap();
 
     let service_node = nodes[l_index].take().unwrap();
     // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
@@ -353,7 +357,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let client_node = nodes[rp_index].take().unwrap();
     let route = RendezvousRoute {
         forward_hops: vec![hop_to_l, hop_to_l2],
-        reply_circuit: vec![hop_to_rp, rp],
+        reply_circuit: vec![hop_to_rp, hop_to_rp2, rp],
         directory: mix,
         threshold: t as u8,
         epoch,
@@ -522,6 +526,13 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
 /// without the binding is a member that answers a client with silence. One sealed frame serves all `q + 1` —
 /// each member runs its own gather over the identical onion and binds. Each point's registration is sealed under
 /// its own seed, so a member that peels one cannot replay it to another point.
+/// Register at every meeting point the way the production driver does: ONE emission per meeting line, at a
+/// salted member of the circuit's FIRST hop, with the fan-out to the line's members carried inside the onion.
+///
+/// It used to emit the sealed frame to each member of each meeting line directly from `host`, which is what
+/// `spawn_rendezvous_host` did — and `Input::Message` carries a transport-authenticated source coordinate, so
+/// that loop published the host's address to every member of every line derived from its own service key. A
+/// fixture that reproduces production's leak proves production's leak works.
 fn register_at_every_meeting_member(
     host: &NodeHandle,
     service_public: &HybridKemPublic,
@@ -530,12 +541,18 @@ fn register_at_every_meeting_member(
     threshold: u8,
     reg: &HostRegister,
 ) {
-    for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
+    let meetings = meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON);
+    let spare: Vec<Triple> = (0..7)
+        .map(|i| Line::<F2>::at(i).coords())
+        .filter(|l| !meetings.contains(l) && !reg.forward_circuit.contains(l))
+        .collect();
+    for (i, point) in meetings.iter().copied().enumerate() {
         let seed = [b"off-combiner-reg".as_slice(), &(i as u32).to_be_bytes()].concat();
-        let fwd = seal_host_register::<F2>(&[point], mix, threshold, reg, &seed).unwrap();
-        for member in line_member_coords::<F2>(point) {
-            host.client().command(Command::Emit { to: member, frame: fwd.frame.clone() });
-        }
+        // Two intermediates, the derived floor: with one, that hop would see the host's address AND learn the
+        // meeting line when it peels.
+        let circuit = vec![spare[i % spare.len()], spare[(i + 1) % spare.len()], point];
+        let fwd = seal_host_register::<F2>(&circuit, mix, threshold, reg, &seed).unwrap();
+        host.client().command(Command::Emit { to: fwd.combiner, frame: fwd.frame });
     }
 }
 

@@ -807,6 +807,58 @@ required. Two subsystems, opposite counsel, neither aware of the other, sending 
 weakness to a worse one. Joined by `plane_can_anonymize`, and the honest answer for a wide cell is a wider
 **onion budget** — cell width and onion width are independent deployment parameters.
 
+**A-C2 — a hidden service published its address to its own meeting lines. CRITICAL, fixed.** Reducing the
+derivation across the other circuit builders found the same shape one subsystem over, and worse. `seal_host_
+register`'s doc says *"the registration itself is an onion, so the combiner never learns the operator's
+coordinate"*; its parameter is `meeting_circuit: &[Triple]`, a slice, so intermediates can precede the meeting
+line. The sole production caller passed `&[meeting]` and then emitted the sealed frame to **every member of
+every one of the `f + 1` meeting lines, from its own node**.
+
+`Input::Command(Emit)` becomes `Effect::Send`, and the receiving engine's `Input::Message` carries `from:
+Triple` documented as *"source coordinate (the transport authenticates this)"*. So: the operator emits; a
+member receives it from the operator's coordinate; that member knows the meeting line is `H(svc_pub‖epoch‖
+beacon)` and the registration carries `identity` in the clear (#67). At Fano that is 3 lines × 3 members —
+effectively the whole cell learns which machine runs the service. No threshold, no collusion, no correlation
+window. The onion hid the coordinate in its **payload** while the emission carried it on the **wire**, and the
+substrate's symmetry claim ("the two are symmetric") was false as shipped: the client rode two intermediates
+before anything service-derived saw it, the host rode zero.
+
+Why it broadcast at all: a registration must reach every member so whichever one later gathers a client request
+holds the binding (#55), and `seal_forward` addresses only the first hop. The fix moves the fan-out **inside**:
+the body rides a `deaddrop_envelope`, so the last hop multicasts to the line — the same primitive a NOSTOS dead
+drop uses, one match arm away, and the fan-out now happens at a member of the destination line rather than at
+the origin that must not be seen by it. Plus two intermediates, and the companion leg
+(`HostRegister.forward_circuit`, also depth 0, also a vector all along).
+
+**And writing its test found the residual in the fix.** The launch lands on a salted member of the first hop —
+but two distinct lines meet in exactly one point, so at `q = 2` one of that hop's three members also sits on the
+meeting line, and a launch landing there hands *one* node both the operator's address and the registration
+naming the service. **This is where line-counting stops applying**: capturing a *hop* costs `t` members, while
+learning the *launcher's* address costs nothing, because the transport authenticates the source. `2t − 1` is
+the wrong bound for a leak that needs no capture at all. Fixed by walking the salt until the addressee is off
+the meeting line; measured, the naive launch would have landed there on **well over a tenth** of registrations,
+and the test asserts that rate so its zero-leak half stays a constraint.
+
+**A-H4 — and the derivation in A-C1's own commit undercounted the reply leg. Corrected same day.** It read:
+"`R_1` names the service side, `D` names the client, so `R_1 ≠ D`, so `e ≥ 1`", and shipped
+`MIN_REPLY_DEPTH = 1`. Wrong, because **a hop learns both of its neighbours** — who sent to it (the transport
+authenticates the source) and where it forwards (peeling reveals the next hop). At `e = 1` that single
+intermediate is both `R_1` and `R_e`, so it holds the launcher and `D` at once: the same forbidden pair with a
+hop's worth of ceremony around it.
+
+Two things make this worth recording rather than quietly fixing. First, **no intersection test can see it** —
+`R_1` and `D` are different lines, so the pair table finds nothing; only a depth rule catches it, which is why
+`route_leaks` now covers both shapes and `anonymous_dial` has one gate instead of two. Second, the shipped
+default was `--reply-depth 2` and therefore *always sound*; only the floor was too permissive, so nothing
+would ever have failed and the error would have sat in the record as a derivation. A wrong derivation that
+agrees with the default is the hardest kind to notice.
+
+`MIN_REPLY_DEPTH = MIN_FORWARD_DEPTH` — one constant seen twice. The name-strength asymmetry is real (`D`
+narrows the client to `q + 1` points where `H_1` gives an address) and does not change the count: a hop
+holding (service, `1`-of-`(q+1)` client) is still a hop holding both. The correction also moved the host's own
+`forward_circuit` from one intermediate to two, where the launcher is a member of the service's meeting line
+and so is itself service-naming.
+
 **And the tests had never run at the shipped depth.** Every `anonymous_quic` e2e used `depths: (1, 1)` while
 production defaults to `(2, 2)`. So the suite that proves an anonymous session completes over real QUIC was
 proving it for a circuit that carries no anonymity. Raised to `(2, 2)`: 10/10 green, ~37 s. That is

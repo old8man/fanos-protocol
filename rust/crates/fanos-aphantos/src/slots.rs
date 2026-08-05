@@ -65,6 +65,10 @@ use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, Threshol
 ///   `M` is a deterministic function of the service's public key (the client derives it with no lookup), so
 ///   knowing `M` *is* knowing the service.
 ///
+/// The mechanism behind both rows is one rule: **a hop learns both of its neighbours** — who sent to it (the
+/// transport authenticates the source) and where it forwards (peeling reveals the next hop). Everything else
+/// follows from where the named parties sit relative to that window.
+///
 /// Deanonymization is one adversary holding both names. Each line costs `t = ⌈2(q+1)/3⌉` corrupted members to
 /// capture, and two **distinct** lines meet in exactly one point, so two of them cost `2t − 1`. On every plane
 /// this platform recommends that exceeds the tolerated budget `f = ⌊(n−1)/3⌋` — at `q = 2`, `2t − 1 = 3 > 2 = f`
@@ -76,15 +80,24 @@ use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, Threshol
 /// none, and the circuit still looks like a circuit.
 pub const MIN_FORWARD_DEPTH: usize = 2;
 
-/// The fewest **intermediate** hops a reply circuit needs before the client's drop line.
+/// The fewest **intermediate** hops a reply circuit needs before the client's drop line — the same number as
+/// [`MIN_FORWARD_DEPTH`], for the same reason, and the reason is worth stating because a weaker version of it
+/// gives `1` and is wrong.
 ///
-/// The same argument on the return leg. The reply circuit is `[R_1, …, R_e, D]`: `R_1` is dialled by whoever
-/// launches the reply, so it names the service side, and `D` is the client's own drop line, so it names the
-/// client to within its `q + 1` members. `R_1 ≠ D` gives `e ≥ 1`.
+/// The reply circuit is `[launcher, R_1, …, R_e, D]`. The tempting argument is "`R_1` names the service side
+/// and `D` names the client, so `R_1 ≠ D`, so `e ≥ 1`". It undercounts, because **a hop learns both of its
+/// neighbours**: `R_1` learns who launched to it *and* where it forwards. At `e = 1` that single hop is
+/// `R_1 = R_e`, so it holds the launcher (service-side) and `D` (client-side) at once — the forbidden pair,
+/// with the intermediate present and doing nothing.
 ///
-/// One rather than two because the reply's client-side name is weaker: `D` narrows the client to a line's
-/// worth of points, where `H_1` gives an address.
-pub const MIN_REPLY_DEPTH: usize = 1;
+/// At `e ≥ 2`, `R_1` holds `(launcher, R_2)` and `R_e` holds `(R_{e-1}, D)`; every middle name is neutral and
+/// no hop holds one of each. Which is exactly [`MIN_FORWARD_DEPTH`]'s argument with the roles swapped, so the
+/// two constants are one constant seen twice.
+///
+/// The name-strength asymmetry is real — `D` narrows the client to a line's `q + 1` points where `H_1` gives an
+/// address — and it does **not** change the count. A hop holding (service, `1`-of-`(q+1)` client) is still a
+/// hop holding both.
+pub const MIN_REPLY_DEPTH: usize = MIN_FORWARD_DEPTH;
 
 /// The circuit depth the layout targets, when the plane's budget allows it — **intermediate hops plus the
 /// destination**, so [`MIN_FORWARD_DEPTH`] `+ 1`.
