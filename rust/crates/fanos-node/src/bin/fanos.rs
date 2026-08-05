@@ -81,6 +81,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("status") => cmd_status(args.get(2..).unwrap_or(&[])).await,
         Some("id") => cmd_id(args.get(2..).unwrap_or(&[])),
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
+        Some("keygen") => cmd_keygen(args.get(2..).unwrap_or(&[])).await,
         Some("authority-key") => cmd_authority_key(args.get(2..).unwrap_or(&[])),
         Some("ingress-deal") => cmd_ingress_deal(args.get(2..).unwrap_or(&[])),
         Some("service-deal") => cmd_service_deal(args.get(2..).unwrap_or(&[])),
@@ -2187,6 +2188,150 @@ fn set_of(
 ///
 /// The seed, not the derived key: `HybridSigSecret::generate` is deterministic in it, so the holder
 /// regenerates the same authority key whenever one is needed — the convention the rest of the tree uses for
+/// `fanos keygen` — run the founding **distributed key generation** with the other founders and write this
+/// operator's beacon provisioning file.
+///
+/// The verb that removes the last trusted dealer. `beacon-deal` is correct for a cell one operator starts —
+/// it says so about itself — but for a public network it means one machine briefly holds the whole beacon
+/// secret, which is the governance gap `docs/testnet.md` §7 names. Here each founder draws its own secret
+/// locally, never transmits it whole, and the group commitment assembles from public data.
+///
+/// The roster is the `x:y:z@host:port` seed form every other verb already speaks, one per line, INCLUDING
+/// this node — a ceremony is defined by its whole participant set and a file that omits its own author
+/// describes a different one.
+///
+/// **The network's name comes from the roster, not from the DKG's output.** Every founder derives it from
+/// the same agreed list, so there is nothing to distribute and no founder to trust with it; and it is not a
+/// function of the beacon's key material, which is the coupling #98 removed — a name derived from the
+/// commitment would make that beacon unretirable.
+///
+/// The recovery authority is a **separate** step and stays one: a DKG that produces the beacon share does
+/// not produce the authority keys. Run `fanos authority-key` per founder and collect the verifiers.
+async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
+    use fanos_keygen::DkgNode;
+    use fanos_node::keygen::DkgCeremony;
+
+    let roster_path = flag(args, "--roster")
+        .ok_or_else(|| NodeError::Config("usage: fanos keygen --roster FILE --threshold T --out FILE".to_owned()))?;
+    let out = flag(args, "--out")
+        .ok_or_else(|| NodeError::Config("fanos keygen needs --out FILE (where to write this founder's beacon params)".to_owned()))?;
+    let threshold: usize = flag(args, "--threshold")
+        .ok_or_else(|| NodeError::Config("fanos keygen needs --threshold T".to_owned()))?
+        .parse()
+        .map_err(|_| NodeError::Config("bad --threshold".to_owned()))?;
+
+    // The roster, in file order — which is also the order the name is derived from, so every founder must
+    // hold the identical file. Blank lines and `#` comments are allowed; anything else must parse.
+    let text = std::fs::read_to_string(roster_path)?;
+    let mut roster: Vec<Peer> = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        roster.push(Peer::parse(line).map_err(|e| NodeError::Config(format!("roster line {}: {e}", n + 1)))?);
+    }
+    if roster.len() < threshold || threshold == 0 {
+        return Err(NodeError::Config(format!(
+            "a {threshold}-of-{} ceremony is not expressible: need 1 <= t <= participants",
+            roster.len()
+        )));
+    }
+
+    // This founder's own long-term identity — the same one `fanos node` runs on, so the coordinate the DKG
+    // seats it at is the coordinate it will hold afterwards.
+    let identity_path = flag(args, "--identity").map(PathBuf::from);
+    let creds = identity::load_or_generate(identity_path.as_deref())?;
+
+    // The name every founder computes identically from the agreed roster. Sorted, so a file whose lines were
+    // reordered is still the same network — the ceremony is a set, not a sequence.
+    let mut canonical: Vec<String> = roster.iter().map(ToString::to_string).collect();
+    canonical.sort();
+    let network_id = fanos_node::NetworkId::from_seed(canonical.join("\n").as_bytes());
+
+    // Fresh per-instance entropy: the participant's own secret (never transmitted whole) and the session
+    // nonce that binds its frames to THIS ceremony, so nothing from a previous run replays into it.
+    let mut secret = [0u8; 32];
+    let mut session = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    getrandom::fill(&mut session).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+
+    let directory = fanos_quic::Directory::new();
+    for peer in &roster {
+        directory.insert(peer.coord, peer.addr);
+    }
+    let listen: SocketAddr = match flag(args, "--listen") {
+        Some(a) => a.parse().map_err(|_| NodeError::Config(format!("bad --listen '{a}'")))?,
+        None => "0.0.0.0:0".parse().map_err(|_| NodeError::Identity)?,
+    };
+
+    let outcome = DkgCeremony::<F2>::slot();
+    let slot = outcome.clone();
+    let handle = fanos_quic::spawn_self_certifying_persistent_over::<F2>(
+        listen.into(),
+        &creds,
+        move |coord| {
+            // Wall-clock deadlines, not the simulator's logical ones: these phases run over real TLS
+            // handshakes on machines an operator does not control, and a complaint round that closes before
+            // an honest share arrives is indistinguishable from a Byzantine dealer.
+            let node = DkgNode::<F2>::new(coord, threshold, secret, session)
+                .with_deadlines(fanos_runtime::Duration::from_millis(30_000), fanos_runtime::Duration::from_millis(30_000));
+            Box::new(DkgCeremony::new(node, slot))
+        },
+        directory,
+        None,
+    )
+    .map_err(|_| NodeError::Identity)?;
+
+    println!("ceremony: {}-of-{} at coordinate {:?}", threshold, roster.len(), handle.address());
+    println!("network:  {}", fanos_node::config::hex_encode(network_id.as_bytes()));
+    if !handle.command(fanos_node::Command::StartHeartbeat) {
+        return Err(NodeError::Config("the engine is not accepting commands".to_owned()));
+    }
+
+    // Bounded: a ceremony that cannot converge must say so rather than hang an operator's terminal. The
+    // ceiling covers both phase deadlines with room for the handshakes between them.
+    let mut notes = handle.client().subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        match tokio::time::timeout_at(deadline, notes.recv()).await {
+            Ok(Ok(Notification::DkgComplete(_))) => break,
+            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(NodeError::Config("the node shut down mid-ceremony".to_owned()));
+            }
+            Err(_) => {
+                return Err(NodeError::Config(
+                    "the ceremony did not complete: check that every founder in the roster is running \
+                     `fanos keygen` with the identical file, and that their addresses are reachable"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+
+    let Some(result) = outcome.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else {
+        return Err(NodeError::Config("the ceremony completed without an outcome".to_owned()));
+    };
+    let params = BeaconParams {
+        network_id,
+        commitment: result.commitment,
+        threshold,
+        share: Some(result.share),
+        // Separate step, deliberately: a DKG that produces the beacon share does not produce the recovery
+        // authority's keys, and a file that silently carried none would look provisioned while leaving the
+        // cell unable to ever reshape its beacon.
+        authority: None,
+    };
+    write_file(Path::new(&out), params.to_config_string(), true)?;
+    println!("joint key agreed; wrote {out}");
+    println!(
+        "next: run `fanos authority-key` on each founder and re-issue these files with \
+         `--authority-verifiers`, or the cell can never reshape its beacon"
+    );
+    Ok(())
+}
+
 /// secret material.
 fn cmd_authority_key(args: &[String]) -> Result<(), NodeError> {
     let out = flag(args, "--out").unwrap_or("recovery-authority.key");
@@ -3172,6 +3317,12 @@ fn help_advanced() -> String {
          \x20              machine also generates the recovery committee, holding every authority secret for\n\
          \x20              the moment of dealing — fine for a private cell. For a public one, each founder\n\
          \x20              runs `fanos authority-key` and you pass their collected verifiers here)\n\
+         \x20 fanos keygen --roster FILE --threshold T --out FILE [--identity PATH] [--listen ADDR]\n\
+         \x20             (run the founding DKG with the other founders — each draws its own secret and no\n\
+         \x20              party ever holds the whole beacon key, unlike `beacon-deal`. The roster is the\n\
+         \x20              `x:y:z@host:port` seed form, one per line, INCLUDING this node; every founder must\n\
+         \x20              hold the identical file, since the network's name is derived from it. The recovery\n\
+         \x20              authority stays a separate step — see `fanos authority-key`)\n\
          \x20 fanos authority-key [--out FILE]\n\
          \x20             (generate THIS founder's recovery-authority key locally: the seed stays here, the\n\
          \x20              printed verifier goes to whoever deals the beacon)\n\
@@ -3411,7 +3562,7 @@ mod tests {
         const VERBS: &[&str] = &[
             "node", "proxy", "host", "message", "validator", "pay", "term", "vpn", "init", "start",
             "stop", "restart", "uninstall", "status", "id", "beacon-deal", "authority-key",
-            "ingress-deal", "service-deal", "taxis-deal", "resolve",
+            "ingress-deal", "service-deal", "taxis-deal", "resolve", "keygen",
         ];
         let text = help_text();
         let missing: Vec<&str> = VERBS.iter().copied().filter(|v| verb_block(&text, v).is_none()).collect();
