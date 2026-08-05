@@ -249,6 +249,8 @@ impl ThresholdSealed {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.nonce);
+        // One sealed share per line member, so this is the plane's line size `q + 1` — 32 at the widest
+        // supported `PG(2, 31)`, three orders below the field (#110).
         out.extend_from_slice(&(self.sealed_shares.len() as u16).to_be_bytes());
         out.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.ciphertext);

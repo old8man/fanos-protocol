@@ -212,6 +212,9 @@ fn pad(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(data);
     let rem = out.len() % K;
     let pad_len = if rem == 0 { K } else { K - rem };
+    // `pad_len ∈ 1..=K` by the line above, and `K` is the code's data-shard count — a small constant, an
+    // order below a byte — so this cannot truncate (#110). `unpad` refuses anything above `K` on the way
+    // back, which is the same bound read from the other side.
     for _ in 0..pad_len {
         out.push(pad_len as u8);
     }

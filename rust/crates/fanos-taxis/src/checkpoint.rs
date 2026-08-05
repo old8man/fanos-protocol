@@ -177,6 +177,11 @@ impl ExecCertificate {
         out.extend_from_slice(&self.height.to_be_bytes());
         out.extend_from_slice(&self.state_root);
         out.extend_from_slice(&self.head);
+        // **Safe, and the bound is the voter index rather than anything here** (#110). `verify` refuses a
+        // repeated `voter` and refuses one outside the verifier list, so a certificate anyone accepts holds
+        // at most one vote per validator — and `ExecVote::voter` is itself a `u8`, so that is at most 256,
+        // an order below this field. Written down because an unexamined narrowing and an examined-safe one
+        // look identical, and the neighbouring `CellEscalate` index with the same shape was NOT safe.
         out.extend_from_slice(&(self.votes.len() as u16).to_be_bytes());
         for v in &self.votes {
             out.extend_from_slice(&v.to_bytes());

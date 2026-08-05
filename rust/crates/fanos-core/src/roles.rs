@@ -383,6 +383,8 @@ impl Demand {
     /// The per-role **eligible supply** — how many members can serve each role (the demand ceiling).
     #[must_use]
     pub fn supply(members: &[(NodeId, Capability)]) -> Demand {
+        // A count of cell members, so it is bounded by the plane: `q² + q + 1` = 993 at the widest supported
+        // order, two orders below the field (#110).
         Demand::per_role(|role| members.iter().filter(|(_, c)| c.offered.has(role)).count() as u16)
     }
 

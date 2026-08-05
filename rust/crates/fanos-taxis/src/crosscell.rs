@@ -245,6 +245,8 @@ impl CrossCellReceipt {
         let mut out = self.msg.to_bytes();
         out.extend_from_slice(&self.index.to_be_bytes());
         out.extend_from_slice(&self.count.to_be_bytes());
+        // A Merkle authentication path: its length is `⌈log₂(leaves)⌉`, so 65 535 would need a tree of 2^65535
+        // leaves. Bounded by arithmetic rather than by a check, which is why nothing enforces it (#110).
         out.extend_from_slice(&(self.proof.len() as u16).to_be_bytes());
         for sib in &self.proof {
             out.extend_from_slice(sib);
