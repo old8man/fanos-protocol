@@ -442,65 +442,35 @@ pub async fn host_registered(node: &mut NodeHandle) -> [u8; 32] {
 /// Tokio's mutex also has no poisoning, which removes the need to launder a panicking test's poison into every sibling.
 static CELL_FIXTURE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// The **cross-binary** half of the same fixture lock.
+/// The **cross-process** half of the same fixture lock, from [`fanos_testkit`].
 ///
-/// [`CELL_FIXTURE`] is a process-local static, and this module is compiled *separately into every*
-/// integration-test binary — which the header above already says about the lints and did not follow through
-/// to the lock. So there are six independent mutexes, one per binary, and `cargo test` runs those binaries
-/// **concurrently**: a guard whose own doc says "a fixture that must not run twice at once" permitted six at
-/// once. Adding a new whole-cell test file therefore raised contention on every existing one, invisibly.
-///
-/// Measured: `a_validator_joining_late_reaches_the_cells_executed_state` passes alone in **6.3 s** and failed
-/// in the same crate's full run, on a host at load 15 — the run that had just gained two more seven-node
-/// cells from `dkg_quic`. Same shape as the quiet-host guard that lived in one crate while the tests it
-/// protected lived in another.
-///
-/// A file is the only thing the six processes share. `CARGO_TARGET_TMPDIR` is per-crate under `target/`, set
-/// by Cargo for integration tests, so the lock is scoped exactly to the suite that contends.
-fn cross_binary_lock_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cell-fixture.lock")
-}
-
-/// Held for a test's body; removes the lockfile on drop, including on panic (drop still runs while
-/// unwinding, and a hard kill is what the staleness steal below covers).
+/// [`CELL_FIXTURE`] is process-local and this module is compiled *separately into every* integration-test
+/// binary — which the header above already says, about the lints, without following it through to the lock.
+/// Six binaries meant six mutexes guarding one machine-wide resource. The wide half now lives beside the
+/// quiet-host guard, where every suite that contends can reach it; see
+/// [`fanos_testkit::acquire_cell_fixture`] for the measurement and the derivation.
 pub struct CellFixture {
     _local: MutexGuard<'static, ()>,
-    path: std::path::PathBuf,
+    _machine: fanos_testkit::CellFixture,
 }
 
-impl Drop for CellFixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Acquire the whole-cell fixture lock — within this binary **and** across the suite's other binaries.
-///
-/// The staleness bound is [`HANG_CEILING`] and is derived rather than picked: it is already the longest a
-/// test may legitimately run before the harness calls it hung, so a lockfile older than that cannot belong
-/// to a live holder. Without a steal, one killed run (a `^C`, an OOM) would wedge the whole suite forever —
-/// which would be a worse instrument than the flakiness this replaces.
+/// Acquire the whole-cell fixture lock — within this binary **and** across every other process on the host.
 pub async fn serial_cell() -> CellFixture {
     let local = CELL_FIXTURE.lock().await;
-    let path = cross_binary_lock_path();
-    loop {
-        let held = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
-        match held {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|t| t.elapsed().unwrap_or_default() > HANG_CEILING);
-                if stale {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            // Acquired — or a target directory this suite cannot write, which is not its problem to
-            // diagnose: fall back to the in-process guard rather than failing every whole-cell test on I/O.
-            Ok(_) | Err(_) => return CellFixture { _local: local, path },
-        }
-    }
+    CellFixture { _local: local, _machine: fanos_testkit::acquire_cell_fixture() }
+}
+
+/// The steal bound must exceed the longest a fixture can legitimately be held, which is this suite's own
+/// hang ceiling. Two constants in two crates cannot be trusted to stay ordered by intent, so the ordering is
+/// asserted rather than assumed — a shorter steal would take a live holder's lock and reintroduce exactly
+/// the concurrency it exists to prevent.
+#[test]
+fn the_fixture_steal_outlasts_any_wait_this_suite_can_make() {
+    assert!(
+        fanos_testkit::FIXTURE_STALE_AFTER >= HANG_CEILING,
+        "a lockfile may be stolen after {:?} while a test may hold it for {HANG_CEILING:?}",
+        fanos_testkit::FIXTURE_STALE_AFTER,
+    );
 }
 
 #[cfg(test)]

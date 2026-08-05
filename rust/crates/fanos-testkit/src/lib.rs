@@ -106,6 +106,79 @@ fn read_load_average() -> Option<f64> {
 }
 
 
+/// How long a whole-cell fixture lockfile may sit before it is presumed abandoned and stolen.
+///
+/// **Derived, not chosen: it must exceed the longest a fixture can legitimately be held**, which is whatever
+/// hang ceiling the slowest suite waits under — `fanos-node`'s `HANG_CEILING` is 240 s and a test asserts the
+/// relationship rather than trusting two constants to stay ordered. A bound any shorter steals a live
+/// holder's lock and reintroduces exactly the concurrency it exists to prevent; longer only delays recovery
+/// from a `^C`.
+///
+/// Without a steal at all, one killed run would wedge every whole-cell test on the machine forever — a worse
+/// instrument than the flakiness this replaces.
+pub const FIXTURE_STALE_AFTER: Duration = Duration::from_secs(240);
+
+/// The **machine-wide** whole-cell fixture lock: held while a test stands up a seven-node QUIC cell.
+///
+/// ## Why machine-wide, and not per-binary or per-crate
+///
+/// Every suite had its own `static SERIAL: LazyLock<Mutex<()>>`, and each guarded, in its own words, "the
+/// transport" — the loopback stack and the host scheduler, which are **machine-wide**. A `static` is
+/// process-local; `tests/*.rs` is one binary each; Cargo runs binaries, and crates, concurrently. So six
+/// mutexes guarded a resource none of them could see, and `real_nat.rs`'s comment even said so out loud —
+/// *"Scoped to this file only — each `tests/*.rs` is its own binary"* — without following it to the
+/// conclusion. A guard is only as wide as the narrowest thing that can observe it.
+///
+/// Measured: a TAXIS test that passes alone in 6.3 s failed inside its own crate's full run once two more
+/// seven-node cells joined the suite, at a host load indistinguishable from the run where it passed.
+///
+/// A file in the machine's temp directory is the one thing every one of those processes can see. Two
+/// checkouts on one host genuinely do contend for the same CPU and the same loopback, so sharing the lock
+/// between them is correct rather than incidental.
+///
+/// ## Blocking, and why that is safe here
+///
+/// Acquisition blocks the calling thread. Each `#[tokio::test]` builds its **own** runtime, and each suite's
+/// in-process mutex already admits at most one waiter per binary, so the thread parked here belongs to a
+/// runtime with nothing else to run. The returned guard is inert (a path), so holding it across `await`s is
+/// fine and it stays `Send`.
+pub struct CellFixture {
+    path: std::path::PathBuf,
+}
+
+impl Drop for CellFixture {
+    /// Releases on drop, including while unwinding from a failed assertion. A hard kill is what
+    /// [`FIXTURE_STALE_AFTER`] covers.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the machine-wide whole-cell fixture lock, blocking until it is free.
+#[must_use]
+pub fn acquire_cell_fixture() -> CellFixture {
+    let path = std::env::temp_dir().join("fanos-cell-fixture.lock");
+    loop {
+        let held = std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
+        match held {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().unwrap_or_default() > FIXTURE_STALE_AFTER);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Acquired — or a temp directory this host will not let us write, which is not a suite's problem
+            // to diagnose: fall through to the in-process guard rather than failing every whole-cell test.
+            Ok(_) | Err(_) => return CellFixture { path },
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

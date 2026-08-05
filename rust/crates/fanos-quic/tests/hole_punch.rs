@@ -27,8 +27,13 @@ use fanos_runtime::{Command, Config, Notification, OverlayNode, Triple};
 /// transport (see `diaulos_quic.rs`).
 static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+/// The in-process half. The **machine-wide** half is `fanos_testkit::acquire_cell_fixture`, and it is what
+/// this file's own comment was missing: "scoped to this file only — each `tests/*.rs` is its own binary" was
+/// stated and then relied on anyway, while the resource being guarded — the loopback stack and the host
+/// scheduler — is shared by every binary Cargo runs concurrently, in this crate and in `fanos-node`.
+fn serial() -> (std::sync::MutexGuard<'static, ()>, fanos_testkit::CellFixture) {
+    let machine = fanos_testkit::acquire_cell_fixture();
+    (SERIAL.lock().unwrap_or_else(PoisonError::into_inner), machine)
 }
 
 /// Bring up an overlay node at `point` on its own directory (default config, HELLO-mode transport).
