@@ -4367,3 +4367,52 @@ feeder deliberately does not, because there a partial directory produces *no* ro
 **Residual, filed rather than papered over:** the refusal branch has no test, because the testkit cannot stall
 a store read. That fixture now blocks at least four "partial view" branches — exactly the code that runs when
 the network is degraded, and the code no happy-path end-to-end ever enters.
+
+## §5. The unwired sweep, re-run — 113 hits, 3 worth acting on, 1 of them refuted
+
+Re-ran the "`pub fn` with no production call site" sweep that produced the July findings. **113 candidates, 3
+actionable, and one of those three did not survive reading** — roughly 3 % yield, which is the calibration to
+carry: the list is a *reading order*, never a finding list.
+
+What made the real ones findable was a sharper predicate than "no caller": **a detector whose own doc-comment
+names a reader that does not exist.**
+
+- `Directory::collisions` — *"surfaced here so a node can react (relocate) instead of silently shadowing a
+  peer"*. Nothing read it. A `MapToPoint` collision is precisely the condition coordinate resolution exists to
+  settle, and a node that cannot see one cannot relocate.
+- `Directory::unresolved_drops` — *"shared across clones, so a node's health surface can read it"*. Nothing
+  did. Distinct from `send_drops` in a way that IS the diagnosis: a peer that stopped draining a connection
+  this node holds, versus a peer it cannot reach at all because the address book has no binding. Same symptom
+  from outside, opposite causes, and `Health` reported neither.
+- `HybridLedger::conservation_breaks` — the #94 gate. **Its decision not to abort is right and carefully
+  argued**: every validator computes the same state, so a `panic!` would turn a value bug into a cell-wide
+  liveness bug that an attacker who found a breaking transaction could trigger deliberately. But the
+  argument's other half — *"`conservation()` names the invariant, the direction and the size when someone
+  asks"* — was never built. No log, no station, no health field. Nobody asked.
+
+**The generalization worth keeping.** Whenever a design deliberately declines to stop — counts instead of
+aborting, warns instead of refusing, degrades instead of failing — the *telling* is not an optional extra, it
+is the other half of the decision. A no-abort detector with no reader silently converts "we chose to continue"
+into "nobody found out". Worth asking of every `saturating_add` on an error counter in the tree.
+
+All three now have readers (`Health::collisions`, `Health::unresolved_drops`, and a new
+`StateMachine::invariants_broken()` the TAXIS driver reads once per commit — the seam exists because
+`fanos-dromos` is sans-I/O and has no logger of its own). Each is asserted **both** ways, because a counter
+checked only at zero is indistinguishable from a field that is always zero.
+
+### The refuted one, recorded because the refutation is the lesson
+
+`Coherence::quarantine_lowers_phi` has no caller and `plan_healing` emits `Quarantine` unconditionally — which
+looks exactly like a security guard written and never installed, the shape the whole sweep is for. It was filed
+as a HIGH on that reading.
+
+**It is wrong, and two formulas settle it.** The healer's Φ is `phi_equicorrelated(N, r) = (N−1)r²`, and on the
+equicorrelated stratum every node's coupling energy is *also* `Σ_{j≠q} r² = (N−1)r²` — exactly Φ. So the D6
+theorem's condition `s_q > Φ/2` reduces to `Φ > Φ/2`, true whenever `r ≠ 0`; the closed form agrees,
+`Φ' = Φ(N−2)/(N−1) = 5Φ/6` at Fano. The guard would change nothing, and the unconditional action is correct
+for the model it runs on.
+
+So the sweep's second question — *unwired, or unreachable?* — needs a third: **or is the condition it tests
+already implied by the model its caller runs on?** The cost that survives is worth writing down and now sits in
+`plan.rs`: because the model cannot tell nodes apart, the theorem holds **vacuously rather than usefully**, and
+a healer that ever builds a *measured* coherence matrix must gate on the predicate at that point.
