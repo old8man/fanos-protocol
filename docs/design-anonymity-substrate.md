@@ -264,7 +264,7 @@ operator `O` is treated exactly as a NOSTOS receiver:
 1. **Anonymous host-registration** (`O → L_rdv`, the `RdvHostRegister` frame, wire `0x5B`). Each epoch, `O`
    draws a fresh dead-drop line `L_O = select_drop_line(c_O, …)` through its own point, and rides a **forward
    onion to `L_rdv`** carrying `{ service_tag, reply_pub_O, forward_route_O }` — where
-   `service_tag = H("FANOS-v1/rdv-host" ‖ svc_pub ‖ epoch)` disambiguates services co-located at one gathering
+   `service_tag = H("FANOS-v1/rdv-host" ‖ svc_signing_prefix ‖ epoch ‖ beacon)` disambiguates services co-located at one gathering
    node, `reply_pub_O` is a fresh NOSTOS reply key, and `forward_route_O` is a threshold circuit ending at `L_O`.
    The registration reaches **every member of `L_rdv`** (hardening §6.1b), because a route binding is state at
    whichever member gathers a request, client launches draw a per-onion member (`combiner_for_salted`), and a
@@ -522,7 +522,7 @@ recovery itself the cheapest denial-of-service against the line it protects. Ver
 per-share commitments for the fresh polynomial without a dealer) is the follow-on that closes it.
 
 **The epoch-rotating service tag is defeated by its own preimage, and the honest scope is narrower than §3b
-reads.** `service_tag = H(identity ‖ epoch)` rotates so a meeting combiner cannot follow one hidden service
+reads.** `service_tag = H(identity ‖ epoch ‖ beacon)` rotates so a meeting combiner cannot follow one hidden service
 through time, and the tags themselves genuinely are unlinkable. But a registration also carries `identity` —
 the bundle the tag hashes from — because the combiner must *recompute* the tag rather than believe it: without
 that, one unsigned message per epoch seizes a service's route (the seizure `HostRegister::verify` refuses).

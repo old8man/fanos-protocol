@@ -500,7 +500,7 @@ async fn rotate_host(
     }
     forward_circuit.push(drop_line);
     let Some(reg) =
-        HostRegister::onion(identity, signer, epoch, reply_pub.encode(), forward_circuit, threshold)
+        HostRegister::onion(identity, signer, epoch, beacon.as_bytes(), reply_pub.encode(), forward_circuit, threshold)
     else {
         return;
     };

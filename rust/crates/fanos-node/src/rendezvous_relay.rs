@@ -73,6 +73,21 @@ pub struct RendezvousRelay<F: Field> {
     /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
     /// A [`BoundedMap`], bounded like `registrations` at [`MAX_HOSTS`] against a registration flood.
     hosts: BoundedMap<[u8; 32], (Epoch, HostRegister)>,
+    /// The **current epoch's beacon seed**, the second half of a host registration's tag (#132).
+    ///
+    /// `service_tag` used to commit to the epoch NUMBER alone, which is known arbitrarily far ahead — and a
+    /// hidden service's identity is public by construction, since clients must hold it to dial. So anyone
+    /// who knew a service could compute its rendezvous slot for every future epoch and pre-position against
+    /// it, while `meeting_line` — the other half of the same rotation — had resisted exactly that since E5
+    /// by folding in the beacon. Both halves resist anticipation now.
+    ///
+    /// Set at construction from the composite's own beacon and pushed forward by it
+    /// ([`CellNode::step_obn`](crate::cell_node::CellNode)) at the moment the beacon adopts a round — not read
+    /// from a directory, because the relay has no clock of its own and the composite is where the beacon and the
+    /// router already meet. It begins at the composite's genesis seed, which is `H("FANOS-v1/genesis-beacon" ‖
+    /// commitment)` for *this* network and is what every party derives an epoch-0 tag from, so a cell that has not
+    /// yet produced a beacon round agrees with itself rather than failing.
+    beacon: [u8; 32],
     /// This relay's **own** data-path readings, merged into the router's on `Command::Observe`.
     ///
     /// The relay had none, so its two forward-path discards — a host whose route it cannot seal to, and a
@@ -129,10 +144,19 @@ pub(crate) const HOST_GRACE_EPOCHS: u64 = 1;
 pub(crate) const MAX_HOSTS: usize = 4096;
 
 impl<F: Field> RendezvousRelay<F> {
-    /// A relay wrapping `router`. No client or host is registered until one sends an
-    /// [`RdvRegister`](fanos_wire::FrameType::RdvRegister) / a §3b host registration; until then it just routes.
+    /// A relay wrapping `router`, holding `beacon` as the current epoch's seed. No client or host is registered
+    /// until one sends an [`RdvRegister`](fanos_wire::FrameType::RdvRegister) / a §3b host registration; until
+    /// then it just routes.
+    ///
+    /// `beacon` is a constructor ARGUMENT rather than a default the caller may override, because it decides which
+    /// network's registrations this relay accepts: a host's `service_tag` commits to it (#132), so a relay holding
+    /// the wrong seed rejects every genuine registration and — worse — would accept ones minted against whatever
+    /// seed it does hold. There is no safe value to guess. The first draft defaulted it to `BeaconSeed::GENESIS`
+    /// and was caught by `nothing_in_a_running_node_picks_its_network_by_naming_the_constant`: the genesis seed is
+    /// `H("FANOS-v1/genesis-beacon" ‖ commitment)`, a per-network value, not the constant. Both composites have a
+    /// beacon in hand where they build this, so neither has to invent one.
     #[must_use]
-    pub fn new(router: ThresholdRouter<F>) -> Self {
+    pub fn new(router: ThresholdRouter<F>, beacon: [u8; 32]) -> Self {
         // Derive the host-forward seed from this relay's coordinate: deterministic (sim-reproducible) and
         // per-node distinct, with no new constructor parameter to thread through every caller.
         let forward_seed = hash_labeled(label::KDF, &encode_coord(router.address()));
@@ -140,11 +164,20 @@ impl<F: Field> RendezvousRelay<F> {
             router,
             registrations: BoundedMap::new(MAX_REGISTRATIONS),
             hosts: BoundedMap::new(MAX_HOSTS),
+            beacon,
             stations: Stations::new(),
             directory: MixDirectory::new(),
             forward_seed,
             forward_counter: 0,
         }
+    }
+
+    /// Adopt `beacon` as the current epoch's seed — the second half of a registration's [`service_tag`].
+    ///
+    /// Driven by the composite the moment the beacon adopts a round, alongside the router's own onion-key
+    /// rotation, so the relay's tag arithmetic and its epoch never disagree.
+    pub fn set_beacon(&mut self, beacon: [u8; 32]) {
+        self.beacon = beacon;
     }
 
     /// The number of hidden-service hosts currently registered here.
@@ -176,7 +209,12 @@ impl<F: Field> RendezvousRelay<F> {
         // registration minted for another epoch carries another tag and would be filed under a key no client of
         // *this* epoch looks up, so refusing it costs nothing that was ever reachable.
         let epoch = self.router.onion_epoch();
-        if !reg.verify(epoch) {
+        // And the epoch's BEACON, given at construction and pushed forward by the composite the moment the
+        // beacon adopts a new round (`CellNode::step_obn`), because the tag is only unanticipatable if it
+        // commits to a value that did not exist before the epoch opened (#132). Before the first round that
+        // value is the network's genesis seed, which is what every party derives its epoch-0 tag from, so a
+        // cell agrees with itself from the start.
+        if !reg.verify(epoch, &self.beacon) {
             // Counted, or a relay under a sustained registration-forgery attempt is indistinguishable from a
             // relay nobody is using (#109). Unattributed: a registration that fails to verify has no
             // authenticated origin, and inventing one would put fabricated evidence against a coordinate into
@@ -457,6 +495,19 @@ pub fn register_targets<F: Field>(cookie: SessionId, reply_line: Triple) -> Vec<
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    /// A fixed beacon for the tag arithmetic under test: the tag is `H(identity ‖ epoch ‖ beacon)` and these
+    /// tests vary the first two, so the third is held constant to isolate what they are about (#132). The
+    /// beacon's own contribution is asserted separately, by the test that shows a future epoch's tag is not
+    /// computable under the current one.
+    const TAG_BEACON: [u8; 32] = [0x7B; 32];
+
+    /// A relay for these tests, holding [`TAG_BEACON`] as its epoch seed — the composite's job in production
+    /// ([`CellNode::new`](crate::cell_node::CellNode::new) / [`MixRelay::new`](crate::mix_relay::MixRelay::new)),
+    /// where the value comes from the node's own beacon rather than a literal.
+    fn test_relay(router: ThresholdRouter<F2>) -> RendezvousRelay<F2> {
+        RendezvousRelay::new(router, TAG_BEACON)
+    }
+
     use super::*;
     use fanos_aphantos::threshold::{HopLine, seal_onion};
     use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
@@ -478,7 +529,7 @@ mod tests {
         let combiner = Point::<F2>::new(line_member_coords::<F2>(line)[0]).unwrap();
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"expiry-id"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x71; 32]));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x71; 32]));
 
         let cookie = [0xC0u8; 16];
         relay.step(Instant(0), Input::Message { from: [1, 2, 3], frame: register_frame(cookie) });
@@ -514,7 +565,7 @@ mod tests {
         let combiner = Point::<F2>::new(line_member_coords::<F2>(line)[0]).unwrap();
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"flood-id"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x5D; 32]));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x5D; 32]));
 
         let cookie_of = |i: u32| -> SessionId {
             let mut c = [0u8; 16];
@@ -551,7 +602,7 @@ mod tests {
         let onion_seed = [0x3D; 32];
 
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"relay-id"));
-        let mut relay = RendezvousRelay::new(ThresholdRouter::<F2>::new(
+        let mut relay = test_relay(ThresholdRouter::<F2>::new(
             combiner, &identity, 1, onion_seed,
         ));
 
@@ -650,7 +701,7 @@ mod tests {
         let unregistered = Point::<F2>::new(members[1]).unwrap();
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"unregistered-member"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(unregistered, &identity, 1, [0x4Cu8; 32]));
+            test_relay(ThresholdRouter::<F2>::new(unregistered, &identity, 1, [0x4Cu8; 32]));
         let mut tagged = cookie.to_vec();
         tagged.extend_from_slice(b"a reply this member cannot route");
         let effects = relay.classify_anonymous(tagged);
@@ -671,7 +722,7 @@ mod tests {
         let onion_seed = [0x7Eu8; 32];
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"shared-relay"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
 
         let alice: Triple = [0x0A, 0x0A, 0x0A];
         let bob: Triple = [0x0B, 0x0B, 0x0B];
@@ -734,7 +785,7 @@ mod tests {
         let combiner = Point::<F2>::new(members[0]).unwrap();
         let onion_seed = [0x4Du8; 32];
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"relay-id-2"));
-        let mut relay = RendezvousRelay::new(ThresholdRouter::<F2>::new(
+        let mut relay = test_relay(ThresholdRouter::<F2>::new(
             combiner, &identity, 1, onion_seed,
         ));
         assert_eq!(relay.registrations(), 0);
@@ -793,7 +844,7 @@ mod tests {
         let onion_seed = [0xA5u8; 32];
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"host-relay-id"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
         let relay_onion = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
         let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xA5, 1]));
         let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xA5, 2]));
@@ -810,12 +861,12 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let tag = service_tag(&bundle, epoch);
+        let tag = service_tag(&bundle, epoch, &TAG_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc_keys, svc_reply_pub) =
             fanos_aphantos::nostos::ReplyKeys::generate(b"svc-deaddrop");
         relay.set_directory(dir.clone());
-        let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], 1)
+        let reg = HostRegister::onion(&bundle, &signer, epoch, &TAG_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
             .expect("the dead-drop line's members are in the directory");
 
         // **A route seizure is refused before the genuine registration is even made.** The tag is a public
@@ -866,7 +917,7 @@ mod tests {
         // A request for an UNregistered tag falls through to a local anonymous delivery (unchanged behaviour).
         let other = Request {
             cookie: *b"client-cookie-02",
-            service_tag: service_tag(b"some-other-service", Epoch::new(0)),
+            service_tag: service_tag(b"some-other-service", Epoch::new(0), &TAG_BEACON),
             reply_circuit: vec![],
             payload: b"unrelated".to_vec(),
             reply_pub: vec![],
@@ -880,6 +931,111 @@ mod tests {
                 Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS
             )),
             "a request for no registered host surfaces locally, as before",
+        );
+    }
+
+    /// The tag binding stated as the thing an adversary is denied (#132).
+    ///
+    /// A hidden service's identity is PUBLIC — a client must hold it to dial — and the epoch number is a
+    /// counter. So while `service_tag` folded those two alone, every future epoch's tag was computable today
+    /// against any known service. A meeting-line member matches inbound requests against that tag, so
+    /// precomputing it is precomputing which requests to drop: a censor could pick and pre-position against
+    /// its targets an unbounded number of epochs ahead of the traffic, while `meeting_line` — the other half
+    /// of the same rotation — had folded the beacon in since E5 for exactly this reason.
+    ///
+    /// This test is the falsification of the fix. It registers a genuine service under one beacon and shows
+    /// the SAME identity at the SAME epoch under a different beacon does not reach the registered entry:
+    /// tags derived under a beacon this relay does not hold are not the tags it serves. Remove `beacon` from
+    /// `service_tag`'s input and both halves collapse to one value, the second registration overwrites the
+    /// first at the same key, and the final assertion fails.
+    #[test]
+    fn a_tag_computed_under_another_beacon_does_not_name_this_epochs_service() {
+        use fanos_pqcrypto::HybridKemSecret;
+        use fanos_rendezvous::{HOST_REGISTER_TAG, MixDirectory, line_member_coords, service_tag};
+
+        let mut dir = MixDirectory::new();
+        for i in 0..7u8 {
+            let (_s, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF1, i]));
+            dir.insert(Point::<F2>::at(usize::from(i)).coords(), public);
+        }
+        let l = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(l)[0]).unwrap();
+        let onion_seed = [0xF1u8; 32];
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"beacon-bind-relay"));
+        let mut relay =
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+        relay.set_directory(dir.clone());
+        let relay_onion = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
+        let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF1, 1]));
+        let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xF1, 2]));
+        let pubs = [relay_onion.public(), &p1, &p2];
+        let seal_to_relay = |body: &[u8], seed: &[u8]| {
+            launch_frame(l, &seal_onion(&[HopLine { line: l, members: &pubs }], 1, body, seed).unwrap())
+        };
+
+        let epoch = relay.router().onion_epoch();
+        let mut srng = SeedRng::from_seed(b"a-service-under-two-beacons");
+        let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
+        let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
+        let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
+        let drop_line = Line::<F2>::at(3).coords();
+        let (_svc, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"two-beacon-deaddrop");
+
+        // The genuine registration, under the beacon this relay holds.
+        let reg = HostRegister::onion(&bundle, &signer, epoch, &TAG_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
+            .expect("the dead-drop line's members are in the directory");
+        let mut body = HOST_REGISTER_TAG.to_vec();
+        body.extend_from_slice(&reg.encode());
+        relay.step(Instant(0), Input::Message { from: [9, 9, 9], frame: seal_to_relay(&body, b"reg") });
+        assert_eq!(relay.hosts(), 1, "the service registered under the epoch's beacon");
+
+        // Everything an adversary who has NOT yet learned this beacon can build: the same public identity, the
+        // same epoch, a validly-signed registration — under the wrong beacon. It is not a forgery, which is the
+        // point: the signature checks out and the tag simply is not the one this epoch serves.
+        let other_beacon = [0x3Cu8; 32];
+        assert_ne!(service_tag(&bundle, epoch, &TAG_BEACON), service_tag(&bundle, epoch, &other_beacon));
+        let stale = HostRegister::onion(&bundle, &signer, epoch, &other_beacon, svc_reply_pub.encode(), vec![drop_line], 1)
+            .expect("the dead-drop line's members are in the directory");
+        let mut stale_body = HOST_REGISTER_TAG.to_vec();
+        stale_body.extend_from_slice(&stale.encode());
+        relay.step(Instant(1), Input::Message { from: [9, 9, 9], frame: seal_to_relay(&stale_body, b"stale") });
+        assert_eq!(
+            relay.hosts(),
+            1,
+            "a registration whose tag was derived under a beacon this relay does not hold is refused — with \
+             the epoch alone it would have hashed to the SAME key and silently replaced the genuine entry",
+        );
+        // Stated as behaviour rather than as map contents, because what matters is which requests the relay
+        // FORWARDS. A tag it hosts is re-sealed onward and never surfaces here; an unknown tag falls through to
+        // a local anonymous delivery.
+        let request = |tag: [u8; 32]| {
+            Request {
+                cookie: *b"two-beacon-cli01",
+                service_tag: tag,
+                reply_circuit: vec![Line::<F2>::at(5).coords()],
+                payload: b"a request naming a tag".to_vec(),
+                reply_pub: b"client-reply-key".to_vec(),
+            }
+            .encode()
+        };
+        let fell_through = |effects: &[Effect]| {
+            effects.iter().any(|e| {
+                matches!(e, Effect::Notify(Notification::Delivered { from, .. }) if *from == ANONYMOUS)
+            })
+        };
+        let good = relay.step(Instant(2), Input::Message {
+            from: [8, 8, 8],
+            frame: seal_to_relay(&request(service_tag(&bundle, epoch, &TAG_BEACON)), b"good"),
+        });
+        assert!(!fell_through(&good), "the tag bound to this epoch's beacon still reaches the service");
+        let wrong = relay.step(Instant(3), Input::Message {
+            from: [8, 8, 8],
+            frame: seal_to_relay(&request(service_tag(&bundle, epoch, &other_beacon)), b"wrong"),
+        });
+        assert!(
+            fell_through(&wrong),
+            "a tag computed under any other beacon names no service here — which is the whole guarantee: an \
+             adversary holding the public identity and an epoch number cannot name a future epoch's slot",
         );
     }
 
@@ -908,7 +1064,7 @@ mod tests {
         let onion_seed = [0xB7u8; 32];
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"retire-relay-id"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
         let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB7, 1]));
         let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xB7, 2]));
         let seal_to_relay = |body: &[u8], seed: &[u8], epoch: Epoch| {
@@ -923,12 +1079,12 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let stale_tag = service_tag(&bundle, epoch0);
+        let stale_tag = service_tag(&bundle, epoch0, &TAG_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc_keys, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"retire-deaddrop");
         relay.set_directory(dir.clone());
         let reg =
-            HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+            HostRegister::onion(&bundle, &signer, epoch0, &TAG_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
                 .expect("the dead-drop line's members are in the directory");
         let mut reg_body = HOST_REGISTER_TAG.to_vec();
         reg_body.extend_from_slice(&reg.encode());
@@ -941,7 +1097,7 @@ mod tests {
         // The adversary records the tag while it is current — a public value, so this costs it nothing. Kept
         // as an assertion rather than a binding: what it can do with the record is measured in the grace
         // test, for the reason given below.
-        assert_eq!(stale_tag, service_tag(&bundle, epoch0), "the tag is public and recordable");
+        assert_eq!(stale_tag, service_tag(&bundle, epoch0, &TAG_BEACON), "the tag is public and recordable");
 
         // The cell's clock turns. The composite hands the relay the new epoch's directory, which is the one
         // moment a sans-I/O combiner can learn that its epoch moved at all.
@@ -1003,7 +1159,7 @@ mod tests {
         let onion_seed = [0xD3u8; 32];
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"grace-relay-id"));
         let mut relay =
-            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
+            test_relay(ThresholdRouter::<F2>::new(combiner, &identity, 1, onion_seed));
         let (_d1, p1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD3, 1]));
         let (_d2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD3, 2]));
         let seal = |body: &[u8], seed: &[u8], epoch: Epoch| {
@@ -1017,11 +1173,11 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let lagging_tag = service_tag(&bundle, epoch0);
+        let lagging_tag = service_tag(&bundle, epoch0, &TAG_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"grace-deaddrop");
         relay.set_directory(dir.clone());
-        let reg = HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+        let reg = HostRegister::onion(&bundle, &signer, epoch0, &TAG_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
             .expect("the dead-drop line's members are in the directory");
         let mut body = HOST_REGISTER_TAG.to_vec();
         body.extend_from_slice(&reg.encode());

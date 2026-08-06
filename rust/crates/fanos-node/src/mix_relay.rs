@@ -44,8 +44,11 @@ impl<F: Field> MixRelay<F> {
     /// registered clients.
     #[must_use]
     pub fn new(router: ThresholdRouter<F>, beacon: BeaconNode<F>) -> Self {
+        // Same reason as `CellNode::new`: the relay's registration tags must start on this network's beacon
+        // seed, which the composed `beacon` already holds — never on a constant (#132, #141).
+        let seed = beacon.seed();
         Self {
-            relay: RendezvousRelay::new(router),
+            relay: RendezvousRelay::new(router, seed),
             beacon,
         }
     }

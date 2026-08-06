@@ -73,9 +73,14 @@ impl<F: Field> CellNode<F> {
     /// coordinate also forwards cookie-tagged anonymous replies to registered clients.
     #[must_use]
     pub fn new(obn: OverlayBeaconNode<F>, router: ThresholdRouter<F>) -> Self {
+        // The relay's tag arithmetic starts on the SAME seed the beacon is already at, taken from `obn`
+        // rather than named as a constant: at genesis that is `H("FANOS-v1/genesis-beacon" ‖ commitment)`,
+        // this network's value (#141), and a relay holding any other seed rejects every genuine registration
+        // in the cell it was just composed into. `step_obn` carries it forward from there.
+        let beacon = obn.beacon_seed();
         Self {
             obn,
-            relay: RendezvousRelay::new(router),
+            relay: RendezvousRelay::new(router, beacon),
         }
     }
 
@@ -144,6 +149,11 @@ impl<F: Field> CellNode<F> {
             .max();
         let mut out: Vec<Effect> = effects.into_iter().map(Self::remap_overlay_timer).collect();
         if let Some(epoch) = target {
+            // Hand the relay the epoch's beacon before advancing its clock: a host registration's
+            // `service_tag` commits to it, and the relay has no clock or directory of its own (#132). Here
+            // rather than anywhere else because this is the one place the beacon and the router already
+            // meet, so the two cannot drift into disagreeing about which epoch's tag is current.
+            self.relay.set_beacon(self.obn.beacon_seed());
             // Lock the router's forward-secure onion key to the adopted beacon epoch (E4∩E5).
             while self.relay.router().onion_epoch() < epoch {
                 let rotation = self

@@ -953,7 +953,7 @@ client acting on the previous epoch's directory is that same case on the lookup 
 from the shipped constants so it stays true when they move.
 
 **S-H1 — rotation did not retire the path it rotated away from. HIGH, fixed (`9d8e611`).**
-`service_tag = H(identity ‖ epoch)`, so a hidden service occupies a different slot in a relay's `hosts` map
+`service_tag = H(identity ‖ epoch)` at the time (`‖ beacon` since #132), so a hidden service occupies a different slot in a relay's `hosts` map
 every epoch and the previous one was never overwritten. Nothing removed it: the map's only eviction was FIFO
 under capacity pressure, justified in its own comment with "it re-registers each epoch anyway" — which is
 exactly what leaves the old entry behind. An honest client never notices, deriving the tag from its live
@@ -1532,7 +1532,14 @@ Only **S1-H2 (beacon reachable)** is fully correct (executed green: a provisione
 - **S1-C1 clearnet — INCOMPLETE.** The TCP *forward* leg is fixed (onion to `meeting_line(exit_key)`, no coordinate leak). But **(a) UDP clearnet still goes Direct** — `dial_udp` (`diaulos.rs:483-504`) never consults `self.profile`, so `proxy --profile anonymous` sends **every SOCKS5 UDP datagram (DNS, QUIC/HTTP-3, WebRTC) Direct to the exit by coordinate** (live path `socks5.rs:134 → udp.rs:111`). **(b) Anonymous clearnet TCP is non-functional** — the onion targets the exit's meeting line, but the exit listens at its own coordinate via the Direct `serve` loop and **no node role hosts an anonymous `RendezvousService`** (grep: only tests/reply-forwarder/calypso), so onions aimed at the exit are never served; `dial()` has no Direct fallback → it fails closed (no leak, but browsing doesn't work). The banner (`bin/fanos.rs:280`) overclaims for both.
 - **S1-H1 cover traffic — INCOMPLETE (dead from startup).** `CellNode::step` routes all commands to `step_obn`, which **never forwards `StartHeartbeat` to the relay** (`cell_node.rs:133-154`), so the router's cover flag is never set at startup. Cover self-starts *lazily* on the first real forward — so the silence→cover transition **coincides with and reveals** the relay's first real traffic, defeating the E1/E6 "uniform whether or not carrying real traffic" property. An idle or line-member-only relay emits **zero cover**. **Fix:** forward `StartHeartbeat` to the relay in `step_obn` (or start cover on role activation).
 - **S1-H3 cookie correlator — STILL OPEN (deferral sound), now worse.** The client still `Emit`s the registration from its real coordinate; the reply combiner learns `cookie→client_coord`. Because S1-C1 now routes *clearnet* through the same machinery, **the reply-relay leak now applies to clearnet too** — exit + reply-relay collusion re-links client↔target, undercutting S1-C1's forward-path win. Needs a SURB-style encrypted single-use reply tag + onion-wrapped registration.
-- **S1-M2 — OPEN + aggravated by S1-H2.** The proxy is pinned at static `--epoch`/`--beacon` (default genesis) and `Node` exposes no accessor to sync the live value; now that relays *advance* epochs (S1-H2), a proxy at epoch 0 draws its mix directory / meeting lines for epoch 0 while relays rotated to epoch N → **dials fail after the first epoch turn.** **Fix:** expose the current `(epoch,beacon)` on `Node`; the proxy consumes it.
+- **S1-M2 — CLOSED (verified at HEAD 2026-08-06).** `Node::live_beacon() -> Option<(Epoch, [u8; 32])>` exists
+  (`node.rs:1173`) and the proxy consumes it: `bin/fanos.rs:1009` prefers the live `(epoch, beacon)` and falls back
+  to the static `--epoch`/`--beacon` only before the first round is adopted, and `discover_exit` (`:3269`) binds the
+  exit directory against the same value, falling back to `client().genesis()` rather than to a constant. The
+  original finding follows, because the *mechanism* it describes — a static flag pinning a rotating derivation —
+  is the class, not this instance.
+
+- ~~**S1-M2 — OPEN + aggravated by S1-H2.**~~ The proxy is pinned at static `--epoch`/`--beacon` (default genesis) and `Node` exposes no accessor to sync the live value; now that relays *advance* epochs (S1-H2), a proxy at epoch 0 draws its mix directory / meeting lines for epoch 0 while relays rotated to epoch N → **dials fail after the first epoch turn.** **Fix:** expose the current `(epoch,beacon)` on `Node`; the proxy consumes it.
 - **Still open (unchanged):** S1-M1 (holonomy absent on the threshold path), S1-M3 (unauthenticated mix-key slots → circuit steering toward attacker-peelable relays), S1-M4 (3-node Fano anonymity set), S1-M5 (censored-bootstrap bridges not wired), S1-M6 (`ct_len` cleartext hop-position leak).
 
 **A bare `fanos node` delivers zero anonymity** (empty `RoleSet`, `beacon: None`); the whole stack requires deliberate provisioning, and even fully provisioned the residuals above break both headline paths. Not defensible as "ultimate."
@@ -2642,7 +2649,10 @@ purge the `best` entries naming it, so the two can never disagree.
 
 ## Two findings this enumeration surfaced that are NOT eviction defects
 
-**§4. HIGH, open — a hidden service's combiner binding is unauthenticated.**
+**§4. HIGH, FIXED `9e34d4c` — a hidden service's combiner binding is unauthenticated.** Written up in full as
+§1 of the hidden-service audit below, which is where the fix and its two eliminated alternatives are recorded; kept
+here because *this* enumeration is where it was found. Marked open when filed and left that way after the fix landed —
+a false open-HIGH is itself a defect in the record, and this pair is the reason the closure sweep now runs each cycle.
 `service_tag = H(RDV_HOST, service_pubkey ‖ epoch)` where the public key IS the service's dial address, so anyone can
 compute the tag; `HostRegister` carries no signature; `register_host` validates only non-emptiness; and
 `BoundedMap::insert` on a known key **overwrites**. One unsigned message per epoch therefore seizes a hidden service's
@@ -2659,7 +2669,11 @@ registration** — it hashes the whole canonical identity bundle — and client 
 around it. Consequence to be stated in the design doc: a KEM-only identity (zero signing prefix) cannot authenticate a
 registration at all, so **hosting requires a signing identity** and such a registration must be refused.
 
-**§5. Open — the mempool and the block are both unbounded.** `ConsensusEngine::mempool` is a plain `Vec<SealedTx>`, the
+**§5. FIXED — the mempool and the block are both unbounded.** Both halves closed and verified at HEAD:
+`ConsensusEngine::mempool` is a `BTreeMap` admitted against `MEMPOOL_CAP` (consensus.rs), and `verify_structure`
+requires `fits_frame()`, so the block ceiling is *derived* from `fanos_wire::MAX_FRAME` rather than chosen — a block
+the transport cannot carry is not a valid block. The original text follows, unedited, because the reasoning about why
+the limit had to be a validation rule and not a proposer courtesy is what made the fix forced. `ConsensusEngine::mempool` is a plain `Vec<SealedTx>`, the
 only remote-fed structure in the workspace without a bound, and the proposer clones the whole of it into a block with no
 per-block limit and no size check in `verify_structure`. So a submitter sets both a validator's peak memory and the
 block size — and therefore the DA shard size every validator erasure-codes, disperses and samples, converting local
@@ -3287,7 +3301,12 @@ ordering the fix guarantees, arrived at by accident. `#[tokio::test]` defaults t
 written the ordinary way would have been unable to fail. Only real parallelism separates the router, the
 engine and the clients, and only then does burst size help.
 
-## §6. [Instrument, open, #84] The whole async suite runs single-threaded
+## §6. [Instrument, CLOSED #84] The whole async suite runs single-threaded
+
+**Closed and verified at HEAD 2026-08-06:** 67 of the 74 `#[tokio::test]` sites now carry
+`flavor = "multi_thread"`, so a race between two tasks can actually be scheduled. The finding below is kept for
+its reasoning — a `current_thread` runtime makes a concurrency test *certify* the defect it was written to catch
+— which is the part that generalises past this suite.
 
 `#[tokio::test]` defaults to a **current-thread** runtime. This tree has 198 of them and three with a
 `flavor`, two of which were added closing §5. So every real-QUIC integration test drives a stack of concurrent

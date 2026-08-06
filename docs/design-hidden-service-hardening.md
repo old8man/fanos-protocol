@@ -476,10 +476,26 @@ Two properties of the setting were established on the way, and both belong here 
 
 ## §7. Anonymity hardening — four residuals
 
-1. **Bind the service tag to the beacon.** `service_tag = H(bundle ‖ epoch)` today, so an adversary holding a list
-   of candidate addresses can precompute every future epoch's tags and watch for them. Adding the epoch beacon —
-   unpredictable until the epoch opens — reduces that to the current epoch only. Cheap, already available, strictly
-   better.
+1. ~~**Bind the service tag to the beacon.**~~ **DONE.** `service_tag = H(RDV_HOST, signing_prefix ‖ epoch ‖ beacon)`.
+   It was `H(bundle ‖ epoch)`, and a hidden service's identity is *public* by construction — a client must hold it to
+   dial — so with the epoch alone the tag was a pure function of two values an adversary already had, and every future
+   epoch's tag was computable today. That is not an abstract exposure: a meeting-line member matches inbound requests
+   against the tag, so precomputing it is precomputing which requests to drop, and a censor could pick and pre-position
+   against its targets an unbounded number of epochs ahead of the traffic. `meeting_line`, the *other* half of the same
+   rotation, had folded the beacon in since E5 for exactly this reason; the two halves now agree.
+
+   The earlier attempt was reverted (`ee80fb4`) because the routing beacon did not reach the relay, which has no clock
+   and no directory of its own. It does now: `CellNode::step_obn` pushes it with `RendezvousRelay::set_beacon` at the
+   moment the beacon adopts a round, in the same step that advances the router's onion epoch — the one place the two
+   already meet, so the relay's tag arithmetic and its epoch cannot drift apart. The one-epoch grace for a lagging
+   client is unaffected: registrations are *filed under* their tag and looked up, never recomputed, so a client that
+   lags the epoch lags the beacon with it and still hits the retained entry.
+
+   Falsified rather than asserted, in both crates. `a_future_epochs_tag_is_not_computable_under_the_current_beacon`
+   computes the next epoch's tag from everything an adversary holds now — public identity, any epoch number, the
+   current beacon — and requires all of it to miss; `a_tag_computed_under_another_beacon_does_not_name_this_epochs_service`
+   shows the same at the relay, by behaviour rather than by map contents. Dropping `beacon` from the hash input fails
+   exactly those two tests and nothing else.
 2. **Client authorization as a first-class mode.** §2.4's authorised set already expresses it; what is missing is
    that an unauthorised client should be unable to *locate* the service at all, not merely be refused by it. That
    means deriving the meeting line from a shared secret for private services, which is a different derivation, not

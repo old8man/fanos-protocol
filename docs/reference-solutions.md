@@ -210,7 +210,7 @@ Gate (WPES 2005) is the only prior IT-below-threshold receiver-privacy guarantee
 could find, and it is a *retrieval* system, not an in-network *path*. That is a real, citable gap NOSTOS
 occupies, not a marketing claim.
 
-**The first open defect** is the `service_tag = H(identity ‖ epoch)` construction (§3b/POROS): the tag
+**The first open defect** is the `service_tag = H(identity ‖ epoch ‖ beacon)` construction (§3b/POROS): the tag
 rotates so a combiner cannot follow one service across epochs by the tag alone, but the registration also
 carries the identity bundle *in the clear beside it* (so the combiner can verify the binding), which makes
 every meeting combiner a linkable, timestamped record of which services exist and when

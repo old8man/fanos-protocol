@@ -406,8 +406,18 @@ pub fn seal_nostos_reply<F: Field>(
 /// So the tag must commit to **the key that authenticates the registration**. Note the resulting split, which is
 /// coherent rather than accidental: [`meeting_line`] stays KEM-derived because it *locates* the service, while this
 /// tag is identity-derived because it *authorises* a route binding. One addresses, the other authenticates.
+/// **The `beacon` is what makes the tag unanticipatable, and it is the whole reason this takes one** (#132).
+/// Folding in the epoch NUMBER alone made a tag computable arbitrarily far ahead: a hidden service's identity is
+/// public by construction — clients must hold it to dial — so anyone who knows the service could compute its slot
+/// for every future epoch and pre-position against it. The epoch's beacon does not exist until the epoch opens,
+/// which is exactly the property [`meeting_line`] already had. Both halves of the rotation resist anticipation
+/// now, rather than one.
+///
+/// Every party that needs a tag already holds the beacon — the client carries it to derive the meeting line, the
+/// host derives its own from it, and a combiner gets it from the composite's epoch clock — so this costs no new
+/// distribution, and the seed is public in any case.
 #[must_use]
-pub fn service_tag(service_identity: &[u8], epoch: Epoch) -> [u8; 32] {
+pub fn service_tag(service_identity: &[u8], epoch: Epoch, beacon: &[u8; 32]) -> [u8; 32] {
     // Only the bundle's **signing prefix** goes in, and that is the invariant rather than an optimisation: the tag
     // must commit to the key that authenticates the registration, which is the signing half. The KEM half's job is
     // to LOCATE the service — the client derives the meeting line from it and already holds it — so carrying it
@@ -417,9 +427,10 @@ pub fn service_tag(service_identity: &[u8], epoch: Epoch) -> [u8; 32] {
     // yields a tag no well-formed identity can reproduce, and `HostRegister::verify` refuses such an identity
     // outright before ever comparing tags.
     let signing = service_identity.get(..HYBRID_VK_LEN).unwrap_or(service_identity);
-    let mut data = Vec::with_capacity(signing.len() + 4);
+    let mut data = Vec::with_capacity(signing.len() + 4 + 32);
     data.extend_from_slice(signing);
     data.extend_from_slice(&epoch.low32_be_bytes());
+    data.extend_from_slice(beacon);
     fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::RDV_HOST, &data)
 }
 
@@ -494,6 +505,7 @@ impl HostRegister {
         identity: &[u8],
         signer: &HybridSigSecret,
         epoch: Epoch,
+        beacon: &[u8; 32],
         reply_pub: Vec<u8>,
         forward_circuit: Vec<Triple>,
         threshold: u8,
@@ -502,7 +514,7 @@ impl HostRegister {
             return None;
         }
         let mut reg = Self {
-            service_tag: service_tag(identity, epoch),
+            service_tag: service_tag(identity, epoch, beacon),
             reply_pub,
             forward_circuit,
             threshold,
@@ -534,8 +546,8 @@ impl HostRegister {
     ///    would authenticate nothing while looking like it did. Hosting requires a signing identity;
     /// 3. the signature must verify over `Self::signing_preimage` under that prefix.
     #[must_use]
-    pub fn verify(&self, epoch: Epoch) -> bool {
-        if self.service_tag != service_tag(&self.identity, epoch) {
+    pub fn verify(&self, epoch: Epoch, beacon: &[u8; 32]) -> bool {
+        if self.service_tag != service_tag(&self.identity, epoch, beacon) {
             return false;
         }
         let Some(prefix) = self.identity.get(..HYBRID_VK_LEN) else { return false };
@@ -552,9 +564,15 @@ impl HostRegister {
     /// forwards each request by a direct `Send` to `coordinate`, learning it. Weaker than [`Self::onion`] —
     /// the primary path hides the coordinate; this leaks it to the one combiner node (Tor's posture).
     #[must_use]
-    pub fn bare(identity: &[u8], signer: &HybridSigSecret, epoch: Epoch, coordinate: Triple) -> Self {
+    pub fn bare(
+        identity: &[u8],
+        signer: &HybridSigSecret,
+        epoch: Epoch,
+        beacon: &[u8; 32],
+        coordinate: Triple,
+    ) -> Self {
         let mut reg = Self {
-            service_tag: service_tag(identity, epoch),
+            service_tag: service_tag(identity, epoch, beacon),
             reply_pub: Vec::new(),
             forward_circuit: Vec::new(),
             threshold: 0,
@@ -684,6 +702,11 @@ pub fn parse_host_register(delivery: &[u8]) -> Option<HostRegister> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// A fixed beacon for the tag arithmetic under test: the tag is `H(identity ‖ epoch ‖ beacon)` and these
+    /// tests vary the first two, so the third is held constant to isolate what they are about (#132). The
+    /// beacon's own contribution is asserted separately, by the test that shows a future epoch's tag is not
+    /// computable under the current one.
+    const TAG_BEACON: [u8; 32] = [0x7B; 32];
     use super::*;
 
     /// A deterministic signing identity plus the canonical bundle it publishes.
@@ -769,7 +792,7 @@ mod tests {
         let (bundle, signer) = identity(b"round-trip-service");
         let epoch = Epoch::new(9);
         let reg = HostRegister {
-            service_tag: service_tag(&bundle, epoch),
+            service_tag: service_tag(&bundle, epoch, &TAG_BEACON),
             reply_pub: b"service-nostos-reply-key".to_vec(),
             forward_circuit: vec![[1, 2, 3], [4, 5, 6]],
             threshold: 2,
@@ -779,7 +802,7 @@ mod tests {
         };
         let reg = HostRegister { sig: signer.sign(&reg.signing_preimage()).to_bytes(), ..reg };
         assert_eq!(HostRegister::decode(&reg.encode()), Some(reg.clone()));
-        assert!(reg.verify(epoch), "a genuine registration survives the wire round trip and verifies");
+        assert!(reg.verify(epoch, &TAG_BEACON), "a genuine registration survives the wire round trip and verifies");
 
         // A tagged onion body parses back through the combiner's classifier; a bare `Request` does not.
         let mut body = Vec::new();
@@ -800,7 +823,7 @@ mod tests {
 
         // The bare-host fallback: empty forward circuit/keys, a real coordinate.
         let (fb_bundle, fb_signer) = identity(b"bare-fallback-service");
-        let fallback = HostRegister::bare(&fb_bundle, &fb_signer, Epoch::new(9), [7, 8, 9]);
+        let fallback = HostRegister::bare(&fb_bundle, &fb_signer, Epoch::new(9), &TAG_BEACON, [7, 8, 9]);
         assert!(fallback.forward_circuit.is_empty(), "the bare fallback names no forward route");
         assert_eq!(HostRegister::decode(&fallback.encode()), Some(fallback));
     }
@@ -866,23 +889,23 @@ mod tests {
         let epoch = Epoch::new(5);
         let (victim, victim_signer) = identity(b"the-victim-service");
         let (attacker, attacker_signer) = identity(b"the-attacker");
-        let genuine = HostRegister::bare(&victim, &victim_signer, epoch, [1, 2, 3]);
-        assert!(genuine.verify(epoch), "the service's own registration verifies");
+        let genuine = HostRegister::bare(&victim, &victim_signer, epoch, &TAG_BEACON, [1, 2, 3]);
+        assert!(genuine.verify(epoch, &TAG_BEACON), "the service's own registration verifies");
 
         // 1. Claim the victim's tag while signing with your own key. The tag is PUBLIC — anyone can compute
-        //    `service_tag(victim_bundle, epoch)` — so this is the cheap attack, and it dies on recomputation.
+        //    `service_tag(victim_bundle, epoch, &TAG_BEACON)` — so this is the cheap attack, and it dies on recomputation.
         let seizure = HostRegister { identity: attacker.clone(), ..genuine.clone() };
         let seizure = HostRegister { sig: attacker_signer.sign(&seizure.signing_preimage()).to_bytes(), ..seizure };
-        assert!(!seizure.verify(epoch), "a tag that does not hash from the presented identity is refused");
+        assert!(!seizure.verify(epoch, &TAG_BEACON), "a tag that does not hash from the presented identity is refused");
 
         // 2. Replay the genuine registration into another epoch. The tag rotates, so the signature no longer
         //    matches the tag it must bind — a stale route cannot be resurrected.
-        assert!(!genuine.verify(Epoch::new(6)), "a registration does not carry across epochs");
+        assert!(!genuine.verify(Epoch::new(6), &TAG_BEACON), "a registration does not carry across epochs");
 
         // 3. Keep the genuine identity and signature, swap only where traffic goes. This is the forgery that
         //    survives signing the TAG alone, which is why the signature covers the whole encoding.
         let redirected = HostRegister { coordinate: [9, 9, 9], ..genuine.clone() };
-        assert!(!redirected.verify(epoch), "the signature covers the forwarding fields, not just the tag");
+        assert!(!redirected.verify(epoch, &TAG_BEACON), "the signature covers the forwarding fields, not just the tag");
 
         // 4. A KEM-only bundle — `bundle_from_kem_public`'s zero signing prefix. Anyone holding the (public) KEM
         //    key rebuilds that bundle byte for byte, so accepting one would authenticate nothing while looking
@@ -890,12 +913,12 @@ mod tests {
         let mut kem_only = vec![0u8; HYBRID_VK_LEN];
         kem_only.extend_from_slice(&[0x42; 32]);
         let unsigned = HostRegister {
-            service_tag: service_tag(&kem_only, epoch),
+            service_tag: service_tag(&kem_only, epoch, &TAG_BEACON),
             identity: kem_only,
             sig: Vec::new(),
             ..genuine.clone()
         };
-        assert!(!unsigned.verify(epoch), "a KEM-only identity cannot authenticate a registration, so it is refused");
+        assert!(!unsigned.verify(epoch, &TAG_BEACON), "a KEM-only identity cannot authenticate a registration, so it is refused");
     }
 
     /// A registration is never launched at the line it names, and cannot be.
@@ -923,7 +946,7 @@ mod tests {
         let (_sec, svc_pub) = HybridKemSecret::generate(&mut kem);
         let (identity, signer) = identity(b"launch-sign");
         let epoch = Epoch::new(9);
-        let reg = HostRegister::onion(&identity, &signer, epoch, svc_pub.encode(), vec![h2, drop], 2)
+        let reg = HostRegister::onion(&identity, &signer, epoch, &TAG_BEACON, svc_pub.encode(), vec![h2, drop], 2)
             .expect("the registration is nameable");
 
         // THE PROPERTY, over many registrations rather than one: the frame lands on a member of the FIRST hop
@@ -1007,7 +1030,7 @@ mod tests {
             fanos_aphantos::nostos::ReplyKeys::generate(b"svc-forward-reply");
 
         let (bundle, signer) = identity(b"onion-service");
-        let reg = HostRegister::onion(&bundle, &signer, Epoch::new(3), reply_pub.encode(), vec![drop_line], 2)
+        let reg = HostRegister::onion(&bundle, &signer, Epoch::new(3), &TAG_BEACON, reply_pub.encode(), vec![drop_line], 2)
         .expect("all forward-line members are in the directory");
         // It names the dead-drop line and the threshold, and carries NO member keys: those are the combiner's
         // to resolve. Carrying them made the registration grow as `q + 1` per hop, so it did not fit the
@@ -1028,14 +1051,14 @@ mod tests {
         );
         // The bare-host fallback has no forward circuit, so it seals nothing (the combiner Sends direct).
         assert!(
-            HostRegister::bare(&bundle, &signer, Epoch::new(3), [1, 1, 1])
+            HostRegister::bare(&bundle, &signer, Epoch::new(3), &TAG_BEACON, [1, 1, 1])
                 .seal_forward_to_host::<F2>(&dir, b"x", b"e", b"o")
                 .is_none()
         );
         // A drop route whose line members are absent from the directory can't self-provision.
         let empty = MixDirectory::new();
         // An empty forward circuit is the bare-host shape, which `onion` refuses by construction.
-        assert!(HostRegister::onion(&bundle, &signer, Epoch::new(3), vec![], vec![], 2).is_none());
+        assert!(HostRegister::onion(&bundle, &signer, Epoch::new(3), &TAG_BEACON, vec![], vec![], 2).is_none());
         let _ = &empty;
         let _ = &reply_keys; // reply_keys' secret half stays with the service; only the public traveled
     }
@@ -1063,7 +1086,7 @@ mod tests {
         let (bundle, signer) = identity(b"a-service-across-time");
 
         let across: Vec<HostRegister> = (1..=8u64)
-            .map(|e| HostRegister::bare(&bundle, &signer, Epoch::new(e), [1, 0, 1]))
+            .map(|e| HostRegister::bare(&bundle, &signer, Epoch::new(e), &TAG_BEACON, [1, 0, 1]))
             .collect();
 
         // The rotation works, on its own terms: no two epochs share a tag.
@@ -1093,13 +1116,61 @@ mod tests {
 
     #[test]
     fn service_tag_is_one_way_epoch_rotating_and_service_specific() {
-        let a = service_tag(b"svc-A", Epoch::new(5));
+        let a = service_tag(b"svc-A", Epoch::new(5), &TAG_BEACON);
         // Deterministic in its inputs.
-        assert_eq!(a, service_tag(b"svc-A", Epoch::new(5)));
+        assert_eq!(a, service_tag(b"svc-A", Epoch::new(5), &TAG_BEACON));
         // Rotates per epoch, and separates distinct services — so co-located hosts never collide.
-        assert_ne!(a, service_tag(b"svc-A", Epoch::new(6)), "the tag rotates per epoch");
-        assert_ne!(a, service_tag(b"svc-B", Epoch::new(5)), "distinct services get distinct tags");
+        assert_ne!(a, service_tag(b"svc-A", Epoch::new(6), &TAG_BEACON), "the tag rotates per epoch");
+        assert_ne!(a, service_tag(b"svc-B", Epoch::new(5), &TAG_BEACON), "distinct services get distinct tags");
         // A real tag is never the all-zero "none" sentinel.
         assert_ne!(a, [0u8; 32]);
+    }
+
+    /// The point of folding the beacon in (#132), stated as the thing an adversary cannot do.
+    ///
+    /// The service identity is *public* — that is what a hidden service publishes — and the epoch number is a
+    /// counter. So with the epoch alone, `service_tag` is a pure function of two values an adversary holds at
+    /// epoch `E`, and it can precompute the tag any service will register under at `E+1`, `E+2`, … The tag is
+    /// what a meeting-line member matches an inbound request against, so precomputing it is precomputing which
+    /// requests to drop: a censor picks its targets an unbounded number of epochs ahead of the traffic.
+    ///
+    /// Folding in `E`'s beacon costs the adversary exactly the beacon's unpredictability. This test is written
+    /// as the falsification: it computes the next epoch's tag under everything an adversary has *now* and
+    /// requires it to differ from the real one. Drop `beacon` from `service_tag`'s hash input and the last two
+    /// assertions fail — which is what makes the parameter load-bearing rather than decorative.
+    #[test]
+    fn a_future_epochs_tag_is_not_computable_under_the_current_beacon() {
+        let identity = b"svc-public-identity";
+        let (this_epoch, next_epoch) = (Epoch::new(5), Epoch::new(6));
+        // Two beacons that the adversary cannot connect: at `this_epoch` it holds the first and, the DVRF being
+        // unpredictable, learns nothing about the second until the epoch it belongs to opens.
+        let (this_beacon, next_beacon) = ([0x11u8; 32], [0x22u8; 32]);
+
+        // The real tag the host will register under next epoch.
+        let real_next = service_tag(identity, next_epoch, &next_beacon);
+        // The current epoch's tag IS computable by anyone — that is not the defect, and must not be: an honest
+        // meeting member matches live traffic against exactly this value.
+        assert_eq!(service_tag(identity, this_epoch, &this_beacon), service_tag(identity, this_epoch, &this_beacon));
+
+        // Everything the adversary can compute at `this_epoch`: the identity is published, the epoch number is a
+        // counter it can advance freely, and the only beacon it holds is the current one.
+        let guessed_next = service_tag(identity, next_epoch, &this_beacon);
+        assert_ne!(
+            real_next, guessed_next,
+            "a censor holding the public identity and the CURRENT beacon must not be able to name the tag a \
+             service will register under next epoch",
+        );
+        // And the epoch counter is not a way around it either: no reachable epoch number, under the beacon the
+        // adversary holds, reproduces the real tag.
+        for ahead in 0..64u64 {
+            assert_ne!(
+                real_next,
+                service_tag(identity, Epoch::new(ahead), &this_beacon),
+                "epoch {ahead}'s tag under the current beacon collided with the next epoch's real tag",
+            );
+        }
+        // The converse, so the test cannot pass by the tag being unstable: given the right beacon it IS the tag,
+        // which is what lets an honest meeting member match a registration it has never seen before.
+        assert_eq!(real_next, service_tag(identity, next_epoch, &next_beacon));
     }
 }

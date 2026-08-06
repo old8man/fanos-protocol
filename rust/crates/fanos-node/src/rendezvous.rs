@@ -186,9 +186,13 @@ pub struct RendezvousRoute {
     pub threshold: u8,
     /// The rendezvous epoch — the meeting line rotates each epoch, so there is no fixed target.
     pub epoch: Epoch,
-    /// The epoch's randomness-beacon seed, folded into the meeting-line derivation so a future epoch's
-    /// line is unpredictable in advance (audit E5). The client obtains it via a `BEACON` sync; both
-    /// parties must use the same epoch's seed to meet. [`BeaconSeed::GENESIS`] before the first round.
+    /// The epoch's randomness-beacon seed, folded into **both** halves of the rendezvous rotation: the
+    /// meeting-line derivation, so a future epoch's line is unpredictable in advance (audit E5), and the
+    /// host-registration [`service_tag`](fanos_rendezvous::service_tag), so a future epoch's tag is not
+    /// computable against a service's public identity either (#132). Carried beside `epoch` rather than
+    /// derived from it because the two must be the same round's — the client obtains both from one `BEACON`
+    /// sync, and both parties must use the same epoch's seed to meet. [`BeaconSeed::GENESIS`] before the
+    /// first round.
     pub beacon: BeaconSeed,
 }
 
@@ -204,7 +208,7 @@ pub struct AnonRouteParams {
     pub threshold: u8,
     /// The rendezvous epoch (the meeting line and placement rotate with it).
     pub epoch: Epoch,
-    /// The epoch's beacon seed (folds into the meeting-line derivation).
+    /// The epoch's beacon seed (folds into the meeting-line derivation AND the host `service_tag`).
     pub beacon: BeaconSeed,
     /// `(forward, reply)` intermediate-hop depths for each freshly-drawn circuit.
     pub depths: (usize, usize),
@@ -556,7 +560,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     // The service host-registration tag: if the service is hosted off its meeting combiner (the general
     // case), the node at the combiner routes this request to the host registered under this tag
     // (§3b). A service that is its own combiner ignores it (the delivery surfaces locally there).
-    let tag = service_tag(identity, route.epoch);
+    let tag = service_tag(identity, route.epoch, route.beacon.as_bytes());
     let rclient = RendezvousClient::<F2>::new(
         forward_circuit,
         reply_circuit,
