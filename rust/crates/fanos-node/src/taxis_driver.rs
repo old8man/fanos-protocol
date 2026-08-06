@@ -766,7 +766,9 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
-        ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from, have_height: *have_height },
+        ConsensusMsg::SyncReq { have_height, have_root } => {
+            Input::SyncReq { from, have_height: *have_height, have_root: *have_root }
+        }
         ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
         // The body-recovery pair. `Body` deliberately does NOT go to `on_skeleton` like `Propose` does: it is a whole
         // block answering a decision this validator already holds, and the engine checks it against that decision.

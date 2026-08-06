@@ -483,11 +483,21 @@ pub enum ConsensusMsg {
     Reveal(RevealMsg),
     /// A validator's execution attestation `(height, state_root)` — the executed-state checkpoint.
     ExecVote(ExecVote),
-    /// A lagging node's **catch-up request** — "I am at `have_height`; offer me a newer certified checkpoint."
-    /// (audit §3.9 / §4 — a node that missed heights re-enters instead of wedging; `crate::sync` state-sync.)
+    /// A lagging **or diverged** node's catch-up request — "I am at `have_height` holding `have_root`; offer
+    /// me something better." (audit §3.9 / §4; `crate::sync` state-sync.)
     SyncReq {
-        /// The requester's current next-height, so a peer offers only a strictly-newer checkpoint.
+        /// The requester's current next-height.
         have_height: u64,
+        /// The requester's executed state root at that height.
+        ///
+        /// **Height alone cannot express the condition that wedges a validator**, which is why this field
+        /// exists. A node that joins late reaches the cell's height by *voting*, not by executing the history
+        /// it missed, so within a few rounds `have_height` matches the server's and the server — which used to
+        /// decide on height alone — refuses a snapshot by construction and answers with a certificate for a
+        /// height the requester already has. Measured: heights equal at `h315`, balances `1000/0` against
+        /// `900/100`, `asks` frozen at 2 and `taken` at 0, permanently. The root is what distinguishes
+        /// "behind" from "beside".
+        have_root: [u8; 32],
     },
     /// A peer's **catch-up response**: a quorum-signed [`ExecCertificate`], the block `head` hash at its height,
     /// and the full serialized state at that height. All untrusted transport — the receiver verifies the
@@ -549,9 +559,10 @@ impl ConsensusMsg {
                 out.push(3);
                 out.extend_from_slice(&v.to_bytes());
             }
-            Self::SyncReq { have_height } => {
+            Self::SyncReq { have_height, have_root } => {
                 out.push(4);
                 codec::put_u64(&mut out, *have_height);
+                out.extend_from_slice(have_root);
             }
             Self::SyncResp { cert, snapshot } => {
                 out.push(5);
@@ -587,8 +598,9 @@ impl ConsensusMsg {
             4 => {
                 let mut r = codec::Reader::new(body);
                 let have_height = r.u64()?;
+                let have_root = r.array::<32>()?;
                 r.finish()?;
-                Some(Self::SyncReq { have_height })
+                Some(Self::SyncReq { have_height, have_root })
             }
             5 => {
                 let mut r = codec::Reader::new(body);
@@ -649,13 +661,16 @@ pub enum Input {
     ExecVote(ExecVote),
     /// The round timer fired (the proposer took too long) — advance the round and re-elect a leader.
     Timeout,
-    /// A catch-up request from validator `from` (the authenticated transport source) at `have_height`.
+    /// A catch-up request from validator `from` (the authenticated transport source) at `have_height`,
+    /// holding `have_root`.
     SyncReq {
         /// The requesting validator's index (the driver fills this from the authenticated source coordinate,
         /// so a response is directed to the real sender, not a spoofable field).
         from: u8,
         /// The requester's current next-height.
         have_height: u64,
+        /// The requester's executed state root there — see [`ConsensusMsg::SyncReq`] for why height is not enough.
+        have_root: [u8; 32],
     },
     /// A commit certificate received off the wire, finalizing the height we are stuck on (verified before use).
     CommitCert(Certificate),
@@ -985,6 +1000,9 @@ pub struct ConsensusEngine<S: StateMachine> {
     // checkpoint that makes divergence detectable and anchors cross-cell proofs.
     exec_votes: BTreeMap<u64, BTreeMap<u8, ExecVote>>,
     checkpoint: Option<ExecCertificate>,
+    // The height at which a Q-quorum attested a state root that is NOT the one we attested — proof our
+    // executed state is not the cell's. Cleared by a successful state-sync. See `try_form_checkpoint`.
+    diverged: Option<u64>,
     // ── State-sync retention (audit §3.9 / §4; `crate::sync`) ──
     // The highest height seen in an off-height message we could not process — how far ahead the cell is, so a
     // lagging node knows to request catch-up rather than wedge.
@@ -1069,6 +1087,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             exec_queue: Vec::new(),
             pending_finalize: BTreeMap::new(),
             exec_votes: BTreeMap::new(),
+            diverged: None,
             checkpoint: None,
             max_seen_height: 0,
             sync_states: BTreeMap::new(),
@@ -1392,7 +1411,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::Reveal(r) => self.on_reveal(&r),
             Input::ExecVote(v) => self.on_exec_vote(v),
             Input::Timeout => self.on_timeout(),
-            Input::SyncReq { from, have_height } => self.on_sync_req(from, have_height),
+            Input::SyncReq { from, have_height, have_root } => self.on_sync_req(from, have_height, have_root),
             Input::NeedBody { from, block } => self.on_need_body(from, &block),
             Input::Body(block) => self.on_body(block),
             Input::CommitCert(cert) => self.on_commit_cert(cert),
@@ -1440,12 +1459,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// answers with a certified snapshot ([`on_sync_req`](Self::on_sync_req)). Adopting is monotone and
     /// certificate-verified, so a spurious request (we were only transiently behind) is harmless.
     fn maybe_request_sync(&mut self) -> Vec<Output> {
-        if self.max_seen_height > self.height() {
-            self.sync_asks = self.sync_asks.saturating_add(1);
-            alloc::vec![Output::Send(ConsensusMsg::SyncReq { have_height: self.height() })]
-        } else {
-            Vec::new()
+        // **Two conditions, because a validator can be wrong without being behind.** `max_seen_height >
+        // height()` catches a node that missed heights. It structurally cannot catch a node that reached the
+        // cell's height by *voting* while never executing the history it missed: its height is correct and its
+        // state is not, so this trigger falls silent and the node stays at the tip with the wrong state for
+        // ever. `diverged` is that second condition, set from a quorum of execution attestations disagreeing
+        // with our own — evidence the cell already gathers and never compared.
+        if self.max_seen_height <= self.height() && self.diverged.is_none() {
+            return Vec::new();
         }
+        self.sync_asks = self.sync_asks.saturating_add(1);
+        alloc::vec![Output::Send(ConsensusMsg::SyncReq {
+            have_height: self.height(),
+            have_root: self.chain.state_root(),
+        })]
     }
 
     /// Every block whose body can still be decided at this height — the sampler's *relevance* criterion.
@@ -1570,11 +1597,19 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// certified state's snapshot, send it point-to-point to the authenticated requester `from` (never a
     /// broadcast, and never to a spoofable field — `from` is the real transport source). A Byzantine requester
     /// gains nothing it could not verify; the snapshot + certificate are self-authenticating.
-    fn on_sync_req(&mut self, from: u8, have_height: u64) -> Vec<Output> {
+    fn on_sync_req(&mut self, from: u8, have_height: u64, have_root: [u8; 32]) -> Vec<Output> {
         let Some(cert) = &self.checkpoint else {
             return self.answer_with_cert(from, have_height);
         };
-        if cert.height <= have_height {
+        // **`cert.height <= have_height` used to end it here, and that is the server half of the wedge.** A
+        // requester standing at our own height with a *different* root needs exactly the thing this branch
+        // refuses — the certified state — and the certificate it gets instead finalizes a height it already
+        // holds, so it changes nothing. Serve on either condition: strictly newer (it is behind), or same
+        // height and a different root (it is beside us). Both are answered by the same snapshot, and both
+        // remain certificate-verified and root-verified at the requester.
+        let behind = cert.height > have_height;
+        let diverged = cert.height == have_height && cert.state_root != have_root;
+        if !behind && !diverged {
             return self.answer_with_cert(from, have_height);
         }
         // Holding a checkpoint is not the same as being able to *serve* it, and the two were conflated: reaching this
@@ -1709,6 +1744,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.sync_states.insert(cert.state_root, snapshot.to_vec());
         self.sync_heads.insert(height, (cert.state_root, head));
         self.checkpoint = Some(cert);
+        // We just installed the certified state, so whatever divergence prompted this is repaired. Clearing it
+        // here and nowhere else keeps the flag meaning "our state is not the cell's" rather than "we asked".
+        self.diverged = None;
         self.max_seen_height = self.max_seen_height.max(self.height());
         // Signal the jump so the driver surfaces the new tip exactly like a finalized height.
         alloc::vec![Output::Committed { height, block_hash: head }]
@@ -2904,12 +2942,27 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // only be assembled from votes that agree on both. Honest validators at one height agree on the head by
         // construction — they finalized the same block — so this rejects nothing legitimate and prevents a certificate
         // from being stitched together across two different tips (T-H6).
+        // Our own attestation for this height, copied out before the loop mutates `self`. Recorded by
+        // `emit_exec_vote`, so it is present whenever we executed the height ourselves.
+        let mine = by_voter.get(&self.me).map(|v| v.state_root);
         let mut by_state: BTreeMap<([u8; 32], [u8; 32]), Vec<ExecVote>> = BTreeMap::new();
         for v in by_voter.values() {
             by_state.entry((v.state_root, v.head)).or_default().push(v.clone());
         }
         for ((root, head), votes) in by_state {
             if votes.len() >= self.params.quorum() {
+                // **The comparison this struct's own doc promised and nothing performed.** The checkpoint is
+                // described as "the executed-state checkpoint that makes divergence *detectable*", and the
+                // quorum root was installed without ever being held against ours. A quorum attesting a root we
+                // did not attest is authenticated evidence (every `ExecVote` is signature-verified, and a
+                // quorum cannot be assembled below `Q`) that our executed state is not the cell's — the exact
+                // condition `maybe_request_sync`'s height comparison cannot see.
+                //
+                // `None` is not divergence: it means we have no attestation of our own at this height, which
+                // is ordinary for a node that is simply behind, and the height trigger already covers that.
+                if mine.is_some_and(|ours| ours != root) {
+                    self.diverged = Some(height);
+                }
                 self.checkpoint = Some(ExecCertificate { height, state_root: root, head, votes });
                 self.prune_recovery_retention();
                 return;

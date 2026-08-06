@@ -258,7 +258,9 @@ impl Cluster {
             ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
             ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
             ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
-            ConsensusMsg::SyncReq { have_height } => Input::SyncReq { from: from as u8, have_height: *have_height },
+            ConsensusMsg::SyncReq { have_height, have_root } => {
+                Input::SyncReq { from: from as u8, have_height: *have_height, have_root: *have_root }
+            }
             ConsensusMsg::SyncResp { cert, snapshot } => {
                 Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() }
             }
@@ -1218,7 +1220,7 @@ fn a_freshly_synced_validator_still_answers_a_laggard_instead_of_going_silent() 
         c.tick();
         c.timeout();
         if c.engines[LAG].chain().next_height() > 0 {
-            let answer = c.engines[LAG].step(Input::SyncReq { from: 0, have_height: 0 });
+            let answer = c.engines[LAG].step(Input::SyncReq { from: 0, have_height: 0, have_root: [0u8; 32] });
             assert!(
                 !answer.is_empty(),
                 "a validator holding a checkpoint above height 0 answered a catch-up request with nothing: {}",
@@ -2524,7 +2526,7 @@ fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate()
     let ckpt = c.engines[0].latest_checkpoint().map_or(0, |c| c.height);
     assert!(head > ckpt, "the cell has finalized past its checkpoint, so the certificate path is exercised at all");
     for h in ckpt..head {
-        let replies = c.engines[0].step(Input::SyncReq { from: 1, have_height: h });
+        let replies = c.engines[0].step(Input::SyncReq { from: 1, have_height: h, have_root: [0u8; 32] });
         assert!(
             replies.iter().any(|o| {
                 matches!(o, Output::SendTo { msg: ConsensusMsg::CommitCert(cert), .. } if cert.height == h)
@@ -2535,7 +2537,7 @@ fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate()
     }
     // And nothing is invented for a height the cell has not reached.
     assert!(
-        c.engines[0].step(Input::SyncReq { from: 1, have_height: head }).is_empty(),
+        c.engines[0].step(Input::SyncReq { from: 1, have_height: head, have_root: [0u8; 32] }).is_empty(),
         "a request at our own height has nothing newer to offer"
     );
 }

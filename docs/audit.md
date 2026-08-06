@@ -3990,3 +3990,67 @@ Reduced wide, the rule to carry: **any threshold over a sub-committee must be si
 `f`-coalition can place on that committee, never against the committee's expected share of a uniform
 corruption.** A line of `m` points inside a cell of `n` is not a scaled-down cell; the adversary picks where
 its budget sits.
+
+---
+
+## The reveal set is not committed state, and the net that was supposed to catch that is not wired (2026-08-06)
+
+Started as "why does `a_validator_joining_late` hang on a quiet box 1 run in 4" and ended two layers below the
+symptom. Nothing here is fixed yet; the detection/repair half is written and unbuilt.
+
+### An agreed clock over a local input is not an agreed decision
+
+`finalize` advances height on the block **header**; execution waits for the anti-MEV reveals. `try_execute`
+drops a still-undecryptable transaction once `chain.next_height() > block.height + REVEAL_WINDOW`, and
+`REVEAL_WINDOW`'s doc is explicit that this is "a decision keyed to the finalized height (identical on every
+validator), **not to local gossip arrival**".
+
+The clock is agreed. The predicate is `shares.len() < t` over `self.reveals` — what this node happened to
+receive. Two honest validators at the same finalized height can hold `t` and `t − 1` openings for one
+transaction, so at the window boundary one executes the transfer and the other drops it. Both advance. Their
+state roots differ permanently: no fork, no equivocation, no height gap, and no Byzantine participant.
+
+### The same function states the correct rule twenty lines later
+
+On the block reward: *"Canonical: every validator reads the identical finalizer set **from the committed
+block**, so crediting it is a deterministic state transition that lands in the state root."* The finalizer set
+was moved into the block precisely because a per-node view "could differ across validators and so could never
+be part of the state root".
+
+The reveal set feeds the same state root, decides something far heavier — whether a transfer happens — and is
+read from gossip. **The rule was derived, applied once, and never reduced wide.**
+
+### Three stated mitigations, and why each is thinner than it reads
+
+* *"every validator re-gossips each reveal it records, so the honest share sets converge well within the
+  window"* — convergence is not a bound; nothing relates reveal propagation to four block heights.
+* *"this drop decision agrees across validators under partial synchrony"* — partial synchrony promises
+  *eventual* delivery, not delivery inside the window. That assumption is the thing that fails.
+* *"the executed-state checkpoint detects any residual async divergence"* — **it does not.**
+  `try_form_checkpoint` installs the quorum's root and never holds it against this node's own attestation,
+  while the field's comment calls the checkpoint "the executed-state checkpoint that makes divergence
+  *detectable*". A design that accepts a possible divergence and delegates it to a net nobody wired.
+
+### And the wedge below it
+
+Even once noticed, nothing repairs it, because two more sites compare heights where the property is a state:
+`maybe_request_sync` fires on `max_seen_height > height()` — but a late validator reaches the cell's height by
+**voting**, not by executing the history it missed, so the trigger falls silent; and `on_sync_req` gates the
+snapshot on `cert.height <= have_height`, so a requester at the server's own height is refused a snapshot *by
+construction* and handed a certificate for a height it already holds. Measured over real QUIC on a quiet box:
+`late h315 alice1000/bob0 root[bf,28,13] | peer0 h315 alice900/bob100 root[c1,d8,52]`, `asks=2 taken=0
+certs=0 answers=(0,3,0)` — three certificate answers, zero snapshots, every rejection counter zero.
+`on_sync_resp`'s own guard is `cert.height < self.height()`, strictly less, so **adoption already accepts an
+equal-height certificate**; it is the detection and the service that refuse.
+
+### The derived fix
+
+Any input to a state transition must be part of the ordered history — the rule the reward already follows.
+Reveals cannot ride in the block they open, so the block at `h + k` carries the **reconstructed opening key**
+(32 bytes per transaction, not the `t` shares; any validator verifies it by opening the AEAD) for the
+in-window blocks below it. Execution then reads its keys from the chain and the drop rule becomes "no key
+appeared by `h + REVEAL_WINDOW`", which is a chain fact. Divergence becomes impossible rather than repairable.
+
+The detection-and-repair change is still worth landing first, as defence in depth and because it is small:
+compare the quorum root against our own when a checkpoint forms, fire the sync trigger on divergence, carry
+`have_root` in `SyncReq`, and serve the snapshot on a root mismatch at equal height.
