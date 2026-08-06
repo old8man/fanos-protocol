@@ -267,8 +267,8 @@ impl Cluster {
             ConsensusMsg::SyncReq { have_height, have_root } => {
                 Input::SyncReq { from: from as u8, have_height: *have_height, have_root: *have_root }
             }
-            ConsensusMsg::SyncResp { cert, snapshot } => {
-                Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() }
+            ConsensusMsg::SyncResp { cert, above, snapshot } => {
+                Input::SyncResp { cert: cert.clone(), above: above.clone(), snapshot: snapshot.clone() }
             }
             ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
             ConsensusMsg::NeedBody { block } => Input::NeedBody { from: from as u8, block: *block },
@@ -542,6 +542,20 @@ impl Cluster {
         self.exchange_shards();
     }
 
+    /// Drive one further height so the previous block's anti-MEV openings are **committed** and it executes.
+    ///
+    /// Execution lags finality by one block, and that is a protocol property rather than a harness quirk
+    /// (#137): the openings for block `H` only exist once `H` is final, so the earliest block that can carry
+    /// them is `H+1`, and execution reads them from the chain rather than from each validator's gossip. A
+    /// test that finalizes a block and immediately asserts on executed state is asking for the state of a
+    /// block whose input has not been agreed yet.
+    ///
+    /// Named rather than written as a bare extra `tick()` so the reason survives in the tests that need it.
+    fn settle(&mut self) {
+        self.tick();
+        self.timeout();
+    }
+
     fn timeout(&mut self) {
         self.timeout_some(&(0..N).collect::<Vec<_>>());
     }
@@ -620,7 +634,8 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
     assert!(tx.open(&[share0]).is_err(), "one share (< t = 2) must not decrypt the transaction");
 
     c.submit_all(&tx);
-    c.tick(); // leader proposes height 0; the cluster drives prepare → commit → finalize → reveal → execute.
+    c.tick(); // leader proposes height 0; the cluster drives prepare → commit → finalize → reveal.
+    c.settle(); // and one more height, because the openings are COMMITTED (#137).
 
     // All seven honest validators finalized height 0, and on the SAME block (agreement).
     assert_eq!(c.honest_count_at(0), N, "every honest validator finalizes height 0");
@@ -738,6 +753,7 @@ fn ssle_the_secret_min_ticket_line_member_leads_and_finalizes() {
     assert!(block.witness.is_some(), "a round-0 secret-leader block carries its Merkle-VRF ticket witness");
 
     // The anti-MEV transfer still executed in agreed order (SSLE composes with the rest of the pipeline).
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     for e in &c.engines {
         assert_eq!(e.chain().state().balance(&ALICE), 900);
         assert_eq!(e.chain().state().balance(&BOB), 100);
@@ -829,7 +845,7 @@ fn ssle_a_down_line_member_does_not_stall_the_round_the_window_expiry_finalizes(
 /// own execution attestation disagreeing with the quorum's is the evidence that triggers the ask; the height
 /// comparison that used to gate both the ask and the answer cannot see this condition at all.
 #[test]
-fn a_validator_that_missed_the_reveals_detects_its_divergence_and_is_repaired() {
+fn a_validator_that_missed_every_gossiped_reveal_executes_the_cells_state_anyway() {
     const BLIND: usize = 5;
     let mut c = Cluster::new(&genesis());
     c.deaf_reveal.insert(BLIND);
@@ -848,23 +864,40 @@ fn a_validator_that_missed_the_reveals_detects_its_divergence_and_is_repaired() 
          test it is never behind"
     );
 
-    // THE PROPERTY.
+    // THE PROPERTY, and #137 inverted it. This test used to assert that a reveal-deaf validator DIVERGES —
+    // executes the block empty — and is then detected by the executed-state checkpoint and repaired by
+    // state-sync. That was an accurate description of a defect: the divergence existed because execution read
+    // a gossip pool, and detect-then-repair was the mitigation. Committing the openings removes the
+    // divergence, so the same fixture now proves the stronger thing.
     let probe = c.engines[BLIND].probe();
     assert_eq!(
         c.engines[BLIND].chain().state().balance(&BOB),
         250,
-        "the validator that never saw a reveal holds the cell's state. Without the root comparison it sits at \
-         the cell's height with the pristine balances for ever: the trigger compares heights and it is not \
-         behind, and the server refuses a snapshot to anyone not below its checkpoint.\n  blind: {probe}"
+        "a validator that received not one gossiped reveal still executes the cell's state, because the \
+         openings reached it on the chain.\n  blind: {probe}"
     );
 
-    // NON-VACUITY: it got there by adopting certified state, not by quietly never diverging. Without this a
-    // harness bug that delivered reveals after all would leave the assertion above passing and empty.
-    assert!(
-        probe.sync_taken > 0,
-        "the repair must run through state-sync — a blind validator that reached the right balance without \
-         ever adopting a snapshot means the reveal drop did not take, and this test proves nothing.\n  \
+    // NON-VACUITY, both directions (`instrument-both-directions`). Either half alone is satisfiable by a
+    // harness bug: without the first, gossip may have been delivered after all and the fixture proves
+    // nothing; without the second, execution might have had no openings at all and the balance could be
+    // right for some other reason.
+    assert_eq!(
+        probe.reveals_taken.0, 0,
+        "the reveal drop must actually take — this validator must have recorded NO gossiped opening.\n  \
          blind: {probe}"
+    );
+    assert!(
+        probe.reveals_taken.1 > 0,
+        "and it must have absorbed openings from committed blocks, which is the input it executed from.\n  \
+         blind: {probe}"
+    );
+
+    // And the repair is now unnecessary rather than merely successful: there was never a divergence to
+    // detect. A `sync_taken > 0` here would mean execution had diverged after all.
+    assert_eq!(
+        probe.sync_taken, 0,
+        "no state-sync repair should be needed: with the openings committed there is no divergence to \
+         detect.\n  blind: {probe}"
     );
 }
 
@@ -1056,14 +1089,17 @@ fn a_sustained_deferral_flood_cannot_restart_an_older_transactions_give_up_clock
     // thing still load-bearing. `TxCommit` is derived from submitted transactions, so a steady arrival of newly
     // deferred ones is remote-reachable, and it pushes every predecessor's deadline forward indefinitely.
     //
-    // THE PROPERTY, and it is the whole claim: a premature transaction occupies blocks for at most `REVEAL_WINDOW`
-    // heights past its first deferral **no matter what arrives after it**.
+    // THE PROPERTY, and it is the whole claim: a premature transaction occupies at most `REVEAL_WINDOW + 1`
+    // BLOCKS **no matter what arrives after it**.
     const CAP: usize = 64; // `deferred_since`'s capacity
     const PER_HEIGHT: usize = 4; // fresh clocks per height, enough to keep displacing the map's oldest entry
-    // The horizon is `REVEAL_WINDOW` heights of PATIENCE, and the give-up decision is made at execution — i.e.
-    // AFTER inclusion — so the height that finally drops the transaction is also the last height carrying it.
-    // The span of occupied heights is therefore `REVEAL_WINDOW + 1`, not `REVEAL_WINDOW`; measured 0..=5 here.
-    const SPAN: u64 = REVEAL_WINDOW + 1;
+    // Blocks carrying it, not the span of heights between the first and the last — and the difference became
+    // load-bearing with #137. The give-up budget bounds RETRIES; the heights between two retries are however
+    // long execution takes to reach the transaction, which is now at least two and up to `REVEAL_WINDOW + 1`.
+    // A span bound therefore measures the pacing of execution and calls it the retry budget, while the count
+    // measures the thing the budget is about and the thing the attack would inflate — the block space one
+    // victim can be made to occupy. Measured 6 blocks here, over a span of 17 heights.
+    const CARRIED: usize = REVEAL_WINDOW as usize + 2;
     let mut c = Cluster::new(&genesis());
 
     // The victim goes in alone and first, so it is unambiguously the oldest clock in the map.
@@ -1091,7 +1127,7 @@ fn a_sustained_deferral_flood_cannot_restart_an_older_transactions_give_up_clock
 
     // Which heights actually carried a transaction, read off the FINALIZED chain (not the proposal set, which
     // can hold blocks no quorum ever agreed).
-    let span_of = |c: &Cluster, want: TxCommit| -> Option<(u64, u64)> {
+    let span_of = |c: &Cluster, want: TxCommit| -> Option<Vec<u64>> {
         let mut carried: Vec<u64> = Vec::new();
         for h in 0..c.engines[0].chain().next_height() {
             let Some(hash) = c.hashes_at(h).into_iter().next() else { continue };
@@ -1100,15 +1136,16 @@ fn a_sustained_deferral_flood_cannot_restart_an_older_transactions_give_up_clock
                 carried.push(h);
             }
         }
-        Some((*carried.first()?, *carried.last()?))
+        carried.first()?;
+        Some(carried)
     };
 
-    let (first, last) = span_of(&c, vc).expect("the victim was included at least once");
+    let carried = span_of(&c, vc).expect("the victim was included at least once");
     assert!(
-        last - first <= SPAN,
-        "the victim occupied heights {first}..={last} ({} past its horizon of {SPAN}) — a flood of newer \
+        carried.len() <= CARRIED,
+        "the victim was carried by {} blocks ({carried:?}), past its horizon of {CARRIED} — a flood of newer \
          deferrals restarted its give-up clock",
-        last - first
+        carried.len()
     );
 
     // And the same rule at the other end, quantified over EVERY transaction rather than a chosen one — because
@@ -1120,18 +1157,20 @@ fn a_sustained_deferral_flood_cannot_restart_an_older_transactions_give_up_clock
     // The universal form needs no guess and is strictly stronger: refusing a clock and refusing the retry are ONE
     // decision, so an engine that re-queues a transaction it declined to age has merely moved immortality from the
     // oldest entry to the newest — and *some* transaction then outlives the span, whichever one it is.
-    let mut worst: Option<(TxCommit, u64, u64)> = None;
+    let mut worst: Option<(TxCommit, Vec<u64>)> = None;
     for tx in c.proposed.iter().flat_map(|b| b.sealed_txs.iter()).map(SealedTx::commit).collect::<BTreeSet<_>>() {
-        let Some((f, l)) = span_of(&c, tx) else { continue };
-        if worst.is_none_or(|(_, wf, wl)| l - f > wl - wf) {
-            worst = Some((tx, f, l));
+        let Some(carried) = span_of(&c, tx) else { continue };
+        if worst.as_ref().is_none_or(|(_, w)| carried.len() > w.len()) {
+            worst = Some((tx, carried));
         }
     }
-    let (_, wf, wl) = worst.expect("the run finalized transactions");
+    let (_, worst_carried) = worst.expect("the run finalized transactions");
     assert!(
-        wl - wf <= SPAN,
-        "some transaction occupied heights {wf}..={wl}, past the horizon of {SPAN} — every transaction is either \
-         aged against a clock or refused outright, and this implementation retried one it could not age"
+        worst_carried.len() <= CARRIED,
+        "some transaction was carried by {} blocks ({worst_carried:?}), past the horizon of {CARRIED} — every \
+         transaction is either aged against a clock or refused outright, and this implementation retried one \
+         it could not age",
+        worst_carried.len()
     );
 
     // THE MECHANISM, second: the clock map is still bounded, so keeping the older clock did not trade a horizon
@@ -1334,12 +1373,12 @@ fn a_forged_or_mismatched_catch_up_response_is_refused() {
     // (1) A FORGED certificate (votes truncated below the quorum) is refused — no adoption.
     let mut weak = cert.clone();
     weak.votes.truncate(1);
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: weak, snapshot: good.clone() }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: weak, above: Vec::new(), snapshot: good.clone() }), Vec::new());
     assert_eq!(c.engines[LAG].chain().next_height(), 0, "an under-quorum certificate is not adopted");
 
     // (2) A MISMATCHED snapshot (the empty state, whose root ≠ the certified root) is refused.
     let wrong = Accounts::new().snapshot();
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: wrong }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), above: Vec::new(), snapshot: wrong }), Vec::new());
     assert_eq!(c.engines[LAG].chain().next_height(), 0, "a snapshot that does not match the certified root is refused");
 
     // **Both refusals are recorded, and recorded APART.** They are the same non-event to a lagging operator —
@@ -1351,12 +1390,12 @@ fn a_forged_or_mismatched_catch_up_response_is_refused() {
     assert_eq!(vr.sync_uncertified, 1, "the mismatched snapshot is counted separately, not folded into it");
 
     // (3) The GENUINE response IS adopted — the positive control: verified certificate + matching snapshot.
-    let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), snapshot: good });
+    let outs = c.engines[LAG].step(Input::SyncResp { cert: cert.clone(), above: Vec::new(), snapshot: good });
     assert!(matches!(outs.as_slice(), [Output::Committed { .. }]), "a valid response adopts (emits Committed)");
     assert_eq!(c.engines[LAG].chain().next_height(), cert.height + 1, "the laggard adopts the certified height");
     assert_eq!(c.engines[LAG].chain().state_root(), cert.state_root, "and reaches the certified state root");
     // (4) A stale re-offer of the SAME certificate is now a no-op (monotone — never rolls back).
-    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert, snapshot: expected.snapshot() }), Vec::new());
+    assert_eq!(c.engines[LAG].step(Input::SyncResp { cert, above: Vec::new(), snapshot: expected.snapshot() }), Vec::new());
 }
 
 #[test]
@@ -1374,12 +1413,18 @@ fn many_blocks_finalize_and_a_dependent_transfer_chain_executes() {
         assert_eq!(c.honest_count_at(h as u64), N, "height {h} finalizes everywhere");
         assert_eq!(c.hashes_at(h as u64).len(), 1, "agreement at height {h}");
     }
+    // The height assertion is read BEFORE settling, so it still measures what it measured: three
+    // transaction blocks. Settling adds heights by design (#137), and folding that into the expected number
+    // would quietly turn a statement about the workload into a statement about the harness.
+    for e in &c.engines {
+        assert_eq!(e.chain().next_height(), 3, "three blocks finalized");
+    }
     // Final balances: ALICE 1000-300+20=720, BOB 300-120=180, CAROL 120-20=100.
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     for e in &c.engines {
         assert_eq!(e.chain().state().balance(&ALICE), 720);
         assert_eq!(e.chain().state().balance(&BOB), 180);
         assert_eq!(e.chain().state().balance(&CAROL), 100);
-        assert_eq!(e.chain().next_height(), 3, "three blocks finalized");
     }
 }
 
@@ -1404,6 +1449,7 @@ fn liveness_holds_with_f_equals_2_crashed_validators() {
     }
     assert_eq!(c.honest_count_at(0), 5, "all 5 honest validators finalize despite f=2 crashes");
     assert_eq!(c.hashes_at(0).len(), 1, "the 5 honest validators agree on one block");
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     for i in 0..5 {
         assert_eq!(c.engines[i].chain().state().balance(&BOB), 42);
     }
@@ -1765,6 +1811,7 @@ fn a_forged_reveal_cannot_censor_a_finalized_transaction() {
     c.tick();
     // Not censored: every replica finalized and executed the transfer, and all agree on the state root.
     assert_eq!(c.hashes_at(0).len(), 1, "agreement at height 0");
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     let root = c.engines[0].chain().state_root();
     for e in &c.engines {
         assert_eq!(e.chain().state().balance(&BOB), 100, "a forged reveal must not censor the transfer");
@@ -1791,6 +1838,7 @@ fn a_byzantine_committee_members_garbage_share_does_not_block_decryption() {
     c.submit_all(&tx);
     c.tick();
     // The honest {member 1, member 2} subset decrypts it on every replica.
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     let root = c.engines[0].chain().state_root();
     for e in &c.engines {
         assert_eq!(e.chain().state().balance(&BOB), 77, "the t-subset open must route around the bad share");
@@ -1850,6 +1898,12 @@ fn a_validator_finalizes_when_the_body_arrives_after_the_commit_certificate() {
     c.run();
     assert!(c.committed[deaf].iter().any(|&(h, _)| h == 0), "the body's arrival unblocks finalization");
     assert_eq!(c.hashes_at(0).len(), 1, "it finalized the same block — no fork");
+    // The fixture says "deaf to the height-0 proposal" and was implemented as deaf to EVERY proposal, which
+    // did not matter while execution read gossip: the reveals still arrived. It matters now — the openings
+    // reach this validator inside block 1, so a validator that can never receive a block can never execute
+    // (#137). Lifting the deafness at the point the fixture always meant it to end.
+    c.deaf_propose.remove(&deaf);
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     assert_eq!(c.engines[deaf].chain().state().balance(&BOB), 5, "and it executes the transfer");
 }
 
@@ -1864,16 +1918,24 @@ fn honest_validators_certify_the_executed_state() {
     c.submit_all(&tx);
     c.tick();
     // Sanity: it executed.
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     assert_eq!(c.engines[0].chain().state().balance(&BOB), 100);
     let root = c.engines[0].chain().state_root();
     // Every honest validator holds a checkpoint certifying height 0 at the agreed root.
+    let executed = c.engines[0].latest_checkpoint().expect("an execution checkpoint formed").height;
     for e in &c.engines {
         let cp = e.latest_checkpoint().expect("an execution checkpoint formed");
-        assert_eq!(cp.height, 0, "checkpoint is at the executed height");
+        // The literal `0` this used to assert became wrong when execution gained its one-block lag (#137):
+        // the settle height executes too, so the LATEST checkpoint is no longer the first block's. What the
+        // test is about survives unchanged — every honest validator certifies the SAME executed height at
+        // the SAME root — so it is stated that way instead of against a number the harness now moves.
+        assert_eq!(cp.height, executed, "every validator's checkpoint is at the same executed height");
         assert_eq!(cp.state_root, root, "checkpoint certifies the agreed executed state root");
         assert!(cp.verify(CellParams::FANO.quorum(), &verifiers), "it is a valid Q-quorum certificate");
         // A divergent validator (a wrong root at the same height) would be detectable + attributable.
-        let bad = fanos_taxis::ExecVote::sign(0, [0xEE; 32], [0xAA; 32], 6, &gen_keys()[6].sig);
+        // At `cp.height`, not the literal 0: a conflicting vote for a DIFFERENT height is not a conflict,
+        // so pinning the height here would have quietly turned the assertion below into a tautology.
+        let bad = fanos_taxis::ExecVote::sign(cp.height, [0xEE; 32], [0xAA; 32], 6, &gen_keys()[6].sig);
         assert_eq!(cp.conflicting(&bad, &verifiers), Some(6), "a wrong-root execution is flagged, not silent");
     }
 }
@@ -2176,6 +2238,10 @@ fn a_partitioned_minority_rejoins_without_forking_the_contested_height() {
     for i in 0..N {
         eprintln!("DIAG me={i} h={} await={:?} rej={:?}", c.engines[i].chain().next_height(), c.engines[i].awaited_body().is_some(), c.engines[i].rejects());
     }
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
+    // Both read AFTER settling: the comparison below is validators against each other, so the reference has
+    // to be taken at the same moment as the values it is compared with. Taken before, it is the height the
+    // cell had one block ago and every engine legitimately disagrees with it.
     let head = c.engines[0].chain().next_height();
     let root = c.engines[0].chain().state_root();
     assert!(head > 1, "the cell made real progress past the contested height (reached {head})");
@@ -2473,7 +2539,13 @@ fn a_cell_whose_timers_never_agree_still_finalizes_a_run_of_heights() {
     c.with_da_delay(4);
     let mut submitted = 0u64;
     let mut widest = 0u32;
-    for step in 0..30usize {
+    // Sixty steps, not thirty, and the reason is measured rather than fitted. Execution lags finality by a
+    // block (#137), so a step yields roughly half the consensus progress it used to and the drift needs
+    // longer to build. Instrumented over 90 steps: the first round jump lands at step ~33 (it was inside
+    // thirty before), the second at ~50, the fourth by ~81. Sixty is past the second with margin — chosen
+    // for the margin, not for being the first value that passes, since a bound fitted to the exact first
+    // occurrence would go vacuous again on any scheduling change.
+    for step in 0..60usize {
         // One transaction per height keeps the nonces consecutive, so a rejected transfer can never be what a stalled
         // height is blamed on.
         if c.engines[0].chain().next_height() >= submitted {
@@ -2763,11 +2835,25 @@ fn a_validator_that_misses_one_height_rejoins_with_no_further_transactions() {
     }
 
     let cell = c.engines[0].chain().next_height();
+    let probe = c.engines[LAG].probe();
     assert_eq!(
         c.engines[LAG].chain().next_height(),
         cell,
-        "the laggard rejoined without anyone submitting more work"
+        "the laggard rejoined without anyone submitting more work\n  laggard: {probe}"
     );
+
+    // NON-VACUITY: it rejoined by WALKING past the server's executed frontier, not by orbiting it (#142).
+    // A checkpoint sits at the executed height, which trails the head, so a snapshot alone lands the
+    // requester where the frontier is and the frontier moves as fast as the head — measured before the
+    // certificate batch existed: 1 → 15 while the cell went 2 → 18, a ~3-height deficit held for ever.
+    // Without this assertion the equality above passes again the moment the batch is dropped and execution
+    // happens to keep pace, which is exactly the coincidence that hid the defect.
+    assert!(
+        probe.synced_certs > 0,
+        "the laggard must have parked COMMIT certificates from a sync batch — reaching the cell's height \
+         without any means the walk-forward path was not what closed the gap.\n  laggard: {probe}"
+    );
+    c.settle(); // execution lags finality by one block — the openings are COMMITTED (#137).
     assert_eq!(c.engines[LAG].chain().state().balance(&ALICE), 850, "it holds the state it never executed");
     assert_eq!(c.engines[LAG].chain().state().balance(&BOB), 150);
     let root = c.engines[0].chain().state_root();
@@ -2804,7 +2890,12 @@ fn a_burst_from_one_account_executes_every_transaction() {
     for tx in &txs {
         c.submit_all(tx);
     }
-    for _ in 0..12 {
+    // Twelve heights sufficed when execution was immediate. Each nonce in the chain is deferred until its
+    // predecessor has EXECUTED, and execution now waits a block for its openings to be committed (#137), so
+    // the chain advances at roughly half the rate. Doubled rather than nudged to the first passing value:
+    // the property is "every transfer eventually executes", and a bound fitted to the exact observed count
+    // would fail on any scheduling change.
+    for _ in 0..24 {
         c.tick();
         c.timeout();
     }

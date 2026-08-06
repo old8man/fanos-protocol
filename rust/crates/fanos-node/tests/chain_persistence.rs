@@ -102,7 +102,7 @@ fn a_validator_that_kept_its_certified_state_comes_back_on_it() {
     // The restart: a fresh engine on the same dealt config, seeded from the persisted pair.
     let mut restarted = engine(&configs[0]);
     assert_eq!(restarted.height(), 0, "a fresh validator starts at genesis");
-    restarted.step(Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() });
+    restarted.step(Input::SyncResp { cert: cert.clone(), above: above.clone(), snapshot: snapshot.clone() });
     // `height()` is the height being *decided*, so a validator that has executed `CERTIFIED` is deciding the
     // one after it. Asserted as the exact value rather than "greater than zero": the difference between
     // resuming at the certified point and resuming somewhere plausible is the whole property.
@@ -162,7 +162,7 @@ fn a_chain_state_that_is_not_certified_is_refused() {
     // A snapshot swapped for one the certificate does not describe: the certificate itself still verifies,
     // so this is caught only by re-deriving the root from the restored state.
     let mut victim = engine(&configs[0]);
-    victim.step(Input::SyncResp { cert: good.clone(), snapshot: b"not a state".to_vec() });
+    victim.step(Input::SyncResp { cert: good.clone(), above: Vec::new(), snapshot: b"not a state".to_vec() });
     assert_eq!(victim.height(), 0, "a snapshot that does not restore to the certified root must be refused");
 
     // The good pair still works, so the loop above is refusing bad certificates rather than everything.
@@ -198,7 +198,7 @@ fn the_persisted_pair_is_the_pair_that_comes_back() {
 
     // And the pair off the disk is adopted, which is the only thing that makes the round trip matter.
     let mut restarted = engine(&configs[0]);
-    restarted.step(Input::SyncResp { cert: back_cert, snapshot: back_snapshot });
+    restarted.step(Input::SyncResp { cert: back_cert, above: Vec::new(), snapshot: back_snapshot });
     assert_eq!(restarted.height(), 13, "the pair read back from disk resumes the chain");
 
     // Truncation is refused rather than half-decoded: a file cut short is not a shorter certificate.

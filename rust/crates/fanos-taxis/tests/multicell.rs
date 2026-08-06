@@ -191,6 +191,37 @@ impl<S: StateMachine + Clone> Cell<S> {
             guard += 1;
             assert!(guard < 100_000, "the cell did not quiesce");
         }
+        // One further height, with nothing submitted: the anti-MEV openings for the block just finalized are
+        // **committed**, not gossiped (#137), so the earliest block that can carry them is the next one and
+        // the transaction above has not executed yet. Folded into `run` rather than left to each caller —
+        // every caller asserts on executed state immediately afterwards, so the wait is a property of "run a
+        // transaction to completion", which is what this helper claims to do.
+        for i in 0..N {
+            let outs = self.engines[i].step(Input::Tick);
+            self.absorb(outs);
+        }
+        let mut guard = 0;
+        while let Some(msg) = self.bus.pop_front() {
+            for i in 0..N {
+                let input = match &msg {
+                    ConsensusMsg::Propose(b) => {
+                        Input::Propose { block: b.clone(), shards: Box::new(b.da_shards().map(Some)) }
+                    }
+                    ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
+                    ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
+                    ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+                    ConsensusMsg::SyncReq { .. }
+                    | ConsensusMsg::SyncResp { .. }
+                    | ConsensusMsg::CommitCert(_)
+                    | ConsensusMsg::NeedBody { .. }
+                    | ConsensusMsg::Body(_) => continue,
+                };
+                let outs = self.engines[i].step(input);
+                self.absorb(outs);
+            }
+            guard += 1;
+            assert!(guard < 100_000, "the cell did not quiesce settling the carrier block");
+        }
     }
 
     fn absorb(&mut self, outs: Vec<Output>) {

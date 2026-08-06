@@ -81,6 +81,7 @@ const HEADER_LABEL: &str = "FANOS-v1/taxis-block-header";
 const TX_ROOT_LABEL: &str = "FANOS-v1/taxis-tx-root";
 const DA_COMMIT_LABEL: &str = "FANOS-v1/taxis-da-commit";
 const LAST_COMMIT_LABEL: &str = "FANOS-v1/taxis-last-commit";
+const REVEAL_ROOT_LABEL: &str = "FANOS-v1/taxis-reveal-root";
 
 /// The **secret-leader sortition witness** a round-0 proposer attaches to its block: its post-quantum
 /// Merkle-VRF `output` at index `height`, plus the `proof` binding that output to the proposer's
@@ -150,6 +151,19 @@ pub struct BlockHeader {
     /// parent's finalizers) as part of block identity, so every validator credits the identical, agreed set
     /// (`crate::incentive`).
     pub last_commit_root: [u8; 32],
+    /// A binding commitment to this block's [`reveals`](Block::reveals) — the anti-MEV share openings for
+    /// **earlier** blocks that this one carries (`H(reveals)`, or all-zero when it carries none).
+    ///
+    /// Here for exactly the reason `last_commit_root` is (#137). Execution used to read its openings from a
+    /// locally gossiped map, so *which transactions a block executes* depended on what each validator had
+    /// happened to receive by the time the reveal window elapsed — two honest validators could commit the
+    /// same block and produce different state roots, and the defence on record was that the executed-state
+    /// checkpoint would *detect* it. An adversarial keyper does not need luck to cause it: revealing to half
+    /// the cell, timed across the window boundary, forks executed state on demand.
+    ///
+    /// Committing the openings makes them what the finalizer set already is — an agreed input to a
+    /// deterministic state transition.
+    pub reveal_root: [u8; 32],
 }
 
 impl BlockHeader {
@@ -161,6 +175,52 @@ impl BlockHeader {
     }
 }
 
+/// One committed anti-MEV opening: sealing-committee member `member` releases its Shamir share for the
+/// transaction committed as `commit`, carried **inside a block** rather than gossiped.
+///
+/// **Unsigned, deliberately.** A gossiped [`RevealMsg`](crate::consensus::RevealMsg) carries a hybrid-PQ
+/// signature because a receiver has no other way to know a stranger did not mint it. Inside a block that a
+/// quorum has committed there are two stronger authenticators already: the block itself is agreed, and
+/// `open_from_subset` reconstructs the key and checks the **Poly1305 tag** — so a share that is not the real
+/// one cannot open the transaction, whoever it is attributed to. A proposer stuffing garbage can therefore
+/// waste block space and nothing else, while a per-reveal PQ signature would cost kilobytes per transaction
+/// and buy no property the AEAD tag does not already give.
+///
+/// `member` is kept for de-duplication and attribution only; correctness never rests on it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommittedReveal {
+    /// The transaction commitment this opening belongs to.
+    pub commit: [u8; 32],
+    /// The revealing committee member's index (attribution and de-duplication only).
+    pub member: u8,
+    /// The member's Shamir share bytes (`x ‖ y`).
+    pub share: Vec<u8>,
+}
+
+impl CommittedReveal {
+    /// Canonical bytes: `commit(32) ‖ member(1) ‖ var_bytes(share)`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33 + self.share.len() + 2);
+        out.extend_from_slice(&self.commit);
+        out.push(self.member);
+        fanos_primitives::codec::put_var_bytes(&mut out, &self.share);
+        out
+    }
+
+    /// The fewest bytes one reveal can occupy on the wire — `commit(32) ‖ member(1) ‖ len(4)` with an empty
+    /// share. Bounds `Reader::seq`'s pre-allocation against a forged count.
+    const MIN_WIRE: usize = 32 + 1 + 4;
+
+    /// Decode from a reader positioned at [`to_bytes`](Self::to_bytes).
+    fn read(r: &mut fanos_primitives::codec::Reader<'_>) -> Option<Self> {
+        let commit = r.array::<32>()?;
+        let member = r.u8()?;
+        let share = r.var_bytes()?.to_vec();
+        Some(Self { commit, member, share })
+    }
+}
+
 /// A full block: the voted-on [`BlockHeader`] plus the ordered sealed-transaction payload it commits to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
@@ -168,6 +228,11 @@ pub struct Block {
     pub header: BlockHeader,
     /// The ordered anti-MEV sealed transactions (the DA-sampled payload).
     pub sealed_txs: Vec<SealedTx>,
+    /// The anti-MEV openings this block **commits** for transactions in earlier blocks — the agreed input
+    /// execution reads, in place of each validator's own gossip pool (#137). Committed by the header's
+    /// `reveal_root`, so like `last_commit` and unlike `witness`/`pol` it **is** part of the block hash: a
+    /// proposer cannot advertise one opening set and ship another.
+    pub reveals: Vec<CommittedReveal>,
     /// The secret-leader sortition witness (SSLE, §10.1), present on a round-0 proposal and absent on a
     /// public-fallback (round ≥ 1) block. It rides **outside** the hashed header — an auxiliary leadership
     /// proof, so the block identity ([`hash`](Self::hash)) is independent of it (see [`LeaderWitness`]).
@@ -207,9 +272,17 @@ impl Block {
     ) -> Self {
         let tx_root = tx_root(&commits_of(&sealed_txs));
         let da_commit = commit_shards(&erasure::encode(&encode_payload(&sealed_txs)));
-        let header =
-            BlockHeader { parent, height, epoch, proposer, tx_root, da_commit, last_commit_root: commit_last(None) };
-        Self { header, sealed_txs, witness: None, last_commit: None, pol: None }
+        let header = BlockHeader {
+            parent,
+            height,
+            epoch,
+            proposer,
+            tx_root,
+            da_commit,
+            last_commit_root: commit_last(None),
+            reveal_root: commit_reveals(&[]),
+        };
+        Self { header, sealed_txs, reveals: Vec::new(), witness: None, last_commit: None, pol: None }
     }
 
     /// Attach the parent block's commit certificate as this block's `last_commit`, updating the header's
@@ -257,6 +330,10 @@ impl Block {
         Self {
             header: self.header.clone(),
             sealed_txs: Vec::new(),
+            // Carried, not dropped: `reveals` is committed by the header, so a skeleton without them could
+            // not answer `verify_structure` for the field the header pins — the same reason `last_commit`
+            // rides along. They are also small next to the payload a skeleton omits.
+            reveals: self.reveals.clone(),
             witness: self.witness.clone(),
             pol: self.pol.clone(),
             last_commit: self.last_commit.clone(),
@@ -289,6 +366,13 @@ impl Block {
         // Length-prefixed proof-of-lock (empty ⇒ None), last so the earlier sections decode unchanged.
         let pol_bytes = self.pol.as_ref().map(|c| c.to_bytes()).unwrap_or_default();
         fanos_primitives::codec::put_var_bytes(&mut out, &pol_bytes);
+        // The committed anti-MEV openings (#137): a count-prefixed sequence, last so the earlier sections
+        // decode unchanged. Unlike the witness and the pol this rides *inside* the block identity via the
+        // header's `reveal_root` — the whole point is that no proposer can vary it after the vote.
+        fanos_primitives::codec::put_u32(&mut out, self.reveals.len() as u32);
+        for reveal in &self.reveals {
+            out.extend_from_slice(&reveal.to_bytes());
+        }
         out
     }
 
@@ -315,8 +399,9 @@ impl Block {
         let pol_bytes = r.var_bytes()?;
         let pol =
             if pol_bytes.is_empty() { None } else { Some(Box::new(Certificate::from_bytes(pol_bytes)?)) };
+        let reveals = r.seq(CommittedReveal::MIN_WIRE, CommittedReveal::read)?;
         r.finish()?;
-        Some(Self { header, sealed_txs, witness, last_commit, pol })
+        Some(Self { header, sealed_txs, reveals, witness, last_commit, pol })
     }
 
     /// The ordered transaction commitments — what the proposer ordered by (blind to contents).
@@ -382,7 +467,7 @@ impl Block {
         // check out: nothing downstream will complain about it, because an over-ceiling frame is dropped
         // *silently* by the receiver (see `fanos_wire::MAX_FRAME`). Verified structure has to mean
         // deliverable structure, or the mempool cannot drain — the block carrying it never arrives (#46).
-        tx_root_ok && da_ok && self.fits_frame() && self.last_commit_matches()
+        tx_root_ok && da_ok && self.fits_frame() && self.last_commit_matches() && self.reveals_match()
     }
 
     /// The recorded `last_commit` matches the header's commitment to it.
@@ -396,6 +481,34 @@ impl Block {
     #[must_use]
     pub fn last_commit_matches(&self) -> bool {
         self.header.last_commit_root == commit_last(self.last_commit.as_ref())
+    }
+
+    /// The carried [`reveals`](Self::reveals) match the header's commitment to them.
+    ///
+    /// The structural half of #137: committing the openings buys nothing unless a receiver checks that the
+    /// block it votes on carries the openings its header names. Their *validity* is not checked here and
+    /// deliberately not anywhere — a share that is not the real one simply fails the AEAD tag during
+    /// `open_from_subset`, so there is no separate verdict to reach (see [`CommittedReveal`]).
+    ///
+    /// Answerable from a skeleton, like [`last_commit_matches`](Self::last_commit_matches), because the
+    /// reveals ride with it.
+    #[must_use]
+    pub fn reveals_match(&self) -> bool {
+        self.header.reveal_root == commit_reveals(&self.reveals)
+    }
+
+    /// Attach the anti-MEV openings this block commits for earlier blocks, updating the header's
+    /// `reveal_root` (and thus the block [`hash`](Self::hash)).
+    ///
+    /// Chained by the proposer after [`assemble`](Self::assemble) and before
+    /// [`with_last_commit`](Self::with_last_commit) — order is irrelevant to the result (each sets its own
+    /// header field), but both must precede [`with_witness`](Self::with_witness), which does not alter the
+    /// hash and would otherwise be attached to a different block.
+    #[must_use]
+    pub fn with_reveals(mut self, reveals: Vec<CommittedReveal>) -> Self {
+        self.header.reveal_root = commit_reveals(&reveals);
+        self.reveals = reveals;
+        self
     }
 
     /// Reconstruct a block's payload from a **subset** of its shards (an erased point is `None`) and verify
@@ -458,8 +571,19 @@ pub fn pack_to_budget(sealed: Vec<SealedTx>, budget: usize) -> Vec<SealedTx> {
 /// already overshot. Building an empty block with the same certificate gives the same overhead for one
 /// cheap encode.
 #[must_use]
-pub fn budget_for(parent: [u8; 32], height: u64, epoch: Epoch, proposer: u8, last_commit: Option<&Certificate>) -> usize {
-    let mut skeleton = Block::assemble(parent, height, epoch, proposer, Vec::new());
+pub fn budget_for(
+    parent: [u8; 32],
+    height: u64,
+    epoch: Epoch,
+    proposer: u8,
+    last_commit: Option<&Certificate>,
+    reveals: &[CommittedReveal],
+) -> usize {
+    // The reveals are passed in rather than allowed for by a constant, and that is the same choice the
+    // `last_commit` note below argues for: their size is the *actual* set this proposer is about to commit,
+    // which `payload_budget` then measures through `to_bytes` like everything else. A fixed allowance would
+    // have to cover the worst case — a full window's openings — and would spend that on every block.
+    let mut skeleton = Block::assemble(parent, height, epoch, proposer, Vec::new()).with_reveals(reveals.to_vec());
     if let Some(cert) = last_commit {
         // Attached as the proof-of-lock TOO, which is not a trick but the worst case measured honestly:
         // `to_bytes` emits `last_commit`, `witness` and `pol`, and a `pol` is a `Certificate` — the same
@@ -512,6 +636,24 @@ fn commit_last(last_commit: Option<&Certificate>) -> [u8; 32] {
         Some(cert) => hash_labeled(LAST_COMMIT_LABEL, &cert.to_bytes()),
         None => [0u8; 32],
     }
+}
+
+/// A binding commitment to the **ordered** committed openings, or all-zero for none — the same
+/// absent-is-zero convention [`commit_last`] uses, so a block that carries no reveals is byte-identical in
+/// identity to one from before this field existed.
+///
+/// Order is part of the commitment because it is part of the encoding; execution treats the set as a set
+/// (first opening per `(commit, member)` wins), so a proposer reordering them changes the block hash and
+/// nothing else.
+fn commit_reveals(reveals: &[CommittedReveal]) -> [u8; 32] {
+    if reveals.is_empty() {
+        return [0u8; 32];
+    }
+    let mut buf = Vec::new();
+    for reveal in reveals {
+        buf.extend_from_slice(&reveal.to_bytes());
+    }
+    hash_labeled(REVEAL_ROOT_LABEL, &buf)
 }
 
 /// A binding commitment to all `N = 7` payload shards: `H(len₀ ‖ shard₀ ‖ len₁ ‖ shard₁ ‖ …)`. A validator

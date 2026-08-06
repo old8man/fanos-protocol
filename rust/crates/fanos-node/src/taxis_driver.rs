@@ -497,7 +497,10 @@ where
                 Some((cert, snapshot)) => {
                     let height = cert.height;
                     let before = engine.height();
-                    for _ in engine.step(Input::SyncResp { cert, snapshot }) {}
+                    // No certificate batch from a FILE: the persisted artefact is the checkpoint and its
+                    // snapshot, and the heights above it were never written. A restarted node therefore
+                    // resumes at the checkpoint and walks forward like any laggard (#142).
+                    for _ in engine.step(Input::SyncResp { cert, above: Vec::new(), snapshot }) {}
                     if engine.height() > before {
                         persisted_height = height;
                         eprintln!(
@@ -774,8 +777,8 @@ fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg
         // block answering a decision this validator already holds, and the engine checks it against that decision.
         ConsensusMsg::NeedBody { block } => Input::NeedBody { from, block: *block },
         ConsensusMsg::Body(b) => Input::Body(b.clone()),
-        ConsensusMsg::SyncResp { cert, snapshot } => {
-            Input::SyncResp { cert: cert.clone(), snapshot: snapshot.clone() }
+        ConsensusMsg::SyncResp { cert, above, snapshot } => {
+            Input::SyncResp { cert: cert.clone(), above: above.clone(), snapshot: snapshot.clone() }
         }
     };
     engine.step(input)

@@ -31,7 +31,7 @@ use fanos_primitives::{BeaconSeed, Epoch, codec};
 
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 
-use crate::block::{Block, LeaderWitness};
+use crate::block::{Block, CommittedReveal, LeaderWitness};
 use crate::state::ExecOutcome;
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
@@ -57,16 +57,25 @@ const MAX_REVEAL_SUBSETS: usize = 4096;
 /// finalizes (well within the reveal window), so eviction almost never touches one.
 pub const MAX_PENDING_REVEAL_COMMITS: usize = 4096;
 
-/// The **reveal window** (in finalized heights): how long a finalized block's execution waits for the anti-MEV
-/// reveals before dropping any still-undecryptable transaction. This is the **deterministic clock** that makes
-/// execution converge without coupling ordering to reveal timing: a transaction still short of `t` valid
-/// openings once consensus has finalized `REVEAL_WINDOW` heights past its block is dropped — a decision keyed to
-/// the *finalized height* (identical on every validator), not to local gossip arrival. Under the keyper-line
-/// liveness assumption (≥ `t` honest members reveal, and reveals are broadcast on finalization) every
-/// well-formed transaction is decrypted well within the window, so only genuinely undecryptable ones (a seal to
-/// non-committee keys, or a withholding keyper majority) are dropped; the execution checkpoint
-/// ([`crate::checkpoint`]) catches any residual divergence. A liveness parameter (like the round timeout),
-/// network-agreed, not a security threshold.
+/// The **reveal window** (in finalized heights): how many blocks a finalized block's execution will wait for
+/// the anti-MEV openings to be **committed** before dropping any transaction still undecryptable.
+///
+/// It bounds the search in [`ConsensusEngine::execution_height`]: block `H` executes at the first height in
+/// `(H, H+REVEAL_WINDOW]` whose committed openings decrypt every transaction in `H`, and at `H+REVEAL_WINDOW`
+/// unconditionally otherwise, dropping whatever still does not open. A liveness parameter, like the round
+/// timeout — network-agreed, not a security threshold.
+///
+/// **Execution therefore lags finality by at least one block, and that is inherent** (#137). The openings for
+/// `H` do not exist until `H` is final — that is what anti-MEV sealing means — so the earliest block that can
+/// carry them is `H+1`. Reading them from local gossip instead is what let two honest validators execute
+/// different transaction sets from the same committed block; the lag is the price of the input being agreed,
+/// and in the ordinary case it is exactly one height, since the committee reveals on finality and the next
+/// proposer already holds the openings.
+///
+/// This doc used to claim the drop decision was "keyed to the finalized height (identical on every validator),
+/// not to local gossip arrival". The *height* was; the *share set compared against it* was not, so the
+/// conjunction it described — enough shares by that height — was local after all. A window is only a
+/// deterministic clock if what it is timing is deterministic too.
 pub const REVEAL_WINDOW: u64 = 4;
 
 /// The DA shards a validator sampled for a proposal: `shards[p]` is point `p`'s payload shard, or `None` if it
@@ -129,6 +138,16 @@ pub struct ConsensusProbe {
     pub sync_answers: (u64, u64, u64),
     /// Certified-state snapshots adopted.
     pub sync_taken: u64,
+    /// COMMIT certificates for heights above the checkpoint, parked from a `SyncResp` batch (#142) — the
+    /// measure of whether catch-up can walk past the server's executed frontier or only orbit it.
+    pub synced_certs: u64,
+    /// Anti-MEV openings this validator recorded from **gossip**, and from **committed blocks** (#137).
+    ///
+    /// Reported as a pair because either alone answers the wrong question. Execution reads only the second,
+    /// so a test that silences gossip has to be able to show both that the silencing took effect (the first
+    /// is zero) and that execution still had its input (the second is not) — a single counter would let a
+    /// harness bug that quietly delivered the reveals anyway pass as a proof that it did not need them.
+    pub reveals_taken: (u64, u64),
     /// Commit certificates **offered by a peer** (`ConsensusMsg::CommitCert`) that finalized a height — the
     /// catch-up path only, never `adopt_certified_parent`'s read of a newer block's `last_commit`.
     pub cert_taken: u64,
@@ -209,7 +228,11 @@ impl core::fmt::Display for ConsensusProbe {
         }
         let (snap, cert, none) = self.sync_answers;
         if self.sync_asks > 0 || snap + cert + none > 0 {
-            write!(f, " sync={}a/{}s/{}c ans={snap}/{cert}/{none}", self.sync_asks, self.sync_taken, self.cert_taken)?;
+            write!(
+                f,
+                " sync={}a/{}s/{}c/{}b ans={snap}/{cert}/{none}",
+                self.sync_asks, self.sync_taken, self.cert_taken, self.synced_certs
+            )?;
         }
         let (bs, bn, br) = self.body_answers;
         if self.body_asks + bs + bn + br + self.body_taken > 0 {
@@ -510,6 +533,20 @@ pub enum ConsensusMsg {
         /// installed it (T-H6). Deleting the field is the fix — a comparison against `cert.head` would have worked too,
         /// and would have been one refactor away from being dropped again.
         cert: ExecCertificate,
+        /// The COMMIT certificates for every finalized height **above** `cert.height` that the server still
+        /// retains, ascending.
+        ///
+        /// Without them a catch-up cannot converge (#142). A checkpoint sits at the server's *executed*
+        /// height, which trails its finalized head, so a snapshot alone lands the requester at the executed
+        /// frontier — and that frontier moves at the same rate as the head, so the requester keeps pace with
+        /// the gap instead of closing it. Measured before this field existed: a validator one height behind
+        /// went 1 → 15 while the cell went 2 → 18, holding a ~3-height deficit for ever and advancing only by
+        /// adopting further snapshots (11 asks / 6 taken / 0 certificates).
+        ///
+        /// A certificate is a `Q`-quorum over `(height, block_hash)` and self-authenticating against the
+        /// fixed committee, so batching them grants the requester nothing it could not have gathered from the
+        /// votes it missed. Bounded by the execution lag, i.e. at most `REVEAL_WINDOW + 1` of them.
+        above: Vec<Certificate>,
         /// The full state at `cert.height`, per [`StateMachine::snapshot`].
         snapshot: Vec<u8>,
     },
@@ -564,10 +601,14 @@ impl ConsensusMsg {
                 codec::put_u64(&mut out, *have_height);
                 out.extend_from_slice(have_root);
             }
-            Self::SyncResp { cert, snapshot } => {
+            Self::SyncResp { cert, above, snapshot } => {
                 out.push(5);
                 // Length-prefix the variable-width certificate; the snapshot runs to the end.
                 codec::put_var_bytes(&mut out, &cert.to_bytes());
+                codec::put_u32(&mut out, above.len() as u32);
+                for c in above {
+                    codec::put_var_bytes(&mut out, &c.to_bytes());
+                }
                 out.extend_from_slice(snapshot);
             }
             Self::CommitCert(cert) => {
@@ -605,8 +646,12 @@ impl ConsensusMsg {
             5 => {
                 let mut r = codec::Reader::new(body);
                 let cert = ExecCertificate::from_bytes(r.var_bytes()?)?;
+                // A `u32` count then that many length-prefixed certificates. Bounded by the bytes present:
+                // `seq` refuses a count larger than `remaining / min_elem`, so a forged length cannot make
+                // the receiver pre-allocate.
+                let above = r.seq(4, |r| Certificate::from_bytes(r.var_bytes()?))?;
                 let snapshot = r.rest().to_vec();
-                Some(Self::SyncResp { cert, snapshot })
+                Some(Self::SyncResp { cert, above, snapshot })
             }
             6 => Some(Self::CommitCert(Certificate::from_bytes(body)?)),
             7 => {
@@ -687,6 +732,9 @@ pub enum Input {
     SyncResp {
         /// The offered certificate — which carries the attested chain tip, so there is no separate head to trust.
         cert: ExecCertificate,
+        /// The COMMIT certificates for finalized heights above `cert.height`, ascending — what lets the
+        /// requester walk past the server's executed frontier instead of orbiting it (#142).
+        above: Vec<Certificate>,
         /// The serialized state at `cert.height`.
         snapshot: Vec<u8>,
     },
@@ -907,6 +955,10 @@ pub struct ConsensusEngine<S: StateMachine> {
     sync_answers: (u64, u64, u64),
     sync_taken: u64,
     cert_taken: u64,
+    // COMMIT certificates parked from a `SyncResp` batch — see `ConsensusProbe::synced_certs`.
+    synced_certs: u64,
+    // Openings recorded from gossip / absorbed from committed blocks — see `ConsensusProbe::reveals_taken`.
+    reveals_taken: (u64, u64),
     // Why an offered commit certificate did NOT advance us: `(wrong height or phase, failed verification, parked for
     // want of the body)`. The trace that forced this: two validators answered ~4250 catch-up requests each with a
     // certificate, five laggards each adopted exactly ONE, and `parked` was empty on all of them — so the certificates
@@ -958,8 +1010,13 @@ pub struct ConsensusEngine<S: StateMachine> {
     /// convergence needs a round in which the locked minority's re-offer happens to arrive first. Measured live
     /// at 1 failure in 8 runs with the re-offer alone.
     valid_value: Option<([u8; 32], Certificate)>,
-    /// The height at which each still-premature transaction was **first** deferred, so retention is bounded by
+    /// How many times each still-premature transaction has been retried, so retention is bounded by
     /// [`REVEAL_WINDOW`] rather than being unbounded: a far-future nonce cannot be re-queued forever.
+    ///
+    /// A **count**, not the height of the first deferral, and the difference is not cosmetic — see
+    /// [`ConsensusEngine::note_deferrals`]. Counting heights was equivalent only while a block executed at
+    /// every height; once execution waits for its openings to be committed (#137) the two rates diverge and
+    /// the retry budget silently halves.
     ///
     /// **A missing record does not fail closed on its own**, and that is what makes the capacity policy load-bearing:
     /// the natural reading of "no record" is "first deferred now", which does not drop the transaction, it *restarts
@@ -973,8 +1030,8 @@ pub struct ConsensusEngine<S: StateMachine> {
     /// `TxCommit` is derived from submitted transactions, so a steady arrival of newly deferred ones is
     /// remote-reachable, and every arrival pushed a predecessor's deadline forward.
     ///
-    /// Note there was nothing better to evict, either: a newcomer's `first` IS the current height and every recorded
-    /// clock is at or before it, so the newcomer is always the youngest and "evict the least-aged" degenerates to
+    /// Note there was nothing better to evict, either: a newcomer has made zero retries and every recorded clock has
+    /// made at least one, so the newcomer is always the youngest and "evict the least-aged" degenerates to
     /// "evict the newcomer". Refusing it outright — and refusing its retry with it — is that same decision without the
     /// map write, and it is the only form in which no clock is ever restarted.
     deferred_since: BoundedMap<TxCommit, u64>,
@@ -990,6 +1047,19 @@ pub struct ConsensusEngine<S: StateMachine> {
     // does not drop the reveals it needs. `exec_queue`: finalized blocks awaiting decryption+execution.
     reveals: BTreeMap<TxCommit, BTreeMap<u8, Share>>,
     pending_reveals: BTreeMap<u8, BoundedMap<TxCommit, RevealMsg>>,
+    // The openings the CHAIN has committed, keyed by the height of the block that carried them (#137).
+    //
+    // This — not `reveals` — is what execution reads. `reveals` is a gossip pool, so the set it holds at any
+    // instant is a local accident of arrival order, and letting it decide which transactions a block executes
+    // made the state root a function of what each validator happened to have received. This map is a
+    // projection of committed blocks, so every validator that has finalized height `h` holds exactly the same
+    // contents for every key `≤ h`.
+    //
+    // Keyed by height rather than flattened per-commit because the execution trigger is an interval: block `H`
+    // executes with the openings committed in `(H, E(H)]`, and a validator that has finalized further must
+    // reach the same answer as one that has just reached `E(H)` — which it can only do if it can restrict the
+    // set to that interval rather than using everything it holds.
+    committed_reveals: BTreeMap<u64, Vec<CommittedReveal>>,
     exec_queue: Vec<Block>,
     // Commit certificates gathered for a height whose block body we have not yet received (an async scheduler
     // may deliver the CC before the proposal). We hold the CC and finalize the moment the body arrives, instead
@@ -1071,6 +1141,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_answers: (0, 0, 0),
             sync_taken: 0,
             cert_taken: 0,
+            synced_certs: 0,
+            reveals_taken: (0, 0),
             cc_rejects: (0, 0, 0),
             round_jumps: (0, 0),
             body_asks: 0,
@@ -1084,6 +1156,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             round0_window: None,
             reveals: BTreeMap::new(),
             pending_reveals: BTreeMap::new(),
+            committed_reveals: BTreeMap::new(),
             exec_queue: Vec::new(),
             pending_finalize: BTreeMap::new(),
             exec_votes: BTreeMap::new(),
@@ -1369,6 +1442,8 @@ impl<S: StateMachine> ConsensusEngine<S> {
             sync_answers: self.sync_answers,
             sync_taken: self.sync_taken,
             cert_taken: self.cert_taken,
+            synced_certs: self.synced_certs,
+            reveals_taken: self.reveals_taken,
             cc_rejects: self.cc_rejects,
             votes_seen: self.votes_seen,
             votes_off_height: self.votes_off_height,
@@ -1415,7 +1490,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             Input::NeedBody { from, block } => self.on_need_body(from, &block),
             Input::Body(block) => self.on_body(block),
             Input::CommitCert(cert) => self.on_commit_cert(cert),
-            Input::SyncResp { cert, snapshot } => self.on_sync_resp(cert, &snapshot),
+            Input::SyncResp { cert, above, snapshot } => self.on_sync_resp(cert, &above, &snapshot),
         }
     }
 
@@ -1646,9 +1721,20 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return self.answer_with_cert(from, have_height);
         };
         let (snapshot, cert) = (snapshot.clone(), cert.clone());
+        // Everything we can still prove above the checkpoint, ascending. Bounded by the retention window, so
+        // this is the execution lag's worth of certificates and not a chain dump. Sent unconditionally rather
+        // than only when the requester is far behind: the requester cannot tell us how much it needs (its
+        // `have_height` is the height it is AT, not the height it can reach), and a certificate it already
+        // holds costs it a rejected duplicate rather than a wrong state.
+        let above: Vec<Certificate> = self
+            .certified
+            .range(cert.height + 1..)
+            .filter(|(_, c)| c.phase == Phase::Commit)
+            .map(|(_, c)| c.clone())
+            .collect();
         self.sync_answers.0 = self.sync_answers.0.saturating_add(1);
         debug_assert_eq!(cert.head, head, "the retained head must be the one the quorum attested");
-        alloc::vec![Output::SendTo { to: from, msg: ConsensusMsg::SyncResp { cert, snapshot } }]
+        alloc::vec![Output::SendTo { to: from, msg: ConsensusMsg::SyncResp { cert, above, snapshot } }]
     }
 
     /// [`offer_commit_cert`](Self::offer_commit_cert), counting whether a certificate actually went back.
@@ -1709,7 +1795,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// Only then install it atomically and reset all per-height working state so we resume at `height + 1`
     /// without re-voting decided heights (which would read as equivocation).
-    fn on_sync_resp(&mut self, cert: ExecCertificate, snapshot: &[u8]) -> Vec<Output> {
+    fn on_sync_resp(&mut self, cert: ExecCertificate, above: &[Certificate], snapshot: &[u8]) -> Vec<Output> {
         // **(1) forward-only, EXCEPT when we know our state is not the cell's.** Monotonicity is the right
         // default and it is also what made divergence unrepairable: the servable certificate is the peer's
         // checkpoint, a checkpoint *lags* execution, so the certified state a diverged validator needs is
@@ -1753,6 +1839,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         self.exec_queue.clear();
         self.reveals.clear();
         self.pending_reveals.clear();
+        self.committed_reveals.clear();
         self.mempool.clear();
         self.sync_states.clear();
         self.sync_heads.clear();
@@ -1772,9 +1859,37 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // We just installed the certified state, so whatever divergence prompted this is repaired. Clearing it
         // here and nowhere else keeps the flag meaning "our state is not the cell's" rather than "we asked".
         self.diverged = None;
+        // **Install the decisions above the checkpoint so the walk forward can actually happen** (#142).
+        //
+        // The snapshot lands us at the server's EXECUTED frontier, which trails its head. Without these the
+        // only way onward is another snapshot, and the frontier advances at the same rate as the head — so a
+        // laggard orbits the gap for ever instead of closing it. Each certificate is a `Q`-quorum over
+        // `(height, block_hash)` verified against the fixed committee, exactly as `adopt_commit_cert`
+        // verifies an offered one; parking them here is the same act that path performs, in bulk.
+        //
+        // Parked rather than applied: `finalize` needs the body, which we do not have. `maybe_request_body`
+        // then fetches them, each from a voter the certificate itself names, and the heights fall in order.
+        let mut parked = 0usize;
+        for c in above {
+            if c.phase != Phase::Commit || c.height < self.height() {
+                continue;
+            }
+            if !c.verify(self.params.quorum(), &self.verifiers) {
+                self.cc_rejects.1 = self.cc_rejects.1.saturating_add(1);
+                continue;
+            }
+            self.pending_finalize.insert(c.height, c.block_hash);
+            self.certified.insert(c.height, c.clone());
+            parked += 1;
+        }
+        self.synced_certs = self.synced_certs.saturating_add(parked as u64);
         self.max_seen_height = self.max_seen_height.max(self.height());
         // Signal the jump so the driver surfaces the new tip exactly like a finalized height.
-        alloc::vec![Output::Committed { height, block_hash: head }]
+        let mut out = alloc::vec![Output::Committed { height, block_hash: head }];
+        // Ask for the first body immediately rather than waiting for the next tick: the whole point of the
+        // batch is that the walk starts now.
+        out.extend(self.maybe_request_body());
+        out
     }
 
     /// Propose a block if this validator is entitled to propose this `(height, round)` and has not yet done so.
@@ -1861,15 +1976,21 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // SILENCE, no validator can reconstruct, nothing commits — and the pool never drains, so the
             // next block is just as oversized. The stall is self-perpetuating and reports nothing.
             // Measured: the shard path fails at ~3.15 MB of payload, the whole-block path at ~1.03 MB.
+            // The openings this block will commit (#137). Computed before packing because they occupy the
+            // same frame: budgeting the payload against a block that does not yet carry them would pack to a
+            // size that no longer fits once they are attached — the self-perpetuating oversize stall of #46,
+            // one field over.
+            let reveals = self.reveals_to_commit(height);
             let budget = crate::block::budget_for(
                 self.chain.head(),
                 height,
                 self.epoch,
                 self.me,
                 self.last_finalized_cert.as_ref(),
+                &reveals,
             );
             let sealed = crate::block::pack_to_budget(sealed, budget);
-            Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed)
+            Block::assemble(self.chain.head(), height, self.epoch, self.me, sealed).with_reveals(reveals)
         };
         // Record the certificate that finalized the parent as this block's `last_commit`, so its execution
         // rewards exactly that (agreed) finalizer set. None before the first finalization (genesis child).
@@ -2628,10 +2749,18 @@ impl<S: StateMachine> ConsensusEngine<S> {
         // (receivers first-writer-wins-dedup them, now cheaply — no re-verify), the principled analogue of
         // block re-proposal on round timeout. It changes no anti-MEV semantics (reveals still post-finality)
         // and no window backstop (a genuinely-undecryptable tx still drops).
+        //
+        // Its purpose narrowed with #137 and it is still needed. Losing the race no longer costs *safety* —
+        // execution reads committed openings, so a validator short of gossip executes the same set as one
+        // that has it all. What it costs is *liveness*: the openings only reach the chain if some PROPOSER
+        // holds them, so the gossip that feeds proposers is now the thing this redundancy protects.
         let awaiting: Vec<Block> = self.exec_queue.clone();
         for prior in &awaiting {
             out.extend(self.emit_reveals(prior));
         }
+        // Take the openings this block commits into the chain-derived pool BEFORE queueing it: a block can
+        // carry reveals for blocks already queued, and `try_execute` below must see them.
+        self.absorb_committed_reveals(&block);
         self.exec_queue.push(block.clone());
         // Validate any reveals that arrived early for this block's transactions, now that we hold the committee.
         out.extend(self.drain_pending_reveals(&block));
@@ -2800,6 +2929,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return false;
         }
         self.reveals.entry(r.commit).or_default().insert(r.member, share);
+        self.reveals_taken.0 += 1;
         true
     }
 
@@ -2835,52 +2965,43 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let t = usize::from(self.params.seal_threshold());
         let mut out = Vec::new();
         while let Some(block) = self.exec_queue.first().cloned() {
-            // The reveal window has elapsed for this block once consensus has finalized REVEAL_WINDOW further
-            // heights — a deterministic, finalized-height-keyed signal that no more reveals will be waited for.
-            let past_window = self.chain.next_height() > block.header.height + REVEAL_WINDOW;
+            // **The execution trigger is a function of the chain, not of this validator's inbox** (#137).
+            //
+            // `E(H)` is the first finalized height in `(H, H+REVEAL_WINDOW]` at which every transaction in
+            // block `H` opens from the reveals *committed* in that interval — or `H+REVEAL_WINDOW` if none
+            // does, at which point whatever still fails to open is dropped. Both the openings and the height
+            // are chain data, so two validators reach the same verdict whatever their gossip looked like and
+            // however far past `E(H)` either has run.
+            //
+            // This replaces reading `self.reveals`, a locally-accumulated gossip pool, which made *which
+            // transactions a block executes* depend on arrival timing. The old code carried a partial-synchrony
+            // argument (reveals are re-gossiped, so honest sets converge inside the window) and offered the
+            // executed-state checkpoint as the backstop — a liveness argument for a safety property, with
+            // detection rather than prevention behind it. A keyper revealing to half the cell across the window
+            // boundary forks executed state deliberately, not by bad luck.
+            let Some(at) = self.execution_height(&block) else {
+                break; // the interval is not yet decided — no later block has been finalized to close it
+            };
+            let committed = self.openings_in(block.header.height, at);
             let mut opened = Vec::new();
             // The sealed transaction each opened one came from, paired **by construction**: an undecryptable
             // transaction is skipped below, so the two vectors are not index-aligned with `block.sealed_txs`
             // and a deferred outcome could not otherwise be matched back to the entry to re-queue.
             let mut opened_from: Vec<SealedTx> = Vec::new();
-            let mut ready = true;
             for tx in &block.sealed_txs {
                 let shares: Vec<Share> =
-                    self.reveals.get(&tx.commit()).map(|m| m.values().cloned().collect()).unwrap_or_default();
-                if shares.len() < t {
-                    if past_window {
-                        continue; // window elapsed ⇒ drop this undecryptable tx and keep executing the block
-                    }
-                    ready = false;
-                    break;
-                }
+                    committed.get(&tx.commit()).map(|m| m.values().cloned().collect()).unwrap_or_default();
                 // Open from a t-subset whose reconstructed key AEAD-authenticates — the Poly1305 tag is the
-                // share-validity oracle. This tolerates a Byzantine committee member that reveals a validly-
-                // signed but off-polynomial share: the subset excluding it still opens.
-                match open_from_subset(tx, &shares, t) {
-                    Some(txn) => {
-                        opened.push(txn);
-                        opened_from.push(tx.clone());
-                    }
-                    None => {
-                        // No t-subset opens yet. A Byzantine share among the ≥ t present can hide a decryptable
-                        // honest subset that needs one more reveal, so — until the window elapses — we do NOT
-                        // give up while any committee member is still outstanding; we wait until every member
-                        // has revealed. Once all `member_count` shares are in and none opens (malformed), OR the
-                        // reveal window has passed, the transaction is dropped (not stalled) — later
-                        // transactions and blocks still execute. Because every validator re-gossips each reveal
-                        // it records ([`regossip`], audit T-H1), the honest share sets converge well within the
-                        // window, so this drop decision agrees across validators under partial synchrony; the
-                        // executed-state checkpoint ([`crate::checkpoint`]) detects any residual async divergence.
-                        if shares.len() < tx.member_count() && !past_window {
-                            ready = false;
-                            break;
-                        }
-                    }
+                // share-validity oracle, and the only validity check a committed opening gets or needs
+                // ([`CommittedReveal`]). It tolerates a Byzantine member's off-polynomial share: the subset
+                // excluding it still opens. A transaction that does not open by `E(H)` is dropped, and
+                // *because the input is committed* every validator drops exactly the same ones.
+                if shares.len() >= t
+                    && let Some(txn) = open_from_subset(tx, &shares, t)
+                {
+                    opened.push(txn);
+                    opened_from.push(tx.clone());
                 }
-            }
-            if !ready {
-                break;
             }
             self.exec_queue.remove(0);
             self.chain.begin_block(block.header.height);
@@ -2913,7 +3034,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // Bounded by the engine's existing give-up horizon rather than a new constant: a transaction still
             // premature `REVEAL_WINDOW` blocks after its first deferral is dropped, the same horizon that
             // already decides when an undecryptable transaction stops being waited for.
-            self.note_deferrals(&opened_from, &outcomes, block.header.height);
+            self.note_deferrals(&opened_from, &outcomes);
             // Attest the executed state at this height — the checkpoint that makes divergence detectable.
             out.push(self.emit_exec_vote(block.header.height, block.header.hash()));
             // Retain a servable snapshot of the just-executed state so a lagging peer can state-sync to it
@@ -2922,6 +3043,104 @@ impl<S: StateMachine> ConsensusEngine<S> {
             self.capture_sync_snapshot(&block);
         }
         out
+    }
+
+    /// `E(H)` — the finalized height at which block `H` executes, or `None` while it is still undecided.
+    ///
+    /// The **whole** determinism argument of #137 rests here, so it is written as a pure function of the
+    /// chain: the openings committed in each height, the block's own transactions, and the finalized head.
+    /// Nothing it reads is local. Concretely, `E(H)` is the least `h ∈ (H, H+REVEAL_WINDOW]` at which every
+    /// transaction in `H` opens from the openings committed in `(H, h]`, and `H + REVEAL_WINDOW` if no such
+    /// `h` exists.
+    ///
+    /// `None` means "not yet decided": this validator has not finalized enough heights to know whether some
+    /// `h` inside the window satisfies the predicate. It is **not** the same as "no reveals yet" — a validator
+    /// far past the window still computes the same `E(H)` as one that has only just reached it, which is
+    /// exactly the property a locally-triggered rule could not have.
+    ///
+    /// Costs at most `REVEAL_WINDOW` open attempts per block, and in the ordinary case exactly one: the
+    /// committee reveals on finality, so the next proposer already holds the openings and `E(H) = H + 1`.
+    fn execution_height(&self, block: &Block) -> Option<u64> {
+        let t = usize::from(self.params.seal_threshold());
+        let h0 = block.header.height;
+        let last = h0.saturating_add(REVEAL_WINDOW);
+        let finalized = self.chain.next_height().saturating_sub(1);
+        let mut h = h0 + 1;
+        while h <= last {
+            if h > finalized {
+                return None; // undecided: a height inside the window is still unfinalized
+            }
+            let committed = self.openings_in(h0, h);
+            let all_open = block.sealed_txs.iter().all(|tx| {
+                let shares: Vec<Share> =
+                    committed.get(&tx.commit()).map(|m| m.values().cloned().collect()).unwrap_or_default();
+                shares.len() >= t && open_from_subset(tx, &shares, t).is_some()
+            });
+            if all_open {
+                return Some(h);
+            }
+            h += 1;
+        }
+        Some(last)
+    }
+
+    /// The openings committed in `(after, through]`, folded per transaction as `member → share`.
+    ///
+    /// First-writer-wins per `(commit, member)` in ascending height order, so a later block re-committing an
+    /// opening cannot displace the one already agreed. Malformed share bytes are skipped rather than rejected:
+    /// a block's structure is checked against `reveal_root`, not against share well-formedness, and a share
+    /// that decodes to nothing simply fails to contribute — the same outcome as one that fails the AEAD tag.
+    fn openings_in(&self, after: u64, through: u64) -> BTreeMap<TxCommit, BTreeMap<u8, Share>> {
+        let mut out: BTreeMap<TxCommit, BTreeMap<u8, Share>> = BTreeMap::new();
+        // An empty interval is a real question with an empty answer — at height 0 there is no earlier block
+        // to have committed anything. `BTreeMap::range` *panics* on an inverted range rather than yielding
+        // nothing, so the emptiness has to be stated here.
+        if after >= through {
+            return out;
+        }
+        for reveals in self.committed_reveals.range(after + 1..=through).map(|(_, v)| v) {
+            for reveal in reveals {
+                let Some(share) = share_from_bytes(&reveal.share) else { continue };
+                out.entry(reveal.commit).or_default().entry(reveal.member).or_insert(share);
+            }
+        }
+        out
+    }
+
+    /// The openings this validator would commit if it proposed at `height`: everything it holds in its gossip
+    /// pool for blocks still awaiting execution, minus what earlier blocks already committed.
+    ///
+    /// The gossip pool keeps its job — collecting openings — and loses only its old one, deciding execution.
+    /// A proposer that holds nothing proposes no reveals and the affected blocks simply wait for a proposer
+    /// that does, up to the window; that is the same liveness the window already bounded.
+    fn reveals_to_commit(&self, height: u64) -> Vec<CommittedReveal> {
+        let floor = height.saturating_sub(REVEAL_WINDOW);
+        let already = self.openings_in(floor.saturating_sub(1), height.saturating_sub(1));
+        let mut out = Vec::new();
+        for block in &self.exec_queue {
+            if block.header.height < floor {
+                continue; // past its window — committing openings for it can no longer change its execution
+            }
+            for tx in &block.sealed_txs {
+                let commit = tx.commit();
+                let Some(mine) = self.reveals.get(&commit) else { continue };
+                for (&member, share) in mine {
+                    if already.get(&commit).is_some_and(|m| m.contains_key(&member)) {
+                        continue;
+                    }
+                    out.push(CommittedReveal { commit, member, share: share_to_bytes(share) });
+                }
+            }
+        }
+        out
+    }
+
+    /// Record a finalized block's committed openings, so [`execution_height`] and [`openings_in`] see them.
+    fn absorb_committed_reveals(&mut self, block: &Block) {
+        if !block.reveals.is_empty() {
+            self.reveals_taken.1 += block.reveals.len() as u64;
+            self.committed_reveals.insert(block.header.height, block.reveals.clone());
+        }
     }
 
     /// Store the just-executed state as a servable state-sync snapshot: dedup the serialized state by its root
@@ -3030,30 +3249,46 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// routinely carries nonce 2 ahead of nonce 1; without re-submission the later one is dropped at finalize (keyed
     /// on inclusion, not outcome) and is never executed and never retryable — measured as four transfers from one
     /// account executing exactly one. Bounded by the engine's existing give-up horizon rather than a new constant: a
-    /// transaction still premature [`REVEAL_WINDOW`] blocks after its first deferral is dropped, the same horizon
-    /// that already decides when an undecryptable transaction stops being waited for.
+    /// transaction still premature after [`REVEAL_WINDOW`] **retries** is dropped, the same budget that already
+    /// decides when an undecryptable transaction stops being waited for.
+    ///
+    /// ## Retries, not heights — and the difference was load-bearing
+    ///
+    /// This clock stored the *block height* of the first deferral and gave up once the current block's height
+    /// had advanced past it by `REVEAL_WINDOW`. That is only the same thing as "four retries" while a block
+    /// executes at every height, and #137 broke that: execution now waits for its openings to be committed, so
+    /// consecutive executions are two heights apart. The horizon in retries silently halved, and a four-deep
+    /// nonce chain lost its last transaction **permanently** — measured, not reasoned: BOB stopped at 300 of
+    /// 400 and was still at 300 at height 120.
+    ///
+    /// A retry counter cannot drift that way because it counts the thing the budget is about. The old form was
+    /// already fragile for the same reason — any block that executed late stretched the gap — and only the
+    /// one-block-per-height coincidence kept it correct.
     ///
     /// A **known** transaction is aged against its stored clock and never re-inserted — re-insertion would be a no-op
     /// on `BoundedMap` anyway, and writing it would suggest the clock could move. A **new** one is admitted only if
     /// there is room for its clock ([`DEFERRAL_CAP`]), because a transaction that cannot be aged must not be retried.
-    fn note_deferrals(&mut self, opened_from: &[SealedTx], outcomes: &[ExecOutcome], height: u64) {
+    fn note_deferrals(&mut self, opened_from: &[SealedTx], outcomes: &[ExecOutcome]) {
         for (sealed, outcome) in opened_from.iter().zip(outcomes) {
             let commit = sealed.commit();
             if *outcome != ExecOutcome::Deferred {
                 self.deferred_since.remove(&commit);
                 continue;
             }
-            let Some(&first) = self.deferred_since.get(&commit) else {
+            let Some(&tries) = self.deferred_since.get(&commit) else {
                 if self.deferred_since.len() < DEFERRAL_CAP {
-                    self.deferred_since.insert(commit, height);
+                    self.deferred_since.insert(commit, 1);
                     self.readmit(sealed.clone());
                 }
                 continue;
             };
-            if height.saturating_sub(first) > REVEAL_WINDOW {
+            if tries >= REVEAL_WINDOW {
                 self.deferred_since.remove(&commit);
                 continue;
             }
+            // `BoundedMap::insert` on a present key must not restart or re-order the clock; it is the same key,
+            // one retry older.
+            self.deferred_since.insert(commit, tries + 1);
             self.readmit(sealed.clone());
         }
     }
