@@ -741,6 +741,12 @@ impl<F: Field> ThresholdRouter<F> {
                 // same size as the one we received — no cross-hop size correlation. The next hop's
                 // gatherer is then picked per onion (salted by the padded bytes, #55): any member
                 // can combine, and varying the pick keeps one dead member from killing the hop.
+                // `pad` fails only on an onion already longer than the bucket, and a peeled inner onion is
+                // strictly shorter than the received one — which arrived at exactly `THRESHOLD_ONION_LEN` or
+                // `Packet::from_bytes` would have refused it. So this is unreachable, and the fallback is safe
+                // for a second reason worth stating rather than trusting: an unpadded forward would be a frame
+                // the NEXT hop drops, because `from_bytes` requires the exact bucket length. The property
+                // degrades to a lost packet, never to a short one on the wire carrying the remaining depth.
                 let padded = threshold::pad(&onion).unwrap_or(onion);
                 match self.gather_member(next, &padded) {
                     Some(c) => self.forward_send(c, encode_onion(next, &padded)),
