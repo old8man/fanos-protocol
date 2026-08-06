@@ -280,11 +280,49 @@ function of `Config::epoch_period` rather than a constant, so it follows a deplo
 > precision it needs allows it to measure, and the window is where that appears. Shortening it means either
 > accepting a wider band (a weaker claim) or a longer dwell (a slower actuation) — the three move together.
 
-**Chosen, and each needs a derivation before it ships.** The retention depth in `history` — the same *kind* of
-question the window turned out to be (how much past is needed to say something with confidence), so the
-derivation that closed the window is the first lever to try on it. The DP `ε` for counter export — the
-*sensitivity* must be derived per counter family as `Δr = 1/21` was for the coherence frame, and until it is,
-counter export stays local-only.
+### The DP sensitivity does not fail to be derived — it is undefined, and that is the result
+
+`Δr = 1/21` was derivable for the coherence frame **because the quantity is inherently bounded**: a correlation
+lives in `[-1, 1]` and the frame averages 21 pairs, so one pair's worst-case swing is `2/21` and the sensitivity
+follows from the algebra with nothing chosen.
+
+A station counter has no such bound. `Stations.counts` is `BTreeMap<(station, line, tag), u64>`, incremented by
+`record` with no per-node and no per-window cap. Differential privacy's sensitivity is *the most one
+contributor can move the answer*, and here one node can move a counter arbitrarily far by doing more of the
+thing being counted. So
+
+> **`Δ = ∞`, and no finite `ε` gives any guarantee.**
+
+That is not "the parameter has not been picked yet". It is that **the query is not privatizable in this
+representation**, and picking an `ε` would produce a number with no meaning attached — the exact failure this
+document's §8 exists to prevent.
+
+**What must change first, and it is one thing.** Bound what a single contributor can add to an exported counter
+per export window. Then the sensitivity is not derived *from* the clamp, it **is** the clamp: `Δ = c`, exactly,
+by definition of the quantity. The clamp itself is then the thing to derive — from the largest honest
+per-window count, so that clamping never distorts a healthy node's report and only ever truncates an outlier,
+which is the same shape as every other bound here.
+
+Note the ordering that follows: **the counter plane cannot be DP-exported before it is clamped**, no matter what
+`ε` is chosen, and the current local-only gate is therefore correct rather than merely cautious.
+
+### Retention is two questions wearing one number
+
+The `history` tiers — `1 s × 1 h`, `1 min × 1 day`, `1 h × 30 days` — are chosen, and the reason they resisted
+derivation is that they answer **two different questions at once**:
+
+1. **What the system needs.** The band reads `behavior_window` samples (derived in §the window), and the
+   recomputed cell-wide decisions read the last `behavior_window` *closed epochs*. That gives a floor:
+   `retention ≥ behavior_window × epoch_length`, and it is derived — it is exactly "the longest window any
+   consumer reads", the same question as "what removes it" asked forwards.
+2. **What an operator needs.** Seeing back to an incident's onset is a human requirement with no system
+   quantity behind it, and 30 days is a reasonable answer to it.
+
+Blending them into one tiered constant makes the derivable part look chosen and the chosen part look derived.
+They should be stated separately: a **floor the node must not go below** (or the band stops resolving, which is
+a correctness failure, not a reduced view), and a **policy above it** the operator may set freely. A compact
+deployment that shortens retention is safe exactly while it stays above the floor, and nothing currently tells
+it where that is.
 
 **Unproven, and the honest frontier.** That aggregate-by-structure counters leak nothing useful to an adversary
 who also observes traffic. R1–R3 forbid the obvious channels, but a *rate* keyed by line is still a signal, and a
