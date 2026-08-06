@@ -16,6 +16,18 @@
 extern "C" {
 #endif
 
+/*
+ * The ABI this header describes. Compare it against fanos_abi_version() before the first call and refuse to
+ * proceed on a mismatch: a stale header linked against a newer library is not a link error, it is silently
+ * wrong struct offsets and argument counts. The dynamic linker catches a renamed symbol; it says nothing
+ * about one whose meaning changed under a caller that still compiles.
+ */
+#define FANOS_ABI_VERSION 1
+
+/* Returns the ABI the linked library implements. Safe to call with nothing open — it touches no state, so a
+ * mismatched caller can discover the mismatch instead of crashing while finding out. */
+uint32_t fanos_abi_version(void);
+
 /* Result codes (0 = OK). */
 #define FANOS_OK            0
 #define FANOS_ERR_NULL     (-1) /* a required pointer argument was null */

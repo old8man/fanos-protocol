@@ -35,6 +35,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
+/// The ABI this library implements. A caller compares it against the `FANOS_ABI_VERSION` its header declared,
+/// and refuses to proceed on a mismatch.
+///
+/// **Why a number and not a soname.** A C caller links a header at compile time and a library at load time, and
+/// nothing in between checks that they agree: a stale header with a newer library is not a link error, it is
+/// silently reading the wrong struct offsets and passing the wrong argument counts. Dynamic-linker versioning
+/// catches a *renamed or removed* symbol and says nothing about one whose meaning changed underneath a caller
+/// that still compiles. This is the only channel through which a caller can find out.
+///
+/// Bumped when anything a caller can observe changes: a signature, a result code's value or meaning, a struct
+/// layout, or the ownership rule for a handle. Adding a new function is not observable to an existing caller
+/// and does not bump it.
+pub const FANOS_ABI_VERSION: u32 = 1;
+
+/// The ABI this library implements — the run-time half of [`FANOS_ABI_VERSION`].
+///
+/// A caller checks `fanos_abi_version() == FANOS_ABI_VERSION` (its header's value) before its first call. It is
+/// deliberately the one function safe to call with nothing open: it touches no state, so a mismatched caller
+/// can discover the mismatch instead of crashing while finding out.
+#[unsafe(no_mangle)]
+pub extern "C" fn fanos_abi_version() -> u32 {
+    FANOS_ABI_VERSION
+}
+
 /// Success.
 pub const FANOS_OK: c_int = 0;
 /// A required pointer argument was null.
