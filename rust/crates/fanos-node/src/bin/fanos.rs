@@ -2640,7 +2640,7 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
     let (configs, registry) =
-        deal_validators(cell, epoch, beacon, &genesis_alloc, &mut SeedRng::from_seed(&rng_seed));
+        deal_validators(cell, epoch, beacon, &genesis_alloc, fanos_taxis::Economics::Unincentivised, &mut SeedRng::from_seed(&rng_seed));
 
     for c in &configs {
         let path = format!("{out}/validator-{}.taxis", c.me);
@@ -2727,7 +2727,7 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     let tx = Transaction::new(HybridLedger::transparent_payload(&signed));
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, info.cell, &rng_seed)
         .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
 
     // Join the overlay (bootstrap to the validators via --bootstrap) and submit to validator 0, which ingests
@@ -2999,7 +2999,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     let tx = Transaction::new(HybridLedger::term_payload(&envelope));
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, info.cell, &rng_seed)
         .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
 
     let config = node_config_from_args(args)?;

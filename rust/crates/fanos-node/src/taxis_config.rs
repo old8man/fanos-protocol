@@ -19,6 +19,7 @@ use fanos_dromos::{HybridLedger, SlashTx};
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_pqcrypto::{HybridKemSecret, HybridSigSecret, HybridVerifier};
 use fanos_primitives::{BeaconSeed, Epoch};
+use fanos_taxis::{Economics, RewardParams};
 use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 use fanos_taxis::params::CellParams;
 use fanos_taxis::tx::Transaction;
@@ -52,13 +53,17 @@ pub fn build_genesis(genesis_alloc: &[([u8; 32], u64)]) -> HybridLedger {
 
 /// Build the [`SlashSealer`] a validator uses to auto-submit a caught equivocation: look up the equivocator's
 /// verifier by index, wrap the two conflicting votes as a DROMOS [`SlashTx`], and seal that to the epoch keyper
-/// line — a transaction any validator then includes, debiting the equivocator's bonded stake in executed state.
-/// The equivocation proof is self-verifying, so a validator can seal a slash for *any* peer without extra trust.
+/// committee — a transaction any validator then includes, debiting the equivocator's bonded stake in executed
+/// state. The equivocation proof is self-verifying, so a validator can seal a slash for *any* peer without
+/// extra trust.
+///
+/// It took a `beacon` while the sealing committee was an epoch-elected line. The committee is the whole cell
+/// now (#136), so there is nothing left for the beacon to elect and carrying it would be a parameter that
+/// cannot affect the result.
 fn build_slash_sealer(
     verifiers: Vec<HybridVerifier>,
     keyper: KeyperRegistry,
     epoch: Epoch,
-    beacon: BeaconSeed,
     cell: CellParams,
 ) -> SlashSealer {
     std::sync::Arc::new(move |ev: &SlashEvidence| {
@@ -99,6 +104,10 @@ pub struct ValidatorConfig {
     /// genesis-only operation, so an empty allocation is a permanently fund-less chain — `fanos taxis-deal`
     /// credits a founder account here so the chain is usable.
     pub genesis_alloc: Vec<([u8; 32], u64)>,
+    /// The cell's **economic regime** — stated, because it was previously a hardcoded `0` with no path from
+    /// any configuration to it (#138). Shared config: every validator must agree, since the reward is a
+    /// state transition.
+    pub economics: Economics,
 }
 
 impl ValidatorConfig {
@@ -110,6 +119,12 @@ impl ValidatorConfig {
     /// configured state directory, so a whole-cell restart can re-seed from any single survivor's disk.
     #[must_use]
     pub fn to_taxis_params(&self, state_dir: Option<std::path::PathBuf>) -> Option<TaxisParams<HybridLedger>> {
+        // Fail closed on an economy the platform's own theorem rejects (#138). `None` here is the same
+        // refusal a malformed verifier gets, and for the same reason: a validator that starts on parameters
+        // it cannot justify looks healthy while the property it advertises does not hold.
+        if !self.economics.is_runnable() {
+            return None;
+        }
         let verifiers = self
             .verifiers
             .iter()
@@ -118,7 +133,7 @@ impl ValidatorConfig {
         let (signer, kem_secret) = keys_from_seed(&self.node_seed);
         // Reconstruct the keyper registry so this validator can seal an auto-submitted slash to the epoch line.
         let keyper = KeyperRegistry::from_bytes(&self.keyper)?;
-        let slash_sealer = Some(build_slash_sealer(verifiers.clone(), keyper, self.epoch, self.beacon, self.cell));
+        let slash_sealer = Some(build_slash_sealer(verifiers.clone(), keyper, self.epoch, self.cell));
         Some(TaxisParams {
             cell: self.cell,
             me: self.me,
@@ -129,7 +144,7 @@ impl ValidatorConfig {
             seed: self.beacon,
             epoch: self.epoch,
             genesis_state: build_genesis(&self.genesis_alloc),
-            reward_per_block: 0,
+            reward_per_block: self.economics.reward_per_block(),
             sortition: None,
             slash_sealer,
             state_dir,
@@ -163,6 +178,18 @@ impl ValidatorConfig {
         }
         out.extend_from_slice(&u32_of(self.keyper.len()).to_be_bytes());
         out.extend_from_slice(&self.keyper);
+        // The economic regime, last so the earlier sections decode unchanged: a tag byte then, for the
+        // incentivised regime, `fee(8) ‖ vote_cost(8) ‖ slash(8)`. `quorum` is not carried — it is
+        // `cell.quorum()`, already above, and a second copy is a second thing to disagree with.
+        match self.economics {
+            Economics::Unincentivised => out.push(0),
+            Economics::Incentivised(p) => {
+                out.push(1);
+                out.extend_from_slice(&p.fee.to_be_bytes());
+                out.extend_from_slice(&p.vote_cost.to_be_bytes());
+                out.extend_from_slice(&p.slash.to_be_bytes());
+            }
+        }
         out
     }
 
@@ -195,10 +222,42 @@ impl ValidatorConfig {
         }
         let keyper_len = r.u32()? as usize;
         let keyper = r.take(keyper_len)?.to_vec();
+        // **Checked like the quorum above, and for the same reason.** An incentivised file whose parameters
+        // fail the equilibrium conditions is refused here rather than run: the theorem it invokes would not
+        // hold, and a cell that pays less than the work costs loses participation slowly, with nothing
+        // pointing back at the file (#138).
+        let economics = match r.u8()? {
+            0 => Economics::Unincentivised,
+            1 => {
+                let params = RewardParams {
+                    fee: r.u64()?,
+                    quorum: cell.quorum(),
+                    vote_cost: r.u64()?,
+                    slash: r.u64()?,
+                };
+                let e = Economics::Incentivised(params);
+                if !e.is_runnable() {
+                    return None;
+                }
+                e
+            }
+            _ => return None,
+        };
         if !r.is_empty() {
             return None; // trailing bytes ⇒ non-canonical
         }
-        Some(Self { me, node_seed, cell, epoch, beacon, keyper_commit, keyper, verifiers, genesis_alloc })
+        Some(Self {
+            me,
+            node_seed,
+            cell,
+            epoch,
+            beacon,
+            keyper_commit,
+            keyper,
+            verifiers,
+            genesis_alloc,
+            economics,
+        })
     }
 }
 
@@ -259,14 +318,27 @@ impl ChainInfo {
 /// derive its signing + KEM keys, and assemble the shared verifier set + keyper registry. Returns one
 /// [`ValidatorConfig`] per validator, all sharing the same public cell configuration. `rng` is OS entropy in
 /// production (`fanos taxis-deal`) or a seeded CSPRNG under test.
+///
+/// # Panics
+/// If `economics` is an incentivised regime whose parameters fail the equilibrium conditions it claims
+/// ([`Economics::is_runnable`]). A panic rather than an `Option`, because this is a ceremony a person runs
+/// once with parameters they chose: there is nothing for a caller to recover from, and the alternative —
+/// writing files that every validator then refuses individually at start-up — reports the same error `n`
+/// times, far from where it can be fixed.
 #[must_use]
 pub fn deal_validators<R: CryptoRng>(
     cell: CellParams,
     epoch: Epoch,
     beacon: BeaconSeed,
     genesis_alloc: &[([u8; 32], u64)],
+    economics: Economics,
     rng: &mut R,
 ) -> (Vec<ValidatorConfig>, KeyperRegistry) {
+    // Refuse to deal an economy the platform's own theorem rejects, rather than writing files that will be
+    // refused one at a time at start-up. The ceremony is the last moment the parameters are all in one
+    // place (#138).
+    assert!(economics.is_runnable(), "an incentivised cell must satisfy its own equilibrium conditions");
+
     // Draw each validator's secret seed, and derive its public verifier + keyper KEM public in one pass.
     let mut node_seeds = Vec::with_capacity(cell.n());
     let mut verifiers: Vec<Vec<u8>> = Vec::with_capacity(cell.n());
@@ -300,6 +372,7 @@ pub fn deal_validators<R: CryptoRng>(
             keyper: keyper_bytes.clone(),
             verifiers: verifiers.clone(),
             genesis_alloc: genesis_alloc.to_vec(),
+            economics,
         })
         .collect();
     (configs, registry)
@@ -365,7 +438,7 @@ mod tests {
         let cell = CellParams::FANO;
         let alloc = vec![([0x11; 32], 1_000_000u64), ([0x22; 32], 500u64)];
         let (configs, _registry) =
-            deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &alloc, &mut SeedRng::from_seed(b"deal"));
+            deal_validators(cell, Epoch::new(5), BeaconSeed::new([0x5E; 32]), &alloc, Economics::Unincentivised, &mut SeedRng::from_seed(b"deal"));
         assert_eq!(configs.len(), cell.n(), "one config per validator seat");
 
         // Every validator agrees on the SAME public cell config (verifiers, keyper commit, cell, beacon, alloc)…
@@ -404,7 +477,7 @@ mod tests {
     #[test]
     fn distinct_validators_get_distinct_secret_seeds() {
         let (configs, _registry) =
-            deal_validators(CellParams::FANO, Epoch::ZERO, BeaconSeed::GENESIS, &[], &mut SeedRng::from_seed(b"d2"));
+            deal_validators(CellParams::FANO, Epoch::ZERO, BeaconSeed::GENESIS, &[], Economics::Unincentivised, &mut SeedRng::from_seed(b"d2"));
         for i in 0..configs.len() {
             for j in (i + 1)..configs.len() {
                 assert_ne!(configs[i].node_seed, configs[j].node_seed, "each validator's seed is unique");
@@ -424,6 +497,7 @@ mod tests {
             Epoch::new(3),
             BeaconSeed::new([7u8; 32]),
             &[([1u8; 32], 1_000u64)],
+            Economics::Unincentivised,
             &mut SeedRng::from_seed(b"sealer-test"),
         );
         let params = configs[0].to_taxis_params(None).expect("dealt params rebuild");
@@ -449,7 +523,7 @@ mod tests {
         let epoch = Epoch::new(9);
         let beacon = BeaconSeed::new([0x33; 32]);
         let (configs, registry) =
-            deal_validators(cell, epoch, beacon, &[([1; 32], 100)], &mut SeedRng::from_seed(b"ci"));
+            deal_validators(cell, epoch, beacon, &[([1; 32], 100)], Economics::Unincentivised, &mut SeedRng::from_seed(b"ci"));
         let commit = registry.commit();
         let info = ChainInfo { cell, epoch, beacon, keyper: registry };
 
@@ -473,6 +547,7 @@ mod tests {
             Epoch::new(9),
             BeaconSeed::new([7; 32]),
             &[([0xAB; 32], 42), ([0xCD; 32], u64::MAX)],
+            Economics::Unincentivised,
             &mut SeedRng::from_seed(b"rt"),
         );
         let c = &configs[3];

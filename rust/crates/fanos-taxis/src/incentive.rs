@@ -73,6 +73,52 @@ pub fn reveal_gated_beneficiaries(voters: &[u8], revealers: &BTreeSet<u8>, block
     voters.iter().copied().filter(|v| !block_has_txs || revealers.contains(v)).collect()
 }
 
+/// Which **economic regime** a cell is provisioned in — a declaration, not a default.
+///
+/// `reward_per_block` shipped as a literal `0` with no path from any configuration file to it (#138), so the
+/// L7 economy was not merely off, it was **unreachable** — while `honest_is_nash()`, the platform's own
+/// equilibrium predicate, is false at `F = 0` and nothing said so. A cell with no economy is a legitimate
+/// deployment: a consortium binds its participants by other means, and the theorem simply does not apply to
+/// it. What is not legitimate is that being the silent default of a system that ships the theorem.
+///
+/// So the regime is stated, and the incentivised one is *checked*: `RewardParams::honest_is_nash` must hold
+/// or the cell refuses to start. The same shape as [`crate::block::seal_fits_a_block`] — a predicate the
+/// configuration must satisfy, enforced rather than remembered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Economics {
+    /// No block reward and no fee. The equilibrium theorem does **not** apply: honest validation is not
+    /// individually rational, and the deployment is asserting that its participants are bound otherwise.
+    Unincentivised,
+    /// A block reward is paid to the finalizers that revealed ([`reveal_gated_beneficiaries`]). The theorem
+    /// applies, so [`RewardParams::honest_is_nash`] must hold at these parameters.
+    Incentivised(RewardParams),
+}
+
+impl Economics {
+    /// The per-block reward pool, or `0` when unincentivised.
+    #[must_use]
+    pub fn reward_per_block(self) -> u64 {
+        match self {
+            Self::Unincentivised => 0,
+            Self::Incentivised(p) => p.fee,
+        }
+    }
+
+    /// Whether this regime may be run: an unincentivised cell always may (it claims nothing), an
+    /// incentivised one only if the equilibrium conditions it claims actually hold.
+    ///
+    /// Refusing rather than warning, for the reason `CellParams`' private fields exist: a configuration that
+    /// looks like an economy and is not one produces validators with no reason to do the work, and the
+    /// failure is a slow drift in participation that nothing attributes back to the config file.
+    #[must_use]
+    pub fn is_runnable(self) -> bool {
+        match self {
+            Self::Unincentivised => true,
+            Self::Incentivised(p) => p.honest_is_nash(),
+        }
+    }
+}
+
 /// The reward/penalty parameters of the per-block stage game.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RewardParams {

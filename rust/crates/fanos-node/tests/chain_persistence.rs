@@ -19,6 +19,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
 
 use fanos_dromos::HybridLedger;
+use fanos_taxis::Economics;
 use fanos_node::taxis_config::deal_validators;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_rendezvous::{BeaconSeed, Epoch};
@@ -38,6 +39,7 @@ fn dealt() -> Vec<fanos_node::taxis_config::ValidatorConfig> {
         Epoch::ZERO,
         BeaconSeed::GENESIS,
         &[([9u8; 32], 1_000_000)],
+        Economics::Unincentivised,
         &mut SeedRng::from_seed(b"chain-persistence"),
     );
     configs
@@ -102,7 +104,7 @@ fn a_validator_that_kept_its_certified_state_comes_back_on_it() {
     // The restart: a fresh engine on the same dealt config, seeded from the persisted pair.
     let mut restarted = engine(&configs[0]);
     assert_eq!(restarted.height(), 0, "a fresh validator starts at genesis");
-    restarted.step(Input::SyncResp { cert: cert.clone(), above: above.clone(), snapshot: snapshot.clone() });
+    restarted.step(Input::SyncResp { cert: cert.clone(), above: Vec::new(), snapshot: snapshot.clone() });
     // `height()` is the height being *decided*, so a validator that has executed `CERTIFIED` is deciding the
     // one after it. Asserted as the exact value rather than "greater than zero": the difference between
     // resuming at the certified point and resuming somewhere plausible is the whole property.
@@ -150,7 +152,7 @@ fn a_chain_state_that_is_not_certified_is_refused() {
         [("a forged state root", forged_root), ("a forged head", forged_head), ("a short quorum", short)]
     {
         let mut victim = engine(&configs[0]);
-        victim.step(Input::SyncResp { cert, snapshot: snapshot.clone() });
+        victim.step(Input::SyncResp { cert, above: Vec::new(), snapshot: snapshot.clone() });
         assert_eq!(
             victim.height(),
             0,
@@ -167,7 +169,7 @@ fn a_chain_state_that_is_not_certified_is_refused() {
 
     // The good pair still works, so the loop above is refusing bad certificates rather than everything.
     let mut ok = engine(&configs[0]);
-    ok.step(Input::SyncResp { cert: good, snapshot });
+    ok.step(Input::SyncResp { cert: good, above: Vec::new(), snapshot });
     assert!(ok.height() > 0, "the honest pair is still adopted");
 }
 
