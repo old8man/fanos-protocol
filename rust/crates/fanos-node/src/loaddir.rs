@@ -151,14 +151,21 @@ pub async fn resolve_load<F: Field>(
     open_load_record::<F>(&bytes, coord, epoch, beacon)
 }
 
-/// Assemble the cell's **agreed setpoint** for `epoch`: resolve every roster member's load report, sum them,
-/// and apply the per-node `capacity` ([`cell_setpoint`]). A member absent from the store simply contributes
-/// zero load. Every node computes the identical setpoint from the identical roster reads — the agreed input the
-/// deterministic assignment needs.
+/// Assemble the cell's setpoint for `epoch`: resolve every roster member's load report, sum them, and apply
+/// the per-node `capacity` ([`cell_setpoint`]). A member absent from the store simply contributes zero load.
+///
+/// **`epoch` must be a CLOSED epoch for the result to be agreed, and this function cannot check that.** Its
+/// doc used to claim the output was "the agreed input the deterministic assignment needs" outright — untrue of
+/// a *live* epoch, and the paragraph below said as much without the two being joined. Members are still
+/// publishing their reports for the current epoch while it runs, so two nodes scanning it see different
+/// subsets and derive different setpoints; the caller's `ClosedEpoch` is what supplies an epoch whose records
+/// have settled. See `role_loop::ClosedEpoch`.
 ///
 /// Also reports whether the scan was **complete**. A member whose report did not resolve in time contributes zero exactly
 /// as a genuine absence does, so the setpoint is *understated* by a partial read — and a setpoint derived from a partial
-/// read is not a settled answer, however many times it repeats.
+/// read is not a settled answer, however many times it repeats. Note what this does *not* cover: an **expired**
+/// directory resolves every slot as a definite absence, so it reads back as a complete scan of a cell with no
+/// load at all. Staleness is the caller's to reject, and `ClosedEpoch::readable_for` is where.
 pub(crate) async fn build_cell_setpoint<F: Field>(
     client: &Client,
     epoch: Epoch,

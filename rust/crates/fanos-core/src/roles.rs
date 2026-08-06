@@ -917,6 +917,22 @@ impl RoleController {
         self.demand
     }
 
+    /// The per-role floor no rebalance drops below.
+    ///
+    /// Exposed so a driver can call [`demand_from_setpoints`](Self::demand_from_setpoints) with *this*
+    /// controller's parameters instead of keeping a second copy of them beside it. Two copies of a floor is
+    /// two things to keep in step, and the one that drifts is the one nothing reads.
+    #[must_use]
+    pub const fn floor(&self) -> Demand {
+        self.floor
+    }
+
+    /// The loop gain in sevenths, `κ = gain_seventh/7` — same reason as [`floor`](Self::floor).
+    #[must_use]
+    pub const fn gain_seventh(&self) -> u8 {
+        self.gain_seventh
+    }
+
     /// The demand implied by a window of **agreed** setpoints — a function of its arguments, with no carried
     /// state, so every node that reads the same window computes the same demand.
     ///

@@ -321,7 +321,12 @@ impl Assignment {
 /// node.
 pub struct LiveRoleController {
     node_id: NodeId,
+    /// Held for its `floor` and `gain` — its **carried demand is deliberately not read**, see [`Self::step`].
     controller: RoleController,
+    /// The last setpoint this node read **completely**, which is what a scan that did not conclude falls back
+    /// to. A published value, not an accumulator: see [`Self::step`] for why that distinction is the whole
+    /// point.
+    last_agreed: Demand,
     reputation: Reputation,
 }
 
@@ -330,13 +335,31 @@ impl LiveRoleController {
     /// (every node fully trusted until observed).
     #[must_use]
     pub fn new(node_id: NodeId, controller: RoleController) -> Self {
-        Self { node_id, controller, reputation: Reputation::new() }
+        Self { node_id, controller, last_agreed: Demand::default(), reputation: Reputation::new() }
     }
 
-    /// The controller's current demand (its internal state).
+    /// The demand this node would assign from right now — a function of [`last_agreed`](Self::last_agreed),
+    /// not of anything carried.
     #[must_use]
     pub fn demand(&self) -> Demand {
-        self.controller.demand()
+        self.demand_for(self.last_agreed)
+    }
+
+    /// The last **complete** setpoint read, which a partial scan holds rather than acting on its own
+    /// understated view.
+    #[must_use]
+    pub fn last_agreed(&self) -> Demand {
+        self.last_agreed
+    }
+
+    /// The demand implied by `setpoint` alone — replayed from the controller's floor, with no carried state,
+    /// so two nodes reading the same setpoint assign from the same demand whatever their histories.
+    fn demand_for(&self, setpoint: Demand) -> Demand {
+        RoleController::demand_from_setpoints(
+            self.controller.floor(),
+            self.controller.gain_seventh(),
+            &[setpoint],
+        )
     }
 
     /// Record whether a node served its assigned role last epoch, from the cell's (agreed) coherence
@@ -349,9 +372,35 @@ impl LiveRoleController {
         self.reputation.observe_reachable(node, performed, reachable);
     }
 
-    /// One epoch: apply reputation to the members' weights, rebalance the demand toward `setpoint`, assign
-    /// roles, and return *this* node's assigned roles for `(epoch, beacon)`. Deterministic given the same
-    /// inputs (including the agreed reputation) on every node.
+    /// One epoch: apply reputation to the members' weights, derive the demand **from `setpoint` alone**,
+    /// assign roles, and return *this* node's assigned roles for `(epoch, beacon)`.
+    ///
+    /// ## Why this does not call [`RoleController::step`]
+    ///
+    /// `step` folds the setpoint into a carried demand, making the assignment a function of this node's
+    /// *history* — and every node then takes its roles out of the report *it* computed, so a cell can
+    /// under-provision a role with no node able to see it. [`RoleController::demand_from_setpoints`] is the
+    /// same law replayed from the shared `floor`, which is the one starting value every node agrees on.
+    ///
+    /// **At the shipped `ROLE_GAIN_SEVENTH = 7` this is numerically identical**, because `κ = 1` reaches the
+    /// setpoint in one step and the carry is already vacuous. That is exactly the reason to change it: cell
+    /// agreement was resting on the *value of a tuning constant*, so damping the loop — the obvious response
+    /// to role churn — would have reintroduced a permanent per-node divergence with no test failing. The
+    /// agreement now holds at every gain, and the constant is free to be tuned for what it is for.
+    ///
+    /// ## The window is one epoch, and that is forced rather than chosen
+    ///
+    /// A window of `W` closed setpoints would need `W` readable closed epochs.
+    /// [`DIRECTORY_SLOT_EPOCHS`](crate::DIRECTORY_SLOT_EPOCHS) is `1` — derived from the onion ratchet's
+    /// `DEFAULT_RETAIN`, i.e. the grace a lagging *reader* needs — so at epoch `e` the only closed load
+    /// directory that still exists is `e − 1`. Smoothing over more history is not a trade-off available here;
+    /// it is unreadable. Raising the retention to buy a window would couple two derivations that answer
+    /// different questions, and the retention's own doc records that larger buys nothing and costs linearly.
+    ///
+    /// Losing the smoothing costs less than it appears, and for a reason specific to this mechanism: the
+    /// assignment is a **fresh beacon lottery every epoch** (`priority_key` hashes the epoch and the seed), so
+    /// *which* nodes serve is fully re-drawn regardless. Damping the count buys no stability that the
+    /// consumer preserves.
     pub fn step(
         &mut self,
         members: &[(NodeId, Capability)],
@@ -359,11 +408,60 @@ impl LiveRoleController {
         beacon: &BeaconSeed,
         setpoint: Demand,
     ) -> Assignment {
+        self.last_agreed = setpoint;
         let weighted = self.reputation.adjust(members);
-        let report = self.controller.step(&weighted, epoch, beacon, setpoint);
+        let report = fanos_core::roles::assign_report(&weighted, epoch, beacon, self.demand_for(setpoint));
         let roles = report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY);
         Assignment { roles, roster: members.len(), epoch }
     }
+}
+
+/// The newest epoch whose load directory is **closed** — final on every node that can read it — together with
+/// the beacon seed its coordinate credentials verify against.
+#[derive(Clone, Copy)]
+struct ClosedEpoch {
+    epoch: Epoch,
+    seed: BeaconSeed,
+}
+
+impl ClosedEpoch {
+    /// The `(epoch, seed)` to read the setpoint from when assigning for `assigning_for`, or `None` when this
+    /// node holds no closed epoch it may read — in which case it must **hold**, never fall back to the live
+    /// directory, which is the one input that cannot be agreed.
+    ///
+    /// Two rejections, and the first is the one that would be silent.
+    ///
+    /// * **Too old.** A record published for epoch `e` is pruned during `e + 2`, so anything older than
+    ///   `assigning_for − 1` returns nothing — and `read_load` calls a missing record a definite `Absent`
+    ///   rather than an unknown (deliberately, so one forged record cannot void a scan). An expired directory
+    ///   therefore reads as a **complete** scan of a cell carrying no load at all, and every role is retired
+    ///   at once. The staleness has to be rejected here because the reader cannot see it.
+    /// * **Never held.** A node that booted mid-run never saw the previous epoch's seed, so on a VRF cell it
+    ///   cannot verify that epoch's credentials. It waits one epoch. This is not a regression against reading
+    ///   the live directory: such a node has not published its own load report for `e − 1` either.
+    ///
+    /// `assigning_for == self.epoch` is the genesis case and the *only* live read the loop performs: at epoch
+    /// zero there is no earlier directory to close. It is corrected at the first beacon advance, and it cannot
+    /// accumulate, because the demand is recomputed from scratch every epoch.
+    fn readable_for(self, assigning_for: Epoch) -> Option<(Epoch, BeaconSeed)> {
+        (self.epoch == assigning_for || self.epoch.next() == assigning_for)
+            .then_some((self.epoch, self.seed))
+    }
+}
+
+/// What an assignment is computed against: the **live** epoch and its seed, and the newest **closed** load
+/// directory. Carried as one value so the two can never be passed separately and drift — the whole change
+/// behind [`ClosedEpoch`] is that these are different epochs on purpose.
+#[derive(Clone, Copy)]
+struct AssignAt {
+    /// The epoch being assigned for. The membership directory and the role lottery both read it live: who is
+    /// present must be current, and a stale roster is a wrong answer for exactly one epoch.
+    epoch: Epoch,
+    /// That epoch's beacon seed — the lottery's randomness and the membership credentials' binding.
+    beacon: BeaconSeed,
+    /// Where the setpoint comes from. Not the live epoch, because a cell-wide count every node must agree on
+    /// cannot be computed from a directory members are still writing to.
+    closed: ClosedEpoch,
 }
 
 /// Spawn the live role loop for a node on plane `F`. Returns the task handle and a `watch` receiver that
@@ -390,6 +488,7 @@ pub fn spawn_role_loop<F: Field>(
         let mut beacons = client.beacons();
         let mut cur = Epoch::ZERO;
         let mut seed = client.genesis();
+        let mut closed = ClosedEpoch { epoch: Epoch::ZERO, seed };
         genesis_assign::<F>(&client, &mut live, capacity, ready, vrf, &roles_tx).await;
         // The refresh is a fixed-point iteration over the roster, so it is polled at a rate proportional to how fast it
         // is still moving: back off geometrically while the assignment is unchanged, snap back to the floor the moment
@@ -412,9 +511,16 @@ pub fn spawn_role_loop<F: Field>(
                 // re-derivation rather than a skipped one.
                 advanced = crate::next_epoch(&mut beacons, cur) => {
                     let Some((epoch, s)) = advanced else { break };
+                    // The epoch being left is now final, and this is the only place its seed is still held —
+                    // the beacon watch keeps no history. A multi-epoch jump leaves `closed` more than one
+                    // behind, which `readable_for` then refuses; that is the intended outcome, since the
+                    // skipped directory has expired.
+                    closed = ClosedEpoch { epoch: cur, seed };
                     cur = epoch;
                     seed = s;
-                    (settled, _) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
+                    (settled, _) =
+                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed }, capacity, vrf, &roles_tx)
+                            .await;
                     // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
                     // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
                     stable = 0;
@@ -472,7 +578,9 @@ pub fn spawn_role_loop<F: Field>(
                 // compute the same assignment, exactly as on a beacon advance — the refresh adds no new randomness, it
                 // just stops the cell being stuck with a startup-race view of itself.
                 _ = refresh.tick() => {
-                    let (now, complete) = assign_epoch::<F>(&client, &mut live, cur, &seed, capacity, vrf, &roles_tx).await;
+                    let (now, complete) =
+                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed }, capacity, vrf, &roles_tx)
+                            .await;
                     if now == settled {
                         stable = next_stable(stable, true, complete);
                         // Local stability is *not* evidence of the global fixed point, and conflating the two is the
@@ -586,7 +694,12 @@ async fn genesis_assign<F: Field>(
     }
     // The roster is read at epoch 0 against this network's genesis seed: the records it must verify were
     // published against that seed, so the constant would reject every one of them.
-    assign_epoch::<F>(client, live, Epoch::ZERO, &client.genesis(), capacity, vrf, roles_tx).await;
+    //
+    // Epoch zero is the one epoch with no closed predecessor, so the setpoint here is a live read — declared
+    // as such rather than hidden, and corrected at the first beacon advance.
+    let closed = ClosedEpoch { epoch: Epoch::ZERO, seed: client.genesis() };
+    let at = AssignAt { epoch: Epoch::ZERO, beacon: client.genesis(), closed };
+    assign_epoch::<F>(client, live, at, capacity, vrf, roles_tx).await;
 }
 
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
@@ -652,7 +765,13 @@ const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> 
 /// makes the two-valued version of this rule a bug and the three-valued one a fix.
 ///
 /// The viability floor rides with the fresh branch, where the supply it must be conditioned on was just read;
-/// a held demand already carries the floor applied when it was last set.
+/// a held setpoint already carries the floor applied when it was last set.
+///
+/// **`held` is a published setpoint, not an accumulator, and that is what makes holding safe.** Two nodes
+/// holding different ones — one read epoch `e − 1`, the other's scan timed out and it still holds `e − 2` —
+/// disagree only until both complete a scan of the same closed epoch. Nothing compounds, because the demand
+/// is recomputed from the floor every epoch rather than stepped from where it was. Under the carried demand
+/// this same fallback was the one path by which a momentary read failure became permanent.
 fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand) -> Demand {
     if complete { read.with_viability_floor(supply) } else { held }
 }
@@ -666,8 +785,7 @@ fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand)
 async fn assign_epoch<F: Field>(
     client: &Client,
     live: &mut LiveRoleController,
-    epoch: Epoch,
-    beacon: &BeaconSeed,
+    at: AssignAt,
     capacity: Demand,
     // Whether this cell's coordinates are VRF-derived, so a roster record must prove the slot it sits at (`crate::bound`).
     vrf: bool,
@@ -676,12 +794,21 @@ async fn assign_epoch<F: Field>(
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
     // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
+    let AssignAt { epoch, beacon, closed } = at;
     let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
-        build_capability_directory::<F>(client, epoch, vrf.then_some(*beacon)),
-        build_cell_setpoint::<F>(client, epoch, capacity, vrf.then_some(*beacon))
+        build_capability_directory::<F>(client, epoch, vrf.then_some(beacon)),
+        async {
+            match closed.readable_for(epoch) {
+                // Verified against the seed of the epoch the records were PUBLISHED in, not the current one:
+                // a credential names its epoch, so the live seed rejects every closed record.
+                Some((e, s)) => build_cell_setpoint::<F>(client, e, capacity, vrf.then_some(s)).await,
+                // No readable closed epoch. Report incomplete so the caller holds; the value is unused.
+                None => (Demand::default(), false),
+            }
+        }
     );
-    let setpoint = setpoint_to_track(setpoint, load_complete, live.demand(), Demand::supply(&members));
-    let roles = live.step(&members, epoch, beacon, setpoint);
+    let setpoint = setpoint_to_track(setpoint, load_complete, live.last_agreed(), Demand::supply(&members));
+    let roles = live.step(&members, epoch, &beacon, setpoint);
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
 }
@@ -1040,6 +1167,86 @@ mod tests {
         }
         assert_eq!(active, 3, "the cell assigns exactly the demanded 3 relays across its members");
         assert_eq!(demand_after, 3, "each controller tracked the setpoint");
+    }
+
+    /// Two nodes that have lived through different pasts must assign the same roles from the same closed epoch.
+    ///
+    /// **This property is invisible at the shipped gain, which is why it survived.** `ROLE_GAIN_SEVENTH = 7`
+    /// is `κ = 1`, so the carried demand reaches the setpoint in one step and is already history-free — the
+    /// test passes with or without the fix. The divergence appears at `κ = 1/7`, and the consequence is worth
+    /// stating plainly: cell agreement was resting on the *value of a tuning constant*, so damping the loop —
+    /// the obvious response to role churn — would have reintroduced a permanent, unobservable disagreement.
+    /// So the gain is what this varies.
+    #[test]
+    fn two_nodes_with_different_histories_assign_the_same_roles() {
+        const GAIN: u8 = fanos_core::roles::GAIN_BOOTSTRAP_SEVENTHS; // κ = 1/7
+        let members: Vec<(NodeId, Capability)> =
+            (0..7).map(|i| (node(i), Capability::new(RoleSet::of(&[Role::Relay]), 4))).collect();
+        let beacon = BeaconSeed::new([0x5a; 32]);
+        let sp = |n: u16| Demand::per_role(|r| if r == Role::Relay { n } else { 0 });
+
+        // How many of the cell's seven nodes take the relay role at epoch 6, after living through `history`.
+        // Counted cell-wide rather than at one node: the count is what the disagreement is *about*, and a
+        // single node can land on the same side of two different cutoffs by luck of the lottery.
+        let assigned = |history: &[(u64, u16)]| -> usize {
+            (0..7u8)
+                .filter(|&i| {
+                    let mut live = LiveRoleController::new(
+                        node(i),
+                        RoleController::new(Demand::default(), Demand::default(), GAIN),
+                    );
+                    for &(e, n) in history {
+                        live.step(&members, Epoch::new(e), &beacon, sp(n));
+                    }
+                    live.step(&members, Epoch::new(6), &beacon, sp(5)).roles.has(Role::Relay)
+                })
+                .count()
+        };
+
+        // THE PROPERTY. A cell whose load has been swinging, against a node that just restarted.
+        let veteran = assigned(&[(1, 40), (2, 3), (3, 40), (4, 3), (5, 40)]);
+        let restarted = assigned(&[]);
+        assert_eq!(
+            veteran, restarted,
+            "the same closed epoch must produce the same cell-wide assignment on both nodes; carried, the \
+             swinging history leaves a demand of 11 against the fresh node's 1, so the cell provisions 7 \
+             relays or 1 depending on which node you ask — and every node's own report looks self-consistent"
+        );
+
+        // The mechanism, asserted after the property so that reverting `step` to the carried controller fails
+        // on the property and not merely here.
+        assert_eq!(
+            restarted, 1,
+            "and the agreed value is the floor replayed over that one setpoint: κ=1/7 of the way to 5 rounds \
+             to zero, so the forced ±1 step gives 1"
+        );
+    }
+
+    /// A closed epoch older than the directory's own lifetime must be refused, because the reader cannot tell.
+    #[test]
+    fn a_closed_epoch_older_than_the_directorys_lifetime_is_refused() {
+        let seed = BeaconSeed::new([0x11; 32]);
+        let at = |e: u64| ClosedEpoch { epoch: Epoch::new(e), seed };
+
+        // THE PROPERTY. `read_load` calls a missing record a definite `Absent` rather than an `Unknown` — on
+        // purpose, so one forged record cannot void a scan. The cost is that an *expired* directory reads as a
+        // COMPLETE scan of a cell carrying no load at all, and the loop retires every role on evidence that
+        // does not exist. Nothing downstream can catch this; it has to be refused here.
+        assert!(at(5).readable_for(Epoch::new(7)).is_none(), "two epochs back is already pruned");
+        assert!(
+            at(0).readable_for(Epoch::new(500)).is_none(),
+            "a node that booted mid-run holds no readable closed epoch, and must wait rather than read an \
+             empty directory as a cell with no work"
+        );
+
+        // The two it must accept: the one closed epoch, and genesis, which has no predecessor to close.
+        assert_eq!(at(5).readable_for(Epoch::new(6)).map(|(e, _)| e), Some(Epoch::new(5)));
+        assert_eq!(at(0).readable_for(Epoch::ZERO).map(|(e, _)| e), Some(Epoch::ZERO));
+
+        // The bound is the slot's lifetime, not a number chosen here: a record published in `e` expires at
+        // `e + DIRECTORY_SLOT_EPOCHS`. Raising the retention to buy a wider smoothing window has to come back
+        // through this assertion.
+        assert_eq!(crate::DIRECTORY_SLOT_EPOCHS, 1, "one closed epoch is readable, so the window is one");
     }
 
     #[test]
