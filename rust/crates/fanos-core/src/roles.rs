@@ -599,10 +599,20 @@ pub fn setpoint_from(load: Demand, capacity: Demand) -> Demand {
     Demand::per_role(|role| load.of(role).div_ceil(capacity.of(role).max(1)))
 }
 
-/// The **cell-agreed setpoint** from every node's observed load: sum the per-node loads (the same summed value
-/// on every node, since each reads the same advertised loads — the design's agreed-input requirement), then
-/// [`setpoint_from`] the total against the per-node `capacity`. This is what a driver feeds the controller so
-/// the whole cell tracks the *same* target and its assignment stays deterministic.
+/// The cell's setpoint from every node's observed load: sum the per-node loads, then [`setpoint_from`] the
+/// total against the per-node `capacity`.
+///
+/// **Agreed only as far as the reads are**, and this used to say otherwise ("the same summed value on every
+/// node, since each reads the same advertised loads"). `resolve_setpoint` is honest that a member whose report
+/// does not resolve in time contributes zero exactly as a genuine absence does, so a partial scan
+/// *understates* the total — and it returns a completeness flag precisely because of that. The role loop uses
+/// that flag for its stability ladder and steps the controller either way, so an understated setpoint is
+/// folded into the carried demand and never comes back out.
+///
+/// So the agreed-input requirement is a requirement, not a fact: it holds for a **closed** epoch whose records
+/// have settled in the store, and not for a live read of the current one. That is the same conclusion
+/// [`Reputation::from_published`] reached from the other side, and it is one conclusion: **a decision that
+/// must agree cell-wide has to be computed from closed published epochs, never from this node's live read.**
 #[must_use]
 pub fn cell_setpoint(node_loads: &[Demand], capacity: Demand) -> Demand {
     let total = node_loads.iter().copied().fold(Demand::default(), Demand::saturating_sum);
@@ -677,8 +687,10 @@ pub const REP_FLOOR: u16 = REP_RECOVER;
 /// that perform. This prices the one freedom the signature and PoW cannot — over-declaring one's *own* weight.
 ///
 /// The performance signal is an **agreed** one: it comes from the cell's coherence self-diagnosis
-/// (`fanos-diakrisis`) — a non-performing node shows as reduced coupling on its lines — which every node reads
-/// identically, so the reputation is the same on every node and the assignment stays deterministic. The model
+/// (`fanos-diakrisis`) — a non-performing node shows as reduced coupling on its lines. **Every node does NOT
+/// read that identically**, and the correction is on [`observe_reachable`](Self::observe_reachable): the
+/// diagnosis is node-local, so a carried reputation forks permanently and
+/// [`from_published`](Self::from_published) is the shape that does not. The model
 /// here is sans-I/O: it consumes performed/failed observations and produces a weight multiplier.
 #[derive(Clone, Debug, Default)]
 pub struct Reputation {
