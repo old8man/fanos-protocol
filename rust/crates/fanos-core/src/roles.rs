@@ -704,11 +704,39 @@ impl LoadMeter {
 
 /// Reputation fixed-point scale: a score of [`REP_SCALE`] is full (declared weight honored in full).
 pub const REP_SCALE: u16 = 256;
-/// How much one good window recovers: the single free parameter of the reputation law.
+
+/// How many **closed** epochs of published diagnoses the reputation is recomputed from
+/// ([`Reputation::from_published`]) — the memory of the law, in epochs.
 ///
-/// It sets the recovery time — `REP_SCALE/REP_RECOVER - 1` good windows from the floor back to full, seven at
-/// the shipped value — and, through [`REP_FLOOR`], everything else.
-pub const REP_RECOVER: u16 = REP_SCALE / 8;
+/// **Derived, and it determines [`REP_RECOVER`] rather than sitting beside it.** Two constraints pin it:
+///
+/// 1. **Memory must equal recovery time.** From the floor, `REP_SCALE/REP_RECOVER − 1` good epochs restore a
+///    node to full. If that exceeds the window, a node that behaved perfectly across every record the system
+///    still holds is *still* de-weighted — punished for epochs the system deliberately forgot. If it is less,
+///    any that many clean epochs at the end saturate the score and the earlier records cannot affect it at
+///    all, so the stated memory overstates the real one. Equality is the only value that is neither.
+/// 2. **`REP_SCALE / (window + 1)` must be exact.** [`REP_FLOOR`]'s fixed-point argument — an alternating
+///    shirker settles at `x = (x + r)/2 = r` — holds exactly only when the halving is exact in integer
+///    arithmetic, so `window + 1` must divide `REP_SCALE`. That leaves `window ∈ {1, 3, 7, 15, …}`.
+///
+/// `7` is the smallest of those with useful resolution: at `1` the score has two levels and cannot separate
+/// "shirked once" from "shirks half the time"; at `3` it has four. Larger costs retention linearly (see
+/// `fanos_node::DIAGNOSIS_SLOT_EPOCHS`) for a distinction between behaviours already many epochs apart.
+///
+/// **It is also a correctness bound, not only a tuning one.** The window may never exceed the retention of
+/// the records it reads: a node reading a longer history than the store keeps sees a different record set
+/// depending on *when* it reads, so two nodes disagree permanently — the same defect as a carried score, one
+/// layer down. The retention is derived from this constant for exactly that reason.
+pub const REP_WINDOW: u64 = 7;
+
+/// How much one good window recovers: `REP_SCALE / (REP_WINDOW + 1)`.
+///
+/// It used to be the "single free parameter of the reputation law", stated as `REP_SCALE / 8` with the
+/// resulting seven-epoch recovery time noted as a consequence. It is not free: the recovery time must equal
+/// the window the score is computed over, and the window has its own bounds ([`REP_WINDOW`]). The shipped
+/// value is unchanged — `8 = REP_WINDOW + 1` — but every call site was passing a window of `8`, one epoch
+/// more memory than the law can use.
+pub const REP_RECOVER: u16 = REP_SCALE / (REP_WINDOW as u16 + 1);
 
 /// Reputation floor: a persistently-non-performing node keeps `REP_FLOOR/REP_SCALE` of its declared weight —
 /// never fully excluded (it may recover, and exclusion would be a censorship lever), only de-prioritized.
@@ -884,8 +912,14 @@ impl Reputation {
     /// declares the whole cell degraded is outvoted rather than believed. It is the same question the liveness
     /// layer already asks with the same shape of answer, so `quorum` should be the corroboration quorum.
     ///
-    /// Epochs strictly older than `latest - window` are ignored, so the score has a bounded, stated memory
-    /// rather than the unbounded one a carried map has.
+    /// Epochs strictly older than `latest − REP_WINDOW` are ignored, so the score has a bounded, stated
+    /// memory rather than the unbounded one a carried map has.
+    ///
+    /// **The window is not a parameter, and that is the point.** It was, and every call site passed the
+    /// literal `8` — one more than the law can use, and one no store retained. A per-caller window is a
+    /// per-caller *score*: two nodes reading the same records with different windows disagree for ever, which
+    /// is the exact failure recomputing was introduced to remove. It is a protocol constant tied to the
+    /// record retention ([`REP_WINDOW`]), so it is read here rather than accepted.
     ///
     /// `members` is indexed by cell point: `members[i]` is the identity at Fano point `i`.
     #[must_use]
@@ -893,11 +927,10 @@ impl Reputation {
         records: &[DiagnosisRecord],
         members: &[NodeId],
         latest: u64,
-        window: u64,
         quorum: usize,
     ) -> Self {
         let mut rep = Self::new();
-        let oldest = latest.saturating_sub(window);
+        let oldest = latest.saturating_sub(REP_WINDOW);
         // Replay the epochs in order, so the law's asymmetry (fast to punish, slow to trust) is applied to the
         // same sequence on every node. Sorting is what makes "the same record set" enough: a store read can
         // return them in any order, and the fold is not commutative.
@@ -1190,6 +1223,41 @@ mod tests {
         );
     }
 
+    /// The law's memory and its recovery time are the same number, and neither is free (#44).
+    ///
+    /// Counted rather than read off the formula: a node at the floor is given `REP_WINDOW` good epochs and
+    /// must arrive at exactly full — one fewer must fall short, so the equality is pinned from both sides.
+    /// An off-by-one here changes no behaviour and makes the stated memory a fiction: with a window longer
+    /// than the recovery, any run of clean epochs saturates the score and everything before it is unreadable.
+    #[test]
+    fn the_reputation_window_is_exactly_the_time_to_recover_from_the_floor() {
+        // `window + 1` must divide the scale, or the alternating shirker's fixed point is not exact.
+        assert_eq!(REP_SCALE % (REP_WINDOW as u16 + 1), 0, "REP_WINDOW + 1 must divide REP_SCALE exactly");
+
+        let node = NodeId([7u8; 32]);
+        let mut rep = Reputation::new();
+        for _ in 0..8 {
+            rep.observe(node, false);
+        }
+        assert_eq!(rep.score(&node), REP_FLOOR, "a persistent shirker sits at the floor");
+
+        for _ in 0..(REP_WINDOW - 1) {
+            rep.observe(node, true);
+        }
+        assert!(
+            rep.score(&node) < REP_SCALE,
+            "one epoch short of the window must NOT be full, or the window is longer than the law uses ({})",
+            rep.score(&node)
+        );
+        rep.observe(node, true);
+        assert_eq!(
+            rep.score(&node),
+            REP_SCALE,
+            "exactly REP_WINDOW good epochs restore full weight — the memory the record set keeps is the \
+             memory the law can use"
+        );
+    }
+
     fn rec(publisher: u8, epoch: u64, degraded: u8, responsive: u8) -> DiagnosisRecord {
         DiagnosisRecord { publisher, epoch, degraded, responsive }
     }
@@ -1289,10 +1357,10 @@ mod tests {
             .collect();
 
         // Two readers, same closed epoch, different orders — a store read returns what it returns.
-        let a = Reputation::from_published(&records, &members, 3, 8, 3);
+        let a = Reputation::from_published(&records, &members, 3, 3);
         let mut shuffled = records.clone();
         shuffled.reverse();
-        let b = Reputation::from_published(&shuffled, &members, 3, 8, 3);
+        let b = Reputation::from_published(&shuffled, &members, 3, 3);
         for id in &members {
             assert_eq!(a.score(id), b.score(id), "the recompute does not depend on read order");
         }
@@ -1309,8 +1377,8 @@ mod tests {
         let mut with_liar = honest.clone();
         with_liar.push(rec(0, 2, 0xFF, 0xFF)); // publisher 0 accuses everyone
 
-        let clean = Reputation::from_published(&honest, &members, 2, 8, 3);
-        let smeared = Reputation::from_published(&with_liar, &members, 2, 8, 3);
+        let clean = Reputation::from_published(&honest, &members, 2, 3);
+        let smeared = Reputation::from_published(&with_liar, &members, 2, 3);
         for id in &members {
             assert_eq!(
                 clean.score(id),
@@ -1321,7 +1389,7 @@ mod tests {
         // And the same accusation from a QUORUM does land — otherwise the test above would pass vacuously
         // against a function that ignores records altogether.
         let conspiracy: Vec<DiagnosisRecord> = (0..3u8).map(|p| rec(p, 2, 1 << 4, 0xFF)).collect();
-        let slashed = Reputation::from_published(&conspiracy, &members, 2, 8, 3);
+        let slashed = Reputation::from_published(&conspiracy, &members, 2, 3);
         assert!(slashed.score(&members[4]) < REP_SCALE, "a quorum's verdict does land");
     }
 
@@ -1335,12 +1403,12 @@ mod tests {
         // A reader that saw only the last epoch's records.
         let partial: Vec<DiagnosisRecord> = full.iter().copied().filter(|r| r.epoch == 3).collect();
 
-        let behind = Reputation::from_published(&partial, &members, 3, 8, 3);
-        let ahead = Reputation::from_published(&full, &members, 3, 8, 3);
+        let behind = Reputation::from_published(&partial, &members, 3, 3);
+        let ahead = Reputation::from_published(&full, &members, 3, 3);
         assert!(behind.score(&members[6]) > ahead.score(&members[6]), "the partial reader punished less");
 
         // Re-reading the same closed epochs makes them identical — no residue of the partial view survives.
-        let caught_up = Reputation::from_published(&full, &members, 3, 8, 3);
+        let caught_up = Reputation::from_published(&full, &members, 3, 3);
         for id in &members {
             assert_eq!(caught_up.score(id), ahead.score(id), "the recompute carries nothing forward");
         }
@@ -1351,9 +1419,9 @@ mod tests {
     fn the_window_bounds_how_far_back_a_failure_is_remembered() {
         let members = cell_members();
         let ancient: Vec<DiagnosisRecord> = (0..7u8).map(|p| rec(p, 1, 1 << 2, 0xFF)).collect();
-        let inside = Reputation::from_published(&ancient, &members, 5, 8, 3);
+        let inside = Reputation::from_published(&ancient, &members, 5, 3);
         assert!(inside.score(&members[2]) < REP_SCALE, "within the window it counts");
-        let outside = Reputation::from_published(&ancient, &members, 50, 8, 3);
+        let outside = Reputation::from_published(&ancient, &members, 50, 3);
         assert_eq!(outside.score(&members[2]), REP_SCALE, "past the window it is forgotten");
     }
 

@@ -29,7 +29,7 @@ use fanos_telemetry::dp::PrivacyBudget;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::DIRECTORY_SLOT_EPOCHS;
+use crate::DIAGNOSIS_SLOT_EPOCHS;
 use crate::resolve::{STORE_TIMEOUT, Read};
 
 /// The store slot a node's privatized coherence frame is published at, keyed by its coordinate **and** the epoch.
@@ -139,7 +139,7 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
     };
     let bytes = frame.export(budget, &mut rng);
     let landed = client
-        .put_ephemeral(coherence_slot(client.address(), epoch), bytes.to_vec(), DIRECTORY_SLOT_EPOCHS)
+        .put_ephemeral(coherence_slot(client.address(), epoch), bytes.to_vec(), DIAGNOSIS_SLOT_EPOCHS)
         .await;
     crate::note_publish(client, crate::Directory::Coherence, epoch, landed)
 }
@@ -199,6 +199,31 @@ pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinH
 mod tests {
     use super::*;
     use fanos_field::F2;
+
+    /// The retention and the law that reads it must be the SAME number (#44).
+    ///
+    /// This is a correctness bound, not a tuning preference. `Reputation::from_published` folds the last
+    /// `REP_WINDOW` closed epochs; if the store keeps fewer, a node reading a longer history than exists sees
+    /// a record set that depends on *when* it read, and two nodes disagree permanently — the carried-score
+    /// defect one layer down. If it keeps more, the surplus is retained for a law that cannot reach it.
+    ///
+    /// Asserted here rather than trusted to the `= REP_WINDOW` in the constant's definition, because the two
+    /// live in different crates and the defect this closes was exactly that: the diagnosis directory borrowed
+    /// `DIRECTORY_SLOT_EPOCHS = 1`, derived from the ONION RATCHET's grace window, while every reader asked
+    /// for eight epochs.
+    #[test]
+    fn the_diagnosis_retention_is_exactly_the_reputation_window() {
+        assert_eq!(
+            u64::from(DIAGNOSIS_SLOT_EPOCHS),
+            fanos_core::roles::REP_WINDOW,
+            "the store must keep exactly the epochs the reputation law reads"
+        );
+        assert_ne!(
+            DIAGNOSIS_SLOT_EPOCHS,
+            crate::DIRECTORY_SLOT_EPOCHS,
+            "and it must not be the routing retention again — different question, different derivation"
+        );
+    }
 
     #[test]
     fn a_slot_is_bound_to_both_the_coordinate_and_the_epoch() {

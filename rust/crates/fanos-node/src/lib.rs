@@ -32,6 +32,22 @@
 /// side of the same rotation.
 pub(crate) const DIRECTORY_SLOT_EPOCHS: u32 = 1;
 
+/// How many further epoch advances a published **coherence diagnosis** outlives before the store reclaims it.
+///
+/// **Its own constant, because it answers a different question from [`DIRECTORY_SLOT_EPOCHS`]** (#44). That
+/// one is derived from the onion ratchet's grace window: a reader acting on the *current* epoch can be one
+/// behind, and nothing honest can use a slot older than the ratchet can peel. Sound — for a reader acting on
+/// now. A diagnosis reader deliberately wants history: `Reputation::from_published` recomputes a score from
+/// the last [`REP_WINDOW`](fanos_core::roles::REP_WINDOW) **closed** epochs, and at the routing retention of
+/// one it could read exactly one. The law was tuned for a memory the store did not keep — one retention
+/// serving two requirements with different needs.
+///
+/// Equal to `REP_WINDOW`, not merely at least it. Shorter and the score is not a function of agreed data at
+/// all: a node reading a longer history than the store holds sees a different record set depending on *when*
+/// it reads, so two nodes disagree permanently — the carried-score defect one layer down. Longer and the
+/// extra epochs are retained for a law that cannot reach them, at a cost of `publishers × 1` slots each.
+pub(crate) const DIAGNOSIS_SLOT_EPOCHS: u32 = fanos_core::roles::REP_WINDOW as u32;
+
 /// Which `(coordinate, epoch)` directory a publish belongs to — the sub-kind
 /// [`Station::DirectoryPublishFailed`] is counted under.
 ///
