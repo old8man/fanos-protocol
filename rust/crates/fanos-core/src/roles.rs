@@ -113,6 +113,24 @@ impl Role {
         }
     }
 
+    /// Whether this role's guarantee is a **threshold property of a line's occupancy** rather than a
+    /// throughput one — so how many the cell needs is decided by the geometry, not by the load.
+    ///
+    /// [`Rendezvous`](Self::Rendezvous) and [`Ingress`](Self::Ingress) are the two, and both role docs say so
+    /// already: a hidden service's anonymity set *is* its meeting line's membership, and POROS's
+    /// "seize fewer than `t` and learn nothing" is a statement about how much of the line is occupied. Neither
+    /// survives being provisioned by demand: a busy line and an idle one need the same `t` points, and an idle
+    /// one provisioned to a single point has not degraded its guarantee, it has inverted it.
+    ///
+    /// The distinction is separate from [`load_is_self_gated`](Self::load_is_self_gated), which the other two
+    /// self-gated roles ([`Service`](Self::Service), [`Exit`](Self::Exit)) satisfy without needing a line: they
+    /// want *one* server retained so the role's load stays observable, and one is enough because one exit does
+    /// exit work. One rendezvous point does not do rendezvous work.
+    #[must_use]
+    pub const fn covers_a_threshold_line(self) -> bool {
+        matches!(self, Role::Rendezvous | Role::Ingress)
+    }
+
     /// This role's index into a per-role array, in [`Role::ALL`] order.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -444,11 +462,37 @@ impl Demand {
     ///
     /// Applied where the **cell total** is known, never per node: if every member floored its own contribution
     /// the cell would provision one server per member instead of one per cell.
+    ///
+    /// ## Two floors, because two different things can bind — and only one of them was here
+    ///
+    /// The floor above answers *observability*: one server keeps the role's load visible, which is the
+    /// persistent excitation the closed loop needs. For [`Role::covers_a_threshold_line`] roles that is the
+    /// **wrong question**, and getting the right answer to it is not enough. A rendezvous line's guarantee is
+    /// `t`-of-`(q+1)`: below `t` occupied points the line cannot peel at all, and a *single* occupied point is
+    /// not a weak anonymity set but none — that one node holds outright what the threshold exists to split.
+    /// So their floor is `line_threshold(line_size)`, a **security** requirement, not a measurement one.
+    ///
+    /// This was invisible while capacity was the placeholder `1`: the setpoint exceeded the eligible supply on
+    /// every active cell, `assign_report` filled `min(demand, eligible)`, and every offering node received the
+    /// role — so the line was fully occupied by saturation rather than by intent. Deriving a real capacity is
+    /// exactly what would have exposed it, by provisioning one rendezvous node and quietly collapsing the
+    /// line. The two must therefore land together, and the floor first.
+    ///
+    /// A floor above the supply is deliberately **not** capped — a cell that cannot staff its rendezvous line
+    /// to threshold genuinely cannot offer the guarantee, and that is a real deficit to escalate rather than a
+    /// phantom to suppress. Conditioning on `supply > 0` still stands: a role *nobody* offers gets no floor.
     #[must_use]
-    pub fn with_viability_floor(self, supply: Demand) -> Demand {
+    pub fn with_viability_floor(self, supply: Demand, line_size: usize) -> Demand {
         Demand::per_role(|role| {
-            let needs_floor = role.load_is_self_gated() && supply.of(role) > 0;
-            self.of(role).max(u16::from(needs_floor))
+            if supply.of(role) == 0 {
+                return self.of(role);
+            }
+            let floor = if role.covers_a_threshold_line() {
+                u16::try_from(fanos_geometry::line_threshold(line_size)).unwrap_or(u16::MAX)
+            } else {
+                u16::from(role.load_is_self_gated())
+            };
+            self.of(role).max(floor)
         })
     }
 }

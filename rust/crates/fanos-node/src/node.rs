@@ -114,9 +114,10 @@ fn ingress_params(config: &NodeConfig) -> Result<Option<IngressParams>, NodeErro
 /// liveness tests are what should confirm it.
 #[must_use]
 pub const fn mix_threshold(line_size: usize) -> usize {
-    // `⌈2m/3⌉` in integers. A degenerate line still needs someone to peel it, hence the floor of one.
-    let t = (2 * line_size).div_ceil(3);
-    if t == 0 { 1 } else { t }
+    // The mixnet's name for the line law, which lives beside the plane because a hop is not the only thing
+    // that needs it: a rendezvous line's occupancy floor and a threshold-hosted descriptor want the same
+    // `⌈2m/3⌉` for the same reason, and three restatements of one formula is three chances to drift.
+    fanos_geometry::line_threshold(line_size)
 }
 
 /// Whether a coalition **inside the tolerated fault budget** can capture the two distinct lines that name a

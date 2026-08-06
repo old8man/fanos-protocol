@@ -53,6 +53,7 @@ use std::sync::Arc;
 
 use fanos_core::roles::{Capability, Demand, Reputation, Role, RoleController, RoleReading, RoleSet};
 use fanos_field::Field;
+use fanos_geometry::Plane;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
 use fanos_quic::{Client, CoordinateProver};
 use fanos_runtime::Notification;
@@ -772,8 +773,8 @@ const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> 
 /// disagree only until both complete a scan of the same closed epoch. Nothing compounds, because the demand
 /// is recomputed from the floor every epoch rather than stepped from where it was. Under the carried demand
 /// this same fallback was the one path by which a momentary read failure became permanent.
-fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand) -> Demand {
-    if complete { read.with_viability_floor(supply) } else { held }
+fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand, line_size: usize) -> Demand {
+    if complete { read.with_viability_floor(supply, line_size) } else { held }
 }
 
 /// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
@@ -807,7 +808,15 @@ async fn assign_epoch<F: Field>(
             }
         }
     );
-    let setpoint = setpoint_to_track(setpoint, load_complete, live.last_agreed(), Demand::supply(&members));
+    // The plane's own line size, so the threshold-line roles are floored at `t`-of-`(q+1)` for THIS plane
+    // rather than at the base cell's three — the ceiling-computed-on-Fano defect (#122), one subsystem over.
+    let setpoint = setpoint_to_track(
+        setpoint,
+        load_complete,
+        live.last_agreed(),
+        Demand::supply(&members),
+        Plane::<F>::LINE_SIZE as usize,
+    );
     let roles = live.step(&members, epoch, &beacon, setpoint);
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
@@ -932,6 +941,13 @@ mod tests {
 
     use super::*;
     use fanos_core::roles::{Capability, Role, RoleSet, cell_setpoint};
+    use fanos_geometry::fano;
+
+    /// The threshold floor a line of `m` points imposes, in `Demand`'s units — the same conversion
+    /// `with_viability_floor` performs, so a test cannot pin a number the production path would not produce.
+    fn line_floor(m: usize) -> u16 {
+        u16::try_from(fanos_geometry::line_threshold(m)).unwrap_or(u16::MAX)
+    }
 
     fn node(i: u8) -> NodeId {
         NodeId([i; 32])
@@ -948,7 +964,7 @@ mod tests {
         let understated = Demand::default();
 
         assert_eq!(
-            setpoint_to_track(understated, false, held, supply),
+            setpoint_to_track(understated, false, held, supply, fano::LINE_SIZE),
             held,
             "a read that did not conclude is not evidence that demand fell — hold"
         );
@@ -957,17 +973,23 @@ mod tests {
         // believing a measured zero is the whole point of the sensor work, and a rule that never shrank a role
         // would trade one defect for its mirror image.
         let measured_zero = Demand::default();
-        let moved = setpoint_to_track(measured_zero, true, held, supply);
+        let moved = setpoint_to_track(measured_zero, true, held, supply, fano::LINE_SIZE);
         assert_eq!(moved.of(Role::Relay), 0, "a COMPLETE read of zero relay demand must shrink the role");
 
-        // …and the floor rides with the fresh branch, so a self-gated role stays observable.
-        assert_eq!(moved.of(Role::Rendezvous), 1, "the viability floor applies to the freshly-read setpoint");
+        // …and the floor rides with the fresh branch. Rendezvous is floored at the LINE THRESHOLD, not at one:
+        // its guarantee is `t`-of-`(q+1)` occupancy, so a single point is not a thin anonymity set but none.
+        assert_eq!(
+            moved.of(Role::Rendezvous),
+            line_floor(fano::LINE_SIZE),
+            "the freshly-read setpoint is floored, and for a threshold-line role the floor is t-of-(q+1)"
+        );
+        assert_eq!(moved.of(Role::Exit), 1, "a role that is merely self-gated keeps the observability floor of 1");
 
         // A young cell must not freeze. Its empty coordinates are definite absences, not unknowns, so the scan
         // reads complete and the demand is free to move from zero — which is what makes holding safe at all.
         let fresh = Demand::per_role(|r| if r == Role::Storage { 4 } else { 0 });
         assert_eq!(
-            setpoint_to_track(fresh, true, Demand::default(), supply).of(Role::Storage),
+            setpoint_to_track(fresh, true, Demand::default(), supply, fano::LINE_SIZE).of(Role::Storage),
             4,
             "a bootstrapping cell whose reads conclude tracks its first real setpoint"
         );
@@ -1062,10 +1084,31 @@ mod tests {
         // floor and the classification is a tautology — flipping the classification moves both sides together
         // and the test still passes, which is exactly what happened when this was first written. What must be
         // pinned is *which roles are which*, and that only a literal can say.
-        let floored = measured_nothing.with_viability_floor(everyone_offers);
+        let floored = measured_nothing.with_viability_floor(everyone_offers, fano::LINE_SIZE);
         assert_eq!(floored.of(Role::Service), 1, "nobody serving means no service to measure");
         assert_eq!(floored.of(Role::Exit), 1, "nobody exiting means no flows to measure");
-        assert_eq!(floored.of(Role::Rendezvous), 1, "nobody gathering means no gathers to measure");
+
+        // **The two floors are different questions, and this is where they part.** Observability is satisfied
+        // by one server; a threshold line is not. `t`-of-`(q+1)` is what a rendezvous line's anonymity set and
+        // POROS's seize-below-`t` guarantee both rest on, so one occupied point does not weaken the property —
+        // it inverts it, handing a single node what the threshold exists to split.
+        let t = line_floor(fano::LINE_SIZE);
+        assert_eq!(t, 2, "PG(2,2): a 3-point line acts at 2, and the floor must be that same t");
+        assert_eq!(floored.of(Role::Rendezvous), t, "a meeting line below t cannot peel at all");
+        assert_eq!(floored.of(Role::Ingress), t, "and POROS's ingress line is the same property");
+        assert!(
+            floored.of(Role::Rendezvous) > floored.of(Role::Exit),
+            "if these ever coincide the threshold floor has silently become the observability one"
+        );
+
+        // The floor tracks the PLANE, not the base cell — the ceiling-computed-on-Fano defect (#122) one
+        // subsystem over. On a wider plane a line is wider and so is the quorum that must occupy it.
+        let wide = measured_nothing.with_viability_floor(everyone_offers, 8);
+        assert_eq!(
+            wide.of(Role::Rendezvous),
+            line_floor(8),
+            "q=7: an 8-point line needs 6 occupied, not the Fano plane's 2"
+        );
         assert_eq!(
             floored.of(Role::Relay),
             0,
@@ -1079,14 +1122,14 @@ mod tests {
 
         // Nobody can serve any role: no floor anywhere, or the cell escalates a want no member can meet.
         assert_eq!(
-            measured_nothing.with_viability_floor(Demand::default()),
+            measured_nothing.with_viability_floor(Demand::default(), fano::LINE_SIZE),
             Demand::default(),
             "a role nobody offers must not be floored into a permanent phantom deficit"
         );
 
         // The floor never overrides a real measurement.
         let busy = Demand::per_role(|_| 9);
-        assert_eq!(busy.with_viability_floor(everyone_offers), busy, "a floor raises, it does not clamp");
+        assert_eq!(busy.with_viability_floor(everyone_offers, fano::LINE_SIZE), busy, "a floor raises, it does not clamp");
     }
 
     #[test]

@@ -44,6 +44,26 @@ pub use flag::Flag;
 pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 
+/// **How many of a line's `m` points must agree for the line to act** — `t = ⌈2m/3⌉`.
+///
+/// A line is FANOS's unit of collective action: a mixnet hop peels when `t` of its members do, a rendezvous
+/// line serves when `t` of it is occupied, a threshold-hosted descriptor opens at `t` shares. All of them
+/// want the same number, and for the same reason — a subset of `m` points carries about `m/3` corrupt in
+/// expectation, and `⌈2m/3⌉` is the threshold that preserves the Fano margin at every `m`. At `m = 3` it is
+/// `2`, which is what the base cell has always used.
+///
+/// It lives here, beside the plane, because it is a statement about a **line** rather than about any one
+/// subsystem — and because the alternative is each subsystem restating it. `fanos_node::node::mix_threshold`
+/// is this function under the mixnet's name, keeping that module's hop-capture derivation where a reader of
+/// the mixnet will find it.
+///
+/// A degenerate line still needs someone to act, hence the floor of one: a quorum of nobody is not a quorum.
+#[must_use]
+pub const fn line_threshold(line_size: usize) -> usize {
+    let t = (2 * line_size).div_ceil(3);
+    if t == 0 { 1 } else { t }
+}
+
 // Re-export the field crate so downstream users get a matched version.
 pub use fanos_field::{self, Field};
 
