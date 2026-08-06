@@ -2,8 +2,10 @@
 //! (`docs/design-storage.md` §6). A consumer escrows a price to store a chunk for a duration; the provider is
 //! paid **in arrears, one slice per passing audit**, and paid *nothing* for an epoch it fails. This is the whole
 //! incentive: FANOS forbids capital staking (it deanonymizes), so there is no bond to slash — a non-proving
-//! provider simply earns nothing and (via the reputation signal these settlements emit) loses future
-//! assignments, while the consumer is refunded every unproven epoch. Honest storage strictly dominates whenever
+//! provider simply earns nothing, while the consumer is refunded every unproven epoch. The settlements emit
+//! a reputation *observation*, but nothing consumes it yet (`Reputation::observe_reachable` has no production
+//! caller), so "loses future assignments" is the intended second consequence and not a present one — the
+//! earnings argument below stands on its own and does not rely on it. Honest storage strictly dominates whenever
 //! the per-epoch slice `p` clears the provider's cost `c`.
 //!
 //! This is the sans-I/O core: [`Deal::settle_epoch`] consumes an audit verdict (from [`crate::por::verify`]) and

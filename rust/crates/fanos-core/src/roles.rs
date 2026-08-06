@@ -220,8 +220,14 @@ pub const MAX_WEIGHT: u16 = 64;
 /// A node's **capability declaration**: which roles it can serve and its capacity class per the node's signed
 /// descriptor. `weight` is clamped to `1..=MAX_WEIGHT` (an offered role always gets at least one ticket; no
 /// node claims more than [`MAX_WEIGHT`] tickets). Only capabilities the node actually possesses should be
-/// declared — a node assigned a role it cannot serve fails to perform, which the cell's self-diagnosis detects
-/// and answers by slashing its weight (the reputation loop, `docs/design-self-organization.md` §4).
+/// declared — a node assigned a role it cannot serve fails to perform, which the cell's self-diagnosis detects.
+///
+/// **The answer to that detection is not yet wired, and this said it was.** [`Reputation`] is built and
+/// unit-proven, and [`Reputation::observe_reachable`] has no production caller: `assign_epoch` steps the
+/// controller and never observes, so every score sits at [`REP_SCALE`] and [`Reputation::adjust`] is the
+/// identity. `docs/design-self-organization.md` §5 already lists this as outstanding ("the performance-slash
+/// reputation feedback ... is specified, not yet closed in code"); the sentence here claimed otherwise, which
+/// is the more dangerous direction for a record to disagree in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capability {
     /// The roles this node offers to serve.

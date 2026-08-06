@@ -10,7 +10,9 @@
 //!
 //! Trust: the load report is a self-observation, and "never another's" is what the **coordinate binding**
 //! buys. A node can inflate its *own* reported load — over-provisioning a role it serves, bounded, one node's
-//! contribution to a sum, and the performance-reputation loop prices sustained mis-reporting.
+//! contribution to a sum, and the performance-reputation loop is *specified* to price sustained
+//! mis-reporting — but is not yet wired (`Reputation::observe_reachable` has no production caller), so today
+//! the coordinate binding is the whole defence and this line must not be read as a second one.
 //!
 //! **It could inflate anyone's until this was bound, and the doc said otherwise.** The store is
 //! content-addressed: a slot key embeds a coordinate, but nothing made the publisher own it, so one member
