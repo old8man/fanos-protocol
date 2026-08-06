@@ -59,7 +59,15 @@ pub struct RendezvousRelay<F: Field> {
     /// relay learns that coordinate; a full cell-node client uses NOSTOS instead and never registers here. A
     /// [`BoundedMap`] so an attacker-chosen 16-byte-cookie flood cannot grow it (audit robustness B2): at
     /// [`MAX_REGISTRATIONS`] the oldest is evicted (an evicted client re-registers; the fallback is best-effort).
-    registrations: BoundedMap<SessionId, Triple>,
+    ///
+    /// **Carries its epoch, and is retired on the turn** ([`retire_stale_registrations`](Self::retire_stale_registrations)).
+    /// Capacity alone is the wrong bound for this: it makes retention a function of TRAFFIC, so a busy relay
+    /// forgets quickly while a quiet one keeps every binding indefinitely — exactly backwards. And what is kept
+    /// is a table of *which coordinate ran which anonymous session*, which is the one thing a seized relay must
+    /// not be able to hand over. The neighbouring `hosts` field already retires by epoch for the same reason
+    /// (#58); a registration's usefulness ends with the epoch, because the client's route rotates with the
+    /// beacon and a reply for a stale cookie can reach nothing.
+    registrations: BoundedMap<SessionId, (Epoch, Triple)>,
     /// `service_tag → registration`: an anonymously-registered hidden service hosted **off** this combiner
     /// (`design-anonymity-substrate.md` §3b). A matching client request peeled here is re-sealed as a NOSTOS
     /// onion to the service's registered dead-drop line — reachable without any node learning its coordinate.
@@ -209,7 +217,7 @@ impl<F: Field> RendezvousRelay<F> {
     /// The coordinate registered for `cookie` (the bare-proxy fallback), if any.
     #[must_use]
     pub fn client_for(&self, cookie: &SessionId) -> Option<Triple> {
-        self.registrations.get(cookie).copied()
+        self.registrations.get(cookie).map(|(_, coord)| *coord)
     }
 
     /// The number of client sessions currently registered.
@@ -233,6 +241,7 @@ impl<F: Field> RendezvousRelay<F> {
     pub fn set_directory(&mut self, directory: MixDirectory) {
         self.directory = directory;
         self.retire_stale_hosts();
+        self.retire_stale_registrations();
     }
 
     /// Drop every hidden-service registration minted for an epoch this relay has passed.
@@ -257,6 +266,21 @@ impl<F: Field> RendezvousRelay<F> {
     fn retire_stale_hosts(&mut self) {
         let now = self.router.onion_epoch().get();
         self.hosts.retain(|_, (minted, _)| minted.get().saturating_add(HOST_GRACE_EPOCHS) >= now);
+    }
+
+    /// Retire client registrations from past epochs — the same argument as [`retire_stale_hosts`], applied to
+    /// the other table, which had only a capacity bound.
+    ///
+    /// A registration exists so this relay can forward one session's replies to the coordinate that asked. That
+    /// coordinate is the single most sensitive thing a relay can hold, and its usefulness is bounded by the
+    /// epoch: the client's route rotates with the beacon, so a reply against a stale cookie reaches nothing an
+    /// honest client is still listening for. Keeping it therefore serves no session and exactly one adversary —
+    /// whoever later takes the relay and reads the table.
+    ///
+    /// Same grace window as hosts, and for the same reason: a session live across the boundary must not be cut.
+    fn retire_stale_registrations(&mut self) {
+        let now = self.router.onion_epoch().get();
+        self.registrations.retain(|_, (seen, _)| seen.get().saturating_add(HOST_GRACE_EPOCHS) >= now);
     }
 
     /// A mutable reference to the wrapped router (for a composite engine to drive its epoch rotation).
@@ -295,7 +319,7 @@ impl<F: Field> RendezvousRelay<F> {
         if let Some(client) = payload
             .get(..size_of::<SessionId>())
             .and_then(|c| <SessionId>::try_from(c).ok())
-            .and_then(|cookie| self.registrations.get(&cookie))
+            .and_then(|cookie| self.registrations.get(&cookie).map(|(_, coord)| coord))
         {
             return vec![Effect::Send { to: *client, frame: framed(FrameType::RdvReply, &payload) }];
         }
@@ -341,7 +365,7 @@ impl<F: Field> RendezvousRelay<F> {
         };
         // The `BoundedMap` bounds this against a cookie flood: a re-registration refreshes the coordinate; a
         // new cookie takes a slot, evicting the oldest at capacity (audit B2) — a bounded map, not a leak.
-        self.registrations.insert(cookie, from);
+        self.registrations.insert(cookie, (self.router.onion_epoch(), from));
     }
 }
 
@@ -440,6 +464,46 @@ mod tests {
     use fanos_geometry::{Line, Point};
     use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
     use fanos_runtime::Epoch;
+
+    /// A client's coordinate is not kept past the epoch it was useful in.
+    ///
+    /// Capacity alone was the whole bound, which makes retention a function of TRAFFIC: a busy relay forgets
+    /// quickly and a quiet one keeps every binding indefinitely. That is backwards, and what it keeps is the
+    /// worst thing a relay can hold — a table of which coordinate ran which anonymous session, waiting for
+    /// whoever takes the machine. The neighbouring `hosts` map already retired by epoch (#58) and this one
+    /// did not, one field over, for the same reason and against a more sensitive value.
+    #[test]
+    fn a_client_registration_does_not_outlive_the_epoch_that_could_use_it() {
+        let line = Line::<F2>::at(0).coords();
+        let combiner = Point::<F2>::new(line_member_coords::<F2>(line)[0]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"expiry-id"));
+        let mut relay =
+            RendezvousRelay::new(ThresholdRouter::<F2>::new(combiner, &identity, 1, [0x71; 32]));
+
+        let cookie = [0xC0u8; 16];
+        relay.step(Instant(0), Input::Message { from: [1, 2, 3], frame: register_frame(cookie) });
+        assert_eq!(relay.client_for(&cookie), Some([1, 2, 3]), "the registration binds in its own epoch");
+
+        // One turn: still inside the grace window, so a session live across the boundary is not cut.
+        relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        relay.set_directory(MixDirectory::new());
+        assert_eq!(
+            relay.client_for(&cookie),
+            Some([1, 2, 3]),
+            "one epoch of grace, so a session in flight across the rotation still gets its replies"
+        );
+
+        // A second turn puts it out of reach of any honest client — the client's route rotated with the
+        // beacon two epochs ago — so keeping the coordinate can serve nobody but a seizure.
+        relay.step(Instant(2), Input::Command(Command::AdvanceEpoch));
+        relay.set_directory(MixDirectory::new());
+        assert_eq!(
+            relay.client_for(&cookie),
+            None,
+            "the coordinate is gone once no honest client could still be listening against this cookie"
+        );
+        assert_eq!(relay.registrations(), 0, "and the slot is released, not merely unreadable");
+    }
 
     #[test]
     fn the_registration_map_is_bounded_against_a_cookie_flood() {
