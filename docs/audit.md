@@ -4096,3 +4096,52 @@ feeding the state root. Then a bond (with an admission rule that an unbonded val
 stays false however large the constant), and only then is there anything for the Γ-gate to evaluate. Until
 both exist, `docs/design-incentive-equilibrium.md` describes a configuration the node does not ship, and
 should say so.
+
+---
+
+## One shape, six places (2026-08-06, consolidating the day's sweep)
+
+Every finding above and below came from one question asked repeatedly:
+
+> **What is this decision computed from, and does that input have the standing the decision requires?**
+
+"Standing" means two different things depending on the decision, and conflating them is what hides these:
+
+* a decision that must be **identical on every node** needs an input every node reads identically;
+* a decision that must be **safe against an adversary** needs an input sized against what that adversary can
+  choose, not against what it gets on average.
+
+| where | the decision | the input | which standing fails |
+|---|---|---|---|
+| `build_cell_setpoint` (#130, fixed `83d9ed2`) | cell-wide role counts | the **live** epoch's load directory | agreement |
+| `try_execute` (#137) | whether a transfer executes | **locally received** reveals, on an agreed clock | agreement |
+| `try_form_checkpoint` (#126) | is our state the cell's | the quorum root, **never compared** to ours | — (the check is absent) |
+| `maybe_request_sync` / `on_sync_req` (#126) | do we need / serve state | **height**, where the property is the state root | — (wrong quantity) |
+| `seal_threshold` (#136) | how many keypers open a tx | the **per-line average** share of corruption | adversary |
+| `with_viability_floor` (fixed `e34ab63`) | how many nodes a role needs | **observability**, where two roles need a threshold | adversary |
+| `Notification::Rebalance` (#139) | cell-wide DDoS response | **this node's** sample — and nothing consumes it | agreement |
+
+### The §6.7 response reaches a log line
+
+`Healer`'s under-coupled `Bind` band emits `Notification::Rebalance { loads }`, and the comments state the
+derivation in full: *"the derived response is `loadbalance::balance_exact(loads)` = the uniform mean, driving
+the hotspot into the whole cell at the projective contraction `λ₂ = 2/9`."*
+
+Every consumer of that notification: the simulator's display formatter, and two matches inside
+`overlay/mod.rs`'s `#[cfg(test)]` module. Every caller of `balance_exact`: that same test module, its own unit
+tests, and two doc comments calling it "the derived response". **The response is computed nowhere.** The cell
+detects the hotspot, names the answer in prose, and does nothing — the [[built-but-nothing-calls-it]] shape
+again, alongside L7 (#138) and the holonomy authenticator (#53).
+
+And wiring it naively would add a seventh row to the table above: `loads` is `self.last_sample`, this node's
+own reading, so two nodes in the band would publish different vectors and derive different targets. The fix
+has to choose deliberately between a **local** response (each node sheds its own forwarding — no agreement
+needed) and an **agreed** one (publish the sample to an epoch-keyed directory and compute over a closed
+epoch, the `loaddir` pattern). Only the second can reassign work *between* nodes.
+
+### The habit
+
+Two of these were found only because a *neighbouring* fix would have exposed them — deriving the role capacity
+would have collapsed the rendezvous line, and wiring the rebalance would have forked the response. So the
+question has a companion: **before replacing a known-wrong value, ask what its wrongness is currently holding
+up.**
