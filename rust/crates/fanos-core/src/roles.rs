@@ -644,9 +644,26 @@ impl LoadMeter {
 
 /// Reputation fixed-point scale: a score of [`REP_SCALE`] is full (declared weight honored in full).
 pub const REP_SCALE: u16 = 256;
+/// How much one good window recovers: the single free parameter of the reputation law.
+///
+/// It sets the recovery time — `REP_SCALE/REP_RECOVER - 1` good windows from the floor back to full, seven at
+/// the shipped value — and, through [`REP_FLOOR`], everything else.
+pub const REP_RECOVER: u16 = REP_SCALE / 8;
+
 /// Reputation floor: a persistently-non-performing node keeps `REP_FLOOR/REP_SCALE` of its declared weight —
 /// never fully excluded (it may recover, and exclusion would be a censorship lever), only de-prioritized.
-pub const REP_FLOOR: u16 = REP_SCALE / 8;
+///
+/// **Derived, not chosen: it is the alternating shirker's fixed point.** With additive recovery `r` and
+/// multiplicative halving on failure, a node that serves every other window settles at
+/// `x = (x + r)/2`, i.e. `x = r` — exactly, for every `r`, and it is checked as such
+/// (`the_floor_is_the_alternating_shirkers_fixed_point`). So setting `REP_FLOOR = REP_RECOVER` states the
+/// property the floor is for: **a node that shirks half the time is worth the floor and no more**, and one
+/// that shirks less is worth strictly more. A floor *below* the fixed point would be unreachable and so
+/// decorative; a floor *above* it would pay an alternator more than its behaviour earns.
+///
+/// It used to be an independent `REP_SCALE / 8` beside a recovery step of `REP_SCALE / 8` — the same number
+/// twice, with no statement that they must be the same number. They must.
+pub const REP_FLOOR: u16 = REP_RECOVER;
 
 /// A per-node **performance reputation** — the third bound on the "controlled freedom" of the self-organizing
 /// loop (`docs/design-self-organization.md` §5): a node declares capability freely, but an assignee that does
@@ -681,7 +698,7 @@ impl Reputation {
     pub fn observe(&mut self, node: NodeId, performed: bool) {
         let cur = self.score(&node);
         let next = if performed {
-            cur.saturating_add(REP_SCALE / 8).min(REP_SCALE)
+            cur.saturating_add(REP_RECOVER).min(REP_SCALE)
         } else {
             (cur / 2).max(REP_FLOOR)
         };
@@ -716,12 +733,33 @@ impl Reputation {
     /// Apply reputation to a member set for the assignment: each capability keeps its offered roles but its
     /// weight becomes the [`effective_weight`](Self::effective_weight). Feed the result to [`assign`] /
     /// [`RoleController::step`] so reputation shapes who wins scarce roles.
+    ///
+    /// **Also the moment the table is trimmed to the roster** ([`retain_members`](Self::retain_members)),
+    /// because it is the one call that is handed the membership.
     #[must_use]
-    pub fn adjust(&self, members: &[(NodeId, Capability)]) -> Vec<(NodeId, Capability)> {
+    pub fn adjust(&mut self, members: &[(NodeId, Capability)]) -> Vec<(NodeId, Capability)> {
+        self.retain_members(members);
         members
             .iter()
             .map(|(id, cap)| (*id, Capability::new(cap.offered, self.effective_weight(id, cap.weight))))
             .collect()
+    }
+
+    /// Drop the scores of nodes that are no longer members.
+    ///
+    /// `scores` had `get` and `insert` and nothing else — a node observed once kept its score for the life of
+    /// the process, so the table grew with every identity the cell ever saw rather than with the cell. Ask of
+    /// any accumulating map what removes from it; here the answer was nothing.
+    ///
+    /// Dropping is also the *correct* semantics, not merely the bounded one. A returning node is scored from
+    /// [`REP_SCALE`] like any unseen one, and that is the same rule the reachability excuse already encodes:
+    /// reputation prices **shirking while reachable**, and a node that was absent was not shirking. Carrying a
+    /// stale score across a departure would punish an outage the corroboration exists to forgive.
+    ///
+    /// Determinism is preserved because every node runs this over the same agreed membership, in the same
+    /// call, before the same assignment.
+    fn retain_members(&mut self, members: &[(NodeId, Capability)]) {
+        self.scores.retain(|id, _| members.iter().any(|(m, _)| m == id));
     }
 }
 
@@ -880,6 +918,63 @@ pub fn assign_report(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+
+    /// The floor is not a second constant: it is where an alternating shirker lands.
+    ///
+    /// With additive recovery `r` and a halving on failure, `x -> (x + r)/2` has the fixed point `x = r`. So a
+    /// node that serves every other window is worth exactly the floor — no more, which would overpay it, and
+    /// no less, which would make the floor unreachable and therefore decorative. Checked by running the law
+    /// rather than by re-deriving it, because the code uses integer division and the algebra does not.
+    #[test]
+    fn the_floor_is_the_alternating_shirkers_fixed_point() {
+        let node = NodeId([9u8; 32]);
+        let mut rep = Reputation::new();
+        for _ in 0..64 {
+            rep.observe(node, true);
+            rep.observe(node, false);
+        }
+        assert_eq!(
+            rep.score(&node),
+            REP_FLOOR,
+            "a node serving every other window settles exactly at the floor"
+        );
+        assert_eq!(REP_FLOOR, REP_RECOVER, "and the floor IS the recovery step, which is why it settles there");
+
+        // Serving MORE than half is worth strictly more than the floor — otherwise the floor would be a
+        // ceiling on everyone who ever failed, and the law would not price behaviour at all.
+        let better = NodeId([8u8; 32]);
+        let mut rep = Reputation::new();
+        for _ in 0..64 {
+            rep.observe(better, true);
+            rep.observe(better, true);
+            rep.observe(better, false);
+        }
+        assert!(
+            rep.score(&better) > REP_FLOOR,
+            "two-in-three is worth more than the floor ({} vs {REP_FLOOR})",
+            rep.score(&better)
+        );
+    }
+
+    /// A departed node's score does not outlive its membership.
+    #[test]
+    fn a_score_is_dropped_when_the_node_leaves_the_roster() {
+        let (stayed, left) = (NodeId([1u8; 32]), NodeId([2u8; 32]));
+        let mut rep = Reputation::new();
+        rep.observe(stayed, false);
+        rep.observe(left, false);
+        assert!(rep.score(&left) < REP_SCALE, "the leaver was scored down while a member");
+
+        let roster = [(stayed, Capability::new(RoleSet::EMPTY, 10))];
+        let _ = rep.adjust(&roster);
+        assert!(rep.score(&stayed) < REP_SCALE, "a member keeps its score across the assignment");
+        assert_eq!(
+            rep.score(&left),
+            REP_SCALE,
+            "a node off the roster is forgotten, so a returning one is scored fresh like any unseen node — \
+             reputation prices shirking while reachable, and an absent node was not shirking"
+        );
+    }
     use super::*;
 
     fn node(n: u8) -> NodeId {
