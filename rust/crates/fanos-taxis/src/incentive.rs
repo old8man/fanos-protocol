@@ -252,7 +252,8 @@ pub fn blocking_threshold(cell: CellParams) -> usize {
 /// of that line's keyper members to deny the `t` honest reveals a transaction sealed to it needs.
 #[must_use]
 fn blocks_line(coalition: &[u8], line: usize, cell: CellParams) -> bool {
-    let held = line_members(line).into_iter().filter(|&m| coalition.contains(&(m as u8))).count();
+    let held =
+        line_members(line).into_iter().flatten().filter(|&m| coalition.contains(&(m as u8))).count();
     held >= blocking_threshold(cell)
 }
 
@@ -445,7 +446,7 @@ mod tests {
         assert_eq!(blocking_threshold(cell), 2);
         // One validator on a keyper line never blocks it (the theorem's unilateral base case).
         for line in 0..fano::N {
-            let m = line_members(line);
+            let m = line_members(line).expect("a real line");
             assert!(!blocks_line(&[m[0] as u8], line, cell), "a lone member cannot block line {line}");
             assert!(blocks_line(&[m[0] as u8, m[1] as u8], line, cell), "two members block line {line}");
         }

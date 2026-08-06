@@ -1962,7 +1962,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if self.round0_window.is_none() {
             self.round0_window = Some(0);
         }
-        let line_size = line_members(leader_line(&self.seed, height, 0)).len();
+        let line_size = line_members(leader_line(&self.seed, height, 0)).map_or(0, |m| m.len());
         if self.round0_tickets.len() >= line_size {
             return self.prepare_round0_min();
         }
@@ -2607,7 +2607,10 @@ impl<S: StateMachine> ConsensusEngine<S> {
     fn emit_reveals(&mut self, block: &Block) -> Vec<Output> {
         let mut out = Vec::new();
         for tx in &block.sealed_txs {
-            let members = line_members(usize::from(tx.line));
+            // `valid_seal` gates both ingress paths on `tx.line == epoch_seal_line(..)`, which is `% N`, so a
+            // transaction in a block always names a real line. `None` here would mean that gate was bypassed,
+            // and skipping is then the only safe answer: a committee we cannot name is one we cannot be on.
+            let Some(members) = line_members(usize::from(tx.line)) else { continue };
             let Some(pos) = members.iter().position(|&m| m == usize::from(self.me)) else {
                 continue; // not on this transaction's sealing committee
             };
@@ -2687,7 +2690,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
         let Some(tx) = self.sealed_tx_for(&r.commit) else {
             return false;
         };
-        let members = line_members(usize::from(tx.line));
+        let Some(members) = line_members(usize::from(tx.line)) else {
+            return false; // see `emit_reveals`: an unnameable committee has no members to accept a reveal from
+        };
         let Some(pos) = members.iter().position(|&m| m == usize::from(r.member)) else {
             return false; // the sender is not on this transaction's keyper line
         };

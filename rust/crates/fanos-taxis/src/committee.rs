@@ -51,11 +51,27 @@ pub fn leader_line(seed: &BeaconSeed, height: u64, round: u32) -> usize {
     (draw(&digest) % fano::N as u64) as usize
 }
 
-/// The `q + 1 = 3` validator indices on Fano line `line` (its committee members), in canonical order.
+/// The `q + 1 = 3` validator indices on Fano line `line` (its committee members), in canonical order, or
+/// `None` if `line` is not a line of the plane.
+///
+/// **`None` rather than a default, and the default it replaced is why.** This used to fall back to
+/// `[0, 0, 0]` — a value that *looks* like a committee and is validator 0 three times over. Every path that
+/// reaches this today derives `line` as `… % fano::N`, so the fallback was unreachable; what makes it worth
+/// removing anyway is where it lands if it ever is reached.
+///
+/// `KeyperRegistry::line_keys` maps these indices through `key(m)` and returns `None` "if any elected member
+/// index is out of range". Index 0 is always in range, so `[0, 0, 0]` yields `Some([k0, k0, k0])` — a
+/// transaction sealed to that "line" is sealed to ONE validator's key three times, and that validator alone
+/// decrypts every transaction in the epoch. The anti-MEV threshold becomes 1-of-1 while every guard reports
+/// success, which is exactly the inversion #63 found in the service line: a degenerate committee that is
+/// accepted because it has the right *shape*.
+///
+/// So the argument is not "this is reachable". It is that a fallback whose value silently collapses a
+/// threshold must not be representable, because the thing that would catch it is the check it satisfies.
 #[must_use]
-pub fn line_members(line: usize) -> [usize; fano::LINE_SIZE] {
-    let pts = fano::LINE_POINTS.get(line).copied().unwrap_or([0, 0, 0]);
-    [pts[0] as usize, pts[1] as usize, pts[2] as usize]
+pub fn line_members(line: usize) -> Option<[usize; fano::LINE_SIZE]> {
+    let pts = fano::LINE_POINTS.get(line).copied()?;
+    Some([pts[0] as usize, pts[1] as usize, pts[2] as usize])
 }
 
 /// The elected **proposer** for `(height, round)`: the member of the elected [`leader_line`] whose
@@ -72,8 +88,11 @@ pub fn leader(seed: &BeaconSeed, height: u64, round: u32) -> usize {
         hash_labeled(LEADER_MEMBER_LABEL, &buf)
     };
     // The committee member with the smallest keyed digest — a uniform pick within the elected line.
+    // `leader_line` returns `… % fano::N`, so the line is always real; a plane that ever stopped being Fano
+    // would surface here as index 0 rather than as a silently degenerate committee.
     line_members(line)
         .into_iter()
+        .flatten()
         .min_by_key(|&m| member_key(m))
         .unwrap_or(0)
 }
@@ -103,9 +122,11 @@ pub fn cross_shard_bridge(line_a: usize, line_b: usize) -> Option<usize> {
     if line_a == line_b || line_a >= fano::N || line_b >= fano::N {
         return None;
     }
-    // The two lines' point sets share exactly one index (dual Steiner / Maekawa).
-    let a = line_members(line_a);
-    let b = line_members(line_b);
+    // The two lines' point sets share exactly one index (dual Steiner / Maekawa). Both are real lines — the
+    // range check above already returned — so the `?`s here are the type carrying that fact rather than a
+    // second guard.
+    let a = line_members(line_a)?;
+    let b = line_members(line_b)?;
     a.into_iter().find(|p| b.contains(p))
 }
 
@@ -135,7 +156,7 @@ pub fn cross_shard_bridge(line_a: usize, line_b: usize) -> Option<usize> {
 /// (public); *which* member leads is secret until it proposes.
 #[must_use]
 pub fn is_line_member(seed: &BeaconSeed, height: u64, round: u32, member: usize) -> bool {
-    line_members(leader_line(seed, height, round)).contains(&member)
+    line_members(leader_line(seed, height, round)).is_some_and(|m| m.contains(&member))
 }
 
 /// A line member's **secret-leader sortition ticket** for `(height, round)`:
@@ -188,6 +209,33 @@ pub fn verify_leader_ticket(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+
+    /// A line index off the plane has no committee, and the value it used to get is why that matters.
+    ///
+    /// The old fallback was `[0, 0, 0]`: validator 0, three times. `KeyperRegistry::line_keys` maps members
+    /// through `key(m)` and returns `None` only when an index is out of RANGE — index 0 never is — so that
+    /// value produced `Some([k0, k0, k0])`, a transaction sealed to one validator's key three times, decrypted
+    /// by that validator alone. The anti-MEV threshold collapses to 1-of-1 while every check reports success,
+    /// which is #63's inversion again: a committee accepted because it has the right SHAPE.
+    ///
+    /// It was not reachable — `valid_seal` gates both ingress paths on `tx.line == epoch_seal_line(..)`, which
+    /// is `% N` — and that is the point of removing it anyway. A fallback whose value silently collapses a
+    /// threshold must not be representable, because the thing that would catch it is the check it satisfies.
+    #[test]
+    fn a_line_off_the_plane_has_no_committee_rather_than_a_degenerate_one() {
+        for line in [fano::N, fano::N + 1, usize::MAX] {
+            assert_eq!(line_members(line), None, "line {line} is not a line of the plane");
+        }
+        // Every real line has three DISTINCT members — the property the old default silently broke.
+        for line in 0..fano::N {
+            let m = line_members(line).expect("a real line");
+            assert_eq!(m.len(), fano::LINE_SIZE);
+            assert!(
+                m[0] != m[1] && m[1] != m[2] && m[0] != m[2],
+                "line {line} has a repeated member {m:?}, so its threshold is smaller than it looks"
+            );
+        }
+    }
     use super::*;
 
     const SEED: BeaconSeed = BeaconSeed::new([7u8; 32]);
@@ -201,7 +249,7 @@ mod tests {
                 assert!(line < fano::N);
                 assert!(leader < fano::N);
                 assert!(
-                    line_members(line).contains(&leader),
+                    line_members(line).is_some_and(|m| m.contains(&leader)),
                     "the proposer must sit on the elected committee line"
                 );
                 // Deterministic in (seed, height, round).
@@ -268,9 +316,13 @@ mod tests {
                     assert_eq!(bridge, None, "a line does not bridge to itself");
                 } else {
                     let p = bridge.expect("distinct lines share a validator");
-                    assert!(line_members(a).contains(&p) && line_members(b).contains(&p));
+                    assert!(
+                        line_members(a).is_some_and(|m| m.contains(&p))
+                            && line_members(b).is_some_and(|m| m.contains(&p))
+                    );
                     // Uniqueness: exactly one shared point.
-                    let shared = line_members(a).into_iter().filter(|x| line_members(b).contains(x)).count();
+                    let (ma, mb) = (line_members(a).expect("a real line"), line_members(b).expect("a real line"));
+                    let shared = ma.into_iter().filter(|x| mb.contains(x)).count();
                     assert_eq!(shared, 1, "lines {a},{b} share exactly one validator");
                 }
             }
@@ -285,7 +337,7 @@ mod tests {
             for round in 0..3u32 {
                 let members = line_members(leader_line(&SEED, height, round));
                 for m in 0..fano::N {
-                    assert_eq!(is_line_member(&SEED, height, round, m), members.contains(&m));
+                    assert_eq!(is_line_member(&SEED, height, round, m), members.expect("a real line").contains(&m));
                 }
                 // The round ≥ 1 public fallback proposer is always drawn from the same line.
                 assert!(is_line_member(&SEED, height, round, leader(&SEED, height, round)));

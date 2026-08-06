@@ -202,7 +202,7 @@ impl KeyperRegistry {
     #[must_use]
     pub fn line_keys(&self, seed: &BeaconSeed, epoch: Epoch) -> Option<Vec<&HybridKemPublic>> {
         let line = epoch_seal_line(seed, epoch);
-        line_members(line).iter().map(|&m| self.key(m)).collect()
+        line_members(line)?.iter().map(|&m| self.key(m)).collect()
     }
 
     /// The Fano line index of the epoch's keyper committee (`crate::committee::epoch_seal_line`).
@@ -298,7 +298,7 @@ mod tests {
         let (_s, _v, _k, registry) = cell(7);
         let epoch = Epoch::new(3);
         let keys = registry.line_keys(&SEED, epoch).expect("in-range line");
-        let members = line_members(epoch_seal_line(&SEED, epoch));
+        let members = line_members(epoch_seal_line(&SEED, epoch)).expect("a real line");
         assert_eq!(keys.len(), members.len());
         for (k, &m) in keys.iter().zip(members.iter()) {
             assert_eq!(k.encode(), registry.key(m).unwrap().encode(), "line key {m} matches the registry");
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(sealed.epoch, epoch);
         assert_eq!(usize::from(sealed.line), epoch_seal_line(&SEED, epoch));
         // A threshold of the *elected committee members* recovers the plaintext.
-        let members = line_members(epoch_seal_line(&SEED, epoch));
+        let members = line_members(epoch_seal_line(&SEED, epoch)).expect("a real line");
         let t = usize::from(params.seal_threshold());
         let shares: Vec<_> = members
             .iter()

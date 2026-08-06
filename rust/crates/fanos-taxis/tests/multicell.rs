@@ -153,7 +153,7 @@ impl<S: StateMachine + Clone> Cell<S> {
 
     /// Seal a transfer to this epoch's keyper line (so it passes admission).
     fn seal(&self, transfer: Transfer, tag: &[u8]) -> SealedTx {
-        let members = line_members(epoch_seal_line(&SEED, EPOCH));
+        let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
         let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &self.kem_dir[m]).collect();
         SealedTx::seal(&transfer.into_tx(), EPOCH, epoch_seal_line(&SEED, EPOCH) as u8, &member_keys, CellParams::FANO.seal_threshold(), tag)
             .unwrap()

@@ -52,7 +52,7 @@ fn vrf_seed(i: usize) -> [u8; 32] {
 
 /// The independently-recomputed SSLE winner: the elected line member with the lowest ticket at `(height, 0)`.
 fn expected_ssle_leader(height: u64) -> u8 {
-    let members = line_members(leader_line(&SEED, height, 0));
+    let members = line_members(leader_line(&SEED, height, 0)).expect("a real line");
     members
         .into_iter()
         .min_by_key(|&m| {
@@ -603,7 +603,7 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
 
     // Anti-MEV precondition: the sealed transaction is opaque to any single validator (< t = 2 shares) —
     // a proposer orders it blind, unable to see it is an ALICE→BOB transfer.
-    let members = line_members(epoch_seal_line(&SEED, EPOCH));
+    let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
     let keys = gen_keys();
     let share0 = tx.member_share(0, &keys[members[0]].kem).expect("member 0 opens its own slot");
     assert!(tx.open(&[share0]).is_err(), "one share (< t = 2) must not decrypt the transaction");
@@ -721,7 +721,7 @@ fn ssle_the_secret_min_ticket_line_member_leads_and_finalizes() {
     // The finalized block was proposed by the min-ticket winner (a genuine line member), and carries its witness.
     let finalized = c.hashes_at(0).into_iter().next().unwrap();
     let block = c.proposed.iter().find(|b| b.hash() == finalized).unwrap();
-    let members = line_members(leader_line(&SEED, 0, 0));
+    let members = line_members(leader_line(&SEED, 0, 0)).expect("a real line");
     assert!(members.contains(&usize::from(block.header.proposer)), "the secret leader is an elected line member");
     assert_eq!(block.header.proposer, expected_ssle_leader(0), "the finalized proposer is the lowest-ticket member");
     assert!(block.witness.is_some(), "a round-0 secret-leader block carries its Merkle-VRF ticket witness");
@@ -762,7 +762,10 @@ fn ssle_leadership_is_secret_valued_and_not_the_public_schedule() {
             // (no witness, from a view change) is led by the deterministic leader — both are line members.
             if block.witness.is_some() {
                 assert_eq!(block.header.proposer, expected_ssle_leader(h), "height {h}: min-ticket leader");
-                assert!(line_members(leader_line(&SEED, h, 0)).contains(&usize::from(block.header.proposer)));
+                assert!(
+                    line_members(leader_line(&SEED, h, 0))
+                        .is_some_and(|m| m.contains(&usize::from(block.header.proposer)))
+                );
                 if block.header.proposer != leader(&SEED, h, 0) as u8 {
                     differed_from_public = true;
                 }
@@ -780,7 +783,7 @@ fn ssle_a_down_line_member_does_not_stall_the_round_the_window_expiry_finalizes(
     // the candidate set — no view change (round advance) is needed, so this stays a witnessed round-0 block.
     let mut c = Cluster::new(&genesis());
     c.enable_sortition_all();
-    let members = line_members(leader_line(&SEED, 0, 0));
+    let members = line_members(leader_line(&SEED, 0, 0)).expect("a real line");
     let victim = members[0];
     c.crashed[victim] = true;
 
@@ -1686,7 +1689,7 @@ fn a_forged_reveal_cannot_censor_a_finalized_transaction() {
     let mut c = Cluster::new(&genesis());
     let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"censor");
     let commit = tx.commit();
-    let members = line_members(epoch_seal_line(&SEED, EPOCH));
+    let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
     let keys = gen_keys();
     // A validator NOT on the keyper line forges member 0's slot (x = 1) with garbage, signed by its own key.
     let attacker = (0..N as u8).find(|v| !members.contains(&(*v as usize))).unwrap();
@@ -1712,7 +1715,7 @@ fn a_byzantine_committee_members_garbage_share_does_not_block_decryption() {
     let mut c = Cluster::new(&genesis());
     let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 77, nonce: 0 }, b"byz-share");
     let commit = tx.commit();
-    let members = line_members(epoch_seal_line(&SEED, EPOCH));
+    let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
     let keys = gen_keys();
     // Keyper member 0 signs a GARBAGE share at its own correct x-coordinate (x = 1) — a well-formed forgery
     // that authentication cannot catch, injected before finality so first-writer-wins records it at slot 0.
@@ -1737,7 +1740,7 @@ fn a_transaction_sealed_to_the_wrong_keyper_line_is_refused() {
     let mut c = Cluster::new(&genesis());
     let right = epoch_seal_line(&SEED, EPOCH);
     let wrong = (0..7usize).find(|&l| l != right).unwrap();
-    let members = line_members(wrong);
+    let members = line_members(wrong).expect("a real line");
     let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &c.kem_dir[m]).collect();
     let tx = SealedTx::seal(
         &Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx(),
