@@ -54,6 +54,17 @@ jobs:
       # the datapath (nothing does yet).
       - name: Clippy — the vpn feature (real TUN device)
         run: cargo clippy -p fanos-node --features vpn --all-targets -- -D warnings
+      # And the three remaining feature surfaces nothing else builds. Traced by enumerating every declared
+      # feature and asking what enables it: `fanos-primitives`' `aead`/`wire` and `fanos-nyx`'s
+      # `transparent-onion` are turned on by dependents, so the runs above compile them. These three are
+      # turned on by nobody — `observatory/sim` gates a target behind `required-features`, so
+      # `cargo test --workspace` SKIPS it rather than failing, which is the quietest form of the same gap.
+      # All three compiled clean when this was added; the point is that nothing was keeping them that way.
+      - name: Clippy — the feature surfaces no other job compiles
+        run: |
+          cargo clippy -p fanos-observatory --features sim --all-targets -- -D warnings
+          cargo clippy -p fanos-telemetry --features sysinfo --all-targets -- -D warnings
+          cargo clippy -p fanos-wasm --features wasm --all-targets -- -D warnings
       # `--no-fail-fast`, and it is not a style preference. `cargo test` stops at the FIRST failing target,
       # so every target ordered after it goes unrun and reports nothing — a green-looking absence rather than
       # a red result. Measured 2026-08-04: `fanos-wire`'s conformance KAT had been failing for six days
@@ -72,8 +83,15 @@ jobs:
         run: |
           cargo test -p fanos-quic --no-fail-fast
           cargo test -p fanos-node --no-fail-fast
-      - name: Tests — validator features (ledger · consensus · TAXIS)
-        run: cargo test --workspace --features validator --no-fail-fast --exclude fanos-node
+      # There is deliberately no `cargo test --workspace --features validator --exclude fanos-node` step.
+      # It was here, and it could never run: `validator` is declared on `fanos-node` and nowhere else, so
+      # excluding that package leaves cargo with a feature no selected package has and it errors out before
+      # a single test — *"none of the selected packages contains this feature: validator"*. The step was
+      # named for the ledger/consensus/TAXIS tests and never ran them.
+      #
+      # It was also redundant even if it had run. `fanos-taxis` and `fanos-dromos` are workspace members, so
+      # the default step above tests them directly; the feature only decides whether `fanos-node` links them.
+      # The step below is the coverage that flag actually needs.
       - name: Tests — fanos-node with validator features, alone
         run: cargo test -p fanos-node --features validator --no-fail-fast
       - name: Reference verifier (V1–V22)
