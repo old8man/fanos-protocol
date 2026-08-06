@@ -787,6 +787,94 @@ impl Reputation {
     }
 }
 
+/// One node's **published** view of its cell for one epoch — the record the reputation is recomputed from.
+///
+/// Every node publishes its own, coordinate-bound, to the epoch's slot; every node then reads the whole set
+/// for a **closed** epoch and recomputes. That ordering is the point: a closed epoch's record set no longer
+/// changes, so the recompute is a pure function of agreed bytes rather than of anyone's live measurements.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DiagnosisRecord {
+    /// Which cell index published it (its Fano point).
+    pub publisher: u8,
+    /// The epoch it describes.
+    pub epoch: u64,
+    /// Bit `i` set ⇒ the publisher found point `i` degraded past its viability threshold.
+    pub degraded: u8,
+    /// Bit `i` set ⇒ the publisher heard from point `i` at all (the weaker, one-witness predicate).
+    pub responsive: u8,
+}
+
+impl Reputation {
+    /// Recompute a reputation from published diagnoses — a **pure function of the record set**, which is the
+    /// property the carried version could not have.
+    ///
+    /// ## Why recompute rather than accumulate
+    ///
+    /// `observe_reachable` folds a node's *local* measurement into a carried map, and the local measurement is
+    /// genuinely local: `coord_alive` trusts its own eyes before any corroboration, so two healthy nodes
+    /// disagree about a peer they have contacted differently. For a stateless decision that is a rare wrong
+    /// answer; for an accumulator it is permanent, because the divergence is written into the score and never
+    /// washes out — and every node's `adjust`, and therefore the cell's whole role assignment, forks with it.
+    ///
+    /// Recomputing removes the failure mode instead of narrowing it. Two nodes that read the same closed
+    /// epochs get the same score *whatever* their local views were, and a node that read a stale set converges
+    /// the moment it re-reads. Self-healing rather than merely unlikely.
+    ///
+    /// ## The aggregation, and why it is a quorum
+    ///
+    /// A member is judged to have PERFORMED in an epoch when at least `quorum` publishers reported it
+    /// undegraded, and to have been REACHABLE when at least `quorum` heard it at all. One publisher therefore
+    /// cannot move a score, which matters because a record is a claim about *others*: a Byzantine member that
+    /// declares the whole cell degraded is outvoted rather than believed. It is the same question the liveness
+    /// layer already asks with the same shape of answer, so `quorum` should be the corroboration quorum.
+    ///
+    /// Epochs strictly older than `latest - window` are ignored, so the score has a bounded, stated memory
+    /// rather than the unbounded one a carried map has.
+    ///
+    /// `members` is indexed by cell point: `members[i]` is the identity at Fano point `i`.
+    #[must_use]
+    pub fn from_published(
+        records: &[DiagnosisRecord],
+        members: &[NodeId],
+        latest: u64,
+        window: u64,
+        quorum: usize,
+    ) -> Self {
+        let mut rep = Self::new();
+        let oldest = latest.saturating_sub(window);
+        // Replay the epochs in order, so the law's asymmetry (fast to punish, slow to trust) is applied to the
+        // same sequence on every node. Sorting is what makes "the same record set" enough: a store read can
+        // return them in any order, and the fold is not commutative.
+        let mut epochs: Vec<u64> =
+            records.iter().map(|r| r.epoch).filter(|e| *e > oldest && *e <= latest).collect();
+        epochs.sort_unstable();
+        epochs.dedup();
+        for epoch in epochs {
+            let at = |f: fn(&DiagnosisRecord) -> u8, i: usize| -> usize {
+                records
+                    .iter()
+                    .filter(|r| r.epoch == epoch && f(r) & (1u8 << i) != 0)
+                    .map(|r| r.publisher)
+                    .fold(Vec::new(), |mut seen, p| {
+                        if !seen.contains(&p) {
+                            seen.push(p);
+                        }
+                        seen
+                    })
+                    .len()
+            };
+            for (i, id) in members.iter().enumerate().take(8) {
+                let degraded_votes = at(|r| r.degraded, i);
+                let responsive_votes = at(|r| r.responsive, i);
+                // Undegraded is the absence of a quorum SAYING degraded: a member nobody complains about is
+                // performing. Requiring a quorum to affirm health instead would punish a quiet epoch.
+                rep.observe_reachable(*id, degraded_votes < quorum, responsive_votes >= quorum);
+            }
+        }
+        rep
+    }
+}
+
 /// The UHM viability gain floor `κ_bootstrap = 1/7`, expressed in sevenths as `1` — the smallest loop gain the
 /// [`RoleController`] uses, under which the pull toward the demand setpoint never vanishes (T-59/T-104).
 pub const GAIN_BOOTSTRAP_SEVENTHS: u8 = 1;
@@ -978,6 +1066,99 @@ mod tests {
             "two-in-three is worth more than the floor ({} vs {REP_FLOOR})",
             rep.score(&better)
         );
+    }
+
+    fn rec(publisher: u8, epoch: u64, degraded: u8, responsive: u8) -> DiagnosisRecord {
+        DiagnosisRecord { publisher, epoch, degraded, responsive }
+    }
+
+    fn cell_members() -> Vec<NodeId> {
+        (0..7u8).map(|i| NodeId([i; 32])).collect()
+    }
+
+    /// The property the carried version could not have: two nodes with DIFFERENT local views compute the SAME
+    /// reputation, because both recompute from the same published set.
+    ///
+    /// This is the whole reason for the shape. `coord_alive` trusts its own eyes before any corroboration, so
+    /// healthy nodes genuinely disagree about a peer they contacted differently — and an accumulator writes
+    /// that disagreement in permanently, forking `adjust` and therefore the cell's role assignment. Here the
+    /// local views are inputs to the RECORDS, not to the score.
+    #[test]
+    fn nodes_with_divergent_local_views_recompute_the_same_reputation() {
+        let members = cell_members();
+        // Publishers 0..4 all say point 5 is degraded; 5 and 6 (which happen to have heard from it) do not.
+        // Whatever any single node's own eyes said, the SET is the same for everyone who reads it.
+        let records: Vec<DiagnosisRecord> = (0..7u8)
+            .map(|p| if p < 5 { rec(p, 3, 1 << 5, 0xFF) } else { rec(p, 3, 0, 0xFF) })
+            .collect();
+
+        // Two readers, same closed epoch, different orders — a store read returns what it returns.
+        let a = Reputation::from_published(&records, &members, 3, 8, 3);
+        let mut shuffled = records.clone();
+        shuffled.reverse();
+        let b = Reputation::from_published(&shuffled, &members, 3, 8, 3);
+        for id in &members {
+            assert_eq!(a.score(id), b.score(id), "the recompute does not depend on read order");
+        }
+        assert!(a.score(&members[5]) < REP_SCALE, "the quorum's verdict is applied");
+        assert_eq!(a.score(&members[1]), REP_SCALE, "a member nobody complains about keeps full standing");
+    }
+
+    /// One publisher cannot move a score. A record is a claim about OTHERS, so a member that declares the whole
+    /// cell degraded must be outvoted rather than believed.
+    #[test]
+    fn a_single_byzantine_publisher_cannot_slash_anyone() {
+        let members = cell_members();
+        let honest: Vec<DiagnosisRecord> = (1..7u8).map(|p| rec(p, 2, 0, 0xFF)).collect();
+        let mut with_liar = honest.clone();
+        with_liar.push(rec(0, 2, 0xFF, 0xFF)); // publisher 0 accuses everyone
+
+        let clean = Reputation::from_published(&honest, &members, 2, 8, 3);
+        let smeared = Reputation::from_published(&with_liar, &members, 2, 8, 3);
+        for id in &members {
+            assert_eq!(
+                clean.score(id),
+                smeared.score(id),
+                "one publisher's accusation changed a score, so a Byzantine member can slash the cell alone"
+            );
+        }
+        // And the same accusation from a QUORUM does land — otherwise the test above would pass vacuously
+        // against a function that ignores records altogether.
+        let conspiracy: Vec<DiagnosisRecord> = (0..3u8).map(|p| rec(p, 2, 1 << 4, 0xFF)).collect();
+        let slashed = Reputation::from_published(&conspiracy, &members, 2, 8, 3);
+        assert!(slashed.score(&members[4]) < REP_SCALE, "a quorum's verdict does land");
+    }
+
+    /// A node that read a stale set converges the moment it re-reads — the self-healing an accumulator cannot
+    /// offer, because there the stale fold is already written in.
+    #[test]
+    fn a_reader_that_missed_records_converges_once_it_sees_them() {
+        let members = cell_members();
+        let full: Vec<DiagnosisRecord> =
+            (0..7u8).flat_map(|p| (1..=3u64).map(move |e| rec(p, e, 1 << 6, 0xFF))).collect();
+        // A reader that saw only the last epoch's records.
+        let partial: Vec<DiagnosisRecord> = full.iter().copied().filter(|r| r.epoch == 3).collect();
+
+        let behind = Reputation::from_published(&partial, &members, 3, 8, 3);
+        let ahead = Reputation::from_published(&full, &members, 3, 8, 3);
+        assert!(behind.score(&members[6]) > ahead.score(&members[6]), "the partial reader punished less");
+
+        // Re-reading the same closed epochs makes them identical — no residue of the partial view survives.
+        let caught_up = Reputation::from_published(&full, &members, 3, 8, 3);
+        for id in &members {
+            assert_eq!(caught_up.score(id), ahead.score(id), "the recompute carries nothing forward");
+        }
+    }
+
+    /// The memory is bounded and stated: epochs outside the window do not reach the score.
+    #[test]
+    fn the_window_bounds_how_far_back_a_failure_is_remembered() {
+        let members = cell_members();
+        let ancient: Vec<DiagnosisRecord> = (0..7u8).map(|p| rec(p, 1, 1 << 2, 0xFF)).collect();
+        let inside = Reputation::from_published(&ancient, &members, 5, 8, 3);
+        assert!(inside.score(&members[2]) < REP_SCALE, "within the window it counts");
+        let outside = Reputation::from_published(&ancient, &members, 50, 8, 3);
+        assert_eq!(outside.score(&members[2]), REP_SCALE, "past the window it is forgotten");
     }
 
     /// A departed node's score does not outlive its membership.
