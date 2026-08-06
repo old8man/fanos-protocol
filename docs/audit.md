@@ -4192,3 +4192,35 @@ A line of `m` maximises `g` at `⌊(m−1)/2⌋` under a **majority** threshold 
 constructively. And the shipped `t = ⌊m/3⌋ + 1` does not even reach the line's own optimum: at `m = 32` it
 gives `g = 10` where majority gives `g = 15`. **Even keeping the line committee, `t` is mis-set** — it buys
 liveness headroom BFT never asked for and pays for it in secrecy.
+
+### Chasing the reveal-eviction attack to ground (2026-08-06)
+
+Worth recording as a *closed* lead, because it nearly became a filed CRITICAL and the discipline that killed it
+is the transferable part.
+
+`pending_reveals` is a `BTreeMap<TxCommit, _>` and its eviction is
+
+```rust
+&& let Some((&oldest, _)) = self.pending_reveals.iter().next()
+{ self.pending_reveals.remove(&oldest); }
+```
+
+which takes the **lexicographically smallest 32-byte commit**, while the comment above it says "evict the
+oldest commit". Those are different rules, and the difference is exploitable: `commit()` is
+`hash(sealed ‖ epoch ‖ line)` and the sealed transaction is in the block, so it is public — a Byzantine keyper
+can mint 4096 commits that all sort *above* a victim's, making the victim the smallest key and evicting it on
+the next insert. A few thousand hashes for a targeted eviction. Note also that the defence stated on the very
+next line — *"first-writer-wins per member, so a flood cannot displace a genuine early reveal"* — is true
+**within** a commit's entry and silent about eviction **across** commits, which is where it happens.
+
+**And the attack still does not close.** `finalize` re-emits reveals for every earlier
+finalized-but-unexecuted block. After finalization the transaction is known, so an arriving reveal lands in
+`reveals`, not in the evictable buffer — the eviction reaches only pre-finalization copies and the
+re-emissions refill what it took. Diverging a targeted validator would need the same reveal suppressed across
+all `REVEAL_WINDOW` re-emissions: a sustained selective loss of one message type on one peer, not one
+eviction.
+
+So the finding downgrades from "cheap attack" to "tail event", and what survives is worth doing anyway: make
+the eviction match its comment (insertion order, or a pin for any commit with buffered reveals), and fix the
+comment either way. **State the failure as a sequence and it dies at the step that refills the buffer** — the
+same discipline that withdrew two HIGHs filed from greps earlier in this audit.
