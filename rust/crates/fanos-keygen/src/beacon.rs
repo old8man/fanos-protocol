@@ -36,6 +36,7 @@ use fanos_vrf::vss::{
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 
 use crate::recovery::{MAX_AUTHORITY_MEMBERS, RecoveryAuthoritySet, RecoveryAuthorization};
+use fanos_primitives::BeaconSeed;
 
 /// Domain-separation label for the cell lineage fingerprint an `RGC` binds to (audit §4).
 const LINEAGE_LABEL: &str = "FANOS-recovery-v1/lineage";
@@ -131,9 +132,16 @@ pub struct BeaconNode<F: Field> {
     /// The group commitment every node verifies partials and rounds against (a DKG output; identical
     /// across all honest nodes, which fold the same qualified set).
     commitment: VssCommitment,
-    /// The current adopted beacon epoch and its public seed (genesis all-zero until the first round).
+    /// The current adopted beacon epoch and its public seed (this network's genesis seed until the first
+    /// round is adopted — see [`BeaconNode::new`]).
     epoch: Epoch,
     seed: [u8; 32],
+    /// This network's epoch-0 seed, kept **separately** from `seed` because `seed` advances every round and
+    /// the invariant it anchors — that the beacon and the transport were provisioned onto the same network —
+    /// has to stay checkable for the node's whole life, not only before the first round. Reading it from
+    /// `seed` would make the guard a precondition on startup order, which is the shape that produced the
+    /// defect in the first place.
+    genesis: BeaconSeed,
     /// Verified partials collected for each not-yet-adopted future epoch, until a round assembles.
     pending: BTreeMap<Epoch, Vec<BeaconPartial>>,
     /// The current epoch's assembled round, cached so this node can answer a `BeaconReq` pull-sync from a
@@ -210,13 +218,24 @@ impl<F: Field> BeaconNode<F> {
 
     /// A beacon node at `coord`, verifying against the group `commitment` at `threshold`. `share` is
     /// this node's DKG beacon share if it is an anchor (it then contributes partials), else `None`.
-    /// Starts at [`Epoch::ZERO`] with the genesis (all-zero) seed until the first round is adopted.
+    /// Starts at [`Epoch::ZERO`] with `genesis` as its seed until the first round is adopted.
+    ///
+    /// `genesis` is **this network's** epoch-0 seed, and it is a parameter rather than a constant because it
+    /// stopped being one. This constructor used to start at `[0u8; 32]` and call that "the genesis seed" —
+    /// true until the seed became `H("FANOS-v1/genesis-beacon" ‖ network_id)` so that two deployments would
+    /// not share every genesis coordinate. After that change a node held **two** epoch-0 beacons: this one at
+    /// zeros and `Client::genesis()` at the derived value, with nothing reading them together (#141).
+    ///
+    /// A parameter and not a setter: a value that must be right will be absent if it is optional, and the one
+    /// production site (`composition.rs`) already holds it as `BeaconParams::genesis_seed()`. A test cell with
+    /// no network name passes [`BeaconSeed::GENESIS`] and means it.
     #[must_use]
     pub fn new(
         coord: Point<F>,
         share: Option<VssShare>,
         commitment: VssCommitment,
         threshold: usize,
+        genesis: BeaconSeed,
     ) -> Self {
         Self {
             rejects: BeaconRejects::default(),
@@ -226,7 +245,8 @@ impl<F: Field> BeaconNode<F> {
             share,
             commitment,
             epoch: Epoch::ZERO,
-            seed: [0u8; 32],
+            seed: *genesis.as_bytes(),
+            genesis,
             pending: BTreeMap::new(),
             current_round: None,
             reshare_gen: 0,
@@ -250,10 +270,23 @@ impl<F: Field> BeaconNode<F> {
         self.epoch
     }
 
-    /// The current public beacon seed (all-zero genesis until the first round is adopted).
+    /// The current public beacon seed (this network's [`genesis`](Self::genesis) until the first round is
+    /// adopted).
     #[must_use]
     pub fn seed(&self) -> [u8; 32] {
         self.seed
+    }
+
+    /// This network's **epoch-0 seed**, as this beacon was provisioned with it — fixed for the node's life,
+    /// unlike [`seed`](Self::seed), which advances each round.
+    ///
+    /// Its purpose is to be compared: the transport seats this node against `Client::genesis()`, and the two
+    /// values reaching one node from two independent provisioning paths must be equal or the node is seating
+    /// itself in one network's coordinate space while running another's epoch clock. `fanos-quic`'s
+    /// `spawn_inner` refuses to start such a node.
+    #[must_use]
+    pub fn genesis(&self) -> BeaconSeed {
+        self.genesis
     }
 
     /// The current reconstruction threshold `t` — the number of distinct anchor partials a round needs. It
@@ -1102,7 +1135,7 @@ mod tests {
         )
         .unwrap();
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
-            .map(|i| BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t))
+            .map(|i| BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t, BeaconSeed::GENESIS))
             .collect();
 
         // Trigger the next epoch on every anchor, then route their partials + assembled rounds.
@@ -1137,7 +1170,7 @@ mod tests {
         let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"regen-genesis")).unwrap();
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"parent-authority"));
         let survivor = || {
-            BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
+            BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t, BeaconSeed::GENESIS)
                 .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
         };
 
@@ -1208,7 +1241,7 @@ mod tests {
         let t = 4usize;
         let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"healthy-genesis")).unwrap();
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"authority"));
-        let mut node = BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t)
+        let mut node = BeaconNode::<F2>::new(Point::at(4), Some(shares[4].clone()), commitment.clone(), t, BeaconSeed::GENESIS)
             .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk]).unwrap());
 
         let t2 = 2u8;
@@ -1268,7 +1301,7 @@ mod tests {
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"parent-cell"));
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
             .map(|i| {
-                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
+                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t, BeaconSeed::GENESIS)
                     .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
             })
             .collect();
@@ -1320,6 +1353,7 @@ mod tests {
                     (i < 6).then_some(shares[i].clone()),
                     commitment.clone(),
                     t,
+                                    BeaconSeed::GENESIS,
                 )
             })
             .collect();
@@ -1342,7 +1376,7 @@ mod tests {
             &mut DeterministicRng::new(b"beacon-forge"),
         )
         .unwrap();
-        let mut node = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment, 1);
+        let mut node = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment, 1, BeaconSeed::GENESIS);
 
         // A valid partial from anchor 2 (index 3), with a flipped response byte.
         let honest = partial_eval(&shares[2], Epoch::new(1));
@@ -1382,7 +1416,7 @@ mod tests {
         // A synced anchor: it proposes epoch 1 (its own partial) and receives the rest, so it adopts and
         // caches the round.
         let mut synced =
-            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t, BeaconSeed::GENESIS);
         synced.step(Instant(0), Input::Command(Command::AdvanceEpoch));
         for share in &shares[1..t] {
             let p = partial_eval(share, Epoch::new(1));
@@ -1397,7 +1431,7 @@ mod tests {
         assert_eq!(synced.epoch(), Epoch::new(1), "the anchor adopted epoch 1");
 
         // A fresh consumer that saw none of it.
-        let mut fresh = BeaconNode::<F2>::new(Point::at(1), None, commitment, t);
+        let mut fresh = BeaconNode::<F2>::new(Point::at(1), None, commitment, t, BeaconSeed::GENESIS);
         assert_eq!(fresh.epoch(), Epoch::ZERO);
 
         // On join it broadcasts a BeaconReq; the synced peer answers with its round; the fresh node
@@ -1488,7 +1522,7 @@ mod tests {
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"reshare-authority"));
         let mut nodes: Vec<BeaconNode<F2>> = (0..N)
             .map(|i| {
-                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t)
+                BeaconNode::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), t, BeaconSeed::GENESIS)
                     .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap())
             })
             .collect();
@@ -1559,7 +1593,7 @@ mod tests {
         let (shares, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"exfil-cell")).unwrap();
         let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-authority"));
         let (impostor_sk, _) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"exfil-impostor"));
-        let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t)
+        let mut victim = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t, BeaconSeed::GENESIS)
             .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk]).unwrap());
         let recv = |v: &mut BeaconNode<F2>, frame: Vec<u8>| v.step(Instant(0), Input::Message { from: [0, 0, 0], frame });
 
@@ -1609,7 +1643,7 @@ mod tests {
         // And the two are kept apart, because they call for opposite responses: configure a trust root, or
         // find who is sending triggers.
         let mut rootless =
-            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t, BeaconSeed::GENESIS);
         assert!(
             recv(&mut rootless, reshare_trigger_frame(&[(0, &authority_sk)], 1, 2, &[1, 2, 3, 4], &[5, 6]).expect("a test roster fits the frame")).is_empty(),
             "a cell with no recovery authority cannot reshare at all"
@@ -1648,7 +1682,7 @@ mod tests {
         let (shares, commitment) =
             deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"beacon-flood")).unwrap();
         let mut node: BeaconNode<F2> =
-            BeaconNode::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t);
+            BeaconNode::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), t, BeaconSeed::GENESIS);
 
         // A member evaluates its share at many far-future epochs — every partial genuinely verifies.
         let far = 4 * MAX_PENDING_EPOCHS as u64;

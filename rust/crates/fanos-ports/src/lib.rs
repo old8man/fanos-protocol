@@ -635,4 +635,19 @@ pub trait Engine {
 
     /// This node's own coordinate (its overlay address).
     fn address(&self) -> Triple;
+
+    /// This network's **epoch-0 beacon seed**, for engines that run a beacon — `None` for the rest.
+    ///
+    /// A seed is not something an engine needs to *do* its job, which is why this is not a required method.
+    /// It is here so a driver can check one invariant it is otherwise impossible to state: a node is
+    /// provisioned onto a network **twice**, once through its beacon parameters and once through the
+    /// directory the transport seats it in, and those two paths agree only by construction of two separate
+    /// call sites. A node whose beacon says one network and whose transport says another draws its
+    /// coordinates against one seed and runs its epoch clock against the other — with nothing failing.
+    ///
+    /// `None` is not "no opinion" in a beacon-bearing engine; it is "this engine has no beacon", and a driver
+    /// must treat it as *unable to disagree* rather than as agreement.
+    fn genesis_seed(&self) -> Option<fanos_primitives::BeaconSeed> {
+        None
+    }
 }

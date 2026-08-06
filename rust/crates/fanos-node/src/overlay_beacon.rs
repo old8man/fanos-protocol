@@ -178,11 +178,17 @@ impl<F: Field> Engine for OverlayBeaconNode<F> {
     fn address(&self) -> Triple {
         self.overlay.address()
     }
+
+    /// The beacon's own provisioned genesis seed — the half of the check the transport cannot supply.
+    fn genesis_seed(&self) -> Option<fanos_primitives::BeaconSeed> {
+        Some(self.beacon.genesis())
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    use fanos_primitives::BeaconSeed;
     use super::*;
     use fanos_field::F2;
     use fanos_geometry::Point;
@@ -213,7 +219,7 @@ mod tests {
             .map(|i| {
                 let overlay = OverlayNode::<F2>::new(Point::at(i), OverlayConfig::default());
                 let beacon =
-                    BeaconNode::<F2>::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), T);
+                    BeaconNode::<F2>::new(Point::at(i), Some(shares[i].clone()), commitment.clone(), T, BeaconSeed::GENESIS);
                 OverlayBeaconNode::new(overlay, beacon)
             })
             .collect();
@@ -270,7 +276,7 @@ mod tests {
         let (_shares, commitment) = beacon_key();
         let coord = Point::<F2>::at(4);
         let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
-        let beacon = BeaconNode::<F2>::new(coord, None, commitment, T);
+        let beacon = BeaconNode::<F2>::new(coord, None, commitment, T, BeaconSeed::GENESIS);
         let mut node = OverlayBeaconNode::new(overlay, beacon);
         // StartHeartbeat must reach the overlay (it arms its heartbeat timer + pings).
         let effects = node.step(Instant(0), Input::Command(Command::StartHeartbeat));

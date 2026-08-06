@@ -484,7 +484,11 @@ async fn spawn_composite(
         .public()
         .clone();
     let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
-    let beacon = BeaconNode::<F2>::new(coord, None, commitment.clone(), beacon_t);
+    // The cell's own epoch-0 beacon is `TEST_BEACON`, the same value every meeting line, drop line and
+    // descriptor key in this file is derived from (#140). It used to be `BeaconSeed::GENESIS` while the
+    // routing used `TEST_BEACON`, so the whole anonymous path was certified against a beacon **no node in
+    // the cell held** — the split #141 fixed in production, still live in the test meant to prove it.
+    let beacon = BeaconNode::<F2>::new(coord, None, commitment.clone(), beacon_t, TEST_BEACON);
     let router = ThresholdRouter::<F2>::new(coord, &secret, onion_t, onion_seed);
     let engine = CellNode::new(OverlayBeaconNode::new(overlay, beacon), router);
     let handle = spawn(Box::new(engine), dir.clone())
@@ -1356,7 +1360,10 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
             threshold: t as u8,
             vrf_coordinates: false,
         },
-        (epoch, [0x5E; 32]), // the genesis (epoch, beacon-seed) — TEST_BEACON's bytes
+        // The cell's epoch-0 `(epoch, seed)`, read from the constant rather than re-typed: a literal here
+        // could drift from `TEST_BEACON` and the drift would show up as an unroutable service, not as a
+        // failed assertion.
+        (epoch, *TEST_BEACON.as_bytes()),
         |req| {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);

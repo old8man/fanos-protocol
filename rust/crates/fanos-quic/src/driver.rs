@@ -984,6 +984,19 @@ pub enum QuicError {
     /// within the grind limit (see [`harness::credentials_for_point`](crate::credentials_for_point)).
     /// Impossible for a real Fano cell; signals an unreachable target or a mis-set limit.
     Grind,
+    /// The engine's beacon and the directory disagree about which network this node is on.
+    ///
+    /// A node is provisioned onto a network twice — once as `BeaconParams` (which the beacon engine reads)
+    /// and once as the directory the transport seats it in (`Directory::for_network`) — and nothing but this
+    /// check makes those two agree. Disagreement is not a degraded mode: coordinates derive from the seed, so
+    /// the node would seat itself in one network's coordinate space while running the other's epoch clock,
+    /// and both halves would look healthy. Misprovisioning, so it refuses to start.
+    GenesisMismatch {
+        /// What the beacon engine was provisioned with.
+        engine: BeaconSeed,
+        /// What the directory the transport seats this node in carries.
+        directory: BeaconSeed,
+    },
 }
 
 impl core::fmt::Display for QuicError {
@@ -995,6 +1008,23 @@ impl core::fmt::Display for QuicError {
                 f,
                 "could not grind credentials for the requested coordinate"
             ),
+            Self::GenesisMismatch { engine, directory } => {
+                // Eight bytes, the repo's short-form for a 32-byte identifier (`config.rs`): enough to tell
+                // two networks apart in a log, and the operator's actual fix is to reconcile `network_id`
+                // between the beacon file and the node configuration, not to read a seed back.
+                write!(f, "genesis seed mismatch: the beacon is provisioned for network ")?;
+                for b in &engine.as_bytes()[..8] {
+                    write!(f, "{b:02x}")?;
+                }
+                write!(f, " but the directory carries ")?;
+                for b in &directory.as_bytes()[..8] {
+                    write!(f, "{b:02x}")?;
+                }
+                write!(
+                    f,
+                    " — this node is misprovisioned and would seat itself in one network while clocking the other"
+                )
+            }
         }
     }
 }
@@ -1640,6 +1670,17 @@ fn spawn_inner(
     // Read before the directory is moved into the transport: this is the network identity every task above
     // the transport asks the handle for, so it is captured once rather than re-derived.
     let genesis = directory.genesis();
+    // The node's two provisioning paths meet here and nowhere else. `BeaconParams` reaches the engine
+    // (`composition.rs`), `Directory::for_network` reaches the transport (`node.rs`), and both happen to call
+    // `genesis_seed(&network_id)` — an agreement held up by two independent call sites, which is not an
+    // invariant, only a coincidence that has so far held. Fail closed: a seed disagreement is silent by
+    // construction (coordinates derive from one value, the epoch clock from the other, and both halves report
+    // healthy), so the only moment it can be caught is before the node exists.
+    if let Some(engine_genesis) = engine.genesis_seed()
+        && engine_genesis != genesis
+    {
+        return Err(QuicError::GenesisMismatch { engine: engine_genesis, directory: genesis });
+    }
     tracing::debug!(?addr, %local_addr, self_certifying = identity.is_some(), "fanos-quic node up");
 
     let (input_tx, input_rx) = mpsc::channel::<Input>(INPUT_CAP);

@@ -23,6 +23,7 @@ use fanos_runtime::{Command, Duration, Effect, Engine, Input, Instant, Notificat
 use fanos_sim::Sim;
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare, deal};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
+use fanos_primitives::BeaconSeed;
 
 /// Beacon threshold (`t`-of-7 anchors), matching `beacon_node_e2e.rs`.
 const BEACON_T: usize = 4;
@@ -66,7 +67,7 @@ fn run_cell(seed: u64, make: impl Fn(usize, &VssShare, &VssCommitment) -> Box<dy
 
 /// An honest anchor engine.
 fn honest(i: usize, share: &VssShare, commitment: &VssCommitment) -> Box<dyn Engine> {
-    Box::new(BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T))
+    Box::new(BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T, BeaconSeed::GENESIS))
 }
 
 /// The all-honest reference seed the adversarial cells must reproduce.
@@ -165,7 +166,7 @@ fn a_forged_partial_cannot_bias_the_beacon() {
     let seed = run_cell(0xB2C0, move |i, share, commitment| {
         if i == liar {
             Box::new(ForgingAnchor {
-                node: BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T),
+                node: BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T, BeaconSeed::GENESIS),
                 forged: counter.clone(),
             })
         } else {
@@ -193,7 +194,7 @@ fn a_silent_anchor_does_not_block_the_beacon() {
     let seed = run_cell(0xB2C0, move |i, share, commitment| {
         if i == absent {
             Box::new(SilentAnchor {
-                node: BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T),
+                node: BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T, BeaconSeed::GENESIS),
                 dropped: counter.clone(),
             })
         } else {

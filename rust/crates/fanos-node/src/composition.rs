@@ -181,7 +181,7 @@ pub fn compose_engine<F: Field + 'static>(
             // freeze the resharing machinery exists to escape was permanent in production while both halves
             // sat built and tested (`BeaconParams::authority`).
             let mut beacon =
-                BeaconNode::<F>::new(coord, bp.share.clone(), bp.commitment.clone(), bp.threshold);
+                BeaconNode::<F>::new(coord, bp.share.clone(), bp.commitment.clone(), bp.threshold, bp.genesis_seed());
             if let Some(authority) = &bp.authority {
                 beacon = beacon.with_recovery_authority(authority.clone());
             }

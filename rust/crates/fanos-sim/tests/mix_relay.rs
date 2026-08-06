@@ -57,7 +57,7 @@ fn a_mixrelay_cell_beacons_rotates_and_rendezvouses() {
             onion_seed(i),
         );
         let beacon =
-            BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T);
+            BeaconNode::<F2>::new(Point::at(i), Some(share.clone()), commitment.clone(), BEACON_T, BeaconSeed::GENESIS);
         sim.add(Box::new(MixRelay::new(router, beacon)));
     }
 

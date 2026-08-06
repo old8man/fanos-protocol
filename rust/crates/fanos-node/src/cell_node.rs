@@ -234,6 +234,7 @@ impl<F: Field> Engine for CellNode<F> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use fanos_primitives::BeaconSeed;
     use super::*;
     use fanos_aphantos::threshold::{HopLine, seal_onion};
     use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
@@ -256,7 +257,7 @@ mod tests {
     fn cell_node(i: usize, shares: &[VssShare], commitment: &VssCommitment) -> CellNode<F2> {
         let coord = Point::<F2>::at(i);
         let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
-        let beacon = BeaconNode::<F2>::new(coord, Some(shares[i].clone()), commitment.clone(), T);
+        let beacon = BeaconNode::<F2>::new(coord, Some(shares[i].clone()), commitment.clone(), T, BeaconSeed::GENESIS);
         let obn = OverlayBeaconNode::new(overlay, beacon);
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xC5, i as u8]));
         let mut onion_seed = [0xC4u8; 32];
@@ -297,7 +298,7 @@ mod tests {
         let (shares, commitment) = beacon_key();
         let coord = Point::<F2>::at(0);
         let overlay = OverlayNode::<F2>::new(coord, OverlayConfig::default());
-        let beacon = BeaconNode::<F2>::new(coord, Some(shares[0].clone()), commitment.clone(), T);
+        let beacon = BeaconNode::<F2>::new(coord, Some(shares[0].clone()), commitment.clone(), T, BeaconSeed::GENESIS);
         let obn = OverlayBeaconNode::new(overlay, beacon);
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xC5, 0]));
         let router =

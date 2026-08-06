@@ -13,6 +13,7 @@ use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_runtime::{Config, OverlayNode, Triple};
 use fanos_sim::Sim;
 use fanos_vrf::vss::{DeterministicRng, deal};
+use fanos_primitives::BeaconSeed;
 
 /// Spawn a full Fano cell `PG(2, q)` of [`OverlayBeaconNode`] composites that share one `threshold`-of-`N`
 /// beacon key: the first `anchors` points hold a DVRF share (and contribute partials each epoch), the rest
@@ -44,7 +45,7 @@ pub fn spawn_beacon_cell<F: Field + 'static>(
     for (i, point) in Plane::<F>::points().enumerate() {
         let overlay = OverlayNode::<F>::new(point, config);
         let share = (i < anchors).then(|| shares[i].clone());
-        let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold)
+        let beacon = BeaconNode::<F>::new(point, share, commitment.clone(), threshold, BeaconSeed::GENESIS)
             .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk.clone()]).unwrap());
         coords.push(sim.add(Box::new(OverlayBeaconNode::new(overlay, beacon))));
     }
