@@ -497,6 +497,12 @@ impl LiveRoleController {
         Assignment { roles, roster: members.len(), epoch }
     }
 
+    /// This node's own identity — what a published record must name for this node to be in it.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
     /// Adopt a reputation **recomputed from published records** ([`Reputation::from_published`]).
     ///
     /// Replaces rather than folds, and that is the whole point: the score is a function of the closed record
@@ -1005,16 +1011,19 @@ async fn refresh_reputation<F: Field>(
     // outcome: the next heartbeat produces a current one, and an epoch with no record is an epoch with no
     // evidence, which the quorum already handles.
     //
-    // And only when this node is itself IN that seating. `seating_complete` means no read timed out, not that
-    // everyone has published: on an epoch turn the capability publisher and this loop are separate tasks, and
-    // under load the roster is read before this node's own advertisement for the epoch has landed. A record
-    // that cannot name its own author is weak evidence — every bit it carries about itself maps to an empty
-    // seat and is silently discarded — so the honest rule is not to testify about an epoch whose roster this
-    // node has not yet joined. It costs one epoch of evidence and the next heartbeat supplies another.
-    let seated_here = fanos_geometry::Point::<F>::new(client.address())
-        .and_then(|p| seating.get(p.index()).copied())
-        .flatten()
-        .is_some();
+    // And only when this node's own IDENTITY is in that seating. `seating_complete` means no read timed out,
+    // not that anyone answered: on an epoch turn the capability publisher and this loop are separate tasks, so
+    // the roster is read before this node's advertisement for the epoch has landed. A record that cannot name
+    // its own author is weak evidence — every bit it carries about itself maps to an empty seat and is
+    // silently discarded — so the honest rule is not to testify about an epoch whose roster this node has not
+    // yet joined. It costs one epoch of evidence; the next refresh supplies another.
+    //
+    // **By identity, not by `client.address()`.** The first draft asked whether this node's *current* point
+    // was occupied, and it was wrong for the reason this whole task is about: the advertisement sits at the
+    // coordinate held when it was published, and a reseat moves the node away from it within the epoch. That
+    // draft was false on essentially every assignment, and reading the seat number instead of the name is
+    // exactly the confusion `DiagnosisRecord::roster` exists to remove.
+    let seated_here = seating.iter().flatten().any(|id| *id == live.node_id());
     if let (Some((sensed_at, degraded, responsive)), true) = (sensed, seating_complete && seated_here)
         && sensed_at == epoch
     {
