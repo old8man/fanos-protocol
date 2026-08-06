@@ -1,6 +1,6 @@
 # Hidden-service hardening — accountable anonymity, attack resistance, load distribution
 
-**Status: §6 is implemented and its bound is demonstrated; §2–§5 are design.** Written 2026-07-31, updated
+**Status: §6 is implemented and its bound is demonstrated; §2 is CLOSED as not implementable on this stack (measured, §8); §3–§5 are design.** Written 2026-07-31, updated
 2026-08-01. What has landed: the registration binding is authenticated (`9e34d4c`), the combiner map covers the
 plane instead of concentrating below the fault bound (`a7c7699`), `m = f + 1` is derived and proven (`32a4248`), a
 host registers at all `m` (`edcf845`), the client spreads over them (`bb13b14`), and — the piece that made the
@@ -517,10 +517,25 @@ client's actual request profile, measured, not guessed. `u*` and `λ` in the con
 picked. Three sibling gather deadlines still hold the chosen 2 s that `ThresholdRouter` shed — `ThresholdService`,
 the threshold-rendezvous intro gather, and POROS admission — and the §6.3 argument applies to each verbatim.
 
-**Unproven, and the honest frontier.** The §2 construction assumes the lattice ZK stack can carry a membership
-proof plus a PRF evaluation plus a range check at a per-request cost a client can pay. OBOLOS's whole-transaction
-shielded-spend proof is the closest existing evidence and it is *not* the same circuit. Until that is measured —
-proof size, prove time, verify time, on real hardware — §2 is a design and not a plan. The correct first step is a
-benchmark of the three clauses against the existing SIS stack, and if the cost is prohibitive the fallback is tier
-0 plus tier 2, which need no ZK at all and still give cost-based DDoS resistance and payment-based load shedding —
-losing only the filterable identifier, which is the one thing that genuinely requires the proof.
+**Measured, and §2 does not survive it (2026-08-06).** The construction assumed the lattice ZK stack could carry
+a membership proof plus a PRF evaluation plus a range check at a per-request cost a client can pay. That is the
+benchmark this section asked for, and it has now been run
+(`ring_membership::the_membership_proof_alone_dwarfs_the_packet_a_request_rides_in`):
+
+> a **depth-1** sound SIS membership proof is **24 512 512 bytes — 23.4 MiB**, against the **20 480-byte**
+> fixed-width onion a client request travels in. **1196 whole packets, for the cheapest clause of three.**
+
+Every quantity in that comparison is the friendliest one available. Depth 1 is a *two-leaf* membership set; a real
+set of `2^d` clients multiplies the path part by `d`. The PRF evaluation and the `i < K` range check are additive
+on top. And the budget is not "a few KiB is awkward" — the tag has to fit *inside* a packet the platform pads to a
+constant 20 KiB precisely so that lengths carry no information.
+
+So the frontier is closed rather than open: **§2 is not implementable on this stack**, by roughly three orders of
+magnitude, and no engineering of the circuit closes a gap of that size. The fallback §8 already named is now the
+plan — **tier 0 plus tier 2**, which need no ZK at all and still give cost-based DDoS resistance and
+payment-based load shedding, losing only the filterable identifier. §4's nginx surface therefore filters on the
+tier-0/tier-2 evidence, not on a nullifier.
+
+This is the same blocker as OBOLOS's shielded spend (task #65: a depth-1 spend proof already exceeds 8 MiB), and
+it has one shared resolution rather than two: recursive proof compaction, or a different proof system. Neither is
+a hidden-service question, and §2 should not be re-opened until one of them lands.

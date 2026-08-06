@@ -4224,3 +4224,32 @@ So the finding downgrades from "cheap attack" to "tail event", and what survives
 the eviction match its comment (insertion order, or a pin for any commit with buffered reveals), and fix the
 comment either way. **State the failure as a sequence and it dies at the step that refills the buffer** — the
 same discipline that withdrew two HIGHs filed from greps earlier in this audit.
+
+---
+
+## The §2 nullifier benchmark, run — and it closes the design (2026-08-06)
+
+`design-hidden-service-hardening.md` §8 named its own frontier honestly: *"the §2 construction assumes the
+lattice ZK stack can carry a membership proof plus a PRF evaluation plus a range check at a per-request cost a
+client can pay … until that is measured, §2 is a design and not a plan."* It also named the correct first step
+— benchmark the clauses against the existing SIS stack — and the fallback if the cost is prohibitive.
+
+Measured (`ring_membership::the_membership_proof_alone_dwarfs_the_packet_a_request_rides_in`):
+
+> a **depth-1** sound SIS membership proof is **24 512 512 bytes (23.4 MiB)** against the **20 480-byte**
+> fixed-width onion a client request rides in — **1196 whole packets, for the cheapest clause of three.**
+
+Every quantity is the friendliest available: depth 1 is a *two-leaf* set, a real `2^d`-client set multiplies
+the path part by `d`, and the PRF and range clauses are additive on top. The budget is not soft either — the
+tag must fit *inside* a packet the platform pads to a constant 20 KiB so that lengths carry no information.
+
+**So the frontier is closed, not open.** No circuit engineering closes three orders of magnitude. §2 is
+unimplementable on this stack and the fallback §8 already named becomes the plan: tier 0 plus tier 2, no ZK,
+keeping cost-based DDoS resistance and payment-based load shedding and losing only the filterable identifier.
+
+Worth noting what the measurement changed and what it did not. It did not find a defect — the design said
+plainly that this was unproven and what to do if it failed. What it changed is the *status of a claim*: an
+open engineering question that a reader could reasonably expect to resolve favourably is now a closed one with
+a number attached. That is the whole value of running the benchmark a design asks for rather than carrying it
+as a residual, and it is the same shape as OBOLOS's shielded spend (#65, depth-1 proof already over 8 MiB) —
+**one shared blocker, recursive compaction or a different proof system, not two independent ones.**

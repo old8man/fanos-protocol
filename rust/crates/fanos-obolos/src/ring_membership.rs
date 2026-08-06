@@ -708,4 +708,40 @@ mod tests {
         let proof = prove_path_sound(&params, &hp, &leaf, &sibs, &dirs, b"seed").expect("sound path");
         assert!(verify_path_sound(&params, &hp, &root, &proof), "a fully sound depth-1 path verifies");
     }
+
+    /// **The §2 benchmark `design-hidden-service-hardening.md` §8 asks for, run.**
+    ///
+    /// §2 proposes a post-quantum rate-limiting nullifier: a per-request tag with a proof of *Merkle membership
+    /// plus a PRF evaluation plus a range check*, on this stack. §8 records it as the design's honest frontier
+    /// — "until that is measured, §2 is a design and not a plan" — and names the fallback if the cost is
+    /// prohibitive.
+    ///
+    /// Membership alone is the FLOOR: the other two clauses are additive, and this measures the cheapest
+    /// possible instance of the dominant one, a depth-1 tree (a two-leaf set — no real membership set is that
+    /// small). The budget it has to fit is not a taste: a client request rides one
+    /// `THRESHOLD_ONION_LEN`-byte onion, so the tag and its proof must fit *inside* that packet's payload.
+    #[test]
+    fn the_membership_proof_alone_dwarfs_the_packet_a_request_rides_in() {
+        use crate::ring_size::ProofSize;
+        // The whole fixed-width packet a client request travels in.
+        const ONION: usize = 20480;
+        let params = RingParams::standard();
+        let hp = HashParams::standard();
+        let leaf = HashNode::from_bytes(b"bench-leaf");
+        let sib0 = HashNode::from_bytes(b"bench-sib");
+        let root = hp.hash(&sib0, &leaf);
+        let proof = prove_path_sound(&params, &hp, &leaf, &[sib0], &[1u64], b"bench").expect("sound path");
+        assert!(verify_path_sound(&params, &hp, &root, &proof), "the measured object is a real, verifying proof");
+
+        let bytes = proof.encoded_bytes();
+        assert!(
+            bytes > 20 * ONION,
+            "a DEPTH-1 sound membership proof is {bytes} bytes against the {ONION}-byte packet that has to \
+             carry it — and depth 1 is a two-leaf membership set. Every clause §2 adds (the PRF evaluation, \
+             the i < K range check) is additive on top, and a real set of 2^d clients multiplies the path \
+             part by d. So §2's per-request tag does not fit by orders of magnitude on this stack, which is \
+             what §8 said had to be measured rather than argued"
+        );
+        std::eprintln!("MEASURED: depth-1 sound membership proof = {bytes} bytes ({} onion packets)", bytes / ONION);
+    }
 }
