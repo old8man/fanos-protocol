@@ -31,7 +31,7 @@ use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_vrf::pqvrf::MerkleVrfSecret;
 use fanos_quic::spawn_cell;
 use fanos_runtime::{Config, Engine, OverlayNode};
-use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 use fanos_taxis::{Accounts, CellParams, Transfer};
 
 const N: usize = 7;
@@ -143,7 +143,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     // Seal an anti-MEV transfer to the epoch keyper line (the canonical committed-authority seal) and submit it
     // to every validator's mempool — a real client's SubmitTx, fanned to the cell.
     let tx = Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx();
-    let sealed = seal_to_keyper_line(&registry, &tx, EPOCH, &SEED, CellParams::FANO, b"live-quic-tx")
+    let sealed = seal_to_keyper_committee(&registry, &tx, EPOCH, CellParams::FANO, b"live-quic-tx")
         .expect("seal to the committed keyper line");
     for h in &handles {
         assert!(h.submit(sealed.clone()).await, "submitted the sealed tx to a live driver");
@@ -277,7 +277,7 @@ async fn a_validator_joining_late_reaches_the_cells_executed_state() {
         keys.into_iter().map(|(i, k)| spawn_taxis::<F2, Accounts>(cell.nodes[i].client(), params_for(i, k))).collect();
 
     let tx = Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx();
-    let sealed = seal_to_keyper_line(&registry, &tx, EPOCH, &SEED, CellParams::FANO, b"late-join-tx")
+    let sealed = seal_to_keyper_committee(&registry, &tx, EPOCH, CellParams::FANO, b"late-join-tx")
         .expect("seal to the committed keyper line");
     for h in &handles {
         assert!(h.submit(sealed.clone()).await, "submitted the sealed tx to a live driver");

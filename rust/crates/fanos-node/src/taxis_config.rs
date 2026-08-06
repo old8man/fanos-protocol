@@ -19,7 +19,7 @@ use fanos_dromos::{HybridLedger, SlashTx};
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_pqcrypto::{HybridKemSecret, HybridSigSecret, HybridVerifier};
 use fanos_primitives::{BeaconSeed, Epoch};
-use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 use fanos_taxis::params::CellParams;
 use fanos_taxis::tx::Transaction;
 use fanos_taxis::SlashEvidence;
@@ -67,7 +67,7 @@ fn build_slash_sealer(
         let tx = Transaction::new(HybridLedger::slash_payload(&slash));
         let mut rng_seed = [0u8; 32];
         getrandom::fill(&mut rng_seed).ok()?;
-        seal_to_keyper_line(&keyper, &tx, epoch, &beacon, cell, &rng_seed).ok()
+        seal_to_keyper_committee(&keyper, &tx, epoch, cell, &rng_seed).ok()
     })
 }
 

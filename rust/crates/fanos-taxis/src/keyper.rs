@@ -15,7 +15,7 @@
 //!   decryption authority to the validator identities — run once at cell formation.
 //! * [`KeyperRegistry::commit`] is the **on-chain decryption-key commitment**: a binding hash of the key set,
 //!   an agreed genesis constant (alongside `verifiers` and the beacon `seed`) that a light client checks.
-//! * [`KeyperRegistry::line_keys`] / [`seal_to_keyper_line`] are the **only** correct way for a client to
+//! * [`KeyperRegistry::line_keys`] / [`seal_to_keyper_committee`] are the **only** correct way for a client to
 //!   seal: the keys come from the committed registry, so the transaction is bound to the on-chain authority.
 //!
 //! What this does **not** claim: a hybrid-KEM ciphertext is not publicly verifiable *before opening* to target
@@ -31,9 +31,8 @@ use fanos_threshold::ThresholdError;
 use fanos_pqcrypto::kem::{HybridKemPublic, PUBLIC_LEN};
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature, HybridVerifier};
-use fanos_primitives::{BeaconSeed, Epoch, hash_labeled};
+use fanos_primitives::{Epoch, hash_labeled};
 
-use crate::committee::{epoch_seal_line, line_members};
 use crate::params::CellParams;
 use crate::tx::{SealedTx, Transaction};
 
@@ -197,18 +196,22 @@ impl KeyperRegistry {
         hash_labeled(COMMIT_LABEL, &buf)
     }
 
-    /// The committed KEM keys of the epoch's keyper line — the exact key set a client seals a transaction to
-    /// (`docs/design-taxis.md` §5). `None` if any elected member index is out of range for the registry.
+    /// The committed KEM keys of the keyper committee — **the whole cell**, in validator-index order, and
+    /// the exact key set a client seals a transaction to (`docs/design-taxis.md` §5).
+    ///
+    /// It was the epoch's elected LINE, which could not be made sound: a coalition inside the cell's own
+    /// fault budget owns a line outright and decrypts everything sealed to it
+    /// ([`CellParams::seal_committee_size`], #136). The committee no longer depends on the epoch or the
+    /// beacon, so there is nothing left to elect.
+    ///
+    /// `None` if the registry does not hold the whole cell — a partially-registered decryption authority
+    /// cannot be sealed to, and guessing which subset to use would reintroduce exactly the question this
+    /// removes.
     #[must_use]
-    pub fn line_keys(&self, seed: &BeaconSeed, epoch: Epoch) -> Option<Vec<&HybridKemPublic>> {
-        let line = epoch_seal_line(seed, epoch);
-        line_members(line)?.iter().map(|&m| self.key(m)).collect()
-    }
-
-    /// The Fano line index of the epoch's keyper committee (`crate::committee::epoch_seal_line`).
-    #[must_use]
-    pub fn line(&self, seed: &BeaconSeed, epoch: Epoch) -> usize {
-        epoch_seal_line(seed, epoch)
+    pub fn committee_keys(&self, params: CellParams) -> Option<Vec<&HybridKemPublic>> {
+        (self.len() >= params.seal_committee_size())
+            .then(|| (0..params.seal_committee_size()).map(|m| self.key(m)).collect())
+            .flatten()
     }
 }
 
@@ -220,18 +223,22 @@ impl KeyperRegistry {
 /// # Errors
 /// [`ThresholdError::Malformed`] if the registry cannot supply the elected line's keys (out-of-range member);
 /// otherwise any [`ThresholdError`] from [`SealedTx::seal`] (bad sharing parameters, non-contributory key, …).
-pub fn seal_to_keyper_line(
+pub fn seal_to_keyper_committee(
     registry: &KeyperRegistry,
     tx: &Transaction,
     epoch: Epoch,
-    seed: &BeaconSeed,
     params: CellParams,
     rng_seed: &[u8],
 ) -> Result<SealedTx, ThresholdError> {
-    let line = epoch_seal_line(seed, epoch);
-    let keys = registry.line_keys(seed, epoch).ok_or(ThresholdError::Malformed)?;
-    let line = u8::try_from(line).map_err(|_| ThresholdError::Malformed)?;
-    SealedTx::seal(tx, epoch, line, &keys, params.seal_threshold(), rng_seed)
+    // Fail closed on unsound parameters rather than sealing to a committee that cannot keep the secret.
+    // The predicate is cheap and the alternative is a transaction that looks sealed and is not (#136).
+    // Both bounds, because they fail independently: `seal_is_sound` asks whether the committee keeps the
+    // secret, `seal_fits_a_block` whether the resulting ciphertext can be carried at all (#136, #143).
+    if !params.seal_is_sound() || !crate::block::seal_fits_a_block(params) {
+        return Err(ThresholdError::Malformed);
+    }
+    let keys = registry.committee_keys(params).ok_or(ThresholdError::Malformed)?;
+    SealedTx::seal(tx, epoch, &keys, params.seal_threshold(), rng_seed)
 }
 
 #[cfg(test)]
@@ -241,7 +248,6 @@ mod tests {
     use fanos_pqcrypto::SeedRng;
     use fanos_pqcrypto::kem::HybridKemSecret;
 
-    const SEED: BeaconSeed = BeaconSeed::new([0x33; 32]);
 
     /// A cell of `n` validators, each with a consensus signing key + a hybrid-KEM decryption key.
     fn cell(n: usize) -> (Vec<HybridSigSecret>, Vec<HybridVerifier>, Vec<HybridKemSecret>, KeyperRegistry) {
@@ -296,12 +302,11 @@ mod tests {
     #[test]
     fn the_keyper_line_keys_are_the_committed_keys_of_the_elected_members() {
         let (_s, _v, _k, registry) = cell(7);
-        let epoch = Epoch::new(3);
-        let keys = registry.line_keys(&SEED, epoch).expect("in-range line");
-        let members = line_members(epoch_seal_line(&SEED, epoch)).expect("a real line");
-        assert_eq!(keys.len(), members.len());
-        for (k, &m) in keys.iter().zip(members.iter()) {
-            assert_eq!(k.encode(), registry.key(m).unwrap().encode(), "line key {m} matches the registry");
+        let params = CellParams::FANO;
+        let keys = registry.committee_keys(params).expect("a fully-registered cell");
+        assert_eq!(keys.len(), params.seal_committee_size(), "the committee is the whole cell (#136)");
+        for (m, k) in keys.iter().enumerate() {
+            assert_eq!(k.encode(), registry.key(m).unwrap().encode(), "committee key {m} matches the registry");
         }
     }
 
@@ -322,19 +327,61 @@ mod tests {
         let epoch = Epoch::new(2);
         let params = CellParams::FANO;
         let tx = Transaction::new(b"anti-mev-payload".to_vec());
-        let sealed = seal_to_keyper_line(&registry, &tx, epoch, &SEED, params, b"seal-seed").unwrap();
-        // The seal is bound to the elected line and epoch.
+        let sealed = seal_to_keyper_committee(&registry, &tx, epoch, params, b"seal-seed").unwrap();
+        // The seal is bound to the epoch; the committee is the cell, so there is no line left to bind.
         assert_eq!(sealed.epoch, epoch);
-        assert_eq!(usize::from(sealed.line), epoch_seal_line(&SEED, epoch));
-        // A threshold of the *elected committee members* recovers the plaintext.
-        let members = line_members(epoch_seal_line(&SEED, epoch)).expect("a real line");
+        assert_eq!(sealed.member_count(), params.seal_committee_size());
+        // A threshold of the committee recovers the plaintext.
         let t = usize::from(params.seal_threshold());
-        let shares: Vec<_> = members
-            .iter()
-            .take(t)
-            .enumerate()
-            .map(|(pos, &m)| sealed.member_share(pos, &kem_secrets[m]).expect("member opens its slot"))
+        let shares: Vec<_> = (0..t)
+            .map(|m| sealed.member_share(m, &kem_secrets[m]).expect("member opens its slot"))
             .collect();
-        assert_eq!(sealed.open(&shares).unwrap(), tx, "the committed keyper line decrypts its own seal");
+        assert_eq!(sealed.open(&shares).unwrap(), tx, "the committed keyper committee decrypts its own seal");
+    }
+
+    /// **The anti-MEV property, measured against the fault budget the cell actually tolerates** (#136).
+    ///
+    /// `seal_threshold`'s doc derives `t` from "the per-line Byzantine bound `⌊(q+1)/3⌋`" — at Fano, one
+    /// faulty member per line. Nothing in the protocol enforces that. The cell tolerates `f = 2` faults
+    /// placed anywhere, a line has `q + 1 = 3` members, and in `PG(2,q)` two points lie on **exactly one**
+    /// common line — so a coalition of two owns one of the seven lines outright, and `epoch_seal_line`
+    /// hands it every transaction for a whole epoch once in seven.
+    ///
+    /// This asserts what the requirement is, not what the code does: a coalition inside the tolerated budget
+    /// must not be able to open a sealed transaction. It fails today, and that failure is the finding.
+    #[test]
+    fn a_coalition_inside_the_fault_budget_must_not_open_a_sealed_transaction() {
+        let (_s, _v, kem_secrets, registry) = cell(7);
+        let epoch = Epoch::new(2);
+        let params = CellParams::FANO;
+        let tx = Transaction::new(b"a-transaction-the-cell-must-keep-sealed".to_vec());
+        let sealed = seal_to_keyper_committee(&registry, &tx, epoch, params, b"seal-seed").unwrap();
+
+        // The adversary corrupts `f` nodes of its choosing, all of them on the committee — which with the
+        // committee being the whole cell is the strongest placement available to it.
+        let coalition: Vec<_> = (0..params.f())
+            .map(|m| sealed.member_share(m, &kem_secrets[m]).expect("a member opens its own slot"))
+            .collect();
+        assert_eq!(coalition.len(), params.f(), "the coalition is exactly the tolerated fault budget");
+
+        // The cost of the only fix that exists, measured before it is built: the committee must be at least
+        // `2f + 1` (safety needs `t > f`, liveness needs `t <= m - f`), which at Fano is 5 of the 7 and rules
+        // a 3-member line out at every plane order. The seal encapsulates to each member, so the ciphertext
+        // grows linearly in the committee — this prints what one transaction costs per member.
+        let bytes = sealed.to_bytes().len();
+        std::eprintln!(
+            "SEAL COST: {bytes} B for m = {} members ({} B/member)",
+            sealed.member_count(),
+            bytes / sealed.member_count()
+        );
+
+        assert!(
+            sealed.open(&coalition).is_err(),
+            "a coalition of f = {} — inside the budget the cell already tolerates — opened a sealed \
+             transaction before its order was fixed. The seal threshold is derived from a per-line fault \
+             bound the protocol never enforces, so the whole anti-MEV property is void for an adversary \
+             that simply chooses which nodes to corrupt.",
+            params.f()
+        );
     }
 }

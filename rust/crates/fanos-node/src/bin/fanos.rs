@@ -2686,7 +2686,7 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::Transaction;
-    use fanos_taxis::keyper::seal_to_keyper_line;
+    use fanos_taxis::keyper::seal_to_keyper_committee;
     use fanos_taxis::wire::tx_to_frame;
 
     init_tracing();
@@ -2727,7 +2727,7 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     let tx = Transaction::new(HybridLedger::transparent_payload(&signed));
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let sealed = seal_to_keyper_line(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
         .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
 
     // Join the overlay (bootstrap to the validators via --bootstrap) and submit to validator 0, which ingests
@@ -2812,7 +2812,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::Transaction;
-    use fanos_taxis::keyper::seal_to_keyper_line;
+    use fanos_taxis::keyper::seal_to_keyper_committee;
     use fanos_taxis::wire::tx_to_frame;
 
     init_tracing();
@@ -2999,7 +2999,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     let tx = Transaction::new(HybridLedger::term_payload(&envelope));
     let mut rng_seed = [0u8; 32];
     getrandom::fill(&mut rng_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-    let sealed = seal_to_keyper_line(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
+    let sealed = seal_to_keyper_committee(&info.keyper, &tx, info.epoch, &info.beacon, info.cell, &rng_seed)
         .map_err(|e| NodeError::Config(format!("could not seal the transaction: {e:?}")))?;
 
     let config = node_config_from_args(args)?;

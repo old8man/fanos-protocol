@@ -49,7 +49,7 @@ pub use incentive::{
     RewardParams, SlashEvidence, best_response_is_honest, blocking_threshold, can_permanently_censor,
     coalition_best_response_is_honest, detect_equivocation,
 };
-pub use keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+pub use keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 pub use params::CellParams;
 pub use state::{Accounts, ExecOutcome, StateMachine, Transfer};
 pub use tx::{SealedTx, Transaction, TxCommit};

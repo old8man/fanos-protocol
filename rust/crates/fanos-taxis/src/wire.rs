@@ -252,7 +252,7 @@ mod tests {
         let kps: Vec<(HybridKemSecret, HybridKemPublic)> =
             (0..3u8).map(|i| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xAB, i]))).collect();
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
-        let tx = SealedTx::seal(&Transaction::new(b"pay-alice".to_vec()), Epoch::new(2), 0, &pubs, 2, b"seed")
+        let tx = SealedTx::seal(&Transaction::new(b"pay-alice".to_vec()), Epoch::new(2), &pubs, 2, b"seed")
             .unwrap();
         assert_eq!(from_frame(&tx_to_frame(&tx)), Some(TaxisApp::Tx(tx)));
     }

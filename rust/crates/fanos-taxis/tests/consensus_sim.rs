@@ -21,7 +21,7 @@ use fanos_taxis::da::Sampler;
 use fanos_taxis::vote::{SignedVote, Vote};
 use fanos_taxis::Phase;
 use fanos_taxis::incentive::SlashEvidence;
-use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 use fanos_taxis::state::StateMachine;
 use fanos_taxis::tx::TxCommit;
 use fanos_taxis::{Accounts, Block, CellParams, SealedTx, Transfer};
@@ -586,9 +586,9 @@ impl Cluster {
     }
 
     /// Seal a transfer to this epoch's beacon-selected keyper line (2-of-3 on the Fano cell) — via the
-    /// committed decryption authority, exactly as a real client seals ([`seal_to_keyper_line`]).
+    /// committed decryption authority, exactly as a real client seals ([`seal_to_keyper_committee`]).
     fn seal(&self, transfer: Transfer, tag: &[u8]) -> SealedTx {
-        seal_to_keyper_line(&self.registry, &transfer.into_tx(), EPOCH, &SEED, CellParams::FANO, tag).unwrap()
+        seal_to_keyper_committee(&self.registry, &transfer.into_tx(), EPOCH, CellParams::FANO, tag).unwrap()
     }
 
     /// The set of honest (non-crashed) validators that have finalized `height`, and the block hashes they
@@ -626,12 +626,19 @@ fn a_transaction_finalizes_and_executes_in_agreed_order() {
     let mut c = Cluster::new(&genesis());
     let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"t0");
 
-    // Anti-MEV precondition: the sealed transaction is opaque to any single validator (< t = 2 shares) —
-    // a proposer orders it blind, unable to see it is an ALICE→BOB transfer.
-    let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
+    // Anti-MEV precondition, stated against the fault budget rather than against one member (#136): a
+    // coalition of `f = 2` — everything the cell tolerates — must not decrypt. The committee is the whole
+    // cell in validator-index order, so member `i`'s slot is index `i`. A proposer orders blind.
     let keys = gen_keys();
-    let share0 = tx.member_share(0, &keys[members[0]].kem).expect("member 0 opens its own slot");
-    assert!(tx.open(&[share0]).is_err(), "one share (< t = 2) must not decrypt the transaction");
+    let coalition: Vec<_> = (0..CellParams::FANO.f())
+        .map(|m| tx.member_share(m, &keys[m].kem).expect("a member opens its own slot"))
+        .collect();
+    assert!(
+        tx.open(&coalition).is_err(),
+        "a coalition at the fault bound f = {} must not decrypt (t = {})",
+        CellParams::FANO.f(),
+        CellParams::FANO.seal_threshold()
+    );
 
     c.submit_all(&tx);
     c.tick(); // leader proposes height 0; the cluster drives prepare → commit → finalize → reveal.
@@ -1852,17 +1859,16 @@ fn a_byzantine_committee_members_garbage_share_does_not_block_decryption() {
 #[test]
 fn a_transaction_sealed_to_the_wrong_keyper_line_is_refused() {
     let mut c = Cluster::new(&genesis());
-    let right = epoch_seal_line(&SEED, EPOCH);
-    let wrong = (0..7usize).find(|&l| l != right).unwrap();
-    let members = line_members(wrong).expect("a real line");
-    let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &c.kem_dir[m]).collect();
+    // "The wrong committee" used to mean a different Fano line. The committee is the whole cell now (#136),
+    // so the way to name a committee this cell will not accept is to seal to a SUBSET of it — here a line's
+    // worth of members, which is exactly the committee that was unsound.
+    let member_keys: Vec<&HybridKemPublic> = c.kem_dir.iter().take(CellParams::FANO.line_size()).collect();
     let tx = SealedTx::seal(
         &Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx(),
         EPOCH,
-        wrong as u8,
         &member_keys,
         CellParams::FANO.seal_threshold(),
-        b"wrong-line",
+        b"wrong-committee",
     )
     .unwrap();
     c.submit_all(&tx);
@@ -1976,16 +1982,19 @@ fn an_equivocating_validator_is_caught_and_slashed() {
 fn an_undecryptable_transaction_is_deterministically_dropped_after_the_reveal_window() {
     use fanos_taxis::consensus::REVEAL_WINDOW;
     let mut c = Cluster::new(&genesis());
-    let line = epoch_seal_line(&SEED, EPOCH);
     // Seal to 3 GARBAGE committee keys (random keypairs, not the real committee) — passes valid_seal, but no
     // honest keyper member's secret opens any slot.
-    let garbage: Vec<(HybridKemSecret, HybridKemPublic)> =
-        (0..3u8).map(|i| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xDE, i]))).collect();
+    // A full committee's worth of keys that belong to nobody: the seal is well-FORMED (it names the right
+    // number of members, so admission accepts it) and undecryptable (no honest node holds a slot). Sized to
+    // the cell rather than to a line since #136 — at a line's size admission would refuse it and the test
+    // would prove something else.
+    let garbage: Vec<(HybridKemSecret, HybridKemPublic)> = (0..CellParams::FANO.seal_committee_size() as u8)
+        .map(|i| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xDE, i])))
+        .collect();
     let member_keys: Vec<&HybridKemPublic> = garbage.iter().map(|(_, p)| p).collect();
     let bad = SealedTx::seal(
         &Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }.into_tx(),
         EPOCH,
-        line as u8,
         &member_keys,
         CellParams::FANO.seal_threshold(),
         b"undecryptable",

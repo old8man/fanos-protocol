@@ -18,7 +18,6 @@ use fanos_wire::Wire;
 use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_taxis::checkpoint::{ExecCertificate, ExecVote};
-use fanos_taxis::committee::{epoch_seal_line, line_members};
 use fanos_taxis::consensus::{ConsensusEngine, ConsensusMsg, Input, Output};
 use fanos_taxis::crosscell::{compose_state_root, CrossMsg, Outbox};
 use fanos_taxis::hierarchy::{ChildCommittee, ChildRegistry};
@@ -153,9 +152,9 @@ impl<S: StateMachine + Clone> Cell<S> {
 
     /// Seal a transfer to this epoch's keyper line (so it passes admission).
     fn seal(&self, transfer: Transfer, tag: &[u8]) -> SealedTx {
-        let members = line_members(epoch_seal_line(&SEED, EPOCH)).expect("a real line");
-        let member_keys: Vec<&HybridKemPublic> = members.iter().map(|&m| &self.kem_dir[m]).collect();
-        SealedTx::seal(&transfer.into_tx(), EPOCH, epoch_seal_line(&SEED, EPOCH) as u8, &member_keys, CellParams::FANO.seal_threshold(), tag)
+        // The whole cell, in validator-index order — the sealing committee since #136.
+        let member_keys: Vec<&HybridKemPublic> = self.kem_dir.iter().collect();
+        SealedTx::seal(&transfer.into_tx(), EPOCH, &member_keys, CellParams::FANO.seal_threshold(), tag)
             .unwrap()
     }
 

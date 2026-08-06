@@ -598,6 +598,24 @@ pub fn budget_for(
     skeleton.payload_budget().saturating_sub(WITNESS_ALLOWANCE)
 }
 
+/// Whether a cell of these parameters can carry **at least one** sealed transaction in a block.
+///
+/// The security bound on the sealing committee ([`CellParams::seal_committee_size`]) is `m ≥ 2f + 1`, which
+/// makes `m` grow with the cell — and the seal encapsulates to every member, so a transaction costs
+/// `m · SEALED_SHARE_LEN`. Past some order that exceeds a whole block and the cell can finalize nothing.
+///
+/// A separate predicate from [`CellParams::seal_is_sound`] because it answers a different question — that one
+/// asks whether the seal keeps its secret, this one whether it fits on the wire — and a cell can fail either
+/// independently. Both are checked before sealing; a provisioning that passes only the first would look
+/// correct and produce blocks nothing can carry.
+///
+/// Measured at the reference cell: 8264 B per transaction, against a payload budget of roughly 1.03 MB.
+#[must_use]
+pub fn seal_fits_a_block(cell: crate::params::CellParams) -> bool {
+    let skeleton = Block::assemble(GENESIS_PARENT, 0, Epoch::ZERO, 0, Vec::new());
+    cell.seal_bytes_per_tx() <= skeleton.payload_budget()
+}
+
 /// Bytes reserved for the SSLE sortition witness, which `maybe_propose` attaches *after* assembly.
 ///
 /// A [`LeaderWitness`] is `output(32) ‖ Merkle siblings`, so its size is `32 + 32·h` for a Merkle-VRF tree
@@ -696,7 +714,7 @@ mod tests {
             HybridKemSecret::generate(&mut rng)
         }).collect();
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
-        SealedTx::seal(&Transaction::new(tag.to_vec()), epoch, 0, &pubs, 2, tag).unwrap()
+        SealedTx::seal(&Transaction::new(tag.to_vec()), epoch, &pubs, 2, tag).unwrap()
     }
 
     #[test]

@@ -36,7 +36,7 @@ use crate::state::ExecOutcome;
 use crate::chain::Chain;
 use crate::checkpoint::{ExecCertificate, ExecVote};
 use crate::committee::{
-    epoch_seal_line, is_line_member, leader, leader_line, line_members, verify_leader_ticket,
+    is_line_member, leader, leader_line, line_members, verify_leader_ticket,
 };
 use crate::incentive::{SlashEvidence, detect_equivocation};
 use crate::params::CellParams;
@@ -1301,9 +1301,9 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// which the keyper line's honest majority tolerates — see the module doc's liveness note.)
     #[must_use]
     fn valid_seal(&self, tx: &SealedTx) -> bool {
-        tx.epoch == self.epoch
-            && usize::from(tx.line) == epoch_seal_line(&self.seed, tx.epoch)
-            && tx.member_count() == self.params.line_size()
+        // The line check is gone with the line: the committee is the whole cell, so `member_count` alone
+        // pins it and there is nothing left for a client or a Byzantine proposer to steer (#136).
+        tx.epoch == self.epoch && tx.member_count() == self.params.seal_committee_size()
     }
 
     /// The block whose **body** this validator is stuck waiting for, if any.
@@ -2799,13 +2799,12 @@ impl<S: StateMachine> ConsensusEngine<S> {
     fn emit_reveals(&mut self, block: &Block) -> Vec<Output> {
         let mut out = Vec::new();
         for tx in &block.sealed_txs {
-            // `valid_seal` gates both ingress paths on `tx.line == epoch_seal_line(..)`, which is `% N`, so a
-            // transaction in a block always names a real line. `None` here would mean that gate was bypassed,
-            // and skipping is then the only safe answer: a committee we cannot name is one we cannot be on.
-            let Some(members) = line_members(usize::from(tx.line)) else { continue };
-            let Some(pos) = members.iter().position(|&m| m == usize::from(self.me)) else {
-                continue; // not on this transaction's sealing committee
-            };
+            // The committee is the whole cell in validator-index order (#136), so this validator's slot is
+            // its own index — there is no membership to look up and no way to be off the committee.
+            let pos = usize::from(self.me);
+            if pos >= self.params.seal_committee_size() {
+                continue; // not a member of this cell at all
+            }
             let Some(share) = tx.member_share(pos, &self.kem_secret) else {
                 continue; // (should not happen for a genuine committee member)
             };
@@ -2905,15 +2904,15 @@ impl<S: StateMachine> ConsensusEngine<S> {
         if self.reveals.get(&r.commit).is_some_and(|members| members.contains_key(&r.member)) {
             return false; // already recorded — not newly recorded, so not re-gossiped, and not re-verified
         }
-        let Some(tx) = self.sealed_tx_for(&r.commit) else {
+        let Some(_tx) = self.sealed_tx_for(&r.commit) else {
             return false;
         };
-        let Some(members) = line_members(usize::from(tx.line)) else {
-            return false; // see `emit_reveals`: an unnameable committee has no members to accept a reveal from
-        };
-        let Some(pos) = members.iter().position(|&m| m == usize::from(r.member)) else {
-            return false; // the sender is not on this transaction's keyper line
-        };
+        // The committee is the whole cell, so the revealer's slot is its validator index; the only way to
+        // be off the committee is to not be in the cell (#136).
+        let pos = usize::from(r.member);
+        if pos >= self.params.seal_committee_size() {
+            return false;
+        }
         let Some(verifier) = self.verifiers.get(usize::from(r.member)) else {
             return false;
         };

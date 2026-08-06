@@ -50,8 +50,7 @@ impl Transaction {
 pub struct SealedTx {
     /// The epoch this transaction was sealed in (binds its committee and its commitment).
     pub epoch: Epoch,
-    /// The Fano line index `0..7` of the sealing committee (`crate::committee::sealing_line`).
-    pub line: u8,
+
     /// The threshold-sealed ciphertext of the transaction payload.
     sealed: ThresholdSealed,
 }
@@ -68,7 +67,6 @@ impl SealedTx {
     pub fn seal(
         tx: &Transaction,
         epoch: Epoch,
-        line: u8,
         member_keys: &[&HybridKemPublic],
         threshold: u8,
         seed: &[u8],
@@ -90,17 +88,22 @@ impl SealedTx {
             &key_rnd,
             &kem_seed,
         )?;
-        Ok(Self { epoch, line, sealed })
+        Ok(Self { epoch, sealed })
     }
 
-    /// The transaction commitment a proposer orders by: `H(sealed_ciphertext ‖ epoch ‖ line)`. Binding to
-    /// the ciphertext (so ordering fixes *which* transaction) and to `(epoch, line)` (so a ciphertext cannot
-    /// be replayed under a different committee). Computable without opening — the blind-ordering guarantee.
+    /// The transaction commitment a proposer orders by: `H(sealed_ciphertext ‖ epoch)`. Binding to the
+    /// ciphertext (so ordering fixes *which* transaction) and to the epoch (so a ciphertext cannot be
+    /// replayed under a later decryption authority). Computable without opening — the blind-ordering
+    /// guarantee.
+    ///
+    /// It used to bind a `line` as well, back when the committee was an epoch-elected Fano line. The
+    /// committee is now the whole cell ([`CellParams::seal_committee_size`], #136), so there is one
+    /// committee per epoch and no line left to name — a field that could only ever hold one value is not a
+    /// binding, it is a decoration that reads like one.
     #[must_use]
     pub fn commit(&self) -> TxCommit {
         let mut buf = self.sealed.to_bytes();
         buf.extend_from_slice(&self.epoch.to_be_bytes());
-        buf.push(self.line);
         hash_labeled(COMMIT_LABEL, &buf)
     }
 
@@ -123,19 +126,18 @@ impl SealedTx {
         Ok(Transaction { payload })
     }
 
-    /// The number of committee members this transaction is sealed to (`q + 1`).
+    /// The number of committee members this transaction is sealed to (`n`, the whole cell).
     #[must_use]
     pub fn member_count(&self) -> usize {
         self.sealed.member_count()
     }
 
-    /// Canonical bytes: `epoch(8) ‖ line(1) ‖ sealed`. The `sealed` tail is self-delimiting
+    /// Canonical bytes: `epoch(8) ‖ sealed`. The `sealed` tail is self-delimiting
     /// ([`ThresholdSealed::from_bytes`]), so no length prefix is needed.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.epoch.to_be_bytes());
-        out.push(self.line);
         out.extend_from_slice(&self.sealed.to_bytes());
         out
     }
@@ -144,9 +146,8 @@ impl SealedTx {
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let epoch = Epoch::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
-        let line = *bytes.get(8)?;
-        let sealed = ThresholdSealed::from_bytes(bytes.get(9..)?)?;
-        Some(Self { epoch, line, sealed })
+        let sealed = ThresholdSealed::from_bytes(bytes.get(8..)?)?;
+        Some(Self { epoch, sealed })
     }
 }
 
@@ -170,7 +171,7 @@ mod tests {
         let kps = committee(3, 1);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         let tx = Transaction::new(b"transfer 10 to bob".to_vec());
-        let sealed = SealedTx::seal(&tx, Epoch::new(4), 5, &pubs, 2, b"tx-seed-1").unwrap();
+        let sealed = SealedTx::seal(&tx, Epoch::new(4), &pubs, 2, b"tx-seed-1").unwrap();
         assert_eq!(sealed.member_count(), 3);
 
         // Members 0 and 2 release their openings after finality.
@@ -188,11 +189,11 @@ mod tests {
         let kps = committee(3, 2);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
         let tx = Transaction::new(b"a".to_vec());
-        let sealed = SealedTx::seal(&tx, Epoch::new(1), 0, &pubs, 2, b"seed-a").unwrap();
+        let sealed = SealedTx::seal(&tx, Epoch::new(1), &pubs, 2, b"seed-a").unwrap();
         // Deterministic + binding to the ciphertext.
         assert_eq!(sealed.commit(), sealed.commit());
         // A different transaction (different seed → different ciphertext) commits differently.
-        let other = SealedTx::seal(&Transaction::new(b"b".to_vec()), Epoch::new(1), 0, &pubs, 2, b"seed-b").unwrap();
+        let other = SealedTx::seal(&Transaction::new(b"b".to_vec()), Epoch::new(1), &pubs, 2, b"seed-b").unwrap();
         assert_ne!(sealed.commit(), other.commit());
         // The SAME ciphertext under a different epoch commits differently (no cross-epoch replay).
         let same_ct_other_epoch = SealedTx { epoch: Epoch::new(2), ..sealed.clone() };
@@ -203,7 +204,7 @@ mod tests {
     fn a_wrong_member_secret_yields_no_share() {
         let kps = committee(3, 3);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
-        let sealed = SealedTx::seal(&Transaction::new(b"x".to_vec()), Epoch::new(0), 1, &pubs, 2, b"s").unwrap();
+        let sealed = SealedTx::seal(&Transaction::new(b"x".to_vec()), Epoch::new(0), &pubs, 2, b"s").unwrap();
         // Member 0's slot cannot be opened with member 1's secret.
         assert!(sealed.member_share(0, &kps[1].0).is_none());
     }
@@ -212,7 +213,7 @@ mod tests {
     fn sealed_tx_round_trips_through_bytes() {
         let kps = committee(3, 4);
         let pubs: Vec<&HybridKemPublic> = kps.iter().map(|(_, p)| p).collect();
-        let sealed = SealedTx::seal(&Transaction::new(b"round-trip".to_vec()), Epoch::new(9), 6, &pubs, 2, b"rt").unwrap();
+        let sealed = SealedTx::seal(&Transaction::new(b"round-trip".to_vec()), Epoch::new(9), &pubs, 2, b"rt").unwrap();
         let decoded = SealedTx::from_bytes(&sealed.to_bytes()).unwrap();
         assert_eq!(decoded, sealed);
         assert_eq!(decoded.commit(), sealed.commit(), "the commitment survives serialization");

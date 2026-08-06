@@ -31,7 +31,7 @@ use fanos_pqcrypto::{HybridSigSecret, HybridVerifier, SeedRng};
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_quic::spawn_cell;
 use fanos_runtime::{Command, Config, Engine, OverlayNode};
-use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_line};
+use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 use fanos_dromos::TokenLedger;
 use fanos_dromos::hermes::{HTLC_ESCROW, HtlcTerms, HtlcTx, hashlock, htlc_id};
 use fanos_dromos::token::{SignedTransfer, Transfer, account_id};
@@ -173,7 +173,7 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
         assert_eq!(local.shielded().spent_count(), 1);
     }
 
-    let sealed = seal_to_keyper_line(&registry, &dromos_tx, EPOCH, &SEED, CellParams::FANO, b"dromos-quic-seed")
+    let sealed = seal_to_keyper_committee(&registry, &dromos_tx, EPOCH, CellParams::FANO, b"dromos-quic-seed")
         .expect("seal the DROMOS transaction to the keyper line");
     for h in &handles {
         assert!(h.submit(sealed.clone()).await, "submitted the sealed private transfer");
@@ -289,7 +289,7 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
     let bob_note = Note::new(1000, derive_owner_pk(&BOB_NSK), auth_of(&BOB_NSK), Randomness::from_seed(b"bob"), [9u8; 32]);
     let (stx, proof) = build_transfer(ledger.params(), anchor, &[sp], &[bob_note], 0);
     let dromos_tx = Transaction::new(HybridLedger::shielded_payload(&encode_submission(&stx, &proof)));
-    let sealed = seal_to_keyper_line(&registry, &dromos_tx, EPOCH, &SEED, CellParams::FANO, b"ingress-seed")
+    let sealed = seal_to_keyper_committee(&registry, &dromos_tx, EPOCH, CellParams::FANO, b"ingress-seed")
         .expect("seal the DROMOS transaction to the keyper line");
 
     // Submit OVER THE NETWORK to exactly ONE validator (index 3): emit the transaction App-frame to its
@@ -387,7 +387,7 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
     // Submit each stage through one ingress point, to a different validator each time — the cell must gossip
     // it to every mempool, and the second stage must find the state the first one left.
     let submit = |tx: Transaction, to: usize, seed: &'static [u8]| {
-        let sealed = seal_to_keyper_line(&registry, &tx, EPOCH, &SEED, CellParams::FANO, seed)
+        let sealed = seal_to_keyper_committee(&registry, &tx, EPOCH, CellParams::FANO, seed)
             .expect("seal the HTLC transaction to the keyper line");
         cell.nodes[0].client().command(Command::Emit { to: Point::<F2>::at(to).coords(), frame: tx_to_frame(&sealed) });
     };

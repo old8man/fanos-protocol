@@ -13,12 +13,10 @@
 
 use alloc::vec::Vec;
 
-use fanos_geometry::fano;
 use fanos_incentives::{CreditIssuer, RedeemProof, Redemption};
 use fanos_pqcrypto::HybridVerifier;
 use fanos_primitives::Epoch;
 
-use crate::committee::line_members;
 use crate::params::CellParams;
 use crate::vote::{Phase, SignedVote};
 
@@ -241,29 +239,36 @@ pub fn best_response_is_honest(params: &RewardParams) -> bool {
 // epoch — so *permanent* censorship demands the coalition block **every** line at once, a covering coalition far
 // larger than `f`. The functions below make that precise; the tests machine-check it exhaustively over the cell.
 
-/// The number of withholders needed to block a keyper line's `t`-of-`(q+1)` reveal reconstruction:
-/// `(q+1) − t + 1`. Below this the honest remainder still reaches the threshold and the transaction decrypts.
+/// The number of withholders needed to block the keyper committee's `t`-of-`m` reveal reconstruction:
+/// `m − t + 1`. Below this the honest remainder still reaches the threshold and the transaction decrypts.
+///
+/// With the committee the whole cell and `t = f + 1` (#136), this is `n − f` — strictly greater than `f`, so
+/// the censorship-resistance lemma below is now an inequality rather than a covering argument.
 #[must_use]
 pub fn blocking_threshold(cell: CellParams) -> usize {
-    cell.line_size().saturating_sub(usize::from(cell.seal_threshold())) + 1
+    cell.seal_committee_size().saturating_sub(usize::from(cell.seal_threshold())) + 1
 }
 
-/// Whether `coalition` holds a blocking subset (≥ [`blocking_threshold`]) of Fano line `line`'s seats — enough
-/// of that line's keyper members to deny the `t` honest reveals a transaction sealed to it needs.
+/// Whether `coalition` holds a blocking subset (≥ [`blocking_threshold`]) of the keyper committee — enough
+/// members to deny the `t` honest reveals a transaction needs.
 #[must_use]
-fn blocks_line(coalition: &[u8], line: usize, cell: CellParams) -> bool {
-    let held =
-        line_members(line).into_iter().flatten().filter(|&m| coalition.contains(&(m as u8))).count();
+fn blocks_committee(coalition: &[u8], cell: CellParams) -> bool {
+    let held = coalition.iter().filter(|&&m| usize::from(m) < cell.seal_committee_size()).count();
     held >= blocking_threshold(cell)
 }
 
-/// Whether `coalition` can **permanently** censor a transaction: it blocks a reveal on *every* one of the `N`
-/// keyper lines, so no epoch's beacon-chosen line escapes it and re-sealing never gets the transaction through.
-/// (Reference Fano cell — the lines are `committee::line_members(0..N)`.) For a coalition within the BFT bound
-/// `f` this is always `false` (machine-checked in the tests) — the censorship-resistance guarantee.
+/// Whether `coalition` can **permanently** censor a transaction: it holds a blocking subset of the keyper
+/// committee, so the `t` honest reveals never assemble and re-sealing never gets the transaction through.
+///
+/// It used to quantify over all `N` Fano lines, because the committee rotated among them and a coalition had
+/// to cover every one. With the committee fixed as the cell (#136) there is nothing to cover and the
+/// guarantee is direct: blocking needs `n − f` members and the budget is `f`, and `n − f > f` is exactly the
+/// cell's own liveness inequality. The old form was also weaker than it looked — it protected against
+/// *permanent* censorship by rotation while conceding that a coalition owning one line censored everything
+/// for the epochs that line was drawn, which at Fano was one epoch in seven.
 #[must_use]
 pub fn can_permanently_censor(coalition: &[u8], cell: CellParams) -> bool {
-    (0..fano::N).all(|l| blocks_line(coalition, l, cell))
+    blocks_committee(coalition, cell)
 }
 
 /// The total payoff of a `coalition` jointly playing `strategy` while every non-member stays honest — the
@@ -326,6 +331,7 @@ pub fn coalition_best_response_is_honest(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use fanos_geometry::fano;
     use fanos_pqcrypto::{HybridSigSecret, SeedRng};
 
     use super::*;
@@ -438,33 +444,37 @@ mod tests {
 
     #[test]
     fn the_blocking_threshold_is_the_line_minority_that_denies_the_honest_reveal_quorum() {
-        // The Fano keyper line is 2-of-3, so blocking its reconstruction needs (q+1) − t + 1 = 3 − 2 + 1 = 2
-        // withholders — a majority of the 3-member line. A single withholder (< 2) is tolerated.
+        // The Fano keyper committee is 3-of-7, so blocking its reconstruction needs m − t + 1 = 7 − 3 + 1 = 5
+        // withholders — `n − f`, strictly more than the tolerated `f = 2`.
         let cell = CellParams::FANO;
-        assert_eq!(cell.line_size(), 3);
-        assert_eq!(cell.seal_threshold(), 2);
-        assert_eq!(blocking_threshold(cell), 2);
-        // One validator on a keyper line never blocks it (the theorem's unilateral base case).
-        for line in 0..fano::N {
-            let m = line_members(line).expect("a real line");
-            assert!(!blocks_line(&[m[0] as u8], line, cell), "a lone member cannot block line {line}");
-            assert!(blocks_line(&[m[0] as u8, m[1] as u8], line, cell), "two members block line {line}");
-        }
+        assert_eq!(cell.seal_committee_size(), 7);
+        assert_eq!(cell.seal_threshold(), 3);
+        assert_eq!(blocking_threshold(cell), cell.n() - cell.f());
+        assert_eq!(blocking_threshold(cell), 5);
+        // A coalition at the fault bound is not a blocking set; one member short of `n − f` still is not.
+        let f_sized: Vec<u8> = (0..cell.f() as u8).collect();
+        assert!(!blocks_committee(&f_sized, cell), "a coalition at the fault bound cannot block");
+        let one_short: Vec<u8> = (0..(blocking_threshold(cell) - 1) as u8).collect();
+        assert!(!blocks_committee(&one_short, cell), "one short of the blocking threshold cannot block");
+        let blocking: Vec<u8> = (0..blocking_threshold(cell) as u8).collect();
+        assert!(blocks_committee(&blocking, cell), "the blocking threshold blocks");
     }
 
     #[test]
     fn no_coalition_within_the_bft_bound_can_permanently_censor() {
         // Machine-checked censorship-resistance lemma: exhaustively over every coalition of the Fano cell, none
-        // of size ≤ f can block a reveal on *every* keyper line (so re-sealing across epochs always gets through).
+        // of size ≤ f can deny the keyper committee's reveal threshold.
         let cell = CellParams::FANO; // f = 2
         for mask in 0u16..(1 << fano::N) {
             let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
             if c.len() <= cell.f() {
-                assert!(!can_permanently_censor(&c, cell), "coalition {c:?} (≤ f={}) must not censor every line", cell.f());
+                assert!(!can_permanently_censor(&c, cell), "coalition {c:?} (≤ f={}) must not censor", cell.f());
             }
         }
-        // The smallest coalition that CAN permanently censor is n − 1 = 6 — its complement is the single point no
-        // line can avoid — far beyond the tolerated f = 2.
+        // The smallest coalition that CAN censor is `n − f = 5`, which is also the commit quorum: censoring the
+        // keyper committee and halting consensus outright now cost the adversary the same. Previously it was
+        // `n − 1 = 6` for PERMANENT censorship — a bigger-looking number for a weaker claim, since a coalition
+        // of 2 owning one line censored everything in the epochs that line was drawn.
         let min_censor = (0u16..(1 << fano::N))
             .filter_map(|mask| {
                 let c: Vec<u8> = (0..fano::N as u8).filter(|i| mask >> i & 1 == 1).collect();
@@ -472,7 +482,7 @@ mod tests {
             })
             .min()
             .expect("some coalition censors");
-        assert_eq!(min_censor, fano::N - 1, "permanent censorship needs n−1 validators");
+        assert_eq!(min_censor, cell.n() - cell.f(), "censorship needs n−f validators");
         assert!(min_censor > cell.f(), "the censoring coalition exceeds the BFT fault bound f={}", cell.f());
     }
 

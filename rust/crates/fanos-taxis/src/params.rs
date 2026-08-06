@@ -124,16 +124,81 @@ impl CellParams {
         self.q as usize + 1
     }
 
-    /// The anti-MEV mempool sealing threshold for a line committee: `t = ⌊(q+1)/3⌋ + 1` — the smallest
-    /// threshold such that an adversary holding at most `⌊(q+1)/3⌋` of a line's members (the per-line
-    /// Byzantine bound) cannot decrypt, while `t` honest members always can once `< t` are faulty.
-    /// For the Fano line (`q+1 = 3`) this is `2`-of-`3`.
+    /// The anti-MEV sealing committee: **the whole cell**, `n` members.
+    ///
+    /// It was a line, `q + 1` members, and that could not be made sound at any plane order (#136). The
+    /// requirement is two inequalities over the committee size `m` and the faults `f_c` an adversary can put
+    /// on it: secrecy needs `t > f_c` (a corrupt coalition must not reach the threshold) and liveness needs
+    /// `t ≤ m − f_c` (the honest remainder must). Together `m ≥ 2·f_c + 1`. An adversary places the cell's
+    /// `f` faults where it likes, so `f_c = min(f, m)` and the bound is `m ≥ 2f + 1` — at Fano, 5 of the 7.
+    /// A line holds 3.
+    ///
+    /// The old derivation asserted "the per-line Byzantine bound `⌊(q+1)/3⌋`", i.e. one faulty member per
+    /// line at Fano. Nothing enforces it. Two points of `PG(2,q)` lie on **exactly one** common line, so a
+    /// coalition of two owns one of the seven lines outright and `epoch_seal_line` hands it every
+    /// transaction for a whole epoch, once in seven. Measured in
+    /// `a_coalition_inside_the_fault_budget_must_not_open_a_sealed_transaction`.
+    ///
+    /// The cell rather than a bare `2f + 1` subset: the seal must name its members anyway, `n` needs no
+    /// selection rule, and the slack matters — at `m = 2f+1` exactly, `t = f+1` leaves every honest member
+    /// load-bearing, so one CRASH (outside the Byzantine budget) stops decryption. With `m = n` the cell
+    /// tolerates `n − t = n − f − 1` unavailable members, which at Fano is 4.
+    ///
+    /// **Where this stops.** The seal encapsulates to each member, measured at 1196 B/member, so a
+    /// transaction costs `n · 1196` bytes: ~8.4 KB at Fano (~120 per block against the measured ~1.03 MB
+    /// whole-block budget) and ~1.19 MB at `q = 31`, which exceeds a whole block. Sound and affordable to
+    /// about `q = 7` (`n = 57`, ~15 tx/block); above that the construction needs a single cell-wide
+    /// threshold encryption key so the ciphertext is `O(1)` in `n` — post-quantum threshold PKE, which is
+    /// research-gated.
+    #[must_use]
+    pub fn seal_committee_size(self) -> usize {
+        self.n
+    }
+
+    /// The anti-MEV sealing threshold: `t = f + 1`, the smallest threshold no tolerated coalition reaches.
+    ///
+    /// The upper end of the admissible range is `n − f`; `f + 1` is chosen because MEV resistance is the
+    /// property being bought and a lower threshold buys less of it, while the liveness slack it costs is
+    /// already generous (see [`seal_committee_size`](Self::seal_committee_size)). At Fano: `3`-of-`7`.
+    /// **Saturating, not wrapping**, and [`seal_is_sound`](Self::seal_is_sound) is what makes that visible.
+    /// `t` used to be bounded by the line size, so `as u8` was safe for every plane order this crate accepts.
+    /// Bounding it by `f` instead put it past 255 at `q ≥ 28`, where an `as` cast would have wrapped `331` to
+    /// `75` — a threshold *below* the fault budget, i.e. the exact defect this change exists to remove,
+    /// reintroduced silently by a type. Saturating leaves `t = 255 < f`, which `seal_is_sound` refuses.
     #[must_use]
     pub fn seal_threshold(self) -> u8 {
-        let line = self.line_size();
-        // ⌊line/3⌋ + 1, clamped to at least 2 and at most `line` (a threshold must be satisfiable).
-        let t = (line / 3) + 1;
-        t.clamp(2, line) as u8
+        u8::try_from((self.f + 1).min(self.n)).unwrap_or(u8::MAX)
+    }
+
+    /// The bytes one sealed transaction spends on its committee: `m · SEALED_SHARE_LEN`.
+    ///
+    /// Derived from the primitive rather than measured, so it cannot drift from the codec: each member gets a
+    /// KEM ciphertext, a wrapped Shamir share and an AEAD tag ([`fanos_threshold::SEALED_SHARE_LEN`]). The
+    /// measured figure at Fano is 1180 B/member against a derived 1169, the difference being the payload and
+    /// framing the committee does not scale.
+    ///
+    /// This is what makes the committee size a *capacity* question as well as a security one — see
+    /// [`seal_committee_size`](Self::seal_committee_size)'s closing note and
+    /// [`crate::block::seal_fits_a_block`].
+    #[must_use]
+    pub fn seal_bytes_per_tx(self) -> usize {
+        self.seal_committee_size().saturating_mul(fanos_threshold::SEALED_SHARE_LEN)
+    }
+
+    /// Whether the sealing parameters are sound: the committee is at least `2f + 1` and the threshold lies
+    /// in `[f + 1, m − f]`.
+    ///
+    /// A predicate rather than a comment because the two inequalities are the whole of the anti-MEV
+    /// argument, and the previous derivation looked reasonable while failing both.
+    // `m >= 2f + 1` rather than clippy's `m > 2f`: the two are the same integer predicate and only one of
+    // them is the bound the derivation states. A reader checking the code against the argument has to be able
+    // to see `2f + 1`.
+    #[allow(clippy::int_plus_one)]
+    #[must_use]
+    pub fn seal_is_sound(self) -> bool {
+        let m = self.seal_committee_size();
+        let t = self.seal_threshold() as usize;
+        m >= 2 * self.f + 1 && t > self.f && t <= m - self.f
     }
 
     /// Whether the masking-quorum **safety** property holds: two `Q`-quorums share `≥ f + 1` validators
@@ -160,8 +225,10 @@ impl CellParams {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use crate::block::{Block, GENESIS_PARENT};
+    use fanos_primitives::Epoch;
     use super::*;
 
     /// The prime-power orders for which `PG(2, q)` exists (small end) — the cells a real deployment picks.
@@ -215,20 +282,75 @@ mod tests {
     }
 
     #[test]
-    fn the_seal_threshold_masks_the_per_line_byzantine_bound() {
-        // The anti-MEV sealing threshold t must exceed the per-line Byzantine bound ⌊(q+1)/3⌋, so an
-        // adversary at that bound cannot open a sealed tx, yet t ≤ line so honest members always can.
+    #[allow(clippy::int_plus_one)] // see `seal_is_sound` — the stated bound is `2f + 1`.
+    fn the_seal_parameters_satisfy_both_bounds_at_every_supported_order() {
+        // The two inequalities that ARE the anti-MEV argument, checked at every order the cell supports:
+        // secrecy `t > f` (no tolerated coalition reaches the threshold) and liveness `t ≤ m − f` (the honest
+        // remainder does). `seal_is_sound` is the same pair, so this also pins the predicate to its meaning.
         for q in PRIME_POWER_ORDERS {
             let p = CellParams::for_order(q).unwrap();
-            let t = usize::from(p.seal_threshold());
-            let line = p.line_size();
-            let per_line_byz = line / 3;
-            assert!(t > per_line_byz, "t={t} must exceed the per-line Byzantine bound {per_line_byz} (q={q})");
-            assert!(t >= 2 && t <= line, "t={t} must be a satisfiable threshold on a line of {line} (q={q})");
+            let (t, m, f) = (usize::from(p.seal_threshold()), p.seal_committee_size(), p.f());
+            assert!(t > f, "t={t} must exceed the cell's fault budget f={f} (q={q})");
+            assert!(t <= m - f, "t={t} must be reachable by the honest remainder m−f={} (q={q})", m - f);
+            assert!(m >= 2 * f + 1, "a committee of {m} cannot satisfy both bounds at f={f} (q={q})");
+            assert!(p.seal_is_sound(), "the soundness predicate must agree with the inequalities (q={q})");
         }
-        // The Fano line is 2-of-3.
-        assert_eq!(CellParams::FANO.seal_threshold(), 2);
-        assert_eq!(CellParams::FANO.line_size(), 3);
+        // The Fano committee is 3-of-7. A LINE would be 3 members against f = 2, which satisfies neither
+        // bound — the defect this replaced, measured in `keyper`'s coalition test.
+        assert_eq!(CellParams::FANO.seal_threshold(), 3);
+        assert_eq!(CellParams::FANO.seal_committee_size(), 7);
+        assert!(CellParams::FANO.line_size() < 2 * CellParams::FANO.f() + 1, "a line is too small at Fano");
+    }
+
+    /// The ceiling the committee bound implies, stated as a number rather than remembered (#143).
+    ///
+    /// `m ≥ 2f + 1` makes the committee grow with the cell, and the seal encapsulates to every member — so
+    /// past some order one transaction is bigger than a block. This finds that order and pins it, so a change
+    /// that moves it (a smaller KEM, a bigger frame, a different committee rule) shows up here rather than as
+    /// a provisioned cell that cannot finalize.
+    #[test]
+    fn the_sealing_committee_bound_puts_a_ceiling_on_the_plane_order() {
+        assert!(crate::block::seal_fits_a_block(CellParams::FANO), "the reference cell must fit");
+        let largest = PRIME_POWER_ORDERS
+            .iter()
+            .copied()
+            .filter(|&q| CellParams::for_order(q).is_some_and(crate::block::seal_fits_a_block))
+            .max()
+            .expect("some order fits");
+        let smallest_over = PRIME_POWER_ORDERS
+            .iter()
+            .copied()
+            .find(|&q| CellParams::for_order(q).is_some_and(|p| !crate::block::seal_fits_a_block(p)));
+        std::eprintln!(
+            "SEAL CEILING: largest order that fits = {largest}; first that does not = {smallest_over:?}; \
+             Fano costs {} B/tx",
+            CellParams::FANO.seal_bytes_per_tx()
+        );
+        assert!(largest >= 2, "the ceiling must at least admit the Fano cell");
+        assert!(smallest_over.is_none(), "every order this crate supports still fits one transaction");
+
+        // The predicate must DISCRIMINATE, not merely be true everywhere it is asked. Every supported order
+        // fits one transaction, so the falsifying case has to be constructed: `q = 31` is `n = 993` members,
+        // ~1.16 MB of committee slots for a single transaction — larger than a whole block. Without this the
+        // assertions above would pass just as well if `seal_fits_a_block` returned `true` unconditionally.
+        let over = CellParams::for_order(31).expect("a valid order");
+        assert!(!crate::block::seal_fits_a_block(over), "one transaction at q=31 exceeds a whole block");
+        // And it is refused on the SECURITY bound too, for a reason worth naming: `t = f + 1 = 331` does not
+        // fit the `u8` the threshold is carried in, so the saturating conversion leaves `t = 255 < f`. A
+        // wrapping cast would have produced `75`, a threshold below the fault budget — #136's defect
+        // reintroduced by a type, at an order nobody would think to test.
+        assert!(!over.seal_is_sound(), "an unrepresentable threshold must not read as sound");
+        assert_eq!(over.seal_threshold(), u8::MAX, "the conversion saturates rather than wrapping");
+
+        // And "fits one transaction" is a floor, not a throughput claim: at the largest supported order a
+        // block carries very few. Stated here so the ceiling is not read as headroom.
+        let big = CellParams::for_order(largest).expect("a valid order");
+        std::eprintln!(
+            "SEAL THROUGHPUT: q={largest} → {} B/tx, about {} tx/block",
+            big.seal_bytes_per_tx(),
+            Block::assemble(GENESIS_PARENT, 0, Epoch::ZERO, 0, Vec::new()).payload_budget()
+                / big.seal_bytes_per_tx().max(1)
+        );
     }
 
     #[test]
