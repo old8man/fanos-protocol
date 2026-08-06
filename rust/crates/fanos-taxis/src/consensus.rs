@@ -55,7 +55,7 @@ const MAX_REVEAL_SUBSETS: usize = 4096;
 /// can force by streaming distinct commits: at most `MAX_PENDING_REVEAL_COMMITS × committee` reveal messages.
 /// The oldest-keyed commit is evicted past this; a genuine buffered reveal is drained the moment its block
 /// finalizes (well within the reveal window), so eviction almost never touches one.
-const MAX_PENDING_REVEAL_COMMITS: usize = 4096;
+pub const MAX_PENDING_REVEAL_COMMITS: usize = 4096;
 
 /// The **reveal window** (in finalized heights): how long a finalized block's execution waits for the anti-MEV
 /// reveals before dropping any still-undecryptable transaction. This is the **deterministic clock** that makes
@@ -989,7 +989,7 @@ pub struct ConsensusEngine<S: StateMachine> {
     // (buffered, then validated against the committee when the block enters the queue) — so a slower validator
     // does not drop the reveals it needs. `exec_queue`: finalized blocks awaiting decryption+execution.
     reveals: BTreeMap<TxCommit, BTreeMap<u8, Share>>,
-    pending_reveals: BTreeMap<TxCommit, BTreeMap<u8, RevealMsg>>,
+    pending_reveals: BTreeMap<u8, BoundedMap<TxCommit, RevealMsg>>,
     exec_queue: Vec<Block>,
     // Commit certificates gathered for a height whose block body we have not yet received (an async scheduler
     // may deliver the CC before the proposal). We hold the CC and finalize the moment the body arrives, instead
@@ -2701,7 +2701,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             if self.validate_and_record(r) {
                 out.push(Self::regossip(r));
             }
-        } else if !self.pending_reveals.get(&r.commit).is_some_and(|m| m.contains_key(&r.member))
+        } else if self.pending_reveals.get(&r.member).is_none_or(|m| m.get(&r.commit).is_none())
             && self.verifiers.get(usize::from(r.member)).is_some_and(|vk| r.verify(vk))
         {
             // Authenticate before buffering (audit B1): a reveal for a not-yet-finalized tx must still be signed
@@ -2711,14 +2711,30 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // verify for an already-buffered (commit, member) — a re-gossiped duplicate was authenticated on
             // first receipt (audit §3.9 / T-H1). Bound the buffer so even a Byzantine member streaming distinct
             // commits cannot grow it without limit — evict the oldest commit past the cap.
-            if !self.pending_reveals.contains_key(&r.commit)
-                && self.pending_reveals.len() >= MAX_PENDING_REVEAL_COMMITS
-                && let Some((&oldest, _)) = self.pending_reveals.iter().next()
-            {
-                self.pending_reveals.remove(&oldest);
+            // **The buffer is partitioned BY MEMBER, and that is the whole defence — not the eviction rule.**
+            //
+            // It used to be one `BTreeMap<TxCommit, _>` evicted with `.iter().next()`, the lexicographically
+            // smallest commit, while the comment beside it said "the oldest". Those are different rules and
+            // the difference was aimable: `commit()` is `hash(sealed ‖ epoch ‖ line)` over a sealed
+            // transaction carried in the block, so it is public — a Byzantine keyper mints commits sorting
+            // above a victim's, the victim becomes the smallest key, and it goes first.
+            //
+            // **Insertion order does not fix it, and measuring that is what produced this shape.** A genuine
+            // early reveal is buffered precisely *because* it arrived early, so under FIFO it is the oldest
+            // entry and the flood evicts it just as reliably — the same lesson a bounded map has taught this
+            // codebase before: FIFO discards the entry the system is waiting on. There is no eviction ORDER
+            // that protects it, because nothing local distinguishes a genuine early reveal from a fabricated
+            // one; both name transactions this node has not seen.
+            //
+            // What does distinguish them is WHO sent them: only a committee member's reveal is buffered at
+            // all. So each member gets `MAX_PENDING_REVEAL_COMMITS / (q+1)` slots of its own, and a flooding
+            // member can then evict nothing but its own entries. The bound on total memory is unchanged; what
+            // changes is that it is no longer a shared resource one participant can monopolise.
+            let share = MAX_PENDING_REVEAL_COMMITS / self.params.line_size().max(1);
+            let mine = self.pending_reveals.entry(r.member).or_insert_with(|| BoundedMap::new(share));
+            if mine.get(&r.commit).is_none() {
+                mine.insert(r.commit, r.clone());
             }
-            // Buffer, first-writer-wins per member, so a flood cannot displace a genuine early reveal.
-            self.pending_reveals.entry(r.commit).or_default().entry(r.member).or_insert_with(|| r.clone());
         }
         out.extend(self.try_execute());
         out
@@ -2728,7 +2744,17 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// bounded-buffer DoS defence (audit B1): this never exceeds `MAX_PENDING_REVEAL_COMMITS`.
     #[must_use]
     pub fn pending_reveal_count(&self) -> usize {
-        self.pending_reveals.len()
+        self.pending_reveals.values().map(BoundedMap::len).sum()
+    }
+
+    /// Whether any reveal is buffered for `commit` — the witness a bound test needs.
+    ///
+    /// A COUNT cannot express the property that matters here. "Some entry was evicted" is true under any
+    /// eviction rule; what distinguishes a steerable rule from a sound one is *which* entry survives, and only
+    /// a per-commit predicate can ask that.
+    #[must_use]
+    pub fn buffers_reveal_for(&self, commit: &TxCommit) -> bool {
+        self.pending_reveals.values().any(|m| m.get(commit).is_some())
     }
 
     /// Find a finalized-but-unexecuted transaction by its commitment (searching the execution queue).
@@ -2789,11 +2815,14 @@ impl<S: StateMachine> ConsensusEngine<S> {
     fn drain_pending_reveals(&mut self, block: &Block) -> Vec<Output> {
         let mut out = Vec::new();
         for tx in &block.sealed_txs {
-            if let Some(early) = self.pending_reveals.remove(&tx.commit()) {
-                for r in early.values() {
-                    if self.validate_and_record(r) {
-                        out.push(Self::regossip(r));
-                    }
+            let commit = tx.commit();
+            // Gathered across the per-member partitions before validating, because `validate_and_record`
+            // borrows `self` mutably and the partitions live there.
+            let early: Vec<RevealMsg> =
+                self.pending_reveals.values_mut().filter_map(|m| m.remove(&commit)).collect();
+            for r in &early {
+                if self.validate_and_record(r) {
+                    out.push(Self::regossip(r));
                 }
             }
         }

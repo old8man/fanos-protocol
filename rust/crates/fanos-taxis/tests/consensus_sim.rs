@@ -2045,6 +2045,58 @@ fn b1_only_authenticated_reveals_are_buffered() {
     assert_eq!(engine.pending_reveal_count(), 1, "a member-signed reveal is buffered");
 }
 
+/// **The buffer's eviction must not be steerable by the flood it defends against.**
+///
+/// `pending_reveals` was a `BTreeMap<TxCommit, _>` evicted with `.iter().next()` — the lexicographically
+/// SMALLEST commit — while the comment beside it said "the oldest commit". Those are different rules, and the
+/// difference is exploitable: `commit()` is `hash(sealed ‖ epoch ‖ line)` over a sealed transaction carried in
+/// the block, so it is public. A Byzantine keyper reads a victim's commit, mints commits that all sort ABOVE
+/// it, and the victim becomes the smallest key and is evicted first. A few thousand hashes to aim a bound.
+///
+/// Asserted as SURVIVAL of the earliest entry rather than as "some eviction happened", because the second is
+/// true under both rules and only the first tells them apart.
+#[test]
+fn a_flood_cannot_choose_which_buffered_reveal_it_evicts() {
+    let mut keys = gen_keys();
+    let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
+    let registry = KeyperRegistry::new(
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+    );
+    let keyper_commit = registry.commit();
+    let k1 = keys.remove(1);
+    let mut engine =
+        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_commit, SEED, EPOCH, genesis());
+
+    // An HONEST keyper's early reveal, at the smallest possible commit — which is what the old key-ordered
+    // rule evicted first, and what an attacker would therefore arrange.
+    let victim: [u8; 32] = [0x00; 32];
+    let _ = engine.step(Input::Reveal(RevealMsg::signed(victim, 0, share_bytes(1, &[0x66; 32]), &keys[0].sig)));
+    assert_eq!(engine.pending_reveal_count(), 1, "the honest keyper's early reveal is buffered");
+
+    // A BYZANTINE keyper — a different committee member, since only members' reveals are buffered at all —
+    // floods past the cap with commits sorting entirely above the victim. Both halves of the attack are here:
+    // the volume, and the aim.
+    for i in 0..=fanos_taxis::consensus::MAX_PENDING_REVEAL_COMMITS {
+        let mut c = [0xFFu8; 32];
+        c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        c[0] |= 0x80; // strictly above the all-zero victim
+        let _ = engine.step(Input::Reveal(RevealMsg::signed(c, 2, share_bytes(1, &[0x77; 32]), &keys[1].sig)));
+    }
+
+    assert!(
+        engine.pending_reveal_count() <= fanos_taxis::consensus::MAX_PENDING_REVEAL_COMMITS,
+        "the bound still holds — this is not a test that the cap was removed"
+    );
+    assert!(
+        engine.buffers_reveal_for(&victim),
+        "an honest keyper's buffered reveal survives another member's flood. Under ONE shared bound it does \
+         not: key-ordered eviction takes the smallest commit (which the attacker arranges), and insertion \
+         order takes the OLDEST — which is the honest early reveal by construction, since arriving early is \
+         why it is buffered. Neither eviction order protects it; only partitioning the bound per member does, \
+         because who sent a reveal is the one thing that distinguishes it locally"
+    );
+}
+
 #[test]
 fn a_height_still_finalizes_after_a_prepare_quorum_that_never_committed() {
     // THE LIVENESS DEFECT `dromos_quic` was actually hitting, reproduced deterministically.

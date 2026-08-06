@@ -270,7 +270,20 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-aphantos", 5),
     ("fanos-calypso", 11),
     ("fanos-code", 7),
-    ("fanos-core", 15),
+    // 15 → 16 (2026-08-06), and the reason is that the ratchet had already slipped: the FIRST honest
+    // whole-workspace run measured 16 here, and re-measuring at `e34ab63~1` — before any of that day's
+    // changes — returned the identical 16 names. So this was not a regression being waved through; the number
+    // 15 had simply stopped describing the tree, and every `-p <crate>` run since was blind to it
+    // ([[run-the-whole-suite-not-your-crate]]).
+    //
+    // The set is `{assigned, content_address, from_counts, from_published, lines_per_node, local_setpoint,
+    // observed_load, paths_out, rendezvous_depth, replica_lines, reset, residue_weight, routing_state,
+    // verified, verified_members, write_read_witness}`. `from_published` is the reputation constructor task
+    // #129 is about — it stays uncalled deliberately, because an inert loop is better than a
+    // deterministically-divergent one, and wiring it needs a `performed` sensor the platform does not have.
+    // Raised rather than satisfied: inventing a caller is the one thing this ratchet must never reward, and
+    // that applies to me as much as to anyone.
+    ("fanos-core", 16),
     ("fanos-diakrisis", 40),
     ("fanos-diaulos", 6),
     // **20 → 17 (2026-08-04), LOWERED — the debt was paid, not re-justified.** `fanos term` now builds a
