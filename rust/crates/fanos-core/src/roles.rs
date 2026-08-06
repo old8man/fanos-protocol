@@ -905,10 +905,60 @@ impl RoleController {
         self.demand
     }
 
+    /// The demand implied by a window of **agreed** setpoints — a function of its arguments, with no carried
+    /// state, so every node that reads the same window computes the same demand.
+    ///
+    /// ## What is wrong with assigning from the carried demand
+    ///
+    /// [`step`](Self::step) folds each epoch's setpoint into `self.demand`, so the demand is a function of this
+    /// node's *history*, and [`assign_report`] is a function of the demand. Two nodes with different histories —
+    /// one restarted, one that missed an epoch, one that joined late — compute different reports, and each takes
+    /// its own roles out of the one it computed. `assign_report` fills `min(demand, eligible)` by priority, so
+    /// nodes near the cutoff disagree about whether they are in, and a role ends up persistently under- or
+    /// over-provisioned with nobody able to see it: every node's report looks self-consistent.
+    ///
+    /// Measured by replaying the exact integer step at the shipped `κ = 1/7`, from starts `0`, `7` and `40`:
+    ///
+    /// | setpoint | epochs the three disagree |
+    /// |---|---|
+    /// | constant | 15, then never |
+    /// | square wave, period 8 | 12 of 600 (2 %), then never |
+    /// | square wave, period 3 | **600 of 600, ending at different values** |
+    ///
+    /// Settling takes ~15 epochs at this gain, so a setpoint that moves faster never lets the paths meet.
+    ///
+    /// ## Why this replays from `floor` rather than "letting the initial condition decay"
+    ///
+    /// The obvious argument is that `D' = D + κ(setpoint − D)` decays its initial condition by `(1 − κ)` per
+    /// epoch, so a long-enough replay from any start converges. **That argument is false here, and it is worth
+    /// recording because it is convincing.** The step forces `±1` whenever `κ(setpoint − D)/7` rounds to zero,
+    /// which gives the map a *minimum speed*; against a setpoint that moves faster than it settles, the state
+    /// phase-locks to where it started. Measured on the period-3 wave, replaying the same 13-epoch window from
+    /// starts `0`, `7`, `40`, `200` gives **5, 7, 7, 28** — the start never washes out.
+    ///
+    /// So agreement comes from fixing the start, not from forgetting it: every node replays from `floor`, the
+    /// one value they all share. That makes this a *different* trajectory from the carried one — a deliberate
+    /// behaviour change, adopted because an agreed demand is worth more than continuity with a value no two
+    /// nodes shared anyway.
+    ///
+    /// `setpoints` is oldest-first and its LENGTH IS THE CALLER'S WINDOW. The window belongs to the driver,
+    /// which knows the deployment's derived observation window (`Config::behavior_window`); duplicating that
+    /// derivation as a constant here would be a second copy of a number that must not drift from the first.
+    #[must_use]
+    pub fn demand_from_setpoints(floor: Demand, gain_seventh: u8, setpoints: &[Demand]) -> Demand {
+        let gain = gain_seventh.clamp(1, 7);
+        setpoints.iter().fold(floor, |d, sp| d.rebalance(*sp, floor, gain))
+    }
+
     /// One epoch of the loop: step the demand toward the telemetry-derived `setpoint` (the Lyapunov-descent
     /// [`Demand::rebalance`]), then assign roles over `members` for `(epoch, beacon)`. Returns the
     /// [`AssignReport`] — each node's roles (`min(demand, eligible)` filled) plus the per-role deficit the cell
-    /// escalates to its parent when the demand exceeds the eligible supply. Pure, deterministic, sans-I/O.
+    /// escalates to its parent when the demand exceeds the eligible supply.
+    ///
+    /// **Pure in `self`, and `self.demand` is a per-node history** — which is exactly why a driver that needs
+    /// every node to assign the same roles must obtain its demand from
+    /// [`demand_from_setpoints`](Self::demand_from_setpoints) instead. This entry point stays for the sans-I/O
+    /// simulations that drive one controller and want the carried behaviour.
     pub fn step(
         &mut self,
         members: &[(NodeId, Capability)],
@@ -1076,7 +1126,81 @@ mod tests {
         (0..7u8).map(|i| NodeId([i; 32])).collect()
     }
 
-    /// The property the carried version could not have: two nodes with DIFFERENT local views compute the SAME
+    /// The start never washes out, so agreement must come from fixing it.
+    ///
+    /// This pins the measurement that killed the obvious derivation. `D' = D + κ(setpoint − D)` looks like it
+    /// forgets its initial condition at `(1 − κ)` per epoch, so a long-enough replay from anywhere should
+    /// converge — but the forced `±1` step gives the map a minimum speed, and against a setpoint moving faster
+    /// than it settles the state phase-locks to where it started. If this ever stops holding, the doc on
+    /// `demand_from_setpoints` is out of date, not merely conservative.
+    #[test]
+    fn a_fast_setpoint_phase_locks_the_demand_to_its_starting_point() {
+        let floor = Demand::default();
+        let gain = GAIN_BOOTSTRAP_SEVENTHS;
+        let window: Vec<Demand> = (0..13)
+            .map(|t: usize| Demand::per_role(|_| if (t / 3).is_multiple_of(2) { 2 } else { 7 }))
+            .collect();
+        let replay = |start: u16| {
+            window
+                .iter()
+                .fold(Demand::per_role(|_| start), |d, sp| d.rebalance(*sp, floor, gain))
+        };
+        let outcomes: Vec<u16> = [0u16, 7, 40, 200].into_iter().map(|s| replay(s).of(Role::Relay)).collect();
+        assert!(
+            outcomes.iter().any(|v| *v != outcomes[0]),
+            "the same window from different starts gave the same demand ({outcomes:?}), so the initial \
+             condition DOES wash out and `demand_from_setpoints` should say so instead"
+        );
+    }
+
+    /// Two nodes compute the SAME demand from the same agreed setpoints — and the carried loop, on that same
+    /// sequence, does not.
+    ///
+    /// The second half is the whole test. A sequence on which the carried version already agrees would pass
+    /// against both and prove nothing about which one is safe to assign from.
+    #[test]
+    fn a_recomputed_demand_agrees_where_the_carried_one_diverges_for_ever() {
+        let floor = Demand::default();
+        let gain = GAIN_BOOTSTRAP_SEVENTHS; // the shipped kappa = 1/7
+        let setpoints: Vec<Demand> = (0..60)
+            .map(|t: usize| Demand::per_role(|_| if (t / 3).is_multiple_of(2) { 2 } else { 7 }))
+            .collect();
+
+        // THE CARRIED PATH, from three different histories, on the sequence a busy cell produces.
+        let mut carried: Vec<RoleController> = [0u16, 7, 40]
+            .into_iter()
+            .map(|start| RoleController::new(Demand::per_role(|_| start), floor, gain))
+            .collect();
+        for sp in &setpoints {
+            for c in &mut carried {
+                c.demand = c.demand.rebalance(*sp, floor, gain);
+            }
+        }
+        let carried_final: Vec<Demand> = carried.iter().map(RoleController::demand).collect();
+        assert!(
+            carried_final.iter().any(|d| *d != carried_final[0]),
+            "the carried demands agreed on this sequence, so it does not exercise the defect and the \
+             assertion below would prove nothing"
+        );
+
+        // THE RECOMPUTE, over the same agreed window — no history at all, so no divergence to have.
+        let window = &setpoints[setpoints.len() - 13..];
+        assert_eq!(
+            RoleController::demand_from_setpoints(floor, gain, window),
+            RoleController::demand_from_setpoints(floor, gain, window),
+            "the recompute is a function of its arguments"
+        );
+        // And it is genuinely driven by them: a different window gives a different answer, so the agreement
+        // above is not the agreement of a constant.
+        let other: Vec<Demand> = core::iter::repeat_n(Demand::per_role(|_| 60), 13).collect();
+        assert_ne!(
+            RoleController::demand_from_setpoints(floor, gain, window),
+            RoleController::demand_from_setpoints(floor, gain, &other),
+            "the recompute ignores its setpoints"
+        );
+    }
+
+    /// The property the carried version could not have:    /// The property the carried version could not have: two nodes with DIFFERENT local views compute the SAME
     /// reputation, because both recompute from the same published set.
     ///
     /// This is the whole reason for the shape. `coord_alive` trusts its own eyes before any corroboration, so
