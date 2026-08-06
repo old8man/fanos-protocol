@@ -3930,3 +3930,63 @@ The window question returns unchanged: only `e − 1` is readable, so a multi-ep
 it verified. That is carried state again — but of *published facts a node checked*, not of opinions, so two
 nodes agree except across a read they missed, and it is recomputed from a fixed start each epoch rather than
 stepped. Bounded, self-healing, does not compound. Same trade as the setpoint, accepted for the same reason.
+
+---
+
+## The anti-MEV seal's committee is too small, at every plane order (2026-08-06)
+
+Found while sweeping `saturating_sub` sites for underflow-to-zero; the arithmetic below is machine-checked
+over eleven prime-power orders and nothing here is fixed yet.
+
+**The claim.** §10.1 / `docs/design-taxis.md` §5: every transaction is threshold-sealed to a beacon-chosen
+keyper **line** so nobody reads the mempool before ordering. `committee::epoch_seal_line` draws one line per
+epoch; `keyper::seal_to_keyper_line` seals to that line's committed decryption keys, openable by
+`t = CellParams::seal_threshold()` of them. Holding `t` of those secret keys decrypts **immediately** — no
+reveal to wait for.
+
+**The arithmetic.** `t = clamp(⌊(q+1)/3⌋ + 1, 2, q+1)` against the cell budget `f = ⌊(n−1)/3⌋`:
+
+| `q` | 2 | 3 | 4 | 5 | 7 | 8 | 9 | 11 | 13 | 16 | 31 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `f` | 2 | 4 | 6 | 10 | 18 | 24 | 30 | 44 | 60 | 90 | 330 |
+| `t` | **2** | 2 | 2 | 3 | 3 | 4 | 4 | 5 | 5 | 6 | 11 |
+
+`t ≤ f` at **every** order, with equality at Fano. So a coalition the system explicitly tolerates can place
+`t` members on a chosen line and read the sealed mempool. At Fano it is geometric rather than probabilistic:
+any two points lie on exactly one line, that line has three points, so the two tolerated faults hold `2 = t`
+of it — and `epoch_seal_line` draws 1 of 7, so **one epoch in seven is fully readable early**. The blocking
+side is inside budget too (`m − t + 1 ≤ f` at every order); `can_permanently_censor` survives only because it
+demands blocking *every* line at once, and decryption has no such requirement.
+
+**Why the test passes.** `the_seal_threshold_masks_the_per_line_byzantine_bound` asserts `t > line/3` and calls
+`line/3` "the per-line Byzantine bound". That is the *expected* share of corruption on a line under uniform
+corruption — but an adversary chooses whom to corrupt and obeys only the cell-wide `f`. The guard pins the
+wrong adversary model, so it passes at every order while the property fails at every order.
+
+Two thresholds also live on one line and coincide only at Fano: `seal_threshold = ⌊m/3⌋+1` and
+`geometry::line_threshold = ⌈2m/3⌉` (the mixnet hop, and now the rendezvous occupancy floor). At `q = 7` that
+is 3 against 6. The mix threshold *is* derived against a targeted cell-wide coalition; the seal threshold is
+not, and they are guarding the same kind of object.
+
+**The structural result, which decides the fix rather than leaving it open.** Secrecy against `f` needs
+`t ≥ f+1`; liveness against `f` failures needs `t ≤ m − f`. On a Fano **line** that is `t ≥ 3` and `t ≤ 1` —
+**empty**, so no choice of `t` repairs this while the committee is a line. On the **cell** it is
+`t ∈ [f+1, n−f] = [3, 5]`, non-empty, and the blocking threshold `n − t + 1 = 5 > f`, so a within-budget
+coalition can neither read nor censor. The keyper committee has to be the cell, which also retires the
+per-epoch line rotation (the committee is everyone). What the line buys is smaller share sets and per-line
+sharding — a performance argument, weighed here against a security property.
+
+**And the platform already owns the right question.** `fanos_node::node::correlation_within_budget(line_size)`
+is exactly `f ≥ 2·mix_threshold(line_size) − 1` — *can a coalition inside the fault budget capture both of a
+circuit's naming lines?* — with a measured table behind it (`false` at `q = 2, 3, 4`; `true` from `q = 5`, and
+`q = 5` and `q = 8` named as the sharp cases). The mixnet threshold is checked against a targeted cell-wide
+coalition, deliberately and with numbers.
+
+The seal threshold is the same kind of object — how many of a line must act — and that predicate is never
+applied to it. Its test asks a different and weaker question instead. So this is not a new adversary model
+being imported from outside: it is the platform's own model, applied to one of its two line thresholds.
+
+Reduced wide, the rule to carry: **any threshold over a sub-committee must be sized against what an
+`f`-coalition can place on that committee, never against the committee's expected share of a uniform
+corruption.** A line of `m` points inside a cell of `n` is not a scaled-down cell; the adversary picks where
+its budget sits.
