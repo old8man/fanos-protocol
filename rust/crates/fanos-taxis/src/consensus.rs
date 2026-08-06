@@ -1602,13 +1602,27 @@ impl<S: StateMachine> ConsensusEngine<S> {
             return self.answer_with_cert(from, have_height);
         };
         // **`cert.height <= have_height` used to end it here, and that is the server half of the wedge.** A
-        // requester standing at our own height with a *different* root needs exactly the thing this branch
+        // requester that is level with us but holds a *different* state needs exactly what this branch
         // refuses — the certified state — and the certificate it gets instead finalizes a height it already
-        // holds, so it changes nothing. Serve on either condition: strictly newer (it is behind), or same
-        // height and a different root (it is beside us). Both are answered by the same snapshot, and both
-        // remain certificate-verified and root-verified at the requester.
+        // holds, so it changes nothing.
+        //
+        // The servable point is **our checkpoint and only our checkpoint**: a `SyncResp` is a certificate plus
+        // the snapshot it certifies, and the only certificate we retain is `self.checkpoint`. So we cannot
+        // serve "the state at the requester's height" in general, and matching heights exactly would answer
+        // almost nobody, because a checkpoint lags execution. Serve the checkpoint to any requester whose root
+        // contradicts ours at a height we can speak for — which is what `have_root` reports — and let the
+        // requester decide whether adopting it is a step forward or a rollback (`on_sync_resp`).
         let behind = cert.height > have_height;
-        let diverged = cert.height == have_height && cert.state_root != have_root;
+        // We can only *contradict* a requester at a height we retain. Where we do not hold that height's root
+        // we cannot tell divergence from agreement, and must not guess: fall through to the certificate.
+        //
+        // **`have_height − 1`, and the off-by-one is the whole mechanism rather than a detail.** `have_height`
+        // is the requester's *next* height, while `have_root` is the state it holds after executing the one
+        // below it — and `sync_heads` is keyed by *executed* block height. Comparing at `have_height` looks up
+        // a block nobody has executed yet, misses on every request, and the diverged validator is answered
+        // with silence for ever. Measured before the correction: 25 asks, 25 "nothing" replies.
+        let executed = have_height.saturating_sub(1);
+        let diverged = self.sync_heads.get(&executed).is_some_and(|(root, _)| *root != have_root);
         if !behind && !diverged {
             return self.answer_with_cert(from, have_height);
         }
@@ -1696,8 +1710,19 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Only then install it atomically and reset all per-height working state so we resume at `height + 1`
     /// without re-voting decided heights (which would read as equivocation).
     fn on_sync_resp(&mut self, cert: ExecCertificate, snapshot: &[u8]) -> Vec<Output> {
-        if cert.height < self.height() {
-            return Vec::new(); // (1) not ahead of us
+        // **(1) forward-only, EXCEPT when we know our state is not the cell's.** Monotonicity is the right
+        // default and it is also what made divergence unrepairable: the servable certificate is the peer's
+        // checkpoint, a checkpoint *lags* execution, so the certified state a diverged validator needs is
+        // almost always BELOW its own height and this guard threw it away.
+        //
+        // Rolling back is sound precisely here and nowhere else — the certificate is a `Q`-quorum attesting
+        // `(height, root, head)`, so adopting it is adopting the cell's own truth rather than a peer's claim,
+        // and `diverged` is set only by a quorum that contradicted our own attestation. A healthy validator
+        // never takes this branch, so the no-rollback property it relies on is untouched. Afterwards we are
+        // *behind* rather than *wrong*, which the ordinary height-driven catch-up already handles — a defect
+        // that was permanent becomes one that is transient and self-healing.
+        if cert.height < self.height() && self.diverged.is_none() {
+            return Vec::new();
         }
         if !cert.verify(self.params.quorum(), &self.verifiers) {
             // **The T-H6 site.** `verify` now requires every `ExecVote` to agree on the head as well as the

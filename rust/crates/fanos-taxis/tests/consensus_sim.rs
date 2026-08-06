@@ -139,6 +139,11 @@ struct Cluster {
     drop_sync_resp: bool,
     /// Validators that never receive block bodies (Propose), to exercise the commit-cert-before-body path.
     deaf_propose: BTreeSet<usize>,
+    /// Validators that never receive **reveals**, while hearing every vote and body — the one loss pattern that
+    /// produces state divergence WITHOUT a height gap, because `finalize` advances on the header and only
+    /// execution waits for the openings. A partition cannot express it: it would deny votes too, and then the
+    /// height trigger already covers the node.
+    deaf_reveal: BTreeSet<usize>,
     /// Every distinct block body seen on the bus (so a test can hand-deliver a withheld body later).
     proposed: Vec<Block>,
     /// Equivocation proofs the engines surfaced (the operational slashing signal).
@@ -199,6 +204,7 @@ impl Cluster {
             drop_to: None,
             drop_phase: None,
             deaf_propose: BTreeSet::new(),
+            deaf_reveal: BTreeSet::new(),
             proposed: Vec::new(),
             slashes: Vec::new(),
             da_begins: 0,
@@ -454,6 +460,9 @@ impl Cluster {
             // A validator deaf to proposals still receives votes/reveals — it can gather a commit certificate
             // without ever seeing the body (the async case the wedge-fix must survive).
             if matches!(msg, ConsensusMsg::Propose(_)) && self.deaf_propose.contains(&i) {
+                continue;
+            }
+            if matches!(msg, ConsensusMsg::Reveal(_)) && self.deaf_reveal.contains(&i) {
                 continue;
             }
             // A targeted vote loss: this validator specifically does not hear this phase.
@@ -802,6 +811,61 @@ fn ssle_a_down_line_member_does_not_stall_the_round_the_window_expiry_finalizes(
     assert_ne!(usize::from(block.header.proposer), victim, "the crashed member did not lead");
     assert!(members.contains(&usize::from(block.header.proposer)), "the leader is a (live) line member");
     assert!(block.witness.is_some(), "still a witnessed round-0 block — the window expiry, not a view-change fallback");
+}
+
+/// **The level-and-wrong state, constructed rather than raced — and repaired.**
+///
+/// `losing_the_sync_race_...` below pins the same property and passes for the wrong reason: in the sim its
+/// laggard stays stuck at genesis, so the condition it forbids is never actually built. This builds it.
+///
+/// One validator hears every vote and every body and no REVEALS, for the whole run. `finalize` advances on the
+/// header, so its height tracks the cell exactly; only execution waits for the openings. Once the cell
+/// finalizes `REVEAL_WINDOW` further heights it drops the transaction as undecryptable while everyone else
+/// executes it — no fork, no equivocation, no Byzantine participant, because the drop CLOCK is agreed and the
+/// drop PREDICATE (`shares.len() < t`) is over a local view.
+///
+/// The property asserted is the OUTCOME, and the second assertion is what stops it being vacuous: the blind
+/// validator must have reached the cell's state by **adopting certified state**, not by never diverging. Its
+/// own execution attestation disagreeing with the quorum's is the evidence that triggers the ask; the height
+/// comparison that used to gate both the ask and the answer cannot see this condition at all.
+#[test]
+fn a_validator_that_missed_the_reveals_detects_its_divergence_and_is_repaired() {
+    const BLIND: usize = 5;
+    let mut c = Cluster::new(&genesis());
+    c.deaf_reveal.insert(BLIND);
+
+    let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 250, nonce: 0 }, b"diverge-tx");
+    c.submit_all(&tx);
+    for _ in 0..14 {
+        c.tick();
+        c.timeout();
+    }
+    assert_eq!(c.engines[0].chain().state().balance(&BOB), 250, "the cell executed the transfer");
+    assert_eq!(
+        c.engines[BLIND].chain().next_height(),
+        c.engines[0].chain().next_height(),
+        "the blind validator keeps up on HEIGHT — `finalize` advances on the header, so by its own catch-up \
+         test it is never behind"
+    );
+
+    // THE PROPERTY.
+    let probe = c.engines[BLIND].probe();
+    assert_eq!(
+        c.engines[BLIND].chain().state().balance(&BOB),
+        250,
+        "the validator that never saw a reveal holds the cell's state. Without the root comparison it sits at \
+         the cell's height with the pristine balances for ever: the trigger compares heights and it is not \
+         behind, and the server refuses a snapshot to anyone not below its checkpoint.\n  blind: {probe}"
+    );
+
+    // NON-VACUITY: it got there by adopting certified state, not by quietly never diverging. Without this a
+    // harness bug that delivered reveals after all would leave the assertion above passing and empty.
+    assert!(
+        probe.sync_taken > 0,
+        "the repair must run through state-sync — a blind validator that reached the right balance without \
+         ever adopting a snapshot means the reveal drop did not take, and this test proves nothing.\n  \
+         blind: {probe}"
+    );
 }
 
 #[test]
@@ -2525,8 +2589,14 @@ fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate()
     // does the retained certificate become the applicable answer. **Every** such height must be served, not merely one.
     let ckpt = c.engines[0].latest_checkpoint().map_or(0, |c| c.height);
     assert!(head > ckpt, "the cell has finalized past its checkpoint, so the certificate path is exercised at all");
+    // The requester's root is the CERTIFIED one, not a placeholder, and that distinction is the test's subject.
+    // This peer is *stuck*, not diverged — it agrees with the cell's executed state and is missing only a
+    // signature — so it reports the root the checkpoint certifies. A fabricated root would make it look diverged
+    // at the checkpoint height and pull the snapshot branch, asserting a reply production would never ask for
+    // (the inverse of [[test-narrower-than-production]]: an input the live path cannot emit).
+    let agreed = c.engines[0].latest_checkpoint().map_or([0u8; 32], |c| c.state_root);
     for h in ckpt..head {
-        let replies = c.engines[0].step(Input::SyncReq { from: 1, have_height: h, have_root: [0u8; 32] });
+        let replies = c.engines[0].step(Input::SyncReq { from: 1, have_height: h, have_root: agreed });
         assert!(
             replies.iter().any(|o| {
                 matches!(o, Output::SendTo { msg: ConsensusMsg::CommitCert(cert), .. } if cert.height == h)
@@ -2537,8 +2607,8 @@ fn a_peer_stuck_between_the_checkpoint_and_the_head_is_offered_the_certificate()
     }
     // And nothing is invented for a height the cell has not reached.
     assert!(
-        c.engines[0].step(Input::SyncReq { from: 1, have_height: head, have_root: [0u8; 32] }).is_empty(),
-        "a request at our own height has nothing newer to offer"
+        c.engines[0].step(Input::SyncReq { from: 1, have_height: head, have_root: agreed }).is_empty(),
+        "a request at our own height, agreeing on state, has nothing newer to offer"
     );
 }
 
