@@ -150,6 +150,21 @@ pub fn plan_healing(verdict: &Verdict, self_index: usize, degraded: u8, phi: f64
             // Byzantine forgery: localize (distrust the violated polar classes) AND escalate to
             // the parent for re-provisioning (spec §6.4 + §6.3). Local distrust alone is not a
             // proven restoration of the Fano wiring, so the parent is the authoritative fix.
+            //
+            // **Quarantine is emitted unconditionally, and the D6 theorem is why — not an oversight.** The
+            // theorem (`docs/design-quarantine-theorem.md`) says quarantining `q` lowers `Φ` iff
+            // `s_q > Φ/2`, and forbids it otherwise because removing an under-coupled node *raises* `Φ`. On
+            // the **equicorrelated stratum this reflex runs on**, that condition is always true:
+            // `Φ_equi(N, r) = (N−1)r²` and every node's coupling energy is `Σ_{j≠q} r² = (N−1)r²`, i.e.
+            // exactly `Φ` — so `s_q > Φ/2` reduces to `Φ > Φ/2`. Closed form agrees:
+            // `Φ' = (N·Φ − 2Φ)/(N−1) = Φ(N−2)/(N−1)`, which is `5Φ/6` at Fano.
+            //
+            // The cost of that, stated because it is invisible otherwise: **the model cannot tell nodes
+            // apart.** Every per-node quantity it can produce is identical, so the theorem holds vacuously
+            // rather than usefully, and this arm's per-class response is not sized to the node it names.
+            // A healer that ever builds a *measured* `Coherence` matrix — rather than modelling one from a
+            // single scalar correlation — must gate each action on `Coherence::quarantine_lowers_phi(c)`,
+            // which exists, is correct, and has no caller for exactly this reason.
             let mut residue = 0u8;
             for &c in classes {
                 actions.push(HealingAction::Quarantine { node: c });

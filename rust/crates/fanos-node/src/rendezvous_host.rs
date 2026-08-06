@@ -433,6 +433,28 @@ struct HostContext {
     signer: HybridSigSecret,
 }
 
+/// Whether this epoch's mix directory is a sound basis for laying a hidden service's circuits.
+///
+/// **An incomplete read is treated exactly like an empty one**, and that is the whole point of carrying the
+/// flag. Every construction downstream draws from the directory: `select_drop_line` skips a line whose members
+/// are absent, `random_hops` picks only from what resolved, and `HostRegister::onion` refuses a hop it cannot
+/// seal to. Under a partial view all three still *succeed*, over whichever lines answered.
+///
+/// Incomplete means a read **timed out**, not that a peer published nothing — an unpublished key is a definite
+/// absence and routing around that node is correct, since it cannot be a hop. A timeout is not a fact about the
+/// cell at all, so an adversary that can slow a chosen subset of store reads, far cheaper than compromising a
+/// node, would otherwise steer this service's circuit placement. Registering over a subset an attacker shaped
+/// is worse than not registering: the epoch is lost either way, and only one of the two hands the placement
+/// over.
+///
+/// A named predicate rather than an inline `if`, so the rule can be asserted both ways — its two siblings in
+/// the role loop (`setpoint_to_track`, `next_stable`) are pure for the same reason, and the branch it guards
+/// is otherwise reachable only from a live cell whose store reads are being stalled.
+#[must_use]
+const fn may_register(resolved: usize, complete: bool) -> bool {
+    resolved > 0 && complete
+}
+
 /// One epoch's host rotation: rebuild the directory, register the anonymous forward route at the current
 /// meeting combiner, and push the fresh `(reply key, directory)` to the accept loop. A silent no-op if the
 /// directory is not yet resolvable or a member key is missing — the next epoch (or the client's retransmits)
@@ -451,20 +473,9 @@ async fn rotate_host(
     let beacon = BeaconSeed::new(seed);
     // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
     // must prove its slot exactly where coordinates are VRF-derived (S1-M3, `mixdir::parse_bound_record`).
-    // An INCOMPLETE read is treated exactly like an empty one, and that is the whole point of carrying the
-    // flag. Every construction below draws from `dir`: `select_drop_line` skips a line whose members are
-    // absent, `random_hops` picks only from what resolved, and `HostRegister::onion` refuses a hop it cannot
-    // seal to. Under a partial read those all still *succeed*, over whichever lines answered.
-    //
-    // Incomplete here means a read TIMED OUT, not that a peer published nothing — an unpublished key is a
-    // definite absence and routing around it is correct, since that node cannot be a hop. A timeout is not a
-    // fact about the cell, so an adversary that can slow a chosen subset of store reads would otherwise steer
-    // this service's circuit placement without touching a node. Registering over a subset an attacker shaped
-    // is worse than not registering: the epoch is lost either way, and only one of the two hands the
-    // placement over.
     let (dir, complete) =
         build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
-    if dir.is_empty() || !complete {
+    if !may_register(dir.len(), complete) {
         if !complete {
             tracing::warn!(
                 resolved = dir.len(),
@@ -631,6 +642,17 @@ where
 mod tests {
     use super::*;
     use fanos_aphantos::nostos::seal_to_receiver;
+
+    /// Both directions of the registration gate, which is the only way to tell a working refusal from one
+    /// that never registers at all.
+    #[test]
+    fn a_hidden_service_registers_only_on_a_directory_that_fully_resolved() {
+        assert!(may_register(7, true), "a complete read of a populated cell is what registration is for");
+        assert!(may_register(3, true), "a cell where four members published nothing is still a KNOWN cell");
+        assert!(!may_register(0, true), "nothing to seal to");
+        assert!(!may_register(7, false), "a full-looking view whose reads timed out is not a view of the cell");
+        assert!(!may_register(3, false), "and neither is a partial one");
+    }
 
     #[test]
     fn open_forwarded_tries_the_recent_epoch_ring() {

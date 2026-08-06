@@ -74,6 +74,24 @@ pub trait StateMachine {
     /// default is a no-op — a plain ledger has no block reward.
     fn apply_block_reward(&mut self, _beneficiaries: &[HybridVerifier], _amount: u64) {}
 
+    /// How many executed blocks have left one of this state machine's **own invariants** broken — zero on a
+    /// correct ledger, and monotonic.
+    ///
+    /// A state machine that checks its invariants and finds one violated faces a choice with no good option:
+    /// aborting turns a value bug into a cell-wide liveness bug, since every validator computes the same state
+    /// and would abort together — and an attacker who found a breaking transaction could stop the chain
+    /// deliberately. So the right answer is to count and carry on. **That answer is only complete if someone
+    /// is told**, and this is the seam that tells them: a driver reads it after each commit and reports an
+    /// increase, so "we deliberately did not stop" does not become "nobody found out".
+    ///
+    /// Monotonic and deterministic — a function of the same state every validator has — so reading it cannot
+    /// fork the chain and a driver may compare it across heights. The default is `0`: a state machine with no
+    /// invariant to check has none to break, which is different from one that never looks and must say so by
+    /// implementing this.
+    fn invariants_broken(&self) -> u64 {
+        0
+    }
+
     /// Apply one transaction (already reconstructed and in committed order) to the state.
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome;
 

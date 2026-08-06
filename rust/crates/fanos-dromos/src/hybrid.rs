@@ -1108,6 +1108,12 @@ impl HybridLedger {
 }
 
 impl StateMachine for HybridLedger {
+    /// The #94 conservation gate's count — see [`HybridLedger::conservation_breaks`]. Reported through the
+    /// trait so the driver can say so out loud; this crate is sans-I/O and has no logger of its own.
+    fn invariants_broken(&self) -> u64 {
+        self.conservation_breaks
+    }
+
     /// Execute the block through the **parallel scheduler** rather than one transaction at a time.
     ///
     /// This is the hook that puts `spec/platform.md` §3.1's vertical parallelism on the live consensus path: waves of

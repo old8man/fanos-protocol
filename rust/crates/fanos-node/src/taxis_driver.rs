@@ -556,6 +556,7 @@ where
         // Tx-gossip dedup: a bounded set of transaction commitments this node has already ingested + gossiped,
         // so a received transaction floods the cell exactly once and a committed (pruned) one does not
         // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
+        let mut last_broken = 0u64;
         let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
         // Anonymous deliveries this driver refused because they carried something other than a transaction.
         let mut anon_refused: u64 = 0;
@@ -595,11 +596,11 @@ where
                         broadcast_shard(&client, &coords, me, &ShardMsg::NeedSkeleton { block: want });
                     }
                     let outs = engine.step(Input::Tick);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da, &mut last_broken);
                 }
                 () = tokio::time::sleep_until(timeout_deadline) => {
                     let outs = engine.step(Input::Timeout);
-                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
+                    drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da, &mut last_broken);
                     // This round did not finalize before its deadline: back off before injecting the next
                     // Timeout, so a slow (not failed) round is given more time rather than livelocked by a
                     // premature advance. A finalization anywhere resets it via the progress check below.
@@ -661,7 +662,7 @@ where
                         // (spec §6). Only a known validator's skeleton is worth sampling.
                         Some(TaxisApp::Consensus(ConsensusMsg::Propose(skeleton))) => {
                             if coords.contains(&from) {
-                                on_skeleton(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, skeleton);
+                                on_skeleton(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut last_broken, skeleton);
                             }
                         }
                         // Any other consensus message: accepted only from a known validator coordinate (its index
@@ -676,7 +677,7 @@ where
                                 if let ConsensusMsg::Body(b) = &msg {
                                     da.forget(&b.hash());
                                 }
-                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da);
+                                drive(&mut engine, &client, &coords, me, outs, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut da, &mut last_broken);
                             }
                         }
                         // A submitted transaction: accepted from ANY sender — a client (the network ingress that
@@ -688,7 +689,7 @@ where
                         // A DA shard — a dispersed / sampled shard, or a peer's sampling request. Handled by the
                         // driver's DA layer; a reconstructed block enters the engine via `try_reconstruct`.
                         Some(TaxisApp::Shard(shard)) => {
-                            on_shard(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, shard, from);
+                            on_shard(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut last_broken, shard, from);
                         }
                         None => {}
                     },
@@ -828,6 +829,9 @@ fn drive<S: StateMachine>(
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
     da: &mut Sampler,
+    // The highest `invariants_broken` already reported, so a standing breach is named once rather than on
+    // every subsequent commit — an error repeated per block is an error nobody reads.
+    last_broken: &mut u64,
 ) {
     let mut queue: VecDeque<Output> = outs.into_iter().collect();
     while let Some(out) = queue.pop_front() {
@@ -884,6 +888,26 @@ fn drive<S: StateMachine>(
                 }
             }
             Output::Committed { height, block_hash } => {
+                // **The state machine's own invariants, read once per commit.** DROMOS's conservation gate
+                // deliberately counts a broken invariant rather than aborting — every validator computes the
+                // same state, so a `panic!` would stop the whole cell, and an attacker who found a breaking
+                // transaction could do it on purpose. That choice is only complete if someone is told, and
+                // the counter had no reader at all (#149). Reported here because this crate has a logger and
+                // `fanos-dromos` is sans-I/O by design.
+                //
+                // Deterministic and monotonic, so comparing it across heights cannot fork anything.
+                let broken = engine.chain().state().invariants_broken();
+                if broken > *last_broken {
+                    tracing::error!(
+                        height,
+                        breaks = broken,
+                        "LEDGER INVARIANT BROKEN: executing this block left one of the state machine's own \
+                         invariants violated. The chain continues by design — every validator computed the \
+                         same state, so stopping here would stop the cell — but every balance derived from \
+                         this ledger is suspect from this height on."
+                    );
+                    *last_broken = broken;
+                }
                 let _ = events.send(TaxisEvent::Committed { height, block_hash });
             }
             Output::Slash(ev) => {
@@ -924,6 +948,7 @@ fn on_skeleton<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
+    last_broken: &mut u64,
     skeleton: Block,
 ) {
     let hash = skeleton.hash();
@@ -932,12 +957,12 @@ fn on_skeleton<S: StateMachine>(
     // an all-propose round: N proposals each needed a sampling round trip, the collection window is one tick, and so
     // every replica ranked a different subset and split its PREPARE. A no-op outside SSLE round 0.
     let ranked = engine.step(Input::Skeleton { block: skeleton.clone() });
-    drive(engine, client, coords, me, ranked, events, last_ckpt, slash_sealer, seen, da);
+    drive(engine, client, coords, me, ranked, events, last_ckpt, slash_sealer, seen, da, last_broken);
     if !da.begin(skeleton) {
         return; // already sampling this block — do not discard the shards gathered so far
     }
     request_shards(client, coords, hash, &da.missing(&hash));
-    admit_if_recovered(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, hash);
+    admit_if_recovered(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, last_broken, hash);
 }
 
 /// Handle a received DA **shard** message: store a delivered shard (feeding any pending reconstruction, and
@@ -953,6 +978,7 @@ fn on_shard<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
+    last_broken: &mut u64,
     msg: ShardMsg,
     from: Triple,
 ) {
@@ -960,7 +986,7 @@ fn on_shard<S: StateMachine>(
         ShardMsg::Deliver { block, index, data } => {
             engine.note_shard_taken();
             if let Some(full) = da.accept(block, index, data) {
-                admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, full);
+                admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, last_broken, full);
             }
         }
         ShardMsg::Request { block, index } => {
@@ -1022,10 +1048,11 @@ fn admit_if_recovered<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
+    last_broken: &mut u64,
     hash: [u8; 32],
 ) {
     if let Some(full) = da.reconstruct(&hash) {
-        admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, full);
+        admit(engine, client, coords, me, da, events, last_ckpt, slash_sealer, seen, last_broken, full);
     }
 }
 
@@ -1041,11 +1068,12 @@ fn admit<S: StateMachine>(
     last_ckpt: &mut Option<u64>,
     slash_sealer: Option<&SlashSealer>,
     seen: &mut BoundedMap<[u8; 32], ()>,
+    last_broken: &mut u64,
     full: Block,
 ) {
     // `from` is unused for a Propose; the reconstructed block carries its own proposer index.
     let outs = step_msg(engine, &ConsensusMsg::Propose(full), me);
-    drive(engine, client, coords, me, outs, events, last_ckpt, slash_sealer, seen, da);
+    drive(engine, client, coords, me, outs, events, last_ckpt, slash_sealer, seen, da, last_broken);
 }
 
 /// Spawn a **cross-cell checkpoint publisher** for a running cell: subscribe to `handle`'s events and, for each

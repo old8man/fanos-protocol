@@ -889,6 +889,22 @@ pub struct Health {
     /// reading `> 0` while its coordinate looks wrong failed to *apply* the move. Two defects, one symptom, and without
     /// this they are indistinguishable — the same trap `verified_claims` was added for.
     pub probe_index: Option<u16>,
+    /// **Coordinate collisions this node has observed** — two distinct addresses claiming one point.
+    ///
+    /// Nonzero means the projective address space suffered a `MapToPoint` collision, which is the exact
+    /// condition coordinate resolution exists to settle: one of the two claimants must advance along its probe
+    /// walk. Read beside `probe_index` and `verified_claims` on purpose — those two were added so that "did
+    /// not hear of the rival" and "heard and did not move" could be told apart, and this is the third leg of
+    /// the same question: *was there a rival at all*. The directory counted it from the start and nothing read
+    /// it, so the counter's own doc promised a health surface that did not exist (#149).
+    pub collisions: usize,
+    /// **Frames dropped because the destination coordinate had no address.**
+    ///
+    /// Distinct from `send_drops`, and the distinction is why both are here: `send_drops` is a peer that
+    /// stopped draining a connection this node *has*, while this is a peer this node cannot reach at all
+    /// because its address book has no binding for the point. Same symptom from outside — traffic not moving —
+    /// and opposite causes, so a node reporting only one of them is as ambiguous as one reporting neither.
+    pub unresolved_drops: usize,
     /// The advertised roles.
     pub roles: RoleSet,
 }
@@ -1209,6 +1225,8 @@ impl Node {
             known_peers: self.directory.len(),
             reflexive: self.reflexive,
             send_drops: self.handle.send_drops(),
+            collisions: self.directory.collisions(),
+            unresolved_drops: self.directory.unresolved_drops(),
             roles: self.roles,
         }
     }
