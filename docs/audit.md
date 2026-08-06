@@ -4167,3 +4167,28 @@ missed every **generic** function, whose definition reads `fn f<F: Field>(`; and
 correct but rejected against a bad reference — a `grep -v` for doc comments that never fired, because grep
 prints `path:NN:␠␠␠␠/// text`. Sixteen "callers" of `peel_onion` were comments. **A scan's reference has to be
 established by reading the mentions, not by a second grep that shares the first's blind spot.**
+
+### Correction to the seal finding: "use the cell" does not scale (2026-08-06, same day)
+
+The fix proposed above — make the keyper committee the cell — is right at Fano and wrong as a general rule,
+and the correction sharpens the result rather than softening it.
+
+Secrecy against a coalition `g` needs `t ≥ g+1`; liveness against `g` failures needs `t ≤ m − g`; together
+`m ≥ 2g+1`. At `g = f` that is `m ≥ 2f+1 ≈ 2n/3`, so **no small committee exists at any plane order.** One
+ML-KEM ciphertext (~1088 B) per member puts a per-transaction seal at:
+
+| `q` | line | cell | `2f+1` |
+|---|---|---|---|
+| 2 | 3 KiB | **7 KiB** | 5 KiB |
+| 7 | 8 KiB | 61 KiB | 39 KiB |
+| 31 | 34 KiB | **1.0 MiB** | 702 KiB |
+
+So the cell-wide seal is cheap and correct on the shipping plane and prohibitive at `q = 31`. The honest
+alternatives are therefore (a) cell-wide, documented as Fano-scale only, or (b) keep the line and **state the
+seal's own adversary bound `g < f` as a number**, rather than letting a test imply it inherits `f`.
+
+A line of `m` maximises `g` at `⌊(m−1)/2⌋` under a **majority** threshold `t = ⌈(m+1)/2⌉`. At Fano that is
+`g = 1` — so a three-point line cannot reach `f = 2` under *any* `t`, which is the impossibility restated
+constructively. And the shipped `t = ⌊m/3⌋ + 1` does not even reach the line's own optimum: at `m = 32` it
+gives `g = 10` where majority gives `g = 15`. **Even keeping the line committee, `t` is mis-set** — it buys
+liveness headroom BFT never asked for and pays for it in secrecy.
