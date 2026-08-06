@@ -3856,3 +3856,77 @@ growing with no removal, of which one mattered:
 
 **A zero is the most dangerous count**: a non-zero one invites scrutiny, a zero invites relief. Print
 `examined / both-halves-seen / flagged` on the same line as the finding, always.
+
+---
+
+## Sweep: what makes a cell-wide decision agreed (2026-08-06)
+
+Started as "wire the two loops that were built and never called" (#129, #130) and turned into one question
+applied twice: **what is this decision computed from, and is that input the same bytes on every node?**
+
+### #130 CLOSED — the setpoint was read from the live epoch (`83d9ed2`)
+
+`build_cell_setpoint` scanned the load directory for the epoch *currently running*, while its members were
+still writing to it. Two nodes therefore saw different subsets and provisioned different counts of every
+role — permanently, with each node's own report internally consistent. The function's doc asserted the
+opposite outright ("the agreed input the deterministic assignment needs") one paragraph above the partial-read
+caveat that contradicts it.
+
+Fixed by `ClosedEpoch`: the setpoint comes from the newest directory whose records have settled, carried with
+**the seed it was published against** (a credential names its epoch, so the live seed rejects every closed
+record). Membership stays a live read, and the asymmetry is the design — who is present must be current, and
+a stale roster is wrong for one epoch, where a disagreed count is wrong in a way nobody can observe.
+
+Three things the derivation produced that the fix alone would not have:
+
+1. **The window is forced, not chosen.** `DIRECTORY_SLOT_EPOCHS = 1`, derived from the onion ratchet's grace
+   for a lagging *reader*. So exactly one closed epoch is readable and there is no smoothing window to choose.
+   Raising the retention to buy one would couple two derivations answering different questions.
+2. **Agreement was resting on a tuning constant.** At the shipped `ROLE_GAIN_SEVENTH = 7` (κ = 1) the carried
+   demand reaches the setpoint in one step, so the carry is *already* vacuous and every test passed. Damping
+   the loop — the obvious response to role churn — would have reintroduced a permanent per-node divergence
+   with nothing failing. The new test varies the gain to `1/7` and splits a seven-node cell **7-vs-1**.
+3. **An expired directory reads as a healthy empty one.** `read_load` calls a missing record a definite
+   `Absent` (deliberately: one forged record must not void a scan), so a pruned epoch scans **complete** with
+   zero load and every role retires at once. Staleness is unobservable downstream and is now refused at
+   `ClosedEpoch::readable_for`.
+
+### #129 REFRAMED — `performed` has no sensor, and one role cannot have one
+
+The reputation half looked like the same job. It is not, and the blocker is a layer down.
+
+`Reputation::observe_reachable(node, performed, reachable)` wants **two** facts. The only per-peer signal the
+platform produces is `OverlayNode::cell_liveness`, whose `degraded` bit is set by `!coord_alive` — that is
+**reachability**, in both slots. Feeding it to both is [[a-borrowed-number-counts-another-object]] again: the
+number exists and counts a different object. Consequences, precisely:
+
+- a node that is up and serves nothing is **invisible** — `degraded` never means "did not serve";
+- a node most of the cell can reach but a quorum cannot is **slashed** — that is a partition symptom, not
+  shirking. (Not vacuous: `reachable ∧ ¬performed` needs `publishers ≥ 2·quorum`, satisfiable at `7 ≥ 6`.)
+
+**The oracle that does exist is the directories themselves.** A node assigned a role must publish that role's
+artefact for the epoch, and presence is a published, epoch-keyed, third-party-checkable fact — no gossip, no
+quorum, no subjectivity. `Directory`'s own doc already states the semantics ("a relay missing here cannot be a
+circuit hop"). Likewise `reachable(X, e)` needs no witness protocol: X's **capability record** at epoch `e`
+proves X was up, and every node publishes one regardless of role.
+
+Coverage is the finding, and it is not uniform:
+
+| role | artefact | measurable? |
+|---|---|---|
+| Relay | `MixKey` | yes |
+| Exit | `ExitKey` | yes |
+| Ingress | `IngressKey` | yes |
+| Storage | — | no artefact; `Load` is self-reported |
+| Rendezvous | — | line membership is *derived* from the beacon, so there is nothing to publish |
+| **Service** | — | **cannot exist**: the role's property is that nobody learns who serves (#125) |
+
+Half the roles are measurable, one gap is fundamental rather than unfinished, and the last row is the
+interesting one: **accountability and anonymity want opposite things from the same record.** A per-epoch "I am
+serving" attestation is exactly the leak #125 closed. So the Service role's reputation cannot come from
+attestation, and any future answer has to be a zero-knowledge one or none.
+
+The window question returns unchanged: only `e − 1` is readable, so a multi-epoch reputation must cache what
+it verified. That is carried state again — but of *published facts a node checked*, not of opinions, so two
+nodes agree except across a read they missed, and it is recomputed from a fixed start each epoch rather than
+stepped. Bounded, self-healing, does not compound. Same trade as the setpoint, accepted for the same reason.
