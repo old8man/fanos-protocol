@@ -180,8 +180,7 @@ impl<F: Field> Engine for CellNode<F> {
             // material may be installed from one; the relay would be wrong to take a directory from a frame.
             Input::Command(Command::Control { tag, ref body }) if tag == CONTROL_MIX_DIRECTORY => {
                 if let Some(dir) = MixDirectory::decode(body) {
-                    let beacon = fanos_primitives::BeaconSeed::new(self.beacon_seed());
-                    self.relay.set_directory(dir, beacon);
+                    self.relay.set_directory(dir);
                 }
                 Vec::new()
             }

@@ -556,7 +556,7 @@ pub fn anonymous_dial<R: CryptoRng>(
     // The service host-registration tag: if the service is hosted off its meeting combiner (the general
     // case), the node at the combiner routes this request to the host registered under this tag
     // (§3b). A service that is its own combiner ignores it (the delivery surfaces locally there).
-    let tag = service_tag(identity, route.epoch, &route.beacon);
+    let tag = service_tag(identity, route.epoch);
     let rclient = RendezvousClient::<F2>::new(
         forward_circuit,
         reply_circuit,

@@ -392,7 +392,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-quic-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true)
         .coords();
     let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-quic-svc-secret");
-    let reg = HostRegister::onion(&bundle, &signer, epoch, &TEST_BEACON, svc_reply_pub.encode(), vec![drop_line], t as u8)
+    let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], t as u8)
         .expect("the dead-drop line is nameable");
     for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
         let seed = [b"anon-quic-svc-secret".as_slice(), &(i as u32).to_be_bytes()].concat();
@@ -528,7 +528,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-cell-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true)
         .coords();
     let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-cell-svc-secret");
-    let reg = HostRegister::onion(&bundle, &signer, epoch, &TEST_BEACON, svc_reply_pub.encode(), vec![drop_line], t as u8)
+    let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], t as u8)
         .expect("the dead-drop line is nameable");
     for (i, point) in meeting_lines::<F2>(&service_public.encode(), epoch, &TEST_BEACON).into_iter().enumerate() {
         let seed = [b"anon-cell-svc-secret".as_slice(), &(i as u32).to_be_bytes()].concat();
@@ -734,7 +734,7 @@ impl OffCombiner {
     let (host_reply_keys, host_reply_pub) = ReplyKeys::generate(b"off-combiner-host");
     // The primary, coordinate-hiding registration: a 1-hop forward route to the dead-drop line, signed under the
     // service's published identity so the combiner can check the binding rather than believe it.
-    let reg = HostRegister::onion(&bundle, &signer, epoch, &TEST_BEACON, host_reply_pub.encode(), vec![drop_line], t as u8)
+    let reg = HostRegister::onion(&bundle, &signer, epoch, host_reply_pub.encode(), vec![drop_line], t as u8)
         .expect("the dead-drop line's members are in the mix directory");
 
     // The combiner is handed the epoch's mix directory — the hop keys it seals the forward onion with. It cannot
