@@ -718,9 +718,27 @@ impl Reputation {
     /// [`observe`](Self::observe).
     ///
     /// This is the churn-safety the mass-recovery scenario needs: reputation must track *shirking* (reachable
-    /// but not serving), never *outage* (down through no fault of its own). The reachability corroboration
-    /// (spec §6.4 witnessed liveness) is the cell-agreed signal separating the two, so every node excuses the
-    /// identical set and the assignment stays deterministic.
+    /// but not serving), never *outage* (down through no fault of its own).
+    ///
+    /// ## The determinism precondition, and why it does not hold yet
+    ///
+    /// This used to claim that §6.4's reachability corroboration "is the cell-agreed signal separating the two,
+    /// so every node excuses the identical set and the assignment stays deterministic". **The premise is
+    /// false.** `OverlayNode::coord_alive` trusts *our own eyes first* — a node that has heard from a peer
+    /// inside the liveness window returns alive with no corroboration at all, and only falls back to the
+    /// witness quorum when it has not. So two healthy nodes with different direct-contact histories produce
+    /// different `degraded` masks, and the diagnosis is **node-local**, not cell-agreed.
+    ///
+    /// That would be survivable for a stateless decision and is not survivable here, because **reputation
+    /// integrates**. A single epoch's divergence is written into `scores` and never washes out: from then on
+    /// the two nodes weigh that member differently, `adjust` differs, and the assignment differs — a momentary
+    /// disagreement becomes a permanent split of the cell's role allocation.
+    ///
+    /// So the shape the wiring needs is not "feed this in". It is: make the reputation a **pure function of
+    /// agreed, published state** — recomputed each epoch from the last `W` published diagnoses rather than
+    /// carried — so that divergence is self-healing the moment the published record agrees. Until such a
+    /// record exists, [`observe_reachable`](Self::observe_reachable) is deliberately left with no production
+    /// caller: an inert loop is strictly better than a deterministically-divergent one.
     pub fn observe_reachable(&mut self, node: NodeId, performed: bool, reachable: bool) {
         if reachable {
             self.observe(node, performed);
