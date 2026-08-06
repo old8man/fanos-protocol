@@ -821,6 +821,8 @@ pub struct Node {
     directory: Directory,
     local_addr: SocketAddr,
     roles: RoleSet,
+    /// Whether this node has a reflexive layer — see [`Health::reflexive`].
+    reflexive: bool,
     /// The background task republishing this node's mix onion key each epoch — present only for a relay
     /// node (which runs the mixnet role). Held so it lives as long as the node; it ends when the node's
     /// notification stream closes on shutdown.
@@ -853,6 +855,18 @@ pub struct Health {
     pub local_addr: SocketAddr,
     /// The number of peers currently in the address book.
     pub known_peers: usize,
+    /// Whether this node has a **reflexive layer** at all — a coherence self-model, a liveness diagnosis and
+    /// the §6.7 self-healing actions (#145).
+    ///
+    /// `false` is not a degraded reading, it is an *absent instrument*: the DIAKRISIS unit is a seven-member
+    /// cell, and only `PG(2,2)` forms one from the plane itself. On a larger plane a node discovers peers but
+    /// nothing tells it which seven are its cell, so the whole reflex returns early — and every other field
+    /// here still reads healthy, because the component that would say otherwise is the one that is missing.
+    ///
+    /// Derived from configuration rather than read from the engine, which is exact: the condition is
+    /// `plane_order == 2` (or an explicit roster, which no deployment path sets today), and nothing at run
+    /// time can change it.
+    pub reflexive: bool,
     /// Frames this node did **not** make because a peer's send queue was full (#89).
     ///
     /// Zero on a healthy node, and one meaning when it is not: some peer stopped draining its connection, so
@@ -899,6 +913,29 @@ impl Node {
     /// [`NodeError::Config`] if `plane_order` is not a supported prime power. `PG(2,q)` exists only for prime powers, so
     /// an unsupported order is refused here rather than producing a cell whose geometry does not close.
     pub async fn start_on_plane(config: NodeConfig) -> Result<Self, NodeError> {
+        // **A larger plane buys an anonymity set and costs the whole reflexive layer, and that trade was
+        // silent.** The DIAKRISIS unit is a seven-member CELL, not a plane: `self_index` — the gate on the
+        // coherence self-model, the liveness attestation, the verdict, the homeostat band, the shed and
+        // every §6.7 healing action — is set either from an explicit roster or, on the base plane where the
+        // plane IS the cell, from the node's own point. A deployed node is meant to discover its roster by
+        // announcement, and announcement establishes *peers*, not a cell: on `PG(2,q>2)` nothing answers
+        // "which seven of my peers are my cell", so `self_index` stays `None` and the reflex returns early
+        // at every entry point.
+        //
+        // Said rather than refused, deliberately. The configuration is a real capability — `q = 2` is a test
+        // fixture for a mixnet, as this function's own doc argues — and taking it away to fix a reporting
+        // problem would be the wrong trade. What is dangerous is the SILENCE: a node with no reflex reports
+        // healthy, because the component that would report otherwise is the missing one. Cell assignment on
+        // a larger plane is an open design question (#145); until it is answered an operator must at least
+        // be told which half of the trade they are getting.
+        if config.plane_order > 2 {
+            eprintln!(
+                "fanos: WARNING — running on PG(2,{}) with no cell roster: this node has NO coherence \
+                 self-model, NO liveness diagnosis and NO self-healing. It will report healthy regardless. \
+                 Only PG(2,2) forms a cell from the plane itself (#145).",
+                config.plane_order
+            );
+        }
         match config.plane_order {
             2 => Self::start::<fanos_field::F2>(config).await,
             4 => Self::start::<fanos_field::F4>(config).await,
@@ -1088,6 +1125,8 @@ impl Node {
             directory,
             local_addr,
             roles: config.roles,
+            // A cell is seven members; only the base plane is its own cell (#145).
+            reflexive: config.plane_order == 2,
             _mix_publisher: mix_publisher,
             _epoch_driver: epoch_driver,
             _recovery_trigger: recovery_trigger,
@@ -1168,6 +1207,7 @@ impl Node {
             probe_index: self.directory.claim_at(address).map(|(index, _)| index),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
+            reflexive: self.reflexive,
             send_drops: self.handle.send_drops(),
             roles: self.roles,
         }
@@ -1444,6 +1484,16 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("plane order {q} must start: {e}"));
             assert!(node.health().local_addr.port() > 0, "the node on PG(2,{q}) is live");
+            // **And whether it has a reflex is reported, because "live" does not imply it** (#145). A cell
+            // is seven members and only the base plane is its own cell, so a larger-plane node runs with no
+            // coherence self-model, no diagnosis and no self-healing — while every other health field reads
+            // fine, since the component that would say otherwise is the one that is absent. Asserted on both
+            // sides so the flag cannot be a constant.
+            assert_eq!(
+                node.health().reflexive,
+                q == 2,
+                "PG(2,{q}) must report whether it forms a cell — silence here is the defect, not the plane"
+            );
             node.shutdown();
         }
 
