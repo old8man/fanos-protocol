@@ -4416,3 +4416,43 @@ So the sweep's second question — *unwired, or unreachable?* — needs a third:
 already implied by the model its caller runs on?** The cost that survives is worth writing down and now sits in
 `plan.rs`: because the model cannot tell nodes apart, the theorem holds **vacuously rather than usefully**, and
 a healer that ever builds a *measured* coherence matrix must gate on the predicate at that point.
+
+## §6. The empty assignment — filed on bad evidence, refuted, then confirmed by the experiment the refutation demanded
+
+Worth recording as an arc rather than a finding, because every step was necessary and two of them were wrong.
+
+**Filed.** A guard added while wiring §2 — *publish a diagnosis only if this node is in the seating the
+capability scan returned* — never fired. Read as evidence that the roster is empty on every epoch turn, and
+therefore that the role loop publishes an empty assignment and every actuated role flaps. Logged as HIGH.
+
+**Refuted.** A single-node probe sampling the published `Assignment` across two epoch turns showed the roster
+steady at **1**, with one role released — relay, on a solitary node carrying no relay load, which is the
+homeostat doing its job. The guard's silence had an unrelated cause: it compared this node's *current*
+coordinate against a record written at the coordinate it held when it published, so it was false on essentially
+every assignment. **A guard's silence has two explanations — the condition is always false, and the guard asks
+the wrong question — and for a guard written five minutes ago the second is likelier.** Fixed in `c680f1c`.
+
+**Confirmed.** The refutation named what the evidence could not see: one node's own advertisement is a *local
+write*, with no round trip to lose. On **three nodes over real QUIC**, node 0 published an assignment with a
+roster of **0** while its own address book held 2 peers. `caps_complete` reported that scan COMPLETE, correctly
+— an absent record is a definite absence, deliberately, so one forged record cannot void a scan. "Complete"
+means *no read timed out*, never *the cell answered*, and nothing in the loop distinguished the two.
+
+Every node in a cell turns at the same instant, so a threshold role's line drops below `t` cell-wide together
+and returns only at the next within-epoch refresh — invisible, because every read concluded.
+
+**The fix** is self-referential and needs no peer count: `assign_epoch` holds the previous assignment —
+publishes nothing, steps nothing, reports **incomplete**, which is already the signal that keeps the refresh at
+its floor — when this node cannot find *its own* identity in the roster it just read. A node whose own local
+write is not yet visible has definitely read a directory that does not exist yet. The alternative,
+`members.len() < peers()`, would hold for ever on a cell where a peer legitimately never publishes a
+capability. It is the same predicate the diagnosis publish uses one function over.
+
+**The residual is measured, not assumed** (#151). After the fix, the same run: settled rosters `[3, 3, 3]`,
+worst `(roster, known_peers)` per node `[(1, 2), (3, 2), (3, 3)]`. Node 0 still dips to a roster of **1** — its
+own record has landed, its peers' have not. That is handled today only by consumers that consult
+`Assignment::is_solitary()`, whose doc says exactly what it is for; an opt-in property carrying a correctness
+guarantee is the shape worth returning to.
+
+**The transferable rule: a refutation is a narrowing, not an acquittal.** Had the task been deleted when the
+single-node probe came back clean, a real defect would have gone with it.

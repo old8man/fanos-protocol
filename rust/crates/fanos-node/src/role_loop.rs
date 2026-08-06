@@ -1102,6 +1102,32 @@ async fn assign_epoch<F: Field>(
         Demand::supply(&members),
         Plane::<F>::LINE_SIZE as usize,
     );
+    // **A node that is not in the roster it just read may not speak for the cell** (#146).
+    //
+    // A capability record lives at `cap_slot(coord, epoch)`, so at the instant an epoch opens every slot is
+    // empty until each node republishes for it — locally one write, for a peer a round trip. The loop wakes on
+    // the same `BeaconReady` and reads that directory, and `caps_complete` says **true**, because an absent
+    // record is a *definite* absence (deliberately, so one forged record cannot void a scan). "Complete" means
+    // "no read timed out", never "the cell answered". So without this guard the loop assigns over an empty
+    // roster, `assign_report` returns nothing for this node, and the `watch` every actuator reads goes to
+    // `RoleSet::EMPTY` until the next within-epoch refresh.
+    //
+    // **Measured, on a three-node cell over real QUIC** (`tests/role_roster.rs`): a node published a roster of
+    // 0 while its own address book held 2 peers. Every node turns at the same instant, so a threshold role's
+    // line drops below `t` cell-wide together — and it is invisible, because the reads all "concluded".
+    //
+    // The predicate is self-referential on purpose, and it is the same one the diagnosis publish uses one
+    // function over: **can I find my own advertisement for this epoch?** It needs no peer count and cannot
+    // false-positive — a node whose own local write is not yet visible has definitely read a directory that
+    // does not exist yet — while `members.len() < peers()` would hold forever on a cell where some peer
+    // legitimately never publishes a capability. Genesis is unaffected: `genesis_assign` waits on
+    // `capability_ready` before it assigns at all.
+    //
+    // Holding means: publish nothing, step nothing, and report **incomplete** — which is already the signal
+    // that keeps the refresh at its floor, so the next look comes soon rather than after a backoff.
+    if !members.iter().any(|(id, _)| *id == live.node_id()) {
+        return (*roles_tx.borrow(), false);
+    }
     let roles = live.step(&members, epoch, &beacon, setpoint);
     note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
