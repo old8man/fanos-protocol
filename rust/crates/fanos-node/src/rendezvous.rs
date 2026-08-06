@@ -310,6 +310,80 @@ pub fn client_drop_line<F: Field>(
     usable(line).then(|| line.coords())
 }
 
+/// Emit `payload` into the cell **anonymously**: sealed into a threshold onion over a freshly drawn circuit
+/// whose last hop is `destination`, and launched at the first hop. The destination line surfaces it as
+/// `Notification::Delivered { from: ANONYMOUS, .. }`, and no node on the path learns this node's coordinate.
+///
+/// The one-shot counterpart to [`dial_anonymous`], which is session-oriented. It exists because a message can
+/// need anonymity without needing a conversation — a chain transaction is the case that forced it: sealing the
+/// *content* to a keyper line while emitting the frame **from this node straight at a named validator** hid
+/// what was said and published who said it, which for a shielded-pool currency is the wrong half.
+///
+/// Returns the coordinate it launched at, or `None` when the plane cannot supply a sound circuit, the seal
+/// fails, or the emit is refused — never a silent fall back to a direct send, because a caller that asked for
+/// anonymity and got a plain emit is worse off than one that got an error: it believes it is hidden.
+///
+/// **The destination's members must run the mixnet relay** to peel the last layer. On a base cell where every
+/// node carries every role that is automatic; a deployment that splits roles must place them accordingly.
+#[must_use]
+pub fn emit_anonymously<F: Field, R: CryptoRng>(
+    client: &Client,
+    params: &AnonRouteParams,
+    destination: Coord,
+    payload: &[u8],
+    rng: &mut R,
+) -> Option<Coord> {
+    let fwd = seal_anonymous_emit::<F, R>(params, destination, payload, rng)?;
+    client.command(Command::Emit { to: fwd.combiner, frame: fwd.frame }).then_some(fwd.combiner)
+}
+
+/// The decision half of [`emit_anonymously`], with no I/O: draw the circuit, seal the onion, and choose a
+/// launch addressee — or `None` if the plane cannot supply one.
+///
+/// Split out because every property worth asserting lives here and none of them needs a socket. An anonymity
+/// path proved only by a live cell is proved only where a live cell can be run, and the depth floor, the
+/// terminus and the off-destination launch are decidable from the plane and the directory alone.
+#[must_use]
+pub fn seal_anonymous_emit<F: Field, R: CryptoRng>(
+    params: &AnonRouteParams,
+    destination: Coord,
+    payload: &[u8],
+    rng: &mut R,
+) -> Option<fanos_rendezvous::Forward> {
+    let hops = random_hops::<F, R>(params.depths.0, &[destination], &params.directory, rng);
+    // The same floor as a dial, and for the same reason: the first hop is dialled by this node and the last
+    // learns the destination, so below it those are ONE line ([`slots::MIN_FORWARD_DEPTH`]).
+    if hops.len() < slots::MIN_FORWARD_DEPTH {
+        return None;
+    }
+    let mut circuit = hops;
+    circuit.push(destination);
+    let mut seed = [0u8; 32];
+    rng.fill_bytes(&mut seed);
+    // The launch addressee must not be a member of the DESTINATION line, and this is the same place the
+    // line-counting argument stops applying that `seal_host_register` found: capturing a hop costs `t` members,
+    // while learning the launcher's address costs nothing, because the transport authenticates the source. Two
+    // distinct lines meet in exactly one point, so one of the first hop's members also sits on the destination
+    // line — and a launch landing there hands that one node both this node's coordinate and the payload it is
+    // about to receive. The salt is walked rather than the circuit redrawn: the addressee is a function of the
+    // onion bytes, and every line meets the destination in a point, so no choice of first hop avoids it.
+    let members = fanos_rendezvous::line_member_coords::<F>(destination);
+    (0..LAUNCH_SALT_ATTEMPTS).find_map(|i| {
+        let mut salted = seed.to_vec();
+        salted.extend_from_slice(&(i as u32).to_be_bytes());
+        let fwd =
+            fanos_rendezvous::seal_forward::<F>(&circuit, &params.directory, params.threshold, payload, &salted)?;
+        (!members.contains(&fwd.combiner)).then_some(fwd)
+    })
+}
+
+/// How many salts [`emit_anonymously`] may walk looking for a launch addressee off the destination line.
+///
+/// Each try succeeds with probability `q/(q+1)` — `2/3` at Fano — so sixteen leaves a failure probability of
+/// about `2 x 10^-8`, and the walk is bounded so a degenerate directory cannot spin. The same reasoning and
+/// the same number as `fanos_rendezvous`'s registration launch, because it is the same problem.
+const LAUNCH_SALT_ATTEMPTS: usize = 16;
+
 /// The line that would let one captured coalition name **both** endpoints of `forward_circuit` /
 /// `reply_circuit`, or `None` if the route is sound.
 ///
@@ -617,6 +691,75 @@ mod tests {
 
     /// Drawing the route AROUND the drop line removes every way one line can name both endpoints — and the
     /// same measurement on the old order shows the test can see the defect, so the first half is not vacuous.
+    /// A one-shot anonymous emit lands on a hop and never on the line it is addressed to.
+    ///
+    /// The whole point of the path: the transport authenticates the source, so whoever receives the launch
+    /// learns the sender's coordinate for free — no threshold, no collusion. Two distinct lines meet in exactly
+    /// one point, so one of the first hop's three members sits on the destination at `q = 2`, and a launch
+    /// there hands one node the sender AND the payload. Measured across seeds, with the unsalted rate beside
+    /// it so the zero half stays a constraint.
+    #[test]
+    fn a_one_shot_anonymous_emit_never_launches_at_its_own_destination() {
+        let dir = fano_directory();
+        let epoch = Epoch::new(4);
+        let params = fano_params(dir.clone(), epoch);
+        let destination = Line::<F2>::at(2).coords();
+        let members = fanos_rendezvous::line_member_coords::<F2>(destination);
+        let trials = 200u32;
+        let (mut sealed, mut naive_would_leak) = (0u32, 0u32);
+        for i in 0..trials {
+            let mut rng = TestRng(u64::from(i).wrapping_mul(0x9E37_79B9).wrapping_add(7));
+            let Some(fwd) = seal_anonymous_emit::<F2, _>(&params, destination, b"payload", &mut rng) else {
+                continue;
+            };
+            sealed += 1;
+            assert!(
+                !members.contains(&fwd.combiner),
+                "the launch landed on a member of the destination line: that node would hold the sender's \
+                 coordinate and the payload at once"
+            );
+            // What an unsalted launch would have done, over the same circuit.
+            let mut rng = TestRng(u64::from(i).wrapping_mul(0x9E37_79B9).wrapping_add(7));
+            let hops = random_hops::<F2, _>(params.depths.0, &[destination], &dir, &mut rng);
+            let mut circuit = hops;
+            circuit.push(destination);
+            if let Some(naive) =
+                fanos_rendezvous::seal_forward::<F2>(&circuit, &dir, params.threshold, b"payload", b"plain")
+                && members.contains(&naive.combiner)
+            {
+                naive_would_leak += 1;
+            }
+        }
+        assert!(sealed > trials * 9 / 10, "only {sealed} of {trials} draws produced a circuit at all");
+        assert!(
+            naive_would_leak > trials / 10,
+            "only {naive_would_leak} of {trials} unsalted launches would have landed on the destination line, \
+             so this test cannot see the defect the salt walk exists to remove"
+        );
+    }
+
+    /// The floor is enforced here too, and it is the same floor: below it the hop the sender transmits to is
+    /// the hop that learns the destination, so one line holds both.
+    #[test]
+    fn an_anonymous_emit_below_the_depth_floor_is_refused() {
+        let dir = fano_directory();
+        let epoch = Epoch::new(4);
+        let mut params = fano_params(dir, epoch);
+        let destination = Line::<F2>::at(2).coords();
+        for depth in 0..slots::MIN_FORWARD_DEPTH {
+            params.depths = (depth, params.depths.1);
+            assert!(
+                seal_anonymous_emit::<F2, _>(&params, destination, b"payload", &mut TestRng(9)).is_none(),
+                "a {depth}-hop anonymous emit must be refused rather than sent in a weaker form"
+            );
+        }
+        params.depths = (slots::MIN_FORWARD_DEPTH, params.depths.1);
+        assert!(
+            seal_anonymous_emit::<F2, _>(&params, destination, b"payload", &mut TestRng(9)).is_some(),
+            "and at the floor it seals — so the refusals above are about the depth, not the plane"
+        );
+    }
+
     #[test]
     fn no_line_of_a_drawn_route_names_both_endpoints() {
         let dir = fano_directory();

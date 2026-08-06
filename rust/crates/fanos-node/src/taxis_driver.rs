@@ -554,6 +554,8 @@ where
         // so a received transaction floods the cell exactly once and a committed (pruned) one does not
         // re-circulate. Bounded ([`SEEN_TX_CAP`]) against a commitment flood.
         let mut seen_txs: BoundedMap<[u8; 32], ()> = BoundedMap::new(SEEN_TX_CAP);
+        // Anonymous deliveries this driver refused because they carried something other than a transaction.
+        let mut anon_refused: u64 = 0;
         // Data-availability transport (spec §6): dispersed shards this node serves + skeletons it is sampling.
         let mut da = Sampler::new(me);
 
@@ -632,6 +634,24 @@ where
                     });
                 }
                 note = note_rx.recv() => match note {
+                    // A transaction that arrived as an ANONYMOUS threshold delivery, so no validator learned who
+                    // submitted it (`rendezvous::emit_anonymously`). Only `Tx` may come this way, and the boundary
+                    // is derived rather than chosen: **a transaction authenticates itself** — it is signed, sealed
+                    // to the epoch's keyper line and checked on ingest — while a consensus message authenticates
+                    // by its sender's committee membership, which an anonymous delivery by construction cannot
+                    // show. So the arm below already accepts `Tx` "from ANY sender"; this adds the sender that has
+                    // no name, and refuses everything else rather than widening the trusted set.
+                    Some(Notification::Delivered { from, payload }) if from == fanos_aphantos::threshold_router::ANONYMOUS => {
+                        match parse_app_body(&payload) {
+                            Some(TaxisApp::Tx(tx)) => {
+                                ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
+                            }
+                            // Counted, not dropped in silence: an anonymous delivery carrying consensus is either
+                            // a misrouted frame or a member trying to vote without showing a seat, and both are
+                            // things an operator should be able to see happening.
+                            _ => anon_refused = anon_refused.saturating_add(1),
+                        }
+                    }
                     Some(Notification::App { body, from }) => match parse_app_body(&body) {
                         // A proposal arrives DA-dispersed: a payload-less skeleton (the full block rides as
                         // shards). Sample its shards from peers and admit it to the engine once reconstructed

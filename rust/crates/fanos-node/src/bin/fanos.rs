@@ -1119,6 +1119,71 @@ fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
     })
 }
 
+/// Put a sealed transaction on the wire, **anonymously by default**.
+///
+/// The submission used to be `Emit { to: Point::at(0) }` — this node's own coordinate, on a connection the
+/// transport authenticates, straight at a constant validator. The keyper seal hid *what* was being sent and
+/// the emission published *who* was sending it, to one named node, for every user of this binary. For a
+/// platform whose currency is a shielded pool that is the wrong half hidden, and the fixed destination made
+/// it worse: one node saw every submission, which is a surveillance point and a censorship chokepoint at once.
+///
+/// So the frame now rides a threshold onion to a **randomly drawn destination line**, launched at its first
+/// hop, and surfaces there as an anonymous delivery the TAXIS driver ingests (`Tx` authenticates itself, so
+/// accepting it from a sender with no name widens nothing). Two things change together: no validator learns
+/// the submitter, and no validator sees more than its share.
+///
+/// `--direct` restores the old path for a user who wants it — and says what it costs, because an exposure
+/// nobody names is one nobody weighs.
+#[cfg(feature = "validator")]
+async fn submit_tx_frame(
+    node: &Node,
+    args: &[String],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    frame: &[u8],
+) -> Result<bool, NodeError> {
+    use fanos_geometry::{Line, Plane, Point};
+    use fanos_runtime::Command;
+
+    // OS entropy, freshly per submission: the destination line and the circuit must not be predictable from
+    // anything an observer holds, or a watcher waits at the line this binary was going to pick anyway.
+    let mut entropy = [0u8; 33];
+    getrandom::fill(&mut entropy).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let (seed, pick) = entropy.split_at(32);
+
+    if has_flag(args, "--direct") {
+        eprintln!(
+            "warning: --direct submits straight to a validator from this node's own coordinate, so that \
+             validator learns you submitted this transaction and can link it to you when it is revealed."
+        );
+        return Ok(node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: frame.to_vec() }));
+    }
+    let client = node.client();
+    let directory = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await;
+    let params = AnonRouteParams {
+        directory,
+        threshold: mix_threshold_arg(args)?,
+        epoch,
+        beacon: *beacon,
+        depths: (fanos_aphantos::slots::MIN_FORWARD_DEPTH, fanos_aphantos::slots::MIN_REPLY_DEPTH),
+    };
+    let mut rng = SeedRng::from_seed(seed);
+    // A fresh destination line per submission, so no node accumulates a view of who transacts. The line is
+    // where the delivery surfaces; its salted member ingests and gossips to the rest of the cell.
+    let n = Plane::<F2>::N as usize;
+    let destination = Line::<F2>::at(usize::from(pick.first().copied().unwrap_or(0)) % n.max(1)).coords();
+    if fanos_node::rendezvous::emit_anonymously::<F2, _>(&client, &params, destination, frame, &mut rng)
+        .is_some()
+    {
+        return Ok(true);
+    }
+    Err(NodeError::Config(
+        "could not submit anonymously: this cell offers no sealable circuit of the required depth right now. \
+         Retry, or pass `--direct` to submit in the clear — which tells one validator that you sent this."
+            .to_owned(),
+    ))
+}
+
 /// Parse a 64-hex-char (32-byte) epoch beacon seed. The beacon is *public* per-epoch randomness (the
 /// rendezvous DVRF output) shared by every party on the epoch — a client obtains it out-of-band or from
 /// the overlay and passes it so its drawn meeting line matches the service's. Accepts an optional `0x`
@@ -2602,11 +2667,9 @@ fn cmd_taxis_deal(_args: &[String]) -> Result<(), NodeError> {
 async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     use fanos_dromos::HybridLedger;
     use fanos_dromos::token::{SignedTransfer, Transfer, account_id};
-    use fanos_geometry::Point;
     use fanos_node::ChainInfo;
     use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
-    use fanos_runtime::Command;
     use fanos_taxis::Transaction;
     use fanos_taxis::keyper::seal_to_keyper_line;
     use fanos_taxis::wire::tx_to_frame;
@@ -2657,7 +2720,7 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     let config = node_config_from_args(args)?;
     let node = Node::start::<F2>(config).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
-    let submitted = node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: tx_to_frame(&sealed) });
+    let submitted = submit_tx_frame(&node, args, info.epoch, &info.beacon, &tx_to_frame(&sealed)).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
     node.shutdown();
     if submitted {
@@ -2730,11 +2793,9 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     use fanos_dromos::naming::name_digest;
     use fanos_dromos::token::account_id;
     use fanos_dromos::price;
-    use fanos_geometry::Point;
     use fanos_node::ChainInfo;
     use fanos_pqcrypto::HybridSigSecret;
     use fanos_pqcrypto::rng::SeedRng;
-    use fanos_runtime::Command;
     use fanos_taxis::Transaction;
     use fanos_taxis::keyper::seal_to_keyper_line;
     use fanos_taxis::wire::tx_to_frame;
@@ -2929,7 +2990,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     let config = node_config_from_args(args)?;
     let node = Node::start::<F2>(config).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
-    let submitted = node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: tx_to_frame(&sealed) });
+    let submitted = submit_tx_frame(&node, args, info.epoch, &info.beacon, &tx_to_frame(&sealed)).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
     node.shutdown();
     if submitted {

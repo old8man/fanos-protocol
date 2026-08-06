@@ -216,6 +216,75 @@ fn signing_half(kem: &HybridKemPublic, seed: &[u8]) -> (HybridSigSecret, Vec<u8>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn emit_anonymously_delivers_without_the_sender_dialling_the_destination() {
+    common::require_quiet_host("whether a one-shot anonymous emit is delivered");
+    let _serial = serial();
+    let _serial = common::serial_cell().await;
+    let dir = Directory::new();
+    let t = 2usize;
+
+    let mut nodes: Vec<NodeHandle> = Vec::new();
+    let mut mix = MixDirectory::new();
+    for i in 0..7usize {
+        let (handle, public) = router(i, &dir, t).await;
+        mix.insert(Point::<F2>::at(i).coords(), public);
+        nodes.push(handle);
+    }
+    // The emitter sits OFF the plane, on a coordinate no mix member holds — so if the destination ever saw
+    // this coordinate, the frame reached it directly and the whole point was lost.
+    let sender_coord = [0xFF, 0xFF, 0xFF];
+    let sender = spawn(Box::new(RawInjector { coord: sender_coord }), dir.clone())
+        .await
+        .expect("spawn the emitting node");
+
+    let epoch = fanos_rendezvous::Epoch::new(11);
+    let destination = Line::<F2>::at(3).coords();
+    let params = AnonRouteParams {
+        directory: mix.clone(),
+        threshold: t as u8,
+        epoch,
+        beacon: TEST_BEACON,
+        depths: (
+            fanos_aphantos::slots::MIN_FORWARD_DEPTH,
+            fanos_aphantos::slots::MIN_REPLY_DEPTH,
+        ),
+    };
+    let payload = b"one-shot anonymous payload".to_vec();
+    let mut rng = SeedRng::from_seed(b"emit-anon-seed");
+    let launch = fanos_node::rendezvous::emit_anonymously::<F2, _>(
+        &sender.client(),
+        &params,
+        destination,
+        &payload,
+        &mut rng,
+    )
+    .expect("the plane can lay a sound circuit to the destination");
+
+    // It arrives at a member of the destination line, peeled over real sockets. WHICH member is the per-onion
+    // salted pick, so the assertion is over the line rather than a canonical combiner (#55).
+    assert!(
+        await_anonymous_on_line(&mut nodes, destination, &payload).await,
+        "the payload was delivered anonymously to a member of the destination line over QUIC"
+    );
+
+    // THE PROPERTY, and the reason this is not merely a delivery test: the ONE node this sender transmitted to
+    // is not on the destination line. The transport authenticates the source, so whoever receives the launch
+    // learns this coordinate for free — no threshold, no collusion — and if that node were also a member of
+    // the destination line it would hold the sender AND the payload at once. Two distinct lines meet in exactly
+    // one point, so at q = 2 one of the first hop's three members sits on the destination: this is not rare,
+    // and `emit_anonymously` walks the onion salt until the launch lands elsewhere.
+    let members = line_member_coords::<F2>(destination);
+    assert!(
+        !members.contains(&launch),
+        "the launch landed on {launch:?}, a member of the destination line — that node holds this sender's \
+         coordinate and the payload it is about to receive, which is the whole leak the circuit exists to \
+         prevent"
+    );
+    // And the launch is a real hop, not the destination reached by another name.
+    assert_ne!(launch, destination, "the launch addressee is a member of the FIRST hop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_onion_reaches_the_meeting_line_over_real_quic() {
     common::require_quiet_host("whether an onion reaches the meeting line");
     let _serial = serial();
