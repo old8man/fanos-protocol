@@ -161,15 +161,36 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 /// this reads the constants rather than any live configuration.
 #[must_use]
 pub(crate) fn role_capacity() -> Demand {
-    Demand::per_role(|role| match role {
-        Role::Storage => STORAGE_CAPACITY_PER_NODE,
-        Role::Rendezvous => saturating_cap(
-            crate::rendezvous_relay::MAX_REGISTRATIONS + crate::rendezvous_relay::MAX_HOSTS,
-        ),
-        Role::Service => saturating_cap(crate::threshold_service::DEFAULT_MAX_PENDING),
-        Role::Exit => saturating_cap(crate::diaulos::MAX_SESSIONS),
-        Role::Relay | Role::Ingress => ROLE_CAPACITY_PER_NODE,
+    Demand::per_role(|role| {
+        debug_assert_eq!(
+            capacity_is_derived(role),
+            !matches!(role, Role::Relay | Role::Ingress),
+            "`capacity_is_derived` must name exactly the roles this match derives, or `note_deficit` \
+             reports on a fabricated number (or stays silent about a real one)"
+        );
+        match role {
+            Role::Storage => STORAGE_CAPACITY_PER_NODE,
+            Role::Rendezvous => saturating_cap(
+                crate::rendezvous_relay::MAX_REGISTRATIONS + crate::rendezvous_relay::MAX_HOSTS,
+            ),
+            Role::Service => saturating_cap(crate::threshold_service::DEFAULT_MAX_PENDING),
+            Role::Exit => saturating_cap(crate::diaulos::MAX_SESSIONS),
+            Role::Relay | Role::Ingress => ROLE_CAPACITY_PER_NODE,
+        }
     })
+}
+
+/// Whether this role's capacity is **derived** from a bound its subsystem enforces, rather than still being
+/// the [`ROLE_CAPACITY_PER_NODE`] placeholder.
+///
+/// Named because two different things read it and must not drift apart: `role_capacity` decides the
+/// denominator, and `note_deficit` decides whether the resulting shortfall is worth an operator's attention.
+/// A placeholder capacity makes the demand exceed eligible supply on any active cell, so its "deficit" is an
+/// artefact of the denominator and reporting it would fire on every epoch for ever — and a station that fires
+/// every epoch is not a signal, which is the same reason the deficit went unreported before the capacities
+/// were derived at all.
+const fn capacity_is_derived(role: Role) -> bool {
+    matches!(role, Role::Storage | Role::Rendezvous | Role::Service | Role::Exit)
 }
 
 /// An admission bound in [`Demand`]'s `u16` units.
@@ -912,7 +933,12 @@ async fn assign_epoch<F: Field>(
 fn note_deficit(client: &Client, epoch: Epoch, deficit: Demand) {
     for role in Role::ALL {
         let short = deficit.of(role);
-        if short == 0 {
+        // A shortfall is only evidence where the denominator is. Relay and Ingress still divide by the
+        // placeholder, so their demand exceeds supply on any active cell by construction — reporting that
+        // would put a permanent warning in front of an operator and teach them to ignore the station, which
+        // is worse than the silence this replaced. `the_last_two_capacities_and_the_parent_escalation_are_
+        // still_open` is the tripwire that says so when they gain a real capacity.
+        if short == 0 || !capacity_is_derived(role) {
             continue;
         }
         client.record_station(
@@ -1062,6 +1088,30 @@ mod tests {
             ROLE_CAPACITY_PER_NODE,
             "ingress HAS a bound and no sensor — a denominator over a numerator nobody reports is not a ratio"
         );
+    }
+
+    /// A shortfall is reported only where the denominator that produced it is real.
+    ///
+    /// The two halves have to name the same roles: `role_capacity` decides which capacities are derived, and
+    /// `note_deficit` decides which shortfalls reach an operator. If they drift, the node either warns every
+    /// epoch about a number that is an artefact of the placeholder — teaching an operator to ignore the
+    /// station, which is worse than the silence this replaced — or goes quiet about a real one.
+    #[test]
+    fn only_a_derived_capacity_may_report_a_shortfall() {
+        let cap = role_capacity();
+        for role in Role::ALL {
+            let derived = cap.of(role) != ROLE_CAPACITY_PER_NODE;
+            assert_eq!(
+                capacity_is_derived(role),
+                derived,
+                "{role:?}: `capacity_is_derived` and the capacity vector disagree, so the deficit report is \
+                 either noise or missing"
+            );
+        }
+        // Named literally, so flipping the classification cannot move both sides together and pass.
+        assert!(!capacity_is_derived(Role::Relay), "relay divides by the placeholder — its deficit is an artefact");
+        assert!(!capacity_is_derived(Role::Ingress), "ingress has no sensor at all — same");
+        assert!(capacity_is_derived(Role::Exit), "exit divides by MAX_SESSIONS, so its shortfall is real");
     }
 
     /// **A tripwire on the half of the capacity work that is still open.**
