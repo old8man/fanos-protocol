@@ -163,6 +163,21 @@ fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
         );
         return;
     }
+    // A wider plane inherits a decision the base cell never had to make. Said here because nothing else says
+    // it: on a plane where a tolerated coalition CAN hold both of a circuit's naming lines, drawing a fresh
+    // circuit per dial accumulates — the chance of ever being correlated rises with the dial count, which is
+    // exactly the argument that gave Tor its entry guards. On the recommended planes it cannot, so fresh is
+    // strictly right and a guard would only cost unlinkability.
+    if fanos_node::node::correlation_within_budget(line_size) {
+        eprintln!(
+            "warning: on plane order {q} a coalition inside the fault budget CAN hold both lines that name a \
+             circuit's endpoints, so drawing a fresh circuit per dial accumulates risk with the dial count \
+             (measured over 1000 dials: 99.1% at q=5, 64.2% at q=8, 5.8% at q=7 — the boundary is \
+             non-monotonic). This deployment wants a pinned entry; the base cell does not, because there the \
+             correlation is structurally impossible.",
+            q = config.plane_order
+        );
+    }
     if config.plane_order > 2 {
         return;
     }

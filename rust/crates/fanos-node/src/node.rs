@@ -119,6 +119,47 @@ pub const fn mix_threshold(line_size: usize) -> usize {
     if t == 0 { 1 } else { t }
 }
 
+/// Whether a coalition **inside the tolerated fault budget** can capture the two distinct lines that name a
+/// circuit's two endpoints — the predicate that decides whether drawing a fresh circuit per dial is safe.
+///
+/// `false` means first-and-last correlation is **structurally impossible**, not merely unlikely: naming both
+/// ends costs `2t − 1` corrupted members (two distinct lines meet in exactly one point) and that exceeds
+/// `f = ⌊(n−1)/3⌋`. `true` means it is possible, and then the *accumulation* matters.
+///
+/// ## Why this is the guard question, and why the answer is not a policy
+///
+/// FANOS draws a fresh circuit per dial (`RendezvousRoute::draw`), which is what makes successive dials
+/// unlinkable. Tor abandoned that for entry **guards**, because with a fresh entry every circuit the chance of
+/// *eventually* drawing a hostile one goes to 1. Whether that argument transfers here is decided by this
+/// predicate and then by arithmetic, not by taste — and the answer is plane-dependent and **non-monotonic**,
+/// because `t = ⌈2(q+1)/3⌉` crosses divisibility boundaries. Over 1000 dials, drawing both ends fresh:
+///
+/// | `q` | both capturable | `P(one line)` | `P(ever correlated)` | with a pinned entry |
+/// |---|---|---|---|---|
+/// | 2, 3, 4 | **no** | 0.14 / 0.05 / 0.01 | **0 %** | — |
+/// | 5 | yes | 0.067 | **99.1 %** | 6.7 % |
+/// | 7 | yes | 0.009 | 5.8 % | 0.9 % |
+/// | 8 | yes | 0.030 | 64.2 % | 3.0 % |
+/// | 11 | yes | 0.014 | 19.5 % | 1.4 % |
+/// | 31 | yes | 3e-5 | ~0 % | ~0 % |
+///
+/// So **on every plane this platform recommends, fresh-per-dial is strictly right**: a guard would buy nothing
+/// against an impossibility and would cost the unlinkability that fresh circuits exist for. The guard question
+/// only opens where this returns `true` and the per-dial square is large enough to accumulate — `q = 5` and
+/// `q = 8` are the sharp cases, and `q = 5` is the worst plane here exactly as it is on liveness spare.
+///
+/// A deployment that widens the plane therefore inherits a decision the base cell never had to make, and
+/// nothing told it so until this existed.
+#[must_use]
+pub const fn correlation_within_budget(line_size: usize) -> bool {
+    // `q + 1 = line_size`, so `n = q² + q + 1` and the Byzantine budget is `⌊(n−1)/3⌋` — the same `f` every
+    // quorum in the platform is sized against.
+    let q = line_size.saturating_sub(1);
+    let n = q * q + q + 1;
+    let f = n.saturating_sub(1) / 3;
+    f >= 2 * mix_threshold(line_size) - 1
+}
+
 /// The mix threshold on the default plane, `PG(2,2)`: a 3-point line, `2`-of-`3`.
 ///
 /// Kept as a named value for the client CLI's default, which cannot see a plane before it parses one.
@@ -1184,6 +1225,28 @@ impl Node {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// The planes this platform recommends cannot correlate a circuit's two ends within the fault budget, and
+    /// the ones above them can — so fresh-per-dial is right here and the guard question is real there.
+    ///
+    /// Pinned as a table rather than a formula because the boundary is NON-MONOTONIC: `t = ⌈2(q+1)/3⌉` crosses
+    /// divisibility boundaries, so "wider is safer" is false and an intuition check would pass the wrong code.
+    #[test]
+    fn correlation_is_impossible_exactly_on_the_recommended_planes() {
+        for (q, expected) in [(2usize, false), (3, false), (4, false), (5, true), (7, true), (8, true), (31, true)] {
+            assert_eq!(
+                correlation_within_budget(q + 1),
+                expected,
+                "plane order {q}: 2t-1 = {} against f = {}",
+                2 * mix_threshold(q + 1) - 1,
+                (q * q + q + 1 - 1) / 3
+            );
+        }
+        // The boundary is where it is because of the ARITHMETIC, not because 4 is special: at q = 4 the budget
+        // is 6 and two lines cost 7, and one more corrupted node would flip it.
+        assert_eq!(2 * mix_threshold(5) - 1, 7, "two lines cost 7 at q = 4");
+        assert_eq!((4 * 4 + 4 + 1 - 1) / 3, 6, "and the budget there is 6");
+    }
     use super::*;
 
     /// **The plane order should be chosen for its liveness SPARE, and the spare is `⌊(q+1)/3⌋`.**
