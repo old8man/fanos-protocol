@@ -764,18 +764,20 @@ impl<F: Field> ThresholdRouter<F> {
         let me = self.coord.coords();
         Self::line_members(line)
             .into_iter()
-            .map(|member| {
+            .filter_map(|member| {
                 if member == me {
-                    Effect::Notify(Notification::Delivered {
+                    return Some(Effect::Notify(Notification::Delivered {
                         from: ANONYMOUS,
                         payload: e2e.to_vec(),
-                    })
-                } else {
-                    Effect::Send {
-                        to: member,
-                        frame: encode_drop(line, e2e),
-                    }
+                    }));
                 }
+                // `encode_drop` refuses a body too wide for the bucket, and that cannot happen here:
+                // `e2e` arrived inside an onion of exactly `THRESHOLD_ONION_LEN` (`Packet::from_bytes`
+                // rejects any other width), so it is strictly shorter than the room a cell leaves. Stated
+                // rather than trusted, and the fallback is a *skipped member* rather than a short frame —
+                // a narrow cell on the wire would be precisely the distinguisher the padding removes, so
+                // the property degrades to a lost delivery and never to a leaking one.
+                encode_drop(line, e2e).map(|frame| Effect::Send { to: member, frame })
             })
             .collect()
     }
@@ -998,17 +1000,61 @@ fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
     Some((line, body.get(12..)?.to_vec()))
 }
 
-fn encode_drop(line: Triple, e2e: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 12 + e2e.len());
+/// A NOSTOS dead-drop cell: `TAG ‖ line(12) ‖ [len(4 BE) ‖ body ‖ filler]`, where the bracketed region is
+/// **exactly [`THRESHOLD_ONION_LEN`]**.
+///
+/// ## The cell used to be the one payload-bearing frame on the anonymous path that was not constant-width
+///
+/// `ThresholdPeel::Forward` re-pads every onion it relays, with the reason stated at the site — *"so the
+/// forwarded packet is the same size as the one we received — no cross-hop size correlation"*. The delivery
+/// arm ten lines below it sent the raw end-to-end body. Since `e2e = seal_to_receiver(..)` is
+/// `const(KEM) + len(payload) + const(tag)`, the cell's length **was** the reply's plaintext length — visible
+/// to every member of the line, and the same length leaving one coordinate `q + 1` times at once, a pattern
+/// nothing else on the network produces.
+///
+/// The transport shaper does not cover this and must not be relied on: `ShapingProfile::pad_to_target` only
+/// pads *up* to a random target in `[size_floor, size_ceil]` and never buckets a larger frame down, and
+/// `ProteusShaper::shape` returns immediately for `Morph::Plain`. It is a censorship-resistance device
+/// (resemble the cover protocol's size distribution), not an anonymity-set one.
+///
+/// ## Why the bucket is the ONION's, not one sized to replies
+///
+/// A cheaper bucket sized to reply bodies would be a **separate anonymity set** — a frame in it says "this is
+/// a dead-drop delivery" as loudly as its length said "this is a 900-byte reply". Reusing
+/// `THRESHOLD_ONION_LEN` makes the cell byte-identical in size to a forwarded onion frame
+/// (`1 + 12 + THRESHOLD_ONION_LEN` either way), so it joins the largest set the plane already has instead of
+/// forming its own. The cost is `q + 1` × 20 KiB per delivery, which is what the forward direction already
+/// pays per hop.
+///
+/// The body always fits: it arrived inside an onion of exactly this bucket, so it is strictly shorter.
+/// `None` when it somehow is not — fail closed rather than emit a short cell that would be a distinguisher.
+fn encode_drop(line: Triple, e2e: &[u8]) -> Option<Vec<u8>> {
+    let room = threshold::THRESHOLD_ONION_LEN.checked_sub(4)?;
+    if e2e.len() > room {
+        return None;
+    }
+    let mut v = Vec::with_capacity(1 + 12 + threshold::THRESHOLD_ONION_LEN);
     v.push(TAG_DROP);
     v.extend_from_slice(&fanos_geometry::encode_triple(line));
+    v.extend_from_slice(&u32::try_from(e2e.len()).ok()?.to_be_bytes());
     v.extend_from_slice(e2e);
-    v
+    let mut filler = alloc::vec![0u8; room - e2e.len()];
+    fanos_primitives::hash::hash_xof("FANOS-v1/nostos-drop-pad", e2e, &mut filler);
+    v.extend_from_slice(&filler);
+    Some(v)
 }
 
+/// Decode a dead-drop cell. **Fail-closed on width**: a cell whose padded region is not exactly
+/// [`THRESHOLD_ONION_LEN`] is refused rather than accepted at its natural length, so the constant-width
+/// property cannot silently degrade to "whatever arrived".
 fn decode_drop(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
     let line = fanos_geometry::decode_triple(body.get(..12)?)?;
-    Some((line, body.get(12..)?.to_vec()))
+    let region = body.get(12..)?;
+    if region.len() != threshold::THRESHOLD_ONION_LEN {
+        return None;
+    }
+    let len = u32::from_be_bytes(*region.first_chunk::<4>()?) as usize;
+    Some((line, region.get(4..4 + len)?.to_vec()))
 }
 
 fn encode_req(req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<u8> {
@@ -1630,7 +1676,24 @@ mod tests {
         let (reply_keys, reply_pub) = ReplyKeys::generate(b"rk-drop");
         let payload = b"drop me home";
         let e2e = seal_to_receiver(&reply_pub, payload, b"e2e").unwrap();
-        let cell = encode_drop(l, &e2e);
+        let cell = encode_drop(l, &e2e).expect("a body that came out of an onion fits a cell");
+
+        // THE PROPERTY: the cell's width is a constant, so it carries no information about the reply. Asserted
+        // against the ONION frame's width rather than a literal, because sharing the bucket is the point —
+        // a cell in a bucket of its own would announce "dead-drop delivery" as loudly as its length used to
+        // announce the reply's size.
+        let onion_frame = 1 + 12 + threshold::THRESHOLD_ONION_LEN;
+        assert_eq!(cell.len(), onion_frame, "a drop cell is the same width as a forwarded onion frame");
+        let longer = seal_to_receiver(&reply_pub, &[7u8; 400], b"e2e2").unwrap();
+        assert_ne!(longer.len(), e2e.len(), "the two replies really do differ in size");
+        assert_eq!(
+            encode_drop(l, &longer).expect("also fits").len(),
+            cell.len(),
+            "and a reply 400 bytes longer produces a cell of the identical width — the length of the plaintext \
+             is what used to reach every member of the line"
+        );
+        // Fail closed on width: a short cell must be refused, not accepted at whatever arrived.
+        assert!(decode_drop(&cell[1..cell.len() - 1]).is_none(), "a truncated cell is refused");
 
         // A router at a member coordinate of L hands the body to its application.
         let (id_r, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"id-r"));
@@ -1658,7 +1721,7 @@ mod tests {
         let mut outsider = ThresholdRouter::<F2>::new(off_line, &id_x, 2, [0x2; 32]);
         assert!(
             outsider
-                .step(Instant(0), Input::Message { from: [0, 0, 0], frame: cell })
+                .step(Instant(0), Input::Message { from: [0, 0, 0], frame: cell.clone() })
                 .is_empty(),
             "a node not on the line ignores a dead-drop cell addressed to that line",
         );
