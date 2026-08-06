@@ -241,6 +241,20 @@ pub enum Station {
     /// leaves only the descriptor commitment to check against.
     DescriptorUnrecoverable,
 
+    /// The cell **wants more nodes in a role than any member offered** — a real provisioning shortfall
+    /// (`AssignReport::deficit`), which for a threshold-line role means the guarantee that role exists to
+    /// provide is not currently being met.
+    ///
+    /// Silent until now, and harmlessly so only by accident: while `ROLE_CAPACITY_PER_NODE` was the
+    /// placeholder `1` the demand exceeded eligible supply on *every* active cell, so the deficit was a
+    /// fabrication and reporting it would have been noise on every epoch. With the capacities derived from
+    /// each role's own admission bound the number means what it says, and a shortfall that nothing reads is
+    /// the worse of the two failure modes the tripwire in `role_loop` warned about.
+    ///
+    /// [`Observation::tag`] carries the role index. This is the *local* signal; escalating a shortfall to the
+    /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
+    RoleUnderProvisioned,
+
     /// A `(coordinate, epoch)` directory publish did not land — the node is **absent from that roster for
     /// that epoch**, and until this station existed it was the last to know.
     ///
@@ -297,6 +311,7 @@ impl Station {
         Self::ShareOffCommitment,
         Self::DescriptorUnrecoverable,
         Self::DirectoryPublishFailed,
+        Self::RoleUnderProvisioned,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
@@ -335,6 +350,7 @@ impl Station {
             Self::ShareOffCommitment => "share.off_commitment",
             Self::DescriptorUnrecoverable => "descriptor.unrecoverable",
             Self::DirectoryPublishFailed => "directory.publish_failed",
+            Self::RoleUnderProvisioned => "role.under_provisioned",
             Self::AuthenticationRejected => "auth.rejected",
         }
     }
@@ -686,6 +702,7 @@ mod tests {
                 Station::ShareOffCommitment => listed(Station::ShareOffCommitment),
                 Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
                 Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
+                Station::RoleUnderProvisioned => listed(Station::RoleUnderProvisioned),
                 Station::AuthenticationRejected => listed(Station::AuthenticationRejected),
             }
         }

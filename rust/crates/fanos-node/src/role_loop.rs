@@ -121,17 +121,64 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 /// about the denominator — the divergence that would reintroduce a double division without any type noticing.
 ///
 /// **Per role, because capacity is not one number.** Each role's load is measured in its own units, so its
-/// capacity has to be too: storage counts held keys and has the derivation above; relay counts originated
-/// frames per observation window, which is a throughput figure only `fanos-bench` can produce; the remaining
-/// four have no sensor at all yet, so a capacity for them would be a denominator over a fabricated numerator.
-/// Those keep [`ROLE_CAPACITY_PER_NODE`] and its stated defect until each gets a measurement — replacing one
-/// wrong number with another by taste is the thing this whole subsystem is trying not to do.
+/// capacity has to be too.
+///
+/// ## The rule, which storage established and four roles now follow
+///
+/// > **Capacity is the bound the node's own admission rule already enforces on the very number the sensor
+/// > reports.**
+///
+/// Not a measurement to be commissioned and not a number to be chosen: the node is *already* refusing work
+/// past some point, and reading capacity off anything else would be reading a figure the node does not obey.
+/// Four of the six roles have both halves — a level-valued sensor and an enforced cap on that same level —
+/// and the match of units is what makes the ratio meaningful rather than merely arithmetic:
+///
+/// | role | the sensor reports | the node enforces |
+/// |---|---|---|
+/// | storage | `store.entries.len()` | [`MAX_STORE_ENTRIES`](fanos_runtime::MAX_STORE_ENTRIES) at admission |
+/// | rendezvous | `registrations() + hosts()` | those two `BoundedMap`s' caps |
+/// | service | `service.pending()` | `max_pending`, checked before accepting an intro |
+/// | exit | flows in flight | `MAX_SESSIONS`, LRU-evicted by the session demux |
+///
+/// The two residuals are residual for **different reasons**, and collapsing them would lose the distinction
+/// that says what each still needs:
+///
+/// * **Relay** has a sensor and no matching bound. Its load is *frames originated* — a rate — while every cap
+///   in reach is a level, so no admission rule answers "how many frames per window". That one is a genuine
+///   throughput measurement, which is `fanos-bench`'s job.
+/// * **Ingress** has a bound (POROS's own pending cap) and no sensor. A denominator over a numerator nobody
+///   reports is not a ratio, so the bound is unusable until the role is measured.
+///
+/// Both keep [`ROLE_CAPACITY_PER_NODE`] and its stated defect. Replacing one wrong number with another by
+/// taste is the thing this whole subsystem exists not to do.
+///
+/// ## Why these read protocol constants and never a node's configuration
+///
+/// Capacity is a **cell-wide denominator**: every node divides the same summed load by it, and the assignment
+/// is only deterministic while they all use the same value. A node that locally lowers its own `max_pending`
+/// therefore does not lower the cell's model of it — it simply under-serves relative to that model, which
+/// surfaces as a deficit rather than as a silent disagreement. That is the correct direction, and it is why
+/// this reads the constants rather than any live configuration.
 #[must_use]
 pub(crate) fn role_capacity() -> Demand {
     Demand::per_role(|role| match role {
         Role::Storage => STORAGE_CAPACITY_PER_NODE,
-        _ => ROLE_CAPACITY_PER_NODE,
+        Role::Rendezvous => saturating_cap(
+            crate::rendezvous_relay::MAX_REGISTRATIONS + crate::rendezvous_relay::MAX_HOSTS,
+        ),
+        Role::Service => saturating_cap(crate::threshold_service::DEFAULT_MAX_PENDING),
+        Role::Exit => saturating_cap(crate::diaulos::MAX_SESSIONS),
+        Role::Relay | Role::Ingress => ROLE_CAPACITY_PER_NODE,
     })
+}
+
+/// An admission bound in [`Demand`]'s `u16` units.
+///
+/// Saturating rather than truncating, and the direction matters: a cap past `u16::MAX` clamps to a *smaller*
+/// capacity, which over-provisions the role. Over-provisioning is visible and safe; the truncated alternative
+/// wraps to a tiny capacity and demands a hundred nodes for one node's work.
+const fn saturating_cap(bound: usize) -> u16 {
+    if bound > u16::MAX as usize { u16::MAX } else { bound as u16 }
 }
 
 /// The latest per-role load this node **measured**, shared between the engine's notification stream and the role
@@ -328,6 +375,9 @@ pub struct LiveRoleController {
     /// to. A published value, not an accumulator: see [`Self::step`] for why that distinction is the whole
     /// point.
     last_agreed: Demand,
+    /// Per-role shortfall from the last [`step`](LiveRoleController::step) — see
+    /// [`deficit`](LiveRoleController::deficit).
+    last_deficit: Demand,
     reputation: Reputation,
 }
 
@@ -336,7 +386,13 @@ impl LiveRoleController {
     /// (every node fully trusted until observed).
     #[must_use]
     pub fn new(node_id: NodeId, controller: RoleController) -> Self {
-        Self { node_id, controller, last_agreed: Demand::default(), reputation: Reputation::new() }
+        Self {
+            node_id,
+            controller,
+            last_agreed: Demand::default(),
+            last_deficit: Demand::default(),
+            reputation: Reputation::new(),
+        }
     }
 
     /// The demand this node would assign from right now — a function of [`last_agreed`](Self::last_agreed),
@@ -412,8 +468,22 @@ impl LiveRoleController {
         self.last_agreed = setpoint;
         let weighted = self.reputation.adjust(members);
         let report = fanos_core::roles::assign_report(&weighted, epoch, beacon, self.demand_for(setpoint));
+        self.last_deficit = report.deficit;
         let roles = report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY);
         Assignment { roles, roster: members.len(), epoch }
+    }
+
+    /// Per role, how many nodes the cell's demand fell short of its eligible supply at the last
+    /// [`step`](Self::step) — `AssignReport::deficit`, which used to be computed and dropped.
+    ///
+    /// **Reportable only now that capacity means something.** Under the placeholder capacity the demand
+    /// exceeded supply on every active cell, so this was a fabrication on every epoch and surfacing it would
+    /// have been pure noise; the saturation is exactly what made dropping it harmless. With four roles'
+    /// capacities read off their own admission bounds the number says what it claims, and for a
+    /// [`Role::covers_a_threshold_line`] role a positive value means the guarantee is not currently met.
+    #[must_use]
+    pub fn deficit(&self) -> Demand {
+        self.last_deficit
     }
 }
 
@@ -818,8 +888,45 @@ async fn assign_epoch<F: Field>(
         Plane::<F>::LINE_SIZE as usize,
     );
     let roles = live.step(&members, epoch, &beacon, setpoint);
+    note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
+}
+
+/// Record a provisioning shortfall where an operator will see it — one
+/// [`RoleUnderProvisioned`](fanos_runtime::ports::stations::Station::RoleUnderProvisioned) per role that came
+/// up short, tagged with the role.
+///
+/// **The counterpart to `note_publish`, and installed for the same reason.** A deficit was computed on every
+/// assignment and dropped on every assignment, so a cell that could not staff a role looked exactly like one
+/// that could. What changed is that the number is now true: under the placeholder capacity every active cell
+/// ran a permanent fabricated deficit, and a station firing on every epoch is not a signal.
+///
+/// Per role rather than aggregated, because the consequence is not the same everywhere — one relay short is a
+/// throughput matter, while one point short on a rendezvous line means the `t`-of-`(q+1)` guarantee that role
+/// exists to provide is not being met at all. One count cannot say which.
+///
+/// This is the **local** signal. Escalating to the parent cell, which `docs/design-roles.md` describes, needs
+/// the hierarchy path and is deliberately not invented here: a half-wired escalation would be worse than a
+/// stated gap.
+fn note_deficit(client: &Client, epoch: Epoch, deficit: Demand) {
+    for role in Role::ALL {
+        let short = deficit.of(role);
+        if short == 0 {
+            continue;
+        }
+        client.record_station(
+            fanos_runtime::ports::stations::Station::RoleUnderProvisioned,
+            Some(client.address()),
+            Some(role.index() as u64),
+        );
+        tracing::warn!(
+            role = ?role,
+            short,
+            epoch = ?epoch,
+            "the cell wants more nodes in this role than any member offered"
+        );
+    }
 }
 
 /// The running self-organizing subsystem of a node: the three background tasks (capability publisher, load
@@ -917,24 +1024,71 @@ mod tests {
         );
     }
 
+    /// Every derived capacity is **the bound its own subsystem enforces**, read from that subsystem rather
+    /// than restated here.
+    ///
+    /// A copy would drift the instant a cap moved, and nothing would notice: the assignment would simply
+    /// provision the wrong number of nodes for that role, which is not a failure any test asserts directly.
+    /// So the assertion is an identity against the source of truth, and the *only* thing it pins is that the
+    /// two remain the same number.
     #[test]
-    fn capacity_and_the_deficit_escalation_must_be_fixed_together() {
+    fn each_derived_capacity_is_its_subsystems_own_admission_bound() {
+        let cap = role_capacity();
+        assert_eq!(
+            usize::from(cap.of(Role::Rendezvous)),
+            crate::rendezvous_relay::MAX_REGISTRATIONS + crate::rendezvous_relay::MAX_HOSTS,
+            "the combiner reports registrations + hosts, so its capacity is the sum of those two caps"
+        );
+        assert_eq!(
+            usize::from(cap.of(Role::Service)),
+            crate::threshold_service::DEFAULT_MAX_PENDING,
+            "the service reports intros being gathered, and refuses past max_pending"
+        );
+        assert_eq!(
+            usize::from(cap.of(Role::Exit)),
+            crate::diaulos::MAX_SESSIONS,
+            "an exit reports flows in flight, and the session demux caps concurrent sessions"
+        );
+
+        // The two that are still placeholders, and the distinction between them is the point: each names what
+        // it is waiting for. Collapsing them into "unmeasured" loses that.
+        assert_eq!(
+            cap.of(Role::Relay),
+            ROLE_CAPACITY_PER_NODE,
+            "relay's sensor is a RATE and every cap in reach is a level — it needs a throughput measurement"
+        );
+        assert_eq!(
+            cap.of(Role::Ingress),
+            ROLE_CAPACITY_PER_NODE,
+            "ingress HAS a bound and no sensor — a denominator over a numerator nobody reports is not a ratio"
+        );
+    }
+
+    /// **A tripwire on the half of the capacity work that is still open.**
+    ///
+    /// Four roles now divide by their own admission bound. Two do not, for the two different reasons the test
+    /// above pins, and while `ROLE_CAPACITY_PER_NODE` is still `1` those two saturate: their demand exceeds
+    /// eligible supply on any active cell, so every offering node gets them and the controller expresses
+    /// nothing about them.
+    ///
+    /// The second half — the one this exists to hand on — is that a real capacity makes
+    /// `AssignReport::deficit` mean something. That is now recorded locally (`note_deficit` →
+    /// `Station::RoleUnderProvisioned`), so a shortfall is no longer silently dropped. What is still absent is
+    /// the **parent-cell escalation** `docs/design-roles.md` describes: a cell that cannot staff a role tells
+    /// its operator and not its parent. That is a hierarchy-transport gap, deliberately not faked here.
+    #[test]
+    fn the_last_two_capacities_and_the_parent_escalation_are_still_open() {
         assert_eq!(
             ROLE_CAPACITY_PER_NODE, 1,
-            "Capacity is no longer the placeholder — good, but read this before going further.\n\
+            "Relay and Ingress capacity are no longer the placeholder — good, but read this first.\n\
              \n\
-             It was `1` because nobody had measured how much load one node absorbs per observation window, and\n\
-             that placeholder saturated the assignment: every offering node got every role, so the controller\n\
-             could express nothing and role churn was undetectable.\n\
+             `1` reads an event count as a node count, so those two roles saturate the assignment and the\n\
+             controller cannot express anything about them. Their deficits are therefore FABRICATED, and\n\
+             `note_deficit` will be reporting a shortfall for them on every epoch.\n\
              \n\
-             The saturation also MASKED a second defect. `AssignReport::deficit` is a fabricated shortfall\n\
-             under a placeholder capacity, and it has no production caller — the parent-cell escalation in\n\
-             `docs/design-roles.md` is unwired. With a real capacity the deficit becomes meaningful, so the\n\
-             escalation should now be wired; with a real capacity and the escalation still unwired, a genuine\n\
-             shortfall is silently ignored instead of harmlessly fabricated.\n\
-             \n\
-             Either wire the escalation, or state here why a real deficit may still go unread — then update\n\
-             this test to assert the new capacity's units rather than its value."
+             When you give them a real capacity, check that the reported deficit becomes true rather than\n\
+             merely quieter — and note that the parent-cell escalation is still unwired, so a genuine\n\
+             shortfall reaches an operator and no other cell."
         );
     }
 

@@ -99,7 +99,7 @@ pub struct RendezvousRelay<F: Field> {
 /// The cap on concurrently-registered bare-proxy client sessions (audit robustness B2). Beyond it, the
 /// oldest registration is evicted FIFO, so an attacker streaming distinct cookies cannot grow the map without
 /// bound. Generous enough for any real relay's concurrent fallback clients.
-const MAX_REGISTRATIONS: usize = 4096;
+pub(crate) const MAX_REGISTRATIONS: usize = 4096;
 
 /// How many further epoch advances a hidden-service registration outlives before the relay retires it.
 ///
@@ -126,7 +126,7 @@ pub(crate) const HOST_GRACE_EPOCHS: u64 = 1;
 /// The cap on concurrently-registered hidden-service hosts (§3b). A `HostRegister` peels out as an
 /// anonymous delivery, so — like the client registrations — an unbounded map would be a remote OOM; beyond
 /// the cap the oldest host is evicted FIFO (it re-registers each epoch anyway). Generous for any real cell.
-const MAX_HOSTS: usize = 4096;
+pub(crate) const MAX_HOSTS: usize = 4096;
 
 impl<F: Field> RendezvousRelay<F> {
     /// A relay wrapping `router`. No client or host is registered until one sends an

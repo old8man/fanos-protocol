@@ -53,7 +53,7 @@ const ANONYMOUS: Triple = [0, 0, 0];
 
 /// Default cap on concurrently-gathering intros — a bound on combiner state against an intro flood
 /// (spec §12.5 DoS). Beyond it, new intros are dropped until a slot frees (completed or timed out).
-const DEFAULT_MAX_PENDING: usize = 256;
+pub(crate) const DEFAULT_MAX_PENDING: usize = 256;
 
 /// How many recently-served intro ids to remember, to suppress a replayed intro re-serving (bounded).
 const SERVED_MEMORY: usize = 256;
