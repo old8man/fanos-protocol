@@ -28,6 +28,21 @@ extern "C" {
  * mismatched caller can discover the mismatch instead of crashing while finding out. */
 uint32_t fanos_abi_version(void);
 
+/*
+ * A human-readable reason for THIS THREAD's most recent failure, or an empty string if none — never NULL, so
+ * it may be printed unconditionally.
+ *
+ * A result code says which CLASS of thing went wrong. FANOS_ERR_IO on a publish is a dead peer, a full store
+ * or a rejected slot, and the code cannot tell them apart. Four calls below return a POINTER and have no code
+ * at all — fanos_open, fanos_service_connect, fanos_service_host, fanos_service_accept — so for those NULL is
+ * the whole vocabulary and this is the only channel that exists.
+ *
+ * LIFETIME, and it is the whole contract: the pointer is BORROWED and valid until this thread's NEXT call
+ * into this library. Copy it before doing anything else. Thread-local, because this ABI takes no lock and two
+ * threads failing at once must not read each other's reason.
+ */
+const char *fanos_last_error(void);
+
 /* Result codes (0 = OK). */
 #define FANOS_OK            0
 #define FANOS_ERR_NULL     (-1) /* a required pointer argument was null */

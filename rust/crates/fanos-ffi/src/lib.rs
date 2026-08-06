@@ -20,7 +20,7 @@
 // documented `# Safety` contract.
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::{ptr, slice};
 
 use fanos_diaulos::{StaticKeypair, bundle_from_kem_public};
@@ -34,6 +34,66 @@ use fanos_pqcrypto::rng::SeedRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot};
+
+thread_local! {
+    /// The calling thread's last failure message. See [`fanos_last_error`] for the lifetime rule.
+    static LAST_ERROR: core::cell::RefCell<CString> = core::cell::RefCell::new(CString::default());
+}
+
+/// A human-readable reason for this thread's most recent failure, or an empty string if none.
+///
+/// ## Why a code is not enough, and for a third of this surface is not anything
+///
+/// A `c_int` says which CLASS of thing went wrong. [`FANOS_ERR_IO`] on a publish is a dead peer, a full store
+/// or a rejected slot, and a C caller cannot tell them apart or log anything an operator could act on.
+///
+/// Worse: **four of the exported functions return a POINTER** — [`fanos_open`], [`fanos_service_connect`],
+/// [`fanos_service_host`], [`fanos_service_accept`] — and `NULL` is their entire failure vocabulary. For those
+/// this is not better diagnostics, it is the only channel that exists.
+///
+/// ## The lifetime rule, which is the whole contract
+///
+/// The pointer is **borrowed, thread-local, and valid until this thread's next call into this library.** Copy
+/// it before doing anything else. It is stated here and in `fanos.h` because a returned pointer with an
+/// unstated lifetime is worse than no pointer at all: a caller keeps it, it is correct in testing, and it is a
+/// use-after-free the first time the next call happens to reallocate.
+///
+/// Thread-local rather than global because this ABI takes no lock: two threads failing at once would otherwise
+/// each read the other's reason, which is worse than reading none.
+///
+/// Never `NULL` — an empty string means "no failure recorded", so a caller may print it unconditionally.
+#[unsafe(no_mangle)]
+pub extern "C" fn fanos_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| e.borrow().as_ptr())
+}
+
+/// Record `msg` as this thread's failure reason and return `code`.
+///
+/// Every failing return in this file goes through this or [`fail_null`], and
+/// `tests/every_failure_sets_the_error_channel.rs` asserts there are no bare ones — because "remember to set
+/// it" is the same kind of instruction as "keep the header in sync", and it fails the same way.
+fn fail(code: c_int, msg: &str) -> c_int {
+    set_last_error(msg);
+    code
+}
+
+/// Record `msg` and return a null pointer — the pointer-returning half of [`fail`].
+fn fail_null<T>(msg: &str) -> *mut T {
+    set_last_error(msg);
+    ptr::null_mut()
+}
+
+/// Replace this thread's message. Interior NULs are truncated at rather than rejected: a diagnostic must never
+/// be the reason a call fails.
+fn set_last_error(msg: &str) {
+    let owned = CString::new(msg).unwrap_or_else(|e| {
+        msg.as_bytes()
+            .get(..e.nul_position())
+            .and_then(|head| CString::new(head).ok())
+            .unwrap_or_default()
+    });
+    LAST_ERROR.with(|e| *e.borrow_mut() = owned);
+}
 
 /// The ABI this library implements. A caller compares it against the `FANOS_ABI_VERSION` its header declared,
 /// and refuses to proceed on a mismatch.
@@ -110,11 +170,11 @@ pub unsafe extern "C" fn fanos_open(config: *const c_char) -> *mut FanosNode {
     } else {
         // SAFETY: the caller guarantees `config` is a valid NUL-terminated string for this call.
         let Ok(text) = unsafe { CStr::from_ptr(config) }.to_str() else {
-            return ptr::null_mut();
+            return fail_null("the config string is not valid UTF-8");
         };
         match NodeConfig::from_config_str(text) {
             Ok(cfg) => cfg,
-            Err(_) => return ptr::null_mut(),
+            Err(_) => return fail_null("the config string did not parse; see fanos_node::config for the accepted keys"),
         }
     };
     // **At least two workers.** Every call in this ABI blocks the *caller's* thread on `block_on`, so the runtime
@@ -128,11 +188,11 @@ pub unsafe extern "C" fn fanos_open(config: *const c_char) -> *mut FanosNode {
     // comparing sequential batches across a varying host, not from the parameter.
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().build() else {
-        return ptr::null_mut();
+        return fail_null("the tokio runtime could not be built (thread or file-descriptor limit?)");
     };
     match rt.block_on(Node::start::<F2>(config)) {
         Ok(node) => Box::into_raw(Box::new(FanosNode { rt, node })),
-        Err(_) => ptr::null_mut(),
+        Err(_) => fail_null("the node failed to start: it could not bind its socket or reach any bootstrap peer"),
     }
 }
 
@@ -159,7 +219,7 @@ pub unsafe extern "C" fn fanos_open(config: *const c_char) -> *mut FanosNode {
 pub unsafe extern "C" fn fanos_join(node: *mut FanosNode) -> c_int {
     // SAFETY: the caller guarantees `node` is null or a live `fanos_open` handle.
     let Some(handle) = (unsafe { node.as_mut() }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_join: the node handle is null");
     };
     handle.node.command(Command::Join { info: Vec::new() });
     handle.rt.block_on(async {
@@ -196,11 +256,11 @@ pub unsafe extern "C" fn fanos_publish(
 ) -> c_int {
     // SAFETY: guarded by the null checks below; the caller guarantees the lengths.
     let Some(handle) = (unsafe { node.as_ref() }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_publish: the node handle is null");
     };
     let (Some(key), Some(val)) = (unsafe { as_slice(key, key_len) }, unsafe { as_slice(val, val_len) })
     else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_publish: key or val is null, or its length overflows isize");
     };
     // Bounded, like every other store call: a Put whose responsible peer never answers must fail the call, not
     // hang the C caller forever. A foreign caller has no way to interrupt a blocking FFI function.
@@ -231,15 +291,15 @@ pub unsafe extern "C" fn fanos_lookup(
 ) -> c_int {
     // SAFETY: guarded by the null checks below; the caller guarantees the lengths.
     let Some(handle) = (unsafe { node.as_ref() }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_lookup: the node handle is null");
     };
     let Some(key) = (unsafe { as_slice(key, key_len) }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_lookup: key is null, or key_len overflows isize");
     };
     // Validate the caller's out-buffer *before* the lookup: a malformed triple is an argument error, not a
     // verdict about the key.
     if !out_buffer_is_valid(out, out_cap, out_len) {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_lookup: out is null, out_len is null, or out_cap overflows isize");
     }
     // Bounded for the same reason as the Put above — and this is the one that was measured hanging: an overlay
     // Get from a freshly-bootstrapped peer intermittently never resolves, and without a bound the C caller waits
@@ -249,7 +309,7 @@ pub unsafe extern "C" fn fanos_lookup(
         tokio::time::timeout(STORE_TIMEOUT, handle.node.client().get(key.to_vec())).await.ok().flatten()
     });
     let Some(value) = found else {
-        return FANOS_ERR_NOTFOUND;
+        return fail(FANOS_ERR_NOTFOUND, "fanos_lookup: no peer holds a value under this key");
     };
     // SAFETY: the caller guarantees `out`/`out_len` are writable for the stated capacity, and the value is a
     // freshly-read Vec distinct from the caller's buffer.
@@ -318,30 +378,30 @@ pub unsafe extern "C" fn fanos_service_connect(
 ) -> *mut FanosStream {
     // SAFETY: guarded by the null checks; the caller guarantees a valid `addr` string.
     let Some(handle) = (unsafe { node.as_ref() }) else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_connect: the node handle is null");
     };
     if addr.is_null() {
-        return ptr::null_mut();
+        return fail_null("fanos_service_connect: addr is null");
     }
     let Ok(name) = unsafe { CStr::from_ptr(addr) }.to_str() else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_connect: addr is not valid UTF-8");
     };
     // Resolve the `.fanos` name to the service coordinate + KEM key (min_pow 0 — the caller's descriptor
     // policy is a higher-level concern), then dial a DIAULOS session with fresh per-dial ephemeral keys.
     let resolver = NodeResolver::new(handle.node.client(), Epoch::ZERO, 0);
     let Some((coord, public)) = handle.rt.block_on(resolver.resolve(name)) else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_connect: the name did not resolve — no descriptor for it in the store");
     };
     let mut seed = [0u8; 32];
     if getrandom::fill(&mut seed).is_err() {
-        return ptr::null_mut();
+        return fail_null("fanos_service_connect: the OS refused entropy for the session seed");
     }
     let mut rng = SeedRng::from_seed(&seed);
     // `dial_service` spawns the session's transport bridge, so it must run inside the runtime context.
     let stream = {
         let _guard = handle.rt.enter();
         let Some(kem) = fanos_diaulos::service_public_from_bundle(&public) else {
-            return ptr::null_mut();
+            return fail_null("fanos_service_connect: the resolved descriptor carries no usable service key");
         };
         dial_service(handle.node.client(), coord, &kem, &mut rng)
     };
@@ -380,10 +440,10 @@ pub unsafe extern "C" fn fanos_service_host(
 ) -> *mut FanosService {
     // SAFETY: guarded by the null checks; the caller guarantees the buffer lengths.
     let Some(handle) = (unsafe { node.as_ref() }) else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_host: the node handle is null");
     };
     let Some(seed_bytes) = (unsafe { as_slice(seed, seed_len) }) else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_host: seed is null, or seed_len overflows isize");
     };
     // The deterministic service identity and its self-certifying `.fanos` name.
     let keypair = StaticKeypair::generate(&mut SeedRng::from_seed(seed_bytes));
@@ -392,7 +452,7 @@ pub unsafe extern "C" fn fanos_service_host(
     // Check the caller's buffer up front — before standing anything up — but write into it only once the
     // service is actually hosted, so a failed call leaves it untouched, as the null return implies.
     if !cstr_fits(&name, addr_out, addr_out_cap) {
-        return ptr::null_mut();
+        return fail_null("fanos_service_host: addr_out is too small for the address (including its NUL)");
     }
 
     // Host the service: each accepted client session is forwarded onto the accept queue (its own fresh OS
@@ -400,7 +460,7 @@ pub unsafe extern "C" fn fanos_service_host(
     let (tx, rx) = mpsc::channel::<(DuplexStream, oneshot::Sender<()>)>(ACCEPT_QUEUE);
     let mut serve_seed = [0u8; 32];
     if getrandom::fill(&mut serve_seed).is_err() {
-        return ptr::null_mut();
+        return fail_null("fanos_service_host: the OS refused entropy for the serve seed");
     }
     {
         let _guard = handle.rt.enter();
@@ -439,7 +499,7 @@ pub unsafe extern "C" fn fanos_service_host(
         .is_ok_and(|r| r.is_ok())
     });
     if !published {
-        return ptr::null_mut();
+        return fail_null("fanos_service_host: the descriptor did not publish — no peer accepted it");
     }
     // SAFETY: `cstr_fits` held above — `addr_out` is non-null with room for the name and its terminator, and
     // the name is a local `String` distinct from the caller's buffer.
@@ -459,7 +519,7 @@ pub unsafe extern "C" fn fanos_service_host(
 pub unsafe extern "C" fn fanos_service_accept(service: *mut FanosService) -> *mut FanosStream {
     // SAFETY: the caller guarantees `service` is null or a live handle.
     let Some(service) = (unsafe { service.as_mut() }) else {
-        return ptr::null_mut();
+        return fail_null("fanos_service_accept: the service handle is null");
     };
     match service.handle.block_on(service.incoming.recv()) {
         // The guard rides with the stream: holding it keeps the hosting handler parked, and freeing this handle
@@ -469,7 +529,7 @@ pub unsafe extern "C" fn fanos_service_accept(service: *mut FanosService) -> *mu
             stream,
             _session: Some(guard),
         })),
-        None => ptr::null_mut(),
+        None => fail_null("fanos_service_accept: the service is shutting down, so no further session will arrive"),
     }
 }
 
@@ -500,13 +560,13 @@ pub unsafe extern "C" fn fanos_stream_read(
 ) -> c_int {
     // SAFETY: guarded by the null check; the caller guarantees `buf` has `len` writable bytes.
     let Some(stream) = (unsafe { stream.as_mut() }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_stream_read: the stream handle is null");
     };
     // The read is capped at `i32::MAX` so the returned byte count always fits the C return type.
     // SAFETY: the caller guarantees `buf` has `len` writable bytes; a null buffer with a non-zero length is
     // rejected rather than borrowed.
     let Some(dst) = (unsafe { as_slice_mut(buf, len.min(i32::MAX as usize)) }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_stream_read: out is null, or out_cap overflows isize");
     };
     if dst.is_empty() {
         return 0;
@@ -539,10 +599,10 @@ pub unsafe extern "C" fn fanos_stream_write(
 ) -> c_int {
     // SAFETY: guarded by the null checks; the caller guarantees `buf` has `len` readable bytes.
     let Some(stream) = (unsafe { stream.as_mut() }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_stream_write: the stream handle is null");
     };
     let Some(src) = (unsafe { as_slice(buf, len) }) else {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "fanos_stream_write: data is null, or data_len overflows isize");
     };
     // Bounded for the same reason as the read: a peer that never drains leaves `write_all` waiting on flow
     // control, and a foreign caller cannot interrupt it.
@@ -624,12 +684,12 @@ fn out_buffer_is_valid(out: *const u8, out_cap: usize, out_len: *const usize) ->
 /// writable bytes, distinct from `value`.
 unsafe fn write_out(value: &[u8], out: *mut u8, out_cap: usize, out_len: *mut usize) -> c_int {
     if !out_buffer_is_valid(out, out_cap, out_len) {
-        return FANOS_ERR_NULL;
+        return fail(FANOS_ERR_NULL, "the caller's out buffer is unusable: out is null, out_len is null, or out_cap overflows isize");
     }
     // SAFETY: `out_len` is non-null (checked) and the caller guarantees it is writable.
     unsafe { *out_len = value.len() };
     if value.len() > out_cap {
-        return FANOS_ERR_BUFFER;
+        return fail(FANOS_ERR_BUFFER, "the value is larger than out_cap — *out_len holds the length needed, so retry with that");
     }
     // Only copy a non-empty value: a size probe passes `out` null, and a null `dst` is UB for
     // `copy_nonoverlapping` even at a zero count. An empty value has nothing to write and the reported
