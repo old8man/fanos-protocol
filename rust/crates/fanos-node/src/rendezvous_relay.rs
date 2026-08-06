@@ -35,6 +35,7 @@
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::threshold_router::ANONYMOUS;
 use fanos_field::Field;
+use fanos_primitives::BeaconSeed;
 use fanos_geometry::Triple;
 use fanos_primitives::BoundedMap;
 use fanos_primitives::hash::{hash_labeled, label};
@@ -92,6 +93,8 @@ pub struct RendezvousRelay<F: Field> {
     /// Per-node seed for the fresh onion/e2e seeds each host-forward draws; deterministic (derived from this
     /// relay's coordinate) so a sim reproduces exactly, distinct per node so two combiners never collide.
     forward_seed: [u8; 32],
+    /// The epoch's beacon seed, needed to recompute a registration's [`service_tag`]. Set with the directory.
+    beacon: BeaconSeed,
     /// Monotonic counter domain-separating each forward's seed pair, so no two forwards reuse key material.
     forward_counter: u64,
 }
@@ -142,6 +145,7 @@ impl<F: Field> RendezvousRelay<F> {
             hosts: BoundedMap::new(MAX_HOSTS),
             stations: Stations::new(),
             directory: MixDirectory::new(),
+            beacon: BeaconSeed::GENESIS,
             forward_seed,
             forward_counter: 0,
         }
@@ -176,7 +180,7 @@ impl<F: Field> RendezvousRelay<F> {
         // registration minted for another epoch carries another tag and would be filed under a key no client of
         // *this* epoch looks up, so refusing it costs nothing that was ever reachable.
         let epoch = self.router.onion_epoch();
-        if !reg.verify(epoch) {
+        if !reg.verify(epoch, &self.beacon) {
             // Counted, or a relay under a sustained registration-forgery attempt is indistinguishable from a
             // relay nobody is using (#109). Unattributed: a registration that fails to verify has no
             // authenticated origin, and inventing one would put fabricated evidence against a coordinate into
@@ -238,8 +242,13 @@ impl<F: Field> RendezvousRelay<F> {
     /// cannot look anything up itself (it is a sans-I/O `Engine`), so the composite that already rebuilds the cell
     /// directory each epoch hands it over. A relay with no directory simply cannot forward — registrations still
     /// bind, and the next epoch's install makes them usable.
-    pub fn set_directory(&mut self, directory: MixDirectory) {
+    pub fn set_directory(&mut self, directory: MixDirectory, beacon: BeaconSeed) {
         self.directory = directory;
+        // The epoch's beacon arrives WITH the directory rather than through a channel of its own, because the
+        // two are the same fact: a mix directory is the directory *of an epoch*, and `service_tag` is now
+        // beacon-bound, so a relay that held one without the other could file registrations it could not
+        // authenticate. One seam, one epoch.
+        self.beacon = beacon;
         self.retire_stale_hosts();
         self.retire_stale_registrations();
     }
@@ -457,6 +466,9 @@ pub fn register_targets<F: Field>(cookie: SessionId, reply_line: Triple) -> Vec<
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    /// A fixed beacon for the relay tests — `service_tag` is beacon-bound, and the relay is handed the
+    /// epoch's seed alongside its directory.
+    const TEST_BEACON: BeaconSeed = BeaconSeed::new([0x5c; 32]);
     use super::*;
     use fanos_aphantos::threshold::{HopLine, seal_onion};
     use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
@@ -486,7 +498,7 @@ mod tests {
 
         // One turn: still inside the grace window, so a session live across the boundary is not cut.
         relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
-        relay.set_directory(MixDirectory::new());
+        relay.set_directory(MixDirectory::new(), BeaconSeed::GENESIS);
         assert_eq!(
             relay.client_for(&cookie),
             Some([1, 2, 3]),
@@ -496,7 +508,7 @@ mod tests {
         // A second turn puts it out of reach of any honest client — the client's route rotated with the
         // beacon two epochs ago — so keeping the coordinate can serve nobody but a seizure.
         relay.step(Instant(2), Input::Command(Command::AdvanceEpoch));
-        relay.set_directory(MixDirectory::new());
+        relay.set_directory(MixDirectory::new(), BeaconSeed::GENESIS);
         assert_eq!(
             relay.client_for(&cookie),
             None,
@@ -810,12 +822,12 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let tag = service_tag(&bundle, epoch);
+        let tag = service_tag(&bundle, epoch, &TEST_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc_keys, svc_reply_pub) =
             fanos_aphantos::nostos::ReplyKeys::generate(b"svc-deaddrop");
-        relay.set_directory(dir.clone());
-        let reg = HostRegister::onion(&bundle, &signer, epoch, svc_reply_pub.encode(), vec![drop_line], 1)
+        relay.set_directory(dir.clone(), TEST_BEACON);
+        let reg = HostRegister::onion(&bundle, &signer, epoch, &TEST_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
             .expect("the dead-drop line's members are in the directory");
 
         // **A route seizure is refused before the genuine registration is even made.** The tag is a public
@@ -866,7 +878,7 @@ mod tests {
         // A request for an UNregistered tag falls through to a local anonymous delivery (unchanged behaviour).
         let other = Request {
             cookie: *b"client-cookie-02",
-            service_tag: service_tag(b"some-other-service", Epoch::new(0)),
+            service_tag: service_tag(b"some-other-service", Epoch::new(0), &TEST_BEACON),
             reply_circuit: vec![],
             payload: b"unrelated".to_vec(),
             reply_pub: vec![],
@@ -923,12 +935,12 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let stale_tag = service_tag(&bundle, epoch0);
+        let stale_tag = service_tag(&bundle, epoch0, &TEST_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc_keys, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"retire-deaddrop");
-        relay.set_directory(dir.clone());
+        relay.set_directory(dir.clone(), TEST_BEACON);
         let reg =
-            HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+            HostRegister::onion(&bundle, &signer, epoch0, &TEST_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
                 .expect("the dead-drop line's members are in the directory");
         let mut reg_body = HOST_REGISTER_TAG.to_vec();
         reg_body.extend_from_slice(&reg.encode());
@@ -941,7 +953,7 @@ mod tests {
         // The adversary records the tag while it is current — a public value, so this costs it nothing. Kept
         // as an assertion rather than a binding: what it can do with the record is measured in the grace
         // test, for the reason given below.
-        assert_eq!(stale_tag, service_tag(&bundle, epoch0), "the tag is public and recordable");
+        assert_eq!(stale_tag, service_tag(&bundle, epoch0, &TEST_BEACON), "the tag is public and recordable");
 
         // The cell's clock turns. The composite hands the relay the new epoch's directory, which is the one
         // moment a sans-I/O combiner can learn that its epoch moved at all.
@@ -950,11 +962,11 @@ mod tests {
         // see `a_client_one_epoch_behind_still_reaches_a_host_across_the_turn`, which is the test that found
         // the boundary rule this one originally asserted made every service unreachable once per epoch.
         relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
-        relay.set_directory(dir.clone());
+        relay.set_directory(dir.clone(), TEST_BEACON);
         relay.step(Instant(2), Input::Command(Command::AdvanceEpoch));
         let epoch1 = relay.router().onion_epoch();
         assert!(epoch1 > epoch0, "the router's onion epoch advanced");
-        relay.set_directory(dir.clone());
+        relay.set_directory(dir.clone(), TEST_BEACON);
         assert_eq!(
             relay.hosts(),
             0,
@@ -1017,11 +1029,11 @@ mod tests {
         let (signer, verifier) = fanos_pqcrypto::HybridSigSecret::generate(&mut srng);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut srng);
         let bundle = fanos_diaulos::bundle_from_identity(&verifier, &kem_pub);
-        let lagging_tag = service_tag(&bundle, epoch0);
+        let lagging_tag = service_tag(&bundle, epoch0, &TEST_BEACON);
         let drop_line = Line::<F2>::at(3).coords();
         let (_svc, svc_reply_pub) = fanos_aphantos::nostos::ReplyKeys::generate(b"grace-deaddrop");
-        relay.set_directory(dir.clone());
-        let reg = HostRegister::onion(&bundle, &signer, epoch0, svc_reply_pub.encode(), vec![drop_line], 1)
+        relay.set_directory(dir.clone(), TEST_BEACON);
+        let reg = HostRegister::onion(&bundle, &signer, epoch0, &TEST_BEACON, svc_reply_pub.encode(), vec![drop_line], 1)
             .expect("the dead-drop line's members are in the directory");
         let mut body = HOST_REGISTER_TAG.to_vec();
         body.extend_from_slice(&reg.encode());
@@ -1031,7 +1043,7 @@ mod tests {
         // The cell's clock turns. The host will re-register at the new epoch, but a client that has not yet
         // adopted the new beacon is still computing `lagging_tag`.
         relay.step(Instant(1), Input::Command(Command::AdvanceEpoch));
-        relay.set_directory(dir.clone());
+        relay.set_directory(dir.clone(), TEST_BEACON);
         assert_eq!(
             relay.hosts(),
             1,
@@ -1065,7 +1077,7 @@ mod tests {
         // previous test closes stays closed. A recorded tag buys an adversary one epoch, which is the same
         // window every other component already grants.
         relay.step(Instant(3), Input::Command(Command::AdvanceEpoch));
-        relay.set_directory(dir.clone());
+        relay.set_directory(dir.clone(), TEST_BEACON);
         assert_eq!(
             relay.hosts(),
             0,
