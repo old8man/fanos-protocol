@@ -4145,3 +4145,25 @@ Two of these were found only because a *neighbouring* fix would have exposed the
 would have collapsed the rendezvous line, and wiring the rebalance would have forked the response. So the
 question has a companion: **before replacing a known-wrong value, ask what its wrongness is currently holding
 up.**
+
+---
+
+## A note on the uncalled-`pub fn` sweep in this codebase (2026-08-06)
+
+Re-ran it: **151 of 1712** `pub fn`s are mentioned nowhere outside their own definition. **That list is not a
+findings list here**, and the reason is architectural rather than accidental. FANOS is sans-I/O
+message-passing, so much of the calling happens by matching an `Input`/`Command` variant inside `step`, never
+by name. `spawn_ingress_rotation` is wired at `node.rs:1072` and drives the POROS rotation through
+`Command::Control`; `arm_rotation`, `emit_reshares`, `rotating_into` and `open_and_combine_reshares`
+consequently all read as uncalled. A nine-function cluster across two modules looked like a falsely-closed
+task and was the dispatch seam.
+
+Use the sweep to choose what to *read*, never as evidence on its own. Everything it contributed this pass
+(`balance_exact` → §6.7, `collect_fee`/`distribute` → L7) was confirmed by opening the file.
+
+Getting the scan itself right took three attempts, each wrong in a way the previous check could not see:
+cutting at the first `#[cfg(test)]` truncated the corpus and deleted *call sites*; matching `name\s*\(`
+missed every **generic** function, whose definition reads `fn f<F: Field>(`; and the third attempt was
+correct but rejected against a bad reference — a `grep -v` for doc comments that never fired, because grep
+prints `path:NN:␠␠␠␠/// text`. Sixteen "callers" of `peel_onion` were comments. **A scan's reference has to be
+established by reading the mentions, not by a second grep that shares the first's blind spot.**
