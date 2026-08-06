@@ -1763,13 +1763,13 @@ mod tests {
         // derived from the beacon this test provisions — not the constant. Naming the constant here was the
         // shape that hid the real defect: reader and writer agreed with each other and with nothing else.
         let genesis = client.genesis();
-        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await;
+        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
         for _ in 0..30 {
             if !dir.is_empty() {
                 break;
             }
             let _ = tokio::time::timeout(Duration::from_millis(100), node.next_notification()).await;
-            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await;
+            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
         }
         assert!(
             !dir.is_empty(),

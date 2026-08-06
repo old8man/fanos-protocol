@@ -1335,7 +1335,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     // Wait for the mix keys to be readable, not for a duration: the host driver below builds its directory from this
     // store, and an empty read makes it register a route through nothing.
     common::converge("every cell mix key is published", || async {
-        let dir = build_cell_mix_directory::<F2>(&nodes[0].as_ref().unwrap().client(), fanos_rendezvous::Epoch::ZERO, None).await;
+        let dir = build_cell_mix_directory::<F2>(&nodes[0].as_ref().unwrap().client(), fanos_rendezvous::Epoch::ZERO, None).await.0;
         (dir.len() == 7, format!("mix keys readable: {}", dir.len()))
     })
     .await;

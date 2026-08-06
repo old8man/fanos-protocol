@@ -451,8 +451,28 @@ async fn rotate_host(
     let beacon = BeaconSeed::new(seed);
     // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
     // must prove its slot exactly where coordinates are VRF-derived (S1-M3, `mixdir::parse_bound_record`).
-    let dir = build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
-    if dir.is_empty() {
+    // An INCOMPLETE read is treated exactly like an empty one, and that is the whole point of carrying the
+    // flag. Every construction below draws from `dir`: `select_drop_line` skips a line whose members are
+    // absent, `random_hops` picks only from what resolved, and `HostRegister::onion` refuses a hop it cannot
+    // seal to. Under a partial read those all still *succeed*, over whichever lines answered.
+    //
+    // Incomplete here means a read TIMED OUT, not that a peer published nothing — an unpublished key is a
+    // definite absence and routing around it is correct, since that node cannot be a hop. A timeout is not a
+    // fact about the cell, so an adversary that can slow a chosen subset of store reads would otherwise steer
+    // this service's circuit placement without touching a node. Registering over a subset an attacker shaped
+    // is worse than not registering: the epoch is lost either way, and only one of the two hands the
+    // placement over.
+    let (dir, complete) =
+        build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
+    if dir.is_empty() || !complete {
+        if !complete {
+            tracing::warn!(
+                resolved = dir.len(),
+                "hidden service not registering this epoch: the cell's mix directory did not resolve in \
+                 full, so any circuit drawn from it would be drawn from whichever lines answered rather \
+                 than from the cell"
+            );
+        }
         return;
     }
     let Some(point) = Point::<F2>::new(coord) else { return };

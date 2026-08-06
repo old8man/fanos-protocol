@@ -4272,3 +4272,98 @@ open engineering question that a reader could reasonably expect to resolve favou
 a number attached. That is the whole value of running the benchmark a design asks for rather than carrying it
 as a residual, and it is the same shape as OBOLOS's shielded spend (#65, depth-1 proof already over 8 MiB) —
 **one shared blocker, recursive compaction or a different proof system, not two independent ones.**
+
+# 2026-08-06/07 — the cell-wide inputs, and three defects only the wire could show
+
+**Trigger.** Two tasks that had sat as "the pure half is built, the wiring remains" for weeks (#131/#129), and
+one that had been reverted once (#132). Wiring them turned out to be where the defects were — not in the
+libraries, which were correct, but in the two or three lines that connect a library to a running node. That is
+the same *libraries-ahead / wiring-behind* pattern the July audits named, and the yield says it is still where
+to look.
+
+## §1. `service_tag` folded the epoch NUMBER alone (FIXED `73530cb`)
+
+A hidden service's identity is **public** — a client must hold it to dial — and the epoch is a counter. So the
+tag was a pure function of two values an adversary already had, and every future epoch's tag was computable
+today. A meeting-line member matches inbound requests against that tag, so precomputing it is precomputing
+which requests to drop: **a censor could pick and pre-position against its targets an unbounded number of
+epochs ahead of the traffic.** `meeting_line`, the other half of the same rotation, had folded the beacon in
+since E5 for exactly this reason; the two halves now agree.
+
+**The reverted attempt (`ee80fb4`) failed for a reason worth keeping**: the relay has no clock and no directory
+of its own, so the routing beacon had nowhere to enter. It enters by two routes taken together — a constructor
+argument on `RendezvousRelay::new` and a push from `CellNode::step_obn` in the same step that advances the
+router's onion epoch. Choosing the composite's step function is not incidental: it is the one place the beacon
+and the router already meet, so the relay's tag arithmetic and its epoch cannot drift apart.
+
+**And the beacon must not have a default.** The first draft used `BeaconSeed::GENESIS` as a harmless-looking
+initial value, and it was wrong twice: it decides *which network* the relay is on by naming a constant, and it
+fails **open** — a relay never given a beacon accepts registrations minted under the constant rather than
+refusing everything. Caught by `nothing_in_a_running_node_picks_its_network_by_naming_the_constant`, a one-line
+source scan, while the same defect's other symptom was three failing real-QUIC anonymity tests that look
+exactly like the contention flakes they usually are. **The cheap deterministic guard named the cause; the
+expensive test only noticed.**
+
+## §2. Reputation was recomputed from nothing, and its record was indexed by seat (FIXED `8f76e63`)
+
+`Reputation::observe_reachable` had **no production caller at all**, so every node's score was a fresh
+`Reputation::new()` for its whole life and the assignment's reputation weighting was the identity function.
+The fix is not to call the folder — a carried fold over a *local* measurement is what makes two honest nodes
+disagree permanently — but to publish the measurement and recompute from a closed window.
+
+Wiring it exposed a defect in the built-and-tested pure half: `Reputation::from_published` took a single
+`members` list, indexed by cell position, and applied it across the whole `REP_WINDOW`. **A cell re-draws every
+coordinate each epoch and the window spans seven of them, so six sevenths of the evidence would have landed on
+whoever sits at that point now.** Resolving each past epoch's roster instead is not available — the capability
+directory is retained for one epoch. The record therefore carries its own seating, which is also what lets the
+reputation window outlive every other directory's retention.
+
+Three more, all found by one end-to-end assertion that a record simply *exists*:
+
+1. **A `select!` arm starved by its own awaits.** Reading the engine's cell masks off the role loop's event arm
+   delivered **two** notifications across a whole run while a plain consumer saw nineteen: a re-derivation
+   awaits up to a `STORE_TIMEOUT` and `recv()` is not polled while it runs. A *current reading* is state, not
+   an event — it belongs on a `watch` with a forwarder task. Same conclusion #86 reached for the epoch.
+2. **A reading and its roster must share an epoch.** The publisher's own bit was clear in a record it had
+   written, because the reading came from the seat it held one epoch earlier.
+3. **Publish cadence must beat record retention.** At a short epoch the loop published one epoch in eleven
+   against a seven-epoch retention, so every record expired before the next and the window could never hold
+   more than one entry. Whenever a producer's cadence and a retention are derived separately, check the
+   inequality between them.
+
+## §3. A refuted HIGH, kept in the record because the refutation is the lesson (`c680f1c`)
+
+The guard added in §2 — *publish only if this node is in the seating the scan returned* — **never fired**, and
+that silence was filed as evidence for a much larger claim: that the role loop reads an empty roster on every
+epoch turn and publishes an empty assignment, flapping every actuated role.
+
+**Both halves were wrong.** The guard was silent because it compared this node's *current* coordinate against a
+record written at the coordinate it held when it published — reading a seat *number* where the *name* was
+meant, one function away from the fix §2 had just made. And a direct probe refuted the big claim in one run:
+across two epoch turns the roster stayed at **1**, not 0, and a single role was released (relay, on a solitary
+node carrying no relay load), which is the homeostat working.
+
+A guard's silence has two explanations — *the condition is always false* and *the guard asks the wrong
+question* — and for a guard written five minutes ago the second is likelier. **Untested new code is not an
+instrument.** The residual is re-scoped to the experiment that could still answer it: a three-node cell where
+a peer's advertisement costs a round trip rather than a local write.
+
+## §4. The mix directory dropped its completeness flag (FIXED)
+
+`build_cell_mix_directory` was the one directory returning no `complete` flag, so a caller could not tell
+"this cell has three mix relays" from "four reads timed out". Every anonymous-path construction gates on
+membership — `select_drop_line` skips a line whose members are absent, `random_hops` draws only from what
+resolved, `HostRegister::onion` refuses a hop it cannot seal to — and all three still *succeed* over a partial
+view, routing around whatever did not answer.
+
+**Narrower than it first looks, and the precision matters.** A missing record is a *definite* absence, so an
+unpublished mix key leaves the scan complete and routing around that node is correct — it cannot be a hop.
+`complete` goes false only on a **timeout**, which is not a fact about the cell but about the reader's luck. So
+what this closes is timeout-shaped steering: an adversary slowing a chosen subset of store reads, far cheaper
+than compromising a node, would otherwise shape a hidden service's circuit placement while the `2t − 1` cost
+argument assumes the draw is from the whole cell. `rotate_host` now declines the epoch; the combiner-side
+feeder deliberately does not, because there a partial directory produces *no* route rather than a wrong one.
+
+**Residual, filed rather than papered over:** the refusal branch has no test, because the testkit cannot stall
+a store read. That fixture now blocks at least four "partial view" branches — exactly the code that runs when
+the network is degraded, and the code no happy-path end-to-end ever enters.

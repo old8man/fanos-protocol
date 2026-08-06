@@ -1010,7 +1010,7 @@ async fn build_proxy_dialer(
             .map_or((epoch, cfg.beacon), |(e, s)| (e, BeaconSeed::new(s)));
         // `Some(beacon)` — the live beacon resolved just above. A forged mix key at another relay's slot is
         // refused rather than sealed to (S1-M3).
-        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
+        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await.0;
         let need = usize::from(cfg.threshold) + 1;
         if directory.len() < need {
             return Err(NodeError::Config(format!(
@@ -1174,7 +1174,7 @@ async fn submit_tx_frame(
         return Ok(node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: frame.to_vec() }));
     }
     let client = node.client();
-    let directory = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await;
+    let directory = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await.0;
     let params = AnonRouteParams {
         directory,
         threshold: mix_threshold_arg(args)?,

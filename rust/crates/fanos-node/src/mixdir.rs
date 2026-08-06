@@ -156,20 +156,41 @@ pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
 /// This is the “live directory from membership” the anonymous profile needs (audit #54): no central
 /// directory, no hand-built map — the cell advertises itself through the overlay store, one relay per
 /// epoch-tagged slot, and a client reads the current epoch's advertisement.
+/// The second value is **whether every read concluded**, and a caller must act on it.
+///
+/// It used to be discarded, so a caller could not tell "this cell has three mix relays" from "four reads timed
+/// out". Those are different facts and they call for opposite responses, and the difference matters more here
+/// than in any other directory, because every anonymous-path construction gates on membership:
+/// `select_drop_line` skips a line whose members are absent from the directory, `random_hops` draws only from
+/// what resolved, and `HostRegister::onion` refuses a hop it cannot seal to. All three still *succeed* over a
+/// partial view — they simply route around whatever did not resolve.
+///
+/// **What the flag catches, exactly.** A missing record is a *definite* `Absent`, so a node that has not
+/// published a mix key leaves the scan complete — and routing around it is right, since it cannot be a hop.
+/// `complete` goes false only when a read **timed out**, which is the case that is not a fact about the cell
+/// at all but about the reader's luck. An adversary that can slow store reads for a chosen subset of slots —
+/// far cheaper than compromising a node — thereby steers circuit placement toward the lines it left alone,
+/// while the `2t − 1` cost argument in `docs/design-anonymity-substrate.md` assumes the draw is from the
+/// *cell*. That is the hole this closes.
+///
+/// Every sibling directory already returns it (`build_capability_directory`, `build_cell_setpoint`,
+/// `read_diagnosis_window`) and the role loop already declines to act on a partial view. This one was the
+/// exception.
 pub async fn build_cell_mix_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> MixDirectory {
+) -> (MixDirectory, bool) {
     let scan = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
         read_mix_key_in_mode::<F>(&client, coord, epoch, beacon).await
     })
     .await;
+    let complete = scan.complete();
     let mut dir = MixDirectory::new();
     for (coord, public) in scan.found {
         dir.insert(coord, public);
     }
-    dir
+    (dir, complete)
 }
 
 /// One slot read, in whichever mode the cell runs.
@@ -270,7 +291,11 @@ pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: boo
     tokio::spawn(async move {
         let mut beacons = client.beacons();
         let install = async |client: &Client, epoch: Epoch, beacon: BeaconSeed| {
-            let dir = build_cell_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
+            // `.0`: a partial view is *safe* on this side, for the reason the doc above gives — a combiner
+            // that cannot seal simply does not forward, so an incomplete directory produces no route rather
+            // than a wrong one. The host side is the opposite (`rotate_host`) and must refuse.
+            let (dir, _complete) =
+                build_cell_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
             if !dir.is_empty() {
                 client.command(Command::Control {
                     tag: fanos_rendezvous::CONTROL_MIX_DIRECTORY,
