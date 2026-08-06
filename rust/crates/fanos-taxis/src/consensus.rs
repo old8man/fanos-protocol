@@ -3011,14 +3011,34 @@ impl<S: StateMachine> ConsensusEngine<S> {
             // block's recorded `last_commit` (already validated as a commit Q-certificate for the parent in
             // on_propose). Canonical: every validator reads the identical finalizer set from the committed
             // block, so crediting it is a deterministic state transition that lands in the state root.
+            //
+            // **Reveal-gated** (#138): a finalizer that never released its sealing opening is not paid. The
+            // incentive model prices `Strategy::WithholdReveal` at `0` and says so in one line —
+            // "reveal-gated payment → forfeits the share" — while this credited every signature in the
+            // certificate. So the one deviation the theorem rules out by *payment* was, in the shipped code,
+            // worth exactly as much as honest play, and `distribute` (which does gate on it) had no caller.
+            //
+            // Expressible only since #137. The openings are committed, so "who revealed" is read off the
+            // chain like the finalizer set beside it; from a gossip pool it would have been a per-node split
+            // and so could never have entered the state root.
+            //
+            // The committee is the whole cell (#136), so every validator owes an opening for every
+            // transaction and the predicate is universal — no membership to check. A block with no
+            // transactions has nothing to withhold, so every finalizer qualifies; gating on an empty set
+            // would pay nobody for an empty block, which prices honesty at zero rather than withholding.
             if self.reward_per_block > 0
                 && let Some(cert) = &block.last_commit
             {
-                let beneficiaries: Vec<HybridVerifier> = cert
-                    .votes
-                    .iter()
-                    .filter_map(|sv| self.verifiers.get(usize::from(sv.vote.voter)).cloned())
-                    .collect();
+                let revealers: BTreeSet<u8> =
+                    committed.values().flat_map(|m| m.keys().copied()).collect();
+                let voters: Vec<u8> = cert.votes.iter().map(|sv| sv.vote.voter).collect();
+                let paid = crate::incentive::reveal_gated_beneficiaries(
+                    &voters,
+                    &revealers,
+                    !block.sealed_txs.is_empty(),
+                );
+                let beneficiaries: Vec<HybridVerifier> =
+                    paid.iter().filter_map(|&v| self.verifiers.get(usize::from(v)).cloned()).collect();
                 self.chain.apply_block_reward(&beneficiaries, self.reward_per_block);
             }
             // One call, not a loop: `apply_block` lets a state machine schedule the block's independent transactions in

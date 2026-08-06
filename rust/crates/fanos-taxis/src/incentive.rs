@@ -11,6 +11,7 @@
 //! Fees are the existing anonymous VOPRF credit ([`fanos_incentives`]), context-bound to the block so a fee
 //! cannot be replayed or front-run; this module is the *accounting and game theory* on top of that token.
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use fanos_incentives::{CreditIssuer, RedeemProof, Redemption};
@@ -47,6 +48,29 @@ pub fn collect_fee(
     height: u64,
 ) -> bool {
     matches!(issuer.redeem(proof, &fee_context(epoch, height)), Redemption::Accepted)
+}
+
+/// Which of a block's finalizers are **paid** for it: those that also released their sealing openings.
+///
+/// The rule the equilibrium model already assumed and the engine did not apply (#138). `payoff` prices
+/// `Strategy::WithholdReveal` at `0` with the one-line justification "reveal-gated payment → forfeits the
+/// share", while the engine credited every signature in the commit certificate — so the deviation the theorem
+/// rules out *by payment* was worth exactly as much as honest play, and `distribute`, which does gate on it,
+/// had no caller.
+///
+/// `revealers` must be **chain-derived**, not gossip-derived. Before the openings were committed (#137) this
+/// rule was unimplementable: a per-node view of who revealed would credit different validators on different
+/// nodes and so could never be part of the state root, which is exactly why the engine paid the certificate
+/// instead. It is a projection of committed blocks now.
+///
+/// A block with **no transactions** has nothing to withhold, so every finalizer is paid. Gating on an empty
+/// revealer set would pay nobody for an empty block — pricing honest work at zero rather than withholding,
+/// which inverts the incentive this exists to create.
+///
+/// Order is preserved from `voters`, so the result is as canonical as its input.
+#[must_use]
+pub fn reveal_gated_beneficiaries(voters: &[u8], revealers: &BTreeSet<u8>, block_has_txs: bool) -> Vec<u8> {
+    voters.iter().copied().filter(|v| !block_has_txs || revealers.contains(v)).collect()
 }
 
 /// The reward/penalty parameters of the per-block stage game.
@@ -440,6 +464,40 @@ mod tests {
         // honest validator by fabricating a second vote.
         let framed = SignedVote::sign(Vote { block_hash: [8u8; 32], ..base }, &other_sk);
         assert!(detect_equivocation(&a, &framed, &vk).is_none(), "a forged second vote cannot slash validator 4");
+    }
+
+    #[test]
+    fn a_finalizer_that_withheld_its_opening_is_not_paid() {
+        // The rule the equilibrium model assumed and the engine did not apply (#138). Exhaustive over the
+        // subsets that matter rather than one example, because the failure mode is a filter that is present
+        // and inert — which one example can look identical to.
+        let voters: Vec<u8> = (0..7).collect();
+
+        // Everyone revealed: everyone is paid.
+        let all: BTreeSet<u8> = voters.iter().copied().collect();
+        assert_eq!(reveal_gated_beneficiaries(&voters, &all, true), voters, "no withholder, no forfeit");
+
+        // Each single withholder in turn forfeits, and only it.
+        for w in 0..7u8 {
+            let revealed: BTreeSet<u8> = voters.iter().copied().filter(|&v| v != w).collect();
+            let paid = reveal_gated_beneficiaries(&voters, &revealed, true);
+            assert!(!paid.contains(&w), "the withholder {w} must forfeit its share");
+            assert_eq!(paid.len(), voters.len() - 1, "and only it — {w} cost someone else their pay");
+        }
+
+        // A block with nothing to reveal pays everyone: gating on an empty set would price honest work at
+        // zero for an empty block, inverting the incentive rather than creating it.
+        assert_eq!(
+            reveal_gated_beneficiaries(&voters, &BTreeSet::new(), false),
+            voters,
+            "an empty block has nothing to withhold"
+        );
+        // And the same input WITH transactions pays nobody — so the `block_has_txs` arm is doing work, and
+        // the assertion above is not passing because the filter is inert.
+        assert!(
+            reveal_gated_beneficiaries(&voters, &BTreeSet::new(), true).is_empty(),
+            "with transactions and no openings, nobody is paid"
+        );
     }
 
     #[test]
