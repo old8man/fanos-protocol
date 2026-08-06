@@ -753,6 +753,68 @@ A follow-up spec-vs-implementation audit (driving toward #97) re-swept the spec 
 
 None of these is a regression — each is a tracked frontier item, several already in progress. This addendum records where the "drive to 100%" effort stands; it does not supersede the Tier-0/1 resolutions above.
 
+## Self-organization sweep — 2026-08-06: three findings, one family
+
+All three are the same question asked of different subsystems: **what is this cell-wide decision computed
+from, and is that input exactly the same on every node?**
+
+> **A decision that must agree cell-wide has to be computed from CLOSED PUBLISHED EPOCHS, never from this
+> node's live read of the current one.** A closed epoch's records have settled, so every node reads the same
+> bytes; a live read is whatever arrived before the timeout.
+
+**R-H1 — the reputation loop has no production caller, and three docs said otherwise.** `LiveRoleController::
+observe` delegates to `Reputation::observe_reachable` and nothing calls it (denominator: 29 `.observe(` sites
+in fanos-node + fanos-core; only the definition, the delegation and unit tests). So `scores` is always empty,
+`adjust` is the identity, and a node can shirk every assigned role for ever at no cost. `docs/design-self-
+organization.md` §5 was honest throughout — "specified, not yet closed in code" — while `roles.rs`,
+`loaddir.rs` and `market.rs` each asserted it live. Corrected in `a39fdc8`; `loaddir`'s line in particular read
+as a *second* defence beside the coordinate binding, and there is only one.
+
+**R-H2 — and the precondition for wiring it is false.** `Reputation`'s doc claimed §6.4 corroboration made the
+input cell-agreed. `OverlayNode::coord_alive` opens with *"Trust our own eyes first"*: alive with **no**
+corroboration when it has heard from the peer, quorum only as fallback. Two healthy nodes with different
+contact histories produce different masks. **And reputation integrates**, so a single epoch's divergence is
+written in and never washes out — `adjust` forks, and the cell's whole role allocation with it. Wiring the local
+mask would have been *worse* than the inert loop: a deterministically-divergent role loop is harder to see and
+harder to recover from than one that does nothing. `ddb135d`.
+
+**R-H3 — role coverage is decided by a CARRIED per-node demand.** `RoleController::step` folds each setpoint
+into `self.demand` and assigns from it, so the assignment is a function of the node's history; `assign_report`
+fills `min(demand, eligible)` by priority, so nodes near the cutoff disagree about whether they are in and a
+role is persistently under- or over-provisioned with nobody able to see it. Measured at `κ = 1/7` from starts
+`0`, `7`, `40`:
+
+| setpoint | epochs the three disagree |
+|---|---|
+| constant | 15, then never |
+| square wave, period 8 | 12 of 600 (2 %) |
+| square wave, period 3 | **600 of 600, ending at different values** |
+
+Settling is ~15 epochs, so any setpoint moving faster never lets the paths meet. `e571848`.
+
+**R-H4 — and the setpoint is the input to both.** `resolve_setpoint` contributes **zero** for a member whose
+report did not resolve in time, exactly as a genuine absence does, so a partial scan understates the total —
+which is why it returns a completeness flag. The role loop uses that flag for its stability ladder and steps the
+controller **either way**, so an understated setpoint is folded in and never comes back out. `b33028a`.
+
+**The pure halves are built and verified**: `Reputation::from_published` (`4e9c0db`) and
+`RoleController::demand_from_setpoints` (`e571848`), with the aggregation derived — a **quorum**, because a
+record is a claim about *others*, and "healthy" as the **absence** of a quorum saying otherwise rather than the
+presence of one affirming it, because a quiet epoch has nothing to report.
+
+**One derivation was thrown away before shipping, and it is the useful part.** `D' = D + κ(setpoint − D)` looks
+like it forgets its initial condition at `(1 − κ)` per epoch, so replaying the last `W` setpoints from any start
+should *equal* the carried value once `(1 − κ)^W·D_max` falls under the integer rounding — `W ≈ 13` at
+`κ = 1/7`. The step **forces ±1** when the linear term rounds to zero, giving the map a minimum speed, and
+against a setpoint that moves faster than it settles the state **phase-locks to its start**: the same 13-epoch
+window from starts `0/7/40/200` gives **5, 7, 7, 28**. So agreement comes from *fixing* the start — everyone
+replays from `floor` — not from forgetting it. A convincing derivation that is not checked numerically against
+the code's own integer arithmetic is the same defect as a chosen constant.
+
+Residual (`#131`): one driver change in `assign_epoch` reading closed epochs and refusing to fold an incomplete
+scan, plus the e2e that decides it — a node joining late into a cell under swinging load, asserting identical
+role coverage across the cell. No unit test can see that property.
+
 ## Anonymity sweep — 2026-08-05: one derivation, four defects
 
 The whole section came from refusing a single sentence. `TARGET_DEPTH = 3` was documented as *"the depth that
