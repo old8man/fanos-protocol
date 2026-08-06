@@ -445,8 +445,25 @@ pub enum Notification {
     /// `Wire` shape that peers exchange and this is a **local** reading — the same boundary the station
     /// counters keep.
     Liveness {
+        /// The epoch the reading was taken in.
+        ///
+        /// Load-bearing, not provenance. The masks are indexed by cell POSITION and a cell re-draws every
+        /// coordinate each epoch, so a reading is only interpretable beside the seating of its own epoch —
+        /// publishing an older one against a fresher roster attributes each measurement to whoever sits there
+        /// now. Found by exactly that: the publisher's own bit was clear in a record it had written, because
+        /// the reading came from the seat it held one epoch earlier.
+        epoch: Epoch,
         /// Bit `i` ⇔ point `i` is degraded (has not been heard from within the liveness timeout).
         degraded: u8,
+        /// Bit `i` ⇔ point `i` was heard from **at all**, with no corroboration quorum required — the weaker
+        /// half of a deliberate pair (one witness proves an endpoint exists, a quorum proves it is
+        /// dependable), and the discriminator between a lossy cut and a crash.
+        ///
+        /// Beside `degraded` rather than derivable from it: a point can be degraded *and* responsive (a cut),
+        /// or degraded and silent (a crash), and those call for opposite responses. It is also the second
+        /// half of what a node publishes as its per-epoch diagnosis (`fanos_node::diagdir`), so a reader that
+        /// only had `degraded` could not tell the cell whether an accused member was there to be accused.
+        responsive: u8,
         /// How many members are live, including this node.
         alive: u16,
     },

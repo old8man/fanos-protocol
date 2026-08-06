@@ -51,7 +51,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
-use fanos_core::roles::{Capability, Demand, Reputation, Role, RoleController, RoleReading, RoleSet};
+use fanos_core::roles::{
+    Capability, Demand, REP_WINDOW, Reputation, Role, RoleController, RoleReading, RoleSet,
+};
 use fanos_field::Field;
 use fanos_geometry::Plane;
 use fanos_primitives::{BeaconSeed, Epoch, NodeId};
@@ -61,7 +63,8 @@ use fanos_vrf::VrfSecret;
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::capdir::{build_capability_directory, spawn_capability_publisher};
+use crate::capdir::{Seating, build_capability_directory, spawn_capability_publisher};
+use crate::diagdir::{publish_diagnosis, read_diagnosis_window};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
 /// The load one node is taken to absorb per role — the setpoint denominator, applied **once**, cell-wide, in
@@ -494,6 +497,15 @@ impl LiveRoleController {
         Assignment { roles, roster: members.len(), epoch }
     }
 
+    /// Adopt a reputation **recomputed from published records** ([`Reputation::from_published`]).
+    ///
+    /// Replaces rather than folds, and that is the whole point: the score is a function of the closed record
+    /// set, so two nodes that read the same records hold the same score whatever their local views were. A
+    /// caller must only install a score computed over a window every node can read — see `assign_epoch`.
+    pub fn adopt_reputation(&mut self, reputation: Reputation) {
+        self.reputation = reputation;
+    }
+
     /// Per role, how many nodes the cell's demand fell short of its eligible supply at the last
     /// [`step`](Self::step) — `AssignReport::deficit`, which used to be computed and dropped.
     ///
@@ -545,7 +557,7 @@ impl ClosedEpoch {
 /// directory. Carried as one value so the two can never be passed separately and drift — the whole change
 /// behind [`ClosedEpoch`] is that these are different epochs on purpose.
 #[derive(Clone, Copy)]
-struct AssignAt {
+struct AssignAt<'a> {
     /// The epoch being assigned for. The membership directory and the role lottery both read it live: who is
     /// present must be current, and a stale roster is a wrong answer for exactly one epoch.
     epoch: Epoch,
@@ -554,6 +566,17 @@ struct AssignAt {
     /// Where the setpoint comes from. Not the live epoch, because a cell-wide count every node must agree on
     /// cannot be computed from a directory members are still writing to.
     closed: ClosedEpoch,
+    /// This node's coordinate proof, present exactly where the cell's coordinates are VRF-derived, so a roster
+    /// record must prove the slot it sits at (`crate::bound`). `Some` IS the mode.
+    prover: Option<&'a CoordinateProver>,
+    /// What this node's heartbeat last sensed about its cell — `(epoch, degraded, responsive)` from
+    /// `Notification::Liveness`, which is what it publishes as that epoch's diagnosis. The epoch travels with
+    /// it because a reading is only interpretable against the seating of the epoch it was taken in.
+    sensed: Option<(Epoch, u8, u8)>,
+    /// The closed epochs whose seeds this node still holds, newest last — the reputation window. Beside
+    /// `closed` rather than derived from it because the two are different lengths on purpose: the setpoint
+    /// reads one closed epoch (the load directory's whole retention), the reputation reads `REP_WINDOW`.
+    window: &'a [(Epoch, BeaconSeed)],
 }
 
 /// Spawn the live role loop for a node on plane `F`. Returns the task handle and a `watch` receiver that
@@ -570,8 +593,8 @@ pub fn spawn_role_loop<F: Field>(
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
     peers: impl Fn() -> usize + Send + 'static,
-    // See `assign_epoch`: whether a roster record must prove the coordinate it sits at.
-    vrf: bool,
+    // See `assign_epoch`: `Some` exactly where a roster record must prove the coordinate it sits at.
+    prover: Option<CoordinateProver>,
 ) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
     let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
     let handle = tokio::spawn(async move {
@@ -581,7 +604,24 @@ pub fn spawn_role_loop<F: Field>(
         let mut cur = Epoch::ZERO;
         let mut seed = client.genesis();
         let mut closed = ClosedEpoch { epoch: Epoch::ZERO, seed };
-        genesis_assign::<F>(&client, &mut live, capacity, ready, vrf, &roles_tx).await;
+        // What this node currently senses about its cell, on a `watch` rather than read off this loop's own
+        // event arm.
+        //
+        // **It has to be latest-state, and the reason is measured.** This loop's `select!` re-derives the
+        // assignment whenever the beacon is ahead, and a re-derivation costs up to one `STORE_TIMEOUT` of
+        // directory reads; while it runs, the event arm is not polled. On a cell whose epoch period is shorter
+        // than an assignment the epoch arm is therefore ready every time round and the event arm starves — in
+        // the harness that found this, the whole run delivered TWO notifications to it, so a `sensed` folded
+        // from the stream stayed `None` for ever and nothing was ever published. The same shape as #86: a
+        // current *value* must not travel on a lossy event channel, because the consumer only needs the
+        // newest and the channel's job is to deliver every one.
+        let sensed_rx = spawn_liveness_watch(&client);
+        // The closed epochs whose seeds this node still holds, newest last, capped at the reputation window —
+        // a record is bound against the seed of the epoch it was PUBLISHED in, and the beacon watch keeps no
+        // history, so this ring is the only place those seeds survive. Bounded by `REP_WINDOW` because the law
+        // folds no more than that and a longer ring would retain seeds nothing can use.
+        let mut window: std::collections::VecDeque<(Epoch, BeaconSeed)> = std::collections::VecDeque::new();
+        genesis_assign::<F>(&client, &mut live, capacity, ready, prover.as_ref(), &roles_tx).await;
         // The refresh is a fixed-point iteration over the roster, so it is polled at a rate proportional to how fast it
         // is still moving: back off geometrically while the assignment is unchanged, snap back to the floor the moment
         // it moves. Converged cells therefore stop paying for it (a fixed 5 s scan forever is two cell-wide directory
@@ -608,10 +648,20 @@ pub fn spawn_role_loop<F: Field>(
                     // behind, which `readable_for` then refuses; that is the intended outcome, since the
                     // skipped directory has expired.
                     closed = ClosedEpoch { epoch: cur, seed };
+                    // The epoch just left joins the reputation window, in order, oldest evicted. Pushed here
+                    // and nowhere else, for the same reason `closed` is: this is the last moment the seed
+                    // exists anywhere in the process.
+                    window.push_back((cur, seed));
+                    while window.len() > REP_WINDOW as usize {
+                        window.pop_front();
+                    }
                     cur = epoch;
                     seed = s;
+                    let ring: Vec<(Epoch, BeaconSeed)> = window.iter().copied().collect();
+                    // Read out of the borrow before the await: a `watch` guard is not `Send`.
+                    let sensed = *sensed_rx.borrow();
                     (settled, _) =
-                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed }, capacity, vrf, &roles_tx)
+                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed, prover: prover.as_ref(), sensed, window: &ring }, capacity, &roles_tx)
                             .await;
                     // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
                     // fallback at the floor rather than letting a stale backoff carry over into the new epoch.
@@ -670,8 +720,10 @@ pub fn spawn_role_loop<F: Field>(
                 // compute the same assignment, exactly as on a beacon advance — the refresh adds no new randomness, it
                 // just stops the cell being stuck with a startup-race view of itself.
                 _ = refresh.tick() => {
+                    let ring: Vec<(Epoch, BeaconSeed)> = window.iter().copied().collect();
+                    let sensed = *sensed_rx.borrow();
                     let (now, complete) =
-                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed }, capacity, vrf, &roles_tx)
+                        assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed, prover: prover.as_ref(), sensed, window: &ring }, capacity, &roles_tx)
                             .await;
                     if now == settled {
                         stable = next_stable(stable, true, complete);
@@ -772,8 +824,8 @@ async fn genesis_assign<F: Field>(
     live: &mut LiveRoleController,
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
-    // See `assign_epoch`: whether a roster record must prove the coordinate it sits at.
-    vrf: bool,
+    // See `assign_epoch`: `Some` exactly where a roster record must prove the coordinate it sits at.
+    prover: Option<&CoordinateProver>,
     roles_tx: &watch::Sender<Assignment>,
 ) {
     let (capability_ready, load_ready) = ready;
@@ -790,8 +842,18 @@ async fn genesis_assign<F: Field>(
     // Epoch zero is the one epoch with no closed predecessor, so the setpoint here is a live read — declared
     // as such rather than hidden, and corrected at the first beacon advance.
     let closed = ClosedEpoch { epoch: Epoch::ZERO, seed: client.genesis() };
-    let at = AssignAt { epoch: Epoch::ZERO, beacon: client.genesis(), closed };
-    assign_epoch::<F>(client, live, at, capacity, vrf, roles_tx).await;
+    // No sensed reading and no closed epochs yet: at genesis this node has not run a heartbeat's diagnosis
+    // and there is no earlier epoch to have closed, so it publishes nothing and keeps its fresh reputation —
+    // which is the same value a recompute over an empty record set would give.
+    let at = AssignAt {
+        epoch: Epoch::ZERO,
+        beacon: client.genesis(),
+        closed,
+        prover,
+        sensed: None,
+        window: &[],
+    };
+    assign_epoch::<F>(client, live, at, capacity, roles_tx).await;
 }
 
 /// One epoch of the loop: read the live authenticated capability directory *and* the cell-agreed setpoint (from
@@ -868,6 +930,125 @@ fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand,
     if complete { read.with_viability_floor(supply, line_size) } else { held }
 }
 
+/// The node's **latest** cell reading, on a `watch` — `(degraded, responsive)` from the heartbeat's
+/// `Notification::Liveness`, or `None` until the first one lands.
+///
+/// A task of its own, doing nothing but forwarding, for one reason: the role loop cannot afford to be the
+/// consumer. Its `select!` spends up to a `STORE_TIMEOUT` inside each re-derivation, and on a cell whose epoch
+/// period is shorter than that the epoch arm is ready every time round, so the event arm is polled almost
+/// never — measured at **two** notifications delivered across a whole run, with the reading consequently never
+/// set and no diagnosis ever published. A dedicated forwarder is always at its `recv`, and a `watch` keeps only
+/// the newest value, which is exactly what a *current reading* means. Ends when the notification stream closes.
+#[must_use]
+fn spawn_liveness_watch(client: &Client) -> watch::Receiver<Option<(Epoch, u8, u8)>> {
+    let (tx, rx) = watch::channel(None);
+    let mut events = client.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(Notification::Liveness { epoch, degraded, responsive, .. }) => {
+                    // A send with no receivers is not an error here: the role loop holding the only receiver
+                    // has ended, and this task ends with it on the next stream close.
+                    let _ = tx.send(Some((epoch, degraded, responsive)));
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// Publish this node's view of `epoch`, then recompute the reputation from the closed `window` — the two
+/// halves of "a cell-wide decision reads closed published epochs, never this node's live measurement".
+///
+/// ## The publish
+///
+/// `sensed` is the `(degraded, responsive)` pair the engine raises every heartbeat, and `seating` is who sat
+/// where in `epoch` as the capability scan just found them. A record is written for the epoch it is measured
+/// in, at the coordinate held during it, bound against its own seed — the same discipline as the load report,
+/// and for the same reason: a record published for an epoch this node has already left names a coordinate it
+/// no longer occupies, so no reader can verify it.
+///
+/// Skipped when the capability scan was incomplete. A partial seating names fewer seats than the cell has, and
+/// the empty ones are indistinguishable from "nobody there" to every reader — so an incomplete scan would
+/// publish a *claim* that members were absent, which is the accusation this whole mechanism exists to make
+/// carefully.
+///
+/// ## The recompute, and why the window must be full
+///
+/// [`Reputation::from_published`] is a pure function of the record set, so two nodes reading the same closed
+/// epochs get the same score however their local views differed. That only holds if they read the SAME
+/// epochs: a node folding a shorter window sees fewer accusations and weights a bad node higher, which forks
+/// the assignment exactly as the carried accumulator did. So the score is adopted only from a window that is
+/// both **full width** (`REP_WINDOW` closed epochs) and **completely read** — otherwise the previous score
+/// stands.
+///
+/// **The residual this leaves, stated rather than hidden.** A node that booted mid-run holds fewer than
+/// `REP_WINDOW` past seeds, cannot verify those epochs' bindings, and therefore holds a neutral reputation
+/// while its established peers hold a recomputed one. The two disagree for at most `REP_WINDOW` epochs and
+/// then converge for good, and the disagreement is bounded by what reputation can do (it only ever *reduces*
+/// a weight, from the full standing a fresh score already gives). It is the same trade `ClosedEpoch::readable_for`
+/// already makes at width one for the setpoint. Removing it needs the epoch seeds to be recoverable by a node
+/// that was absent, which is a beacon-history question, not a role-loop one.
+async fn refresh_reputation<F: Field>(
+    client: &Client,
+    live: &mut LiveRoleController,
+    at: AssignAt<'_>,
+    seating: &Seating,
+    seating_complete: bool,
+) {
+    let AssignAt { epoch, beacon, prover, sensed, window, .. } = at;
+    // Publish only a reading taken in the epoch being published for, against the seating of that same epoch.
+    // A reading from an earlier epoch was measured at an earlier *seating* — the node itself sat elsewhere —
+    // so pairing it with today's roster attributes every bit to the wrong node. Skipping is the honest
+    // outcome: the next heartbeat produces a current one, and an epoch with no record is an epoch with no
+    // evidence, which the quorum already handles.
+    //
+    // And only when this node is itself IN that seating. `seating_complete` means no read timed out, not that
+    // everyone has published: on an epoch turn the capability publisher and this loop are separate tasks, and
+    // under load the roster is read before this node's own advertisement for the epoch has landed. A record
+    // that cannot name its own author is weak evidence — every bit it carries about itself maps to an empty
+    // seat and is silently discarded — so the honest rule is not to testify about an epoch whose roster this
+    // node has not yet joined. It costs one epoch of evidence and the next heartbeat supplies another.
+    let seated_here = fanos_geometry::Point::<F>::new(client.address())
+        .and_then(|p| seating.get(p.index()).copied())
+        .flatten()
+        .is_some();
+    if let (Some((sensed_at, degraded, responsive)), true) = (sensed, seating_complete && seated_here)
+        && sensed_at == epoch
+    {
+        // Proven per write, never once at spawn: the credential names an epoch, so one made at startup would
+        // verify only in the epoch it was made — the same reason every other publisher re-proves.
+        let credential = prover.map(|prove| prove(epoch, &beacon));
+        publish_diagnosis(
+            client,
+            client.address(),
+            epoch,
+            degraded,
+            responsive,
+            seating,
+            credential.as_ref(),
+        )
+        .await;
+    }
+    if window.len() < REP_WINDOW as usize {
+        return; // not yet a window every node can be reading the same way
+    }
+    let (records, complete) = read_diagnosis_window::<F>(client, window, prover.is_some()).await;
+    if !complete {
+        return; // a partial read is a per-node record set, which is the divergence being removed
+    }
+    let Some(latest) = window.iter().map(|(e, _)| e.get()).max() else {
+        return;
+    };
+    // The **corroboration quorum**, not a local choice: a diagnosis record is a claim about others, and the
+    // liveness layer already asks the same question with the same answer (`f + 1` at Fano). Reading it from
+    // the geometry rather than restating it means the two can never drift apart.
+    let quorum = fanos_runtime::corroboration_quorum(Plane::<F>::N as usize);
+    live.adopt_reputation(Reputation::from_published(&records, latest, quorum));
+}
+
 /// Recompute and publish the assignment for `epoch`, reporting whether the directory reads it rests on were **complete**.
 ///
 /// The second value is the one that was missing. A read that timed out was indistinguishable from a member that published
@@ -877,17 +1058,16 @@ fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand,
 async fn assign_epoch<F: Field>(
     client: &Client,
     live: &mut LiveRoleController,
-    at: AssignAt,
+    at: AssignAt<'_>,
     capacity: Demand,
-    // Whether this cell's coordinates are VRF-derived, so a roster record must prove the slot it sits at (`crate::bound`).
-    vrf: bool,
     roles_tx: &watch::Sender<Assignment>,
 ) -> (Assignment, bool) {
+    let vrf = at.prover.is_some();
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
     // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
-    let AssignAt { epoch, beacon, closed } = at;
-    let ((members, caps_complete), (setpoint, load_complete)) = tokio::join!(
+    let AssignAt { epoch, beacon, closed, .. } = at;
+    let ((members, seating, caps_complete), (setpoint, load_complete)) = tokio::join!(
         build_capability_directory::<F>(client, epoch, vrf.then_some(beacon)),
         async {
             match closed.readable_for(epoch) {
@@ -899,6 +1079,11 @@ async fn assign_epoch<F: Field>(
             }
         }
     );
+    // Publish what this node sensed about the epoch it is IN, against the seating it just read, and recompute
+    // the reputation from the closed window. Both are here rather than in a publisher task of their own for
+    // one reason: the record's roster must be the seating the assignment used, and this is the only place
+    // that holds it. A second reader would produce a second seating and the two could disagree.
+    refresh_reputation::<F>(client, live, at, &seating, caps_complete).await;
     // The plane's own line size, so the threshold-line roles are floored at `t`-of-`(q+1)` for THIS plane
     // rather than at the base cell's three — the ceiling-computed-on-Fano defect (#122), one subsystem over.
     let setpoint = setpoint_to_track(
@@ -1010,7 +1195,7 @@ pub fn spawn_self_organization<F: Field>(
         spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability, prover.clone());
     let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source, prover.clone());
     let (role_loop, assigned) =
-        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, prover.is_some());
+        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, prover);
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 

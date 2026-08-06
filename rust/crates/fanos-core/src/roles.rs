@@ -878,14 +878,52 @@ impl Reputation {
 /// changes, so the recompute is a pure function of agreed bytes rather than of anyone's live measurements.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DiagnosisRecord {
-    /// Which cell index published it (its Fano point).
+    /// Which cell index published it — its Fano point **in the epoch this record describes**.
+    ///
+    /// Used only to dedup votes within one epoch, which is why a bare index is enough: two records for the
+    /// same `(epoch, publisher)` are one voice however the cell later reshuffles.
     pub publisher: u8,
     /// The epoch it describes.
     pub epoch: u64,
-    /// Bit `i` set ⇒ the publisher found point `i` degraded past its viability threshold.
+    /// Who sat at each cell position **in that epoch**, as the publisher saw it — `roster[i]` is whom bit `i`
+    /// of [`degraded`](Self::degraded) / [`responsive`](Self::responsive) is about, and `None` is a position
+    /// with no member.
+    ///
+    /// **Carried in the record rather than looked up, because the lookup does not exist.** A cell reshuffles
+    /// every epoch (`vrf_coordinates`, spec §L3), so cell position `i` is a different node each epoch, while
+    /// [`REP_WINDOW`] spans seven of them — a positional mask read against the *current* roster attributes six
+    /// sevenths of the evidence to the wrong nodes. Resolving each past epoch's roster instead is not
+    /// available: the capability directory is retained for `DIRECTORY_SLOT_EPOCHS = 1`, so those rosters are
+    /// gone by the time the window needs them. Making the record self-contained is what lets the reputation
+    /// window outlive the directory retention at all.
+    ///
+    /// A lying publisher can name identities that were not there; its votes then land on identities the rest
+    /// of the cell does not corroborate, so the same quorum that protects the masks protects this.
+    pub roster: [Option<NodeId>; 7],
+    /// Bit `i` set ⇒ the publisher found `roster[i]` degraded past its viability threshold.
     pub degraded: u8,
-    /// Bit `i` set ⇒ the publisher heard from point `i` at all (the weaker, one-witness predicate).
+    /// Bit `i` set ⇒ the publisher heard from `roster[i]` at all (the weaker, one-witness predicate).
     pub responsive: u8,
+}
+
+impl DiagnosisRecord {
+    /// Whether this record says bit-predicate `f` holds of `id` — i.e. some position in its roster is `id` and
+    /// the corresponding bit is set.
+    ///
+    /// A roster naming one identity twice votes once, which is what makes a malformed record harmless rather
+    /// than a way to multiply a single publisher's weight.
+    #[must_use]
+    fn says(&self, f: fn(&Self) -> u8, id: &NodeId) -> bool {
+        self.roster
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| slot.as_ref() == Some(id) && f(self) & (1u8 << i) != 0)
+    }
+
+    /// Every identity this record has an opinion about — its roster, without the empty positions.
+    fn named(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.roster.iter().filter_map(|slot| *slot)
+    }
 }
 
 impl Reputation {
@@ -921,14 +959,19 @@ impl Reputation {
     /// is the exact failure recomputing was introduced to remove. It is a protocol constant tied to the
     /// record retention ([`REP_WINDOW`]), so it is read here rather than accepted.
     ///
-    /// `members` is indexed by cell point: `members[i]` is the identity at Fano point `i`.
+    /// ## Identities, not cell positions
+    ///
+    /// The votes are counted **per identity**, read out of each record's own
+    /// [`roster`](DiagnosisRecord::roster). There is no `members` parameter, and there must not be: a cell
+    /// reshuffles coordinates every epoch, so a single point-indexed roster applied across a `REP_WINDOW` of
+    /// seven epochs would attribute six sevenths of the evidence to whoever happens to sit at that point *now*.
+    /// A record therefore carries the roster it is about, and this function never needs to know the present
+    /// one.
+    ///
+    /// A member no record names in an epoch is simply not observed that epoch — which is right: an absent
+    /// record is absent evidence, and inventing a verdict for it is what a default would do.
     #[must_use]
-    pub fn from_published(
-        records: &[DiagnosisRecord],
-        members: &[NodeId],
-        latest: u64,
-        quorum: usize,
-    ) -> Self {
+    pub fn from_published(records: &[DiagnosisRecord], latest: u64, quorum: usize) -> Self {
         let mut rep = Self::new();
         let oldest = latest.saturating_sub(REP_WINDOW);
         // Replay the epochs in order, so the law's asymmetry (fast to punish, slow to trust) is applied to the
@@ -939,25 +982,30 @@ impl Reputation {
         epochs.sort_unstable();
         epochs.dedup();
         for epoch in epochs {
-            let at = |f: fn(&DiagnosisRecord) -> u8, i: usize| -> usize {
-                records
-                    .iter()
-                    .filter(|r| r.epoch == epoch && f(r) & (1u8 << i) != 0)
-                    .map(|r| r.publisher)
-                    .fold(Vec::new(), |mut seen, p| {
-                        if !seen.contains(&p) {
-                            seen.push(p);
-                        }
-                        seen
-                    })
+            let in_epoch = || records.iter().filter(|r| r.epoch == epoch);
+            // Everyone any publisher had an opinion about this epoch, in a deterministic order — the fold is
+            // not commutative, so two readers must walk the same identities in the same sequence.
+            let mut subjects: Vec<NodeId> = in_epoch().flat_map(DiagnosisRecord::named).collect();
+            subjects.sort_unstable();
+            subjects.dedup();
+            for id in subjects {
+                let votes = |f: fn(&DiagnosisRecord) -> u8| -> usize {
+                    in_epoch().filter(|r| r.says(f, &id)).map(|r| r.publisher).fold(
+                        Vec::new(),
+                        |mut seen, p| {
+                            if !seen.contains(&p) {
+                                seen.push(p);
+                            }
+                            seen
+                        },
+                    )
                     .len()
-            };
-            for (i, id) in members.iter().enumerate().take(8) {
-                let degraded_votes = at(|r| r.degraded, i);
-                let responsive_votes = at(|r| r.responsive, i);
+                };
+                let degraded_votes = votes(|r| r.degraded);
+                let responsive_votes = votes(|r| r.responsive);
                 // Undegraded is the absence of a quorum SAYING degraded: a member nobody complains about is
                 // performing. Requiring a quorum to affirm health instead would punish a quiet epoch.
-                rep.observe_reachable(*id, degraded_votes < quorum, responsive_votes >= quorum);
+                rep.observe_reachable(id, degraded_votes < quorum, responsive_votes >= quorum);
             }
         }
         rep
@@ -1258,8 +1306,25 @@ mod tests {
         );
     }
 
+    /// A record whose roster is the canonical seating — `cell_members()[i]` at position `i`, which is what
+    /// every test below assumes unless it deliberately permutes.
     fn rec(publisher: u8, epoch: u64, degraded: u8, responsive: u8) -> DiagnosisRecord {
-        DiagnosisRecord { publisher, epoch, degraded, responsive }
+        seated(publisher, epoch, degraded, responsive, &cell_members())
+    }
+
+    /// A record explicitly stating who sat where — the shape a reshuffling cell actually publishes.
+    fn seated(
+        publisher: u8,
+        epoch: u64,
+        degraded: u8,
+        responsive: u8,
+        seats: &[NodeId],
+    ) -> DiagnosisRecord {
+        let mut roster = [None; 7];
+        for (slot, id) in roster.iter_mut().zip(seats.iter()) {
+            *slot = Some(*id);
+        }
+        DiagnosisRecord { publisher, epoch, roster, degraded, responsive }
     }
 
     fn cell_members() -> Vec<NodeId> {
@@ -1357,15 +1422,72 @@ mod tests {
             .collect();
 
         // Two readers, same closed epoch, different orders — a store read returns what it returns.
-        let a = Reputation::from_published(&records, &members, 3, 3);
+        let a = Reputation::from_published(&records, 3, 3);
         let mut shuffled = records.clone();
         shuffled.reverse();
-        let b = Reputation::from_published(&shuffled, &members, 3, 3);
+        let b = Reputation::from_published(&shuffled, 3, 3);
         for id in &members {
             assert_eq!(a.score(id), b.score(id), "the recompute does not depend on read order");
         }
         assert!(a.score(&members[5]) < REP_SCALE, "the quorum's verdict is applied");
         assert_eq!(a.score(&members[1]), REP_SCALE, "a member nobody complains about keeps full standing");
+    }
+
+    /// **The reshuffle test.** A cell re-draws every coordinate each epoch (spec §L3), so the same node sits at
+    /// a different cell position each epoch while [`REP_WINDOW`] spans seven of them. The score must follow the
+    /// NODE, not the seat.
+    ///
+    /// This is the falsification for carrying the roster in the record. One node misbehaves for three
+    /// consecutive epochs, moving seat each epoch; a quorum of publishers reports it each time. Its score must
+    /// fall by three epochs' worth of the law, and no innocent node may be touched. Apply ONE seating to every
+    /// epoch instead — the shape `from_published` had, with a single `members` list — and the accusations land
+    /// on three *different* identities: the guilty node is punished once, two bystanders are punished for it,
+    /// and the assertion that every innocent keeps full standing fails.
+    #[test]
+    fn a_score_follows_the_node_across_a_reshuffle_not_the_seat() {
+        let members = cell_members();
+        let culprit = members[6];
+        // Three epochs, three different seatings. The culprit walks 0 -> 3 -> 5; everyone else fills in around it.
+        let seatings: [Vec<NodeId>; 3] = [
+            alloc::vec![culprit, members[0], members[1], members[2], members[3], members[4], members[5]],
+            alloc::vec![members[0], members[1], members[2], culprit, members[3], members[4], members[5]],
+            alloc::vec![members[0], members[1], members[2], members[3], members[4], culprit, members[5]],
+        ];
+        let culprit_seat = [0usize, 3, 5];
+
+        let mut records = Vec::new();
+        for (n, seats) in seatings.iter().enumerate() {
+            let epoch = 1 + n as u64;
+            let mask = 1u8 << culprit_seat[n];
+            // A quorum of three publishers, each naming the epoch's own seating.
+            for p in 0..3u8 {
+                records.push(seated(p, epoch, mask, 0xFF, seats));
+            }
+        }
+
+        let rep = Reputation::from_published(&records, 3, 3);
+        assert!(
+            rep.score(&culprit) < REP_SCALE,
+            "the node the quorum accused in all three epochs kept full standing - the votes landed elsewhere",
+        );
+        for id in &members {
+            if *id == culprit {
+                continue;
+            }
+            assert_eq!(
+                rep.score(id),
+                REP_SCALE,
+                "a node nobody accused lost standing: the accusation was attributed by SEAT, so one node's \
+                 misbehaviour was smeared across the cell by the reshuffle",
+            );
+        }
+        // And the three epochs compounded, so this is not passing on a single hit: one epoch of the same
+        // accusation must leave a strictly higher score than three.
+        let one = Reputation::from_published(&records[..3], 1, 3);
+        assert!(
+            rep.score(&culprit) < one.score(&culprit),
+            "three epochs of the same accusation scored no worse than one, so the window is not replayed",
+        );
     }
 
     /// One publisher cannot move a score. A record is a claim about OTHERS, so a member that declares the whole
@@ -1377,8 +1499,8 @@ mod tests {
         let mut with_liar = honest.clone();
         with_liar.push(rec(0, 2, 0xFF, 0xFF)); // publisher 0 accuses everyone
 
-        let clean = Reputation::from_published(&honest, &members, 2, 3);
-        let smeared = Reputation::from_published(&with_liar, &members, 2, 3);
+        let clean = Reputation::from_published(&honest, 2, 3);
+        let smeared = Reputation::from_published(&with_liar, 2, 3);
         for id in &members {
             assert_eq!(
                 clean.score(id),
@@ -1389,7 +1511,7 @@ mod tests {
         // And the same accusation from a QUORUM does land — otherwise the test above would pass vacuously
         // against a function that ignores records altogether.
         let conspiracy: Vec<DiagnosisRecord> = (0..3u8).map(|p| rec(p, 2, 1 << 4, 0xFF)).collect();
-        let slashed = Reputation::from_published(&conspiracy, &members, 2, 3);
+        let slashed = Reputation::from_published(&conspiracy, 2, 3);
         assert!(slashed.score(&members[4]) < REP_SCALE, "a quorum's verdict does land");
     }
 
@@ -1403,12 +1525,12 @@ mod tests {
         // A reader that saw only the last epoch's records.
         let partial: Vec<DiagnosisRecord> = full.iter().copied().filter(|r| r.epoch == 3).collect();
 
-        let behind = Reputation::from_published(&partial, &members, 3, 3);
-        let ahead = Reputation::from_published(&full, &members, 3, 3);
+        let behind = Reputation::from_published(&partial, 3, 3);
+        let ahead = Reputation::from_published(&full, 3, 3);
         assert!(behind.score(&members[6]) > ahead.score(&members[6]), "the partial reader punished less");
 
         // Re-reading the same closed epochs makes them identical — no residue of the partial view survives.
-        let caught_up = Reputation::from_published(&full, &members, 3, 3);
+        let caught_up = Reputation::from_published(&full, 3, 3);
         for id in &members {
             assert_eq!(caught_up.score(id), ahead.score(id), "the recompute carries nothing forward");
         }
@@ -1419,9 +1541,9 @@ mod tests {
     fn the_window_bounds_how_far_back_a_failure_is_remembered() {
         let members = cell_members();
         let ancient: Vec<DiagnosisRecord> = (0..7u8).map(|p| rec(p, 1, 1 << 2, 0xFF)).collect();
-        let inside = Reputation::from_published(&ancient, &members, 5, 3);
+        let inside = Reputation::from_published(&ancient, 5, 3);
         assert!(inside.score(&members[2]) < REP_SCALE, "within the window it counts");
-        let outside = Reputation::from_published(&ancient, &members, 50, 3);
+        let outside = Reputation::from_published(&ancient, 50, 3);
         assert_eq!(outside.score(&members[2]), REP_SCALE, "past the window it is forgotten");
     }
 

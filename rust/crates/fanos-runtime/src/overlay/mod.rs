@@ -79,7 +79,7 @@ pub(crate) const fn fault_budget(n: usize) -> usize {
 /// Clamped to at least `1` so a degenerate cell still requires *someone* to vouch, and to at most the
 /// witnesses that can exist (`n − 2`), so a plane too small to satisfy both constraints fails closed on the
 /// liveness side rather than demanding a quorum no honest cell can reach.
-pub(crate) const fn corroboration_quorum(n: usize) -> usize {
+pub const fn corroboration_quorum(n: usize) -> usize {
     let safety = fault_budget(n) + 1;
     let available = n.saturating_sub(2);
     if safety > available && available >= 1 { available } else if safety < 1 { 1 } else { safety }
@@ -1222,7 +1222,9 @@ impl<F: Field> OverlayNode<F> {
             // discarded until now — an operator's node map cannot be reconstructed from a 3-bit code that
             // localizes one fault when there may be three.
             out.push(Effect::Notify(Notification::Liveness {
+                epoch: self.epoch,
                 degraded,
+                responsive: self.responsive_mask(now),
                 alive: u16::try_from(alive_count).unwrap_or(u16::MAX),
             }));
             out.push(self.healer.emit_observation(
@@ -1307,7 +1309,17 @@ impl<F: Field> OverlayNode<F> {
         // every round.
         let healthy_lines = self.partition_healthy_lines(now);
         let responsive = self.responsive_mask(now);
-        let mut effects = self.healer.diagnose::<F>(
+        // The same reading the sense-only `Observe` raises, raised here too — because `Observe` has one
+        // production caller (the operator's `admin` read) while THIS runs every heartbeat, and the role loop
+        // needs the pair every epoch to publish its diagnosis (`fanos_node::diagdir`). A notification only an
+        // operator can provoke is not a sensor the cell can be driven by.
+        let mut effects = alloc::vec![Effect::Notify(Notification::Liveness {
+            epoch: self.epoch,
+            degraded,
+            responsive,
+            alive: u16::try_from(alive_count).unwrap_or(u16::MAX),
+        })];
+        effects.extend(self.healer.diagnose::<F>(
             now,
             self_index,
             degraded,
@@ -1316,7 +1328,7 @@ impl<F: Field> OverlayNode<F> {
             Some(responsive),
             &self.config,
             self.epoch,
-        );
+        ));
         // The load this node is carrying, reported every observation — it needs no coherence matrix, only the
         // counts the node already keeps, and the role controller's setpoint is its one real input.
         effects.push(

@@ -169,6 +169,16 @@ pub fn cell_cap_coords<F: Field>() -> Vec<Coord> {
     (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect()
 }
 
+/// Who sat at each cell position for one epoch — `seating[i]` is the identity that published a verified
+/// capability advertisement at `Point::at(i)`, or `None` for an empty seat.
+///
+/// The **compacted** `(NodeId, Capability)` list beside it is what the assignment consumes; this is what a
+/// diagnosis record must carry. A cell re-draws every coordinate each epoch (spec §L3), so a mask indexed by
+/// cell position only means anything alongside the seating of the epoch it was measured in — see
+/// [`DiagnosisRecord::roster`](fanos_core::roles::DiagnosisRecord::roster) for why the record carries it
+/// rather than looking it up.
+pub(crate) type Seating = [Option<NodeId>; 7];
+
 /// Assemble the cell's **live, authenticated capability directory** for `epoch`: resolve every roster
 /// member's advertisement and keep those that verify. The result is exactly the `(NodeId, Capability)` list
 /// `fanos_core::roles::assign` / `RoleController::step` consumes — a member that is down, or has not published
@@ -179,15 +189,24 @@ pub(crate) async fn build_capability_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> (Vec<(NodeId, Capability)>, bool) {
+) -> (Vec<(NodeId, Capability)>, Seating, bool) {
     let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
         read_capability::<F>(&client, coord, epoch, beacon).await
     })
     .await;
-    // The second value is what the caller could not previously know: whether this is the whole cell or only the part that
+    // The third value is what the caller could not previously know: whether this is the whole cell or only the part that
     // answered in time. An assignment derived from a partial view is not a settled answer (`role_loop`).
     let complete = scan.complete();
-    (scan.found.into_iter().map(|(_, member)| member).collect(), complete)
+    let mut seating: Seating = [None; 7];
+    for (coord, (id, _)) in &scan.found {
+        // Points past the seventh have no seat in the reflex's index space, and the diagnosis masks are `u8`.
+        // Silently skipping them is right for the base cell (there are none) and is the honest answer on a
+        // larger plane, where the reflex does not run at all (#145) and a seat number would be an invention.
+        if let Some(seat) = Point::<F>::new(*coord).map(|p| p.index()).and_then(|i| seating.get_mut(i)) {
+            *seat = Some(*id);
+        }
+    }
+    (scan.found.into_iter().map(|(_, member)| member).collect(), seating, complete)
 }
 
 /// As [`resolve_capability`], distinguishing a read that **did not conclude** from a definite absence.

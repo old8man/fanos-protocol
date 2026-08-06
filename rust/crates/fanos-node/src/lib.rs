@@ -68,6 +68,8 @@ pub enum Directory {
     IngressKey,
     /// Coherence telemetry frame (`telemetry_dir`).
     Coherence,
+    /// Per-epoch cell diagnosis (`diagdir`) — the evidence the reputation is recomputed from.
+    Diagnosis,
     /// Cross-cell execution certificate (`crosscell_dir`) — what a parent anchors finality on.
     Checkpoint,
     /// Cross-cell health report (`crosscell_dir`).
@@ -83,6 +85,7 @@ impl Directory {
         Self::ExitKey,
         Self::IngressKey,
         Self::Coherence,
+        Self::Diagnosis,
         Self::Checkpoint,
         Self::Health,
     ];
@@ -103,6 +106,7 @@ impl Directory {
             Self::Coherence => 5,
             Self::Checkpoint => 6,
             Self::Health => 7,
+            Self::Diagnosis => 8,
         }
     }
 
@@ -116,6 +120,7 @@ impl Directory {
             Self::ExitKey => "exit_key",
             Self::IngressKey => "ingress_key",
             Self::Coherence => "coherence",
+            Self::Diagnosis => "diagnosis",
             Self::Checkpoint => "checkpoint",
             Self::Health => "health",
         }
@@ -220,6 +225,7 @@ pub mod error;
 pub mod exit;
 pub mod capdir;
 pub mod crosscell_dir;
+pub mod diagdir;
 pub mod loaddir;
 pub mod role_loop;
 pub mod taxis_driver;

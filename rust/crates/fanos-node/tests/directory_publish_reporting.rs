@@ -89,7 +89,8 @@ fn directory_tags_and_names_are_unique_and_pinned() {
     // Pinned values, not just distinct ones: an operator's dashboard reads these numbers.
     assert_eq!(Directory::MixKey.tag(), 0);
     assert_eq!(Directory::Health.tag(), 7);
-    assert_eq!(Directory::ALL.len(), 8, "a new directory must be added to ALL, or it is invisible to readers");
+    assert_eq!(Directory::Diagnosis.tag(), 8);
+    assert_eq!(Directory::ALL.len(), 9, "a new directory must be added to ALL, or it is invisible to readers");
 }
 
 /// The gate an operator reads is stable and unambiguous, for the same reason a directory's tag is (#109).

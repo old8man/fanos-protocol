@@ -534,7 +534,7 @@ async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notificatio
     let mut seen: Option<(u8, u16)> = None;
     loop {
         match tokio::time::timeout_at(deadline, notes.recv()).await {
-            Ok(Ok(Notification::Liveness { degraded, alive })) => seen = Some((degraded, alive)),
+            Ok(Ok(Notification::Liveness { degraded, alive, .. })) => seen = Some((degraded, alive)),
             Ok(Ok(Notification::Observed(bytes))) => {
                 // **`(0, 0)` would read as "nothing degraded, nobody alive", which is a claim rather than
                 // an absence.** The footprint arrives on the same lossy broadcast as the frame, immediately

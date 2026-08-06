@@ -74,7 +74,7 @@ fn note_desc(note: &Notification) -> String {
         Notification::Snapshot(bytes) => format!("Snapshot {} bytes", bytes.len()),
         // The footprint as points, not as a number: `degraded=20` makes a reader do binary in their head,
         // and the whole reason this rides beside the syndrome is that a reader needs the SET.
-        Notification::Liveness { degraded, alive } => {
+        Notification::Liveness { degraded, alive, .. } => {
             let down: Vec<String> =
                 (0..8).filter(|i| degraded & (1u8 << i) != 0).map(|i| i.to_string()).collect();
             if down.is_empty() {

@@ -37,7 +37,7 @@ pub use fanos_ports as ports;
 // re-exported here as `stream` so existing `fanos_runtime::stream::*` paths keep resolving.
 pub use fanos_stream as stream;
 
-pub use overlay::{Config, MAX_STORE_ENTRIES, OverlayNode, QUARANTINE_TTL};
+pub use overlay::{Config, MAX_STORE_ENTRIES, OverlayNode, QUARANTINE_TTL, corroboration_quorum};
 pub use ports::{Command, Duration, Effect, Engine, Escalation, Input, Instant, Notification, TimerToken};
 
 // Re-export the wire address type so drivers and apps speak the same coordinates.
