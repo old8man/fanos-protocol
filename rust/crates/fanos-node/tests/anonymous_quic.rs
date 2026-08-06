@@ -97,6 +97,18 @@ impl Engine for RawInjector {
             Input::Command(Command::Send { to, payload }) => {
                 vec![Effect::Send { to, frame: payload }]
             }
+            // **`Emit` too, and its absence is why this file's one-shot test could not pass.** A production
+            // node handles `Command::Emit` in the overlay (`overlay/mod.rs`: `Emit { to, frame }` →
+            // `Effect::Send`), and `rendezvous::emit_anonymously` issues exactly that. This stub matched only
+            // `Send`, so every anonymous emit fell into the catch-all below and was dropped in silence — the
+            // frame never left the sender, and the test waited out its full timeout blaming the network.
+            //
+            // A test double that silently discards the input the code under test sends does not weaken the
+            // test, it empties it. The catch-all stays, because a stub must ignore the traffic it is not
+            // modelling, but every command this file's subjects actually issue has to have an arm.
+            Input::Command(Command::Emit { to, frame }) => {
+                vec![Effect::Send { to, frame }]
+            }
             _ => Vec::new(),
         }
     }
