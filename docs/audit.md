@@ -4054,3 +4054,45 @@ appeared by `h + REVEAL_WINDOW`", which is a chain fact. Divergence becomes impo
 The detection-and-repair change is still worth landing first, as defence in depth and because it is small:
 compare the quorum root against our own when a checkpoint forms, fire the sync trigger on divergence, carry
 `have_root` in `SyncReq`, and serve the snapshot on a root mismatch at equal height.
+
+---
+
+## L7 is built, unit-tested, and switched off (2026-08-06)
+
+Followed from #137's question — *what else feeds the state root that is not committed state?* — to
+`reward_per_block`, and from there to the whole incentive layer. Every link below is verified; **none of this
+is a security hole.** BFT safety rests on the quorum arithmetic, not on payments, and equivocation is still
+detected and recorded. What is missing is the economics.
+
+The platform states its own condition:
+
+```
+honest_is_nash()   = covers_cost() && slashing_deters()
+covers_cost()      = fee / Q >= vote_cost          (C1)
+slashing_deters()  = slash > 0                     (C2)
+```
+
+**C1 is false.** `apply_block_reward` is gated on `reward_per_block > 0`; the only production constructor of
+`TaxisParams` hard-codes it to `0`, nothing parses it from a config, and `collect_fee`'s only caller in the
+workspace is its own unit test. `set_reward_per_block`'s doc says "a driver sets this from the fees it
+collects per block" — no driver does.
+
+**C2 is false.** `apply_slash` takes `stake.bonded(&account)` under `if amount > 0`, and `StakeTx` occurs only
+inside `fanos-dromos` and its tests: no production constructor, no bonding CLI verb. Nothing is ever bonded,
+so the slash moves zero.
+
+**And the predicate has no caller.** `honest_is_nash`, `covers_cost`, `best_response_is_honest` and
+`coalition_best_response_is_honest` are re-exported from `lib.rs` and invoked nowhere — not in production, not
+in the HOLARCH Γ-gate, not in any test outside `incentive.rs`'s own module. So the platform ships a
+configuration its own theorem rejects, and the function that would say so is never run.
+
+What *is* wired is the punishment half — `detect_equivocation`, `build_slash_sealer`, `TaxisEvent::Slashed`,
+`record_slashed` — so a fault is detected, permanently recorded, and costs the offender nothing. A validator
+is a pure cost centre with a reputational record.
+
+Closing it has a dependency order, and the first step is a trap: a fee total must be read from the
+**committed block**, never computed per node, or it is exactly #137's defect one field over — a local number
+feeding the state root. Then a bond (with an admission rule that an unbonded validator is not seated, or C2
+stays false however large the constant), and only then is there anything for the Γ-gate to evaluate. Until
+both exist, `docs/design-incentive-equilibrium.md` describes a configuration the node does not ship, and
+should say so.
