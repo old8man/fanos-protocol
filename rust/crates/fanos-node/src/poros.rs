@@ -182,11 +182,35 @@ impl DescriptorBinding {
         self.shares.get(usize::from(x).checked_sub(1)?).copied()
     }
 
-    /// Whether an arriving `share` opens its dealt commitment. Vacuously `true` for a
-    /// [`rotated`](Self::rotated) binding, which has no per-share commitments left to check.
+    /// Why an arriving `share` is refused, or `None` if it is admitted.
+    ///
+    /// **`share(x)` returns `None` for two different reasons, and only one of them may admit.** This used to
+    /// be `self.share(x).is_none_or(|c| ...)`, which granted for both:
+    ///
+    /// * the binding is [`rotated`](Self::rotated), so no per-share commitments survive — admitting is
+    ///   intended and documented there, and `recover`'s one-fault fallback is what compensates;
+    /// * `x` lies **outside the dealt line**, where the commitments exist and do apply.
+    ///
+    /// The second is a forged index and admitting it defeats the whole check. It is not theoretical: `x` is a
+    /// `u8` and a Fano line has three members, so 253 spare indices are available; `on_share` puts an admitted
+    /// share straight into the gather under its own `x`, so it *adds* to the set rather than displacing an
+    /// honest one, and `recover` interpolates over everything held while tolerating exactly **one** corrupt
+    /// share. Two such frames therefore make an ingress request `Unrecoverable` — a censorship primitive
+    /// against the bootstrap path POROS exists to protect.
+    ///
+    /// The mixnet's own gather already knew this: `Station::ShareIndexOutOfRange` is documented as *"a forged
+    /// share … an attack indicator, not an error rate"* and is recorded by `fanos-aphantos`'s threshold
+    /// router. The ingress gather is the one place that admitted it.
     #[must_use]
-    fn admits(&self, share: &Share) -> bool {
-        self.share(share.x()).is_none_or(|c| share_commitment(&self.dealing, share) == c)
+    fn refuse(&self, share: &Share) -> Option<Station> {
+        if self.shares.is_empty() {
+            return None; // rotated: nothing left to check against, by construction
+        }
+        match self.share(share.x()) {
+            None => Some(Station::ShareIndexOutOfRange),
+            Some(c) if share_commitment(&self.dealing, share) == c => None,
+            Some(_) => Some(Station::ShareOffCommitment),
+        }
     }
 
     /// The binding a **rotated** line carries: the descriptor commitment survives (resharing preserves the
@@ -1224,9 +1248,11 @@ impl PorosHost {
     /// forged share never enters the gather, so the gather can still fill from the line's honest members and
     /// serve normally. Rejecting it later would mean the gather holds a threshold it cannot use.
     fn on_share(&mut self, now: Instant, requester: Triple, share: Share) -> Vec<Effect> {
-        if !self.binding.admits(&share) {
+        if let Some(station) = self.binding.refuse(&share) {
             // Provably not the value the dealer handed that member — evidence of forgery, not of failure.
-            self.stations.record(Station::ShareOffCommitment, None);
+            // The two refusals are counted apart because they name different attacks: a wrong value at a real
+            // index is a member misbehaving, an index the line does not have is anyone at all.
+            self.stations.record(station, None);
             return Vec::new();
         }
         let Some(pending) = self.pending.get_mut(&requester) else {
@@ -2351,6 +2377,95 @@ mod tests {
         assert!(
             probe_serve(&mut good_hosts, &new_line, b"c", new_epoch, &beacon),
             "an uncorrupted committed rotation still serves — the commitment guard is not over-eager",
+        );
+    }
+
+    /// **Two frames from anyone deny every ingress request, if an out-of-range index may enter the gather.**
+    ///
+    /// `Binding::share(x)` answers `None` for two different reasons — the binding is *rotated* (no per-share
+    /// commitments survive resharing, so admitting is intended) and `x` lies *outside the dealt line* (where
+    /// the commitments exist and do apply). The check was `is_none_or`, which granted for both.
+    ///
+    /// The consequence is not a curiosity. `x` is a `u8` and a Fano line has three members, so 253 spare
+    /// indices are available; `on_share` puts an admitted share into the gather under its own `x`, so it
+    /// *adds* rather than displacing an honest one; and `recover` interpolates over everything held while
+    /// tolerating exactly ONE corrupt share. Two forged indices therefore make the gather `Unrecoverable` —
+    /// against the bootstrap path POROS exists to keep censorship-resistant.
+    ///
+    /// Asserted in the order that matters: the request is still SERVED, and served the dealt peers, before
+    /// anything is claimed about counters. A combiner that served nothing would pass a refusal assertion
+    /// vacuously.
+    #[test]
+    fn two_shares_at_indices_the_line_does_not_have_cannot_deny_an_ingress_request() {
+        let desc = descriptor(4);
+        let threshold = 2usize;
+        let community = b"out-of-range".to_vec();
+        let (epoch, difficulty) = (Epoch::new(1), 4);
+        let beacon = BeaconSeed::new([0x71; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x5Bu8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
+
+        let mut combiner = PorosHost::new(
+            line[0],
+            shares[0].clone(),
+            binding,
+            line.clone(),
+            threshold,
+            community.clone(),
+            epoch,
+            beacon,
+            difficulty,
+            Sybil::Uncapped,
+        );
+        let requester = coord(5);
+        let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
+        combiner.step(Instant(0), Input::Message { from: requester, frame: request_frame(&req) });
+
+        // Two shares at indices the three-member line does not have. The payload is irrelevant — the point is
+        // that nothing in the dealt commitments can speak about `x = 200` or `x = 201`, so the only sound
+        // answer is to refuse. `from` is a coordinate off the line, because the handler never reads it.
+        let outsider = coord(6);
+        for (n, x) in [200u8, 201].into_iter().enumerate() {
+            let junk = Share::new(x, vec![0xEE; shares[0].y().len()]);
+            let frame = encode(FrameType::PorosShare, &encode_share_reply(requester, &junk));
+            let out = combiner.step(Instant(1 + n as u64), Input::Message { from: outsider, frame });
+            assert!(out.is_empty(), "a share at an index the line does not have must produce nothing");
+        }
+
+        // **The property, before the counter.** The honest second member answers and the request is served —
+        // with the DEALT peers. Admit the two forgeries instead and the gather holds three shares of which two
+        // are junk, which is past `recover`'s one-exclusion budget: `Unrecoverable`, and no response at all.
+        let honest = encode(FrameType::PorosShare, &encode_share_reply(requester, &shares[1]));
+        let response = combiner
+            .step(Instant(3), Input::Message { from: line[1], frame: honest })
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send { to, frame } if *to == requester => {
+                    let (decoded, _) = decode_frame(frame).ok()?;
+                    (decoded.frame_type() == Some(FrameType::PorosResponse))
+                        .then(|| IngressResponse::from_bytes(decoded.body))?
+                }
+                _ => None,
+            })
+            .expect("the honest pair still completes the gather");
+        assert_eq!(response.peers, desc.bucket(&req), "and served the dealt peers, not silence");
+
+        // And the refusals are attributed to the right attack. `ShareIndexOutOfRange`'s own doc calls an index
+        // outside the line's membership "a forged share … an attack indicator, not an error rate", and the
+        // mixnet's threshold router has recorded it since it was written; the ingress gather is the one place
+        // that used to admit it.
+        assert_eq!(
+            combiner.stations().total(Station::ShareIndexOutOfRange),
+            2,
+            "both forged indices are counted, and as forgery rather than as a value that failed to open",
+        );
+        assert_eq!(
+            combiner.stations().total(Station::ShareOffCommitment),
+            0,
+            "and NOT as an off-commitment share — a wrong value at a real index is a member misbehaving, an \
+             index the line does not have is anyone at all, and one count cannot say which",
         );
     }
 

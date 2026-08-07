@@ -4501,3 +4501,51 @@ publish.
 **The residual is now a measurement, not a proposal.** Whether the roster is ever short *at derivation time* —
 both values read in the same frame, inside `assign_epoch` — is unknown, and the station's tag is the
 instrument for it.
+
+## §8. An out-of-range share index bypasses the POROS commitment check (HIGH, FIXED)
+
+Found by sweeping for `Option`s whose **`None` grants** — `is_none_or`, `unwrap_or(true)`, `map_or(true, ..)`.
+Ten sites in the workspace, nine of them correct (no checkpoint yet ⇒ accept the first; no held version ⇒
+accept the write; no tunnel ⇒ create one). One was not.
+
+```rust
+fn admits(&self, share: &Share) -> bool {
+    self.share(share.x()).is_none_or(|c| share_commitment(&self.dealing, share) == c)
+}
+```
+
+`Binding::share(x)` answers `None` for **two different reasons**:
+
+1. the binding is **rotated** — resharing lands on a fresh polynomial, so no per-share commitments survive.
+   Admitting is intended and documented, with `recover`'s one-fault fallback named as the compensation;
+2. `x` lies **outside the dealt line** (`shares.get(x - 1)` is `None`), where the commitments exist and apply.
+
+The second is a forged index, and `is_none_or` granted for it. Textbook one-predicate-two-decisions.
+
+**Why it is a censorship primitive rather than a curiosity.** `step`'s `PorosShare` arm discards `from`, so
+`on_share` cannot check who sent it — unlike `on_share_req` and `on_reshare`, which both take it. An admitted
+share goes straight into the gather under its own `x` (`entry(x).or_insert`), so it *adds* to the set rather
+than displacing an honest one. `recover` dedups by `x` and interpolates over everything held, tolerating
+exactly **one** corrupt share — the one-exclusion search, reachable only when `held.len() > threshold`. `x` is
+a `u8` and a Fano line has three members, so **253 spare indices are available and two frames are enough** to
+make every ingress request on that combiner `Unrecoverable`. Against the bootstrap path POROS exists to keep
+censorship-resistant, from any node that can reach it.
+
+**The same class was already handled one subsystem over.** `Station::ShareIndexOutOfRange` exists, and its
+doc reads: *"A share carried an index outside the line's real membership — a forged share, and therefore
+distinguishable from noise: this is an attack indicator, not an error rate."* `fanos-aphantos`'s threshold
+router has recorded it since it was written. The ingress gather was the one place that admitted it — the
+[[canonical-addressee-family]] shape, a defect that is fixed in one subsystem and open in its sibling.
+
+**Fixed** by making the two `None`s distinct: rotated ⇒ admit (unchanged), index outside the dealt
+commitments ⇒ refuse and count `ShareIndexOutOfRange`, in range but mismatched ⇒ refuse and count
+`ShareOffCommitment` (unchanged). Counting them apart is not cosmetic: a wrong value at a real index is a
+member misbehaving, an index the line does not have is anyone at all, and one count cannot say which.
+
+**Falsified** by restoring the old expression, which fails the new test at its *liveness* assertion — the
+request stops being served — rather than at a counter. The property is asserted before the instrument, so a
+fixture that served nothing could not pass the refusal half vacuously.
+
+Two things this leaves open, both deliberately separate: `on_share` still does not know its sender, and a
+**rotated** binding still admits any index by construction — the documented residual that verified resharing
+closes.
