@@ -4414,8 +4414,28 @@ for the model it runs on.
 
 So the sweep's second question — *unwired, or unreachable?* — needs a third: **or is the condition it tests
 already implied by the model its caller runs on?** The cost that survives is worth writing down and now sits in
-`plan.rs`: because the model cannot tell nodes apart, the theorem holds **vacuously rather than usefully**, and
-a healer that ever builds a *measured* coherence matrix must gate on the predicate at that point.
+`plan.rs`: because the model cannot tell nodes apart, the theorem holds **vacuously rather than usefully**.
+
+### The conditional this left, and why a conditional is not a plan (#156)
+
+The paragraph above used to end: *"and a healer that ever builds a **measured** coherence matrix must gate on
+the predicate at that point."* Two things went wrong with that sentence, and the second is the lesson.
+
+**It had already come true.** `Healer::diagnose` builds the measured matrix today —
+`let measured = self.monitor.ready().then(|| self.monitor.coherence()).flatten();` — and hands it to
+`diagnose`. The trigger fired and nobody noticed, because it was written as a *future condition* rather than as
+a check. **A conditional obligation in the record needs a tripwire, or it is a wish.** The generalisation is
+worth more than the finding: any audit entry of the form *"when X becomes true, do Y"* should land with a test
+that fails when X becomes true, in the same change that writes it down.
+
+**And the obligation was wrong anyway.** Installing the gate would refuse to quarantine a *proven equivocator*
+that relays little traffic: `s_q` is read from the measured **relay-activity** matrix, a `Verdict::Structural`
+from the **polar attestation** sum rules, and the two are independent inputs. So an adversary evades exile by
+doing *less* work. Every quarantine emitter in FANOS is a security action — the Structural arm, the
+vouch-fabricator detector, and the driver's identity-keyed `Command::Quarantine` (R-M1) — and none is
+coherence-motivated, so D6's true scope is currently **empty**. `design-quarantine-theorem.md` now carries the
+scope split and the rule it rests on: *a metric may decide whether an excision helps; it may never decide
+whether evidence counts.*
 
 ## §6. The empty assignment — filed on bad evidence, refuted, then confirmed by the experiment the refutation demanded
 
@@ -4630,13 +4650,30 @@ assertion fails with `None` against `Some(4)`.
 unconditionally, so nothing reaches this today — which means the trap would have been sprung by whoever
 finally provisions a cell, in the same change that made the reflex work at all.
 
-What remains on #145 is a design decision, and the analysis is settled enough to state it: the reflex is
-Fano-specific mathematics (the 14 polar identities are a property of PG(2,2)'s self-duality); **PG(2,q)
-contains a Fano subplane iff q is even**, verified algebraically and by exhaustive search, so of the supported
-orders {2, 4, 7, 31} only 2 and 4 admit one; the cell need not be a subplane, because `polar_class` indexes by
-cell POSITION; and the roster must be **epoch-stable**, so `[Triple; 7]` is the wrong key while coordinates
-re-draw every epoch. The platform's own primitive for that is `address_point` — identity-hash-derived and
-epoch-independent, already used to keep a descended node's sub-cell placement across a reshuffle.
+The supporting mathematics, settled and not to be re-derived: the reflex is Fano-specific (the 14 polar
+identities are a property of PG(2,2)'s self-duality); **PG(2,q) contains a Fano subplane iff q is even**,
+verified algebraically and by exhaustive search, so of the supported orders {2, 4, 7, 31} only 2 and 4 admit
+one; the cell need not be a subplane, because `polar_class` indexes by cell POSITION; and the roster must be
+**epoch-stable**, so `[Triple; 7]` is the wrong key while coordinates re-draw every epoch.
+
+**The design decision has since been made, and #145 is now blocked on a subsystem rather than on a choice.**
+The engine does *not* become identity-aware: audit **R-M1** already settled that layering for quarantine —
+identity lives in the driver, because that is where it is *authenticated* (the HELLO verified
+`coord = MapToPoint(VRF(sk, cert ‖ epoch ‖ beacon))` against the peer's certificate), and `Distrust` therefore
+holds the verdict by identity and re-issues `Command::Quarantine`/`Readmit` as occupants move. The roster
+follows the same shape: identity-keyed in the driver, delivered to the engine as coordinates. Making the
+engine hold `[NodeId; 7]` would also require it to *learn* the permutation, and it cannot — `on_announce`
+drops repeats, so the membership view cannot track an occupant change at all.
+
+What blocks it is that **nothing forms a cell above `q = 2`**: `node.rs` sets `cell_members: None`
+unconditionally, the only writers are simulator scenarios, and there is no config field, no election and no
+descent rule that names seven nodes. Wiring a driver-side roster means inventing cell formation — which seven
+of `q²+q+1`, how they agree, and how the choice stays stable across the `BEHAVIOR_WINDOW` samples the healer
+accumulates. That is a subsystem, and the same class of block as #76.
+
+The general form of the same defect turned out to be live on the base cell after all, and is fixed by #153:
+not "the roster moved" but *every* piece of state addressed by a seat stopped meaning what its address says,
+at one instant.
 
 ## §11. The coherence window spans the boundary that permutes the seats it is indexed by (#153)
 
@@ -4686,3 +4723,90 @@ gate: a window cleared each boundary never refills, so `ready()` stays false and
 silent — which is the honest behaviour for a deployment whose epoch is too short to resolve its own band.
 `control_confidence`'s own doc already names the epoch as *"when coordinates, rosters, directories and roles
 all change anyway"*; this is that sentence applied to the instrument the same derivation sizes.
+
+## §12. The instrument gap — five surfaces, one shape: built to end a silence, and silent
+
+Five findings from one sweep, and they are one defect stated at five distances from the operator. Each was
+built deliberately, each carries a correct justification in its own doc, and each stops one hop short of
+anyone who could act on it. The remedy is one seam, which is why they are recorded together.
+
+### The measurement
+
+A workspace scan of counter-shaped fields (`pub <snake>: u64|u32|usize` declarations, then whole-word mentions
+across every `src` and `tests` file):
+
+* **88** counter-shaped fields.
+* **1** mentioned only at its own declaration.
+* **41** with no *production* mention outside their owning crate — of which `fanos-sim`'s 8 are correct by
+  construction (the simulator **is** the top consumer) and 6 are not counters at all (`plane_order`,
+  `budget_hops`, `pow_nonce`, `footprint_width`, `proc_rss`, `start_nanos`). What survives is `fanos-keygen`'s
+  10 and `fanos-taxis`'s 17.
+
+**87 of 88 increment correctly.** The increment discipline is not the problem; the wiring is. Do not re-run
+the first half of this scan.
+
+### The five, from the outside in
+
+**1. `render_health` prints 7 of `Health`'s 10 fields.** The three omitted are `collisions`,
+`unresolved_drops` (both added by #149, whose title was *"the three unread detectors now have readers"*)
+and `reflexive` (added by #145, *"so an operator is told the reflex is absent"*). `reflexive` is the
+sharpest: its only job is to say that **every other line in that output is uninformative** on a plane above
+`q = 2`, and it is the line missing from the output. The function's own doc states the rule it breaks —
+*"a counter that appears only when non-zero teaches an operator that its absence means 'not measured'"*.
+
+**2. Four reject/probe surfaces never leave their crate.** `ConsensusProbe` (with `ProposalRejects` and
+`VoteRejects`), `DkgRejects`, `BeaconRejects`. `grep -rn "\.rejects()\|VoteRejects\|ProposalRejects"
+fanos-node/src fanos-quic/src` returns **nothing**; every reader is a unit or integration test. Each carries
+the same justification — *"a peer actively forging votes and a peer sending nothing are otherwise the same
+observation"*, *"a ceremony that fails to terminate has to be able to say why"*, *"a beacon that stalls stalls
+everything and the cause has to be readable"*. The largest loss is the best-designed one:
+`ConsensusProbe::awaiting_body` carries the *identity* of the awaited block because *"a cell in which every
+validator awaits the same block is one whose body never reached anyone… each awaiting a different one is
+failing to converge. The two demand opposite investigations and a boolean cannot tell them apart, which cost
+one round of this hunt."* Learned expensively, encoded correctly, visible only to a test.
+
+**3. `DkgRejects::deal_rejected` is never incremented.** The one field in the workspace mentioned only at its
+own declaration — and it is the counter for **CRITICAL B2**. The security fix is present and correct (B2 is
+enforced twice, at `try_verify`'s `vss::verify_share` gate and at the QUAL fold's `ingest_share` gate, both
+silently), so this is not a regression: it is a named, documented field that reads zero by construction, which
+is worse than an absent one because `deal_rejected == 0` looks like evidence. One field is also too few for the
+two events — *"this dealer never qualified for me"* and *"a QUAL dealer's share does not fold"* are different
+anomalies, and the second is strictly stronger.
+
+**4. The beacon counts the rare path and not the hot one.** Four of `BeaconRejects`'s five counters cover the
+**reshare trigger** — a rare, operator-initiated event — and the steady-state partial/round flood has none.
+The sharpest is one early return carrying two decisions:
+
+```rust
+if epoch <= self.epoch || !verify_partial(&partial, epoch, &self.commitment) {
+    return Vec::new();
+}
+```
+
+A stale re-flood (benign, expected, constant-rate — it is how the flood terminates) and a **failed DLEQ against
+the group commitment** (a forgery, or this node holding the wrong commitment) share a branch, so they are not
+merely uncounted but *indistinguishable in principle* until the condition is split. Three more silent exits
+follow, the worst being `try_assemble`'s: the cell reaches threshold, assembles, the combined round fails
+verification, the clock stops, and every counter reads zero.
+
+**5. A frame from a node that has observed nothing read as healthy.** Closed in this pass (#154, #153's
+sibling): the published `CoherenceFrame`'s scalars came from `effective_correlation`, which falls back to the
+configured `healthy_correlation = 0.45` before a window exists. Through the platform's own closed forms that
+is `Φ = 1.215 ≥ 1`, `P = 0.3164 ≥ 2/N`, `R = 0.4514 ≥ 1/3`, `r` inside `(0.4082, 0.5774]` — healthy on every
+axis — and `SnapshotFrame::ready`, documented as *"bound **and self-observing**"*, was satisfied by it. Fixed
+with `MEASURED_BIT` (verdict bit 5, previously spare, absent-means-assumed) threaded from the one caller that
+knows, and `ready` now requires it. #153 makes this matter: a node is in that state for a full window after
+**every** epoch turn, ~15% of uptime, on every node at once.
+
+### The generalization worth keeping
+
+**A counter's definition of done is a production reader, not a unit test.** For an instrument, "called by a
+test" is the failure mode rather than the evidence — the counter is written while fixing the defect it
+observes, in that crate, with a test beside it; the reader lives in another crate, written later, by someone
+asking a different question. So the test gets written and the wiring does not, and from inside the crate the
+surface looks finished, because from inside the crate it is.
+
+Three faces of one coin now have names: **never fires** (#104's refuted `Alarm::Integration`, and
+`deal_rejected` here), **never read** (#149), **never leaves** (this section). Ask all three of every new
+counter, and pick *one* seam per platform — two mechanisms for one question is how the next surface gets wired
+to only one of them.

@@ -139,6 +139,11 @@ impl SnapshotSource for LiveCellSource {
             gap,
             -1,
             self.heal_seq,
+            // `true`: this source stands in for a node that HAS a self-model, so `HEALTHY_R` is a synthetic
+            // measurement, not the "no window yet" fallback the bit exists to flag (#154). Passing `false`
+            // would pin `ready` to false for every frame this source ever emits and flatten the readiness
+            // curve the demo is here to show — which is also the check that the bit is load-bearing.
+            true,
         );
         CoherenceSnapshot::from_frame(&frame)
     }

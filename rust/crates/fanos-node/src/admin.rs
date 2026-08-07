@@ -215,6 +215,21 @@ pub fn render_health(health: &Health) -> String {
     use std::fmt::Write as _;
     let [x, y, z] = health.address;
     let mut s = String::new();
+    // **First, because it qualifies every line below it** (#165). `reflexive: false` is not a degraded
+    // reading, it is an *absent instrument*: on a plane above `q = 2` nothing tells a node which seven peers
+    // are its cell, so there is no coherence self-model, no liveness diagnosis and no §6.7 healing — and every
+    // other field here still reads healthy, because the component that would say otherwise is the one that is
+    // missing. It was added to `Health` so an operator would be told, and then was not printed, which left the
+    // warning one hop from the person it was written for.
+    if health.reflexive {
+        let _ = writeln!(s, "reflexive: yes");
+    } else {
+        let _ = writeln!(
+            s,
+            "reflexive: NO — no coherence self-model, no liveness diagnosis, no §6.7 healing on this plane; \
+             the readings below describe transport only"
+        );
+    }
     let _ = writeln!(s, "coordinate: {x}:{y}:{z}");
     let _ = writeln!(s, "listen: {}", health.local_addr);
     let _ = writeln!(s, "known_peers: {}", health.known_peers);
@@ -222,6 +237,12 @@ pub fn render_health(health: &Health) -> String {
     // operator that its absence means "not measured" — and this is a health signal about the *cell*, since a
     // peer that stops draining is what makes it move (#89).
     let _ = writeln!(s, "send_drops: {}", health.send_drops);
+    // The same rule, applied to the two detectors #149 gave a reader and this renderer then did not print.
+    // `collisions` is documented as the signal a node *reacts* to by relocating instead of silently shadowing
+    // a peer, and `unresolved_drops` as the difference between a quiet cell and one this node cannot address
+    // — neither of which it can be, from a field nothing renders. Zeros included, for the reason above.
+    let _ = writeln!(s, "collisions: {}", health.collisions);
+    let _ = writeln!(s, "unresolved_drops: {}", health.unresolved_drops);
     match health.verified_claims {
         Some(n) => {
             let _ = writeln!(s, "verified_claims: {n}");
@@ -548,6 +569,55 @@ mod tests {
     use super::*;
     use fanos_runtime::ports::Duration;
     use fanos_runtime::ports::stations::Station;
+
+    /// **Every field of `Health` reaches the operator** (#165) — a ratchet, not a smoke test.
+    ///
+    /// `render_health` printed **7 of 10**, and the three it dropped were precisely the ones added by audit
+    /// work *so that an operator could see them*: `collisions` and `unresolved_drops` (#149, whose title was
+    /// "the three unread detectors now have readers" — they got their reader and the reader printed nothing)
+    /// and `reflexive` (#145, "so an operator is told the reflex is absent"). `reflexive` was the sharpest
+    /// loss, because its only job is to say that **every other line here is uninformative**.
+    ///
+    /// A field is added to `Health` by whoever needs it in a test, in a different file from this one, so the
+    /// omission is the default outcome rather than an oversight. This test makes it a red build: every field
+    /// is set to a value that cannot occur by accident, and each must appear in the output.
+    #[test]
+    fn render_health_prints_every_field_it_is_given() {
+        let health = Health {
+            address: [1, 2, 3],
+            local_addr: "127.0.0.1:65001".parse().expect("addr"),
+            known_peers: 41,
+            reflexive: false,
+            send_drops: 43,
+            collisions: 44,
+            unresolved_drops: 45,
+            verified_claims: Some(46),
+            probe_index: Some(47),
+            roles: crate::config::RoleSet::default(),
+        };
+        let out = render_health(&health);
+        // Values, not key names: a renderer that prints `collisions: 0` for a `Health` carrying 44 is exactly
+        // the failure this is for, and a key-only check would pass it.
+        for (what, needle) in [
+            ("coordinate", "1:2:3"),
+            ("listen", "65001"),
+            ("known_peers", "41"),
+            ("send_drops", "43"),
+            ("collisions", "44"),
+            ("unresolved_drops", "45"),
+            ("verified_claims", "46"),
+            ("probe_index", "47"),
+        ] {
+            assert!(out.contains(needle), "`{what}` is in Health and not in the rendering:\n{out}");
+        }
+        assert!(out.contains("reflexive: NO"), "an absent reflex must be stated, loudly:\n{out}");
+        assert!(out.contains("roles"), "the offered roles are part of the answer:\n{out}");
+
+        // And the other direction, so the line above is a discriminator rather than a constant.
+        let reflexive = render_health(&Health { reflexive: true, ..health });
+        assert!(reflexive.contains("reflexive: yes"), "a present reflex says so too:\n{reflexive}");
+        assert!(!reflexive.contains("reflexive: NO"));
+    }
 
     #[test]
     fn every_documented_verb_parses_and_nothing_else_does() {

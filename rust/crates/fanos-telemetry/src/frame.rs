@@ -69,11 +69,16 @@ impl AlarmLevel {
     }
 }
 
-// `verdict` byte layout: [ .. .. integrated | alarm(2) | regime(2) ].
+// `verdict` byte layout: [ .. .. measured | integrated | alarm(2) | regime(2) ].
 const REGIME_MASK: u8 = 0b0000_0011;
 const ALARM_SHIFT: u8 = 2;
 const ALARM_MASK: u8 = 0b0000_1100;
 const INTEGRATED_BIT: u8 = 1 << 4;
+/// Whether the correlation the scalars were computed at was **measured** rather than assumed (#154).
+///
+/// Absent-bit means *assumed*, which is the fail-safe direction: a producer that does not set it is read as
+/// unmeasured, never the reverse.
+const MEASURED_BIT: u8 = 1 << 5;
 /// The syndrome occupies 3 bits (`0` healthy, `1..=7` a point address).
 const SYNDROME_MASK: u8 = 0b0000_0111;
 
@@ -123,8 +128,19 @@ impl CoherenceFrame {
     /// Fold a cell's coherence `matrix`, its degraded-node bitmask, and its spectral `gap` into a
     /// frame. The `degraded` mask (bit `k` = point `k` faulted) becomes the 3-bit syndrome; the
     /// scalars and regime/alarm are read from the matrix. Non-finite scalars are coerced to `0.0`.
+    ///
+    /// `measured` says whether the correlation behind `matrix` was **read from a full observation window** or
+    /// **assumed** from configuration. It is not cosmetic: with `measured = false` and the shipped
+    /// `healthy_correlation = 0.45`, the equicorrelated closed forms give `Φ = (N−1)r² = 1.215 ≥ 1`,
+    /// `P = 0.3164 ≥ 2/N`, `R = 0.4514 ≥ 1/3` and `r = 0.45` inside the band `(0.4082, 0.5774]` — so a node
+    /// that has observed **nothing** produces a frame that reads as a healthy collective subject, and
+    /// [`SnapshotFrame::ready`](crate::SnapshotFrame) called it *"bound and self-observing"* (#154).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // f64→f32 narrowing is deliberate for the wire frame.
+    // Eight distinct inputs to one fold, same as `SelfObserver::observe_liveness`: a params struct would
+    // add a type whose only job is to be destructured immediately, and would hide `measured` — the one
+    // argument a caller must think about — among six it copies from the frame it is building.
+    #[allow(clippy::too_many_arguments)]
     pub fn observe(
         cell_id: CellId,
         epoch: u64,
@@ -133,6 +149,7 @@ impl CoherenceFrame {
         gap: f64,
         forecast: i16,
         heal_seq: u32,
+        measured: bool,
     ) -> Self {
         let m = matrix.measures();
         let regime = match matrix.collective_state() {
@@ -148,6 +165,9 @@ impl CoherenceFrame {
         let mut verdict = regime | (alarm << ALARM_SHIFT);
         if m.phi >= PHI_TH {
             verdict |= INTEGRATED_BIT;
+        }
+        if measured {
+            verdict |= MEASURED_BIT;
         }
         Self {
             cell_id,
@@ -188,6 +208,26 @@ impl CoherenceFrame {
     #[must_use]
     pub fn is_integrated(&self) -> bool {
         self.verdict & INTEGRATED_BIT != 0
+    }
+
+    /// Whether the correlation these scalars were computed at was **measured**, or **assumed** from
+    /// configuration because the node has no full observation window yet (#154).
+    ///
+    /// Every other field is meaningless without this one. The scalars are always the equicorrelated model's
+    /// (`design-telemetry.md` §2: the syndrome is the load-bearing part); the only question is whether the
+    /// `r` it was evaluated at came from `BehaviorMonitor::coherence` or from `Config::healthy_correlation`.
+    /// At the shipped `0.45` the assumed frame reads `Φ = 1.215`, `P = 0.3164`, `R = 0.4514`, `r` inside the
+    /// collective-subject band — **healthy on every axis**, from a node that has observed nothing.
+    ///
+    /// A node is in that state for a full observation window after **every** epoch turn (#153 clears the
+    /// window at a boundary because it is indexed by seats the boundary permutes), which at the shipped
+    /// 600 s epoch and `W = 178` is ~89 s in 600 — 15% of uptime, on every node in the cell at once.
+    ///
+    /// **Absent means assumed.** A producer that does not set the bit reads as unmeasured, never the reverse,
+    /// so an older or unknown producer is treated conservatively.
+    #[must_use]
+    pub fn correlation_is_measured(&self) -> bool {
+        self.verdict & MEASURED_BIT != 0
     }
 
     /// **Pairwise dispersion** `v = q² − m²` — the variance of the cell's off-diagonal correlations, where
@@ -260,7 +300,7 @@ mod tests {
     fn sample_frame() -> CoherenceFrame {
         // A collective-subject cell (r = 0.5 ∈ (1/√6, 1/√3]) with point 0 faulted.
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
-        CoherenceFrame::observe(CellId([0x11; 16]), 42, &matrix, 0b0000_0001, 0.5, -1, 3)
+        CoherenceFrame::observe(CellId([0x11; 16]), 42, &matrix, 0b0000_0001, 0.5, -1, 3, true)
     }
 
     #[test]
@@ -286,7 +326,7 @@ mod tests {
             CoherenceMatrix::from_correlation(block, 7).expect("a block matrix is PSD"),
         ];
         for matrix in cases {
-            let frame = CoherenceFrame::observe(CellId([0x22; 16]), 1, &matrix, 0, 0.5, -1, 0);
+            let frame = CoherenceFrame::observe(CellId([0x22; 16]), 1, &matrix, 0, 0.5, -1, 0, true);
             let expected = matrix.dispersion() as f32;
             assert!(
                 (frame.dispersion() - expected).abs() < 1e-4,
@@ -296,7 +336,7 @@ mod tests {
         }
         // …and the two cases really are different, so the comparison above has content.
         let flat = CoherenceFrame::observe(
-            CellId([0x22; 16]), 1, &CoherenceMatrix::equicorrelated(7, 0.5), 0, 0.5, -1, 0,
+            CellId([0x22; 16]), 1, &CoherenceMatrix::equicorrelated(7, 0.5), 0, 0.5, -1, 0, true,
         );
         assert!(flat.dispersion() < 1e-6, "an equicorrelated cell reads zero dispersion");
     }
@@ -305,7 +345,7 @@ mod tests {
     fn observe_reads_the_matrix_measures() {
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
         let m = matrix.measures();
-        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.25, -1, 0);
+        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.25, -1, 0, true);
         assert!((f64::from(f.phi) - m.phi).abs() < 1e-6);
         assert!((f64::from(f.purity) - m.purity).abs() < 1e-6);
         assert!((f64::from(f.reflection) - m.reflection).abs() < 1e-6);
@@ -317,7 +357,7 @@ mod tests {
     fn syndrome_localizes_a_single_fault() {
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
         // Point 0's address is 1 (Fano/Hamming): a single fault there is a non-zero 3-bit syndrome.
-        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0);
+        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0, true);
         assert!(f.is_faulted());
         assert!(f.syndrome <= 7, "syndrome is 3 bits");
     }
@@ -328,7 +368,7 @@ mod tests {
         // Several faulted points at once: the mask still folds to a valid 3-bit syndrome (no panic,
         // no overflow), and the frame round-trips.
         for mask in [0b0000_0110u8, 0b0101_1010, 0b1111_1111] {
-            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, mask, 0.0, -1, 0);
+            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, mask, 0.0, -1, 0, true);
             assert!(
                 f.syndrome <= 7,
                 "a multi-bit mask still yields a 3-bit syndrome"
@@ -342,7 +382,7 @@ mod tests {
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
         // A non-finite gap (a degenerate spectral computation could produce one) must not leak into
         // the frame: NaN would break the by-value round-trip (NaN != NaN) and poison comparisons.
-        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, f64::NAN, 0, 0);
+        let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, f64::NAN, 0, 0, true);
         assert!(
             f.gap.is_finite() && f.gap == 0.0,
             "a non-finite gap is coerced to 0.0"
@@ -375,22 +415,60 @@ mod tests {
         if f.is_integrated() {
             rebuilt |= INTEGRATED_BIT;
         }
+        if f.correlation_is_measured() {
+            rebuilt |= MEASURED_BIT;
+        }
         assert_eq!(rebuilt, f.verdict);
     }
 
-    /// Known-answer test (mirrored in `conformance/vectors/telemetry.json`): the canonical frame for
-    /// a `r = 0.5` collective-subject Fano cell with point 0 faulted, epoch 42, gap 0.5, no forecast,
-    /// heal_seq 3. Pins the wire layout *and* the coherence math (`Φ = 1.5`, `R = 0.4`, `r = 0.5`).
-    /// Any drift in either breaks this.
+    /// Known-answer test for the canonical frame: a `r = 0.5` collective-subject Fano cell with point 0
+    /// faulted, epoch 42, gap 0.5, no forecast, heal_seq 3, correlation **measured**. Pins the wire layout
+    /// *and* the coherence math (`Φ = 1.5`, `R = 0.4`, `r = 0.5`). Any drift in either breaks this.
+    ///
+    /// The word *"mirrored in `conformance/vectors/telemetry.json`"* used to stand here and was the only
+    /// thing holding the two copies together — nothing read the JSON (#160). `tests/conformance.rs` now
+    /// loads it and compares, so this constant and the vector cannot drift apart in silence. This one stays
+    /// because it is the in-crate check that survives `no_std` (an integration test has `std`, a unit test
+    /// in this crate does not).
     #[test]
     fn frame_matches_the_known_answer_vector() {
         use core::fmt::Write;
-        const KAT: &str = "11111111111111111111111111111111000000000000002a04113fc000003eb6db6e3ecccccd3f0000003f000000ffff00000003";
+        const KAT: &str = "11111111111111111111111111111111000000000000002a04313fc000003eb6db6e3ecccccd3f0000003f000000ffff00000003";
         let mut hex = String::with_capacity(FRAME_LEN * 2);
         for b in sample_frame().encode() {
             let _ = write!(hex, "{b:02x}");
         }
         assert_eq!(hex, KAT, "canonical telemetry frame KAT");
+    }
+
+    /// **The measured bit, both directions** (#154) — a bit checked only in the `true` case is
+    /// indistinguishable from a constant.
+    #[test]
+    fn a_frame_says_whether_its_correlation_was_measured_or_assumed() {
+        let matrix = CoherenceMatrix::equicorrelated(7, 0.45); // the shipped `healthy_correlation`
+        let assumed = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.5, -1, 0, false);
+        let measured = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.5, -1, 0, true);
+
+        assert!(!assumed.correlation_is_measured(), "a fallback frame says so");
+        assert!(measured.correlation_is_measured(), "and a measured one says so");
+
+        // **The reason the bit exists.** The two frames are byte-identical apart from it, and every scalar
+        // in both reads healthy: at the shipped `r = 0.45` the equicorrelated closed forms give
+        // `Φ = (N−1)r² = 1.215 ≥ 1` and `R = 1/(N·P) = 0.4514 ≥ 1/3`. Without the bit, a node that had
+        // observed nothing was indistinguishable from a healthy one — on the numbers, in the same direction.
+        assert!(f64::from(assumed.phi) > 1.0, "the assumed frame reads integrated");
+        assert!(assumed.is_integrated(), "…and says so in its verdict");
+        assert_eq!(
+            assumed.verdict | MEASURED_BIT,
+            measured.verdict,
+            "the two differ in exactly one bit — which is why nothing else could have told them apart",
+        );
+
+        // It survives the wire, or a reader on the other side is back where it started.
+        let back = CoherenceFrame::decode(&assumed.encode()).expect("round-trips");
+        assert!(!back.correlation_is_measured());
+        let back = CoherenceFrame::decode(&measured.encode()).expect("round-trips");
+        assert!(back.correlation_is_measured());
     }
 
     #[test]

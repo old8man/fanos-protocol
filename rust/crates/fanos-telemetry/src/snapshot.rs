@@ -144,7 +144,15 @@ impl CoherenceSnapshot {
             syndrome: frame.syndrome,
             cascade_lead: frame.forecast,
             heal_seq: frame.heal_seq,
-            ready: phi >= PHI_THRESHOLD && reflection >= REFLECTION_FLOOR,
+            // **Self-observing is a premise, not a corollary** (#154). This read `Φ ≥ 1 ∧ R ≥ 1/3` and was
+            // documented as *"bound and self-observing"* — but both scalars are the equicorrelated model's,
+            // and when the node has no observation window the caller evaluates that model at the configured
+            // `healthy_correlation = 0.45`, which gives `Φ = 1.215` and `R = 0.4514`. So a node that had
+            // observed **nothing** satisfied its own liveness gate, on numbers chosen to be healthy. The
+            // third conjunct is the one the sentence always claimed.
+            ready: frame.correlation_is_measured()
+                && phi >= PHI_THRESHOLD
+                && reflection >= REFLECTION_FLOOR,
             alive_nodes: alive,
             setpoint_offset: phi - OPTIMAL_INTEGRATION,
         }
@@ -261,7 +269,7 @@ mod tests {
     /// A frame from an equicorrelated cell at correlation `r` over `alive` nodes.
     fn frame(r: f64) -> CoherenceFrame {
         let matrix = CoherenceMatrix::equicorrelated(7, r);
-        CoherenceFrame::observe(CellId([0xAB; 16]), 9, &matrix, 0, 0.5, -1, 3)
+        CoherenceFrame::observe(CellId([0xAB; 16]), 9, &matrix, 0, 0.5, -1, 3, true)
     }
 
     #[test]
@@ -342,7 +350,7 @@ mod tests {
         // Mirrors SelfObserver::observe_liveness with 2 nodes down (5 alive): the matrix really is
         // 5×5 equicorrelated, so the inversion recovers 5, not the fixed CELL_N=7.
         let matrix = CoherenceMatrix::equicorrelated(5, 0.45);
-        let f = CoherenceFrame::observe(CellId([0xCD; 16]), 1, &matrix, 0b0001_1000, 0.3, -1, 0);
+        let f = CoherenceFrame::observe(CellId([0xCD; 16]), 1, &matrix, 0b0001_1000, 0.3, -1, 0, true);
         let snap = CoherenceSnapshot::from_frame(&f);
         assert_eq!(snap.alive_nodes, 5);
     }
@@ -359,7 +367,7 @@ mod tests {
         // And a localized fault does not change the count, because the count is measured rather than inferred
         // from the fault bit. The old code returned `CELL_N − 1` here purely because it could not divide.
         let matrix = CoherenceMatrix::equicorrelated(7, 0.0);
-        let faulted_frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0);
+        let faulted_frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0b0000_0001, 0.0, -1, 0, true);
         let faulted = CoherenceSnapshot::from_frame(&faulted_frame);
         assert!(faulted.faulted);
         assert_eq!(faulted.alive_nodes, 7, "the matrix still describes seven nodes");
@@ -405,7 +413,7 @@ mod tests {
         for n in [7usize, 21, 57, 993] {
             for r in [0.0, 0.05, 0.3] {
                 let matrix = CoherenceMatrix::equicorrelated(n, r);
-                let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0);
+                let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0, true);
                 let snap = CoherenceSnapshot::from_frame(&f);
                 assert_eq!(snap.alive_nodes as usize, n, "N={n} r={r}: the count must be exact");
                 // …and the radius must follow the recovered N, not a constant.
@@ -426,7 +434,7 @@ mod tests {
         // in range.
         for r in [-0.9, -0.1, 0.0, 1e-7, 0.408, 0.577, 0.9, 1.0] {
             let matrix = CoherenceMatrix::equicorrelated(7, r);
-            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0);
+            let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0, true);
             let snap = CoherenceSnapshot::from_frame(&f);
             assert!(snap.alive_nodes <= MAX_CELL_N as u32, "r={r}");
         }

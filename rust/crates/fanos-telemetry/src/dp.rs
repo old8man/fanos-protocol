@@ -155,7 +155,15 @@ impl CoherenceFrame {
         // `gap = 0.0` / `forecast = -1` / `heal_seq = 0` withhold the non-`r` fields. Φ/P/R and the
         // regime/alarm/integrated verdict come from the DP-noised equicorrelated matrix — all
         // post-processing of the single Laplace release, so the whole frame is ε-DP.
-        Self::observe(self.cell_id, self.epoch, &matrix, 0, 0.0, -1, 0)
+        //
+        // **The measured bit is carried through, and it costs zero ε** (#154). It is not a function of the
+        // noised release, so it needs its own argument — but ε bounds how much the output distribution can
+        // move between *neighbouring worlds*, and neighbouring here means one peer's behaviour differs.
+        // Whether **this** node's own observation window is full does not change under that perturbation, so
+        // the bit is invariant across neighbours and releases nothing. Dropping it would be the costly
+        // choice: every exported frame would read unmeasured, so a roll-up would either discard all of them
+        // or — worse, and the whole point of #154 — go back to averaging assumed scalars as if measured.
+        Self::observe(self.cell_id, self.epoch, &matrix, 0, 0.0, -1, 0, self.correlation_is_measured())
     }
 
     /// The **only sanctioned way to produce bytes that leave the cell**: privatize, then encode.

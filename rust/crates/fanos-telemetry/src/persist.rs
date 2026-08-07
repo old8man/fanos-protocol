@@ -56,9 +56,20 @@ mod tests {
         }
         store.record(MetricId::PHI, 0, 1.5);
 
-        // A unique temp path in the OS temp dir (no external deps).
+        // A temp path in the OS temp dir (no external deps) — **unique per process, and that is not
+        // cosmetic.** It used to be the fixed name `fanos-telemetry-persist-test.fts`, which is a
+        // machine-wide path, and `save` writes through a *sibling* `…fts.tmp` that was therefore
+        // machine-wide too. Two concurrent runs of this test — two shells, two `CARGO_TARGET_DIR`s, or
+        // CI's parallel jobs — interleave on both: A creates the shared tmp, B truncates it, A renames
+        // it onto the target, and B's rename fails with
+        // `Os { code: 2, kind: NotFound }`. Observed exactly that way in a full-suite run while a second
+        // cargo invocation was live; the test passes in isolation, which is the signature.
+        //
+        // Uniqueness rather than a lock: #117 serialized six tests that genuinely shared one machine-wide
+        // resource, but there is no reason for two runs to share this file at all, and a private path
+        // cannot be raced by a test that has not been written yet.
         let mut path = std::env::temp_dir();
-        path.push("fanos-telemetry-persist-test.fts");
+        path.push(format!("fanos-telemetry-persist-test-{}.fts", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         // Missing file → Ok(None).

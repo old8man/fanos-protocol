@@ -53,7 +53,7 @@ impl TryRng for SplitMix64 {
 /// faulted-point mask, spectral gap, and healing counter.
 fn internal_frame(r: f64, degraded: u8, gap: f64, heal_seq: u32) -> CoherenceFrame {
     let matrix = CoherenceMatrix::equicorrelated(7, r);
-    CoherenceFrame::observe(CellId([0x5A; 16]), 7, &matrix, degraded, gap, 4, heal_seq)
+    CoherenceFrame::observe(CellId([0x5A; 16]), 7, &matrix, degraded, gap, 4, heal_seq, true)
 }
 
 #[test]

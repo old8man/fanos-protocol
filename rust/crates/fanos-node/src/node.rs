@@ -940,14 +940,27 @@ impl Node {
         //
         // Said rather than refused, deliberately. The configuration is a real capability — `q = 2` is a test
         // fixture for a mixnet, as this function's own doc argues — and taking it away to fix a reporting
-        // problem would be the wrong trade. What is dangerous is the SILENCE: a node with no reflex reports
+        // problem would be the wrong trade. What was dangerous was the SILENCE: a node with no reflex reported
         // healthy, because the component that would report otherwise is the missing one. Cell assignment on
         // a larger plane is an open design question (#145); until it is answered an operator must at least
         // be told which half of the trade they are getting.
+        //
+        // **That silence is now closed at both surfaces, and this line used to say otherwise.** It read "It
+        // will report healthy regardless", which was true when it was written and is not any more:
+        //   * `admin::render_health` prints `reflexive: NO` **first**, because it qualifies every line under
+        //     it (#165) — it had been a `Health` field that nothing rendered;
+        //   * and a non-reflexive node no longer passes its own liveness gate. `self_index` is `None`, so
+        //     `sample_behavior` returns early, the behavioural window never fills, `measured_correlation`
+        //     stays `None`, and `SnapshotFrame::ready` — which since #154 requires
+        //     `correlation_is_measured()` — is therefore false. Before #154 it was *true*, on scalars the
+        //     equicorrelated model produced from the configured `healthy_correlation = 0.45`.
+        // The warning below is still the right thing to print at startup; it is no longer the only thing that
+        // tells the operator.
         if config.plane_order > 2 {
             eprintln!(
                 "fanos: WARNING — running on PG(2,{}) with no cell roster: this node has NO coherence \
-                 self-model, NO liveness diagnosis and NO self-healing. It will report healthy regardless. \
+                 self-model, NO liveness diagnosis and NO self-healing. `fanos status health` reports \
+                 `reflexive: NO` and its coherence snapshot is not ready, because nothing measures. \
                  Only PG(2,2) forms a cell from the plane itself (#145).",
                 config.plane_order
             );

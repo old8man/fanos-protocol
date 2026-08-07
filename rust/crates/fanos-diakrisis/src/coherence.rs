@@ -393,10 +393,25 @@ impl CoherenceMatrix {
     }
 
     /// Whether quarantining node `q` **strictly lowers** the cell integration `Φ` — the D6 quarantine
-    /// theorem's exact condition `s_q > Φ/2`: quarantine is a valid Φ-reducing healing step iff the node's
-    /// coupling energy exceeds half the cell integration (a structurally-inconsistent / Byzantine node,
-    /// which injects spurious high correlation, satisfies this; an under-coupled silent node does not, and
-    /// quarantining it would *raise* Φ — the theorem forbids that). `false` for a degenerate cell.
+    /// theorem's exact condition `s_q > Φ/2`: excising a node whose coupling energy exceeds half the cell
+    /// integration reduces Φ, and excising an under-coupled one *raises* it. `false` for a degenerate cell.
+    ///
+    /// # It has no caller, and that is correct (#156)
+    ///
+    /// This is the gate for a **coherence-motivated** excision — one chosen *in order to move Φ*. FANOS has
+    /// none. Every quarantine it emits is a **security** action: the `Verdict::Structural` arm of
+    /// `plan_healing` (a polar sum-rule violation — proven equivocation), the vouch-fabricator detector, and
+    /// the driver's identity-keyed `Command::Quarantine` (audit R-M1).
+    ///
+    /// **Do not install it on those.** `s_q` is read from the measured *relay-activity* correlation matrix
+    /// while a `Verdict::Structural` is read from the *polar attestation* sum rules — independent inputs — so
+    /// a member that equivocates while relaying little traffic is simultaneously caught and under-coupled,
+    /// and this predicate would spare it. An adversary evading exile by doing *less* work.
+    ///
+    /// Kept `pub` rather than hidden behind `cfg(test)` because it is the correct gate for the excision that
+    /// does not exist yet, and the theorem it implements is proven and validated
+    /// (`docs/design-quarantine-theorem.md`, `quarantine_experiment`). When that excision is built, gate it
+    /// here and say at the call site that the security quarantines are deliberately outside D6.
     #[must_use]
     pub fn quarantine_lowers_phi(&self, q: usize) -> bool {
         if self.n < 2 || q >= self.n {

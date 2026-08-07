@@ -235,6 +235,22 @@ fanos-sim = { path = "crates/fanos-sim", version = "0.1.0", default-features = f
 # Build profiles. FANOS targets "extreme performance"; the default release build
 # stays fast to compile, and `maxperf` is the ship profile (whole-program LTO).
 # ----------------------------------------------------------------------------
+# **Dependencies are optimized in dev and test; workspace crates are not** (#157).
+#
+# Nobody steps through a lattice NTT or a BLAKE3 rotate in a debugger, and at `opt-level = 0` those are what
+# the test suite spends its time on. Measured rather than assumed: the slowest target (`consensus_sim`,
+# 51 tests) was **62% of the whole workspace suite's wall clock** — 1185 s against 105 s for the next slowest
+# — running at 100% CPU, so it was computing, not waiting. A 5-second `sample` of the live process attributed
+# it: `ml_dsa` 2011 samples, `blake3` 1055, `ml_kem` 285, `sha3` 213, with
+# `core::intrinsics::rotate_right` appearing as an **out-of-line function call** (256 samples) — one `ROR`
+# instruction in any optimized build.
+#
+# The glob covers dependencies only, so every `fanos-*` crate stays at `opt-level = 0` and fully debuggable;
+# `[profile.test]` inherits from `[profile.dev]`, so the suite gets it too. The cost is a one-time dependency
+# rebuild — incremental workspace builds are untouched.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -119,6 +119,15 @@ impl HealingPlan {
 /// yet still heal without the parent — the peeling code recovers where the syndrome decoder cannot.
 #[must_use]
 pub fn plan_healing(verdict: &Verdict, self_index: usize, degraded: u8, phi: f64) -> HealingPlan {
+    // **The tripwire for a conditional obligation** (#156). The planner takes a *scalar* `phi`, never a
+    // `CoherenceMatrix`, and that is load-bearing: the D6 gate `quarantine_lowers_phi` needs a matrix, and
+    // installing it on the `Structural` arm below would spare a proven equivocator that relays little traffic
+    // (see that arm). An audit note once said "when a healer builds a measured matrix, gate on it" — the
+    // condition came true and nothing noticed, because a caveat in prose is not a check.
+    //
+    // So: **changing this signature to take a matrix breaks the build here on purpose.** Read the `Structural`
+    // arm and `docs/design-quarantine-theorem.md` §"What this theorem does not govern" before widening it.
+    const _OBLIGATION: fn(&Verdict, usize, u8, f64) -> HealingPlan = plan_healing;
     let budget_hops = max_reroute_depth(phi);
     let mut actions = Vec::new();
 
@@ -162,9 +171,26 @@ pub fn plan_healing(verdict: &Verdict, self_index: usize, degraded: u8, phi: f64
             // The cost of that, stated because it is invisible otherwise: **the model cannot tell nodes
             // apart.** Every per-node quantity it can produce is identical, so the theorem holds vacuously
             // rather than usefully, and this arm's per-class response is not sized to the node it names.
-            // A healer that ever builds a *measured* `Coherence` matrix — rather than modelling one from a
-            // single scalar correlation — must gate each action on `Coherence::quarantine_lowers_phi(c)`,
-            // which exists, is correct, and has no caller for exactly this reason.
+            //
+            // **This used to end "a healer that ever builds a measured Coherence matrix must gate each action
+            // on `quarantine_lowers_phi`". Do not do that** (#156). Two reasons, and the second is the one
+            // that matters:
+            //
+            //  1. The condition already holds. `Healer::diagnose` builds the measured matrix today
+            //     (`monitor.ready().then(|| monitor.coherence()).flatten()`) and feeds it to `diagnose`; it
+            //     simply never reaches here. A caveat phrased as a future event fired unnoticed — hence the
+            //     signature ratchet below, so the next person to thread it through is told there is an
+            //     obligation attached.
+            //  2. **The gate would refuse to quarantine a proven equivocator.** `s_q` is read from the
+            //     measured *relay-activity* correlation matrix; a `Verdict::Structural` is read from the
+            //     *polar attestation* sum rules. Independent inputs — so a member that equivocates while
+            //     relaying little traffic is simultaneously caught and under-coupled (`s_q < Φ/2`), and the
+            //     gate would spare it. An evasion reachable by doing *less* work.
+            //
+            // Every quarantine in FANOS is a **security** action — this arm, the vouch-fabricator detector,
+            // and the driver's identity-keyed `Command::Quarantine` (audit R-M1). D6 governs a quarantine
+            // chosen *to lower Φ*, and there is none. A metric may decide whether an excision helps; it may
+            // never decide whether evidence counts.
             let mut residue = 0u8;
             for &c in classes {
                 actions.push(HealingAction::Quarantine { node: c });

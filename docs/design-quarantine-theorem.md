@@ -45,9 +45,9 @@ using `frob − N = N·Φ`. For the inequality, `Φ' < Φ ⇔ N·Φ − 2 s_q < 
   *high* coupling energy, so it satisfies `s_q > Φ/2` and quarantine provably reduces integration toward the
   healthy band. This is the theorem the Quarantine action needed.
 - **When quarantine would harm.** An *under-coupled* node (a silent or isolated member, `s_q < Φ/2`) has `Φ'
-  > Φ`: removing it concentrates the remaining correlation and **raises** integration. The theorem forbids
-  quarantining such a node — a genuine, non-obvious safety condition the healing planner must respect
-  (`quarantine_lowers_phi` gates on exactly `s_q > Φ/2`).
+  > Φ`: removing it concentrates the remaining correlation and **raises** integration. `quarantine_lowers_phi`
+  is exactly the predicate `s_q > Φ/2`, and it is the condition a **coherence-motivated** excision must
+  respect. Read §"What this theorem does *not* govern" before installing it anywhere.
 - **Relation to Decouple.** Decouple removes a single edge (`one C_ij²`); quarantine removes a node — *all* its
   edges (`2 s_q` of off-diagonal energy) and one diagonal, over a shrunk `N`. Quarantine is thus a *structural
   Decouple*, and D6 is its quantitative law: the same "shed correlation to lower Φ" principle, now exact for
@@ -63,7 +63,37 @@ Deterministic, over many random symmetric unit-diagonal matrices and every node:
   every case, including the boundary;
 - **Byzantine vs. silent** — a synthetic over-coupled ("Byzantine") node is confirmed to have `s_q > Φ/2` and
   its quarantine lowers Φ, while a synthetic isolated node has `s_q < Φ/2` and its quarantine raises Φ — the
-  planner's gate keeps the first and rejects the second.
+  **predicate** keeps the first and rejects the second. (An earlier revision of this line said *"the planner's
+  gate"*. The planner has no gate; the experiment exercises `quarantine_lowers_phi` directly, and the next
+  section says why the planner is right not to call it.)
 
 This closes the gap: Quarantine now has the same kind of proven, experimentally-validated coherence guarantee
 that Reroute and Decouple already carry.
+
+## What this theorem does *not* govern — and the hole that installing it would open
+
+D6 is a law about **what excision does to integration**. It is therefore the right gate for a quarantine
+chosen *in order to lower Φ*. **There is no such quarantine in FANOS.** Every emitter is a security action:
+
+| site | driven by | kind |
+|---|---|---|
+| `plan.rs`, `Verdict::Structural` arm | a polar sum-rule violation — proven equivocation (§6.4) | security |
+| `healer.rs`, `polar::fabricators_by_persistent_freshness` | a colluding vouch-fabricator keeping a dead node believed-alive | security |
+| `overlay`, `Command::Quarantine` | the driver's identity-keyed distrust, re-applied across a reseat (audit R-M1) | security |
+
+So `plan_healing` emitting `Quarantine` unconditionally is **correct**, and gating it on
+`quarantine_lowers_phi` would be a defect. The bullet above assumes a Byzantine node *"spuriously tracks or
+mirrors the cell to appear live"* and therefore carries high coupling energy — but that is a **modelling
+assumption about the adversary, enforced nowhere**, and the two quantities come from independent inputs:
+
+* `s_q` is read from the measured **relay-activity** correlation matrix (`BehaviorMonitor::coherence`);
+* a `Verdict::Structural` is read from the **polar cross-attestation** sum rules, over gossiped `DiagAttest`
+  reports.
+
+An adversary that equivocates in its attestations *while relaying little traffic* is therefore simultaneously
+**proven inconsistent** and **under-coupled**. With the gate installed the planner would refuse to quarantine
+it — an evasion reachable by doing *less* work rather than more, and a coherence metric overruling proof.
+
+**The rule.** A metric may decide *whether an excision helps*; it may never decide *whether evidence counts*.
+When a coherence-motivated excision is finally built, gate that one on `quarantine_lowers_phi` — and say at
+its call site that the security quarantines above are deliberately outside it.

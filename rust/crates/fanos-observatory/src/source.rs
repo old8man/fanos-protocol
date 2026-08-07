@@ -152,6 +152,9 @@ impl SnapshotSource for ScenarioSource {
             gap,
             -1,
             self.heal_seq,
+            // A synthetic measurement, not the "no observation window yet" fallback — see the same argument
+            // at `live.rs`'s source (#154).
+            true,
         );
         CoherenceSnapshot::from_frame(&frame)
     }

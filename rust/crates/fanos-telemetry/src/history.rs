@@ -561,7 +561,7 @@ mod tests {
         );
 
         let matrix = fanos_diakrisis::coherence::CoherenceMatrix::equicorrelated(7, 0.5);
-        let frame = CoherenceFrame::observe(crate::CellId([0; 16]), 1, &matrix, 0, 0.5, -1, 0);
+        let frame = CoherenceFrame::observe(crate::CellId([0; 16]), 1, &matrix, 0, 0.5, -1, 0, true);
         store.record_frame(1_000, &frame);
         assert!(store.series(MetricId::PHI).unwrap().latest().unwrap().last > 1.0);
         // The 7 system metrics (cpu..disk_write) plus the 5 coherence scalars (phi..gap).

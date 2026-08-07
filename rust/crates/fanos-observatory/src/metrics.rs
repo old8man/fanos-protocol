@@ -314,7 +314,7 @@ mod tests {
     /// helper so the two crates' tests exercise the same shape of sample data.
     fn snapshot(r: f64) -> CoherenceSnapshot {
         let matrix = CoherenceMatrix::equicorrelated(7, r);
-        let frame = CoherenceFrame::observe(CellId([0xAB; 16]), 9, &matrix, 0, 0.5, -1, 3);
+        let frame = CoherenceFrame::observe(CellId([0xAB; 16]), 9, &matrix, 0, 0.5, -1, 3, true);
         CoherenceSnapshot::from_frame(&frame)
     }
 
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn a_faulted_cell_shows_the_localized_verdict_and_syndrome() {
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
-        let frame = CoherenceFrame::observe(CellId([0x22; 16]), 4, &matrix, 0b0000_0001, 0.1, -1, 1);
+        let frame = CoherenceFrame::observe(CellId([0x22; 16]), 4, &matrix, 0b0000_0001, 0.1, -1, 1, true);
         let snap = CoherenceSnapshot::from_frame(&frame);
         let text = render_openmetrics(&snap);
         let cell_id = cell_id_label(&snap);
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(derived_verdict(&snapshot(0.1)), "structure_alarm");
         assert_eq!(derived_verdict(&snapshot(0.6)), "systemic");
         let matrix = CoherenceMatrix::equicorrelated(7, 0.5);
-        let frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 1, 0.0, -1, 0);
+        let frame = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 1, 0.0, -1, 0, true);
         assert_eq!(derived_verdict(&CoherenceSnapshot::from_frame(&frame)), "localized");
         // "integration_alarm" (Φ<1 but P≥2/N) is NOT reachable from this generator: on the
         // equicorrelated stratum P = (1+Φ)/N, so P=2/N and Φ=1 are the exact same crossing —

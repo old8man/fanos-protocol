@@ -449,11 +449,18 @@ impl Healer {
         healthy_correlation: f64,
     ) -> Effect {
         let correlation = self.effective_correlation(healthy_correlation);
+        // **Say which of the two it is** (#154). `effective_correlation` falls back to the configured
+        // `healthy_correlation` until a full window exists, and at the shipped `0.45` that fallback produces
+        // a frame reading healthy on every axis from a node that has observed nothing. Since #153 clears the
+        // window at every epoch boundary, that is ~89 s in every 600 rather than a startup transient, so the
+        // distinction has to travel with the frame.
+        let measured = self.measured_correlation.is_some();
         let frame = self.observer.observe_liveness(
             now.as_nanos(),
             epoch.get(),
             alive_count,
             correlation,
+            measured,
             degraded,
             polar_gap_from_liveness(degraded), // spectral gap Δ (T-226(v)) from this window's health topology
             -1,                                // cascade forecast: none from liveness alone

@@ -73,6 +73,7 @@ impl SelfObserver {
             gap,
             forecast,
             self.heal_seq,
+            true, // built from real per-node signals — this is the measured case by construction
         );
         self.history.record_frame(now_nanos, &frame);
         Some(frame)
@@ -84,6 +85,12 @@ impl SelfObserver {
     /// the honest minimal self-observation a node can always produce — the 3-bit syndrome is exact;
     /// the coherence scalars are the model's (design-telemetry.md §2: the syndrome is load-bearing).
     /// Records the frame and returns it to publish.
+    ///
+    /// `measured` says where `correlation` came from and it is **not optional bookkeeping** (#154). The
+    /// caller falls back to a configured constant when it has no observation window, and at the shipped
+    /// `healthy_correlation = 0.45` that constant produces a frame reading healthy on every axis — `Φ =
+    /// 1.215`, `P = 0.3164`, `R = 0.4514`, `r` inside the band — from a node that has measured nothing. The
+    /// bit is what lets a reader tell that frame from a real one.
     #[allow(clippy::too_many_arguments)] // distinct scalar inputs to the fold; a params struct adds no clarity
     pub fn observe_liveness(
         &mut self,
@@ -91,6 +98,7 @@ impl SelfObserver {
         epoch: u64,
         alive_count: usize,
         correlation: f64,
+        measured: bool,
         degraded: u8,
         gap: f64,
         forecast: i16,
@@ -109,6 +117,7 @@ impl SelfObserver {
             gap,
             forecast,
             self.heal_seq,
+            measured,
         );
         self.history.record_frame(now_nanos, &frame);
         frame
@@ -207,7 +216,7 @@ mod tests {
         // 6 alive, point 0 faulted (bit 0 set), healthy correlation 0.5. The frame stamps the AGREED
         // epoch passed in (3), NOT now_nanos/window (which here would be 9) — so nodes at different local
         // clocks but the same beacon epoch agree on the frame epoch (audit A3).
-        let frame = obs.observe_liveness(9_000_000_000, 3, 6, 0.5, 0b0000_0001, 0.4, -1);
+        let frame = obs.observe_liveness(9_000_000_000, 3, 6, 0.5, true, 0b0000_0001, 0.4, -1);
         assert_eq!(
             frame.epoch, 3,
             "frame epoch is the agreed epoch, decoupled from the local clock"
