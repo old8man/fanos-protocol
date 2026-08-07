@@ -29,6 +29,8 @@
 #![forbid(unsafe_code)]
 
 mod claims;
+/// **Which addresses this node may put packets at** — the shared realm policy for every dial (#171).
+pub mod dial_policy;
 mod directory;
 mod driver;
 mod harness;

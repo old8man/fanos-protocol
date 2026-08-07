@@ -66,40 +66,14 @@ pub const MAX_DATAGRAM_LEN: usize = 65535;
 ///
 /// `realm` widens nothing but loopback; see [`Realm`] for why that hatch exists and why it is this narrow.
 #[must_use]
+/// Whether an exit may relay to `addr` under `realm` — the platform's shared dial policy (#171).
+///
+/// The rule this used to spell out inline now lives in `fanos_quic::dial_policy`, because the hole-punch is
+/// its second consumer and needed a DIFFERENT realm: a peer behind NAT is legitimately on 10/8, while an exit
+/// destination never may be. Two named policies, one module, each with its derivation — rather than two
+/// copies of a list of RFC ranges that would drift.
 fn is_relayable(addr: &std::net::IpAddr, realm: Realm) -> bool {
-    use std::net::IpAddr;
-    if realm == Realm::AlsoLoopback && addr.is_loopback() {
-        return true;
-    }
-    match addr {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !(v4.is_loopback()                       // 127/8      RFC 1122
-                || v4.is_private()                   // 10/8, 172.16/12, 192.168/16   RFC 1918
-                || v4.is_link_local()                // 169.254/16 RFC 3927 — the metadata endpoint lives here
-                || v4.is_broadcast()                 // 255.255.255.255
-                || v4.is_multicast()                 // 224/4      RFC 5771
-                || v4.is_unspecified()               // 0.0.0.0
-                || o[0] == 0                         // 0/8        RFC 1122 "this network"
-                || (o[0] == 100 && (64..128).contains(&o[1]))   // 100.64/10  RFC 6598 CGNAT
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)      // 192.0.0/24 RFC 6890
-                || v4.is_documentation()             // 192.0.2/24, 198.51.100/24, 203.0.113/24  RFC 5737
-                || (o[0] == 198 && (o[1] & 0xfe) == 18)         // 198.18/15  RFC 2544 benchmarking
-                || (o[0] & 0xf0) == 240)             // 240/4      RFC 1112 reserved
-        }
-        IpAddr::V6(v6) => {
-            let seg = v6.segments();
-            !(v6.is_loopback()                       // ::1
-                || v6.is_unspecified()               // ::
-                || v6.is_multicast()                 // ff00::/8
-                || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7   RFC 4193 unique-local
-                || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10  RFC 4291 link-local
-                || (seg[0] == 0x2001 && seg[1] == 0xdb8)        // 2001:db8::/32 RFC 3849 documentation
-                // IPv4-mapped and IPv4-compatible: the v4 rules above must not be reachable by wrapping.
-                || v6.to_ipv4_mapped().is_some_and(|m| !is_relayable(&IpAddr::V4(m), realm))
-                || v6.to_ipv4().is_some_and(|m| !is_relayable(&IpAddr::V4(m), realm)))
-        }
-    }
+    fanos_quic::dial_policy::may_dial(addr, realm.policy())
 }
 
 /// Resolve `host:port` and return the first **relayable** address, or `None` if the name resolves to
@@ -157,6 +131,19 @@ pub enum Realm {
     /// Additionally permits loopback. **Test fixtures only** — an exit constructed this way will relay an
     /// anonymous client onto the operator's own host.
     AlsoLoopback,
+}
+
+impl Realm {
+    /// The shared dial policy this realm selects (#171).
+    ///
+    /// Both map to a `Clearnet*` policy: an exit is never permitted the punch path's tolerance for private
+    /// addresses, and this function is the one place that mapping is written.
+    const fn policy(self) -> fanos_quic::dial_policy::Policy {
+        match self {
+            Self::Global => fanos_quic::dial_policy::Policy::Clearnet,
+            Self::AlsoLoopback => fanos_quic::dial_policy::Policy::ClearnetOrLoopback,
+        }
+    }
 }
 
 /// What clearnet targets an exit will relay to: a destination **port** rule the operator writes (the common

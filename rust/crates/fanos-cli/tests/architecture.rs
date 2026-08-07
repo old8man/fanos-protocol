@@ -904,3 +904,89 @@ fn no_production_code_creates_a_directory_at_the_umask() {
          name to every account on the host (#82, #166)."
     );
 }
+
+/// **Every production dial of a peer-chosen remote address consults the shared realm policy (#170, #171).**
+///
+/// The census that produced this: `connect(`/`lookup_host(` in non-test `src/` reduces to a handful of files,
+/// and exactly two of them dial an address a *peer* named — the clearnet exit and the NAT hole-punch. #170
+/// gave the exit a filter and the punch went on dialling anything, because the fix was applied at the site
+/// that had the bug rather than to the class ([[enumerate-the-class-after-fixing-it]]).
+///
+/// So this is a class guard, not a site guard: a new dial site is caught on the commit that adds it, which is
+/// the only moment the cost of writing the realm argument is small. The two sanctioned entry points are
+/// `fanos_quic::dial_policy::may_dial` and `exit.rs`'s `resolve_relayable`, which calls it.
+#[test]
+fn every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy() {
+    /// Files permitted to call a dialing primitive, each with what makes it safe.
+    ///
+    /// A short list on purpose. Anything added here has to argue that the address is NOT peer-chosen —
+    /// which is the whole question — so a row is a claim, not an exemption.
+    /// `(file, why, must still contain)` — the third column is what stops a row from being a free pass.
+    ///
+    /// **A row that only names a file is not an exemption, it is a hole.** Both files that dial a peer-named
+    /// address are on this list, so without the third column the guard could not see either of them losing
+    /// its filter — which is precisely the regression it exists to prevent. Measured: removing the punch
+    /// filter left the first version of this test green.
+    const SANCTIONED: &[(&str, &str, &str)] = &[
+        ("fanos-quic/src/dial_policy.rs", "the policy itself", "pub fn may_dial"),
+        ("fanos-quic/src/driver.rs", "the punch path filters with Policy::Overlay before it dials", "dial_policy::may_dial"),
+        ("fanos-node/src/exit.rs", "resolves through `resolve_relayable`, on the Clearnet realm", "dial_policy::may_dial"),
+        ("fanos-node/src/admin.rs", "connects to a Unix socket path, not a network address", ""),
+        ("fanos-proxy/src/udp.rs", "sends to the LOCAL SOCKS client that opened the association", ""),
+        ("fanos-proxy/src/http.rs", "connects only inside its own tests", ""),
+    ];
+
+    let mut offenders = Vec::new();
+    let mut examined = 0usize;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    for krate in std::fs::read_dir(root.join("crates")).expect("crates/") {
+        let root = krate.expect("entry").path().join("src");
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else { continue };
+                let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+                examined += 1;
+                // Keyed by crate-relative PATH, not basename: `driver.rs` exists in both `fanos-quic` and
+                // `fanos-vpn`, and matching on the name alone applied the quic row's liveness requirement to
+                // the vpn file — a row silently governing a file it was never written about.
+                let named = path.to_string_lossy().replace('\\', "/");
+                if let Some((_, why, required)) = SANCTIONED.iter().find(|(f, ..)| named.ends_with(*f)) {
+                    // The liveness half: a sanctioned file that no longer contains its safe mechanism has
+                    // stopped being sanctioned, and saying so here is the only thing that makes the row
+                    // mean anything ([[falsify-the-exemption-not-the-rule]]).
+                    assert!(
+                        required.is_empty() || src.contains(required),
+                        "`{named}` is exempted because {why}, and no longer contains `{required}` — either \
+                         it stopped dialling (delete the row) or it stopped filtering (that is the bug)."
+                    );
+                    continue;
+                }
+                for (i, line) in production.lines().enumerate() {
+                    let code = line.split("//").next().unwrap_or("");
+                    if code.contains("lookup_host(") || code.contains("endpoint.connect(") {
+                        offenders.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+    }
+    // The denominator, so a walk that finds nothing fails rather than passes.
+    assert!(examined > 200, "the scan examined only {examined} production files — it is not reaching them");
+    assert!(
+        offenders.is_empty(),
+        "these dial a remote address without going through `fanos_quic::dial_policy`: {offenders:?}. A dial \
+         to an address a PEER named must state its realm — the exit's (globally routable only) or the \
+         overlay's (anything that can be a distinct peer). Without one, a single tolerated peer aims this \
+         node's packets at the operator's LAN, their loopback, or 169.254.169.254 (#171)."
+    );
+}

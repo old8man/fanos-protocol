@@ -82,34 +82,41 @@ impl Paths {
     }
 }
 
-/// Whether this process is running with uid 0.
+/// Whether this process may install to the system paths — asked, and now answered, as a **capability**.
+///
+/// The previous version compared `/etc`'s owner against a uid it learned by writing
+/// `<temp>/fanos-uid-probe-<pid>` and reading the owner back. Two defects followed from that shape, and the
+/// comment above it had already described the right check without implementing it (#174):
+///
+/// 1. `fs::write` is `O_WRONLY|O_CREAT|O_TRUNC` and **follows symlinks**, at a fully predictable path in a
+///    shared directory. No race was needed — pre-create the plausible PID range as symlinks and the name is
+///    already there — so it truncated whatever the link pointed at, with our privileges.
+/// 2. `metadata()` follows the link too, so the uid returned was the **target's** owner. Pointing it at a file
+///    the attacker owns made `is_root()` false for an actual root operator, and `fanos setup` then provisioned
+///    to the user paths silently.
+///
+/// Neither was escalation — destruction within our own authority, and misprovisioning — and on a default
+/// Linux `fs.protected_symlinks=1` blocks both, while macOS gives each user a `0700` `TMPDIR`. It was still
+/// the wrong shape: the question is *"may I write to a root-only place?"* and it was answered by a uid
+/// comparison that a shared directory could influence.
+///
+/// So ask it directly. `create_new` is `O_EXCL|O_CREAT`: it refuses if the path exists **at all**, symlink or
+/// not, so there is no link to follow and nothing to truncate. `/etc` is root-owned and not world-writable on
+/// every platform this ships to, so an attacker who could plant a name there is already root and the question
+/// is moot.
+///
+/// Fails **closed**: any error reads as "not root", which provisions to the user paths — visible to the
+/// operator and recoverable, where the opposite would attempt a system install and fail midway.
 #[must_use]
 pub fn is_root() -> bool {
-    // No libc dependency for one number: the effective uid is what `id -u` reports, and on the platforms this
-    // binary targets `/proc` and `id` are not both guaranteed — but `USER`/`LOGNAME` are spoofable, so neither is
-    // used. `geteuid` via the standard library is unavailable, so the honest check is the one filesystem fact that
-    // cannot be faked: whether we can write to a root-only location.
-    Path::new("/etc").metadata().is_ok_and(|m| {
-        use std::os::unix::fs::MetadataExt as _;
-        m.uid() == current_uid()
-    })
-}
-
-/// This process's effective uid, read without a libc dependency.
-fn current_uid() -> u32 {
-    // A file we certainly own: our own temporary marker is overkill, and `/proc/self` is Linux-only. The portable
-    // fact is that a file we create is owned by us.
-    std::env::temp_dir().metadata().map_or(u32::MAX, |_| {
-        use std::os::unix::fs::MetadataExt as _;
-        // `std::env::temp_dir()` is shared, so read our own uid off a file we made rather than off the directory.
-        let probe = std::env::temp_dir().join(format!("fanos-uid-probe-{}", std::process::id()));
-        let uid = std::fs::write(&probe, b"")
-            .ok()
-            .and_then(|()| probe.metadata().ok())
-            .map_or(u32::MAX, |m| m.uid());
+    // A dot-name with the pid, created and removed immediately. Not `/etc/fanos` — the probe must not collide
+    // with anything an install would later create.
+    let probe = Path::new("/etc").join(format!(".fanos-root-probe-{}", std::process::id()));
+    let created = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
+    if created {
         let _ = std::fs::remove_file(&probe);
-        uid
-    })
+    }
+    created
 }
 
 /// The port a fresh install listens on unless the operator says otherwise.

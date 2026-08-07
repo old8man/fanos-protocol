@@ -2590,6 +2590,18 @@ fn accept_holepunch(t: &Transport, body: &[u8]) {
     let Some((peer, addr)) = decode_punch(body) else {
         return;
     };
+    // **Where, not just how many (#171).** The two bounds this function derives — no directory write before
+    // the coordinate is proven, at most one outstanding punch per coordinate — limit the RATE at which a
+    // tolerated peer can make this node emit QUIC Initials. Neither limits the TARGET, and the doc above
+    // names the harm exactly: "a fleet of FANOS nodes becomes a reflector aimed at a third party who never
+    // joined anything." Until this line, a peer could name `169.254.169.254`, the operator's LAN, or their
+    // own loopback, and this node would dial it from the operator's IP.
+    //
+    // `Overlay`, not the exit's realm: a FANOS peer legitimately sits on 10/8 or 192.168/16, and NAT
+    // traversal is what that topology needs. What is refused is an address that cannot BE a distinct peer.
+    if !crate::dial_policy::may_dial(&addr.ip(), crate::dial_policy::Policy::Overlay) {
+        return;
+    }
     // Claim the coordinate, or drop: a punch toward a peer we are already punching adds nothing, and
     // dropping it is what makes the in-flight count bounded by the plane rather than by the sender.
     let claimed = match t.punching.lock() {
