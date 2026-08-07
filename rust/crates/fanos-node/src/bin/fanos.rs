@@ -301,6 +301,21 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
 }
 
 /// Run a node until Ctrl-C.
+/// Whether this node was given bootstrap peers and has verified **none** of them (#179).
+///
+/// A pure function because it is the whole decision, and a decision buried in a `select!` arm cannot be
+/// tested. Three states, not two:
+///
+/// * `configured == 0` — this node is founding a cell. Never isolated, however few peers it has verified;
+///   warning here would fire at every genesis, which is how a warning stops being read.
+/// * `verified == None` — no claims book at all (no self-certifying identity, a legitimate configuration).
+///   That is **cannot tell**, not **verified nobody**. Writing `verified.is_none_or(|n| n == 0)` would warn
+///   on every identity-less node, which is the shape that has bitten this codebase before.
+/// * `verified == Some(0)` with peers configured — reached nobody. This is the one that warns.
+const fn is_isolated(verified: Option<usize>, configured: usize) -> bool {
+    configured > 0 && matches!(verified, Some(0))
+}
+
 async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let config = node_config_from_args(args)?;
@@ -311,12 +326,32 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     let health = node.health();
     let [x, y, z] = health.address;
     info!(coord = ?health.address, local_addr = %health.local_addr, peers = health.known_peers, "fanos node up");
+    // "configured", not a bare count: bootstrap peers are INSERTED into the directory at startup without a
+    // dial (`node.rs`), so `known_peers` here is the number the operator typed and nothing has answered yet.
+    // Reporting it as though it were a connection count is what made a mistyped list look like a healthy
+    // start (#179).
     eprintln!(
-        "fanos node up — coordinate {x}:{y}:{z} on {} ({} bootstrap peers)",
+        "fanos node up — coordinate {x}:{y}:{z} on {} ({} bootstrap peers configured)",
         health.local_addr, health.known_peers
     );
 
     let (admin_socket, mut admin_rx) = control_socket(args);
+
+    // One-shot isolation check, one epoch after start (#179).
+    //
+    // A mistyped or stale bootstrap list produces a node that starts cleanly, forms a cell of ONE, and looks
+    // healthy — and an empty list is the legitimate genesis configuration, so "alone on purpose" and "alone
+    // by accident" were the same observable. One epoch is the settling time the protocol itself defines: the
+    // coordinate proof is epoch-scoped, so a peer that has not been verified within one has not been reached.
+    //
+    // **Three states, and that is the whole predicate.** `verified_claims` is `Option<usize>` and `None`
+    // means this node has no claims book at all — no self-certifying identity, a legitimate configuration —
+    // which is "cannot tell", not "verified nobody". `is_none_or(|n| n == 0)` would warn on every
+    // identity-less node; the match on `Some(0)` is deliberate.
+    let configured = health.known_peers;
+    let isolation_check = tokio::time::sleep(epoch_period);
+    tokio::pin!(isolation_check);
+    let mut isolation_checked = configured == 0; // a node founding a cell must stay silent, or this cries wolf at every genesis
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -326,6 +361,19 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
             _ = &mut ctrl_c => {
                 info!("shutdown signal received");
                 break;
+            }
+            () = &mut isolation_check, if !isolation_checked => {
+                isolation_checked = true;
+                if is_isolated(node.health().verified_claims, configured) {
+                    warn!(
+                        configured,
+                        "reached none of the configured bootstrap peers — this node is alone and is now its \
+                         own cell; check the addresses are right and that those peers are running"
+                    );
+                    eprintln!(
+                        "fanos: reached none of the {configured} configured bootstrap peers — this node is alone"
+                    );
+                }
             }
             Some((req, reply)) = admin_rx.recv() => {
                 // `fanos node` runs no chain, so `consensus` is answered by saying so rather than by inventing a
@@ -3604,6 +3652,27 @@ fn verb_block(text: &str, verb: &str) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// The three worlds the isolation warning must tell apart (#179).
+    ///
+    /// A test driving only the failing world passes against a build that always warns, so all three are here
+    /// and the two silent ones carry the reason they must stay silent.
+    #[test]
+    fn isolation_is_reached_nobody_and_not_merely_alone() {
+        // Reached nobody with peers configured — the one case that warns.
+        assert!(is_isolated(Some(0), 3), "3 configured, 0 verified: this node is alone by accident");
+
+        // Founding a cell: no peers configured, so "verified nobody" is the expected state, not a fault.
+        assert!(!is_isolated(Some(0), 0), "genesis must not warn, or the warning fires on every new network");
+
+        // No claims book — no self-certifying identity. Cannot tell, so must not claim.
+        assert!(!is_isolated(None, 3), "`None` is 'cannot tell', not 'verified nobody'");
+        assert!(!is_isolated(None, 0), "…and certainly not at genesis");
+
+        // Reached somebody: healthy, whatever the configured count.
+        assert!(!is_isolated(Some(1), 3), "one verified peer is not isolation");
+        assert!(!is_isolated(Some(3), 3), "nor is all of them");
+    }
+
     use super::*;
 
     #[test]
