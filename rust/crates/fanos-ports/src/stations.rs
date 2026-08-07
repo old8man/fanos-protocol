@@ -316,9 +316,25 @@ pub enum Station {
     AuthenticationRejected,
 }
 
+/// **`ALL` is complete, proven by the compiler.**
+///
+/// `ALL` is what a reader enumerates, so a variant missing from it is invisible *exactly* where a new
+/// discard site was just instrumented — the failure this whole plane exists to end. That cannot be closed
+/// by a test: a test can only visit the variants the list already contains, so the omission it is looking
+/// for is the one case it never reaches. (The previous guard here iterated `ALL` and asserted each element
+/// was in `ALL`; every assertion was true by construction, and its exhaustive `match` forced a new variant
+/// to be *named*, not *listed*.)
+///
+/// `variant_count` answers the question directly and at compile time. Add a variant without adding it to
+/// `ALL` and the crate does not build.
+const _: () = assert!(
+    Station::ALL.len() == core::mem::variant_count::<Station>(),
+    "a Station variant is missing from Station::ALL, so every reader that enumerates is blind to it"
+);
+
 impl Station {
     /// Every station, for a reader that enumerates rather than guesses (a dashboard, a test asserting the
-    /// table is complete).
+    /// table is complete). Completeness is enforced above, by the compiler, not by a test.
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
@@ -355,6 +371,8 @@ impl Station {
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
     /// not break when a variant is added elsewhere in the enum.
+    //
+    // (The completeness of `ALL` is proven below the impl, at compile time — not here, and not by a test.)
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -700,52 +718,15 @@ mod tests {
     }
 
     #[test]
-    fn all_lists_every_variant_and_the_compiler_enforces_it() {
-        // `ALL` is hand-maintained, so a variant added to the enum could silently be missing from it —
-        // and a dashboard that enumerates `ALL` would then have a blind spot exactly where a new discard
-        // site was just instrumented, which is the failure this whole plane exists to end.
+    fn all_contains_no_duplicates() {
+        // Completeness is proven at compile time by the `const _` assertion above `impl Station`, so it
+        // is deliberately NOT re-checked here. What a test can still add is the property the compiler
+        // cannot see: that the list contains each variant *once*. A duplicate would double-count a
+        // station on any dashboard that sums by enumerating.
         //
-        // The `match` below is what makes that impossible rather than merely tested: it is exhaustive,
-        // so adding a variant **fails the build** until it is handled here, and each arm asserts the
-        // variant is present in `ALL`. A test can only check the variants it knows about; a compiler
-        // check knows about all of them.
-        for station in Station::ALL {
-            let listed = |s: Station| assert!(Station::ALL.contains(&s), "{s:?} missing from ALL");
-            match *station {
-                Station::GatherExpired => listed(Station::GatherExpired),
-                Station::GatherCompleted => listed(Station::GatherCompleted),
-                Station::QuarantineDropped => listed(Station::QuarantineDropped),
-                Station::HostForwardUnsealable => listed(Station::HostForwardUnsealable),
-                Station::RequestForUnknownHost => listed(Station::RequestForUnknownHost),
-                Station::ShareLateAfterPeel => listed(Station::ShareLateAfterPeel),
-                Station::ShareAfterDeadline => listed(Station::ShareAfterDeadline),
-                Station::GatherUnpeelable => listed(Station::GatherUnpeelable),
-                Station::GatherSelfShareMissing => listed(Station::GatherSelfShareMissing),
-                Station::GatherEvicted => listed(Station::GatherEvicted),
-                Station::GatherOpenFailed => listed(Station::GatherOpenFailed),
-                Station::ShareRequestNotAMember => listed(Station::ShareRequestNotAMember),
-                Station::SharePartialFailed => listed(Station::SharePartialFailed),
-                Station::ShareForUnknownRequest => listed(Station::ShareForUnknownRequest),
-                Station::ShareIndexOutOfRange => listed(Station::ShareIndexOutOfRange),
-                Station::ShareFloodCapped => listed(Station::ShareFloodCapped),
-                Station::HolonomyRejected => listed(Station::HolonomyRejected),
-                Station::StoreAtCapacity => listed(Station::StoreAtCapacity),
-                Station::FrameDecodeFailed => listed(Station::FrameDecodeFailed),
-                Station::FrameTypeUnknown => listed(Station::FrameTypeUnknown),
-                Station::AdmissionIdentityUnbound => listed(Station::AdmissionIdentityUnbound),
-                Station::AdmissionPowFailed => listed(Station::AdmissionPowFailed),
-                Station::AdmissionSybilCapped => listed(Station::AdmissionSybilCapped),
-                Station::AdmissionNoCapacity => listed(Station::AdmissionNoCapacity),
-                Station::ShareOffCommitment => listed(Station::ShareOffCommitment),
-                Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
-                Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
-                Station::RoleUnderProvisioned => listed(Station::RoleUnderProvisioned),
-                Station::AssignmentWithheld => listed(Station::AssignmentWithheld),
-                Station::ReseatOutOfCell => listed(Station::ReseatOutOfCell),
-                Station::AuthenticationRejected => listed(Station::AuthenticationRejected),
-            }
-        }
-        // And no variant is listed twice, which would double-count it in any enumeration.
+        // What stood here before was a loop over `ALL` asserting each element was in `ALL` — true by
+        // construction, for every arm. It was removed rather than repaired: a guard that cannot fail is
+        // worse than none, because it reads as coverage.
         let mut seen: Vec<Station> = Station::ALL.to_vec();
         let before = seen.len();
         seen.sort_unstable();

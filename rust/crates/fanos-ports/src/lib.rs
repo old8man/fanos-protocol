@@ -12,6 +12,12 @@
 //! `fanos_runtime::ports` for source compatibility.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// `variant_count` turns "every station is listed in `Station::ALL`" from a hand-maintained invariant
+// into a compile-time one. The list is what a dashboard enumerates, so a variant missing from it is
+// invisible exactly where a new discard site was just instrumented — and no *test* can catch that,
+// because a test can only check the variants the list already contains. The project pins nightly
+// deliberately (see `rust-toolchain.toml`) and already uses `portable_simd` on the same grounds.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;

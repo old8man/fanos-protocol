@@ -14,6 +14,11 @@
 //! service, and exit engines — and the SOCKS5/DNS proxy and VPN surfaces — compose on top in later
 //! phases (`docs/design.md` §5).
 
+// See `fanos_ports::stations` for the reasoning: `variant_count` makes "every variant is listed in
+// `ALL`" a compile-time fact rather than a hand-maintained one. `ALL` is what a reader enumerates, so a
+// variant missing from it is invisible precisely where something new was just made observable — and a
+// test cannot catch that, because it can only visit the variants the list already holds.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 /// How many further epoch advances a published directory slot outlives before the store reclaims it.
@@ -75,6 +80,14 @@ pub enum Directory {
     /// Cross-cell health report (`crosscell_dir`).
     Health,
 }
+
+/// `Directory::ALL` is complete, proven by the compiler — not by the `ALL.len() == 9` assertion in
+/// `tests/directory_publish_reporting.rs`, which forces deliberation when the list *grows* but passes
+/// unchanged when a variant is added to the enum and omitted from the list.
+const _: () = assert!(
+    Directory::ALL.len() == core::mem::variant_count::<Directory>(),
+    "a Directory variant is missing from Directory::ALL, so it is invisible to every reader that enumerates"
+);
 
 impl Directory {
     /// Every directory, for a reader that enumerates rather than guesses.
@@ -153,6 +166,12 @@ pub enum Gate {
     /// A **coordinate-bound** capability advertisement that failed entitlement, identity or signature.
     BoundCapabilityAdvertisement,
 }
+
+/// `Gate::ALL` is complete, proven by the compiler. Same reasoning as [`Directory`].
+const _: () = assert!(
+    Gate::ALL.len() == core::mem::variant_count::<Gate>(),
+    "a Gate variant is missing from Gate::ALL, so it is invisible to every reader that enumerates"
+);
 
 impl Gate {
     /// Every gate, for a reader that enumerates rather than guesses.

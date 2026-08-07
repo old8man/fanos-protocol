@@ -90,7 +90,10 @@ fn directory_tags_and_names_are_unique_and_pinned() {
     assert_eq!(Directory::MixKey.tag(), 0);
     assert_eq!(Directory::Health.tag(), 7);
     assert_eq!(Directory::Diagnosis.tag(), 8);
-    assert_eq!(Directory::ALL.len(), 9, "a new directory must be added to ALL, or it is invisible to readers");
+    // Completeness is the compiler's job now (`const _` beside `impl Directory`): a variant missing from
+    // `ALL` does not build. What this count still buys is *deliberation* — adding a directory changes a
+    // stated number, so it cannot happen as a side effect of an unrelated change.
+    assert_eq!(Directory::ALL.len(), 9, "the directory count changed; confirm the addition was intended");
 }
 
 /// The gate an operator reads is stable and unambiguous, for the same reason a directory's tag is (#109).
@@ -108,7 +111,7 @@ fn gate_tags_and_names_are_unique_and_pinned() {
     assert_eq!(Gate::ReshareSubShare.tag(), 0);
     assert_eq!(Gate::BoundCapabilityAdvertisement.tag(), 3);
     assert_eq!(Gate::IngressShare.tag(), 4);
-    assert_eq!(Gate::ALL.len(), 5, "a new gate must be added to ALL, or it is invisible to readers");
+    assert_eq!(Gate::ALL.len(), 5, "the gate count changed; confirm the addition was intended");
 }
 
 /// A `Directory` tag and a `Gate` tag are read under **different** stations, so they may collide freely —
