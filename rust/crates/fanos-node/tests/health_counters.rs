@@ -40,7 +40,16 @@ async fn a_nodes_health_reports_the_directory_counters_it_is_documented_to_repor
     assert_eq!(before.unresolved_drops, 0, "and has dropped nothing for want of an address");
 
     // Force a genuine collision: two DISTINCT addresses claiming one point, which is what `bind` counts.
-    let coord = [1, 0, 1];
+    //
+    // **The point must not be this node's own**, and a literal cannot guarantee that: a fresh identity lands
+    // on one of the seven Fano points at random, so a hard-coded `[1, 0, 1]` is the node's own seat one run in
+    // seven — and then the node's *self*-binding is already there, the first insert collides with it, and the
+    // count is 2. Measured exactly that way, passing in isolation and failing inside the full suite.
+    let own = node.address();
+    let coord = (0..7)
+        .map(|i| fanos_geometry::Point::<F2>::at(i).coords())
+        .find(|c| *c != own)
+        .expect("a seven-point plane has a point that is not this node's");
     let a: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
     let b: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
     node.directory().insert(coord, a);
