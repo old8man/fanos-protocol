@@ -38,7 +38,10 @@
   "first_order_blindness": {
     "comment": "V11: the sum of the seven Fano line-adjacency matrices equals J - I (the complete graph K7). Its spectrum makes pairwise monitoring structure-blind.",
     "sum_equals": "J - I",
-    "spectrum": { "6": 1, "-1": 6 }
+    "spectrum": {
+      "6": 1,
+      "-1": 6
+    }
   },
   "partition_fiedler": {
     "comment": "V14: algebraic connectivity (second-smallest Laplacian eigenvalue) of the health-weighted collinearity graph.",
@@ -51,5 +54,48 @@
     "phi_contraction_per_hop": 0.1111111111111111,
     "self_observation_floor_r_th": 0.3333333333333333,
     "kappa_bootstrap": 0.14285714285714285
+  },
+  "stability_radius": {
+    "comment": "T-104, corrected 2026-08-07. The Bures distance from the cell's state to the viability shell {P = 2/N} — the input to the DDoS shed law and the gauge an operator reads. TWO forms ship on purpose: a closed runtime form the homeostat STEERS on, and an exact form used only to REPORT. Values below are the base 7-cell.",
+    "runtime_form": {
+      "comment": "Band coordinates: r = K(N) * (sqrt(Phi) - 1) / sqrt(N). Error <=1.13% across the window and <0.01% at the wall, which is where the shed law needs it. Keys are prefixed because this file is read by a flat `\"key\": number` scan that takes the FIRST numeric match — an unprefixed `at_phi_star` in both forms would make the exact one unreachable.",
+      "formula": "K(N) * (sqrt(P - 1/N) - sqrt(1/N)),  K(N) = sqrt(N) * (N-1)^(1/4) / (2 * sqrt(N-2))",
+      "k_7": 0.9259165243012528,
+      "runtime_at_phi_1_1": 0.017081317833560736,
+      "runtime_at_phi_star": 0.07247982461295915,
+      "runtime_at_phi_2_ceiling": 0.1449596492259183,
+      "runtime_band_spread_ratio": 8.486444116220763
+    },
+    "exact_form": {
+      "comment": "The one-dominant family's exact Bures distance, machine-exact to 1e-14. This is what the telemetry snapshot and the fanos_coherence_stability_radius gauge must reproduce.",
+      "formula": "a(P) = (1 + sqrt((N-1)*(N*P - 1)))/N;  a_c = (1 + sqrt(N-1))/N;  r = sqrt(2*(1 - sqrt(a*a_c) - sqrt((1-a)*(1-a_c))))",
+      "exact_at_phi_1_1": 0.017080221763821075,
+      "exact_at_phi_star": 0.07264323919372198,
+      "exact_at_phi_2_ceiling": 0.14661720405627565,
+      "exact_band_spread_ratio": 8.584033982909798
+    },
+    "root": {
+      "comment": "THE LOAD-BEARING INVARIANT. Both forms are exactly zero on P <= 2/N and only there. It is why every claim that reads only the root — the fault-count table, the tolerated fault fraction — survived the correction untouched, while every claim about the curve's SHAPE had to be redone. Pin the root and that reasoning is checkable rather than a note in a doc.",
+      "vanishes_iff": "P <= 2/N",
+      "at_p_crit": 0.0,
+      "below_p_crit": 0.0
+    },
+    "setpoint": {
+      "comment": "The max-min point of the runtime metric: the band has two opposite failures, so the robust point maximises the SMALLER distance. Equalising them gives sqrt(Phi*) = (1+sqrt2)/2. The scale K/sqrt(N) cancels in the balance, so Phi* is the same on every plane — by proof, not coincidence.",
+      "defining_property": "r(Phi*) - r(1) == r(2) - r(Phi*)",
+      "phi_star_closed_form": "(3 + 2*sqrt(2)) / 4",
+      "phi_star": 1.4571067811865475,
+      "purity_star_closed_form": "(7 + 2*sqrt(2)) / (4*N)",
+      "purity_star_7": 0.3510152544552211,
+      "half_the_ceiling": "r(Phi*) == max_stability_radius / 2, exactly, in the runtime metric",
+      "plane_independent": true
+    },
+    "refuted_form": {
+      "comment": "NEGATIVE VECTOR — this is what the law is NOT. Pinning only the right answer does not stop someone re-deriving the wrong one, and this exact surd shipped for months. It was cited to Fuchs-van de Graaf; the chain bounds d_B from ABOVE through the trace norm while delta-P lives in L2 geometry, and an inequality the wrong way round was asserted as an equality.",
+      "formula": "sqrt(P - 2/N)",
+      "overstates_at_the_wall": "81.7x at Phi = 1.0007; 4.57x at the setpoint; the error DIVERGES because the true law is linear in eps = P - 2/N while the surd is eps^(1/2)",
+      "not_uniformly_wrong": "overstates the ceiling 2.61x at N=7 and 1.73x at N=57, but UNDERSTATES at N=993 (0.0317 against the true 0.0369) — the two laws cross, so rescaling the old numbers errs in both directions",
+      "ceiling_at_7": 0.3779644730092272
+    }
   }
 }

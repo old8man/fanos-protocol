@@ -256,8 +256,14 @@ fn render_vitals(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnaps
         Span::styled("over-coupled — shed correlation", Style::default().fg(CRIT))
     };
     // The radius alone cannot say whether it is small because the cell is small or because the cell is badly
-    // placed inside its band — `r_stab` varies 3.16× across `Φ ∈ (1, 2]`. The offset from the derived robust
-    // point `Φ* = 5/4` is what distinguishes them, so it annotates the radius rather than standing alone.
+    // placed inside its band — `r_stab` varies **8.58×** across `Φ ∈ (1, 2]` (`0.0171` at `Φ = 1.1` against
+    // `0.1466` at `Φ = 2` on a Fano cell). The offset from the derived robust point
+    // `Φ* = (3 + 2√2)/4 ≈ 1.4571` is what distinguishes them, so it annotates the radius rather than standing
+    // alone. Both figures are corrected (T-104, 2026-08-07): this read "3.16×" and "Φ* = 5/4", the refuted
+    // metric's answers. The band is far less uniform than the old number implied, which makes this annotation
+    // more load-bearing, not less. The ±0.1 display bands below are unchanged — they are 20% of the band
+    // either way — but note they were sized around the old setpoint; the thresholds themselves read
+    // `setpoint_offset`, which is computed from `OPTIMAL_INTEGRATION`, so the verdict already moved with it.
     let setpoint_note = if snap.setpoint_offset < -0.1 {
         Span::styled("under-coupled — room above", Style::default().fg(WARN))
     } else if snap.setpoint_offset <= 0.1 {

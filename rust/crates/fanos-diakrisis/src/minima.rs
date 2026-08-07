@@ -264,7 +264,15 @@ pub fn max_survivable_disturbance(n: usize, kappa: f64) -> f64 {
 ///
 /// So: exposed, not enforced. [`crate::homeostat::Homeostat::control`] still returns `Hold` anywhere in the
 /// band, and changing that is gated on evidence rather than on this derivation — see `docs/open-tasks.md`.
-pub const OPTIMAL_INTEGRATION: f64 = 1.457_106_781_186_547_6;
+/// # Computed, not typed
+///
+/// This was the decimal literal `1.457_106_781_186_547_6`, which parses to `1.4571067811865477` while
+/// `(3 + 2√2)/4` is `1.4571067811865475` — **2 ULP apart**. The magnitude is irrelevant; the shape is not. A
+/// derived quantity written as a hand-typed decimal has no link to its derivation, so it cannot be checked by
+/// reading it, it drifts silently if the derivation is revised, and — as `5/4` did here for months — it
+/// outlives the argument that produced it. Evaluating the closed form makes the value and its reason the same
+/// object.
+pub const OPTIMAL_INTEGRATION: f64 = (3.0 + 2.0 * core::f64::consts::SQRT_2) / 4.0;
 
 /// The V-preservation gate expressed in the band's own coordinate: `g_V = Φ − 1`.
 ///
@@ -744,7 +752,7 @@ mod tests {
                 let sum = stability_radius(p, n) + over_coupling_distance(p, n);
                 assert!(
                     (sum - max_stability_radius(n)).abs() < 1e-12,
-                    "N={n} Φ={phi}: the distances must sum to 1/√N, got {sum}"
+                    "N={n} Φ={phi}: the distances must sum to max_stability_radius, got {sum}"
                 );
             }
         }
@@ -752,6 +760,21 @@ mod tests {
 
     #[test]
     fn the_setpoint_is_consistent_across_its_three_forms() {
+        // The closed form, checked through a DIFFERENT expression than the one that defines the constant.
+        // `OPTIMAL_INTEGRATION` evaluates `(3 + 2√2)/4`; the derivation's own intermediate step is
+        // `√Φ* = (1 + √2)/2`, so squaring one and rooting the other are independent routes to the same number.
+        // Re-stating the defining expression here instead would assert nothing at all.
+        // `f64::midpoint(1, √2)` rather than `(1 + √2)/2` — clippy's suggestion, and it happens to say the
+        // derivation out loud: `√Φ*` is the midpoint of the band's two endpoints *in the √Φ coordinate*, which
+        // is exactly what equalising `√Φ − 1` against `√2 − √Φ` means.
+        assert!(
+            (OPTIMAL_INTEGRATION.sqrt() - f64::midpoint(1.0, core::f64::consts::SQRT_2)).abs() < 1e-15,
+            "√Φ* must be the midpoint of 1 and √2, got {}",
+            OPTIMAL_INTEGRATION.sqrt()
+        );
+        // And it is not the midpoint — the conclusion that survived the correction, in weakened form.
+        assert!((OPTIMAL_INTEGRATION - 1.5).abs() > 0.04, "Φ* is not the band midpoint");
+
         // Φ*, P* and r* must describe one state, or a caller steering by correlation would aim somewhere the
         // caller reading purity does not.
         for n in CELLS {

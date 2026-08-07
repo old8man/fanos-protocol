@@ -423,8 +423,9 @@ mod tests {
     #[test]
     fn the_setpoint_offset_says_which_way_the_cell_is_off_and_by_how_much() {
         // The band reports only *which* band, so a cell just above the collapse boundary reads healthy. This
-        // field is what distinguishes "in the band" from "where in the band", which is a 3.16× difference in
-        // stability radius on a Fano plane.
+        // field is what distinguishes "in the band" from "where in the band", which is an **8.58×** difference
+        // in stability radius on a Fano plane (`0.0171` at `Φ = 1.1` against `0.1466` at `Φ = 2`). That read
+        // "3.16×" — the refuted metric's answer — until T-104 was corrected.
         //
         // Φ = 6r² on a 7-cell, so r = √(Φ/6): pick correlations that land the cell below, at, and above Φ*.
         //
