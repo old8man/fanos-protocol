@@ -109,7 +109,7 @@ mod tests {
     const RESOLVER: IpAddr = IpAddr::V4(RESOLVER4);
     const HOST: IpAddr = IpAddr::V4(HOST4);
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_udp_flow_relays_out_and_the_response_returns_as_a_tun_packet() {
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(16);
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(dg2.payload, b"quic-initial");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_tcp_packet_is_dropped_not_relayed() {
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(16);
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);

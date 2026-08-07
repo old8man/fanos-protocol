@@ -685,7 +685,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn request_response_through_the_async_stream() {
         let mut rng = SeedRng::from_seed(b"async-session-key");
         let keypair = StaticKeypair::generate(&mut rng);
@@ -720,7 +720,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_full_duplex_service_streams_both_ways() {
         // The service side is now a DuplexStream via `serve_over_channels`, not an answer-once loop. Prove
         // it: the handler **talks first** — it writes a banner before any request arrives — then
@@ -851,7 +851,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dial_over_a_coordinate_addressed_transport() {
         let mut rng = SeedRng::from_seed(b"mock-key");
         let keypair = StaticKeypair::generate(&mut rng);
@@ -886,7 +886,7 @@ mod tests {
         let _ = CLIENT; // documents the client coordinate in this scenario
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_large_payload_streams_through_the_async_stream() {
         // ~100 KB each way exercises the multi-cell path: the driver's READ_CHUNK loop, many
         // poll/handle rounds, the sliding window, and the retransmit tick — not just a single cell.
@@ -923,7 +923,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_empty_request_completes_cleanly() {
         // The app closes its write side without sending a byte. The driver still propagates the finish
         // (an empty FIN stream), the service answers empty, and the client reads a clean EOF — no hang.
@@ -1026,7 +1026,7 @@ mod tests {
         std::future::pending::<()>().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_session_whose_peer_vanishes_ends_instead_of_retransmitting_forever() {
         // **The ghost session.** Before this, nothing in the platform ever gave up: `drive` returned only
         // on `is_done()` or a closed transport, and a peer that has stopped answering satisfies neither.
@@ -1072,7 +1072,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_live_peer_is_never_abandoned_by_the_give_up_rule() {
         // The other half, and the one that makes the rule safe to have: the give-up threshold must be
         // reachable ONLY by a peer that has genuinely stopped acknowledging. A working request/response

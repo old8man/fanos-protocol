@@ -857,7 +857,7 @@ mod tests {
         assert!(answer.is_none(), "a path with no socket must read as `not running`");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_request_reaches_the_node_and_its_answer_comes_back() {
         let dir = std::env::temp_dir().join(format!("fanos-admin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

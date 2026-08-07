@@ -762,7 +762,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wedged_session_ages_out_even_while_its_peer_keeps_sending() {
         // The ghost-session sweep half. `last_active` must measure whether this session is still
         // CONSUMING, not whether datagrams keep arriving for it: a handler that has stopped draining

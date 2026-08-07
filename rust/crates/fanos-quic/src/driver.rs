@@ -2999,7 +2999,7 @@ mod tests {
     /// the new epoch, re-seats the engine to it, and rebinds its directory coordinate. Driven with a
     /// synthetic beacon so the outcome is deterministic: the new coordinate is exactly
     /// `verifiable_coordinate(creds, epoch, seed)`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_beacon_round_reshuffles_the_coordinate_and_rebinds_the_directory() {
         let creds = NodeCredentials::generate().expect("credentials");
         let (genesis, _, genesis_rank) =
@@ -3113,7 +3113,7 @@ mod tests {
     }
 
     /// A beacon whose VRF lands the node back on its current point is a no-op: no re-seat command.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_beacon_that_does_not_move_the_coordinate_is_a_noop() {
         let creds = NodeCredentials::generate().expect("credentials");
         let (genesis, _, genesis_rank) =

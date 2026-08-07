@@ -4921,17 +4921,24 @@ the_umask` now fails on the next one, and was falsified against that exact line.
 
 ## Adjacent, filed rather than fixed
 
-* The address predicate belongs to the platform, not to `fanos-node::exit`. The hole-punch dial in
-  `fanos-quic` is its second consumer — and needs a **different** realm rule, because an overlay peer is
-  legitimately on RFC 1918 while an exit destination is not. `accept_holepunch`'s own doc names the harm ("a
-  fleet of FANOS nodes becomes a reflector aimed at a third party") and then bounds the *count* rather than
-  the target. Honest severity is MEDIUM: no directory poisoning (the write happens only after a proven
-  coordinate), amplification ≈ 0, and the in-flight set is bounded by the plane.
-* `fanos validator` assembles a bare `OverlayNode::<F2>::new(coord, OverlayConfig::default())`, bypassing
-  `compose_engine` — and the seam guard cannot see it, because it matches the literal `OverlayNode::<F>::new`
-  and the binary writes `F2`.
-* The durable R-C3 loss ledger has no reader: `lost_keys()` is called by nothing in the workspace, while its
-  doc calls a non-empty ledger "visible, auditable evidence". Permanent loss is reported as one log line and
-  the record that outlives the process cannot be queried.
+**This section is the only claim in this file about the _present_.** Everything else is an account of a pass
+and stays true by being dated; a "not fixed yet" list stops being true the moment someone fixes one, and
+nothing here notices. Two of its four entries had in fact been closed — verified against the code, not
+against a task list, and both had been shipped for many commits (#202). Each entry now carries the state it
+was last checked in, so the next reader can see the claim's age instead of assuming it is current.
+
+* **CLOSED — `df41c78`.** *(Was: the address predicate belongs to the platform, not to `fanos-node::exit`; the
+  hole-punch dial in `fanos-quic` is its second consumer and needs a **different** realm rule, because an
+  overlay peer is legitimately on RFC 1918 while an exit destination is not.)* `fanos-quic::dial_policy` now
+  holds the predicate with two named realms, and `every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy`
+  keeps every dialing site on it. The punch-realm derivation in the original note was wrong until a test
+  refuted it — see §12's account.
+* **CLOSED — `48e3a09`.** *(Was: `fanos validator` assembles a bare `OverlayNode::<F2>::new(...)`, bypassing
+  `compose_engine`, and the seam guard cannot see it because it matches the literal `OverlayNode::<F>::new`
+  while the binary writes `F2`.)* The binary goes through `compose_engine::<F2>` and the guard normalises the
+  turbofish, so the evasion that hid it is gone rather than the one instance patched.
+* **OPEN** (re-verified: `lost_keys()` has zero callers in the workspace). The durable R-C3 loss ledger has no
+  reader, while its doc calls a non-empty ledger "visible, auditable evidence". Permanent loss is reported as
+  one log line and the record that outlives the process cannot be queried.
 * `Command::SampleAvailability` (§L4.3) is constructed only by two simulator tests — the light-client
   availability check has no light client.

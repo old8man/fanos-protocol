@@ -915,7 +915,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_bridge_seals_outbound_and_surfaces_only_anonymous_replies() {
         use fanos_aphantos::nostos::seal_to_receiver;
         let dir = fano_directory();

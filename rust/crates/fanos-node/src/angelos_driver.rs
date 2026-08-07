@@ -161,7 +161,7 @@ mod tests {
         HybridKemSecret::generate(&mut SeedRng::from_seed(seed))
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_message_crosses_the_stream_and_arrives_intact() {
         let (secret, public) = keypair(b"angelos-driver-recipient-seed-32");
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(received.seq, sent.seq);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_conversation_carries_many_messages_in_order() {
         // The ratchet advances per message, so the second and later ones are the real test: a framing bug that
         // splits or merges ciphertexts passes the first exchange and fails here.
@@ -210,7 +210,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_clean_end_of_stream_is_not_an_error() {
         // The difference between "the conversation ended" and "the conversation broke" — a messenger that
         // cannot tell them apart reports a hang-up as a failure.
@@ -226,7 +226,7 @@ mod tests {
         assert!(matches!(result, Ok(None)), "a clean hang-up must read as end-of-conversation");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_oversize_length_is_refused_before_anything_is_allocated() {
         // The length is attacker-supplied and read *before* the body. Unbounded, a four-byte header is a
         // four-gigabyte allocation from an unauthenticated peer.
@@ -243,7 +243,7 @@ mod tests {
         writer.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_handshake_that_does_not_verify_is_refused_rather_than_answered() {
         // A responder that replies to garbage tells an unauthenticated prober it is a messenger.
         let (secret, _public) = keypair(b"angelos-driver-bad-handshake-see");

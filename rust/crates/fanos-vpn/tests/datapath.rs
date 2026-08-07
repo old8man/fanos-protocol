@@ -77,7 +77,7 @@ impl UdpDialer for Recorder {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_udp_datagram_written_to_the_device_is_dialed_to_its_original_destination() {
     // The datapath's whole promise in one assertion: a packet the kernel would route to the TUN leaves through the exit
     // addressed to where the application sent it — not to the tunnel endpoint, and not dropped.

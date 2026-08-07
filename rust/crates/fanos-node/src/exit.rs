@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(parse_target("udp:no-port"), None, "a malformed udp target is rejected");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_udp_relay_tunnels_datagrams_to_a_target_and_back() {
         use std::time::Duration;
 

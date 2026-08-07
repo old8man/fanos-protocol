@@ -146,7 +146,7 @@ mod tests {
         assert!(parse_authority("host:not-a-port").is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn connect_opens_a_tunnel_and_splices_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(&echo, b"ping");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_target_is_answered_403_not_dropped() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -180,7 +180,7 @@ mod tests {
         assert!(read_available(&mut client).await.starts_with("HTTP/1.1 403"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_non_connect_method_gets_400() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

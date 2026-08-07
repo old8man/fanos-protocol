@@ -990,3 +990,92 @@ fn every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy() 
          node's packets at the operator's LAN, their loopback, or 169.254.169.254 (#171)."
     );
 }
+
+/// A test that spawns a concurrent peer must run on a runtime that can be concurrent.
+///
+/// `#[tokio::test]` defaults to the **current-thread** runtime. A test that `tokio::spawn`s a peer and then
+/// drives the other side is asserting a concurrent property on an executor where the two can only interleave
+/// at each other's await points — so a data race cannot manifest, a deadlock that needs true parallelism
+/// cannot appear, and the ordering the test happens to observe gets certified as the ordering.
+///
+/// This is #84's class, and #84 was closed while **26 such tests across 12 files** remained. They were all
+/// converted (#201); this guard is what stops the flavour drifting back, because the conversion is invisible
+/// in a diff that only adds a `spawn` to an existing test.
+///
+/// The filter is `spawns ∧ current-thread`, not "is async" — a sequential async test needs no threads and
+/// paying for them is waste.
+///
+/// **`worker_threads` is not checked here, and two is not the answer.** Two is the smallest count that makes
+/// concurrency *possible*, which is a different property from making a race *observable* — the only
+/// measurement in this tree says so directly: `fanos-quic/tests/proteus.rs` records "two workers see it 3
+/// times in 8 where four see it 8 of 8". The conversions therefore use four. Reading "two is enough to
+/// interleave" as a licence to halve them is the mistake this paragraph exists to stop; it was very nearly
+/// made here, reasoning from the minimum that satisfies the definition instead of from the number that was
+/// measured against the purpose.
+#[test]
+fn a_test_that_spawns_a_peer_does_not_run_on_a_current_thread_runtime() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    // **The scanner must not count itself.** This file quotes both `#[tokio::test` and `tokio::spawn` in the
+    // text above, and the first run of this guard duly reported its own doc comment as an offender. Excluded
+    // by `file!()` rather than by name, so the exclusion cannot drift onto some other file and cannot be
+    // widened into a list — a list of exempt files is the hole, not the fix.
+    let myself = root.join(file!()).canonicalize().ok();
+    let mut offenders = Vec::new();
+    let mut async_tests = 0usize;
+    let mut files = 0usize;
+
+    for krate in std::fs::read_dir(root.join("crates")).expect("crates/") {
+        let base = krate.expect("entry").path();
+        let mut stack = vec![base.join("src"), base.join("tests")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                if path.canonicalize().ok() == myself {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else { continue };
+                if !src.contains("#[tokio::test") {
+                    continue;
+                }
+                files += 1;
+                // Split on the attribute so each test's own body is examined, not the file's. A file-level
+                // grep would clear a file that has one `spawn` in production code, which is most of them.
+                for chunk in src.split("#[tokio::test").skip(1) {
+                    async_tests += 1;
+                    let (attr, body) = chunk.split_once('\n').unwrap_or((chunk, ""));
+                    if attr.contains("multi_thread") {
+                        continue;
+                    }
+                    let body = &body[..body.len().min(4000)];
+                    if body.contains("tokio::spawn") {
+                        let name = body
+                            .split("async fn ")
+                            .nth(1)
+                            .and_then(|s| s.split('(').next())
+                            .unwrap_or("<unnamed>");
+                        offenders.push(format!("{}::{name}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+
+    // A scan that examined nothing is a pass by accident. Both counts are floors observed at the time this
+    // guard landed, so a walk that silently stops finding files fails here rather than reporting "clean".
+    assert!(files >= 20, "the walk found only {files} files with async tests; the scan is broken, not the tree");
+    assert!(async_tests >= 100, "only {async_tests} async tests examined; the split is broken");
+    assert!(
+        offenders.is_empty(),
+        "these tests spawn a peer on a current-thread runtime, where it cannot run concurrently \
+         — give them `#[tokio::test(flavor = \"multi_thread\", worker_threads = N)]` (#201):\n  {}",
+        offenders.join("\n  ")
+    );
+}

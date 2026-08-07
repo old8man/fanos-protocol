@@ -96,7 +96,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn run_vpn_bridges_a_tun_device_through_the_datapath() {
         let (feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>(8);
         let (sent_tx, mut sent_rx) = mpsc::channel::<Vec<u8>>(8);

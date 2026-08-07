@@ -143,7 +143,7 @@ async fn udp_associate_ignores_a_fragmented_datagram() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusing_dialer_yields_a_socks_error() {
     use fanos_proxy::dialer::RefuseDialer;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
