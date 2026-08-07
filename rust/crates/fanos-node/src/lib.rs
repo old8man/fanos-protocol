@@ -139,6 +139,13 @@ impl Directory {
 pub enum Gate {
     /// A POROS reshare sub-share that did not come from the outgoing member whose index it claimed.
     ReshareSubShare,
+    /// A POROS **descriptor share** that arrived from a coordinate outside the ingress line.
+    ///
+    /// A combiner asks its own line for shares and they answer it directly, so a share from anywhere else was
+    /// never requested and cannot be an answer. The handler used to discard the sender entirely — unlike the
+    /// reshare and share-request paths, which both take it — and a share is not a harmless message to accept
+    /// from a stranger: it enters the gather, and `recover` tolerates only one corrupt member (#152).
+    IngressShare,
     /// A rendezvous host registration whose signature or epoch did not verify.
     HostRegistration,
     /// A capability advertisement that failed its signature or epoch check.
@@ -151,6 +158,7 @@ impl Gate {
     /// Every gate, for a reader that enumerates rather than guesses.
     pub const ALL: &'static [Self] = &[
         Self::ReshareSubShare,
+        Self::IngressShare,
         Self::HostRegistration,
         Self::CapabilityAdvertisement,
         Self::BoundCapabilityAdvertisement,
@@ -165,6 +173,7 @@ impl Gate {
             Self::HostRegistration => 1,
             Self::CapabilityAdvertisement => 2,
             Self::BoundCapabilityAdvertisement => 3,
+            Self::IngressShare => 4,
         }
     }
 
@@ -173,6 +182,7 @@ impl Gate {
     pub const fn name(self) -> &'static str {
         match self {
             Self::ReshareSubShare => "reshare_sub_share",
+            Self::IngressShare => "ingress_share",
             Self::HostRegistration => "host_registration",
             Self::CapabilityAdvertisement => "capability_advertisement",
             Self::BoundCapabilityAdvertisement => "bound_capability_advertisement",

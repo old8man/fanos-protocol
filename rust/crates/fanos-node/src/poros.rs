@@ -1247,7 +1247,30 @@ impl PorosHost {
     /// The check is at arrival rather than at reconstruction because that is what preserves liveness: a
     /// forged share never enters the gather, so the gather can still fill from the line's honest members and
     /// serve normally. Rejecting it later would mean the gather holds a threshold it cannot use.
-    fn on_share(&mut self, now: Instant, requester: Triple, share: Share) -> Vec<Effect> {
+    fn on_share(&mut self, now: Instant, from: Triple, requester: Triple, share: Share) -> Vec<Effect> {
+        // **A share from outside the line was never requested and cannot be an answer** (#152). A combiner
+        // asks its OWN line for shares (`on_share_req` replies straight to the asker), so the only legitimate
+        // senders are the coordinates in `self.line`. This handler used to discard `from` altogether — the
+        // reshare and share-request paths both take it — and a share is not a harmless message to accept from
+        // a stranger: it enters the gather, and `recover` tolerates only one corrupt member, so two admitted
+        // frames deny the request.
+        //
+        // Checked BEFORE the commitment, because the two answer different questions and only one of them can
+        // be answered about a stranger. A member forging a value is caught below by its dealt commitment; a
+        // non-member has no dealt commitment to be caught by, and on a rotated line there is nothing to check
+        // against at all — so this is the only gate that closes for the rotated case.
+        //
+        // Counted, not merely dropped: a rejection that leaves no trace is indistinguishable from a message
+        // that never arrived, which is the whole of #109.
+        if !self.line.contains(&from) {
+            self.stations.record_tagged(
+                Station::AuthenticationRejected,
+                Some(from),
+                Some(crate::Gate::IngressShare.tag()),
+                1,
+            );
+            return Vec::new();
+        }
         if let Some(station) = self.binding.refuse(&share) {
             // Provably not the value the dealer handed that member — evidence of forgery, not of failure.
             // The two refusals are counted apart because they name different attacks: a wrong value at a real
@@ -1360,7 +1383,7 @@ impl Engine for PorosHost {
                         .and_then(decode_triple)
                         .map_or_else(Vec::new, |requester| self.on_share_req(from, requester)),
                     Some(FrameType::PorosShare) => decode_share_reply(decoded.body)
-                        .map_or_else(Vec::new, |(requester, share)| self.on_share(now, requester, share)),
+                        .map_or_else(Vec::new, |(requester, share)| self.on_share(now, from, requester, share)),
                     Some(FrameType::PorosReshare) => decode_reshare(decoded.body)
                         .map_or_else(Vec::new, |(epoch, old_x, sealed)| self.on_reshare(from, epoch, old_x, &sealed)),
                     _ => Vec::new(),
@@ -2423,14 +2446,15 @@ mod tests {
         let req = solve_ingress_request(requester, &community, epoch, &beacon, difficulty);
         combiner.step(Instant(0), Input::Message { from: requester, frame: request_frame(&req) });
 
-        // Two shares at indices the three-member line does not have. The payload is irrelevant — the point is
-        // that nothing in the dealt commitments can speak about `x = 200` or `x = 201`, so the only sound
-        // answer is to refuse. `from` is a coordinate off the line, because the handler never reads it.
-        let outsider = coord(6);
+        // Two shares at indices the three-member line does not have, **sent by a real line member** — the
+        // harder case, and the one this check exists for. A stranger is stopped at the membership gate before
+        // any of this (asserted separately below); a member is not, so the dealt commitments are the only
+        // thing standing between a forged index and the gather. The payload is irrelevant: nothing in those
+        // commitments can speak about `x = 200`, so the only sound answer is to refuse.
         for (n, x) in [200u8, 201].into_iter().enumerate() {
             let junk = Share::new(x, vec![0xEE; shares[0].y().len()]);
             let frame = encode(FrameType::PorosShare, &encode_share_reply(requester, &junk));
-            let out = combiner.step(Instant(1 + n as u64), Input::Message { from: outsider, frame });
+            let out = combiner.step(Instant(1 + n as u64), Input::Message { from: line[2], frame });
             assert!(out.is_empty(), "a share at an index the line does not have must produce nothing");
         }
 
@@ -2466,6 +2490,27 @@ mod tests {
             0,
             "and NOT as an off-commitment share — a wrong value at a real index is a member misbehaving, an \
              index the line does not have is anyone at all, and one count cannot say which",
+        );
+
+        // **And a stranger never reaches that check at all.** The share handler used to discard `from`, so
+        // anyone who could reach the combiner could feed its gather; the reshare and share-request paths both
+        // took the sender. A combiner asks its OWN line and they answer it directly, so a share from anywhere
+        // else was never requested. This is also the only gate that closes for a ROTATED binding, where there
+        // are no per-share commitments left to check a forgery against.
+        let outsider = coord(6);
+        let honest_again = encode(FrameType::PorosShare, &encode_share_reply(requester, &shares[2]));
+        assert!(
+            combiner
+                .step(Instant(4), Input::Message { from: outsider, frame: honest_again })
+                .is_empty(),
+            "a share relayed by a coordinate off the line must produce nothing — even a VALID one, because \
+             the combiner did not ask it and cannot know what else it would send",
+        );
+        assert_eq!(
+            combiner.stations().get(Station::AuthenticationRejected, Some(outsider)),
+            1,
+            "and the refusal is attributed to the coordinate that sent it, so a probe is distinguishable from \
+             a quiet line (#109) — the tag names WHICH gate closed",
         );
     }
 

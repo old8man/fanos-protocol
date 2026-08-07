@@ -107,7 +107,8 @@ fn gate_tags_and_names_are_unique_and_pinned() {
     assert_eq!(names.len(), n_names, "two gates share a name");
     assert_eq!(Gate::ReshareSubShare.tag(), 0);
     assert_eq!(Gate::BoundCapabilityAdvertisement.tag(), 3);
-    assert_eq!(Gate::ALL.len(), 4, "a new gate must be added to ALL, or it is invisible to readers");
+    assert_eq!(Gate::IngressShare.tag(), 4);
+    assert_eq!(Gate::ALL.len(), 5, "a new gate must be added to ALL, or it is invisible to readers");
 }
 
 /// A `Directory` tag and a `Gate` tag are read under **different** stations, so they may collide freely —

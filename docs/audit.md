@@ -4546,6 +4546,23 @@ member misbehaving, an index the line does not have is anyone at all, and one co
 request stops being served — rather than at a counter. The property is asserted before the instrument, so a
 fixture that served nothing could not pass the refusal half vacuously.
 
-Two things this leaves open, both deliberately separate: `on_share` still does not know its sender, and a
-**rotated** binding still admits any index by construction — the documented residual that verified resharing
-closes.
+### The second half: the handler now knows its sender
+
+`on_share` discarded `from` entirely, while `on_share_req` and `on_reshare` both took it — so any node that
+could reach a combiner could feed its gather. A combiner asks its **own line** for shares and they answer it
+directly (`on_share_req` replies straight to the asker), so a share from anywhere else was never requested and
+cannot be an answer. It now refuses one, records `Station::AuthenticationRejected` tagged with a new
+`Gate::IngressShare`, and attributes it to the coordinate that sent it.
+
+Checked **before** the commitment, because the two gates answer different questions and only one of them can
+be answered about a stranger: a member forging a value is caught by its dealt commitment, while a non-member
+has no dealt commitment to be caught by — and on a **rotated** binding there is nothing to check against at
+all, so this is the only gate that closes that case. The two together are defence in depth rather than a
+duplicate: the index check stops a *member* forging, the membership check stops *everyone else*.
+
+The test exercises the harder case deliberately. The forged indices are sent **by a real line member**, since a
+stranger is now stopped at the door and would make the index assertions vacuous — the failure that appeared the
+moment the membership gate landed, and the reason the two are asserted separately.
+
+Still open, and deliberately: a **rotated** binding admits any index by construction — the documented residual
+that verified resharing closes.
