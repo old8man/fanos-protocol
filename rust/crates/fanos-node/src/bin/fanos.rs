@@ -353,12 +353,12 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     tokio::pin!(isolation_check);
     let mut isolation_checked = configured == 0; // a node founding a cell must stay silent, or this cries wolf at every genesis
 
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let stop = fanos_node::shutdown::stop_requested();
+    tokio::pin!(stop);
     loop {
         tokio::select! {
             biased;
-            _ = &mut ctrl_c => {
+            () = &mut stop => {
                 info!("shutdown signal received");
                 break;
             }
@@ -821,7 +821,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     // Serve the proxy until Ctrl-C, while concurrently draining the node's notifications so the overlay keeps
     // making progress and operator-visible events are logged.
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        fanos_node::shutdown::stop_requested().await;
         info!("shutdown signal received");
     };
     let (admin_socket, mut admin_rx) = control_socket(args);
@@ -940,7 +940,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     info!(coord = ?health.address, name = %address.to_name(), %forward, "fanos host up");
 
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        fanos_node::shutdown::stop_requested().await;
         info!("shutdown signal received");
     };
     let (admin_socket, mut admin_rx) = control_socket(args);
@@ -1013,7 +1013,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     info!(coord = ?node.address(), tun = %tun_name, "fanos vpn up");
 
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        fanos_node::shutdown::stop_requested().await;
         info!("shutdown signal received");
     };
     let (admin_socket, mut admin_rx) = control_socket(args);
@@ -2037,12 +2037,12 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         let _ = write!(identity_hex, "{byte:02x}");
     }
     eprintln!("  {identity_hex}");
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let stop = fanos_node::shutdown::stop_requested();
+    tokio::pin!(stop);
     loop {
         tokio::select! {
             biased;
-            _ = &mut ctrl_c => break,
+            () = &mut stop => break,
             note = node.next_notification() => match note {
                 Some(n) => log_notification(&n),
                 None => break,
@@ -3161,12 +3161,12 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     // Serve until Ctrl-C, logging consensus progress, draining the node's notifications, and — the point of the
     // `consensus` verb — answering an operator who wants to know why this validator sits where it does.
     let (admin_socket, mut admin_rx) = control_socket(args);
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let stop = fanos_node::shutdown::stop_requested();
+    tokio::pin!(stop);
     loop {
         tokio::select! {
             biased;
-            _ = &mut ctrl_c => {
+            () = &mut stop => {
                 info!("shutdown signal received");
                 break;
             }

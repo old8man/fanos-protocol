@@ -258,6 +258,8 @@ pub mod admin;
 pub mod composition;
 pub mod angelos_driver;
 pub mod setup;
+/// Which signals mean "stop cleanly" — the half of the drain that lives above the drain itself.
+pub mod shutdown;
 pub mod resolve;
 /// Differentially-private telemetry export over the overlay store (audit C7) — see [`telemetry_dir`].
 pub mod telemetry_dir;

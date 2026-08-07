@@ -305,6 +305,14 @@ pub fn render_systemd_unit(exe: &Path, config: &Path, data: &Path, user_unit: bo
     let _ = writeln!(s, "ExecStart={} node --config {}", exe.display(), config.display());
     let _ = writeln!(s, "Restart=on-failure");
     let _ = writeln!(s, "RestartSec=5");
+    // **Stated, not defaulted.** systemd's default stop signal is SIGTERM either way, but writing it makes
+    // the supervisor's half of the contract readable — and a guard asserts it is one the binary actually
+    // handles (`fanos_node::shutdown::HANDLED_STOP_SIGNALS`). The two halves are each plausible alone and
+    // only wrong together: a unit sending a signal nobody catches, or a binary catching one nobody sends.
+    let _ = writeln!(s, "KillSignal=SIGTERM");
+    // The node persists its store before closing its endpoint. systemd's default 90 s is generous for that,
+    // but stating it keeps the drain's budget beside the signal that starts it, rather than in a manual.
+    let _ = writeln!(s, "TimeoutStopSec=30");
     // A node that cannot reach the overlay retries forever by design; without this, systemd gives up on it.
     let _ = writeln!(s, "StartLimitIntervalSec=0");
     let _ = writeln!(s, "StateDirectory=fanos");
@@ -557,6 +565,38 @@ mod tests {
         let taken = held.local_addr().expect("its address").port();
         let found = free_udp_port(taken, 16).expect("a later port is free");
         assert_ne!(found, taken, "the probe handed back a port it could not have bound");
+    }
+
+    #[test]
+    fn the_signal_the_unit_sends_is_one_the_binary_handles() {
+        // **A guard on the join, not on either half.** "The unit stops the node with SIGTERM" and "the node
+        // handles SIGINT" are both defensible sentences; together they mean every `systemctl stop` kills the
+        // process before it persists. Neither file can see the mismatch, so the check has to read both — the
+        // rendered unit for what will be *sent*, and the binary's own list for what is *caught*.
+        let unit = render_systemd_unit(
+            Path::new("/usr/local/bin/fanos"),
+            Path::new("/etc/fanos/fanos.conf"),
+            Path::new("/var/lib/fanos"),
+            false,
+        );
+        // systemd's default when the key is absent is SIGTERM, so an omitted key is not a pass — it is the
+        // same obligation, unstated. Read the value if present and fall back to what systemd would do.
+        let sent = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("KillSignal="))
+            .unwrap_or("SIGTERM")
+            .trim();
+        assert!(
+            crate::shutdown::HANDLED_STOP_SIGNALS.contains(&sent),
+            "the unit stops the node with {sent}, which is not in {:?} — an orchestrated stop would \
+             terminate it before the store is persisted",
+            crate::shutdown::HANDLED_STOP_SIGNALS
+        );
+        // The drain needs a budget on the supervisor's side too, or systemd SIGKILLs mid-write.
+        assert!(
+            unit.lines().any(|l| l.starts_with("TimeoutStopSec=")),
+            "the unit must give the drain a stated budget:\n{unit}"
+        );
     }
 
     #[test]
