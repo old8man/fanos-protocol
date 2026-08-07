@@ -16,14 +16,40 @@ No open CRITICAL/HIGH *security* item remains (`docs/audit.md`, all four passes 
 
 ### [A] The homeostat has a derived setpoint and does not steer to it
 `Homeostat::control` (`homeostat.rs`) returns `Hold` for any mean correlation inside `collective_subject_window`, i.e. any
-`Φ ∈ (1, 2]` — a range across which `r_stab = √((Φ−1)/N)` varies **3.16×** (`0.120` at `Φ = 1.1` against `0.378` at
-`Φ = 2` on a Fano cell). A cell can sit a hair above the collapse boundary, be told it is healthy, and absorb a third of
-the disturbance it could.
+`Φ ∈ (1, 2]` — a range across which the stability radius varies **8.58×** (`0.0171` at `Φ = 1.1` against `0.1466` at
+`Φ = 2` on a Fano cell, in the exact metric; `8.49×` and `0.1450` in the runtime one). A cell can sit a hair above the
+collapse boundary, be told it is healthy, and absorb an eighth of the disturbance it could. In the runtime form the
+ratio is exactly `(√2 − 1)/(√1.1 − 1)` and therefore **the same on every plane** — the scale factor `K/√N` cancels in
+it, as it does in the setpoint below.
 
-The setpoint is now **derived** (`fanos_diakrisis::minima::OPTIMAL_INTEGRATION`): the metric is the one `r_stab` already
-implies, `ds = dP/(2√(P − 2/N))`, and integrating it to the upper boundary gives `d_high = 1/√N − r_stab`, so the two
-distances partition `1/√N` and the max-min point is `r_stab* = 1/(2√N)`, i.e. `Φ* = 5/4`, `P* = (9/4)/N`. Notably **not**
-the midpoint `Φ = 3/2`, which is strictly worse — the metric is singular at the lower boundary.
+The setpoint is **derived** (`fanos_diakrisis::minima::OPTIMAL_INTEGRATION`), and in band coordinates the derivation is
+one line. The runtime radius is `r_stab = K(N)·(√Φ − 1)/√N` with `K(N) = √N·⁴√(N−1)/(2√(N−2))`, so the distance down to
+collapse is `∝ √Φ − 1` and the distance up to the ceiling is `∝ √2 − √Φ`. **The scale factor `K/√N` divides out**, so the
+max-min point equalises the two brackets and is the same on every plane:
+
+```
+√Φ − 1 = √2 − √Φ   ⟹   √Φ* = (1 + √2)/2   ⟹   Φ* = (3 + 2√2)/4 = 1.4571067811865475
+```
+
+Notably **not** the midpoint `Φ = 3/2` — but only just, and the reason matters (below). One clean consequence worth
+asserting: since the setpoint equalises the two distances and they sum to the ceiling, `r_stab(Φ*)` is **exactly half**
+`max_stability_radius` — `0.0725` against `0.1450` on a Fano cell, and at every `N`. That identity is exact in the
+**runtime** metric, which is the one Φ\* is the max-min point of; against the exact metric it holds to `0.9 %`
+(`0.0726` against half of `0.1466`), inside the runtime form's stated ≤1.13 % budget.
+
+> **Corrected 2026-08-07 (#183).** This section derived `Φ* = 5/4`, `P* = (9/4)/N`, `r_stab* = 1/(2√N)` from
+> `r_stab = √(P − 2/N)` and a metric `ds = dP/(2√(P − 2/N))`, and quoted a **3.16×** spread across the band. That radius
+> formula was refuted — it overstates the margin by up to 81.7× at the viability wall. The old derivation's load-bearing
+> sentence was that the metric is *singular at the lower boundary*, so equal distance in `Φ` is not equal distance in the
+> geometry. **That singularity was an artefact of the surd**: the true radius is linear in `ε = P − 2/N` near the wall, so
+> `ds` is constant there. The conclusion survives in weakened form — `1.4571` is still not `1.5` — but the singularity was
+> doing most of the work, and the setpoint moves up by `0.207`.
+>
+> The cost of having held the old value: at `Φ = 5/4` the true margin is `0.0413` against `0.1466` available at `Φ = 2`,
+> so the homeostat was aiming at **28 % of the robustness the band affords** while believing it was at the max-min point.
+
+The closed form above is exact; `OPTIMAL_INTEGRATION` should be *computed* from it rather than typed as a decimal, since
+the hand-written literal is 2 ULP off the true value.
 
 **What remains is the control change, and it should be evidence-gated.** Teaching `control` to nudge toward `Φ*` inside
 the band replaces a dead zone with a proportional term, which can oscillate; it needs a closed-loop experiment showing a

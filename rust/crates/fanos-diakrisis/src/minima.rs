@@ -24,16 +24,23 @@
 //! `(1/√(N−1), √(2/(N−1))]` — but in integration they are the constants `Φ ∈ (1, 2]`, equivalently
 //! `P ∈ (2/N, 3/N]`. A cell grows by *diluting* correlation at exactly the rate that holds `Φ` still.
 //!
-//! **3. The stability radius falls as the cell grows — and fault tolerance does not.** The radius is
-//! `r_stab = √(P − 2/N) = √((Φ − 1)/N)`, and `Φ ≤ 2` caps it at
+//! **3. The stability radius falls as the cell grows — and fault tolerance does not.** `Φ ≤ 2` caps the
+//! radius at [`max_stability_radius`],
 //!
 //! ```text
-//! r_stab ≤ 1/√N
+//! r_stab ≤ ⁴√(N−1)·(√2 − 1) / (2·√(N−2))     ~  N^(−1/4)
 //! ```
 //!
 //! attained only at the top of the window. Since T-104 survives sustained noise `h` iff `h < κ·r_stab`, the
-//! disturbance such a cell can absorb is at most `κ/√N` — and with `κ_bootstrap = ω₀/N` it falls as
-//! `ω₀·N^(−3/2)`.
+//! disturbance such a cell can absorb is at most `κ·r_max`.
+//!
+//! **Corrected 2026-08-07.** This read `r_stab = √(P − 2/N) = √((Φ − 1)/N)`, capped at `1/√N`, with the
+//! absorbed disturbance falling as `ω₀·N^(−3/2)`. The radius formula was refuted (see
+//! [`crate::stability::stability_radius`]) and the exponent moved with it: `N^(−1/2)` → `N^(−1/4)`, so with
+//! `κ_bootstrap = ω₀/N` the absorbed disturbance falls as `ω₀·N^(−5/4)`, not `N^(−3/2)`. **The `N^(−3/2)`
+//! figure still appears in result 6's cancellation argument and has not been recomputed** — result 6's
+//! headline is derived from purity arithmetic that this correction does not touch, but its radius-scaling
+//! sentences are stale until someone redoes them.
 //!
 //! **The tempting reading of that is wrong, and it was published here for most of a day.** "A larger cell has
 //! a smaller radius, so it is less robust" compares an *absolute* distance without asking what it is compared
@@ -60,23 +67,26 @@
 //! ## 5. The band has a setpoint, and it is not its midpoint
 //!
 //! [`crate::homeostat::Homeostat::control`] returns `Hold` for any correlation inside the collective-subject
-//! window, i.e. for any `Φ ∈ (1, 2]`. Result 3 says robustness is not flat there: it varies **3.16×**, from
-//! `r_stab = 0.120` at `Φ = 1.1` to `0.378` at `Φ = 2` on a Fano cell. A cell can sit a hair above the collapse
-//! boundary, be told it is healthy, and absorb a third of the disturbance it could.
+//! window, i.e. for any `Φ ∈ (1, 2]`. Robustness is not flat there: on a Fano cell it varies **8.58×**, from
+//! `r_stab = 0.0171` at `Φ = 1.1` to `0.1466` at `Φ = 2`. A cell can sit a hair above the collapse boundary,
+//! be told it is healthy, and hold under a twelfth of the disturbance it could.
 //!
-//! The band has two opposite failures, so the robust point maximizes the *smaller* distance — and both
-//! distances are available in one metric without inventing anything. `r_stab = √(P − 2/N)` is the Bures
-//! distance to the lower boundary, which fixes `ds = dP/(2√(P − 2/N))`; integrating that up to `3/N` gives
-//! `d_high = 1/√N − r_stab`. The two therefore **partition the constant `1/√N`**, and the max-min point is
-//! where they are equal:
+//! (That spread was published here as **3.16×** — the refuted metric's answer. The band is far less uniform
+//! than it looked and its bottom far more fragile, which is the practical content of the correction.)
+//!
+//! The band has two opposite failures, so the robust point maximizes the *smaller* distance, both measured in
+//! the one metric the theory offers. With `d_low(P) = r(P)` and `d_high(P) = r(3/N) − r(P)` the two sum to the
+//! constant `r(3/N)` and the max-min point is where they are equal, `r(P*) = r(3/N)/2`. The metric's scale
+//! **cancels** there, so the answer is N-independent:
 //!
 //! ```text
-//! r_stab* = 1/(2√N)      ⟺      Φ* = 5/4      ⟺      P* = (9/4)/N
+//! Φ* = (3 + 2√2)/4 = 1.4571…      ⟺      P* = (7 + 2√2)/(4N)
 //! ```
 //!
-//! **Φ = 3/2 is the midpoint and it is wrong** — strictly worse, because the metric is singular at the lower
-//! boundary and equal distance in `Φ` is not equal distance in the geometry the theory uses. That is the whole
-//! reason to derive it rather than pick it. See [`OPTIMAL_INTEGRATION`].
+//! It is still **not** the midpoint `Φ = 3/2`, but the old derivation's reason — *"the metric is singular at
+//! the lower boundary"* — was an artefact of the refuted surd: the true law is linear in `P − 2/N` near the
+//! wall, so the metric is not singular and the setpoint moves from `5/4` most of the way to the midpoint.
+//! See [`OPTIMAL_INTEGRATION`].
 //!
 //! Exposed, not enforced: teaching `control` to steer toward `Φ*` inside the band is a control-law change and
 //! is gated on evidence, not on this derivation alone (`docs/open-tasks.md`).
@@ -147,11 +157,17 @@ pub const MIN_VIABLE_CELL: usize = 3;
 /// `N` grows, but only so as to hold this interval fixed.
 pub const PHI_WINDOW: (f64, f64) = (1.0, 2.0);
 
-/// The greatest stability radius an `N`-node cell can hold: `1/√N`.
+/// The greatest stability radius an `N`-node cell can hold — the value at the top of the band, `P = 3/N`.
 ///
-/// From `r_stab = √((Φ − 1)/N)` maximized over the admissible window `Φ ≤ 2`. Decreasing in `N`, so this is
-/// simultaneously the answer to "how robust can a cell of this size be" and the argument for keeping cells
-/// small.
+/// ```text
+/// r_max = ⁴√(N−1)·(√2 − 1) / (2·√(N−2))
+/// ```
+///
+/// **This was `1/√N`, from the refuted `r_stab = √(P − 2/N)` (T-104, corrected 2026-08-07).** Substituting the
+/// corrected metric changes the number *and the exponent*: `1/√N` falls as `N^{−1/2}`, this falls as
+/// `N^{−1/4}`. The ceiling still decreases with cell size — the qualitative claim survives — but far more
+/// slowly, and the two curves cross: measured `0.14496` vs `0.37796` at `N = 7` (2.6× lower), `0.07639` vs
+/// `0.13245` at `N = 57` (1.7×), and `0.03692` vs `0.03173` at `N = 993`, where the old form **understated**.
 ///
 /// Returns `0` for a cell below [`MIN_VIABLE_CELL`], where no admissible `Φ` exists at all — rather than the
 /// formula's value, which would be a positive number describing a state the cell cannot occupy.
@@ -160,7 +176,7 @@ pub fn max_stability_radius(n: usize) -> f64 {
     if n < MIN_VIABLE_CELL {
         return 0.0;
     }
-    1.0 / sqrt(n as f64)
+    crate::stability::stability_radius(3.0 / n as f64, n)
 }
 
 /// The greatest sustained disturbance an `N`-node cell can absorb at healing gain `kappa`: `κ/√N`.
@@ -175,30 +191,54 @@ pub fn max_survivable_disturbance(n: usize, kappa: f64) -> f64 {
 
 /// The integration a cell should be **held at**: `Φ* = 5/4`.
 ///
-/// Derived, not chosen. The band has two opposite failures — collapse at `Φ = 1` and loss of the self-model
-/// above `Φ = 2` — so the robust operating point maximizes the *smaller* of the two distances. The distances
-/// have to be measured in one metric, and there is only one on offer: `r_stab = √(P − 2/N)` is the Bures
-/// distance to the lower boundary, which fixes the line element
+/// Derived, not chosen — and **re-derived 2026-08-07 after the metric it rests on was refuted**.
+///
+/// The band has two opposite failures, collapse at `Φ = 1` and loss of the self-model above `Φ = 2`, so the
+/// robust operating point maximizes the *smaller* of the two distances, both measured in the one metric the
+/// theory offers: the Bures distance to the viability shell,
+/// [`stability_radius`](crate::stability::stability_radius).
+///
+/// With `d_low(P) = r(P)` and `d_high(P) = r(3/N) − r(P)`, the two sum to the constant `r(3/N)` and the
+/// max-min point is where they are equal, `r(P*) = r(3/N)/2`. Under the runtime metric
+/// `r = K(√(P − 1/N) − √(1/N))` the scale `K` **cancels** — the balance point of two distances is unchanged
+/// by any monotone rescaling — leaving
 ///
 /// ```text
-/// ds = dP / (2·√(P − 2/N))
+/// √(P* − 1/N) = √(1/N)·(1 + √2)/2
+/// P*          = (7 + 2√2)/(4N)
+/// Φ*          = N·P* − 1 = (3 + 2√2)/4 = 1.4571…
 /// ```
 ///
-/// Integrating that from `P` up to the upper boundary `3/N` gives a closed form,
+/// `K` cancelling is why this is **N-independent**, exactly as the old value was.
 ///
-/// ```text
-/// d_high = √(3/N − 2/N) − √(P − 2/N) = 1/√N − r_stab
-/// ```
+/// # What was wrong before, and why the old argument cannot be repaired
 ///
-/// so the two distances sum to the constant `1/√N` and `max min(d_low, d_high)` lands where they are equal:
+/// This constant was `5/4`, derived from `r_stab = √(P − 2/N)` — a formula the corpus refuted, *toward
+/// danger*, and whose overstatement diverges at the wall. The old derivation's load-bearing sentence was:
 ///
-/// ```text
-/// r_stab* = 1/(2√N)      ⟺      Φ* = 5/4      ⟺      P* = (9/4)/N
-/// ```
+/// > *"It is not the midpoint of the band. `Φ = 3/2` would be, and it is wrong: the metric is **singular at
+/// > the lower boundary**, so equal distance in `Φ` is not equal distance in the geometry."*
 ///
-/// **It is not the midpoint of the band.** `Φ = 3/2` would be, and it is wrong: the metric is singular at the
-/// lower boundary, so equal distance in `Φ` is not equal distance in the geometry the theory actually uses.
-/// A setpoint picked by eye would have landed there.
+/// **That singularity was an artefact of the refuted surd.** The true radius is *linear* in `ε = P − 2/N` near
+/// the wall, so `ds` is constant there and the metric is not singular at all. The premise that pushed the
+/// setpoint down to `5/4` does not exist.
+///
+/// The conclusion survives in weakened form: `1.4571` is still **not** the midpoint `1.5`, so the derivation
+/// still does work — but the singularity was doing about 85% of it, and saying so is the point of recording a
+/// correction rather than quietly editing a number.
+///
+/// # The cost of holding the old value
+///
+/// At `Φ = 5/4` the true margin is `0.0413`, against `0.1466` available at `Φ = 2` — the homeostat was holding
+/// the cell at **28% of the robustness the band affords** while believing it was at the max-min point. The old
+/// gauge reported `0.18898` there, overstating by `4.57×`.
+///
+/// # Approximation, stated
+///
+/// This is the max-min point of the **runtime** metric, which is what the homeostat steers by — a setpoint
+/// derived from a different metric than the gauge would put the two out of agreement by construction. Against
+/// the exact closed form the gap is `0.31%` at `N = 7`, rising to `1.06%` at `N = 57`, inside the runtime
+/// form's stated ≤1.13% budget.
 ///
 /// # What this is not
 ///
@@ -224,7 +264,7 @@ pub fn max_survivable_disturbance(n: usize, kappa: f64) -> f64 {
 ///
 /// So: exposed, not enforced. [`crate::homeostat::Homeostat::control`] still returns `Hold` anywhere in the
 /// band, and changing that is gated on evidence rather than on this derivation — see `docs/open-tasks.md`.
-pub const OPTIMAL_INTEGRATION: f64 = 1.25;
+pub const OPTIMAL_INTEGRATION: f64 = 1.457_106_781_186_547_6;
 
 /// The V-preservation gate expressed in the band's own coordinate: `g_V = Φ − 1`.
 ///
@@ -446,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn the_survivable_disturbance_falls_as_n_to_the_three_halves() {
+    fn the_survivable_disturbance_falls_as_n_to_the_five_quarters() {
         // The corollary, with `κ = ω₀/N` as the bootstrap constant defines it. Sizing a deployment against
         // absorbed disturbance therefore penalizes a big cell twice: once through κ and once through r_stab.
         let omega = 1.0;
@@ -454,8 +494,11 @@ mod tests {
         for n in CELLS {
             let kappa = omega / n as f64;
             let h = max_survivable_disturbance(n, kappa);
-            let predicted = omega * (n as f64).powf(-1.5);
-            assert!((h - predicted).abs() < 1e-12, "N={n}: expected ω·N^-3/2 = {predicted}, got {h}");
+            // `ω·N^(−3/2)` was exact only because the refuted `r_stab` was exactly `1/√N`. The corrected
+            // ceiling falls as `N^(−1/4)`, so the product falls as `N^(−5/4)` and is no longer a clean power
+            // — assert the definition, and the exponent asymptotically below.
+            let predicted = kappa * max_stability_radius(n);
+            assert!((h - predicted).abs() < 1e-12, "N={n}: h must be κ·r_max = {predicted}, got {h}");
             assert!(h < previous, "N={n}: absorbed disturbance must fall as the cell grows");
             previous = h;
         }
@@ -653,15 +696,26 @@ mod tests {
                     (gate - v_gate_of_integration(phi)).abs() < 1e-12,
                     "N={n} Φ={phi}: g_V must equal Φ−1, got {gate}"
                 );
+                // `r_stab = √(g_V/N)` was the refuted law's form. In the band coordinate the corrected one
+                // is `K(√Φ − 1)/√N` — still zero exactly at `Φ = 1`, but LINEAR there rather than a square
+                // root, which is the whole content of T-104's correction.
+                let k = sqrt(n as f64) * sqrt(sqrt(n as f64 - 1.0)) / (2.0 * sqrt(n as f64 - 2.0));
                 assert!(
-                    (stability_radius(p, n) - sqrt(gate / n as f64)).abs() < 1e-12,
-                    "N={n} Φ={phi}: r_stab must equal √(g_V/N)"
+                    (stability_radius(p, n) - k * (sqrt(phi) - 1.0) / sqrt(n as f64)).abs() < 1e-9,
+                    "N={n} Φ={phi}: r_stab must equal K(√Φ−1)/√N"
                 );
             }
-            // The cost the max-min setpoint pays, stated as a number: a quarter of full healing authority.
+            // What the max-min setpoint costs in healing authority, stated as a number. Under the refuted
+            // metric the setpoint was Φ* = 5/4 and this was exactly a quarter; the corrected setpoint
+            // (3+2√2)/4 buys `Φ*−1 ≈ 0.457` — nearly half — which is a second, independent reason the old
+            // value was steering the cell worse than it claimed.
             assert!(
-                (v_gate_of_integration(OPTIMAL_INTEGRATION) - 0.25).abs() < 1e-12,
-                "the setpoint runs regeneration at quarter authority — the reason it is not claimed optimal"
+                (v_gate_of_integration(OPTIMAL_INTEGRATION) - (OPTIMAL_INTEGRATION - 1.0)).abs() < 1e-12,
+                "g_V at the setpoint is Φ*−1 by the gate's own identity"
+            );
+            assert!(
+                (v_gate_of_integration(OPTIMAL_INTEGRATION) - 0.457_106_781_186_547_6).abs() < 1e-12,
+                "the corrected setpoint runs regeneration at ~46% authority, not the old 25%"
             );
         }
     }
@@ -705,9 +759,11 @@ mod tests {
             let r = optimal_correlation(n);
             assert!((phi_equicorrelated(n, r) - OPTIMAL_INTEGRATION).abs() < 1e-9, "N={n}: r* ↦ Φ*");
             assert!((purity_equicorrelated(n, r) - p).abs() < 1e-12, "N={n}: r* ↦ P*");
+            // Half the ceiling is what MAKES it the max-min point, and that survives the metric change —
+            // only the ceiling's value moved, from the refuted `1/√N` to `max_stability_radius`.
             assert!(
-                (stability_radius(p, n) - 1.0 / (2.0 * sqrt(n as f64))).abs() < 1e-12,
-                "N={n}: the setpoint sits at exactly half the robustness ceiling"
+                (stability_radius(p, n) - max_stability_radius(n) / 2.0).abs() < 1e-9,
+                "N={n}: the setpoint must sit at exactly half the robustness ceiling"
             );
             // It is inside the band the homeostat enforces, which it must be to be reachable by `Hold`.
             let (lo, hi) = collective_subject_window(n);
@@ -756,12 +812,15 @@ mod tests {
             assert!(consumed < previous, "N={n}: one failure must cost a smaller share than in a smaller cell");
             previous = consumed;
         }
-        // The Fano figure, pinned: a third of the radius for a single node is why a seven-cell tolerates two.
+        // The Fano figure, pinned — and RESTATED under the corrected metric (T-104). One node's
+        // decorrelation costs **53%** of a seven-cell's radius, not the 34.5% the refuted surd reported.
+        // The qualitative claim above (the share falls with cell size) is what carries result 6, and it is
+        // unchanged; this number is the scale of the per-fault cost, and it nearly doubled.
         let fano = {
             let full = stability_radius(purity_after_failures(7, 0), 7);
             (full - stability_radius(purity_after_failures(7, 1), 7)) / full
         };
-        assert!((0.30..0.40).contains(&fano), "one Fano node should cost about a third of the radius: {fano}");
+        assert!((0.50..0.56).contains(&fano), "one Fano node costs ~53% of the radius: {fano}");
     }
 
     #[test]

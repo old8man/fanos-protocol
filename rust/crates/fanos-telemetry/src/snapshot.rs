@@ -22,7 +22,7 @@ use alloc::string::String;
 use core::fmt::Write as _;
 
 use fanos_diakrisis::minima::OPTIMAL_INTEGRATION;
-use fanos_diakrisis::stability::stability_radius;
+use fanos_diakrisis::stability::stability_radius_exact;
 
 use crate::frame::{AlarmLevel, CellId, CoherenceFrame, Regime};
 
@@ -68,7 +68,24 @@ pub struct CoherenceSnapshot {
     pub mean_correlation: f64,
     /// Polar spectral gap `Δ` (T-226(v)) — the healing-rate / density signal.
     pub spectral_gap: f64,
-    /// Stability radius `r_stab = √(max(0, P − 2/N))` (T-104) — the viability speedometer.
+    /// Stability radius (T-104) — the Bures distance to the viability shell `{P = 2/N}`, i.e. the cell's
+    /// viability speedometer.
+    ///
+    /// **This field carries the *exact* radius, not the one the homeostat steers on**, and the two are
+    /// different functions on purpose. `fanos_diakrisis::stability` ships both: a closed runtime form
+    /// (≤1.13% error across the window, <0.01% at the wall) that the shed law and the setpoint derivation
+    /// use, and [`stability_radius_exact`] — machine-exact to `1e-14` — whose own doc says to use it *"when
+    /// reporting a number rather than steering on one"*. This is the reporting surface: it reaches an
+    /// operator through `fanos-observatory`'s dashboard and the `fanos_coherence_stability_radius` gauge,
+    /// and nothing decides on it.
+    ///
+    /// The steering sites keep the runtime form deliberately. In particular the band setpoint `Φ*` is the
+    /// max-min point *of the law the controller measures with* — derive it from the exact form instead and
+    /// the homeostat would be aimed at a point its own gauge does not consider optimal.
+    ///
+    /// The old doc here read `√(max(0, P − 2/N))`. That form was refuted in 2026-08 (it overstates the
+    /// margin by up to 81.7× at the viability wall, and the error grows precisely as the wall is
+    /// approached); see `stability::stability_radius` for the derivation and the measured error table.
     pub stability_radius: f64,
     /// The collective-subject band classification.
     pub regime: Regime,
@@ -137,7 +154,7 @@ impl CoherenceSnapshot {
             reflection,
             mean_correlation,
             spectral_gap: f64::from(frame.gap),
-            stability_radius: stability_radius(purity, alive.max(1) as usize),
+            stability_radius: stability_radius_exact(purity, alive.max(1) as usize),
             regime: frame.regime(),
             alarm: frame.alarm(),
             faulted,
@@ -295,10 +312,40 @@ mod tests {
 
     #[test]
     fn stability_radius_matches_the_theorem() {
-        // r_stab = √(max(0, P − 2/7)); at the boundary purity it is 0.
+        // This test used to restate `r = √(max(0, P − 2/N))` and check the field against it. That law was
+        // refuted (T-104, 2026-08): it overstates the margin by up to 81.7× at the viability wall, and this
+        // test held the wrong number in place from a second crate, outside the sweep that fixed the first.
+        //
+        // The reported field carries the **exact** radius, so the theorem restated here is the exact one —
+        // written out independently rather than by calling the function it checks, which would assert
+        // nothing:
+        //   a(P) = (1 + √((N−1)(N·P − 1)))/N,   a_c = a(2/N) = (1 + √(N−1))/N
+        //   r    = √(2·(1 − √(a·a_c) − √((1−a)(1−a_c))))
         let snap = CoherenceSnapshot::from_frame(&frame(0.5));
-        let expect = (snap.purity - PURITY_FLOOR).max(0.0).sqrt();
-        assert!((snap.stability_radius - expect).abs() < 1e-9);
+        let n = snap.alive_nodes as f64;
+        let a = (1.0 + ((n - 1.0) * (n * snap.purity - 1.0)).sqrt()) / n;
+        let ac = (1.0 + (n - 1.0).sqrt()) / n;
+        let expect = (2.0 * (1.0 - (a * ac).sqrt() - ((1.0 - a) * (1.0 - ac)).sqrt())).max(0.0).sqrt();
+        assert!(
+            (snap.stability_radius - expect).abs() < 1e-9,
+            "reported {} vs exact theorem {expect}",
+            snap.stability_radius
+        );
+
+        // Exactly zero at and below the viability shell, so it stays a genuine "how much can I still take"
+        // gauge rather than going imaginary or negative. `PURITY_FLOOR = 2/N` is that shell.
+        let n7 = CELL_N;
+        assert_eq!(stability_radius_exact(PURITY_FLOOR, n7), 0.0, "no margin left at the wall");
+        assert_eq!(stability_radius_exact(PURITY_FLOOR - 0.01, n7), 0.0, "and none below it");
+
+        // The refuted law is not merely different, it is different in the dangerous direction — larger, and
+        // increasingly so toward the wall. Pinned so a revert to it fails here as well as in fanos-diakrisis.
+        let refuted = (snap.purity - PURITY_FLOOR).max(0.0).sqrt();
+        assert!(
+            refuted > snap.stability_radius * 2.0,
+            "the old surd overstates the margin (old {refuted}, exact {})",
+            snap.stability_radius
+        );
     }
 
     #[test]
@@ -380,13 +427,23 @@ mod tests {
         // stability radius on a Fano plane.
         //
         // Φ = 6r² on a 7-cell, so r = √(Φ/6): pick correlations that land the cell below, at, and above Φ*.
-        let below = CoherenceSnapshot::from_frame(&frame((1.05f64 / 6.0).sqrt()));
-        let at = CoherenceSnapshot::from_frame(&frame((1.25f64 / 6.0).sqrt()));
-        let above = CoherenceSnapshot::from_frame(&frame((1.90f64 / 6.0).sqrt()));
+        //
+        // The probes are placed **relative to `OPTIMAL_INTEGRATION`**, not at literals. They used to be
+        // 1.05 / 1.25 / 1.90 with 1.25 standing in for Φ*, and when T-104's correction moved the setpoint to
+        // `5/4 + (√2−1)/2 ≈ 1.4571` the middle probe silently became a point 0.207 off it — the assertion
+        // "at Φ* it reads ~zero" was then a claim about a Φ that is not Φ*. Derived offsets cannot go stale
+        // that way. `±0.4` keeps all three inside the band `Φ ∈ (1, 2]` and below the over-coupling edge.
+        const PROBE: f64 = 0.4;
+        let at_phi = |phi: f64| CoherenceSnapshot::from_frame(&frame((phi / 6.0).sqrt()));
+        let below = at_phi(OPTIMAL_INTEGRATION - PROBE);
+        let at = at_phi(OPTIMAL_INTEGRATION);
+        let above = at_phi(OPTIMAL_INTEGRATION + PROBE);
 
-        assert!(below.setpoint_offset < -0.1, "under-coupled reads negative: {}", below.setpoint_offset);
+        assert!(below.setpoint_offset < -0.35, "under-coupled reads negative: {}", below.setpoint_offset);
         assert!(at.setpoint_offset.abs() < 0.01, "at Φ* it reads ~zero: {}", at.setpoint_offset);
-        assert!(above.setpoint_offset > 0.5, "toward over-coupling reads positive: {}", above.setpoint_offset);
+        assert!(above.setpoint_offset > 0.35, "toward over-coupling reads positive: {}", above.setpoint_offset);
+        // Ordered, so the field is a signed distance and not merely three signs that happen to differ.
+        assert!(below.setpoint_offset < at.setpoint_offset && at.setpoint_offset < above.setpoint_offset);
 
         // All three are inside the band, so `Regime` cannot tell them apart — which is the whole reason this
         // field exists. Assert that, or the test would pass on a field nobody needs.
@@ -409,15 +466,15 @@ mod tests {
     #[test]
     fn the_count_is_exact_for_every_supported_plane() {
         // The defect this replaced clamped to `CELL_N`, so a `PG(2,31)` cell reported seven alive nodes out of
-        // 993 — and the stability radius `√(P − 2/N)` was computed against the wrong `N` with it.
+        // 993 — and the stability radius was computed against the wrong `N` with it.
         for n in [7usize, 21, 57, 993] {
             for r in [0.0, 0.05, 0.3] {
                 let matrix = CoherenceMatrix::equicorrelated(n, r);
                 let f = CoherenceFrame::observe(CellId([0; 16]), 1, &matrix, 0, 0.0, -1, 0, true);
                 let snap = CoherenceSnapshot::from_frame(&f);
                 assert_eq!(snap.alive_nodes as usize, n, "N={n} r={r}: the count must be exact");
-                // …and the radius must follow the recovered N, not a constant.
-                let expected = stability_radius(snap.purity, n);
+                // …and the radius must follow the recovered N, not a constant. Reported means exact.
+                let expected = stability_radius_exact(snap.purity, n);
                 assert!(
                     (snap.stability_radius - expected).abs() < 1e-9,
                     "N={n} r={r}: r_stab must use the recovered N (got {}, want {expected})",

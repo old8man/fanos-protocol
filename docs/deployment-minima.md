@@ -28,27 +28,64 @@ collapse every question about cell size onto one variable. Four consequences fol
 `(1/√(N−1), √(2/(N−1))]` — but in integration they are the constants `Φ ∈ (1, 2]`, equivalently
 `P ∈ (2/N, 3/N]`. A cell grows by *diluting* correlation at exactly the rate that holds `Φ` still.
 
-**3. The stability radius falls as the cell grows — and fault tolerance does not.** Since `r_stab = √(P − 2/N) = √((Φ − 1)/N)` and
-`Φ ≤ 2`:
+**3. The stability radius falls as the cell grows — and fault tolerance does not.** In band coordinates the
+radius is `r_stab = K(N)·(√Φ − 1)/√N` with `K(N) = √N·⁴√(N−1)/(2√(N−2))`, so `Φ ≤ 2` caps it at
 
 ```
-r_stab ≤ 1/√N
+r_stab ≤ ⁴√(N−1)·(√2 − 1) / (2·√(N−2))     ~  N^(−1/4)
 ```
 
-attained only at the top of the window. T-104 survives sustained noise `h` iff `h < κ·r_stab`, so the
-disturbance an `N`-node cell can absorb is at most `κ/√N` — and with `κ_bootstrap = ω₀/N`, at most `ω₀·N^(−3/2)`.
+attained only at the top of the window. T-104 survives sustained noise `h` iff `h < κ·r_stab`, so with
+`κ_bootstrap = ω₀/N` the disturbance an `N`-node cell can absorb is at most `ω₀·N^(−5/4)`.
+
+> **Corrected 2026-08-07 (#183).** This section read `r_stab = √(P − 2/N) = √((Φ − 1)/N)`, capped at `1/√N`,
+> with the absorbed disturbance falling as `ω₀·N^(−3/2)`. **That radius formula was refuted, and toward
+> danger** — it overstates the margin by up to 81.7× at the viability wall, because the true law is linear in
+> `ε = P − 2/N` while the surd is `ε^{1/2}`. See `fanos_diakrisis::stability::stability_radius`.
+>
+> The correction is **not uniformly downward**, which is why the numbers had to be recomputed rather than
+> scaled. At the top of the band the old law overstates the ceiling by `2.61×` at `N = 7` and `1.73×` at
+> `N = 57`, but by `N = 993` it *understates* it (`0.0317` against the true `0.0369`) — the two laws cross
+> somewhere between. A deployment reading the old table was misled in one direction on a Fano cell and in the
+> other on a large one.
 
 **The tempting reading of that is wrong, and this document carried it for most of a day.** "A larger cell has a
 smaller radius, so it is less robust" compares an absolute distance without asking what it is measured against
-— and the disturbance scales too. One decorrelated node consumes **34.5 %** of a Fano cell's radius and
-**0.2 %** of a `PG(2,31)` cell's. Both the capacity and the per-fault cost fall as `N^(−3/2)`, and they cancel.
+— and the disturbance scales too. Both the capacity and the per-fault cost fall together, and they cancel.
 What survives the cancellation is the fault count in the table further down, and that is what a deployment
 feels.
 
+The share of the radius **one** decorrelated node consumes, recomputed under the corrected law:
+
+| cell | refuted figure | corrected |
+|---|---|---|
+| `PG(2,2)`, N = 7 | 34.5 % | **52.9 %** |
+| `PG(2,4)`, N = 21 | 10.0 % | 16.7 % |
+| `PG(2,7)`, N = 57 | 3.6 % | 6.0 % |
+| `PG(2,31)`, N = 993 | 0.2 % | **0.34 %** |
+
+One Fano node now costs **more than half** the cell's whole margin, not a third — the per-fault cost nearly
+doubled everywhere. The qualitative claim the cancellation rests on (*the share falls as the cell grows*) is
+unchanged, and it is what result 6 actually uses.
+
+> **What is corrected and what is still open.** The percentages above are recomputed. The claim that
+> accompanied them — that capacity and per-fault cost *both fall as* `N^(−3/2)` — is **not**, and it is removed
+> rather than restated, because it is a statement about the curve's **shape** and the correction changed the
+> shape. Deriving the corrected exponents is open work, flagged the same way in
+> `fanos_diakrisis::minima`'s result 3.
+>
+> The cancellation's *conclusion* does not wait on that, and the reason is exact rather than a hope: the
+> fault-count table below counts failures until the radius reaches **zero**, so it reads only the radius's
+> **root** — and both the refuted surd and the corrected law are zero on precisely `P ≤ 2/N`, which is the
+> first line of each function. The correction moved the whole curve and left its root untouched, so every
+> statement that reads only the root survives unchanged, while every statement about the shape had to be
+> redone. That is the clean line between the two halves of this section.
+
 One qualification before it. The condition is `Φ ≤ 2`, i.e. `P ≤ 3/N` — purity that *scales down* with the cell. Hold purity at an absolute
-level instead and `r_stab = √(P − 2/N)` runs the **other way**, because the subtrahend `2/N` shrinks: at
-`P = 0.75` the radius climbs from `0.699` at `N = 7` to `0.865` at `N = 993`, and integrating the reduced
-dynamics there measures a critical attack that *grows* with the cell (`0.725` at `N = 7`, `3.875` at `N = 21`).
+level instead and the radius runs the **other way**, and under the corrected law it does so far more sharply:
+at `P = 0.75` it climbs from `0.372` at `N = 7` to `1.007` at `N = 57` and `2.342` at `N = 993`, growing
+without bound rather than saturating near `1` as the refuted surd suggested. Integrating the reduced dynamics
+there measures a critical attack that *grows* with the cell.
 
 Only the first case describes a cell this platform would keep, and the reason is exact: `R = 1/(N·P)`, so the
 self-model floor `R ≥ 1/3` **is** `P ≤ 3/N`. A cell at absolute purity `0.75` has `R = 0.19` on a Fano plane —

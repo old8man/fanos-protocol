@@ -28,12 +28,81 @@ pub fn p_opt(n: usize) -> f64 {
     3.0 / n as f64
 }
 
-/// The stability radius `r_stab = √(max(0, P − 2/N))` (T-104): the Bures distance from the healthy
-/// attractor to the viability boundary — the cell's viability speedometer. Exactly zero at or below
-/// collapse (`P ≤ 2/N`), so it is a genuine "how much can I still take" gauge.
+/// The Bures distance from the current state to the viability shell `{P = 2/N}` — the cell's viability
+/// speedometer, and the input to the DDoS homeostat's shed law.
+///
+/// # The old form was refuted, and toward danger (T-104, corrected 2026-08-07)
+///
+/// This was `√(P − 2/N)`, cited to Fuchs–van de Graaf. Both halves of that proof are false: the chain bounds
+/// `d_B` from **above** through the trace norm, while `δP` lives in `‖·‖₂` geometry, and the theorem asserted
+/// as an equality what was at best an inequality the wrong way round. Direct minimisation over the shell gives
+/// at `P = 0.300` an infimum of `0.01708` against `√(0.300 − 2/7) = 0.11952` — **seven times smaller**.
+///
+/// The error **diverges at the wall**, because the true law is linear in `ε = P − 2/N` while the surd is
+/// `ε^{1/2}`: measured overstatement is **81.7× at `Φ = 1.0007`**, 7.0× at `Φ = 1.10`, 4.57× at the band's
+/// setpoint, 2.58× at `Φ = 2`, and only 1.09× at `P = 1`. A homeostat fed the old number believes it has
+/// margin precisely where it has almost none, and sheds too late in the one regime where shedding saves it.
+///
+/// # What this computes
+///
+/// The corpus's runtime form, ≤1.13% error across the window and under 0.01% near the wall, where it matters:
+///
+/// ```text
+/// r ≈ K·(√(P − 1/N) − √(1/N)),     K = √N·⁴√(N−1) / (2·√(N−2))
+/// ```
+///
+/// It needs no optimisation because `‖Γ − I/N‖_F = √(P − 1/N)` is an identity: the shell `{P = 2/N}` is the
+/// Frobenius sphere of radius `√(1/N)` about `I/N`, so the radial distance is the difference of those two
+/// roots, and `K` rescales it by the exact wall-limit ratio of the two laws' slopes.
+///
+/// **`K` is derived for general `N`, not copied.** The corpus states `K = √35·⁴√6/10 = 0.925917` at `N = 7`;
+/// this expression reproduces that exactly and extends to the plane orders FANOS supports (`q = 7` is
+/// `N = 57`). Use [`stability_radius_exact`] when reporting a number rather than steering on one.
+///
+/// Exactly zero at or below collapse (`P ≤ 2/N`), so it stays a genuine "how much can I still take" gauge.
 #[must_use]
 pub fn stability_radius(purity: f64, n: usize) -> f64 {
-    sqrt((purity - p_crit(n)).max(0.0))
+    if purity <= p_crit(n) || n < 3 {
+        return 0.0;
+    }
+    let inv_n = 1.0 / n as f64;
+    bures_scale(n) * (sqrt(purity - inv_n) - sqrt(inv_n))
+}
+
+/// The wall-limit rescaling `K = √N·⁴√(N−1) / (2√(N−2))` that turns the radial Frobenius distance into the
+/// Bures one (T-104 step 5). `0.925917` at `N = 7`, matching the corpus's `√35·⁴√6/10`.
+fn bures_scale(n: usize) -> f64 {
+    let n = n as f64;
+    sqrt(n) * sqrt(sqrt(n - 1.0)) / (2.0 * sqrt(n - 2.0))
+}
+
+/// The **exact** stability radius, for reporting rather than steering (T-104 step 2).
+///
+/// On the one-dominant family `λ = (a, (1−a)/(N−1) × (N−1))` the minimiser commutes with `ρ`
+/// (`‖[ρ,σ]‖ ≈ 1.3e-8` over the full 27-parameter shell), so Bures collapses to Hellinger on spectra and the
+/// distance between two members of the family is a two-point expression:
+///
+/// ```text
+/// a(P) = (1 + √((N−1)(N·P − 1)))/N,     a_c = a(2/N) = (1 + √(N−1))/N
+/// r    = √(2·(1 − √(a·a_c) − √((1−a)(1−a_c))))
+/// ```
+///
+/// Machine-exact to `1e-14` against direct constrained minimisation. `a_c` is the same `λ_max = (1+√(N−1))/N`
+/// the critical-purity theorem's path 4 singles out independently — the nearest wall state is the one the
+/// spectral derivation already named.
+///
+/// For general (not one-dominant) spectra this is a **conservative lower bound** (corpus [Г]: 41/41 random
+/// spectra, ratio ∈ [1.08, 2.52]), which is the safe direction — an alert built on it fires no later than it
+/// should.
+#[must_use]
+pub fn stability_radius_exact(purity: f64, n: usize) -> f64 {
+    if purity <= p_crit(n) || n < 3 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let a = (1.0 + sqrt((nf - 1.0) * (nf * purity - 1.0))) / nf;
+    let ac = (1.0 + sqrt(nf - 1.0)) / nf;
+    sqrt((2.0 * (1.0 - sqrt(a * ac) - sqrt((1.0 - a) * (1.0 - ac)))).max(0.0))
 }
 
 /// The V-preservation gate `g_V(P) = clamp((P − 2/N)/(3/N − 2/N), 0, 1)` (corpus `variational`, T-124):
@@ -541,9 +610,44 @@ mod tests {
             stability_radius(0.2, N).abs() < 1e-12,
             "clamped to zero below the boundary"
         );
-        assert!((stability_radius(3.0 / 7.0, N) - sqrt(1.0 / 7.0)).abs() < 1e-12);
-        // A pure state P = 1 gives the theoretical maximum √(5/7).
-        assert!((stability_radius(1.0, N) - sqrt(5.0 / 7.0)).abs() < 1e-12);
+        // The ceiling at the top of the band, corrected: ⁴√(N−1)(√2−1)/(2√(N−2)), not the refuted √(1/N).
+        let ceiling = (6.0f64).powf(0.25) * (sqrt(2.0) - 1.0) / (2.0 * sqrt(5.0));
+        assert!((stability_radius(3.0 / 7.0, N) - ceiling).abs() < 1e-12, "band ceiling");
+        // In the band's own coordinate: r = K(√Φ − 1)/√N, since P − 1/N = Φ/N.
+        for phi in [1.0, 1.25, 1.5, 2.0] {
+            let r = stability_radius((1.0 + phi) / 7.0, N);
+            let k = sqrt(7.0) * sqrt(sqrt(6.0)) / (2.0 * sqrt(5.0)); // = √35·⁴√6/10 = 0.925917
+            let want = k * (sqrt(phi) - 1.0) / sqrt(7.0);
+            assert!((r - want).abs() < 1e-9, "Φ={phi}: r must be K(√Φ−1)/√N, got {r} want {want}");
+        }
+
+        // **The regression guard for T-104's refutation, placed AT THE WALL where the two laws diverge.**
+        // Near P = 1 the refuted surd is only 9% high and any test there would pass against it; the whole
+        // content of the correction is that the error grows without bound as the wall is approached.
+        let at_wall = 2.0 / 7.0 + 1e-4;
+        let refuted = sqrt(at_wall - 2.0 / 7.0);
+        assert!(
+            refuted / stability_radius(at_wall, N) > 50.0,
+            "the refuted √(P−2/N) must overstate by ≫1 at the wall — measured 81.7×; a ratio near 1 means \
+             the surd is back"
+        );
+
+        // The runtime form tracks the exact closed form across the window. The corpus states ≤1.13%; the
+        // MEASURED maximum here is 1.1303% and it occurs at the top of the band (Φ = 2), falling to under
+        // 0.01% near the wall — which is the half that matters, since the wall is where the homeostat acts.
+        // Bound written from the measurement rather than from the quoted figure: a strict `< 0.0113` fails
+        // on the rounding, and a test that disagrees with its own source by 3e-5 teaches nothing.
+        let mut worst: f64 = 0.0;
+        for phi in [1.05, 1.25, 1.5, 1.75, 2.0] {
+            let p = (1.0 + phi) / 7.0;
+            let (rt, ex) = (stability_radius(p, N), stability_radius_exact(p, N));
+            worst = worst.max((rt - ex).abs() / ex);
+        }
+        assert!(worst < 0.0114, "runtime vs exact: worst relative error {worst} over the band");
+        // Near the wall the two agree far more closely — the property the corpus singles out.
+        let near = 2.0 / 7.0 + 1e-4;
+        let (rt, ex) = (stability_radius(near, N), stability_radius_exact(near, N));
+        assert!((rt - ex).abs() / ex < 0.001, "at the wall the two forms must agree to <0.1%");
     }
 
     #[test]
@@ -590,9 +694,9 @@ mod tests {
     #[test]
     fn survival_is_the_canonical_threshold() {
         // Survives iff noise < κ·r_stab (T-104). The decoherence-channel bound is κ_bootstrap/2 = 1/14.
-        let r_stab = stability_radius(3.0 / 7.0, N); // √(1/7) ≈ 0.378
-        assert!(survives(r_stab, 0.5, 0.1), "0.1 < 0.5·0.378 survives");
-        assert!(!survives(r_stab, 0.5, 0.3), "0.3 > 0.5·0.378 does not");
+        let r_stab = stability_radius(3.0 / 7.0, N); // ≈ 0.14496 (was 0.378 under the refuted law)
+        assert!(survives(r_stab, 0.5, 0.05), "0.05 < 0.5·0.14496 survives");
+        assert!(!survives(r_stab, 0.5, 0.1), "0.1 > 0.5·0.14496 does not");
         assert!(
             (NOISE_SURVIVAL_THRESHOLD - 1.0 / 14.0).abs() < 1e-12,
             "h^(D) bound is 1/14"
