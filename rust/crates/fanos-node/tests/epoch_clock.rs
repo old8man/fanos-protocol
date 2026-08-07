@@ -73,5 +73,5 @@ async fn the_live_epoch_clock_advances_the_beacon_across_epochs() {
         "the wall-clock epoch driver must tick repeatedly, driving ≥ 2 distinct epochs: {epochs:?}"
     );
 
-    node.shutdown();
+    node.shutdown().await;
 }

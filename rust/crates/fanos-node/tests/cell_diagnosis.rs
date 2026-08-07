@@ -149,5 +149,5 @@ async fn a_running_node_publishes_the_cell_diagnosis_its_reputation_is_recompute
         records.len(),
     );
 
-    node.shutdown();
+    node.shutdown().await;
 }

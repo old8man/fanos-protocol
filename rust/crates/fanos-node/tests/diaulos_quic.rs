@@ -68,7 +68,7 @@ async fn start_distinct(bootstrap: Vec<Peer>, taken: &[Coord]) -> Node {
         if !taken.contains(&node.address()) {
             return node;
         }
-        node.shutdown();
+        node.shutdown().await;
     }
 }
 
@@ -120,8 +120,8 @@ async fn diaulos_request_response_over_quic() {
         "the encrypted response arrived end-to-end over the real QUIC transport"
     );
 
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -181,8 +181,8 @@ async fn diaulos_full_duplex_service_over_quic() {
         "the service's unsolicited banner and streamed echo arrived over real QUIC"
     );
 
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -228,9 +228,9 @@ async fn diaulos_serves_two_clients_concurrently() {
     assert_eq!(resp1, b"echo:one", "client 1 got its own answer");
     assert_eq!(resp2, b"echo:two", "client 2 got its own answer");
 
-    s.shutdown();
-    c1.shutdown();
-    c2.shutdown();
+    s.shutdown().await;
+    c1.shutdown().await;
+    c2.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -281,8 +281,8 @@ async fn fanos_dialer_reaches_a_service_by_name() {
         .await;
     assert!(matches!(clear, Err(DialError::Unsupported(_))));
 
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 /// **Interactive streaming over real QUIC: a write with no half-close, read by the peer.**
@@ -330,8 +330,8 @@ async fn an_interactive_write_without_half_close_reaches_the_peer() {
     let echoed = common::echo(&mut stream, sent).await;
     assert_eq!(echoed, sent, "an interactive write round-trips without either side half-closing");
 
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 /// **The accept-queue arrangement, without the C ABI's two runtimes and blocking calls.**
@@ -383,6 +383,6 @@ async fn an_accepted_stream_taken_from_a_queue_receives_an_interactive_write() {
         .expect("the accepted stream is readable");
     assert_eq!(buf.get(..n), Some(&sent[..]), "the interactive payload arrived intact");
 
-    a.shutdown();
-    b.shutdown();
+    a.shutdown().await;
+    b.shutdown().await;
 }

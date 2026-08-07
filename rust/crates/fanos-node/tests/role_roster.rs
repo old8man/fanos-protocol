@@ -114,7 +114,7 @@ async fn no_node_ever_assigns_over_fewer_members_than_it_can_see() {
         .expect("a member starts");
         // Fresh identities collide 1/7 on the Fano plane; a collision is a different experiment.
         if nodes.iter().any(|n: &Node| n.address() == node.address()) {
-            node.shutdown();
+            node.shutdown().await;
             continue;
         }
         nodes.push(node);
@@ -149,7 +149,7 @@ async fn no_node_ever_assigns_over_fewer_members_than_it_can_see() {
     let stations: Vec<Vec<fanos_runtime::ports::stations::Observation>> =
         nodes.iter().map(|n| n.client().driver_stations()).collect();
     for node in &nodes {
-        node.shutdown();
+        node.shutdown().await;
     }
 
     // A roster below the transport's own peer count is an assignment computed over fewer members than the node

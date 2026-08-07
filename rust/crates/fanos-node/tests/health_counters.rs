@@ -73,5 +73,5 @@ async fn a_nodes_health_reports_the_directory_counters_it_is_documented_to_repor
     node.directory().insert(coord, b);
     assert_eq!(node.health().collisions, 1, "a repeat of the SAME binding is not a collision");
 
-    node.shutdown();
+    node.shutdown().await;
 }

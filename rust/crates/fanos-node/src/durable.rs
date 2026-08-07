@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fanos_quic::Client;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 /// The file a node's durable store lives in, inside its state directory.
@@ -182,36 +183,105 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Keep `state_dir`'s snapshot current for as long as the node runs.
+/// A running store persister, and the two signals that let a clean stop wait for its last write (#178).
+///
+/// Both are `watch` channels rather than a `oneshot` pair because [`crate::Node::shutdown`] takes `&self` and
+/// cannot move a sender out; a `watch` sender is usable from a shared reference, and its receiver can be
+/// cloned per waiter.
+pub struct StorePersister {
+    /// Kept so the task is aborted when the node drops, exactly as the bare `JoinHandle` was.
+    _task: JoinHandle<()>,
+    /// Set to `true` to ask the persister for one final snapshot. Sent BEFORE the engine is torn down, so the
+    /// snapshot request still has an engine to answer it.
+    stop: watch::Sender<bool>,
+    /// Flipped by the persister once that final write has returned. A clean stop waits on this.
+    done: watch::Receiver<bool>,
+}
+
+impl StorePersister {
+    /// Ask for a final snapshot and wait until it has been written.
+    ///
+    /// Returns as soon as the persister is finished — or immediately if it has already exited, since the
+    /// `watch` value is retained after the sender drops.
+    pub async fn drain(&self) {
+        // A closed channel means the persister is already gone; either way there is nothing more to wait for.
+        let _ = self.stop.send(true);
+        let mut done = self.done.clone();
+        let _ = done.wait_for(|finished| *finished).await;
+    }
+}
+
+/// Keep `state_dir`'s snapshot current for as long as the node runs, **and once more on the way out**.
 ///
 /// Asks the engine for its durable bytes every [`snapshot_interval`] and writes them when they have changed.
 /// The comparison is against what was last written, not a dirty flag: the snapshot is canonical — every map
 /// streams in sorted order — so equal state produces equal bytes, and an idle node does no disk I/O at all.
 /// A dirty flag would need a seam into the engine that nothing else wants.
 ///
-/// Ends when the node does.
+/// **The final write is the point of the signal, not a nicety (#178).** `every` is derived from a *crash*
+/// model — `snapshot_interval(ASSUMED_RESTARTS_PER_DAY, DURABILITY_TARGET)` bounds how much may be lost when
+/// the process dies without warning. A clean stop is the case where nothing need be lost, and before this it
+/// was charged the same interval: the loop slept, then asked an engine that was already down, got `None`, and
+/// broke *before* writing. So the one path where the node knew it was stopping was the path that discarded
+/// everything since the last tick — and a node that started, served and stopped inside one interval persisted
+/// nothing at all, because the loop sleeps before its first snapshot.
+///
+/// The chain state next door already gets this right and says why (`taxis_driver.rs:745`): it persists on a
+/// checkpoint, "the only moment there is anything certified to write". The store has no such natural event —
+/// writing on every `put` would be absurd — so a period is right for its crash case. Only the *anticipated*
+/// case was missing.
 #[must_use]
-pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
+pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration) -> StorePersister {
+    let (stop, mut stop_rx) = watch::channel(false);
+    let (done_tx, done) = watch::channel(false);
+    let task = tokio::spawn(async move {
         let mut last: Option<Vec<u8>> = None;
+        // Every exit from the loop goes through this, so "the persister is finished" cannot be signalled by
+        // one path and forgotten by another.
+        let finish = |done_tx: &watch::Sender<bool>| {
+            let _ = done_tx.send(true);
+        };
         loop {
-            tokio::time::sleep(every).await;
+            let stopping = tokio::select! {
+                () = tokio::time::sleep(every) => false,
+                // `changed()` errs only when every sender is gone, which means the node is being dropped
+                // without a clean stop — nothing is waiting on `done`, and there may be no engine to ask.
+                r = stop_rx.changed() => {
+                    if r.is_err() {
+                        finish(&done_tx);
+                        return;
+                    }
+                    true
+                }
+            };
             // A correlated request, not a subscription: the answer is the whole store, and the notification
             // stream would hand a clone of it to every subscriber a running node keeps.
             let Some(bytes) = client.snapshot().await else {
-                break; // the node has shut down, or did not answer inside the request timeout
+                // The node has shut down, or did not answer inside the request timeout.
+                finish(&done_tx);
+                return;
             };
             if last.as_ref().is_some_and(|prev| *prev == bytes) {
+                if stopping {
+                    finish(&done_tx);
+                    return;
+                }
                 continue;
             }
             match write_snapshot(&state_dir, &bytes) {
                 Ok(()) => last = Some(bytes),
                 // Reported and retried on the next tick rather than fatal: a full disk should degrade a node
-                // to the pre-#77 behaviour, not stop it serving the cell.
+                // to the pre-#77 behaviour, not stop it serving the cell. On the *stopping* path there is no
+                // next tick, so the report is all there is — and it is why this is `eprintln!` and not silence.
                 Err(e) => eprintln!("fanos: could not persist the store to {}: {e}", state_dir.display()),
             }
+            if stopping {
+                finish(&done_tx);
+                return;
+            }
         }
-    })
+    });
+    StorePersister { _task: task, stop, done }
 }
 
 #[cfg(test)]

@@ -61,7 +61,7 @@ async fn start_distinct(bootstrap: Vec<Peer>, taken: &[Coord]) -> Node {
         if !taken.contains(&node.address()) {
             return node;
         }
-        node.shutdown();
+        node.shutdown().await;
     }
 }
 
@@ -171,8 +171,8 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
         "the payload round-tripped: client → exit → TCP echo → exit → client"
     );
 
-    e.shutdown();
-    c.shutdown();
+    e.shutdown().await;
+    c.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -221,8 +221,8 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
         "the echo server is still only reachable directly — the exit never dialed it"
     );
 
-    e.shutdown();
-    c.shutdown();
+    e.shutdown().await;
+    c.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -270,7 +270,7 @@ async fn an_exit_advertises_itself_and_is_discovered() {
         expected.encode(),
         "the discovered key is the exit's seed-derived service public key"
     );
-    node.shutdown();
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -307,8 +307,8 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
         "a dialer with no exit refuses a clearnet target"
     );
 
-    e.shutdown();
-    c.shutdown();
+    e.shutdown().await;
+    c.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -360,6 +360,6 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
         "a dialer with no exit refuses clearnet UDP"
     );
 
-    e.shutdown();
-    c.shutdown();
+    e.shutdown().await;
+    c.shutdown().await;
 }

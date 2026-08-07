@@ -347,7 +347,11 @@ pub unsafe extern "C" fn fanos_free(node: *mut FanosNode) {
     }
     // SAFETY: the caller guarantees `node` is a live, not-yet-freed `fanos_open` handle.
     let handle = unsafe { Box::from_raw(node) };
-    handle.node.shutdown();
+    // `block_on`, because a clean stop persists the store before closing the endpoint (#178) and that is I/O.
+    // The same shape every other call in this ABI uses — the runtime is owned right here, and this is the last
+    // thing it does. An embedder that calls `fanos_free` gets the durable stop; there is no second door that
+    // would let them get the abrupt one by accident.
+    handle.rt.block_on(handle.node.shutdown());
     // `handle` (and its runtime) drop here, tearing the node down.
 }
 

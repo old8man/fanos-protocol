@@ -388,7 +388,7 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
             },
         }
     }
-    node.shutdown();
+    node.shutdown().await;
     // Take the control socket with us. The serving task clears it when its accept loop ends, but a clean exit
     // leaves the process before that task is polled again — so without this a normal shutdown leaves the path
     // behind. Not fatal (`serve` clears a stale socket, and `ask` reads a refused connection as "not running"),
@@ -781,7 +781,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     let dialer = match build_proxy_dialer(&node, resolver, epoch, anon.as_ref(), exit).await {
         Ok(dialer) => Arc::new(dialer),
         Err(e) => {
-            node.shutdown();
+            node.shutdown().await;
             return Err(e);
         }
     };
@@ -829,7 +829,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         () = serve_proxy(socks, http, dialer, shutdown) => {}
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
-    node.shutdown();
+    node.shutdown().await;
     let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos proxy down");
     Ok(())
@@ -907,7 +907,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         publish_service(&node.client(), &bundle, [0, 0, 0], epoch, descriptor_pow, b"profile=anonymous")
             .await
     {
-        node.shutdown();
+        node.shutdown().await;
         return Err(e);
     }
 
@@ -948,7 +948,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         () = shutdown => {}
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
-    node.shutdown();
+    node.shutdown().await;
     let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos host down");
     Ok(())
@@ -982,7 +982,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
         None => discover_exit(&node, epoch).await,
     };
     let Some((exit_coord, exit_public)) = exit else {
-        node.shutdown();
+        node.shutdown().await;
         return Err(NodeError::Config(
             "fanos vpn needs a clearnet exit (--exit-via FILE, or a discoverable exit) — every UDP flow \
              leaves through it"
@@ -1022,7 +1022,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
         () = shutdown => {}
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
-    node.shutdown();
+    node.shutdown().await;
     let _ = std::fs::remove_file(&admin_socket);
     eprintln!("fanos vpn down");
     Ok(())
@@ -2010,7 +2010,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
     if let Err(e) =
         publish_service(&node.client(), &bundle, [0, 0, 0], epoch, 0, b"profile=anonymous").await
     {
-        node.shutdown();
+        node.shutdown().await;
         return Err(e);
     }
 
@@ -2049,7 +2049,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
             },
         }
     }
-    node.shutdown();
+    node.shutdown().await;
     Ok(())
 }
 
@@ -2798,7 +2798,7 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
     let submitted = submit_tx_frame(&node, args, info.epoch, &info.beacon, &tx_to_frame(&sealed)).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
-    node.shutdown();
+    node.shutdown().await;
     if submitted {
         println!(
             "submitted: transfer {amount} → {to_hex} (nonce {nonce}), sealed to the epoch {} keyper line",
@@ -3068,7 +3068,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     tokio::time::sleep(Duration::from_secs(2)).await; // let bootstrap connections establish
     let submitted = submit_tx_frame(&node, args, info.epoch, &info.beacon, &tx_to_frame(&sealed)).await?;
     tokio::time::sleep(Duration::from_secs(2)).await; // let the frame flush + propagate
-    node.shutdown();
+    node.shutdown().await;
     if submitted {
         println!("submitted: ERGON term (nonce {nonce}), sealed to the epoch {} keyper line", info.epoch.get());
         Ok(())
@@ -3267,7 +3267,7 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
     if !resolved.metadata.is_empty() {
         println!("  metadata: {} bytes", resolved.metadata.len());
     }
-    node.shutdown();
+    node.shutdown().await;
     Ok(())
 }
 

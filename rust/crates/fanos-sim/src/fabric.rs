@@ -503,7 +503,7 @@ impl NodeFleet {
             )
             .await?;
             if injective && !taken.insert(node.health().address) {
-                node.shutdown(); // collided draw: retry with fresh credentials
+                node.shutdown().await; // collided draw: retry with fresh credentials
                 continue;
             }
             nodes.push(node);
@@ -663,10 +663,14 @@ impl NodeFleet {
         Timeline::new(recorded)
     }
 
-    /// Stop every member.
-    pub fn shutdown(self) {
+    /// Stop every member — **awaiting each one's durable stop** (#178).
+    ///
+    /// Async because `Node::shutdown` is: a clean stop persists the store before closing the endpoint, and a
+    /// fabric that dropped those futures would tear its cell down without writing, which is exactly the
+    /// pre-#178 behaviour one layer up.
+    pub async fn shutdown(self) {
         for node in self.nodes {
-            node.shutdown();
+            node.shutdown().await;
         }
     }
 }
@@ -795,7 +799,7 @@ mod tests {
         assert!(assigned, "the deployed node's composition ran and produced an assignment");
         assert!(node.serves(Role::Rendezvous), "including the role it offered");
         assert!(!node.serves(Role::Exit), "and not one it did not");
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -823,7 +827,7 @@ mod tests {
             "the cell provisioned the anonymous rendezvous role"
         );
         assert!(fleet.fabric.delivered() > 0, "the fleet's traffic crossed the modelled carrier");
-        fleet.shutdown();
+        fleet.shutdown().await;
     }
 
     #[tokio::test]
@@ -849,7 +853,7 @@ mod tests {
             );
         }
         assert_eq!(fleet.fabric.delivered(), 0, "nothing crossed the carrier, confirming the isolation");
-        fleet.shutdown();
+        fleet.shutdown().await;
     }
 
     #[tokio::test]
@@ -875,7 +879,7 @@ mod tests {
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
         let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
-        fleet.shutdown();
+        fleet.shutdown().await;
 
         let roster = trace.map(|a| a.roster);
         let assigned = trace.map(|a| a.roles);
@@ -1193,7 +1197,7 @@ mod tests {
             )
             .await;
         let trace = fleet.observe(8, Duration::from_secs(2), fanos_node::Node::assignment).await;
-        fleet.shutdown();
+        fleet.shutdown().await;
         let roster = trace.map(|a| a.roster);
         assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
         assert!(
@@ -1266,7 +1270,7 @@ mod tests {
             fleet.isolate(peer, 3);
         }
         let trace = fleet.observe(10, Duration::from_secs(3), fanos_node::Node::assignment).await;
-        fleet.shutdown();
+        fleet.shutdown().await;
 
         if !settled.is_reached() {
             println!("isolated-member churn: inconclusive — cell had not settled before the cut: {settled:?}");
@@ -1325,7 +1329,7 @@ mod tests {
             .await
             .expect("fleet starts");
         let trace = fleet.observe(12, Duration::from_secs(2), fanos_node::Node::assignment).await;
-        fleet.shutdown();
+        fleet.shutdown().await;
 
         // `revisits`, not `transitions`: a cell still discovering members legitimately assigns more roles as
         // it finds them, which is progress. Only a node returning to a role set it had already left is the
@@ -1407,7 +1411,7 @@ mod tests {
                 },
             )
             .await;
-        fleet.shutdown();
+        fleet.shutdown().await;
         assert!(
             !inconclusive.is_refuted(),
             "a system still moving has NOT been measured and must not be reported as a failure: {inconclusive:?}"
@@ -1440,7 +1444,7 @@ mod tests {
 
         let moved = fleet.until(|f| f.nodes().first().is_some_and(|n| n.health().address == target)).await;
         let after = node.health().address;
-        fleet.shutdown();
+        fleet.shutdown().await;
         assert!(moved, "a re-seat must move the reported coordinate: {before:?} → {target:?}, still reads {after:?}");
         assert_eq!(after, target, "and every layer reads the same live value");
     }
@@ -1464,7 +1468,7 @@ mod tests {
             .until(|f| f.nodes().iter().any(|n| n.health().verified_claims.is_some_and(|c| c > 0)))
             .await;
         let counts: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
-        fleet.shutdown();
+        fleet.shutdown().await;
         assert!(recorded, "a node that completes a handshake must record the peer's verified claim, saw {counts:?}");
     }
 
@@ -1515,7 +1519,7 @@ mod tests {
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
             // `None` = not bound at all (it lost the arbitration and holds no directory entry).
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
-            fleet.shutdown();
+            fleet.shutdown().await;
             // Deliberately NOT reporting rosters here. The `until` predicate waits for distinct *addresses*, so a roster
             // sampled at that instant is read before the role loop has assigned anything — it prints `[0, 0, …]` and looks
             // like broken propagation when it is only an early read. Roster convergence has its own probe
@@ -1550,7 +1554,7 @@ mod tests {
                 if drawn.len() < fleet.nodes().len() {
                     break fleet; // at least two nodes drew the same point
                 }
-                fleet.shutdown();
+                fleet.shutdown().await;
             };
             let trace = fleet.observe(40, Duration::from_secs(4), fanos_node::Node::assignment).await;
             let coords: Vec<fanos_geometry::Triple> = fleet.nodes().iter().map(|n| n.health().address).collect();
@@ -1564,7 +1568,7 @@ mod tests {
             // line-restricted walk being exhausted (or the settle path declining to bind at all).
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
             let peers: Vec<_> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
-            fleet.shutdown();
+            fleet.shutdown().await;
             let roster = trace.map(|a| a.roster);
             println!(
                 "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} peers {peers:?} → final rosters {:?} agreed={:?}",
@@ -1593,7 +1597,7 @@ mod tests {
             let coords: Vec<fanos_geometry::Triple> = fleet.nodes().iter().map(|node| node.health().address).collect();
             let distinct: HashSet<fanos_geometry::Triple> = coords.iter().copied().collect();
             println!("  coords {coords:?} → {} distinct of {n}", distinct.len());
-            fleet.shutdown();
+            fleet.shutdown().await;
             let roster = trace.map(|a| a.roster);
             println!(
                 "occupancy {n}/7: final rosters {:?}  agreed={:?}  known_peers={peers:?}",
@@ -1624,7 +1628,7 @@ mod tests {
             println!("t={:>4}s  rosters={rosters:?}  epochs={epochs:?}  known_peers={peers:?}", tick * 5);
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        fleet.shutdown();
+        fleet.shutdown().await;
     }
 
     #[tokio::test]
@@ -1649,7 +1653,7 @@ mod tests {
                 fleet.fabric.delivered(),
                 fleet.fabric.dropped()
             );
-            fleet.shutdown();
+            fleet.shutdown().await;
         }
     }
 

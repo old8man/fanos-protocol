@@ -54,7 +54,7 @@ async fn a_node_whose_beacon_and_directory_share_a_network_starts() {
     };
 
     let node = Node::start::<F2>(config).await.expect("a consistently-provisioned node must start");
-    node.shutdown();
+    node.shutdown().await;
 }
 
 /// The mechanism: two networks in one node is refused, and named.

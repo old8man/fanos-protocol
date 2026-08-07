@@ -711,7 +711,7 @@ fn spawn_store_role(
     handle: &NodeHandle,
     state_dir: Option<PathBuf>,
     restored_len: Option<usize>,
-) -> Option<JoinHandle<()>> {
+) -> Option<crate::durable::StorePersister> {
     let Some(dir) = state_dir else {
         // Said once, rather than left to be discovered after a restart. A node with no state directory is a
         // legitimate configuration — a test, a proxy-only client — but "keeps nothing" must be a sentence the
@@ -835,9 +835,12 @@ pub struct Node {
     _recovery_trigger: Option<JoinHandle<()>>,
     /// Re-announces this node to the cell on every coordinate move — see [`spawn_move_announcer`].
     _move_announcer: Option<JoinHandle<()>>,
-    /// Keeps this node's durable store on disk (#77) — present only when the config named a state
-    /// directory. Held for the node's lifetime; it ends when the engine stops.
-    _store_persister: Option<JoinHandle<()>>,
+    /// Keeps this node's durable store on disk (#77) — present only when the config named a state directory.
+    ///
+    /// Held for the node's lifetime, and now **read on the way out**: [`Node::shutdown`] drains it so a clean
+    /// stop persists what a crash-derived period would have lost (#178). It stopped being `_`-prefixed on the
+    /// commit that gave it a reader.
+    store_persister: Option<crate::durable::StorePersister>,
     /// The **self-organizing role subsystem** — the capability/load publishers and the per-epoch assignment loop.
     /// Held for the node's lifetime; [`assigned_roles`](Self::assigned_roles) reads the current assignment.
     self_org: SelfOrganization,
@@ -1162,7 +1165,7 @@ impl Node {
             _epoch_driver: epoch_driver,
             _recovery_trigger: recovery_trigger,
             _move_announcer: move_announcer,
-            _store_persister: store_persister,
+            store_persister,
             self_org,
             live_beacon,
         })
@@ -1256,8 +1259,28 @@ impl Node {
         self.handle.next_notification().await
     }
 
-    /// Shut the node down (closes the endpoint; the notification stream then ends).
-    pub fn shutdown(&self) {
+    /// Shut the node down cleanly: **persist the store, then** close the endpoint (the notification stream
+    /// then ends).
+    ///
+    /// Async because it does I/O, and the ordering is the whole point (#178). The store persister runs on a
+    /// derived period that bounds loss on a *crash*; a clean stop is the case where nothing need be lost, and
+    /// before this it was charged the same bound — `shutdown` closed the endpoint, the persister's next
+    /// `snapshot()` returned `None`, and it exited without writing. Everything stored since the last tick went
+    /// with it, on the one path where the node knew it was stopping.
+    ///
+    /// **The order cannot be inverted.** `drain()` asks the engine for a snapshot, so it must run while the
+    /// engine still answers — before `handle.shutdown()`, not after.
+    ///
+    /// This is the only door, deliberately. The alternative considered was a separate `persist_and_shutdown`
+    /// leaving this one abrupt, which makes the safe path opt-in — the shape that is reliably missed by the
+    /// next caller ([[opt-in-security-defaults-off]]). Making the single door async costs every caller an
+    /// `.await`, and costs the C ABI one `block_on`, which is the idiom `fanos-ffi` already uses five times.
+    ///
+    /// A node with no state directory has no persister and returns as fast as the old synchronous call did.
+    pub async fn shutdown(&self) {
+        if let Some(persister) = &self.store_persister {
+            persister.drain().await;
+        }
         self.handle.shutdown();
     }
 
@@ -1504,7 +1527,7 @@ mod tests {
         );
         assert!(matches!(a, Err(NodeError::Resolve(_))));
         assert!(matches!(b, Err(NodeError::Resolve(_))));
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1527,7 +1550,7 @@ mod tests {
                 q == 2,
                 "PG(2,{q}) must report whether it forms a cell — silence here is the defect, not the plane"
             );
-            node.shutdown();
+            node.shutdown().await;
         }
 
         // PG(2,q) exists only for prime powers, so a non-prime-power order is refused at the port rather than producing a
@@ -1548,7 +1571,7 @@ mod tests {
             health.local_addr.port() > 0,
             "endpoint bound to a real port"
         );
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1576,7 +1599,7 @@ mod tests {
         let health = node.health();
         assert_eq!(health.address, node.address());
         assert!(health.local_addr.port() > 0, "endpoint bound");
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1664,7 +1687,7 @@ mod tests {
         .await
         .expect("a service node with valid parameters starts");
         assert!(node.health().local_addr.port() > 0, "endpoint bound");
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1705,7 +1728,7 @@ mod tests {
         .await
         .expect("an exit node with valid parameters starts");
         assert!(node.health().local_addr.port() > 0, "endpoint bound");
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1746,7 +1769,7 @@ mod tests {
         assert!(node.serves(Role::Rendezvous), "…including the NOSTOS rendezvous role");
         // A role the node never offered is never assigned — the offer is a ceiling, not a hint.
         assert!(!node.serves(Role::Exit), "an unoffered role is not assigned");
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1808,7 +1831,7 @@ mod tests {
             !dir.is_empty(),
             "the relay published its mix onion key to the cell directory"
         );
-        node.shutdown();
+        node.shutdown().await;
     }
 
     #[tokio::test]
@@ -1843,7 +1866,7 @@ mod tests {
         };
         let mut b = make_b().await.unwrap();
         while b.address() == a_addr {
-            b.shutdown();
+            b.shutdown().await;
             b = make_b().await.unwrap();
         }
 
@@ -1868,8 +1891,8 @@ mod tests {
         .expect("timed out waiting for delivery");
         assert_eq!(delivered.as_deref(), Some(b"hello over quic".as_slice()));
 
-        a.shutdown();
-        b.shutdown();
+        a.shutdown().await;
+        b.shutdown().await;
     }
 
     #[tokio::test]
@@ -1895,7 +1918,7 @@ mod tests {
         };
         let mut b = make_b().await.unwrap();
         while b.address() == a_addr {
-            b.shutdown();
+            b.shutdown().await;
             b = make_b().await.unwrap();
         }
         let b_addr = b.address();
@@ -1935,8 +1958,8 @@ mod tests {
             "a routed back to a peer it only ever received a connection from (self-certifying reverse discovery)"
         );
 
-        a.shutdown();
-        b.shutdown();
+        a.shutdown().await;
+        b.shutdown().await;
     }
 
     #[tokio::test]
