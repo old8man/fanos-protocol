@@ -11,11 +11,18 @@
 //! released, which is the homeostat working. But one node cannot answer it — its own advertisement is a local
 //! write with no round trip to lose. This needs peers.
 //!
-//! The predicate asserted is the loop's own: the transport's peer table is a lower bound on live membership
-//! that owes nothing to the overlay store, and `role_loop` already uses `roster < peers()` to decide whether
-//! to keep looking. Using it as an *admission* rule for what may be published is the same evidence, one step
-//! earlier — so an assignment computed over fewer members than the node can literally see a connection to is
-//! the thing to catch.
+//! **Two assertions, and only one of them is sound from out here.** The published assignment must never be
+//! the degenerate one (`roster > 0`), which is an absolute statement about a sampled value. What this test
+//! must *not* assert is `roster >= known_peers`: the roster was computed inside the loop at one instant and
+//! the peer count is read from outside at a later one, and the address book only grows during discovery — so
+//! a perfectly sound derivation over one member reads as a violation the moment a second peer appears. An
+//! earlier draft asserted it and failed on exactly that. Comparisons between the two belong inside
+//! `assign_epoch`, where both are read together.
+//!
+//! The third assertion is the deterministic one: the guard **engaged**. The window it protects is tens of
+//! milliseconds wide on loopback, so a sampler catches it by luck — removing the guard and re-running once
+//! gave a clean pass purely on timing. The `AssignmentWithheld` station is exact, so a run in which nothing
+//! was ever withheld means the fixture did not reproduce the race and the other assertions prove nothing.
 //!
 //! Runtime: multi-threaded with four workers (#84). One beacon anchor drives the epochs for the whole cell.
 
@@ -138,6 +145,9 @@ async fn no_node_ever_assigns_over_fewer_members_than_it_can_see() {
         }
         tokio::time::sleep(SAMPLE).await;
     }
+    // Read the data-path plane before shutting down: the withheld count lives on the driver's station plane.
+    let stations: Vec<Vec<fanos_runtime::ports::stations::Observation>> =
+        nodes.iter().map(|n| n.client().driver_stations()).collect();
     for node in &nodes {
         node.shutdown();
     }
@@ -153,8 +163,41 @@ async fn no_node_ever_assigns_over_fewer_members_than_it_can_see() {
              every actuated role on it was torn down until the next refresh, and `caps_complete` reported \
              that scan COMPLETE because an absent record is a definite absence",
         );
+        // **`roster >= peers` is deliberately NOT asserted here, and the reason is a methodological one.**
+        // `roster` was computed inside the loop at some earlier instant; `known_peers` is read now. Comparing
+        // them is comparing two different moments — the address book only grows during discovery, so a
+        // perfectly sound derivation over 1 member reads as a violation the moment a second peer appears.
+        // The first draft of this test asserted it and failed on exactly that, at `(roster 1, peers 2)`.
+        //
+        // The comparison belongs where both values are read together, which is inside `assign_epoch`. What a
+        // test outside the loop can check is that the guard *engaged* — the station below — and that the
+        // published value is never the degenerate one, above.
+        let _ = peers;
     }
+    // **The deterministic half.** The two assertions above sample a window that is tens of milliseconds wide
+    // on loopback, so a passing run is not proof the dip is absent — removing the guard and re-running gave a
+    // clean pass once, purely on timing. The station is exact: every hold records one, tagged with the roster
+    // the scan produced, so "the mechanism engaged" is a count rather than a lucky sample.
+    //
+    // At least one node must have withheld at least once. On a cell whose members all turn at the same
+    // instant and whose records cost a round trip, a run in which nobody ever read a short view would mean
+    // the fixture is not reproducing the race at all — and then the assertions above are vacuous.
+    let withheld: u64 = stations
+        .iter()
+        .map(|obs| {
+            obs.iter()
+                .filter(|o| o.station == fanos_runtime::ports::stations::Station::AssignmentWithheld)
+                .map(|o| o.count)
+                .sum::<u64>()
+        })
+        .sum();
+    assert!(
+        withheld > 0,
+        "no node ever withheld an assignment across two epoch turns, so this fixture did not reproduce the \
+         race the guard exists for and the roster assertions above prove nothing",
+    );
+
     // Reported rather than asserted: the settled and worst rosters, so a future reader can see what the cell
     // actually did instead of inferring it from a passing test.
-    println!("settled rosters {settled:?}, worst (roster, known_peers) per node {worst:?}");
+    println!("settled rosters {settled:?}, worst (roster, known_peers) {worst:?}, withheld {withheld}");
 }

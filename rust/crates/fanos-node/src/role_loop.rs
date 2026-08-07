@@ -1126,12 +1126,51 @@ async fn assign_epoch<F: Field>(
     // Holding means: publish nothing, step nothing, and report **incomplete** — which is already the signal
     // that keeps the refresh at its floor, so the next look comes soon rather than after a backoff.
     if !members.iter().any(|(id, _)| *id == live.node_id()) {
-        return (*roles_tx.borrow(), false);
+        return withhold(client, roles_tx, members.len());
     }
+    // **`members.len() < peers()` is deliberately NOT a second hold condition, and that was a close call.**
+    //
+    // It is tempting: the loop already uses that comparison to decide whether to keep *looking*, so using it
+    // to decide whether to *speak* looks like the same evidence one step earlier. It is not. `peers()` is the
+    // address book, which holds every coordinate this node has merely *heard of* through flooded announces —
+    // including nodes that offer no roles and will never publish a capability at all. A roster smaller than
+    // it is therefore not evidence that the directory is behind, and a hold on that condition would freeze
+    // the assignment for as long as such a peer is known. Bounding the hold to once per epoch was tried, and
+    // an ad-hoc bound to contain a condition that should not have fired is the wrong shape.
+    //
+    // What motivated it was a sampled `(roster 1, peers 2)`, and that reading does not support it either:
+    // the roster was computed inside this function at one instant and the peer count read from outside at a
+    // later one, so the address book had grown in between. The sound version of that measurement is taken
+    // *here*, where both values are read together, and it has not been taken. See #151.
     let roles = live.step(&members, epoch, &beacon, setpoint);
     note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
+}
+
+/// Keep the previously published assignment, and **say so**: the same value, `complete = false`, and one
+/// [`AssignmentWithheld`](fanos_runtime::ports::stations::Station::AssignmentWithheld) tagged with the roster
+/// the scan produced.
+///
+/// The station is not decoration. Holding is a *deliberate non-action*, and a loop that silently keeps
+/// returning the same answer is indistinguishable from a converged one — the exact ambiguity the
+/// `complete`/`repeated` split in [`next_stable`] exists to remove one level up. It is also the only
+/// deterministic observable of this mechanism: the window it guards is tens of milliseconds on loopback, so a
+/// test sampling the published assignment catches it by luck, while the counter is exact.
+///
+/// `complete = false` rather than `true` because that is already the signal that keeps the refresh at its
+/// floor — a withheld assignment must be re-derived soon, not backed off from.
+fn withhold(
+    client: &Client,
+    roles_tx: &watch::Sender<Assignment>,
+    roster: usize,
+) -> (Assignment, bool) {
+    client.record_station(
+        fanos_runtime::ports::stations::Station::AssignmentWithheld,
+        Some(client.address()),
+        Some(roster as u64),
+    );
+    (*roles_tx.borrow(), false)
 }
 
 /// Record a provisioning shortfall where an operator will see it — one

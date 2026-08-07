@@ -4456,3 +4456,48 @@ guarantee is the shape worth returning to.
 
 **The transferable rule: a refutation is a narrowing, not an acquittal.** Had the task been deleted when the
 single-node probe came back clean, a real defect would have gone with it.
+
+## §7. Two readings from two moments — one artefact, three wrong things
+
+A methodological finding, recorded because it produced a task, a test assertion and very nearly a shipped
+rule, all before anyone noticed the two numbers were not comparable.
+
+```rust
+worst[i] = (node.assignment().roster, node.health().known_peers);
+```
+
+Both reads are on one line, so they look simultaneous. `roster` was computed **inside the role loop**, seconds
+earlier, from a directory scan; `known_peers` is the address book **now**, and it only grows during discovery.
+A derivation that was entirely correct over one member therefore reads as `(1, 2)` the moment a second peer is
+learned.
+
+What that produced:
+
+1. **A filed residual** (#151) claiming the roster dips below what the transport can see, with `(1, 2)` as its
+   evidence.
+2. **A test assertion** `roster >= known_peers`, which failed on a node whose derivation had been right.
+3. **A rule that was written and then removed** — hold the assignment when `members.len() < peers()`. Asking
+   what `peers()` counts settles it: every coordinate this node has merely *heard of* through flooded
+   announces, including nodes that offer no roles and will never publish a capability. A roster smaller than
+   it is not evidence of anything, and holding on it freezes the assignment for as long as such a peer is
+   known.
+
+**The tell was there before the measurement.** The rule was bounded to "at most once per epoch" precisely
+because it could otherwise freeze — and *an ad-hoc bound added to contain a condition that should not have
+fired is a signal the predicate is wrong, not that it needs tuning*. That discomfort was the finding; capping
+it was the mistake.
+
+**What landed instead is the better half.** `Station::AssignmentWithheld`, recorded on every hold and tagged
+with the roster the scan produced. A hold is a *deliberate non-action*, and a loop that silently keeps
+returning the same answer is indistinguishable from a converged one — the ambiguity the `complete`/`repeated`
+split already removes one level up. It is also the only **deterministic** observable of the mechanism: the
+guarded window is tens of milliseconds on loopback, so a sampler catches it by luck (removing the guard and
+re-running once gave a clean pass purely on timing) while the counter is exact. The test now asserts the
+station fired, so a run that failed to reproduce the race declares itself rather than passing vacuously.
+
+Measured with the self-guard alone, two epoch turns on three nodes: **withheld 9**, worst roster 2, no empty
+publish.
+
+**The residual is now a measurement, not a proposal.** Whether the roster is ever short *at derivation time* —
+both values read in the same frame, inside `assign_epoch` — is unknown, and the station's tag is the
+instrument for it.

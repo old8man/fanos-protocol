@@ -255,6 +255,23 @@ pub enum Station {
     /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
+    /// The role loop **declined to publish an assignment** because the view it derived one from was behind
+    /// what this node can already see — its own capability record missing from the roster, or the roster
+    /// smaller than the transport's own peer table.
+    ///
+    /// A deliberate non-action, and therefore one that has to be counted. Holding the previous assignment is
+    /// right — a capability record lives at `cap_slot(coord, epoch)`, so at an epoch turn every slot is empty
+    /// until each node republishes, and an assignment derived from that view is one no other node computes
+    /// (#146, measured at a roster of 0 with 2 peers known). But a loop that silently keeps returning the
+    /// same answer is indistinguishable from a converged one, which is exactly the ambiguity the
+    /// `complete`/`repeated` split in `next_stable` exists to remove one level up.
+    ///
+    /// Zero after a cell settles. A **rising** count means this node's directory view is persistently behind
+    /// its transport view — a store that is not answering, or a peer that is in the address book and never
+    /// publishes a capability. [`Observation::tag`] carries the roster size the scan produced, so the two are
+    /// distinguishable without a second station.
+    AssignmentWithheld,
+
     /// A `(coordinate, epoch)` directory publish did not land — the node is **absent from that roster for
     /// that epoch**, and until this station existed it was the last to know.
     ///
@@ -312,6 +329,7 @@ impl Station {
         Self::DescriptorUnrecoverable,
         Self::DirectoryPublishFailed,
         Self::RoleUnderProvisioned,
+        Self::AssignmentWithheld,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
@@ -351,6 +369,7 @@ impl Station {
             Self::DescriptorUnrecoverable => "descriptor.unrecoverable",
             Self::DirectoryPublishFailed => "directory.publish_failed",
             Self::RoleUnderProvisioned => "role.under_provisioned",
+            Self::AssignmentWithheld => "assignment.withheld",
             Self::AuthenticationRejected => "auth.rejected",
         }
     }
@@ -703,6 +722,7 @@ mod tests {
                 Station::DescriptorUnrecoverable => listed(Station::DescriptorUnrecoverable),
                 Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
                 Station::RoleUnderProvisioned => listed(Station::RoleUnderProvisioned),
+                Station::AssignmentWithheld => listed(Station::AssignmentWithheld),
                 Station::AuthenticationRejected => listed(Station::AuthenticationRejected),
             }
         }
