@@ -3282,8 +3282,12 @@ fn log_notification(note: &Notification) {
 /// cost is not churn but accumulation, since a cell reshuffled faster than it reintegrates never reaches a
 /// steady state at all.
 fn log_notification_against(note: &Notification, configured: Option<Duration>) {
-    if let Notification::EpochFloor { millis } = note {
-        match (millis, configured) {
+    match note {
+        // Folded into the one match rather than an early `if let … return`. That shape left a dead
+        // `EpochFloor` arm below whose empty body clippy could not distinguish from the deliberately-quiet
+        // ones — and the distinction between "handled elsewhere" and "chosen not to surface" is precisely
+        // what this function now exists to record.
+        Notification::EpochFloor { millis } => match (millis, configured) {
             (None, _) => {
                 tracing::warn!(
                     "this cell can sustain no epoch cadence at all — one advance already spends its whole \
@@ -3299,10 +3303,7 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
                 );
             }
             (Some(ms), _) => info!(floor_ms = ms, "measured the shortest epoch period this cell can sustain"),
-        }
-        return;
-    }
-    match note {
+        },
         Notification::Delivered { from, payload } => {
             info!(?from, bytes = payload.len(), "payload delivered");
         }
@@ -3319,7 +3320,84 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
             warn!("behavioural coherence collapsed (Phi <= 1) — the cell needs re-provisioning, not a reroute");
         }
         Notification::Decoupled => info!("cascade pre-empted (decoupled)"),
-        other => info!(event = ?other, "engine event"),
+
+        // --- Everything below replaced one `other => info!(event = ?other, "engine event")` arm. ---
+        //
+        // That arm was not silence — every variant was logged — but it flattened all of them to one level,
+        // one message and a `Debug` dump: `DataLost` (permanent loss of stored content) came out at `info`,
+        // in the same shape as `Stored`, which is per-operation routine. An operator filtering at `warn`
+        // never saw it, and one reading `info` saw it buried. Structured fields were lost too, so nothing a
+        // log aggregator can index or alert on survived.
+        //
+        // The catch-all is also why it accumulated: a new variant compiled, logged *something*, and looked
+        // handled. Being exhaustive makes "at what level, and with which fields?" a question the compiler
+        // asks when a variant is added. Several arms below are deliberately quiet — the point is not to
+        // print more, it is that staying quiet is now a decision on the record.
+
+        // Version skew, and the one escalation that names WHO sent WHAT — the actionable content of a
+        // rollout. It read as "engine event" before, which is the least useful possible rendering of it.
+        Notification::Escalated(Escalation::UnsupportedCritical { type_code, from }) => warn!(
+            type_code,
+            ?from,
+            "a peer sent a critical frame type this build does not implement — the cell is running mixed \
+             versions and this peer is ahead"
+        ),
+
+        // Permanent loss. `warn`, not `info`: the shard is gone and no repair will bring it back.
+        Notification::DataLost { key, epoch } => warn!(
+            key = %fanos_node::config::hex_encode(key),
+            epoch = epoch.get(),
+            "stored content is permanently lost — below the erasure threshold with no surviving replica"
+        ),
+
+        // This node's coordinate changed. Every address an operator recorded for it is now stale, which is
+        // an action, not a status line.
+        Notification::Reseated { old, new } => {
+            warn!(?old, ?new, "this node moved coordinate — recorded addresses for it are stale");
+        }
+
+        // Being refused entry. Repeated refusals mean this node will not join until something changes.
+        Notification::AdmissionRefused { required } => {
+            warn!(?required, "a peer refused this node's admission");
+        }
+
+        // The positive confirmation an operator starting a hidden service is waiting for. Without it,
+        // success and silent failure look identical at the console.
+        Notification::HostRegistered { service_tag } => info!(
+            service_tag = %fanos_node::config::hex_encode(service_tag),
+            "hidden service registered at its meeting points"
+        ),
+
+        Notification::PeerMoved { old, new } => info!(?old, ?new, "a peer moved coordinate"),
+        Notification::Grey(p) => info!(node = ?p, "peer greylisted"),
+        Notification::Bound => info!("cell bound (homeostat)"),
+        Notification::Verdict(v) => info!(verdict = ?v, "coherence verdict"),
+        Notification::Liveness { epoch, degraded, responsive, alive } => {
+            info!(epoch = epoch.get(), degraded, responsive, alive, "cell liveness");
+        }
+        Notification::Rebalance { loads } => info!(?loads, "role rebalance"),
+        Notification::BeaconReady { epoch, .. } => info!(epoch = epoch.get(), "beacon ready"),
+        Notification::DkgComplete(commitment) => info!(
+            commitment = %fanos_node::config::hex_encode(commitment),
+            "distributed key generation complete"
+        ),
+        Notification::RendezvousLine(l) => info!(line = ?l, "rendezvous line selected"),
+        Notification::Availability { key, available } => info!(
+            key = %fanos_node::config::hex_encode(key),
+            available,
+            "availability sample"
+        ),
+
+        // Deliberately not surfaced: per-operation, and at a rate that would drown everything above.
+        // `Snapshot`, `Observed` and `DataPath` are answers to a request the caller is already awaiting
+        // (`await_data_path`, `await_observation`), so logging them here would duplicate that path.
+        Notification::App { .. }
+        | Notification::Stored(_)
+        | Notification::Retrieved { .. }
+        | Notification::LoadReport { .. }
+        | Notification::Snapshot(_)
+        | Notification::Observed(_)
+        | Notification::DataPath { .. } => {}
     }
 }
 
