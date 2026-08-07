@@ -260,3 +260,56 @@ fn a_crafted_snapshot_cannot_amplify_through_the_side_maps() {
         );
     }
 }
+
+/// **The startup report must say what actually happened, not what was on disk** (#189).
+///
+/// `compose_engine` applies the snapshot and throws away `OverlayNode::restore`'s verdict, delegating the
+/// report to the host with the comment *"the host reports whether it took"*. The host was handed the byte
+/// count — a **proxy**: "there was a file" and "the file was adopted" agree only on the happy path. An
+/// upgrade that changed the snapshot format therefore printed `restored N bytes` at a node that had come up
+/// empty, which is worse than silence, because silence prompts a check and a false affirmation stops one.
+///
+/// The property checked here is not "the predicate rejects garbage" — that would pass against a predicate
+/// that rejects everything. It is that **the reported verdict equals the engine's actual outcome**, in both
+/// worlds, so the sentence the operator reads is the sentence that is true.
+#[test]
+fn the_restore_report_agrees_with_what_the_engine_actually_did() {
+    let dir = Scratch::new("restore-report");
+    let mut before = engine(None);
+    put(&mut *before, 2, b"a-key", b"a value worth persisting");
+    let held = snapshot(&mut *before, 3);
+    fanos_node::durable::write_snapshot(dir.path(), &held).expect("write the snapshot");
+    let good = fanos_node::durable::read_snapshot(dir.path()).expect("read it back");
+
+    // World 1 — an intact snapshot. The predicate says yes, and the engine really does come back holding it.
+    assert!(fanos_runtime::snapshot_is_readable(&good), "an intact snapshot must read as adoptable");
+    let mut restored = engine(Some(good.clone()));
+    assert_eq!(snapshot(&mut *restored, 4), held, "and the engine must actually hold it");
+
+    // World 2 — one byte of the body flipped, which is what a format change or a damaged file looks like from
+    // here. Flip inside the body rather than the trailing tag so BOTH the authenticator and the version path
+    // are exercised the way a real mismatch would exercise them.
+    let mut damaged = good.clone();
+    let at = damaged.len() / 2;
+    damaged[at] ^= 0xFF;
+    assert!(!fanos_runtime::snapshot_is_readable(&damaged), "a damaged snapshot must read as refused");
+    let mut refused = engine(Some(damaged));
+    assert_eq!(
+        snapshot(&mut *refused, 5),
+        snapshot(&mut *engine(None), 5),
+        "and the engine must genuinely be empty — the refusal is not cosmetic"
+    );
+
+    // The discrimination itself, stated: the two worlds differ, so a report derived from this predicate
+    // cannot say the same thing about both. A byte count would have.
+    assert_ne!(
+        fanos_runtime::snapshot_is_readable(&good),
+        fanos_runtime::snapshot_is_readable(&{
+            let mut d = good.clone();
+            let at = d.len() / 2;
+            d[at] ^= 0xFF;
+            d
+        }),
+        "the predicate must discriminate the two worlds, or the report is a proxy again"
+    );
+}

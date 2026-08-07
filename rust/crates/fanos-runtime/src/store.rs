@@ -176,6 +176,27 @@ const SNAPSHOT_LABEL: &str = "FANOS-v1/store-snapshot";
 /// its local shards, which the `[7,3,4]` erasure code across the cell is *designed* to re-heal.
 const SNAPSHOT_VERSION: u32 = 1;
 
+/// Whether `bytes` is a snapshot **this build can adopt** — the question, exposed without the type.
+///
+/// [`Store`] is deliberately `pub(crate)`, so a host that wants to *report* the outcome of a restore had no
+/// way to learn it: `OverlayNode::restore` returns the verdict but the composition swallows it, and the host
+/// was left holding the byte count instead (#189). A byte count answers *"was there a file?"*; this answers
+/// *"can it be read?"*, which is the fact the startup report claims.
+///
+/// Defined by calling the same [`Store::restore`] the adoption path uses, so the two **cannot** disagree —
+/// a re-implementation of the header check here would be a second decoder to keep in step, which is the
+/// shape that made the version constant above worth having in the first place.
+///
+/// At the one call site that matters this is *exact* rather than merely indicative: `compose_engine` invokes
+/// `restore` immediately after `OverlayNode::new`, when the store is provably empty, so the only reachable
+/// cause of a refusal is the decode — not the "already holding entries" arm.
+///
+/// Costs one extra decode of a file already in memory, once per process start.
+#[must_use]
+pub fn snapshot_is_readable(bytes: &[u8]) -> bool {
+    Store::restore(bytes).is_some()
+}
+
 impl Store {
     /// This node's **durable** state as canonical bytes: the held shards, the expiry schedule, the loss
     /// ledger, and the read-nonce counter.

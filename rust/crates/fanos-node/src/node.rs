@@ -8,7 +8,7 @@
 
 use core::fmt;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -699,6 +699,25 @@ const ROLE_CAPACITY_WEIGHT: u16 = 4;
 const ROLE_GAIN_SEVENTH: u8 = 7;
 
 
+/// The previous run's snapshot **and** whether this build can adopt it, derived together.
+///
+/// Two facts about one file, and the whole of #189 was them drifting apart: `compose_engine` applies the
+/// bytes and discards `OverlayNode::restore`'s verdict, delegating the report to this host with the comment
+/// *"the host reports whether it took"* — and the host held only the length, a **proxy**. "There was a file"
+/// and "the file was adopted" agree on the happy path and nowhere else.
+///
+/// Computed in one function precisely so they cannot separate again: a caller that has the bytes has the
+/// verdict, in the same expression. `snapshot_is_readable` asks the same `Store::restore` the adoption path
+/// asks, so the report cannot disagree with what the engine then does.
+///
+/// Returns `(bytes for the engine builder, (len, adoptable) for the report)`; both `None` on a first boot or
+/// an ephemeral node that configured no state directory.
+fn read_restore(state_dir: Option<&Path>) -> (Option<Vec<u8>>, Option<(usize, bool)>) {
+    let bytes = state_dir.and_then(crate::durable::read_snapshot);
+    let report = bytes.as_ref().map(|b| (b.len(), fanos_runtime::snapshot_is_readable(b)));
+    (bytes, report)
+}
+
 /// Keep this node's durable store on disk, and say at startup whether the previous run's came back.
 ///
 /// `None` when the config named no state directory — an ephemeral node (a test, a proxy-only client) has
@@ -710,7 +729,7 @@ const ROLE_GAIN_SEVENTH: u8 = 7;
 fn spawn_store_role(
     handle: &NodeHandle,
     state_dir: Option<PathBuf>,
-    restored_len: Option<usize>,
+    restored: Option<(usize, bool)>,
 ) -> Option<crate::durable::StorePersister> {
     let Some(dir) = state_dir else {
         // Said once, rather than left to be discovered after a restart. A node with no state directory is a
@@ -719,10 +738,22 @@ fn spawn_store_role(
         eprintln!("fanos: no state directory configured — this node keeps nothing across a restart");
         return None;
     };
-    match restored_len {
-        Some(len) => eprintln!(
+    // Three states, not two. "A file was there" and "the file was adopted" are different facts, and the
+    // second is the one this report claims; conflating them made an upgrade that changed the snapshot format
+    // print `restored N bytes` at a node that had come up empty (#189). The refusal is not a fault — the
+    // header carries `SNAPSHOT_VERSION` and a mismatch is *meant* to refuse, and `[7,3,4]` re-heals one
+    // member's shards — but it must be a sentence the operator read, because by this function's own argument
+    // there is no other way to observe it.
+    match restored {
+        Some((len, true)) => eprintln!(
             "fanos: restored {len} bytes of store state from {}",
             dir.join(crate::durable::STORE_FILE).display()
+        ),
+        Some((len, false)) => eprintln!(
+            "fanos: REFUSED the {len}-byte store snapshot in {} — it does not decode for this build \
+             (format change, or a damaged file); starting empty, and the cell's erasure code re-heals \
+             this node's shards",
+            dir.display()
         ),
         None => eprintln!("fanos: no store snapshot in {} — starting empty", dir.display()),
     }
@@ -1055,10 +1086,7 @@ impl Node {
         // before anything has been served (#77). Absent on a first boot, and absent for good on a node that
         // configured no state directory, which is what an ephemeral node means.
         let state_dir = config.state_path.clone();
-        let restore = state_dir.as_deref().and_then(crate::durable::read_snapshot);
-        // What the engine builder consumes; `restored_len` is what the startup report needs, kept because the
-        // builder is a `move` closure and the bytes go with it.
-        let restored_len = restore.as_ref().map(Vec::len);
+        let (restore, restored) = read_restore(state_dir.as_deref());
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -1150,7 +1178,7 @@ impl Node {
         // ephemeral node (a test, a proxy-only client) has nothing worth a file and should not make one.
         // Reported at startup rather than inferred: whether the previous run's store came back is exactly the
         // fact an operator cannot see any other way, and a silent empty start is the failure this closes.
-        let store_persister = spawn_store_role(&handle, state_dir, restored_len);
+        let store_persister = spawn_store_role(&handle, state_dir, restored);
 
         let move_announcer = announce_node(&handle, &config);
 
