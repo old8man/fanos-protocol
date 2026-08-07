@@ -404,7 +404,7 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
     // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
     // combiner: a client now picks among the `f + 1` points, and a registration is what makes any of them able to
     // reach it. Being at a combiner stops being load-bearing — it becomes an accident of placement.
-    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-quic-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true)
+    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-quic-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true).expect("every line usable in this fixture")
         .coords();
     let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-quic-svc-secret");
     let reg = HostRegister::onion(&bundle, &signer, epoch, TEST_BEACON.as_bytes(), svc_reply_pub.encode(), vec![drop_line], t as u8)
@@ -544,7 +544,7 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
     // The service registers a forward route at EVERY meeting point, even though it happens to sit at one
     // combiner: a client now picks among the `f + 1` points, and a registration is what makes any of them able to
     // reach it. Being at a combiner stops being load-bearing — it becomes an accident of placement.
-    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-cell-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true)
+    let drop_line = select_drop_line(Point::<F2>::at(l_index), b"anon-cell-svc-secret", epoch.get(), TEST_BEACON.as_bytes(), |_| true).expect("every line usable in this fixture")
         .coords();
     let (svc_reply_keys, svc_reply_pub) = ReplyKeys::generate(b"anon-cell-svc-secret");
     let reg = HostRegister::onion(&bundle, &signer, epoch, TEST_BEACON.as_bytes(), svc_reply_pub.encode(), vec![drop_line], t as u8)
@@ -749,7 +749,9 @@ impl OffCombiner {
     let host_point = Point::<F2>::at(host_index);
     // Its dead-drop line (beacon-blinded, through its own point): where forwarded requests come home.
     let drop_line =
-        select_drop_line(host_point, b"off-combiner-host", epoch.get(), TEST_BEACON.as_bytes(), |_| true).coords();
+        select_drop_line(host_point, b"off-combiner-host", epoch.get(), TEST_BEACON.as_bytes(), |_| true)
+            .expect("every line usable in this fixture")
+            .coords();
     let (host_reply_keys, host_reply_pub) = ReplyKeys::generate(b"off-combiner-host");
     // The primary, coordinate-hiding registration: a 1-hop forward route to the dead-drop line, signed under the
     // service's published identity so the combiner can check the binding rather than believe it.

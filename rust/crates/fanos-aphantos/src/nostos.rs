@@ -84,8 +84,14 @@ const DROP_LINE_LABEL: &str = "FANOS-v1/nostos-drop-line";
 ///
 /// The blinded index chooses where the search **starts**, not what it returns, so the walk costs no
 /// unpredictability: an observer who cannot compute the digest cannot compute the starting point either, and
-/// `usable` is a public property of the plane. Falls back to the blinded choice when no line qualifies —
-/// a degenerate cell should still produce an answer rather than a panic.
+/// `usable` is a public property of the plane.
+///
+/// **`None` when no line through `receiver` qualifies**, and that is the whole point of the return type. It
+/// used to fall back to the blinded choice — handing back an UNUSABLE line typed exactly like a usable one,
+/// so a caller could not tell the two apart. Only `q + 1` lines pass through a point (three on the Fano
+/// plane), so "none usable" is one absent directory entry away, not a degenerate corner. The hidden-service
+/// host was the caller that did not re-check: it laid every circuit around an unsealable drop line, `onion`
+/// then returned `None`, and the service went unregistered for the whole epoch without a word (#163).
 #[must_use]
 pub fn select_drop_line<F: Field>(
     receiver: Point<F>,
@@ -93,7 +99,7 @@ pub fn select_drop_line<F: Field>(
     epoch: u64,
     beacon: &[u8],
     usable: impl Fn(Line<F>) -> bool,
-) -> Line<F> {
+) -> Option<Line<F>> {
     let mut material = Vec::with_capacity(shared_secret.len() + 8 + beacon.len());
     material.extend_from_slice(shared_secret);
     material.extend_from_slice(&epoch.to_be_bytes());
@@ -112,13 +118,10 @@ pub fn select_drop_line<F: Field>(
     // Walk the `q+1` lines through `receiver` from the blinded index to the first the caller can use.
     // `lines_through` always yields exactly `q+1` and every index is reduced mod that, so `nth` is always
     // `Some`; the `Line::at(0)` fallback is unreachable and keeps the function total without an `unwrap`.
-    (0..line_size)
-        .find_map(|k| {
-            let line = Plane::<F>::lines_through(receiver).nth((idx + k) % line_size)?;
-            usable(line).then_some(line)
-        })
-        .or_else(|| Plane::<F>::lines_through(receiver).nth(idx))
-        .unwrap_or_else(|| Line::<F>::at(0))
+    (0..line_size).find_map(|k| {
+        let line = Plane::<F>::lines_through(receiver).nth((idx + k) % line_size)?;
+        usable(line).then_some(line)
+    })
 }
 
 /// The receiver's **ephemeral reply key** — a fresh hybrid-KEM keypair whose public half travels to
@@ -271,20 +274,20 @@ mod tests {
     #[test]
     fn the_drop_line_is_the_receivers_own_line_and_is_beacon_blinded() {
         let r = Point::<F7>::at(11);
-        let l = select_drop_line(r, b"shared-secret", 7, b"beacon-epoch-7", |_| true);
+        let l = select_drop_line(r, b"shared-secret", 7, b"beacon-epoch-7", |_| true).expect("every line usable");
         assert!(r.is_on(&l), "the receiver is a member of its own dead-drop line");
 
         // A different shared secret, epoch, or beacon can move the line — and whatever it is, the
         // receiver is still on it (it is always one of R's own q+1 lines).
-        let l_other_secret = select_drop_line(r, b"other-secret", 7, b"beacon-epoch-7", |_| true);
-        let l_other_epoch = select_drop_line(r, b"shared-secret", 8, b"beacon-epoch-8", |_| true);
+        let l_other_secret = select_drop_line(r, b"other-secret", 7, b"beacon-epoch-7", |_| true).expect("usable");
+        let l_other_epoch = select_drop_line(r, b"shared-secret", 8, b"beacon-epoch-8", |_| true).expect("usable");
         assert!(r.is_on(&l_other_secret));
         assert!(r.is_on(&l_other_epoch));
         // Over the q+1 = 8 lines, the blinds land on more than one line (not a constant) — sampled
         // across secrets so the assertion does not hinge on one arbitrary pair colliding.
         let mut seen = alloc::collections::BTreeSet::new();
         for s in 0u8..16 {
-            seen.insert(select_drop_line(r, &[s], 7, b"b", |_| true).coords());
+            seen.insert(select_drop_line(r, &[s], 7, b"b", |_| true).expect("usable").coords());
         }
         assert!(seen.len() > 1, "the blinded index actually varies the line");
     }
@@ -306,6 +309,31 @@ mod tests {
         }
     }
 
+    /// When NOTHING is usable, the answer is `None` — not a line the caller cannot use.
+    ///
+    /// The complement of `a_drop_line_is_always_one_the_caller_can_use`, and the half that did not exist.
+    /// The old fallback returned the blinded line when the walk found nothing, typed identically to a usable
+    /// one, so a caller had no way to distinguish "here is your line" from "nothing worked" (#163). Only
+    /// `q + 1` lines pass through a point — three on Fano — so this state is one absent directory entry
+    /// away, not a pathological input.
+    ///
+    /// Assert the `Some` side in the same test, or a `select_drop_line` that returned `None` unconditionally
+    /// would satisfy the interesting half.
+    #[test]
+    fn no_usable_line_yields_none_rather_than_an_unusable_one() {
+        for p in 0..57usize {
+            let r = Point::<F7>::at(p);
+            assert!(
+                select_drop_line(r, b"secret", 7, b"beacon", |_| false).is_none(),
+                "point {p}: with every line rejected there is no drop line, and saying so is the contract"
+            );
+            assert!(
+                select_drop_line(r, b"secret", 7, b"beacon", |_| true).is_some(),
+                "point {p}: …and with every line accepted there certainly is one"
+            );
+        }
+    }
+
     /// The end-to-end round trip: a reply threshold-routed to the receiver's line is opened by the
     /// receiver — and by no one else, including the members of the delivery line who peel the onion.
     /// **The chosen drop line must be one the caller can use**, and the blinded index must only decide where
@@ -319,6 +347,7 @@ mod tests {
     ///   * every line returned satisfies `usable`, for every receiver and every rejected subset;
     ///   * the choice still depends on the secret — two secrets that would start at different indices must
     ///     not be collapsed onto one answer by the walk.
+
     #[test]
     fn a_drop_line_is_always_one_the_caller_can_use() {
         use alloc::collections::BTreeSet;
@@ -327,7 +356,8 @@ mod tests {
             // Reject all but one of the receiver's lines: the walk has to find it wherever it starts.
             let only = Plane::<F7>::lines_through(r).next().expect("a point lies on q+1 lines");
             for secret in 0u8..32 {
-                let l = select_drop_line(r, &[secret], 7, b"beacon", |cand| cand.coords() == only.coords());
+                let l = select_drop_line(r, &[secret], 7, b"beacon", |cand| cand.coords() == only.coords())
+                    .expect("exactly one line is permitted and it is reachable from any start");
                 assert_eq!(
                     l.coords(),
                     only.coords(),
@@ -342,7 +372,7 @@ mod tests {
         // the same line would satisfy the assertion above while destroying the blinding it is built on.
         let r = Point::<F7>::at(11);
         let spread: BTreeSet<_> =
-            (0u8..64).map(|s| select_drop_line(r, &[s], 7, b"b", |_| true).coords()).collect();
+            (0u8..64).map(|s| select_drop_line(r, &[s], 7, b"b", |_| true).expect("usable").coords()).collect();
         assert!(
             spread.len() > 1,
             "the blinded index must still choose: {} distinct lines over 64 secrets",
@@ -355,7 +385,7 @@ mod tests {
         let t = 3u8;
         // The receiver and its dead-drop line L (a real line through R).
         let r = Point::<F7>::at(11);
-        let l = select_drop_line(r, b"session-key", 7, b"beacon-7", |_| true);
+        let l = select_drop_line(r, b"session-key", 7, b"beacon-7", |_| true).expect("usable");
         assert!(r.is_on(&l));
 
         // The receiver's ephemeral reply key (the end-to-end seal target).
@@ -454,7 +484,7 @@ mod tests {
         let drop = line_members(8, 50);
         let drop_pub: Vec<&HybridKemPublic> = drop.iter().map(|(_, p)| p).collect();
         let r = Point::<F7>::at(5);
-        let l = select_drop_line(r, b"s", 1, b"b", |_| true);
+        let l = select_drop_line(r, b"s", 1, b"b", |_| true).expect("usable");
         let return_hops = [HopLine {
             line: l.coords(),
             members: &drop_pub,

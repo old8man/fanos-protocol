@@ -492,12 +492,24 @@ async fn rotate_host(
     // function silently returns — leaving the service unregistered for the whole epoch because one member of
     // one line happened to be absent. Choosing a usable line is the difference between a service that is
     // reachable and one that is quietly not there.
-    let drop_line = select_drop_line(point, host_secret, epoch.get(), &seed, |l| {
+    let Some(drop_line) = select_drop_line(point, host_secret, epoch.get(), &seed, |l| {
         line_member_coords::<F2>(l.coords())
             .iter()
             .all(|m| dir.get(m).is_some())
     })
-    .coords();
+    .map(|l| l.coords()) else {
+        // No line through this point can be sealed against this epoch's directory. Refuse the registration
+        // and SAY so — the silence was half the defect (#163). This used to be indistinguishable from
+        // success: `select_drop_line` returned an unusable line typed like a usable one, every circuit below
+        // was laid around it, `onion` then returned `None`, and the function returned quietly. The service
+        // was absent for the whole epoch and the failure surfaced as a CLIENT-side reachability fault.
+        tracing::warn!(
+            ?point,
+            epoch = epoch.get(),
+            "no sealable dead-drop line through this host's point — refusing to register for this epoch"
+        );
+        return;
+    };
     // Every circuit below is laid AROUND `drop_line`, and around the meeting lines, for the reason
     // `rendezvous::route_leaks` states: no line may hold both a name for this host and a name for the service
     // it serves. Drawn from a per-epoch secret seed, so the paths are stable for the epoch the signed

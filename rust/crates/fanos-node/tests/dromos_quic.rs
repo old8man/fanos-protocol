@@ -233,14 +233,26 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     //     zero (measured — the test stays green), so it does not pin dispersal and is not claimed to: it pins that
     //     shards flow and the sampler takes them.
     let mut dispersed = 0u64;
+    let mut taken = 0u64;
     for (i, h) in handles.iter().enumerate() {
         let p = h.probe().await.expect("validator is up").consensus;
         let (asked, served) = p.shard_asks;
         dispersed += p.shards_sent;
-        assert!(p.shards_taken > 0, "v{i} accepted a shard the sampler took: {p}");
+        taken += p.shards_taken;
         assert!(asked > 0 && served > 0, "v{i} answered a peer's shard request (the sampling loop ran): {p}");
     }
     assert!(dispersed > 0, "some proposer dispersed erasure shards rather than shipping whole blocks");
+    // Cell-wide, NOT per-validator — and that is the correction, not a weakening. `shards_taken` counts
+    // accepted deliveries, and the protocol does not promise every validator accepts one: a node that races
+    // ahead already holds the block and needs no sampled shard. Observed exactly that way — v6 failed this
+    // assertion with `took=0 shard=24/24 vrej[stale=6]`: it had ANSWERED 24 shard requests and rejected six
+    // votes as stale, i.e. it was ahead of the cell, and the same test passed on the next run of the same
+    // tree. Per-validator, this was the `waves_last_block` mistake the comment fifteen lines above this one
+    // describes — "an assertion that depends on when it looks rather than on what happened".
+    //
+    // `shard_asks` stays per-validator because that one IS a per-node fact: the sampling loop runs on every
+    // validator, so every validator must have answered a peer.
+    assert!(taken > 0, "the sampler took shards somewhere in the cell: shards flow and are accepted");
 }
 
 /// The same private transfer, but submitted the way a **real external client** does: sealed and sent as a

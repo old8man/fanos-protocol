@@ -331,7 +331,10 @@ impl HybridLedger {
         else {
             return false;
         };
-        let _ = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        // HTLC_ESCROW was credited `amount` when this HTLC was created, and a claim consumes the lock exactly
+        // once (the state check above returns early on a second attempt), so the escrow still holds it.
+        let moved = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        debug_assert!(moved, "HTLC_ESCROW was credited `amount` when this HTLC was created, and a cl…");
         true
     }
 
@@ -341,7 +344,10 @@ impl HybridLedger {
         let Some(Resolution::Pay { to, amount }) = self.htlcs.htlcs.get_mut(id).and_then(|h| h.refund(height)) else {
             return false;
         };
-        let _ = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        // HTLC_ESCROW was credited `amount` when this HTLC was created, and a claim consumes the lock exactly
+        // once (the state check above returns early on a second attempt), so the escrow still holds it.
+        let moved = self.tokens.move_system(&HTLC_ESCROW, to, amount);
+        debug_assert!(moved, "HTLC_ESCROW was credited `amount` when this HTLC was created, and a cl…");
         true
     }
 
@@ -444,13 +450,18 @@ impl HybridLedger {
             return false;
         }
         if stx.public_value > 0 {
-            let _ = self.tokens.move_system(&POOL_SINK, stx.public_recipient, stx.public_value);
+            // `pool_backing() >= public_value + fee` was checked at the top of this fn before anything mutated, so
+            // both this move and the fee below are covered.
+            let moved = self.tokens.move_system(&POOL_SINK, stx.public_recipient, stx.public_value);
+            debug_assert!(moved, "`pool_backing() >= public_value + fee` was checked at the top of this …");
         }
         // The fee leaves the pool to the treasury (audit O-H1): otherwise it silently reduces the shielded
         // supply while staying stranded in the pool sink, breaking the `POOL_SINK == Σ unspent notes` invariant
         // and paying no one — now the fee is collected and validator-distributable.
         if stx.fee > 0 {
-            let _ = self.tokens.move_system(&POOL_SINK, TREASURY, stx.fee);
+            // The other half of the `leaving = public_value + fee` backing check above.
+            let moved = self.tokens.move_system(&POOL_SINK, TREASURY, stx.fee);
+            debug_assert!(moved, "The other half of the `leaving = public_value + fee` backing check abo…");
         }
         true
     }
@@ -488,7 +499,10 @@ impl HybridLedger {
                 }
                 let ok = self.stake.decrease(&st.transfer.from, st.transfer.amount);
                 debug_assert!(ok, "bonded ≥ amount was checked immediately above");
-                let _ = self.tokens.move_system(&STAKE_SINK, st.transfer.from, st.transfer.amount);
+                // `bonded(from) >= amount` is checked two lines above and STAKE_SINK's balance equals the total bonded
+                // stake (this fn's doc), so the sink covers this release.
+                let moved = self.tokens.move_system(&STAKE_SINK, st.transfer.from, st.transfer.amount);
+                debug_assert!(moved, "`bonded(from) >= amount` is checked two lines above and STAKE_SINK's b…");
                 true
             }
         }
@@ -511,7 +525,9 @@ impl HybridLedger {
         let amount = self.stake.bonded(&account);
         if amount > 0 {
             let _ = self.stake.decrease(&account, amount);
-            let _ = self.tokens.move_system(&STAKE_SINK, TREASURY, amount);
+            // `amount = bonded(account)` read immediately above, and STAKE_SINK holds the total bonded stake.
+            let moved = self.tokens.move_system(&STAKE_SINK, TREASURY, amount);
+            debug_assert!(moved, "`amount = bonded(account)` read immediately above, and STAKE_SINK hold…");
         }
         true
     }
@@ -597,7 +613,10 @@ impl HybridLedger {
             return false;
         };
         if let Settlement::Pay { provider, amount } = settlement {
-            let _ = self.tokens.move_system(&STORAGE_ESCROW, provider, amount);
+            // The settlement is bounded by the deal's remaining escrow, which STORAGE_ESCROW received at deal
+            // creation; the replay guard above stops one proof draining it twice (audit AT-C1).
+            let moved = self.tokens.move_system(&STORAGE_ESCROW, provider, amount);
+            debug_assert!(moved, "The settlement is bounded by the deal's remaining escrow, which STORAG…");
         }
         true
     }
@@ -618,7 +637,10 @@ impl HybridLedger {
             return false;
         };
         if refund > 0 {
-            let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+            // `refund` is the deal's unreleased escrow, which STORAGE_ESCROW still holds by construction of the
+            // release path above.
+            let moved = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+            debug_assert!(moved, "`refund` is the deal's unreleased escrow, which STORAGE_ESCROW still h…");
         }
         true
     }
@@ -650,7 +672,10 @@ impl HybridLedger {
             }
         }
         for (consumer, refund) in refunds {
-            let _ = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+            // `refund` is the deal's unreleased escrow, which STORAGE_ESCROW still holds by construction of the
+            // release path above.
+            let moved = self.tokens.move_system(&STORAGE_ESCROW, consumer, refund);
+            debug_assert!(moved, "`refund` is the deal's unreleased escrow, which STORAGE_ESCROW still h…");
         }
         // Prune terminal deals (audit §3.4): a Completed/Closed deal settles/refunds no further, so keeping it
         // only makes every subsequent block's lapse sweep + state root carry dead entries without bound. A
@@ -1183,7 +1208,8 @@ impl StateMachine for HybridLedger {
         }
         for v in beneficiaries {
             // Total paid = share·count ≤ pot ≤ treasury, so each move is funded (never underflows).
-            let _ = self.tokens.move_system(&TREASURY, account_id(v), share);
+            let moved = self.tokens.move_system(&TREASURY, account_id(v), share);
+            debug_assert!(moved, "share·count <= pot <= treasury, so every move is funded");
         }
     }
 

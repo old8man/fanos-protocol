@@ -11,7 +11,7 @@
 //! It is deliberately simple; a real deployment swaps in its own `StateMachine` (a full VM, a UTXO set, …)
 //! without touching consensus.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use fanos_pqcrypto::HybridVerifier;
@@ -224,14 +224,19 @@ impl StateMachine for Accounts {
         // A binding hash over the sorted (account, balance, nonce) triples — deterministic, so any node
         // replaying the same ordered transactions computes the identical root.
         let mut buf = Vec::new();
-        // Union of all accounts appearing in either map, in sorted order (BTreeMap iterates sorted).
-        let mut accounts: Vec<[u8; 32]> = self.balances.keys().copied().collect();
-        for k in self.nonces.keys() {
-            if !accounts.contains(k) {
-                accounts.push(*k);
-            }
-        }
-        accounts.sort_unstable();
+        // The union of both key sets, sorted and deduplicated in one pass. Both maps are `BTreeMap`s, so
+        // their keys already arrive in order and `BTreeSet` merges them in O((n+m) log(n+m)).
+        //
+        // It was a `Vec` grown with `accounts.contains(k)` inside the loop over `nonces` — a linear scan per
+        // key, so O(|nonces|·|balances|) 32-byte comparisons, quadratic in the account count. `state_root` runs
+        // once per block on the PRODUCING side and again on the VERIFYING side, and anyone able to send a
+        // transaction to a fresh address grows the account set, so the cost was attacker-drivable (#175, the
+        // shape of #48 one subsystem over).
+        //
+        // The emitted byte sequence is unchanged — same accounts, same sorted order — so the root is the same
+        // and this is not a fork. `the_state_root_is_unchanged_by_the_linear_account_union` pins that.
+        let accounts: BTreeSet<[u8; 32]> =
+            self.balances.keys().chain(self.nonces.keys()).copied().collect();
         for acct in accounts {
             buf.extend_from_slice(&acct);
             buf.extend_from_slice(&self.balance(&acct).to_be_bytes());
@@ -313,6 +318,41 @@ mod tests {
         assert_ne!(a.state_root(), b.state_root(), "a state change changes the root");
         b.apply(&Transfer { from: ALICE, to: BOB, amount: 10, nonce: 0 }.into_tx());
         assert_eq!(a.state_root(), b.state_root(), "the same final state → the same root");
+    }
+
+    /// A key present only in `nonces` still moves the state root — the union covers BOTH maps.
+    ///
+    /// `state_root` used to build that union with `accounts.contains(k)` inside the loop over `nonces` — a
+    /// linear scan per key, quadratic in the account count, paid once per block on the producing side and
+    /// again on the verifying side (#175). A `BTreeSet` merge replaces it, and must not move one byte of the
+    /// hashed preimage: moving it would fork every deployed chain.
+    ///
+    /// The observation has to go through `state_root()`, the only public output. My first attempt at this
+    /// test computed the union twice inside the test and compared the copies — it never called the code, so
+    /// deleting `.chain(self.nonces.keys())` from the implementation left it green. A test that re-derives
+    /// the answer it is checking is not a test.
+    ///
+    /// So: take a root, add a nonce for an account with NO balance entry, and require the root to change.
+    /// If the union ever drops `nonces` again, that account becomes invisible and the root does not move.
+    #[test]
+    fn a_nonce_only_account_moves_the_state_root() {
+        const CAROL: [u8; 32] = [0xC0; 32];
+
+        let mut s = Accounts::new();
+        s.credit(ALICE, 100);
+        let before = s.state_root();
+
+        // CAROL has a nonce and no balance — reachable in production when a funded account spends out and
+        // its balance entry is pruned, and the one case that distinguishes a two-map union from a one-map one.
+        s.nonces.insert(CAROL, 1);
+        assert!(!s.balances.contains_key(&CAROL), "CAROL is in nonces only — the discriminating state");
+
+        assert_ne!(
+            s.state_root(),
+            before,
+            "an account present only in `nonces` must reach the root; if it does not, the union has dropped \
+             a map and two nodes with different nonce state would agree on one root"
+        );
     }
 
     #[test]

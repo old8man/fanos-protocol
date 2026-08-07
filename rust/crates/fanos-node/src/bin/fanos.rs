@@ -3051,7 +3051,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     use fanos_geometry::Point;
     use fanos_node::{ValidatorConfig, spawn_taxis};
     use fanos_quic::{Directory, credentials_for_point, spawn_self_certifying_persistent_on};
-    use fanos_runtime::{Config as OverlayConfig, OverlayNode};
+    use fanos_runtime::Config as OverlayConfig;
 
     init_tracing();
     let config_path = flag(args, "--config")
@@ -3078,10 +3078,15 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     let target = Point::<F2>::at(usize::from(me));
     let creds = credentials_for_point::<F2>(target, fanos_quic::DEFAULT_GRIND_LIMIT)
         .ok_or_else(|| NodeError::Config(format!("could not seat a node at validator point {me}")))?;
+    let what = fanos_node::composition::CellComposition::bare(OverlayConfig::default());
     let mut node = spawn_self_certifying_persistent_on::<F2>(
         listen,
         &creds,
-        |coord| Box::new(OverlayNode::<F2>::new(coord, OverlayConfig::default())),
+        // Through `compose_engine`, the one assembly function — not a bare `OverlayNode::new`. A validator
+        // runs no cell role today, but "no roles" must be SAID rather than achieved by skipping the composer:
+        // a layer added to `compose_engine` has to reach this binary on the same commit, which is the whole
+        // invariant `composition.rs` exists to hold and which this call site silently broke (#168).
+        move |coord| fanos_node::composition::compose_engine::<F2>(coord, &what),
         directory,
         None,
     )

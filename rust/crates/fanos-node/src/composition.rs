@@ -129,6 +129,39 @@ impl CellComposition {
     }
 }
 
+impl CellComposition {
+    /// A node with the overlay and **no other role** — the composition a validator runs.
+    ///
+    /// This exists because `fanos validator` did not have one. It built `OverlayNode::<F2>::new(coord,
+    /// OverlayConfig::default())` directly, which is a *second assembly path* in the shipped binary — exactly
+    /// what this module exists to prevent, and what its header calls structurally impossible ("there is one
+    /// function, so the two cannot drift"). It went unnoticed because the seam guard matched the literal
+    /// `OverlayNode::<F>::new` and the binary writes `F2` (#168).
+    ///
+    /// Being empty of roles is a *statement about what a validator is*, not a bypass: the engine is still
+    /// assembled by [`compose_engine`], so a layer added there reaches the validator on the same commit.
+    /// Whether a validator should also relay, host, or hold beacon authority is a separate decision — one that
+    /// needs `ValidatorConfig` to carry the knobs, which today it does not, and that is the residual.
+    #[must_use]
+    pub fn bare(overlay: OverlayConfig) -> Self {
+        Self {
+            overlay,
+            admission: None,
+            beacon: None,
+            relay: false,
+            onion_seed: [0u8; 32],
+            kem_seed: [0u8; 32],
+            mix_mean_delay: Duration::from_millis(0),
+            cover_interval: Duration::from_millis(0),
+            service: None,
+            ingress: None,
+            hier_path: None,
+            restore: None,
+            cell_members: None,
+        }
+    }
+}
+
 /// Assemble the engine a node at `coord` runs, from `what` it is configured to be.
 ///
 /// The layering is not arbitrary and each step is a strict extension of the last:

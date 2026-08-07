@@ -21,8 +21,51 @@ use std::path::PathBuf;
 
 /// Constructors that assemble a node engine. Seeing one outside `composition.rs` means a second assembly path
 /// has appeared, which is how the two sides drifted in the first place.
+///
+/// Named WITHOUT a turbofish, and the lines are normalised (below) before matching, because the first version
+/// of this list wrote `"OverlayNode::<F>::new"` — the *generic* spelling — and `line.contains` cannot match
+/// that against `OverlayNode::<F2>::new`, which is how a shipped binary spells it. The guard was therefore
+/// unable to fire on the one file that violated it, and `fanos validator` assembled a bare overlay
+/// unnoticed (#168). A pattern that names a monomorphisation is a pattern that misses every other one.
 const ENGINE_CONSTRUCTORS: &[&str] =
-    &["OverlayNode::<F>::new", "OverlayBeaconNode::new", "CellNode::new", "ServiceNode::new"];
+    &["OverlayNode::new", "OverlayBeaconNode::new", "CellNode::new", "ServiceNode::new"];
+
+/// Strip a turbofish (`::<…>`) so `Type::<F2>::new` and `Type::new` compare equal.
+///
+/// Deliberately not a regex dependency for one transform: scan for `::<`, drop through the matching `>`,
+/// counting nesting so `::<Foo<Bar>>::new` closes correctly.
+fn without_turbofish(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = rest.find("::<") {
+        out.push_str(&rest[..at]);
+        let mut depth = 0i32;
+        let after = &rest[at + 2..];
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(e) = end else {
+            // Unterminated `::<` — a line we cannot parse. Keep the tail so the caller still sees the rest
+            // of it rather than silently dropping a line that might hold a violation.
+            rest = after;
+            break;
+        };
+        rest = &after[e..];
+    }
+    out.push_str(rest);
+    out
+}
 
 /// Crates that must go through `compose_engine` rather than assembling their own.
 const MUST_COMPOSE: &[&str] = &["fanos-sim", "fanos-node"];
@@ -113,8 +156,9 @@ fn only_the_composition_module_assembles_a_node_engine() {
     for crate_name in MUST_COMPOSE {
         for (path, text) in sources_of(crate_name) {
             for line in shipping_lines(&text) {
+                let normalised = without_turbofish(line);
                 for ctor in ENGINE_CONSTRUCTORS {
-                    if line.contains(ctor) {
+                    if normalised.contains(ctor) {
                         offenders.push(format!("{}: {}", path.display(), line.trim()));
                     }
                 }
@@ -152,7 +196,10 @@ fn every_declared_fixture_is_still_one() {
         assert!(path.exists(), "`{file}` is exempted but no longer exists — delete its row");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            ENGINE_CONSTRUCTORS.iter().any(|c| text.contains(c)),
+            // Normalised, exactly as the forward check is. Changing the constants to the turbofish-free
+            // spelling while leaving one of the two comparison sites raw is what made this test red: the
+            // fixtures write `OverlayNode::<F>::new`, which no longer matches `OverlayNode::new` literally.
+            ENGINE_CONSTRUCTORS.iter().any(|c| without_turbofish(&text).contains(c)),
             "`{file}` is exempted but assembles nothing — delete its row"
         );
         assert!(reason.len() > 60, "`{file}`'s reason is too short to be one");

@@ -341,13 +341,19 @@ impl TokenLedger {
     /// A binding commitment to the whole ledger — the sorted `(account, balance, nonce)` triples, hashed.
     #[must_use]
     pub fn state_root(&self) -> [u8; 32] {
-        let mut accounts: Vec<[u8; 32]> = self.balances.keys().copied().collect();
-        for k in self.nonces.keys() {
-            if !accounts.contains(k) {
-                accounts.push(*k);
-            }
-        }
-        accounts.sort_unstable();
+        // The union of both key sets, sorted and deduplicated in one pass. Both maps are `BTreeMap`s, so
+        // their keys already arrive in order and `BTreeSet` merges them in O((n+m) log(n+m)).
+        //
+        // It was a `Vec` grown with `accounts.contains(k)` inside the loop over `nonces` — a linear scan per
+        // key, so O(|nonces|·|balances|) 32-byte comparisons, quadratic in the account count. `state_root` runs
+        // once per block on the PRODUCING side and again on the VERIFYING side, and anyone able to send a
+        // transaction to a fresh address grows the account set, so the cost was attacker-drivable (#175, the
+        // shape of #48 one subsystem over).
+        //
+        // The emitted byte sequence is unchanged — same accounts, same sorted order — so the root is the same
+        // and this is not a fork. `the_state_root_is_unchanged_by_the_linear_account_union` pins that.
+        let accounts: BTreeSet<[u8; 32]> =
+            self.balances.keys().chain(self.nonces.keys()).copied().collect();
         let mut buf = Vec::with_capacity(accounts.len() * 48);
         for a in &accounts {
             buf.extend_from_slice(a);

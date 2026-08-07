@@ -310,8 +310,9 @@ pub fn client_drop_line<F: Field>(
     let point = Point::<F>::new(client_address)?;
     let usable =
         |l: Line<F>| !forbidden.contains(&l.coords()) && line_is_sealable::<F>(l.coords(), directory);
-    let line = select_drop_line::<F>(point, secret, epoch.get(), beacon.as_bytes(), &usable);
-    usable(line).then(|| line.coords())
+    // The re-check this used to carry is now the return type: `select_drop_line` says `None` when no line
+    // through `point` satisfies `usable`, so a caller cannot mistake an unusable line for a usable one (#163).
+    select_drop_line::<F>(point, secret, epoch.get(), beacon.as_bytes(), &usable).map(|l| l.coords())
 }
 
 /// Emit `payload` into the cell **anonymously**: sealed into a threshold onion over a freshly drawn circuit
