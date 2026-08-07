@@ -272,6 +272,22 @@ pub enum Station {
     /// distinguishable without a second station.
     AssignmentWithheld,
 
+    /// A `Command::Reseat` would have moved this node **out of the explicit cell it was seated in**, and was
+    /// refused.
+    ///
+    /// The two are different mechanisms that must not meet. `with_cell_members` seats a node at a position in
+    /// a provisioned 7-member roster, and the whole DIAKRISIS reflex is addressed off that index —
+    /// `polar_class(self_index)` names the three channels this node mediates. The per-epoch VRF reshuffle is a
+    /// defence for a node's placement on the **base plane**, where the roster *is* the plane. Applying the
+    /// second to a node holding the first used to recompute the index by the base-plane rule and leave the
+    /// roster untouched: at `q = 2` the node then attested under the wrong three channels, and above it the
+    /// reflex switched off — neither visible, because every effect still fired, addressed wrongly (#145).
+    ///
+    /// Nonzero means a deployment has combined an explicit cell roster with VRF coordinates. That is a
+    /// provisioning contradiction, not a runtime fault: nothing is retried and nothing degrades, but the node
+    /// is not doing what the operator's configuration says it is.
+    ReseatOutOfCell,
+
     /// A `(coordinate, epoch)` directory publish did not land — the node is **absent from that roster for
     /// that epoch**, and until this station existed it was the last to know.
     ///
@@ -330,6 +346,7 @@ impl Station {
         Self::DirectoryPublishFailed,
         Self::RoleUnderProvisioned,
         Self::AssignmentWithheld,
+        Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
@@ -370,6 +387,7 @@ impl Station {
             Self::DirectoryPublishFailed => "directory.publish_failed",
             Self::RoleUnderProvisioned => "role.under_provisioned",
             Self::AssignmentWithheld => "assignment.withheld",
+            Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
         }
     }
@@ -723,6 +741,7 @@ mod tests {
                 Station::DirectoryPublishFailed => listed(Station::DirectoryPublishFailed),
                 Station::RoleUnderProvisioned => listed(Station::RoleUnderProvisioned),
                 Station::AssignmentWithheld => listed(Station::AssignmentWithheld),
+                Station::ReseatOutOfCell => listed(Station::ReseatOutOfCell),
                 Station::AuthenticationRejected => listed(Station::AuthenticationRejected),
             }
         }

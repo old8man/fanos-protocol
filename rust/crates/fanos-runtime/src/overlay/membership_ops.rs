@@ -232,11 +232,38 @@ impl<F: Field> OverlayNode<F> {
             }
         }
         self.peers = peers;
-        self.self_index = if Plane::<F>::N == 7 {
-            (0..7).find(|&i| Point::<F>::at(i) == new_pt)
-        } else {
-            None
+        // **A node seated in an explicit cell does not reseat out of it** (#145).
+        //
+        // `with_cell_members` sets `self_index` to this node's position in the ROSTER, and the reflex is
+        // index-addressed off that: `polar_class(self_index)` names the three channels this node mediates,
+        // and `cell_coord(i)` maps every other index through the same roster. Recomputing the index by the
+        // BASE-PLANE rule here — which is what this did — silently substitutes a different question. At
+        // `q = 2` the node would attest under its base-plane point instead of its cell position, so its polar
+        // rates would be filed against the wrong three channels; above `q = 2` the rule yields `None` and the
+        // whole reflex switches off. Neither is visible: every effect still fires, addressed wrongly.
+        //
+        // It is latent only because production never sets `cell_members` — which is exactly why it must be
+        // right *before* it does, rather than after (the trap [[moving-a-seat-moves-its-whole-family]]
+        // describes). An explicit cell is a provisioned committee at fixed transport points; the per-epoch
+        // VRF reshuffle is a defence for a node's placement on the BASE plane, and the two are different
+        // things. So a `Reseat` that would move a node out of its roster is refused, loudly, rather than
+        // half-applied — and one that lands back inside it re-reads the index from the roster.
+        let seat = match &self.cell_members {
+            // The roster's own index, never the base plane's — see above.
+            Some(members) => members.iter().position(|&m| m == new_coord),
+            // No explicit roster: the base plane IS the cell, and only at `N = 7` does it form one.
+            None if Plane::<F>::N == 7 => (0..7).find(|&i| Point::<F>::at(i) == new_pt),
+            None => None,
         };
+        if self.cell_members.is_some() && seat.is_none() {
+            // Nothing is mutated — the node keeps its coordinate, its index and its peer set — and the
+            // refusal is counted, because a silent one is indistinguishable from a `Reseat` that never
+            // arrived. Nonzero here means a deployment combined an explicit roster with VRF coordinates,
+            // which is a provisioning contradiction rather than a runtime fault.
+            self.stations.record(Station::ReseatOutOfCell, Some(new_coord));
+            return Vec::new();
+        }
+        self.self_index = seat;
         self.coord = new_pt;
         // Re-solve our Sybil-admission proof for the NEW `(coordinate, epoch)` (spec §L3), so a peer's
         // per-epoch admission check keeps passing as we reshuffle: seizing a coordinate costs a fresh PoW

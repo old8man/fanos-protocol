@@ -1766,6 +1766,78 @@ mod tests {
         }
     }
 
+    /// **A node seated in an explicit cell does not reseat out of it** (#145).
+    ///
+    /// `with_cell_members` seats a node at a position in a provisioned 7-member roster, and the whole reflex
+    /// is addressed off that index: `polar_class(self_index)` names the three channels this node mediates and
+    /// `cell_coord(i)` maps every other index through the same roster. The per-epoch VRF reshuffle is a
+    /// defence for a node's placement on the **base plane**, where the roster *is* the plane — a different
+    /// mechanism, and applying it to a node holding the first used to recompute the index by the base-plane
+    /// rule while leaving `cell_members` untouched. At `q = 2` the node then attested under its base-plane
+    /// point rather than its cell position, filing its polar rates against the wrong three channels; above
+    /// `q = 2` the rule yields `None` and the reflex switches off entirely. Neither is visible from outside:
+    /// every effect still fires, addressed wrongly.
+    ///
+    /// Latent only because production never sets `cell_members`, which is precisely why it has to be right
+    /// **before** it does. Asserted in both directions, because a refusal that also refused a legitimate move
+    /// would be a different defect wearing the same shape.
+    #[test]
+    fn a_reseat_out_of_an_explicit_cell_is_refused_and_one_inside_it_re_reads_the_roster() {
+        // **On `F7`, not `F2`, and that is a finding rather than a fixture choice.** A Fano roster has seven
+        // members and the Fano plane has seven points, so an explicit roster *covers the whole plane* — the
+        // out-of-cell case is unreachable at `q = 2`. It exists only on a larger transport plane, which is
+        // exactly the setting #145 is about: a cell embedded in a plane bigger than itself. The first draft
+        // of this test was written on `F2` and its own "the roster really does exclude this point" assertion
+        // caught it.
+        //
+        // The seats are also NOT `Point::at(i)`: member `i` sits at point `i * 5 + 2`, so the base-plane rule
+        // and the roster rule disagree about every index and the old code cannot pass by coincidence.
+        let seat_of = |i: usize| Point::<F7>::at(i * 5 + 2).coords();
+        let members: [Triple; 7] = core::array::from_fn(seat_of);
+        let mut node = OverlayNode::<F7>::new(
+            Point::<F7>::new(seat_of(0)).expect("a plane point"),
+            Config::default(),
+        )
+        .with_cell_members(members);
+        assert_eq!(node.self_index, Some(0), "seated at roster position 0");
+
+        // **Inside the roster**: a move to another member's seat re-reads the index FROM THE ROSTER. Position
+        // 4 sits at base-plane point 0, so the two rules give different answers and only one is right.
+        node.step(Instant(1), Input::Command(Command::Reseat { coord: seat_of(4) }));
+        assert_eq!(node.coord.coords(), seat_of(4), "the move inside the cell was applied");
+        assert_eq!(
+            node.self_index,
+            Some(4),
+            "and the index came from the ROSTER — the base-plane rule yields {:?} on this plane",
+            (0..7).find(|&i| Point::<F7>::at(i).coords() == seat_of(4)),
+        );
+
+        // **Outside the roster**: refused whole. Nothing is mutated — not the coordinate, not the index — and
+        // the refusal is counted, because a silent one is indistinguishable from a `Reseat` that never came.
+        let outside = Point::<F7>::at(0).coords();
+        assert!(!members.contains(&outside), "the fixture's roster really does exclude this point");
+        node.step(Instant(2), Input::Command(Command::Reseat { coord: outside }));
+        assert_eq!(node.coord.coords(), seat_of(4), "the node did not move out of its cell");
+        assert_eq!(node.self_index, Some(4), "and kept the index the reflex is addressed by");
+        let obs = node
+            .step(Instant(3), Input::Command(Command::Observe))
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations),
+                _ => None,
+            })
+            .expect("the sense-only read answers with the data-path plane");
+        assert_eq!(
+            obs.iter()
+                .filter(|o| o.station == Station::ReseatOutOfCell)
+                .map(|o| o.count)
+                .sum::<u64>(),
+            1,
+            "the refusal is on the operator's plane — nonzero means a deployment combined an explicit roster \
+             with VRF coordinates, which is a provisioning contradiction rather than a runtime fault",
+        );
+    }
+
     #[test]
     fn version_skew_is_counted_by_tag_and_line_where_corruption_is_neither() {
         // `docs/design-upgrade.md` §4: the operational question is not "is anyone stale" — the network

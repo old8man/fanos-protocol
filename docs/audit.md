@@ -4602,3 +4602,38 @@ The correction existed and was accurate. It was simply *somewhere else*, and a r
 theorem list would take the unqualified claim. **A correction that is not at the claim is a stale status line
 with extra steps** — the same defect §4's `S1-M2` and `§6` markers had, one document over. Now annotated in
 place, naming the measurement and the field-wide gap (#67) that would close it.
+
+## §10. An explicit cell survived a reshuffle by accident, and only above `q = 2` (#145, part)
+
+`with_cell_members` seats a node at a position in a provisioned seven-member roster, and the whole DIAKRISIS
+reflex is addressed off that index: `polar_class(self_index)` names the three channels this node mediates, and
+`cell_coord(i)` maps every other index through the same roster. `on_reseat` recomputed the index by the
+**base-plane** rule and left `cell_members` untouched. After one reshuffle a node with an explicit roster
+therefore attested under its base-plane point rather than its cell position — filing its polar rates against
+the wrong three channels at `q = 2`, and losing the reflex entirely above it, where the rule yields `None`.
+Neither is visible from outside: every effect still fires, addressed wrongly.
+
+Now a move *inside* the roster re-reads the index from the roster, and a move *out* of it is refused whole —
+nothing mutated — and counted at `Station::ReseatOutOfCell`. A silent refusal is indistinguishable from a
+`Reseat` that never arrived, and the counter's meaning is exact: nonzero says a deployment has combined an
+explicit roster with VRF coordinates, which is a provisioning contradiction rather than a runtime fault.
+
+**The test produced a finding that sharpens the parent task.** The out-of-cell case is **unreachable at
+`q = 2`** — a Fano roster has seven members and the Fano plane has seven points, so an explicit roster covers
+the entire plane. It exists only on a plane larger than the cell, which is exactly the setting #145 is about.
+The first draft was written on `F2` and its own *"the roster really does exclude this point"* assertion caught
+it; the test now runs on `F7`, with seats at `i * 5 + 2` so the base-plane and roster rules disagree at every
+index and the old code cannot pass by coincidence. Falsified: restore the base-plane rule and the roster
+assertion fails with `None` against `Some(4)`.
+
+**Latent, and that is the reason to fix it now rather than later.** Production sets `cell_members: None`
+unconditionally, so nothing reaches this today — which means the trap would have been sprung by whoever
+finally provisions a cell, in the same change that made the reflex work at all.
+
+What remains on #145 is a design decision, and the analysis is settled enough to state it: the reflex is
+Fano-specific mathematics (the 14 polar identities are a property of PG(2,2)'s self-duality); **PG(2,q)
+contains a Fano subplane iff q is even**, verified algebraically and by exhaustive search, so of the supported
+orders {2, 4, 7, 31} only 2 and 4 admit one; the cell need not be a subplane, because `polar_class` indexes by
+cell POSITION; and the roster must be **epoch-stable**, so `[Triple; 7]` is the wrong key while coordinates
+re-draw every epoch. The platform's own primitive for that is `address_point` — identity-hash-derived and
+epoch-independent, already used to keep a descended node's sub-cell placement across a reshuffle.
