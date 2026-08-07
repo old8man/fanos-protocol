@@ -192,6 +192,32 @@ fn the_simulator_reaches_the_composition_function() {
 /// moved onto it, because each also wired hierarchical peers and there was no field for those.
 const SCENARIO_BRANCHES: &[&str] = &["cell_members", "hier_path", "hier_peers"];
 
+/// Fields of `CellComposition` a **deployment** sets — every role `Node::start` can turn on.
+///
+/// The standing rule is that the simulator differs from production only in *transport*. A role production
+/// enables and no scenario ever enables is a second, quieter way for the two to differ, and it is invisible:
+/// the sim stays green because it is testing a node nobody runs.
+///
+/// This list is the mechanical form of that rule, and it exists because fixing the instances did not work.
+/// `common/mod.rs:108` records `relay` having had no scenario; it was fixed and its siblings were not
+/// enumerated, so `service`, `ingress` and `mix_mean_delay` sat uncovered for as long again (#180).
+/// [[enumerate-the-class-after-fixing-it]]: a class fixed by hand misses one, and here it missed three.
+///
+/// `restore` is deliberately absent — the sim has no disk, and `fanos-node/tests/store_persistence.rs` covers
+/// it. `overlay` is absent because every composition sets it. Both exclusions are about what the field IS,
+/// not about it being inconvenient to cover.
+const ROLE_BRANCHES: &[&str] = &[
+    "admission",
+    "beacon",
+    "relay",
+    "onion_seed",
+    "kem_seed",
+    "mix_mean_delay",
+    "cover_interval",
+    "service",
+    "ingress",
+];
+
 /// Every `.rs` file under `crates/fanos-sim` — **`src/` and `tests/` both**.
 ///
 /// `sources_of` deliberately walks only `src/`, which is right for the rule it serves. It is wrong for these
@@ -255,32 +281,65 @@ fn no_simulator_scenario_seats_a_cell_by_hand() {
 ///
 /// A scenario-only branch with no scenario is a field added for a migration that never happened. Asserting the
 /// absence above is not enough on its own: deleting every cell scenario would satisfy it perfectly.
+/// The simulator files that set `field` on a `CellComposition` to something other than its default.
+///
+/// The three spellings are all needed and each was learned the hard way. `field: Some(..)` is the struct
+/// literal; `field: vec![..]` because `hier_peers` is a `Vec` rather than an `Option`, and a matcher that knew
+/// only `Some` would have reported it unset **while a scenario sets it** — and the remedy for a branch reported
+/// unset is to DELETE it, so a blind spot in this direction does not merely miss a defect, it manufactures one.
+/// `.field =` because half the scenarios build the composition and then assign, which the first version of the
+/// #180 sweep could not see at all.
+///
+/// One function, used by both guards below, because two copies of a matcher are two things that can disagree
+/// about what "set" means — and the one that disagrees quietly is the one that passes.
+fn scenarios_setting(files: &[(PathBuf, String)], field: &str) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(_, text)| {
+            code_lines(text).any(|l| {
+                l.contains(&format!("{field}: Some"))
+                    || l.contains(&format!("{field}: vec!"))
+                    || l.contains(&format!(".{field} ="))
+            })
+        })
+        .map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        .collect()
+}
+
 #[test]
 fn every_scenario_only_branch_of_the_composition_is_taken_by_a_scenario() {
     let files = all_sim_files();
     for field in SCENARIO_BRANCHES {
-        // The three ways a scenario sets one. `vec!` is listed because `hier_peers` is a `Vec`, not an
-        // `Option`, so a matcher that only knew `Some` would have reported it unset while a scenario sets it —
-        // and the fix for a branch reported unset is to DELETE it. A scan's blind spot in this direction does
-        // not merely miss a defect, it invents one.
-        let set = |l: &str| {
-            l.contains(&format!("{field}: Some"))
-                || l.contains(&format!("{field}: vec!"))
-                || l.contains(&format!(".{field} ="))
-        };
-        let takers: Vec<String> = files
-            .iter()
-            .filter(|(_, text)| code_lines(text).any(set))
-            .map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
-            .collect();
         assert!(
-            !takers.is_empty(),
+            !scenarios_setting(&files, field).is_empty(),
             "`CellComposition::{field}` is a branch of `compose_engine` that no deployment sets and now no \
              scenario sets either, so nothing in the workspace can reach it. Either a scenario takes it or \
              the field and its branch come out — a parameter kept for a migration nobody performed is how \
              `cell_members` sat unreachable from the day it was added (#180)."
         );
     }
+}
+
+/// **Every role a deployment can turn on has a scenario that turns it on.**
+///
+/// The class guard, and the reason it exists rather than a fourth round of fixing instances: `relay` was found
+/// with no scenario, fixed, and its siblings were not enumerated — so `service`, `ingress` and `mix_mean_delay`
+/// stayed uncovered for as long again. Nothing stopped that, because nothing was watching the class.
+///
+/// A role production enables and no scenario enables is the standing fidelity rule broken quietly: the sim goes
+/// on being green while testing a node nobody runs. Writing it as a list makes the next role added to
+/// `CellComposition` fail here on the commit that adds it, which is the only moment the cost is small.
+#[test]
+fn every_role_a_deployment_can_enable_has_a_simulator_scenario() {
+    let files = all_sim_files();
+    let missing: Vec<&str> =
+        ROLE_BRANCHES.iter().copied().filter(|f| scenarios_setting(&files, f).is_empty()).collect();
+    assert!(
+        missing.is_empty(),
+        "`Node::start` can enable these and no simulator scenario does: {missing:?}\n\n\
+         The simulator differs from production only in transport — a role only production runs is a second, \
+         quieter way for the two to differ, and it is invisible precisely because the sim stays green."
+    );
 }
 
 /// A declared topology fixture must still exist, and must still be assembling something.
