@@ -297,8 +297,14 @@ impl<F: Field> ThresholdRouter<F> {
         self
     }
 
-    /// Enable Poisson mixing: hold each forwarded hop for an exponential delay of mean `mean_delay`
-    /// before sending, so a batch of onions leaves reordered (spec §L5, V7). Zero disables it.
+    /// Enable Poisson mixing **for a router with cover off**: hold each forwarded hop for an exponential
+    /// delay of mean `mean_delay` before sending, so a batch of onions leaves reordered (spec §L5, V7).
+    /// Zero disables it.
+    ///
+    /// **With [`with_cover`](Self::with_cover) set, this value is not read at all** — [`forward_send`] queues
+    /// the cell for the next constant-rate slot and returns before it reaches the delay, and the batch is
+    /// reordered by the slot's PRF pick instead. The two are alternatives, not layers. Saying so here because
+    /// `forward_send`'s doc said it and this one did not, and a builder is where a caller looks (#181).
     #[must_use]
     pub fn with_mixing(mut self, mean_delay: Duration) -> Self {
         self.mean_delay = mean_delay;

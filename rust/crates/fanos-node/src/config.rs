@@ -32,11 +32,21 @@ pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 /// passive adversary (T2) uses". **It does not, and the measurement is flat.** Sweeping it against the GPA's
 /// input-rate/output-rate correlation (`fanos-sim/tests/traffic_analysis.rs`) gives *the same* `r = 0.643` at 50 ms,
 /// 120 ms, 250 ms, 500 ms, 1000 ms and 2000 ms, against 1.000 with no mixing at all. The reason is structural: a relay emits on **cover slots**, so emission
-/// *times* are set by [`DEFAULT_COVER_INTERVAL`] — the mix delay only chooses *which* queued cell fills a slot, never
-/// *when* slots occur, so it cannot move that correlation at all.
+/// *times* are set by [`DEFAULT_COVER_INTERVAL`], never by this value.
 ///
-/// What it does defend is **intra-batch ordering** — a distinct attack, and one this measurement does not cover. The
-/// rate-correlation channel belongs entirely to the cover schedule.
+/// **Second correction (2026-08-07, #181).** The sentence that stood here went on to say the mix delay "only chooses
+/// *which* queued cell fills a slot", crediting it with intra-batch reordering. **It does not do that either.** The
+/// queued cell is picked by `cover_prf_unit` — a PRF keyed on the router's secret `mix_seed`, at
+/// `threshold_router.rs:379` — and `mean_delay` is not an input to it. With cover on, this value moves neither the
+/// emission times nor the order, and `forward_send` never reads it: the cover branch returns first.
+///
+/// So what it is, stated plainly: **the mixing mode for a relay with cover OFF.** `forward_send`'s own doc says so
+/// exactly. Both defaults are non-zero as defence in depth — an operator who zeroes `cover_interval` to save
+/// bandwidth still gets a per-cell exponential delay rather than an immediate forward. It is not a second defence
+/// running alongside cover; it is the one that takes over when cover stops.
+///
+/// Measured, not argued: delivery through a composed relay cell takes 200 ms at means of 0, 1 s, 5 s, 60 s **and
+/// 600 s** with cover on (`fanos-sim/tests/composed_relay.rs`). A 600 s mean cannot produce 200 ms.
 pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 
 /// Default mean interval between a **relay**'s constant-size **cover cells** (spec §L5/V8): the router's send
