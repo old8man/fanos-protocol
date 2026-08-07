@@ -68,11 +68,14 @@ pub fn verify_delivery(
     claimed: [u8; HOLONOMY_LEN],
 ) -> Result<(), ThresholdError> {
     let holoseed = hash_labeled(HOLOSEED_LABEL, seed);
-    if circuit_line_holonomy(hop_lines, &holoseed) == claimed {
-        Ok(())
-    } else {
-        Err(ThresholdError::HolonomyFail)
-    }
+    // Constant time — same reasoning as `fanos_nyx::verify_holonomy`: the left side is secret-derived and
+    // `claimed` came off the wire, so a short-circuiting `==` leaks the matching prefix length.
+    let ok: bool = subtle::ConstantTimeEq::ct_eq(
+        circuit_line_holonomy(hop_lines, &holoseed).as_slice(),
+        claimed.as_slice(),
+    )
+    .into();
+    if ok { Ok(()) } else { Err(ThresholdError::HolonomyFail) }
 }
 
 /// One hop of a threshold circuit: the hop line's coordinate (where the packet is routed) and the

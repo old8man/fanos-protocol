@@ -11,6 +11,9 @@ keywords = ["onion-routing", "anonymity", "post-quantum", "sans-io", "fanos"]
 categories = ["cryptography", "network-programming"]
 
 [dependencies]
+# Constant-time comparison for the holonomy path-authenticator: `==` on `[u8; 32]` short-circuits,
+# and the right-hand side arrives on the wire (see `verify_holonomy`).
+subtle.workspace = true
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std", "aead"] }

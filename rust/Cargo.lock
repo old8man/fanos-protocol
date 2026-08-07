@@ -912,6 +912,7 @@ dependencies = [
  "fanos-wire",
  "proptest",
  "rand_core 0.10.1",
+ "subtle",
 ]
 
 [[package]]
@@ -1134,6 +1135,7 @@ dependencies = [
  "fanos-primitives",
  "libm",
  "proptest",
+ "subtle",
  "zeroize",
 ]
 

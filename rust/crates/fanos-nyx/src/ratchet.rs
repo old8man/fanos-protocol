@@ -148,7 +148,16 @@ pub fn circuit_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32]) -> [u8;
 /// `A_k` in [`circuit_holonomy`]'s chain and so is caught here.
 #[must_use]
 pub fn verify_holonomy<F: Field>(circuit: &Circuit<F>, seed: &[u8; 32], claimed: [u8; 32]) -> bool {
-    circuit_holonomy(circuit, seed) == claimed
+    // Constant time, not `==`. The left side is derived from `seed`, a secret; `claimed` arrives on the wire.
+    // `PartialEq` for `[u8; 32]` short-circuits on the first differing byte, which is the classic
+    // authenticator-forgery oracle: 256·32 measured attempts instead of 2^256. The exposure here is small —
+    // the verifier is the circuit-owning endpoint and the path runs through Poisson mixing, whose deliberate
+    // jitter dwarfs a memcmp — but the codebase's own standard is `ct_eq` for an authenticator
+    // (`fanos-incentives` does it), and matching it costs one line.
+    bool::from(subtle::ConstantTimeEq::ct_eq(
+        circuit_holonomy(circuit, seed).as_slice(),
+        claimed.as_slice(),
+    ))
 }
 
 #[cfg(test)]
