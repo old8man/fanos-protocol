@@ -110,10 +110,16 @@ pub fn spawn_composed_beacon_cell<F: Field + 'static>(
 /// so the one thing a shipped relay actually is went unexercised, including the hop threshold it seals onions
 /// at. A beacon is required and not incidental: the onion key rotates against the cell epoch, so
 /// `compose_engine` builds no router without one.
+/// `mix` is the **Poisson mixing** mean delay (`CellComposition::mix_mean_delay`). It is a parameter and not a
+/// constant because it was the last composition field with no scenario at any value: every relay the simulator
+/// ever stood up mixed with `Duration(0)`, i.e. forwarded instantly, while `NodeConfig`'s own default asserts
+/// `mix_mean_delay > 0` ("Poisson mixing is on by default", `config.rs:1346`). The sim and a stock deployment
+/// therefore disagreed on whether the timing defence was running at all (#180).
 pub fn spawn_composed_relay_cell<F: Field + 'static>(
     sim: &mut Sim,
     config: Config,
     cover: fanos_runtime::Duration,
+    mix: fanos_runtime::Duration,
     relay: bool,
 ) -> Vec<Triple> {
     let n = Plane::<F>::N as usize;
@@ -131,6 +137,7 @@ pub fn spawn_composed_relay_cell<F: Field + 'static>(
         });
         what.relay = relay;
         what.cover_interval = cover;
+        what.mix_mean_delay = mix;
         // Distinct per node: a relay's onion and router keys are its own, and seeding them identically would
         // make every hop of a circuit peelable by the same secret.
         what.onion_seed = [i as u8; 32];

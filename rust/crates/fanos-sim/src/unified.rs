@@ -1,12 +1,19 @@
 //! The **unified cluster** — K coherent 7-node Fano cells embedded in ONE transport plane / ONE `Sim`,
-//! each running the full DIAKRISIS reflex via `OverlayNode::with_cell_members` (the unified-topology
+//! each running the full DIAKRISIS reflex via `CellComposition::cell_members` (the unified-topology
 //! refactor), and each fronted by a **gateway** that routes to every other cell over the overlay. So one
 //! topology carries BOTH lenses at once: coherence at every node (each pings only its six cell members,
 //! so it scales linearly — no `O(N²)` plane fan-out) AND cross-cell routing between the gateways.
+//!
+//! Every node here is **composed**, not hand-assembled (#180). This file used to be exempt from the seam
+//! guard as a "topology fixture", and the exemption's argument was sound as far as it went: a gateway needs
+//! hierarchical peers pinned by hand and `CellComposition` had no field for them. It has one now, so the
+//! argument no longer holds and the exemption is gone — a cluster the simulator stands up is a cluster of the
+//! engine a deployment runs.
 
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple};
-use fanos_runtime::{Command, Config, Duration, Notification, OverlayNode};
+use fanos_node::composition::{CellComposition, compose_engine};
+use fanos_runtime::{Command, Config, Duration, Notification};
 use fanos_wire::{FrameType, encode_frame};
 
 use crate::fleet::FleetSnapshot;
@@ -50,15 +57,15 @@ impl UnifiedCluster {
         for c in 0..cell_count {
             let members: [Triple; CELL] = core::array::from_fn(|j| member_point(c, j).coords());
             for j in 0..CELL {
-                let mut node = OverlayNode::<F>::new(member_point(c, j), config).with_cell_members(members);
+                let mut what =
+                    CellComposition { cell_members: Some(members), ..CellComposition::overlay_only(config) };
                 if j == 0 {
                     // The gateway: an overlay root that knows every cell's gateway, so cells route to one another.
-                    node = node.with_hier_address(gw_root(c));
-                    for k in 0..cell_count {
-                        node = node.with_hier_peer(gw_root(k), gw_transport(k));
-                    }
+                    what.hier_path = Some(vec![Point::<F>::at(c).coords()]);
+                    what.hier_peers =
+                        (0..cell_count).map(|k| (vec![Point::<F>::at(k).coords()], gw_transport(k))).collect();
                 }
-                sim.add(Box::new(node));
+                sim.add(compose_engine::<F>(member_point(c, j), &what));
             }
             cells.push(members);
             gateway_addrs.push(gw_root(c).encode());

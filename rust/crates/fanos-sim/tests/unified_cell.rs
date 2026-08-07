@@ -1,14 +1,21 @@
 //! The unified-topology payoff: a 7-node Fano cell **embedded** at arbitrary coordinates on a larger
-//! transport plane (via `OverlayNode::with_cell_members`) runs the full DIAKRISIS reflex — it reports a
+//! transport plane (via `CellComposition::cell_members`) runs the full DIAKRISIS reflex — it reports a
 //! coherence self-model at every node and senses member loss — which a plain large-plane node could not
 //! (its `self_index` was `None`, so it produced no frame at all). This is the seam that lets one
 //! connected topology carry both the coherence and routing lenses.
+//!
+//! The cell is composed, not hand-assembled. It used to call `OverlayNode::with_cell_members` directly, which
+//! is a second assembly path — the very thing `composition.rs` exists to remove, and the reason
+//! `CellComposition::cell_members` was added in the first place (its doc says so). The migration was never
+//! done, so that branch of `compose_engine` was reachable from nothing and this cell ran with no admission
+//! gate, no beacon and no mixnet while a deployed one has them (#180).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fanos_field::F31;
 use fanos_geometry::{Point, Triple};
-use fanos_runtime::{Command, Config, Duration, OverlayNode};
+use fanos_node::composition::{CellComposition, compose_engine};
+use fanos_runtime::{Command, Config, Duration};
 use fanos_sim::Sim;
 
 fn config() -> Config {
@@ -25,9 +32,9 @@ const SEATS: [usize; 7] = [3, 17, 42, 100, 250, 500, 900];
 fn embedded_cell(seed: u64) -> (Sim, [Triple; 7]) {
     let members: [Triple; 7] = SEATS.map(|i| Point::<F31>::at(i).coords());
     let mut sim = Sim::new(seed);
+    let what = CellComposition { cell_members: Some(members), ..CellComposition::overlay_only(config()) };
     for &i in &SEATS {
-        let node = OverlayNode::<F31>::new(Point::<F31>::at(i), config()).with_cell_members(members);
-        sim.add(Box::new(node));
+        sim.add(compose_engine::<F31>(Point::<F31>::at(i), &what));
     }
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(1500));
@@ -42,7 +49,8 @@ fn an_embedded_fano_cell_reports_coherence_at_every_node() {
     assert_eq!(snap.stats.total, 7);
     assert_eq!(
         snap.stats.reporting, 7,
-        "an embedded cell reports a self-model at every node (impossible before with_cell_members)"
+        "an embedded cell reports a self-model at every node (impossible before the cell roster was a \
+         composition parameter — without one, self_index is None and no frame is produced at all)"
     );
     assert!(snap.stats.is_healthy(), "the settled embedded cell is fleet-healthy: {:?}", snap.stats);
     assert!(snap.stats.mean_phi.is_finite() && snap.stats.mean_phi > 0.0, "Φ measured: {}", snap.stats.mean_phi);

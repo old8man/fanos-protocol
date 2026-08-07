@@ -1,14 +1,18 @@
 //! The parent tier on a UNIFIED topology: an embedded parent cell (seated at arbitrary coordinates via
-//! `with_cell_members`) receives a child cell's escalation and runs the parent-stratum reflex — folding
-//! the failed child into its `ParentCell` (self_index derived from its real members) and acting. Before
-//! the cell_members refactor an embedded node had `self_index == None`, so `on_cell_escalate` bailed
+//! `CellComposition::cell_members`) receives a child cell's escalation and runs the parent-stratum reflex —
+//! folding the failed child into its `ParentCell` (self_index derived from its real members) and acting.
+//! Before the cell_members refactor an embedded node had `self_index == None`, so `on_cell_escalate` bailed
 //! immediately; now the whole parent stratum runs over a cell seated anywhere.
+//!
+//! Composed rather than hand-assembled (#180): the parent stratum is a claim about a CELL, and a cell the
+//! simulator stands up must be the engine a deployment runs, not a bare overlay.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fanos_field::F31;
 use fanos_geometry::{Point, Triple};
-use fanos_runtime::{Command, Config, Duration, Notification, OverlayNode};
+use fanos_node::composition::{CellComposition, compose_engine};
+use fanos_runtime::{Command, Config, Duration, Notification};
 use fanos_sim::Sim;
 use fanos_wire::{FrameType, encode_frame};
 
@@ -41,10 +45,9 @@ fn an_embedded_parent_runs_the_parent_stratum_reflex_on_a_child_escalation() {
     let members: [Triple; 7] = PARENT.map(|i| Point::<F31>::at(i).coords());
     let mut sim = Sim::new(1);
     let mut coords = Vec::new();
+    let what = CellComposition { cell_members: Some(members), ..CellComposition::overlay_only(config()) };
     for &seat in &PARENT {
-        coords.push(sim.add(Box::new(
-            OverlayNode::<F31>::new(Point::<F31>::at(seat), config()).with_cell_members(members),
-        )));
+        coords.push(sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what)));
     }
     // Settle the parent cell to health so its members carry a real Φ (self_index is set from cell_members).
     sim.inject_all(&Command::StartHeartbeat);

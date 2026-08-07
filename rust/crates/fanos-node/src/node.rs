@@ -1088,10 +1088,12 @@ impl Node {
                     service: service.clone(),
                     ingress: ingress.clone(),
                     restore: restore.clone(),
-                    // A deployed node sits at its cell root and discovers its roster by announcement; both are
-                    // scenario parameters, and their absence here is what a deployment means.
+                    // A deployed node sits at its cell root, discovers its roster by announcement and learns
+                    // its hierarchical siblings the same way; all three are scenario parameters, and their
+                    // absence here is what a deployment means.
                     hier_path: None,
                     cell_members: None,
+                    hier_peers: Vec::new(),
                 };
                 crate::composition::compose_engine::<F>(coord, &what)
             },

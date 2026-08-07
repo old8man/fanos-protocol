@@ -1,14 +1,19 @@
 //! The unified topology: ONE connected topology carrying BOTH lenses at once — coherent 7-node Fano
-//! cells (via `with_cell_members`) that also route to each other across the overlay (via `HierAddr`).
-//! Before the cell_members generalisation this was impossible: coherence existed only on the base plane's
-//! points 0..6, so cells embedded elsewhere reported nothing. Now two cells seated at distinct F31
+//! cells (via `CellComposition::cell_members`) that also route to each other across the overlay (via
+//! `HierAddr`). Before the cell_members generalisation this was impossible: coherence existed only on the base
+//! plane's points 0..6, so cells embedded elsewhere reported nothing. Now two cells seated at distinct F31
 //! coordinates each run the full DIAKRISIS reflex AND exchange a cross-cell message on the same run.
+//!
+//! Composed, not hand-assembled (#180). This file is why the migration stalled: the gateway needs a
+//! hierarchical PEER, `CellComposition` had no field for one, and so both this and the `cell_members` branch
+//! of `compose_engine` stayed unreachable. `hier_peers` is that field.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use fanos_field::F31;
 use fanos_geometry::{HierAddr, Point, Triple};
-use fanos_runtime::{Command, Config, Duration, Notification, OverlayNode};
+use fanos_node::composition::{CellComposition, compose_engine};
+use fanos_runtime::{Command, Config, Duration, Notification};
 use fanos_sim::Sim;
 use fanos_wire::{FrameType, encode_frame};
 
@@ -47,21 +52,29 @@ fn two_coherent_cells_report_and_route_across_each_other() {
     let g1_tp = Point::<F31>::at(CELL1[0]).coords();
 
     let mut sim = Sim::new(1);
+    // Both cells are COMPOSED, not hand-assembled (#180). The gateway differs from its cell-mates only in
+    // carrying a hierarchical address and one peer, and `CellComposition` now expresses both — which is what
+    // was missing when `cell_members` was added for these very scenarios and they could not move onto it.
+    let member = |members: [Triple; 7]| CellComposition {
+        cell_members: Some(members),
+        ..CellComposition::overlay_only(config())
+    };
+    let gateway = |members: [Triple; 7], own: &HierAddr<F31>, peer: &HierAddr<F31>, peer_tp| CellComposition {
+        hier_path: Some(own.points().iter().map(Point::coords).collect()),
+        hier_peers: vec![(peer.points().iter().map(Point::coords).collect(), peer_tp)],
+        ..member(members)
+    };
     // Cell 0: seven coherent members; member 0 is also the routing gateway [P0] that knows [P1].
     for (idx, &seat) in CELL0.iter().enumerate() {
-        let mut node = OverlayNode::<F31>::new(Point::<F31>::at(seat), config()).with_cell_members(m0);
-        if idx == 0 {
-            node = node.with_hier_address(g0.clone()).with_hier_peer(g1.clone(), g1_tp);
-        }
-        sim.add(Box::new(node));
+        let what =
+            if idx == 0 { gateway(m0, &g0, &g1, g1_tp) } else { member(m0) };
+        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what));
     }
     // Cell 1: seven coherent members; member 0 is the gateway [P1] that knows [P0].
     for (idx, &seat) in CELL1.iter().enumerate() {
-        let mut node = OverlayNode::<F31>::new(Point::<F31>::at(seat), config()).with_cell_members(m1);
-        if idx == 0 {
-            node = node.with_hier_address(g1.clone()).with_hier_peer(g0.clone(), g0_tp);
-        }
-        sim.add(Box::new(node));
+        let what =
+            if idx == 0 { gateway(m1, &g1, &g0, g0_tp) } else { member(m1) };
+        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what));
     }
 
     sim.inject_all(&Command::StartHeartbeat);

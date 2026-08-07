@@ -80,18 +80,15 @@ const MUST_COMPOSE: &[&str] = &["fanos-sim", "fanos-node"];
 ///
 /// The claim this test defends is narrower and exact: *when the simulator stands up a cell, it stands up
 /// production's engine.* A new entry here would need the same argument made again.
-const TOPOLOGY_FIXTURES: &[(&str, &str)] = &[
-    (
-        "hierarchy.rs",
-        "a multi-level routing fixture: gateway roots and sub-cell descent paths pinned per node, to exercise \
-         inter-cell routing rather than a node's role composition",
-    ),
-    (
-        "unified.rs",
-        "the unified-topology fixture: one overlay root per cell plus hand-wired hierarchical peers between \
-         them, for the same reason",
-    ),
-];
+/// `unified.rs` came OFF this list in #180 and the reason is worth keeping: its row argued it must hand-wire
+/// because a gateway needs hierarchical peers and `CellComposition` had no field for them. True at the time,
+/// and the fix was to add the field rather than to keep the excuse — an exemption whose premise is "the
+/// composition cannot express this" is a feature request wearing a carve-out's clothes.
+const TOPOLOGY_FIXTURES: &[(&str, &str)] = &[(
+    "hierarchy.rs",
+    "a multi-level routing fixture: gateway roots and sub-cell descent paths pinned per node, to exercise \
+     inter-cell routing rather than a node's role composition",
+)];
 
 fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
@@ -183,6 +180,107 @@ fn the_simulator_reaches_the_composition_function() {
         .iter()
         .any(|(_, text)| shipping_lines(text).iter().any(|l| l.contains("compose_engine")));
     assert!(calls, "the simulator no longer calls `compose_engine` — it has stopped running production's engine");
+}
+
+/// Fields of `CellComposition` that **no deployment ever sets** — `Node::start` pins all three to their empty
+/// value with a comment saying that their absence is what a deployment means.
+///
+/// They exist for one reason: so a simulator scenario need not assemble its own engine to get them. A branch
+/// like that with no scenario taking it is not merely untested, it is *evidence the migration it was added for
+/// never happened* — which is exactly what #180 found. `cell_members`' own doc said it existed "because two
+/// simulator scenarios needed it and were assembling their own engines to get it", and neither scenario ever
+/// moved onto it, because each also wired hierarchical peers and there was no field for those.
+const SCENARIO_BRANCHES: &[&str] = &["cell_members", "hier_path", "hier_peers"];
+
+/// Every `.rs` file under `crates/fanos-sim` — **`src/` and `tests/` both**.
+///
+/// `sources_of` deliberately walks only `src/`, which is right for the rule it serves. It is wrong for these
+/// two, because a simulator's product IS its `tests/` directory: that is where the scenarios live, and a
+/// scenario standing up a bare cell is the defect this file exists to prevent, not a unit test exercising one
+/// layer in isolation.
+fn all_sim_files() -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![
+        workspace().join("crates/fanos-sim/src"),
+        workspace().join("crates/fanos-sim/tests"),
+    ];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push((path, text));
+            }
+        }
+    }
+    out
+}
+
+/// Lines that are not comments. Unlike [`shipping_lines`] this keeps `#[cfg(test)]` modules, because in
+/// `fanos-sim` those hold scenarios rather than unit tests of one layer.
+fn code_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter(|l| !l.trim_start().starts_with("//"))
+}
+
+/// Seating a node in a cell roster goes through `compose_engine`, in `tests/` as much as in `src/`.
+///
+/// `with_cell_members` is the exact marker that a scenario is standing up a **cell** — its doc says it "seats a
+/// node at a position in a provisioned 7-member roster". That is not a unit test of one layer, it is the thing
+/// the seam rule is about, and four such sites called the raw builder while three of them sat in a directory
+/// `sources_of` has never read (#180). Those cells therefore ran with no admission gate, no beacon, no mixnet
+/// and no service, which is precisely the drift this file was written to make impossible.
+#[test]
+fn no_simulator_scenario_seats_a_cell_by_hand() {
+    let files = all_sim_files();
+    assert!(files.len() > 20, "the walk found only {} files — it is not reaching the scenarios", files.len());
+
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|(_, text)| code_lines(text).any(|l| l.contains("with_cell_members")))
+        .map(|(p, _)| p.display().to_string())
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these seat a cell roster with the raw builder instead of `CellComposition::cell_members`:\n{}\n\n\
+         A cell the simulator stands up must be the engine a deployment runs.",
+        offenders.join("\n")
+    );
+}
+
+/// The reverse direction, and the one that would have caught #180 on the commit that created it.
+///
+/// A scenario-only branch with no scenario is a field added for a migration that never happened. Asserting the
+/// absence above is not enough on its own: deleting every cell scenario would satisfy it perfectly.
+#[test]
+fn every_scenario_only_branch_of_the_composition_is_taken_by_a_scenario() {
+    let files = all_sim_files();
+    for field in SCENARIO_BRANCHES {
+        // The three ways a scenario sets one. `vec!` is listed because `hier_peers` is a `Vec`, not an
+        // `Option`, so a matcher that only knew `Some` would have reported it unset while a scenario sets it —
+        // and the fix for a branch reported unset is to DELETE it. A scan's blind spot in this direction does
+        // not merely miss a defect, it invents one.
+        let set = |l: &str| {
+            l.contains(&format!("{field}: Some"))
+                || l.contains(&format!("{field}: vec!"))
+                || l.contains(&format!(".{field} ="))
+        };
+        let takers: Vec<String> = files
+            .iter()
+            .filter(|(_, text)| code_lines(text).any(set))
+            .map(|(p, _)| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !takers.is_empty(),
+            "`CellComposition::{field}` is a branch of `compose_engine` that no deployment sets and now no \
+             scenario sets either, so nothing in the workspace can reach it. Either a scenario takes it or \
+             the field and its branch come out — a parameter kept for a migration nobody performed is how \
+             `cell_members` sat unreachable from the day it was added (#180)."
+        );
+    }
 }
 
 /// A declared topology fixture must still exist, and must still be assembling something.

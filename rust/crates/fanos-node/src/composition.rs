@@ -90,6 +90,20 @@ pub struct CellComposition {
     /// is the second assembly path this module exists to remove. A parameter here folds them back onto the one
     /// path; exempting them would have left the drift in place with a comment on it.
     pub cell_members: Option<[Triple; 7]>,
+    /// **Hierarchical peers** pinned by hand: `(the peer's descent path, its transport coordinate)`.
+    ///
+    /// A deployment never sets this — a gateway learns its siblings by announcement, which is why `Node::start`
+    /// leaves it empty. A multi-cell scenario has no announcement to wait for, so it seats the routes directly.
+    ///
+    /// Added for the same reason as [`cell_members`](Self::cell_members), and it is worth saying why the reason
+    /// was not enough the first time: that field's own doc says it exists so two scenarios could stop assembling
+    /// their own engines, and **they never moved onto it** — the field was added and the migration was not done,
+    /// so both scenario branches of [`compose_engine`] sat unreachable. They could not move, because each also
+    /// wired hierarchical peers and there was no parameter for those. This is that parameter.
+    ///
+    /// Paths are coordinates rather than `HierAddr<F>` for the same reason as `hier_path`: this type stays free
+    /// of the field parameter, and `compose_engine` knows `F`.
+    pub hier_peers: Vec<(Vec<Triple>, Triple)>,
 }
 
 impl CellComposition {
@@ -125,6 +139,7 @@ impl CellComposition {
             restore: None,
             hier_path: None,
             cell_members: None,
+            hier_peers: Vec::new(),
         }
     }
 }
@@ -142,24 +157,25 @@ impl CellComposition {
     /// assembled by [`compose_engine`], so a layer added there reaches the validator on the same commit.
     /// Whether a validator should also relay, host, or hold beacon authority is a separate decision — one that
     /// needs `ValidatorConfig` to carry the knobs, which today it does not, and that is the residual.
+    /// Delegates rather than repeating the field list. The two were byte-identical exhaustive literals kept in
+    /// sync by hand, which is a standing invitation for them to stop agreeing; the distinction that matters is
+    /// what each one *means*, and that lives in the doc comments, not in a second copy of thirteen `None`s.
     #[must_use]
     pub fn bare(overlay: OverlayConfig) -> Self {
-        Self {
-            overlay,
-            admission: None,
-            beacon: None,
-            relay: false,
-            onion_seed: [0u8; 32],
-            kem_seed: [0u8; 32],
-            mix_mean_delay: Duration::from_millis(0),
-            cover_interval: Duration::from_millis(0),
-            service: None,
-            ingress: None,
-            hier_path: None,
-            restore: None,
-            cell_members: None,
-        }
+        Self::overlay_only(overlay)
     }
+}
+
+/// A descent path, as coordinates, read as a hierarchical address of this plane.
+///
+/// `None` when any coordinate is not a point of the plane, or when the path is empty. Shared by
+/// [`CellComposition::hier_path`] and [`CellComposition::hier_peers`] so the two cannot come to disagree about
+/// what a malformed path means: a bad one is **dropped**, never a panic. The path arrives from configuration or
+/// a scenario, and the right outcome is a node left at its root, not an aborted process — under
+/// `panic = "abort"` a panic here kills the node.
+fn hier_addr<F: Field>(path: &[Triple]) -> Option<fanos_geometry::HierAddr<F>> {
+    let points: Option<Vec<Point<F>>> = path.iter().map(|c| Point::<F>::new(*c)).collect();
+    points.and_then(fanos_geometry::HierAddr::from_path)
 }
 
 /// Assemble the engine a node at `coord` runs, from `what` it is configured to be.
@@ -195,12 +211,14 @@ pub fn compose_engine<F: Field + 'static>(
     if let Some(members) = what.cell_members {
         overlay = overlay.with_cell_members(members);
     }
-    if let Some(path) = &what.hier_path {
-        // A coordinate that is not a point of this plane is dropped rather than panicking: the path comes from
-        // configuration or a scenario, and a bad one should leave the node at its root, not abort the process.
-        let points: Option<Vec<Point<F>>> = path.iter().map(|c| Point::<F>::new(*c)).collect();
-        if let Some(hier) = points.and_then(fanos_geometry::HierAddr::from_path) {
-            overlay = overlay.with_hier_address(hier);
+    if let Some(path) = &what.hier_path
+        && let Some(hier) = hier_addr::<F>(path)
+    {
+        overlay = overlay.with_hier_address(hier);
+    }
+    for (path, transport) in &what.hier_peers {
+        if let Some(hier) = hier_addr::<F>(path) {
+            overlay = overlay.with_hier_peer(hier, *transport);
         }
     }
     let overlay = match what.admission {
