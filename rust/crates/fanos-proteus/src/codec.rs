@@ -23,4 +23,16 @@ pub trait MorphCodec: Send + Sync {
     /// Recover a frame from `wire`, or `None` if it was not produced by this codec (e.g. a probe, or a peer
     /// running a different codec).
     fn decode(&self, wire: &[u8]) -> Option<Vec<u8>>;
+
+    /// The most bytes [`encode`](Self::encode) may add to a frame, over every frame and every `seq`.
+    ///
+    /// This is **load-bearing, not documentation**. A receiver bounds its read at
+    /// `MAX_FRAME + MAX_WIRE_OVERHEAD`, because the frame ceiling and the wire ceiling are different
+    /// quantities and the codec is the transform between them. A codec that grows a frame by more than it
+    /// declares makes full-size frames silently undeliverable — the write succeeds, the read refuses, and
+    /// nothing reports it. The default is the built-in bound, which is also the maximum
+    /// [`ProteusShaper::with_codec`](crate::ProteusShaper::with_codec) will accept.
+    fn max_overhead(&self) -> usize {
+        crate::MAX_WIRE_OVERHEAD
+    }
 }

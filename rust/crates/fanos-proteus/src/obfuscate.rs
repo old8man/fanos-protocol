@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 
 use fanos_primitives::hash::hash_xof;
 
-use crate::shape::ShapeParams;
+use crate::shape::{MAX_JUNK_LEN, MAX_PADDING_MULTIPLE, ShapeParams};
 
 const JUNK_LABEL: &str = "FANOS-v1/proteus-junk";
 const PAD_LABEL: &str = "FANOS-v1/proteus-pad";
@@ -28,6 +28,23 @@ const LENGTH_FIELD: usize = 4;
 /// the intra-epoch fixed-prefix signature and the equal-frames-are-linkable weakness of a purely
 /// `θ`-derived junk (cf. AmneziaWG per-packet junk, spec §13.3–§13.4).
 pub const NONCE_LEN: usize = 8;
+
+/// The most bytes shaping can add to a payload, over **every** shape [`epoch_shape`] can produce.
+///
+/// `obfuscate` is strictly growing — `nonce ‖ junk ‖ len ‖ payload ‖ padding` — so a frame sized against
+/// a frame-layer ceiling arrives at the wire *larger than that ceiling*. A receiver that bounds its read
+/// by the frame ceiling therefore drops full-size frames silently, and the sender sees a successful
+/// write. This constant is what lets a reader bound the **wire** instead: it is the gap between the two
+/// ceilings, derived from the parameter ranges rather than chosen, so widening a range without revisiting
+/// the bound is a compile-time coupling instead of a silent hole.
+///
+/// Padding is `(multiple − out.len() % multiple) % multiple`, hence at most `multiple − 1`, and the
+/// coarsest multiple is [`MAX_PADDING_MULTIPLE`].
+///
+/// [`epoch_shape`]: crate::shape::epoch_shape
+/// [`MAX_PADDING_MULTIPLE`]: crate::shape::MAX_PADDING_MULTIPLE
+pub const MAX_WIRE_OVERHEAD: usize =
+    NONCE_LEN + MAX_JUNK_LEN + LENGTH_FIELD + (MAX_PADDING_MULTIPLE as usize - 1);
 
 /// Wrap `payload` under the epoch shape with a per-packet `nonce`:
 /// `nonce ‖ junk ‖ len ‖ payload ‖ padding` (spec §13.2). The junk and padding are keyed by
@@ -119,6 +136,36 @@ mod tests {
         let shape = epoch_shape(b"s", Epoch::new(9));
         let wire = obfuscate(&shape, b"abc", &N0);
         assert_eq!(wire.len() % usize::from(shape.padding_multiple), 0);
+    }
+
+    #[test]
+    fn no_shape_can_grow_a_payload_past_the_declared_overhead() {
+        // MAX_WIRE_OVERHEAD is what a receiver adds to its frame ceiling to get a wire ceiling, so the
+        // bound has to hold for *every* shape and every payload length — not just the ones arithmetic
+        // says are worst. Sweep real shapes and measure the growth. The payload lengths straddle a
+        // padding boundary in both directions, since padding is the term that depends on total length.
+        let mut widest = 0usize;
+        for e in 0u64..512 {
+            let shape = epoch_shape(b"community", Epoch::new(e));
+            for len in [0usize, 1, 63, 64, 65, 191, 192, 1000, 65_536] {
+                let payload = vec![0xA5; len];
+                let grown = obfuscate(&shape, &payload, &N0).len() - len;
+                assert!(
+                    grown <= MAX_WIRE_OVERHEAD,
+                    "epoch {e}, payload {len}: shaping added {grown} bytes, over the declared \
+                     {MAX_WIRE_OVERHEAD} — a receiver sizing its read on this bound would drop the frame"
+                );
+                widest = widest.max(grown);
+            }
+        }
+        // The bound must also be reachable enough to be honest: a wildly loose bound would pass the
+        // assertion above while wasting the receiver's ceiling. This is a floor on tightness, not equality
+        // — the true maximum needs the largest junk AND a worst-case padding remainder in one shape.
+        assert!(
+            widest * 2 > MAX_WIRE_OVERHEAD,
+            "observed worst growth {widest} is less than half the declared {MAX_WIRE_OVERHEAD}: the \
+             bound has drifted away from what shaping actually does"
+        );
     }
 
     #[test]

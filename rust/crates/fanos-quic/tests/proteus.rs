@@ -35,6 +35,66 @@ impl MorphCodec for ReverseCodec {
     }
 }
 
+/// A frame packed to the wire authority's ceiling still arrives once shaped.
+///
+/// The defect this pins: `MAX_FRAME` bounded the sender's *frame* and the receiver's *wire*, and PROTEUS
+/// sits between them growing every packet (`nonce ‖ junk ‖ len ‖ payload ‖ padding`, on by default). A
+/// producer that filled its budget — a TAXIS block does, by design — therefore emitted something no peer
+/// could read, `write_all` reported success, and nothing counted the loss.
+///
+/// The epoch is chosen **by measurement**, not picked: only a heavily-junked shape guarantees the wire
+/// exceeds the frame cap, so searching for one makes this test hit the boundary on every run instead of on
+/// whichever epochs happen to shape hard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_at_the_ceiling_survives_the_shaper() {
+    let secret = b"ceiling-secret".to_vec();
+    let (epoch, junk) = (0u64..100_000)
+        .map(fanos_proteus::Epoch::new)
+        .map(|e| (e, fanos_proteus::epoch_shape(&secret, e).junk_len()))
+        .find(|&(_, junk)| junk > 1200)
+        .expect("some epoch in 100k shapes with >1200 bytes of junk");
+
+    // Sized so the wire provably exceeds the frame cap: the payload is `slack` below it, and shaping adds
+    // at least `junk` — more than `slack` — before the envelope is even counted.
+    let slack = 1024usize;
+    assert!(junk > slack, "the chosen epoch must add more than the slack, got {junk}");
+    let payload = vec![0x5A; fanos_wire::MAX_FRAME - slack];
+
+    let dir = Directory::new();
+    let cfg = || ProteusConfig::polymorph(secret.clone());
+    let a = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
+        dir.clone(),
+        cfg(),
+        epoch,
+    )
+    .await
+    .expect("spawn A");
+    let mut b = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
+        dir.clone(),
+        cfg(),
+        epoch,
+    )
+    .await
+    .expect("spawn B");
+
+    a.command(Command::Send { to: b.address(), payload: payload.clone() });
+
+    let got = tokio::time::timeout(StdDuration::from_secs(20), async {
+        loop {
+            if let Some(Notification::Delivered { from, payload }) = b.next_notification().await
+                && from == a.address()
+            {
+                return payload;
+            }
+        }
+    })
+    .await
+    .expect("a frame at the ceiling must arrive; before the wire got its own bound it never did");
+    assert_eq!(got.len(), payload.len(), "the whole frame arrived, not a truncation");
+}
+
 /// Bring up two shaped nodes under `proteus`, send one payload A→B, and assert it is delivered through the
 /// shaped transport within the timeout.
 async fn deliver_under(proteus: ProteusConfig) {
@@ -103,6 +163,6 @@ async fn shaped_nodes_deliver_under_a_pluggable_codec() {
     deliver_under(ProteusConfig::pluggable(
         b"community-transport-secret".to_vec(),
         Arc::new(ReverseCodec),
-    ))
+    ).unwrap())
     .await;
 }

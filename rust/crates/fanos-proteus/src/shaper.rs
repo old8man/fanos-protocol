@@ -92,15 +92,26 @@ impl ProteusShaper {
     /// [`Morph::Pluggable`] mode. The custom codec fully handles encode/decode; the size/timing profile is
     /// the (identity) `Pluggable` default, so the codec owns the wire. The community secret still seeds the
     /// epoch shape (so a codec MAY consult it), and the epoch still rotates via [`rotate`](Self::rotate).
+    ///
+    /// `None` if the codec declares a
+    /// [`max_overhead`](crate::MorphCodec::max_overhead) above [`MAX_WIRE_OVERHEAD`]: a receiver's read
+    /// bound is `MAX_FRAME + MAX_WIRE_OVERHEAD`, so such a codec would make full-size frames silently
+    /// undeliverable. Refusing at installation is the only place the mismatch is *observable* — past this
+    /// point the loss looks like a network drop, and the sender still sees its write succeed.
+    ///
+    /// [`MAX_WIRE_OVERHEAD`]: crate::MAX_WIRE_OVERHEAD
     #[must_use]
     pub fn with_codec(
         community_secret: impl Into<Vec<u8>>,
         epoch: Epoch,
         codec: Arc<dyn MorphCodec>,
-    ) -> Self {
+    ) -> Option<Self> {
+        if codec.max_overhead() > crate::MAX_WIRE_OVERHEAD {
+            return None;
+        }
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
-        Self {
+        Some(Self {
             secret,
             morph: Morph::Pluggable,
             profile: ShapingProfile::for_morph(Morph::Pluggable),
@@ -108,7 +119,7 @@ impl ProteusShaper {
             epoch,
             shape,
             counter: AtomicU64::new(0),
-        }
+        })
     }
 
     /// The active morph.
@@ -281,15 +292,45 @@ mod tests {
         }
     }
 
+    /// Declares more growth than a receiver's wire bound allows — the case the guard exists for.
+    struct GreedyCodec;
+    impl MorphCodec for GreedyCodec {
+        fn encode(&self, frame: &[u8], _seq: u64) -> Vec<u8> {
+            frame.to_vec()
+        }
+        fn decode(&self, wire: &[u8]) -> Option<Vec<u8>> {
+            Some(wire.to_vec())
+        }
+        fn max_overhead(&self) -> usize {
+            crate::MAX_WIRE_OVERHEAD + 1
+        }
+    }
+
+    #[test]
+    fn a_codec_that_outgrows_the_read_bound_is_refused() {
+        // The property first: a codec declaring one byte more than the receiver will read is refused at
+        // installation. Without this the failure is invisible — full-size frames vanish, the write
+        // succeeds, and it is indistinguishable from packet loss.
+        assert!(
+            ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(GreedyCodec)).is_none(),
+            "a codec growing frames past MAX_WIRE_OVERHEAD must not be installed"
+        );
+        // And the guard is not simply refusing everything: the same call with a conforming codec succeeds.
+        assert!(
+            ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec)).is_some(),
+            "a codec within the bound must still be accepted"
+        );
+    }
+
     #[test]
     fn a_pluggable_codec_replaces_the_builtin_transform() {
-        let shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        let shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec)).unwrap();
         assert_eq!(shaper.morph(), Morph::Pluggable);
         let shaped = shaper.shape(b"hello");
         assert!(shaped.wire.ends_with(&[0xAB]), "the custom codec produced the wire, not obfuscate");
 
         // A peer running the same codec recovers it; the built-in polymorph decode does NOT.
-        let receiver = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        let receiver = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec)).unwrap();
         assert_eq!(receiver.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
         let builtin = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
         assert_ne!(builtin.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
@@ -297,7 +338,7 @@ mod tests {
 
     #[test]
     fn set_morph_off_pluggable_restores_the_builtin_codec() {
-        let mut shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec));
+        let mut shaper = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec)).unwrap();
         shaper.set_morph(Morph::Polymorph);
         assert_eq!(shaper.morph(), Morph::Polymorph);
         // The built-in codec is back: a plain Polymorph shaper decodes the frame (the mock codec would not).

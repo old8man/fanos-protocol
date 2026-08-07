@@ -37,7 +37,7 @@ pub use codec::MorphCodec;
 pub use controller::{DEFAULT_TRIP, MorphController};
 pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
-pub use obfuscate::{deobfuscate, obfuscate};
+pub use obfuscate::{MAX_WIRE_OVERHEAD, deobfuscate, obfuscate};
 pub use profile::ShapingProfile;
 pub use shape::{ShapeParams, epoch_shape};
 pub use shaper::{ProteusShaper, Shaped};

@@ -32,7 +32,7 @@ use fanos_runtime::ports::stations::{Observation, Station, Stations};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
-use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame};
+use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame, varint};
 use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::Directory;
@@ -130,9 +130,20 @@ impl ProteusConfig {
 
     /// A config driven by a **pluggable** [`MorphCodec`] (the §13.3 SPI) instead of the built-in transform —
     /// the honest home for a real cover-protocol tunnel or a third-party morph.
+    ///
+    /// `None` if the codec declares a [`max_overhead`](MorphCodec::max_overhead) above
+    /// [`fanos_proteus::MAX_WIRE_OVERHEAD`] — the receiver's read bound is `MAX_FRAME` plus that overhead,
+    /// so a codec growing a frame by more would make full-size frames undeliverable. Refused **here**,
+    /// where the embedder hands the codec over, because past this point the loss is indistinguishable from
+    /// packet loss and the sender still sees its writes succeed.
     #[must_use]
-    pub fn pluggable(secret: impl Into<Vec<u8>>, codec: Arc<dyn MorphCodec>) -> Self {
-        Self { secret: secret.into(), morph: Morph::Pluggable, environment: None, codec: Some(codec) }
+    pub fn pluggable(secret: impl Into<Vec<u8>>, codec: Arc<dyn MorphCodec>) -> Option<Self> {
+        (codec.max_overhead() <= fanos_proteus::MAX_WIRE_OVERHEAD).then(|| Self {
+            secret: secret.into(),
+            morph: Morph::Pluggable,
+            environment: None,
+            codec: Some(codec),
+        })
     }
 
     /// Build the shared shaper and (when auto-fallback is configured) its controller, seeded at `epoch`. A
@@ -140,8 +151,16 @@ impl ProteusConfig {
     /// else the fixed `morph` with no controller.
     fn build(self, epoch: Epoch) -> (Arc<RwLock<ProteusShaper>>, MaybeController) {
         if let Some(codec) = self.codec {
-            let shaper = ProteusShaper::with_codec(self.secret, epoch, codec);
-            return (Arc::new(RwLock::new(shaper)), None);
+            // `ProteusConfig::pluggable` already refused an over-growing codec, so this is `Some`. The
+            // branch exists because the type cannot carry that proof — and it says so out loud rather
+            // than falling through onto a wire the peer is not expecting.
+            if let Some(shaper) = ProteusShaper::with_codec(self.secret.clone(), epoch, codec) {
+                return (Arc::new(RwLock::new(shaper)), None);
+            }
+            tracing::error!(
+                max_wire_overhead = fanos_proteus::MAX_WIRE_OVERHEAD,
+                "pluggable codec grows a frame by more than a receiver will read; refusing to install it"
+            );
         }
         match self.environment {
             Some(env) => {
@@ -260,6 +279,33 @@ const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
 /// private `const` here with a second `pub const` in `fanos-node`'s ANGELOS driver — see
 /// [`fanos_wire::MAX_FRAME`] for what that cost.
 use fanos_wire::MAX_FRAME;
+/// Bytes a [`Relay`](FrameType::Relay) wrapper adds around an inner frame, **at the largest inner there
+/// can be**.
+///
+/// Derived from `encode_frame`'s own shape — `varint(type) ‖ varint(body_len) ‖ body`, with
+/// `body = target(12B) ‖ origin(12B) ‖ inner` — and evaluated at the biggest body, because the length
+/// varint *widens with it*. Sizing this on an empty inner would understate it by two bytes, and an
+/// understated ceiling is the same defect a little smaller.
+fn relay_overhead() -> usize {
+    let body = 2 * TRIPLE_WIRE_LEN + MAX_FRAME;
+    varint::encoded_len(FrameType::Relay.code()) + varint::encoded_len(body as u64) + 2 * TRIPLE_WIRE_LEN
+}
+
+/// Per-stream receive cap on the **wire** — [`MAX_FRAME`] plus everything applied to it on the way out.
+///
+/// `MAX_FRAME` bounds a *frame*. A reader reads *wire*, and two transforms sit between them, each of which
+/// only grows the bytes:
+/// * the relay wrapper, when a peer is reached through a hub (`send_uni(hub, shaper, &encode_relay(..))` —
+///   the wrapper goes on the frame, and the shaper then wraps *that*), and
+/// * the PROTEUS polymorph transform, `nonce ‖ junk ‖ len ‖ payload ‖ padding`, which is **on by default**.
+///
+/// Bounding the read by the frame cap therefore drops exactly the frames a producer packed to that cap by
+/// design — a full TAXIS block — while `write_all` reports success and nothing counts the loss. Different
+/// quantities need different bounds, and each gap here is derived (from the encoder, and from the shape
+/// parameter ranges) rather than chosen, so neither can silently reopen the hole.
+fn max_wire() -> usize {
+    MAX_FRAME + relay_overhead() + fanos_proteus::MAX_WIRE_OVERHEAD
+}
 /// Cap on **concurrent inbound connection-handler tasks** (audit C3): each accepted connection spawns a
 /// task (HELLO exchange, then frame reads), so without a bound a peer opening connections in a loop grows
 /// the task/handshake count without limit. The accept loop takes a permit per connection and holds it for
@@ -2307,7 +2353,7 @@ async fn read_verified_hello(
     verify: &HelloVerifier,
 ) -> Option<HelloResult> {
     let mut stream = conn.accept_uni().await.ok()?;
-    let raw = stream.read_to_end(MAX_FRAME).await.ok()?;
+    let raw = stream.read_to_end(max_wire()).await.ok()?;
     let hello = shape_in(shaper, raw)?;
     let cert = peer_cert_der(conn)?;
     verify(&cert, &hello)
@@ -2400,7 +2446,7 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
 async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
     let mut stream = conn.accept_uni().await.ok()?;
-    let raw = stream.read_to_end(MAX_FRAME).await.ok()?;
+    let raw = stream.read_to_end(max_wire()).await.ok()?;
     let bytes = shape_in(shaper, raw)?;
     decode_triple(bytes.get(..HELLO_LEN)?)
 }
@@ -2414,7 +2460,7 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
     // wrongly-shaped stream is skipped without sinking the connection.
     while let Ok(mut stream) = conn.accept_uni().await {
-        let Ok(raw) = stream.read_to_end(MAX_FRAME).await else {
+        let Ok(raw) = stream.read_to_end(max_wire()).await else {
             continue;
         };
         let Some(frame) = shape_in(&t.shaper, raw) else {
@@ -2850,6 +2896,28 @@ mod tests {
         for handle in handles {
             handle.shutdown();
         }
+    }
+
+    #[test]
+    fn the_relay_wrapper_never_outgrows_the_ceiling_that_allows_for_it() {
+        // `max_wire()` is what a receiver will read, and it reserves `relay_overhead()` for this wrapper.
+        // The wrapper is NOT a constant: `encode_frame` writes a varint length that widens with the body,
+        // so the lengths below straddle every varint boundary up to the largest frame there can be. Sizing
+        // the reservation on a small inner would pass a naive test and still drop full blocks.
+        let declared = relay_overhead();
+        for len in [0usize, 1, 62, 63, 64, 16_382, 16_383, 16_384, MAX_FRAME - 1, MAX_FRAME] {
+            let inner = vec![0u8; len];
+            let grown = encode_relay([0, 0, 0], [0, 0, 0], &inner).len() - len;
+            assert!(
+                grown <= declared,
+                "inner {len}: the relay wrapper added {grown}, over the {declared} the wire ceiling \
+                 reserves — a relayed full frame would be dropped by the peer's read bound"
+            );
+        }
+        // And the reservation is not absurdly loose: at the largest inner it must be exact, or the ceiling
+        // is carrying slack nobody derived.
+        let at_max = encode_relay([0, 0, 0], [0, 0, 0], &vec![0u8; MAX_FRAME]).len() - MAX_FRAME;
+        assert_eq!(at_max, declared, "the declared overhead must be the one the encoder actually adds");
     }
 
     #[test]
