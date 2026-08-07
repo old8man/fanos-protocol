@@ -84,33 +84,43 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 /// physics, not the implementation. Check the ideal reference before reporting a defect.
 ///
 /// For reference, the same metric on the *Lite* `NyxNode` engine
-/// (`fanos-sim/tests/traffic_analysis.rs::sweep_timing_correlation_against_the_mix_delay`) — better, but still far from
-/// zero:
+/// (`fanos-sim/tests/traffic_analysis.rs::sweep_timing_correlation_against_the_mix_delay`), with the mix delay held at
+/// this crate's [`DEFAULT_MIX_DELAY`] — better than the shipping router, but still far from zero:
 ///
 /// | cover interval | GPA rate correlation |
 /// |---|---|
 /// | 150 ms | 0.500 |
-/// | 300 ms | 0.475 |
-/// | **1000 ms (this default)** | **0.643** |
+/// | 300 ms | **0.475 — the minimum measured** |
+/// | **500 ms (this default)** | **0.546** |
+/// | 1000 ms | 0.643 |
 /// | 3000 ms | 1.000 — no defence at all |
+///
+/// **This table was stale for two months and said so in bold (#187).** It marked the 1000 ms row "(this default)" and
+/// quoted 0.643 as the shipping exposure; `252815b` had moved the default to 500 ms, and 500 was in no sweep at all —
+/// the sweep held its mix axis at the *former* 50 ms and its cover axis at 150/300/1000/3000. The measurement now
+/// imports these constants instead of copying them, and folds the live value into every axis, so the shipped point
+/// cannot fall out of a hand-written list again.
 ///
 /// The correlation is **maximised over the adversary's observation timescale**, because the adversary picks it — and
 /// restricted to bin widths with at least 30 samples, because Pearson over a handful of points reaches 1.000 by chance.
-/// Both constraints matter and both were got wrong first: a single 100 ms bin **understates** the exposure (0.583) since it
-/// is not the attacker's choice, and an unconstrained maximum **overstates** it (1.000 everywhere) on five-sample bins.
+/// Both constraints matter and both were got wrong first: a single 100 ms bin **understates** the exposure (0.445 at
+/// this schedule) since it is not the attacker's choice, and an unconstrained maximum **overstates** it (0.999 on
+/// 2000 ms bins) on five-sample bins.
 ///
 /// The honest reading is worse than "a substantial residual", and it is not what §8.2's "strong against a GPA" implies:
-/// **no configuration measured brings this channel near zero.** The best tested value leaves `r ≈ 0.48`, the shipping
-/// default `r ≈ 0.64`, and 3 s removes the defence entirely. The volume channel *is* fully masked at all of these (leak
-/// slope 0.000 — displacement does not depend on rate), which makes timing the binding constraint and this table the
-/// real GPA exposure.
+/// **no configuration measured brings this channel near zero.** The best tested value leaves `r ≈ 0.48`, this default
+/// `r ≈ 0.55`, and 3 s removes the defence entirely. The volume channel *is* fully masked at all of these (leak slope
+/// 0.000 — displacement does not depend on rate), which makes timing the binding constraint and this table the real GPA
+/// exposure.
 ///
-/// Lowering the interval buys little on either engine — 0.643 → 0.475 on Lite, 0.975 → 0.898 on the shipping router, both
-/// for a ~6× bandwidth increase. So the conclusion is **not** a tuning note: **constant-rate cover on a fixed clock is
-/// the wrong instrument for the timing channel.** A relay's emission times track its input envelope at some timescale
-/// regardless of the slot period, because the queue length does. Closing this needs emission **decoupled from arrival** —
-/// a continuous-time (Poisson) mix, where each cell's delay is independently exponential and cover is itself Poisson, so
-/// the output process is independent of the input rate. Recorded as an open design gap, not a dial.
+/// **The curve is not monotone, which is the reason this is not a dial.** Halving the interval to 300 ms buys
+/// `0.546 → 0.475` for 1.67× the cover bandwidth; halving it *again* to 150 ms makes the channel **worse** (0.500).
+/// Spending more does not keep buying less exposure, so there is no operator trade to expose here — the conclusion is
+/// that **constant-rate cover on a fixed clock is the wrong instrument for the timing channel.** A relay's emission
+/// times track its input envelope at some timescale regardless of the slot period, because the queue length does.
+/// Closing this needs emission **decoupled from arrival** — a continuous-time (Poisson) mix, where each cell's delay is
+/// independently exponential and cover is itself Poisson, so the output process is independent of the input rate.
+/// Recorded as an open design gap, not a dial.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With

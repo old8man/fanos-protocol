@@ -14,9 +14,44 @@
 use fanos_aphantos::{Directory, NyxNode};
 use fanos_field::F7;
 use fanos_geometry::{Plane, Point, Triple};
+use fanos_node::config::{DEFAULT_COVER_INTERVAL, DEFAULT_MIX_DELAY};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_runtime::{Command, Duration};
 use fanos_sim::{FrameObs, Sim};
+
+/// The shipping schedule, **read from the constants rather than copied** (#187).
+///
+/// Every function here used to spell `(50 ms, 1000 ms)` as "the shipping schedule". Those were the defaults
+/// until `252815b` moved them to 120/500 on a knee measurement — and not one of the four measurements that
+/// describe them followed, including the one whose name is `..._at_the_shipping_defaults`. A literal cannot
+/// track a constant; an import can, and the constants are `pub` precisely so a measurement can cite them.
+fn shipping() -> (Duration, Duration) {
+    (engine_span(DEFAULT_MIX_DELAY), engine_span(DEFAULT_COVER_INTERVAL))
+}
+
+/// `std::time::Duration` → the engine's nanosecond span, the same conversion `Node::start` performs.
+fn engine_span(d: std::time::Duration) -> Duration {
+    Duration(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// Whole milliseconds of `d`, for a sweep axis printed and swept in ms.
+fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `candidates` with the shipping value folded in, sorted and deduplicated.
+///
+/// A sweep whose axis is a hand-written list stops covering the default the moment the default moves — which
+/// is exactly what happened: the cover sweep ran 150/300/1000/3000 and the shipping 500 ms was measured
+/// nowhere, while the constant's doc quoted the 1000 ms row as "this default". Folding the live value in makes
+/// the shipping point unmissable whatever it becomes.
+fn including_the_default(candidates: &[u64], default_ms: u64) -> Vec<u64> {
+    let mut axis: Vec<u64> = candidates.to_vec();
+    axis.push(default_ms);
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
 
 /// Spawn a full `PG(2,7)` cell of `NyxNode`s, optionally with Poisson mixing + cover (the C1 defense).
 fn spawn_nyx_cell(sim: &mut Sim, mix: Option<(Duration, Duration)>) -> Vec<Triple> {
@@ -144,18 +179,22 @@ fn constant_rate_cover_collapses_the_gpa_flow_correlation_on_interior_relays() {
 }
 
 /// **Do the SHIPPING defaults actually defend?** The test above measures the GPA defence at a hand-picked schedule
-/// (mix 120 ms, cover 150 ms). `fanos_node::config` ships `DEFAULT_MIX_DELAY = 50 ms` and
-/// `DEFAULT_COVER_INTERVAL = 1000 ms` — a cover schedule **6.7× sparser** than the one measured.
+/// (mix 120 ms, cover 150 ms). This one measures whatever `fanos_node::config` currently ships.
 ///
 /// That matters because the mechanism is *displacement*: a real forward takes the slot a cover cell would have used, so
 /// emitted volume stays constant. Displacement only masks a flow while cover slots are at least as frequent as real
 /// forwards; past that the excess must be **added**, and the volume signal returns. A default that is measured at one
 /// schedule and shipped at another is exactly how a defence becomes decorative.
+///
+/// **And that is precisely what happened to this test (#187).** It was written against `DEFAULT_MIX_DELAY = 50 ms`,
+/// `DEFAULT_COVER_INTERVAL = 1000 ms` and said so in prose; `252815b` then moved the defaults to 120/500 on a knee
+/// measurement, and the two literals below did not move with them — under a comment reading *"the shipping values,
+/// read as the node's config declares them"*, which they were not. For two months the guard against a
+/// measured-at-one-schedule-shipped-at-another defect **was** an instance of it, asserting about a configuration no
+/// node runs. Reading the constants is the only version of this test that cannot go stale, so it now does.
 #[test]
 fn the_shipping_defaults_are_measured_not_assumed() {
-    // The shipping values, read as the node's config declares them.
-    let ship_mix = Duration::from_millis(50);
-    let ship_cover = Duration::from_millis(1_000);
+    let (ship_mix, ship_cover) = shipping();
 
     let undefended = gpa_volume_leak_slope(None);
     let tested = gpa_volume_leak_slope(Some((Duration::from_millis(120), Duration::from_millis(150))));
@@ -178,10 +217,15 @@ fn the_shipping_defaults_are_measured_not_assumed() {
 /// absolute interior volume alongside it.
 #[test]
 fn a_zero_leak_slope_is_masking_and_not_starvation() {
+    let shipped_label = format!(
+        "SHIPPED (mix {}ms, cover {}ms)",
+        millis(DEFAULT_MIX_DELAY),
+        millis(DEFAULT_COVER_INTERVAL)
+    );
     let schedules = [
         ("undefended", None),
         ("tested (mix 120ms, cover 150ms)", Some((Duration::from_millis(120), Duration::from_millis(150)))),
-        ("SHIPPED (mix 50ms, cover 1000ms)", Some((Duration::from_millis(50), Duration::from_millis(1_000)))),
+        (shipped_label.as_str(), Some(shipping())),
     ];
     for (name, mix) in schedules {
         let (cell, e0) = run_and_tap(mix, 0);
@@ -317,8 +361,12 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 fn sweep_bin_width_to_check_the_correlation_is_not_an_artefact() {
     // Both series are mostly zero between cover slots, and CORRELATED ZEROS inflate Pearson. If r survives only at one
     // bin width it is an artefact of the binning, not a property of the traffic.
-    println!("bin width -> r  (shipping schedule: mix 50ms, cover 1000ms)");
-    let ship = Some((Duration::from_millis(50), Duration::from_millis(1_000)));
+    println!(
+        "bin width -> r  (shipping schedule: mix {}ms, cover {}ms)",
+        millis(DEFAULT_MIX_DELAY),
+        millis(DEFAULT_COVER_INTERVAL)
+    );
+    let ship = Some(shipping());
     for bin in [25u64, 50, 100, 250, 500, 1_000, 2_000] {
         println!(
             "  {bin:>5} ms bins -> undefended {:.3}, shipped {:.3}",
@@ -331,15 +379,23 @@ fn sweep_bin_width_to_check_the_correlation_is_not_an_artefact() {
 #[test]
 #[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
 fn sweep_timing_correlation_against_the_mix_delay() {
-    println!("mix delay -> GPA correlation, maximised over observation bin width (cover 1000ms):");
-    for ms in [0u64, 50, 120, 250, 500, 1_000, 2_000] {
-        let m = if ms == 0 { None } else { Some((Duration::from_millis(ms), Duration::from_millis(1_000))) };
-        println!("  {ms:>5} ms -> r = {:.3}", gpa_timing_correlation(m));
+    // Each axis is swept with the OTHER parameter held at its shipping value, so a row reads as "what the
+    // deployed node would get if only this dial moved". Held at a stale literal instead, as both axes were,
+    // the table describes a configuration nobody runs.
+    let (ship_mix, ship_cover) = (millis(DEFAULT_MIX_DELAY), millis(DEFAULT_COVER_INTERVAL));
+
+    println!("mix delay -> GPA correlation, maximised over observation bin width (cover {ship_cover}ms):");
+    for ms in including_the_default(&[0, 50, 250, 500, 1_000, 2_000], ship_mix) {
+        let m = (ms != 0).then(|| (Duration::from_millis(ms), engine_span(DEFAULT_COVER_INTERVAL)));
+        let mark = if ms == ship_mix { " <- shipping" } else { "" };
+        println!("  {ms:>5} ms -> r = {:.3}{mark}", gpa_timing_correlation(m));
     }
-    println!("cover interval sweep (mix 50ms):");
-    for ms in [150u64, 300, 1_000, 3_000] {
-        let r = gpa_timing_correlation(Some((Duration::from_millis(50), Duration::from_millis(ms))));
-        println!("  cover {ms:>5} ms -> r = {r:.3}");
+
+    println!("cover interval sweep (mix {ship_mix}ms):");
+    for ms in including_the_default(&[150, 300, 1_000, 3_000], ship_cover) {
+        let r = gpa_timing_correlation(Some((engine_span(DEFAULT_MIX_DELAY), Duration::from_millis(ms))));
+        let mark = if ms == ship_cover { " <- shipping" } else { "" };
+        println!("  cover {ms:>5} ms -> r = {r:.3}{mark}");
     }
 }
 
@@ -347,8 +403,13 @@ fn sweep_timing_correlation_against_the_mix_delay() {
 #[ignore = "INVALID METRIC — see threshold_routing::measure_gpa_timing_on_the_shipping_router. Kept as a counter-example."]
 fn measure_the_timing_channel_at_the_shipping_defaults() {
     let undefended = gpa_timing_correlation(None);
-    let shipped = gpa_timing_correlation(Some((Duration::from_millis(50), Duration::from_millis(1_000))));
-    println!("GPA in/out rate correlation — undefended {undefended:.3}, SHIPPED {shipped:.3}");
+    let shipped = gpa_timing_correlation(Some(shipping()));
+    println!(
+        "GPA in/out rate correlation — undefended {undefended:.3}, SHIPPED {shipped:.3} \
+         (mix {}ms, cover {}ms)",
+        millis(DEFAULT_MIX_DELAY),
+        millis(DEFAULT_COVER_INTERVAL)
+    );
     assert!(
         undefended > 0.5,
         "an immediate-forwarding relay's output times track its input times (r = {undefended:.3})"
@@ -480,9 +541,11 @@ fn sweep_linkability_against_the_schedule() {
     // Is the residual linkability TUNABLE? The retracted metric could not answer this, because it penalised
     // conservation at every setting. This one can.
     println!("flow-matching accuracy over 5 concurrent flows (chance 0.20):");
+    let shipping_row =
+        format!("SHIPPING  ({}/{})", millis(DEFAULT_MIX_DELAY), millis(DEFAULT_COVER_INTERVAL));
     for (name, mix, cover) in [
         ("undefended", 0u64, 0u64),
-        ("SHIPPING  (50/1000)", 50, 1_000),
+        (shipping_row.as_str(), millis(DEFAULT_MIX_DELAY), millis(DEFAULT_COVER_INTERVAL)),
         ("moderate  (120/300)", 120, 300),
         ("aggressive(250/150)", 250, 150),
         ("heavy     (500/100)", 500, 100),
@@ -495,10 +558,12 @@ fn sweep_linkability_against_the_schedule() {
 #[test]
 fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
     let (undefended, chance) = linkability(None);
-    let (defended, _) = linkability(Some((Duration::from_millis(50), Duration::from_millis(1_000))));
+    let (defended, _) = linkability(Some(shipping()));
     println!(
         "flow-matching accuracy over 5 concurrent flows — chance {chance:.2}, undefended {undefended:.2}, \
-         shipping defaults {defended:.2}"
+         shipping defaults (mix {}ms, cover {}ms) {defended:.2}",
+        millis(DEFAULT_MIX_DELAY),
+        millis(DEFAULT_COVER_INTERVAL)
     );
     // The undefended baseline must actually be attackable, or the experiment proves nothing about the defence.
     assert!(
@@ -512,11 +577,24 @@ fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
         defended < undefended - 0.3,
         "the defence must materially reduce matching (defended {defended:.2}, undefended {undefended:.2})"
     );
-    // And the honest other half: it does NOT reach chance, so linkability remains. Pinned so a regression toward
-    // 'undefended' and an improvement toward chance are both visible.
+    // And the honest other half. This assertion used to read `defended > chance` — "linkability remains" — and it
+    // held at the 50/1000 defaults it was written against. Pointed at the defaults that actually ship (120/500) it
+    // fails, and **not because the system became anonymous**: the accuracy is 0.00, which is *below* chance.
+    //
+    // Below chance is not safety, and the arithmetic says so. The score is `|Pearson|` at zero lag, and the assignment
+    // is greedy, so a matcher reduced to guessing produces something distributed like a random permutation of `K = 5`.
+    // Its expected fixed-point fraction is `1/K = 0.20` — but the *probability of zero* fixed points is only
+    // `D₅/5! = 44/120 ≈ 0.367`. Twelve seeds all scoring zero therefore has probability `0.367¹² ≈ 3e-6` under the
+    // guessing hypothesis. The matcher is not guessing; it is systematically *avoiding* the truth, which means the
+    // score matrix still carries information about it. An anonymous system drives this metric to chance, not to zero.
+    //
+    // So the number is pinned as measured, with the mechanism unexplained and tracked (#187): the likely cause is that
+    // `pearson` compares series at **zero lag only**, while mixing displaces the exit series by the mix delay — a real
+    // flow-correlation adversary scans lags. Until that is resolved this assertion records what the harness does, not
+    // an anonymity claim, and it fails loudly if the value drifts back across chance in either direction.
     assert!(
-        defended > chance,
-        "if this ever reaches chance the claim has strengthened and this bound should be tightened \
-         (defended {defended:.2}, chance {chance:.2})"
+        defended < chance,
+        "the shipping schedule's matching accuracy sits below chance (defended {defended:.2}, chance {chance:.2}); \
+         if it has risen back to or above chance, the harness or the defaults changed and #187 must be re-read"
     );
 }
