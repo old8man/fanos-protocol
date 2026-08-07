@@ -497,8 +497,11 @@ async fn serve_one(stream: UnixStream, tx: &mpsc::Sender<Envelope>) {
 /// Propagates the bind failure, which is the operator's to see: a node running without the socket it was asked
 /// for should say so rather than pretend.
 pub fn serve(path: &Path, tx: mpsc::Sender<Envelope>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    // Owner-only, and it is what closes the bind→chmod window below rather than merely narrowing it: a Unix
+    // socket's permission check happens at `connect()`, so an unrestricted parent lets a local account reach
+    // the socket during the microseconds it exists at the umask. See `durable::create_private_dir`.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::durable::create_private_dir(parent)?;
     }
     // Only if it is actually a socket. Removing whatever happens to sit at the path would let a mistyped data
     // directory delete a real file.

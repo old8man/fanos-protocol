@@ -1287,7 +1287,15 @@ fn ask_line(question: &str, default: &str) -> String {
 /// which is the reason this takes whatever the caller has rather than what the first caller happened to have.
 fn write_file(path: &Path, contents: impl AsRef<[u8]>, secret: bool) -> Result<(), NodeError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        // 0700, not the umask — the same lesson as the mode below, one level up, and the level #166 found
+        // this helper had still missed: a seed written 0600 into a 0755 directory keeps its BYTES private
+        // and publishes the fact that it exists, under its name, to every account on the host. Enumerating
+        // a ceremony's output is most of knowing what to attack.
+        //
+        // Unconditional rather than `if secret`, because a ceremony writes secrets and non-secrets into one
+        // directory and whichever happened to be written first would otherwise decide the mode for both.
+        // An ordering-dependent permission is the defect, not a weaker default.
+        fanos_node::durable::create_private_dir(parent)?;
     }
     if secret {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -1435,10 +1443,15 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     // The directories first. `load_or_generate` writes the key where it is told and does not invent a home for
     // it, so on a host that has never run FANOS the very first write fails with a bare ENOENT — which is what
     // this wizard exists to prevent an operator from ever meeting. Found by running it, not by reading it.
+    // Owner-only (`0o700`), both of them. These two directories hold `identity.key`, `beacon.params`,
+    // `store.snapshot`, `taxis.snapshot` and `admin.sock`; created at the umask they are world-traversable,
+    // which is also what leaves the admin socket reachable during its bind→chmod window. The files were
+    // already `0o600` (#82's lesson); the directories were not, and one place now decides for all three
+    // callers — see `fanos_node::durable::create_private_dir`.
     if let Some(parent) = paths.identity.parent() {
-        std::fs::create_dir_all(parent)?;
+        fanos_node::durable::create_private_dir(parent)?;
     }
-    std::fs::create_dir_all(&paths.data)?;
+    fanos_node::durable::create_private_dir(&paths.data)?;
     let credentials = identity::load_or_generate(Some(&paths.identity))?;
     config.identity_path = Some(paths.identity.clone());
     // An installed node keeps its store (#77). Not asked about: a node that forgets every shard the cell gave
@@ -3509,6 +3522,9 @@ fn help_advanced() -> String {
          EXIT FILE (--exit, clearnet exit relay): a `key = value` file with\n\
          \x20 seed = <64 hex>            the exit's service-identity seed (secret; clients dial this key)\n\
          \x20 ports = 80,443            destination ports to allow (omit = ANY port — an open relay)\n\
+         \x20 (the port list is the only thing you choose: the exit ALWAYS refuses non-globally-routable\n\
+         \x20  destinations — loopback, RFC1918, CGNAT, link-local — so `ports = 80,443` cannot be turned\n\
+         \x20  into a proxy into your own network or your cloud metadata endpoint)\n\
          \x20 (providing it implies the `exit` role; the node logs its `coord`/`key` descriptor at startup)\n\
          \n\
          CLEARNET (proxy): by default `fanos proxy` DISCOVERS an exit from the live cell directory (exits\n\

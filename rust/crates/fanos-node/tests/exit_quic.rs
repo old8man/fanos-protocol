@@ -150,7 +150,7 @@ async fn a_client_reaches_a_clearnet_tcp_target_through_the_exit() {
         e.client(),
         keypair,
         SeedRng::from_seed(b"exit-quic-svc"),
-        ExitPolicy::default(),
+        ExitPolicy::also_permitting_loopback_for_tests(Vec::new()),
         None,
     );
 
@@ -188,7 +188,7 @@ async fn the_exit_policy_refuses_a_disallowed_port() {
         e.client(),
         keypair,
         SeedRng::from_seed(b"exit-deny-svc"),
-        ExitPolicy::web(),
+        ExitPolicy::also_permitting_loopback_for_tests(vec![80, 443]),
         None,
     );
 
@@ -285,7 +285,7 @@ async fn the_proxy_dialer_reaches_clearnet_through_the_exit() {
         e.client(),
         keypair,
         SeedRng::from_seed(b"exit-dialer-svc"),
-        ExitPolicy::default(),
+        ExitPolicy::also_permitting_loopback_for_tests(Vec::new()),
         None,
     );
 
@@ -325,7 +325,7 @@ async fn the_proxy_dialer_relays_udp_through_the_exit() {
         e.client(),
         keypair,
         SeedRng::from_seed(b"exit-udp-svc"),
-        ExitPolicy::default(),
+        ExitPolicy::also_permitting_loopback_for_tests(Vec::new()),
         None,
     );
     let udp_echo = spawn_udp_echo().await;

@@ -46,6 +46,77 @@ const MAX_TARGET_LEN: usize = 256;
 /// above a jumbo DNS response).
 pub const MAX_DATAGRAM_LEN: usize = 65535;
 
+/// Whether `addr` is a destination an exit may relay to: **globally routable, and nothing else** (#170).
+///
+/// The exit policy gated on the destination **port** and on nothing else, so a client could name any
+/// address and the exit would dial it. With the *recommended* `ports = 80, 443` that includes
+/// **`169.254.169.254:80`** — the AWS/GCP/Azure/OpenStack instance-metadata endpoint, which on IMDSv1
+/// answers with the operator's temporary IAM credentials — and with the default empty allow-list ("any
+/// port") it includes the operator's whole LAN and their own loopback on every port.
+///
+/// An anonymity network makes that strictly worse than an ordinary SSRF: the requester is unidentifiable by
+/// construction, and the traffic leaves from the exit operator's address, so the abuse is attributed to
+/// them. Every exit implementation is expected to have this control — Tor's default policy rejects these
+/// ranges before any port rule.
+///
+/// **Deny by default.** The list is written out rather than deferred to `Ipv4Addr::is_global`, which is
+/// unstable, and each entry names the RFC it comes from so the next reader can check it rather than trust
+/// it. Anything not recognised as globally routable is refused: an exit that cannot classify a destination
+/// must not dial it.
+///
+/// `realm` widens nothing but loopback; see [`Realm`] for why that hatch exists and why it is this narrow.
+#[must_use]
+fn is_relayable(addr: &std::net::IpAddr, realm: Realm) -> bool {
+    use std::net::IpAddr;
+    if realm == Realm::AlsoLoopback && addr.is_loopback() {
+        return true;
+    }
+    match addr {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()                       // 127/8      RFC 1122
+                || v4.is_private()                   // 10/8, 172.16/12, 192.168/16   RFC 1918
+                || v4.is_link_local()                // 169.254/16 RFC 3927 — the metadata endpoint lives here
+                || v4.is_broadcast()                 // 255.255.255.255
+                || v4.is_multicast()                 // 224/4      RFC 5771
+                || v4.is_unspecified()               // 0.0.0.0
+                || o[0] == 0                         // 0/8        RFC 1122 "this network"
+                || (o[0] == 100 && (64..128).contains(&o[1]))   // 100.64/10  RFC 6598 CGNAT
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)      // 192.0.0/24 RFC 6890
+                || v4.is_documentation()             // 192.0.2/24, 198.51.100/24, 203.0.113/24  RFC 5737
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)         // 198.18/15  RFC 2544 benchmarking
+                || (o[0] & 0xf0) == 240)             // 240/4      RFC 1112 reserved
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            !(v6.is_loopback()                       // ::1
+                || v6.is_unspecified()               // ::
+                || v6.is_multicast()                 // ff00::/8
+                || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7   RFC 4193 unique-local
+                || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10  RFC 4291 link-local
+                || (seg[0] == 0x2001 && seg[1] == 0xdb8)        // 2001:db8::/32 RFC 3849 documentation
+                // IPv4-mapped and IPv4-compatible: the v4 rules above must not be reachable by wrapping.
+                || v6.to_ipv4_mapped().is_some_and(|m| !is_relayable(&IpAddr::V4(m), realm))
+                || v6.to_ipv4().is_some_and(|m| !is_relayable(&IpAddr::V4(m), realm)))
+        }
+    }
+}
+
+/// Resolve `host:port` and return the first **relayable** address, or `None` if the name resolves to
+/// nothing an exit may dial.
+///
+/// **The resolution happens here, once, and the caller connects to the returned `SocketAddr`** — never to
+/// the name again. That is the whole point and it is easy to get wrong: `TcpStream::connect((host, port))`
+/// resolves *inside* `connect`, so a filter applied to the host **string** is bypassed by a name that simply
+/// resolves to a private address (`metadata.attacker.example → 169.254.169.254` — no rebinding required),
+/// and a resolve-then-reconnect-by-name is bypassed by rebinding between the two lookups.
+async fn resolve_relayable(host: &str, port: u16, realm: Realm) -> Option<std::net::SocketAddr> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .ok()?
+        .find(|addr| is_relayable(&addr.ip(), realm))
+}
+
 /// The transport an exit session relays: a TCP byte stream (the default) or UDP datagrams. Selected by an
 /// optional scheme prefix on the target header (`udp:host:port`; a bare or `tcp:`-prefixed `host:port` is
 /// TCP — backward-compatible with the original TCP-only exit).
@@ -66,25 +137,58 @@ fn parse_target(target: &str) -> Option<(Protocol, &str, u16)> {
     Some((proto, host, port))
 }
 
-/// What clearnet targets an exit will relay to. A first cut gates on the destination **port** (the common
-/// abuse lever — mail relays, scanning); an empty allow-list means any port, which the operator opts into
-/// explicitly rather than by default.
+/// Which **addresses** an exit may dial, independent of the port rule.
+///
+/// This exists only because an in-process end-to-end test has to point the exit at an echo server it just
+/// bound, and the only address it can bind on every CI host is loopback — the one address production must
+/// refuse hardest. So the escape hatch is made explicit, named for what it is, and kept as narrow as the
+/// fixture needs: [`Realm::AlsoLoopback`] relaxes loopback **and nothing else**. RFC 1918, CGNAT and
+/// link-local — including `169.254.169.254` — stay refused in both realms, so the exemption provably cannot
+/// re-open the hole #170 closed, and `the_metadata_endpoint_is_refused_in_every_realm` asserts exactly that.
+///
+/// It is a constructor argument rather than a builder method on purpose: a security default that a caller
+/// must remember to switch on is a default that production ships without.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Realm {
+    /// Globally routable destinations only. The shipping rule, and the only value a configuration file or
+    /// any other production path can produce.
+    #[default]
+    Global,
+    /// Additionally permits loopback. **Test fixtures only** — an exit constructed this way will relay an
+    /// anonymous client onto the operator's own host.
+    AlsoLoopback,
+}
+
+/// What clearnet targets an exit will relay to: a destination **port** rule the operator writes (the common
+/// abuse lever — mail relays, scanning; an empty allow-list means any port, opted into explicitly rather
+/// than by default), and a destination **address** rule that is not the operator's to widen (#170).
 #[derive(Clone, Default, Debug)]
 pub struct ExitPolicy {
     allowed_ports: Vec<u16>,
+    realm: Realm,
 }
 
 impl ExitPolicy {
-    /// An exit policy allowing exactly `allowed_ports` (empty = any port).
+    /// An exit policy allowing exactly `allowed_ports` (empty = any port), to globally routable addresses.
     #[must_use]
     pub fn new(allowed_ports: Vec<u16>) -> Self {
-        Self { allowed_ports }
+        Self { allowed_ports, realm: Realm::Global }
     }
 
     /// The conventional web policy: HTTP (80) and HTTPS (443) only.
     #[must_use]
     pub fn web() -> Self {
         Self::new(vec![80, 443])
+    }
+
+    /// The same policy, but also willing to dial loopback — **for end-to-end tests only**, see [`Realm`].
+    ///
+    /// Named to be unmistakable at the call site and kept honest by
+    /// `the_loopback_exemption_is_reachable_only_from_a_test` in `fanos-cli/tests/architecture.rs`, which
+    /// fails if any non-test file in the workspace calls it.
+    #[must_use]
+    pub fn also_permitting_loopback_for_tests(allowed_ports: Vec<u16>) -> Self {
+        Self { allowed_ports, realm: Realm::AlsoLoopback }
     }
 
     /// Whether this policy permits relaying to `port`.
@@ -136,14 +240,30 @@ async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
     if !policy.allows_port(port) {
         return;
     }
+    // **Then the destination itself** (#170). The port is only half the question, and it was the only half
+    // asked: `ports = 80, 443` — the policy the setup wizard writes, commented "a web-only exit" — permits
+    // `169.254.169.254:80`, the cloud metadata endpoint. Resolved once here so the connect below cannot
+    // re-resolve to something else; see `resolve_relayable`.
+    let Some(dest) = resolve_relayable(host, port, policy.realm).await else {
+        // Loud, because a refusal and a quiet exit look identical to an operator, and this particular
+        // refusal is the signature of someone probing for the metadata endpoint from inside the anonymity
+        // set. The target is logged; the client is unidentifiable by construction, which is the point of the
+        // network and the reason the operator needs the other half.
+        tracing::warn!(
+            target = %target,
+            "exit refused a non-relayable destination: it resolves to a loopback, private, link-local or \
+             otherwise non-global address"
+        );
+        return;
+    };
     match proto {
         Protocol::Tcp => {
-            let Ok(mut tcp) = TcpStream::connect((host, port)).await else {
+            let Ok(mut tcp) = TcpStream::connect(dest).await else {
                 return;
             };
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
         }
-        Protocol::Udp => relay_udp(stream, host, port).await,
+        Protocol::Udp => relay_udp(stream, dest).await,
     }
 }
 
@@ -152,11 +272,13 @@ async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
 /// both directions until either closes. A connected socket keeps this a one-target tunnel (the UDP analog
 /// of `CONNECT`) — the target sees the exit's address, never the client's. This serves DNS-over-FANOS (a
 /// resolver at `udp:host:53`) and any single-destination UDP flow.
-async fn relay_udp(stream: DuplexStream, host: &str, port: u16) {
+async fn relay_udp(stream: DuplexStream, dest: std::net::SocketAddr) {
     let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
         return;
     };
-    if socket.connect((host, port)).await.is_err() {
+    // An already-resolved, already-filtered address (#170) — never a name, which `connect` would resolve
+    // again and could resolve differently.
+    if socket.connect(dest).await.is_err() {
         return;
     }
     let socket = Arc::new(socket);
@@ -448,6 +570,107 @@ mod tests {
     /// Stated over the plane rather than at one forged point — a credential verifies exactly on the
     /// coordinates its VRF walk reaches — and driven through the same `exit_record` / `open_exit_record`
     /// the publisher and the directory use, so deleting the binding from either end fails this.
+    /// **The exit refuses every destination it must not dial** (#170), and the list is the point.
+    ///
+    /// The policy gated on the port and on nothing else, so `ports = 80, 443` — the configuration the setup
+    /// wizard writes, commented *"a web-only exit"* — permitted `169.254.169.254:80`, the cloud
+    /// instance-metadata endpoint that answers with the operator's IAM credentials on IMDSv1. Each address
+    /// below is a destination a client could name and the exit would have dialled.
+    #[test]
+    fn the_exit_refuses_every_destination_it_must_not_dial() {
+        use std::net::IpAddr;
+        let ip = |s: &str| s.parse::<IpAddr>().expect("a literal address");
+
+        for (what, addr) in [
+            ("the cloud metadata endpoint", "169.254.169.254"),
+            ("loopback", "127.0.0.1"),
+            ("another loopback", "127.7.7.7"),
+            ("RFC1918 /8", "10.1.2.3"),
+            ("RFC1918 /12", "172.20.0.1"),
+            ("RFC1918 /16", "192.168.1.1"),
+            ("CGNAT", "100.100.0.1"),
+            ("this-network", "0.0.0.0"),
+            ("benchmarking", "198.19.0.1"),
+            ("documentation", "192.0.2.1"),
+            ("reserved", "240.0.0.1"),
+            ("broadcast", "255.255.255.255"),
+            ("v6 loopback", "::1"),
+            ("v6 unique-local", "fc00::1"),
+            ("v6 link-local", "fe80::1"),
+            ("v6 documentation", "2001:db8::1"),
+            ("an IPv4-mapped loopback — the wrapper must not launder it", "::ffff:127.0.0.1"),
+            ("an IPv4-mapped metadata endpoint", "::ffff:169.254.169.254"),
+        ] {
+            assert!(!is_relayable(&ip(addr), Realm::Global), "{what} ({addr}) must not be relayable");
+        }
+
+        // And the other direction, or the filter above is indistinguishable from a blanket deny — an exit
+        // that refuses everything is not an exit.
+        for (what, addr) in [
+            ("a public v4 address", "93.184.216.34"),
+            ("a public resolver", "9.9.9.9"),
+            ("a public v6 address", "2606:4700:4700::1111"),
+        ] {
+            assert!(is_relayable(&ip(addr), Realm::Global), "{what} ({addr}) must still be relayable");
+        }
+    }
+
+    /// A NAME that resolves to a refused address is refused — the half a string check cannot do.
+    ///
+    /// `TcpStream::connect((host, port))` resolves inside `connect`, so filtering the host *string* is
+    /// bypassed by `metadata.attacker.example → 169.254.169.254` with no rebinding at all. `localhost` is the
+    /// one name every host resolves to a refused address, so it is the portable way to assert the resolved
+    /// address is what gets checked.
+    #[tokio::test]
+    async fn a_name_that_resolves_to_a_refused_address_is_refused() {
+        assert!(
+            resolve_relayable("localhost", 80, Realm::Global).await.is_none(),
+            "a name resolving only to loopback yields no relayable address",
+        );
+        assert!(
+            resolve_relayable("127.0.0.1", 80, Realm::Global).await.is_none(),
+            "and so does the literal",
+        );
+    }
+
+    /// The test-only realm relaxes loopback and **nothing else** — the exemption cannot re-open #170.
+    ///
+    /// This is the assertion that makes [`Realm::AlsoLoopback`] safe to exist. An escape hatch added so an
+    /// end-to-end fixture can reach the echo server it just bound is a hatch someone will later widen "while
+    /// they are in there", and the widening that matters is the metadata endpoint: it is the one address on
+    /// this list that hands over credentials. So the two realms are asserted to differ on loopback and to
+    /// agree on everything else. Delete the `is_loopback` guard's narrowness — make the arm return `true`
+    /// unconditionally — and the second half of this test reds.
+    #[test]
+    fn the_metadata_endpoint_is_refused_in_every_realm() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("a literal address");
+
+        assert!(
+            is_relayable(&ip("127.0.0.1"), Realm::AlsoLoopback),
+            "the fixture realm exists precisely so loopback is dialable",
+        );
+        assert!(
+            is_relayable(&ip("::1"), Realm::AlsoLoopback),
+            "and v6 loopback with it — the fixture binds whichever the host gives it",
+        );
+
+        for (what, addr) in [
+            ("the cloud metadata endpoint", "169.254.169.254"),
+            ("the rest of link-local", "169.254.1.1"),
+            ("an RFC 1918 LAN host", "192.168.1.1"),
+            ("a 10/8 host", "10.0.0.1"),
+            ("a CGNAT host", "100.64.0.1"),
+            ("the unspecified address", "0.0.0.0"),
+            ("a v6 unique-local host", "fc00::1"),
+            ("an IPv4-mapped metadata endpoint", "::ffff:169.254.169.254"),
+        ] {
+            assert!(
+                !is_relayable(&ip(addr), Realm::AlsoLoopback),
+                "{what} ({addr}) must stay refused even in the fixture realm — the hatch is loopback only",
+            );
+        }
+    }
+
     #[test]
     fn an_exit_key_verifies_only_at_a_coordinate_its_publisher_can_prove() {
         use fanos_field::F7;
@@ -534,10 +757,13 @@ mod tests {
         });
 
         // The exit's UDP relay, connected to the echo server, over one half of an in-memory duplex.
+        // `relay_udp` now takes an already-resolved, already-filtered `SocketAddr` (#170) rather than a
+        // name it would resolve itself — so this test hands it the echo server's address directly. Note the
+        // echo server is on LOOPBACK, which `is_relayable` refuses: that is correct and is why this test
+        // calls `relay_udp` rather than going through `relay_one`. The refusal itself is asserted in
+        // `the_exit_refuses_every_destination_it_must_not_dial`.
         let (client, exit) = tokio::io::duplex(64 * 1024);
-        let host = echo_addr.ip().to_string();
-        let port = echo_addr.port();
-        let relay = tokio::spawn(async move { relay_udp(exit, &host, port).await });
+        let relay = tokio::spawn(async move { relay_udp(exit, echo_addr).await });
 
         let (mut rd, mut wr) = tokio::io::split(client);
         // Two distinct framed datagrams each round-trip through the exit and the echo server.

@@ -5,6 +5,38 @@
 **Baseline health at audit time:** `cargo test --workspace` green; `cargo clippy --workspace --all-targets -D warnings` green; CI runs fmt + clippy + tests + no_std/wasm cross-builds + `cargo miri`. The working tree is mid-change (the DIAULOS anonymous-rendezvous WIP) and currently **fails `cargo fmt --check`** at `fanos-rendezvous/src/lib.rs:214`.
 **Method:** whole-workspace read, dependency-graph and determinism analysis, and five parallel adversarial per-cluster reviews. Every CRITICAL/HIGH claim in Parts A–C was re-verified by hand against the source before inclusion.
 
+## How to cite a section of this file
+
+This file accumulates one appended pass per audit, and **each pass restarts its section numbering at §1**.
+A bare "§3" therefore names twelve different sections, "§5" eight, and every cross-reference written that way
+— in a commit message, a task, a code comment — resolves to whichever pass the reader happens to be in. The
+numbering is not the defect; the missing pass qualifier is. Renumbering all 4 800 lines would invalidate every
+citation already written elsewhere and bury the next real change in a codemod-sized diff, so instead:
+
+**Cite as `<key> §N`, never a bare `§N`.** Each pass owns exactly one key below, and each key is derived from
+the pass's own level-1 banner, so it can be re-derived by reading rather than looked up here.
+
+| key | banner | §-sections |
+|---|---|---|
+| `2026-07-18/root` | *FANOS Rust reference implementation — architectural audit* (this header) | numbered `## 1.`–`## 12.` with lettered findings in Parts A–H; no `§` prefix, so already unique |
+| `2026-07-22/deep` | *FANOS platform deep audit* | 11 |
+| `2026-07-23/re-audit` | *FANOS platform re-audit* | 11 |
+| `2026-07-23/pass-2` | *FANOS deep architecture + implementation audit — 2026-07-23 (pass 2)* | 11 |
+| `2026-07-31/hidden-service` | *Hidden-service audit — 2026-07-31 / 08-01* | 8 |
+| `2026-08-04/nat-harness` | *The real-NAT harness found a live defect on its first run* | 2 |
+| `2026-08-04/spawns` | *Which spawns can a peer multiply, and which addresses does it get to name?* | 3 |
+| `2026-08-04/ceremony` | *Audit pass 2026-08-04 — the founding ceremony's own hygiene* | 9 |
+| `2026-08-05/testnet-blocker` | *Audit pass 2026-08-05 — the last testnet blocker* | 7 |
+| `2026-08-05/resharing` | *Audit pass 2026-08-05 (second) — resharing needs an agreed committee* | 5 |
+| `2026-08-05/homeostat` | *The homeostat, derived (2026-08-05, third pass)* | 4 |
+| `2026-08-05/second-dimension` | *2026-08-05, fourth pass — naming the second dimension* | 4 |
+| `2026-08-06/cell-wide-inputs` | *2026-08-06/07 — the cell-wide inputs, and three defects only the wire could show* | 12 |
+
+The remaining level-1 passes (the 2026-07-27 TAXIS-liveness pass, the 2026-07-31 bounded-capacity re-audit,
+the three 2026-08-04 measurement notes on the wedge, the gather deadline and the liveness spare, and the
+2026-08-06 sweeps appended without a banner) use prose headings rather than `§N`, so their headings are
+already unique and need no key.
+
 > **Resolution status — refreshed 2026-07-24: every finding in this document is RESOLVED.** Each was re-verified against the current source in a full per-finding closure re-audit; the last open items (D2, D4, A4/A4b, A6, C4, G1) were closed on 2026-07-24, and the rest were confirmed already fixed. The workspace has since grown to 41 crates and passes `cargo clippy --workspace --all-targets -D warnings` and `cargo test --workspace` green (the mid-change `cargo fmt` failure noted above is long gone). Resolutions are annotated inline (`— **RESOLVED**`) and summarised in the §2 table. This document is deliberately **retained** as the project's internal defect-audit record and external-audit deliverable (`crypto-audit-readiness.md` §6.5), not deleted.
 
 > ## Verification sweep — 2026-08-03
@@ -4810,3 +4842,96 @@ Three faces of one coin now have names: **never fires** (#104's refuted `Alarm::
 `deal_rejected` here), **never read** (#149), **never leaves** (this section). Ask all three of every new
 counter, and pick *one* seam per platform — two mechanisms for one question is how the next surface gets wired
 to only one of them.
+
+---
+
+# The exit filtered one axis of a two-axis decision (2026-08-07)
+
+An exit policy that gates the destination **port** and never the destination **address**, and what fell out of
+fixing it: a regression the gate caught, two vacuous assertions in the ratchet written to prevent recurrence,
+and a site the sibling permission sweep had missed.
+
+## The defect
+
+`ExitPolicy` was `{ allowed_ports: Vec<u16> }`, and its own doc admitted the shape: "a first cut gates on the
+destination port". The client-supplied host went straight into `TcpStream::connect((host, port))`. So the
+policy the `--help` text recommends — `ports = 80,443`, offered as the alternative to "omit = ANY port — an
+open relay" — permitted **`169.254.169.254:80`**, the AWS/GCP/Azure/OpenStack instance-metadata endpoint,
+which on IMDSv1 answers with the operator's temporary IAM credentials. `ExitPolicy::default()` (empty list =
+any port) additionally made the exit an open relay into the operator's LAN and their own loopback on every
+port.
+
+An anonymity network makes this worse than an ordinary SSRF in two ways that compound: the requester is
+unidentifiable **by construction** — that is the product, not a gap — and the traffic leaves from the exit
+operator's address, so the abuse is attributed to them.
+
+The subtle half is the resolution boundary. `connect((host, port))` resolves the name *inside* `connect`, so a
+filter applied to the host **string** is bypassed by a name that merely resolves to a private address
+(`metadata.attacker.example → 169.254.169.254`) with no rebinding at all, and a resolve-then-reconnect-by-name
+is bypassed by rebinding between the two lookups. Resolution now happens once, in `resolve_relayable`, and the
+caller connects to the returned `SocketAddr` — never to the name again.
+
+## The regression, and why the escape hatch has the shape it has
+
+`cargo test -p fanos-node --lib exit::` was 8/8 green. The CI stage `-p fanos-node` then failed three tests in
+`tests/exit_quic.rs`: the end-to-end suite binds its echo server on `127.0.0.1`, the one address the new rule
+refuses hardest. `--lib` does not run `tests/`.
+
+The fixture cannot bind anything but loopback on an arbitrary CI host, so the hatch has to exist. What matters
+is its shape, and all three properties are load-bearing:
+
+* `Realm` is a **constructor argument** with `Global` as `Default`, not a builder method. A security default a
+  caller must remember to switch on is one production ships without.
+* `Realm::AlsoLoopback` relaxes loopback and **nothing else**. RFC 1918, CGNAT and link-local — including the
+  metadata endpoint — stay refused in *both* realms, so the exemption provably cannot re-open what was just
+  closed. `the_metadata_endpoint_is_refused_in_every_realm` asserts that over eight addresses.
+* The only door is `ExitPolicy::also_permitting_loopback_for_tests`, and a workspace scan fails if any
+  non-`tests/` file calls it.
+
+One side benefit worth recording: `the_exit_policy_refuses_a_disallowed_port` now runs in the loopback realm,
+so its refusal is unambiguously the *port* rule. Before, it would have passed for either reason.
+
+## Two assertions in that ratchet could not fail
+
+Both were in the ratchet's **exemption**, not its rule, and both were found by falsifying rather than reading.
+
+1. "A test file is one whose path contains `tests/` **or whose source contains `#[cfg(test)]`**." Nearly every
+   `src/` module here contains `#[cfg(test)]`, because that is where its unit-test module lives — so the second
+   clause exempted the whole codebase. Planting the forbidden call in `fanos-node/src/node.rs` **passed**.
+2. The companion half — "someone still calls it, or delete the constructor" — counted the scanning file itself,
+   which holds the name in a `const` and lives in `tests/`. Renaming away the only real call site **passed**.
+
+The rule was right both times; the way it selected what to look at was not. A carve-out is a claim about a
+population before it is a claim about the code.
+
+## The sibling sweep had missed a site, and it was the telling one
+
+Verifying #166 (state directories created at the process umask) by enumeration rather than by memory turned up
+a fifth call site the hand-applied fix had not reached: `bin/fanos.rs`'s `write_file(path, contents, secret)` —
+the CLI helper that writes founder seeds and validator configs, and whose entire doc-comment is about
+permission hygiene ("the permission is set **before** the bytes land"). A seed written 0600 landed in a 0755
+directory: the bytes private, the names not, and enumerating a ceremony's output is most of knowing what to
+attack. **The function most explicitly about the defect had the defect** — attention had already been spent
+there, so it read as done.
+
+The parent is now made private unconditionally rather than `if secret`, because a ceremony writes secrets and
+non-secrets into one directory and whichever was written first would otherwise decide the mode for both. An
+ordering-dependent permission is the defect, not a weaker default. `no_production_code_creates_a_directory_at_
+the_umask` now fails on the next one, and was falsified against that exact line.
+
+## Adjacent, filed rather than fixed
+
+* The address predicate belongs to the platform, not to `fanos-node::exit`. The hole-punch dial in
+  `fanos-quic` is its second consumer — and needs a **different** realm rule, because an overlay peer is
+  legitimately on RFC 1918 while an exit destination is not. `accept_holepunch`'s own doc names the harm ("a
+  fleet of FANOS nodes becomes a reflector aimed at a third party") and then bounds the *count* rather than
+  the target. Honest severity is MEDIUM: no directory poisoning (the write happens only after a proven
+  coordinate), amplification ≈ 0, and the in-flight set is bounded by the plane.
+* `fanos validator` assembles a bare `OverlayNode::<F2>::new(coord, OverlayConfig::default())`, bypassing
+  `compose_engine` — and the seam guard cannot see it, because it matches the literal `OverlayNode::<F>::new`
+  and the binary writes `F2`.
+* The durable R-C3 loss ledger has no reader: `lost_keys()` is called by nothing in the workspace, while its
+  doc calls a non-empty ledger "visible, auditable evidence". Permanent loss is reported as one log line and
+  the record that outlives the process cannot be queried.
+* `Command::SampleAvailability` (§L4.3) is constructed only by two simulator tests — the light-client
+  availability check has no light client.

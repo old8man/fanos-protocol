@@ -117,6 +117,40 @@ pub struct BeaconRejects {
     /// Counted separately from the two above because it is upstream of them: a corrupted attack frame is
     /// refused here without anything downstream ever learning an attack was attempted.
     pub frame_undecodable: u64,
+
+    // --- The steady state (#161) ---------------------------------------------------------------------
+    //
+    // The five counters above cover the **reshare trigger**: a rare, out-of-band, operator-initiated event.
+    // The partial/round flood is what this beacon does every epoch, for ever, and it had no counters at all —
+    // so the instrument covered the rare path and not the hot one, on the clock every epoch-aligned mechanism
+    // derives from.
+    /// A partial for an epoch this node has already adopted.
+    ///
+    /// **Benign and expected to be nonzero**: re-flooding is how the flood terminates. It is counted only so
+    /// it can be told apart from the one below — the two used to share a single `||` early return, which made
+    /// them indistinguishable *in principle*, not merely uncounted ([[one-predicate-two-decisions]]).
+    pub partial_stale: u64,
+    /// A partial whose **DLEQ proof did not verify** against the group commitment.
+    ///
+    /// Expected zero. Nonzero means one of two things and an operator must investigate both: a forged or
+    /// tampered partial, or **this node holding the wrong commitment** — a provisioning mismatch that looks
+    /// identical from here and stalls the cell just as thoroughly.
+    pub partial_unverified: u64,
+    /// A partial frame whose body did not parse.
+    pub partial_malformed: u64,
+    /// A round frame whose body did not parse.
+    pub round_malformed: u64,
+    /// A **flooded round that failed verification** against the group commitment — a forged beacon round.
+    ///
+    /// This is the frame that sets the cell's shared clock. Expected zero.
+    pub round_unverified: u64,
+    /// This node reached threshold, assembled a round from its own buffered partials, and the **combined
+    /// round failed to verify**.
+    ///
+    /// The worst of the six, because the cell produces no seed and the clock stops. It means at least one
+    /// buffered partial was bad *and passed* `verify_partial`, or the threshold combination is wrong for this
+    /// commitment. Expected zero; nonzero is a cell that is stalling for a reason nothing else reports.
+    pub assembly_unverified: u64,
 }
 
 /// A node running the distributed randomness beacon over its cell.
@@ -415,9 +449,12 @@ impl<F: Field> BeaconNode<F> {
             None => None,
         };
         let Some(round) = round else {
+            // Not enough partials yet — the ordinary state between the first arrival and the threshold, and
+            // deliberately uncounted: it happens on almost every call and would drown the six that matter.
             return Vec::new();
         };
         let Some(seed) = round.verify_and_seed(&self.commitment, self.threshold) else {
+            self.rejects.assembly_unverified = self.rejects.assembly_unverified.saturating_add(1);
             return Vec::new();
         };
         self.adopt_and_announce(epoch, seed, round)
@@ -426,6 +463,7 @@ impl<F: Field> BeaconNode<F> {
     /// A received round: verify it against the group commitment and, if strictly newer, adopt + re-flood.
     fn on_round(&mut self, body: &[u8]) -> Vec<Effect> {
         let Some(round) = BeaconRound::from_bytes(body) else {
+            self.rejects.round_malformed = self.rejects.round_malformed.saturating_add(1);
             return Vec::new();
         };
         let epoch = round.epoch();
@@ -433,6 +471,7 @@ impl<F: Field> BeaconNode<F> {
             return Vec::new(); // not newer — drop (terminates the flood)
         }
         let Some(seed) = round.verify_and_seed(&self.commitment, self.threshold) else {
+            self.rejects.round_unverified = self.rejects.round_unverified.saturating_add(1);
             return Vec::new();
         };
         self.adopt_and_announce(epoch, seed, round)
@@ -441,9 +480,19 @@ impl<F: Field> BeaconNode<F> {
     /// A received partial: verify its DLEQ against the group commitment, buffer it, and try to assemble.
     fn on_partial(&mut self, body: &[u8]) -> Vec<Effect> {
         let Some((epoch, partial)) = parse_partial(body) else {
+            self.rejects.partial_malformed = self.rejects.partial_malformed.saturating_add(1);
             return Vec::new();
         };
-        if epoch <= self.epoch || !verify_partial(&partial, epoch, &self.commitment) {
+        // **Two decisions, and they used to share one `||`** (#161). A stale epoch is the flood terminating —
+        // benign, expected, constant-rate. A failed DLEQ is a forgery or a wrong commitment. Merged into one
+        // early return they were not merely uncounted: they were indistinguishable *in principle*, because no
+        // counter placed on that branch could have said which had happened.
+        if epoch <= self.epoch {
+            self.rejects.partial_stale = self.rejects.partial_stale.saturating_add(1);
+            return Vec::new();
+        }
+        if !verify_partial(&partial, epoch, &self.commitment) {
+            self.rejects.partial_unverified = self.rejects.partial_unverified.saturating_add(1);
             return Vec::new();
         }
         self.buffer(epoch, partial);
@@ -1398,6 +1447,80 @@ mod tests {
             );
         }
         assert_eq!(node.epoch(), Epoch::ZERO, "the node stays at genesis");
+    }
+
+    /// **The steady state counts, and a stale re-flood is not a forgery** (#161).
+    ///
+    /// The five original counters covered the reshare trigger — rare and operator-initiated — while the
+    /// partial/round flood, which is what the beacon does every epoch for ever, had none. The sharpest part
+    /// was one early return carrying two decisions: `epoch <= self.epoch || !verify_partial(…)`. A stale
+    /// re-flood is *how the flood terminates* and is expected at a constant rate; a failed DLEQ is a forgery
+    /// or a wrong commitment. Merged, no counter placed there could have said which happened.
+    ///
+    /// Both directions for each, because a counter asserted only at zero is indistinguishable from a field
+    /// that is always zero — which is exactly what `deal_rejected` turned out to be.
+    #[test]
+    fn the_beacons_steady_state_tells_a_stale_reflood_from_a_forgery() {
+        let (shares, commitment) =
+            deal(&[0xA7; 32], 1, N, &mut DeterministicRng::new(b"beacon-steady")).unwrap();
+        let mk = || {
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), 1, BeaconSeed::GENESIS)
+        };
+        let send = |node: &mut BeaconNode<F2>, frame: Vec<u8>| {
+            node.step(Instant(1), Input::Message { from: [9, 9, 9], frame })
+        };
+
+        // Quiet to begin with, or every assertion below is satisfied by a struct of zeros.
+        let base = mk();
+        let r = base.rejects();
+        assert_eq!(
+            (r.partial_stale, r.partial_unverified, r.partial_malformed, r.round_malformed, r.round_unverified),
+            (0, 0, 0, 0, 0),
+            "a fresh beacon node has refused nothing",
+        );
+
+        // 1. A malformed partial BODY inside a well-formed frame. Truncating the *frame* instead would be
+        //    caught upstream by `frame_undecodable` and never reach `on_partial` at all — the first draft of
+        //    this test did exactly that and read 0, which is the counter being right and the test being wrong.
+        let mut node = mk();
+        send(&mut node, encode(FrameType::BeaconPartial, &[0xEE; 3]));
+        assert_eq!(node.rejects().partial_malformed, 1, "a body that does not parse is counted");
+        assert_eq!(node.rejects().frame_undecodable, 0, "…by the handler, not by the upstream frame decoder");
+
+        // 2. A **stale** partial — epoch 0, already adopted. Benign; the flood's own terminator.
+        let mut node = mk();
+        send(&mut node, partial_frame(Epoch::ZERO, &partial_eval(&shares[2], Epoch::ZERO)));
+        let r = node.rejects();
+        assert_eq!(r.partial_stale, 1, "a re-flood of an adopted epoch is counted as stale");
+        assert_eq!(r.partial_unverified, 0, "…and NOT as a forgery — that is the whole point of the split");
+
+        // 3. A **forged** partial: canonical bytes, flipped response, so it parses and fails its DLEQ.
+        let mut node = mk();
+        let mut bytes = partial_eval(&shares[2], Epoch::new(1)).to_bytes();
+        bytes[65] ^= 0x01;
+        if let Some(forged) = BeaconPartial::from_bytes(&bytes) {
+            send(&mut node, partial_frame(Epoch::new(1), &forged));
+            let r = node.rejects();
+            assert_eq!(r.partial_unverified, 1, "a partial whose DLEQ fails is counted as unverified");
+            assert_eq!(r.partial_stale, 0, "…and NOT as a stale re-flood");
+        }
+
+        // 4. A malformed round body.
+        let mut node = mk();
+        send(&mut node, encode(FrameType::Beacon, &[0xEE; 3]));
+        assert_eq!(node.rejects().round_malformed, 1, "a round body that does not parse is counted");
+
+        // 5. And the honest path leaves every one of them at zero — the direction that makes the four above
+        //    evidence rather than noise.
+        let mut node = mk();
+        send(&mut node, partial_frame(Epoch::new(1), &partial_eval(&shares[2], Epoch::new(1))));
+        let r = node.rejects();
+        assert_eq!(
+            (r.partial_stale, r.partial_unverified, r.partial_malformed, r.round_malformed, r.round_unverified, r.assembly_unverified),
+            (0, 0, 0, 0, 0, 0),
+            "a valid partial refuses nothing",
+        );
+        assert_eq!(node.epoch(), Epoch::new(1), "and at t = 1 it forms the round");
     }
 
     #[test]

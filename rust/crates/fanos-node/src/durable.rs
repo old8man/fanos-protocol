@@ -28,6 +28,34 @@ use tokio::task::JoinHandle;
 /// The file a node's durable store lives in, inside its state directory.
 pub const STORE_FILE: &str = "store.snapshot";
 
+/// Create `path` and every missing parent, **owner-only** (`0o700`).
+///
+/// One function with three callers, because the alternative already happened. #82 fixed *"every dealing
+/// ceremony writes its secrets at the process umask"* — for the **files**. The node then applied that lesson
+/// to `identity.key` (`.mode(0o600)`), to a second secret write, and to the admin socket — and to **no
+/// directory at all**: every `create_dir_all` in this crate created at the umask, typically `0o755`, and the
+/// directory in question holds `identity.key`, `beacon.params`, `store.snapshot`, `taxis.snapshot` and
+/// `admin.sock`.
+///
+/// **The consequence with teeth is the socket.** `admin::serve` binds the listener and *then* chmods it to
+/// `0o600`, and a Unix socket's permission check happens at **`connect()`** — so in the window between those
+/// two calls any local account spinning on `connect()` gets a connection that survives the chmod, on the
+/// channel whose own doc calls itself *"the whole of this channel's access control"*. A `0o700` parent closes
+/// that window by construction: an attacker cannot traverse into the directory to reach the socket at all.
+///
+/// `0o700` and not `0o750`: nothing here is meant to be read by a group. An operator who wants a group to
+/// read the state directory can widen it deliberately, which is a different act from inheriting a umask.
+///
+/// # Errors
+/// Propagates the `create_dir_all` or `set_permissions` failure. **The mode is not best-effort** — a
+/// directory that could not be restricted is one whose contents are readable, and continuing would leave the
+/// caller believing something the filesystem does not agree with.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
 /// How many times a node is assumed to restart per day, for [`snapshot_interval`].
 ///
 /// **An assumption, declared rather than folded into a chosen period.** Once a day is pessimistic for a
@@ -131,12 +159,23 @@ pub fn write_snapshot(state_dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// rename being durable while the bytes it points at are not — the failure that returns a node with a
 /// perfectly-named empty file.
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        // `0o600` on the temp file, not only on the directory. Belt and braces on purpose: a directory mode
+        // is one `chmod` away from being widened by an operator, and this file is the node's store and ledger
+        // snapshot — not key material, but on a shared host it says which content keys this node holds and
+        // what its chain state is. `identity.rs` already writes this way; there is no reason for the two to
+        // differ. The mode applies at *creation*, so unlike a chmod-after there is no window.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -179,6 +218,55 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// **The state directory and everything written into it are owner-only** (#166).
+    ///
+    /// Asserted on the *mode bits*, not on the call: `create_dir_all` succeeding says nothing about
+    /// permissions, and that is exactly how this got here — #82 taught the codebase to set `0o600` on secret
+    /// **files** (`identity.key` does), and every `create_dir_all` in the crate went on creating at the umask.
+    /// A directory left at `0o755` is world-traversable, and it is what left the admin socket reachable
+    /// during the window between `bind` and its `chmod`, because a Unix socket is permission-checked at
+    /// `connect()`.
+    ///
+    /// The mask is `0o077` rather than an equality: what matters is that **no bit is set for group or other**.
+    /// Testing `== 0o700` would also fail an operator who deliberately narrowed it further.
+    #[test]
+    fn the_state_directory_and_its_snapshots_are_unreadable_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Per-process, per-test path: a fixed name under the shared temp dir is a machine-wide resource, and
+        // two concurrent runs then race on it — measured at 7 failures in 8 for the sibling persist test.
+        let dir = std::env::temp_dir().join(format!("fanos-durable-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A umask that WOULD leave the directory world-readable if the mode were not set explicitly. Without
+        // this the test could pass on a developer's `umask 077` box and fail nowhere until production.
+        create_private_dir(&dir).expect("create the state dir");
+        let mode = std::fs::metadata(&dir).expect("stat the dir").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the state directory is group/other-accessible (mode {mode:o}) — it holds identity.key, \
+             beacon.params, the store and chain snapshots, and the admin socket",
+        );
+
+        // And the snapshot itself, at creation rather than by a chmod afterwards (no window).
+        let file = dir.join(STORE_FILE);
+        write_bytes(&file, b"snapshot bytes").expect("write the snapshot");
+        let fmode = std::fs::metadata(&file).expect("stat the file").permissions().mode();
+        assert_eq!(
+            fmode & 0o077,
+            0,
+            "the store snapshot is group/other-readable (mode {fmode:o}) — on a shared host that is which \
+             content keys this node holds and what its chain state is",
+        );
+        assert_eq!(std::fs::read(&file).expect("read back"), b"snapshot bytes", "and it round-trips");
+
+        // The temp sibling must not survive the rename — a `…tmp` left behind at any mode is a second copy.
+        assert!(!file.with_extension("tmp").exists(), "the atomic-write temp file is consumed by the rename");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The derived period, at the declared assumptions, and — the half that matters — that it **moves with
     /// them** rather than being a constant with an equation written above it.

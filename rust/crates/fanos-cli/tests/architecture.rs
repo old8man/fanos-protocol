@@ -709,3 +709,198 @@ fn is_numeric_const(line: &str) -> bool {
         NUMERIC.iter().any(|n| ty == *n || ty.ends_with(&format!("::{n}")))
     })
 }
+
+/// The audit's citation register must name every pass that numbers its sections `§N`, and must count them right.
+///
+/// `docs/audit.md` grows by one appended pass per audit and **each pass restarts at §1**, so a bare "§3" names
+/// twelve different sections and resolves only against the pass a reader happens to be inside. The file's
+/// answer (#169) is a register at the top mapping each pass to a citation key — which is worth exactly as much
+/// as its accuracy, and a register maintained by hand across twenty passes is a stale register.
+///
+/// So this checks the two things a reader relies on, against the file itself:
+///
+/// * **Coverage** — every level-1 banner that owns at least one `## §` heading has a row. A new pass appended
+///   with `§`-numbered sections and no register row fails here, on the commit that adds it.
+/// * **Counts** — each row's stated section count is the number actually present under that banner. This is
+///   the half that catches the likelier drift: a pass gaining a `§13` long after its row was written.
+///
+/// The root pass is deliberately outside both checks: it numbers `## 1.`–`## 12.` with no `§`, so its headings
+/// are already unique and its row says so in prose rather than a number.
+#[test]
+fn every_section_numbering_pass_is_in_the_audits_citation_register() {
+    let audit = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../docs/audit.md"),
+    )
+    .expect("docs/audit.md is readable from the crate");
+
+    // Rows of the register: (quoted banner text, stated count). Rows whose count cell is prose — the root
+    // pass — are skipped by the `parse` and so exempt from both checks, which is the intent.
+    let register: Vec<(String, usize)> = audit
+        .lines()
+        .filter(|l| l.starts_with("| `20"))
+        .filter_map(|l| {
+            let mut cols = l.split('|').map(str::trim);
+            let (_key, banner, count) = (cols.nth(1)?, cols.next()?, cols.next()?);
+            Some((banner.trim_matches('*').to_owned(), count.parse().ok()?))
+        })
+        .collect();
+
+    // Section counts per level-1 banner, from the file itself.
+    let mut actual: Vec<(String, usize)> = Vec::new();
+    for line in audit.lines() {
+        if let Some(banner) = line.strip_prefix("# ") {
+            actual.push((banner.to_owned(), 0));
+        } else if line.starts_with("## §")
+            && let Some(last) = actual.last_mut()
+        {
+            last.1 += 1;
+        }
+    }
+    actual.retain(|(_, n)| *n > 0);
+
+    for (banner, n) in &actual {
+        let row = register.iter().find(|(quoted, _)| banner.contains(quoted.as_str()));
+        let Some((quoted, stated)) = row else {
+            panic!(
+                "the audit pass \"{banner}\" numbers {n} sections `§N` and has no row in the citation register \
+                 at the top of docs/audit.md. Add one — a `§N` under an unregistered banner cannot be cited \
+                 unambiguously from a commit, a task or a code comment, which is the whole defect (#169)."
+            );
+        };
+        assert_eq!(
+            stated, n,
+            "the register says \"{quoted}\" has {stated} `§` sections; the file has {n}. Correct the row — a \
+             count that drifts is how a register stops being read."
+        );
+    }
+    assert_eq!(
+        register.len(),
+        actual.len(),
+        "the register has {} numbered rows for {} passes that actually number sections — a row names a pass \
+         that no longer numbers any `§`, or names one twice.",
+        register.len(),
+        actual.len()
+    );
+}
+
+/// The exit's loopback exemption must be reachable only from a test.
+///
+/// `ExitPolicy::also_permitting_loopback_for_tests` exists because the exit end-to-end suite has to dial an
+/// echo server it bound on `127.0.0.1` — the one address #170 exists to refuse. The constructor is named to
+/// be unmissable in review, but a name is not a guarantee: an exit built with it will relay an anonymous
+/// client onto the operator's own host, and that is precisely the CRITICAL that was just closed.
+///
+/// So the guarantee is mechanical. Any call from a file that is not a test — a `src/` module, a binary, a
+/// benchmark — fails here. The counterpart assertion lives with the code: `the_metadata_endpoint_is_refused_
+/// in_every_realm` proves the hatch relaxes loopback and nothing else, so even a leaked call cannot reach
+/// `169.254.169.254`. Two independent bounds, because one of them is a naming convention.
+#[test]
+fn the_loopback_exemption_is_reachable_only_from_a_test() {
+    const HATCH: &str = "also_permitting_loopback_for_tests";
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut calls = 0usize;
+    let mut stack = vec![crates];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // This file names the constructor in a `const`, and lives in a `tests/` directory — so without
+            // this line it counts itself, and the "someone still calls it" half below can never fail. That
+            // was not hypothetical: it passed after the only real call site had been renamed away.
+            if path.file_name().is_some_and(|n| n == "architecture.rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            // The definition itself, and this test's own mention of the name, are not calls.
+            let body = src.split("pub fn also_permitting").next().unwrap_or(&src);
+            if !body.contains(HATCH) {
+                continue;
+            }
+            calls += 1;
+            // Membership of a `tests/` directory, and nothing softer. The first cut here also accepted any
+            // file containing `#[cfg(test)]` — which is nearly every `src/` module in this workspace, since
+            // that is where a unit-test module lives — so the guard exempted the whole codebase and passed
+            // when a `src/` call was planted in it. A guard that cannot fail is not a guard.
+            if !path.components().any(|c| c.as_os_str() == "tests") {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "{HATCH} is called from non-test code: {offenders:?}. An exit built that way relays an anonymous \
+         client onto the operator's own loopback — use ExitPolicy::new/web, which is the shipping rule (#170)."
+    );
+    assert!(
+        calls > 0,
+        "no file calls {HATCH} — if the exit e2e stopped needing the hatch, delete the constructor rather \
+         than leaving a widened policy nothing exercises."
+    );
+}
+
+/// No production code creates a directory at the umask.
+///
+/// #82 established that a secret must be written 0600 and not chmod-ed a microsecond later. #166 found the
+/// half that lesson had missed — the DIRECTORY holding those secrets was still created at the umask, so the
+/// bytes were private and their names were not, and enumerating a ceremony's output is most of knowing what
+/// to attack. `durable::create_private_dir` is the single answer.
+///
+/// This test exists because the #166 sweep itself missed a call site: `bin/fanos.rs`'s `write_file` — the
+/// CLI helper whose whole doc-comment is about permission hygiene, and the one that writes founder seeds and
+/// validator configs — still called `create_dir_all` directly. A fix applied by hand across a crate is a fix
+/// that misses one; the mechanical check is what makes it hold.
+///
+/// Test modules are exempt: a scratch directory under a per-test temp path holds nothing worth hiding, and
+/// requiring 0700 there would be ceremony without a threat.
+#[test]
+fn no_production_code_creates_a_directory_at_the_umask() {
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![crates];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target" && n != "tests") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            // Everything from the first `#[cfg(test)]` on is a test module — exempt, and excluded by
+            // POSITION rather than by "the file mentions cfg(test)", which would exempt nearly every
+            // `src/` module in this workspace and make the check vacuous.
+            let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+            // `create_private_dir` is the sanctioned wrapper and calls `create_dir_all` itself.
+            if path.file_name().is_some_and(|n| n == "durable.rs") {
+                continue;
+            }
+            for (i, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("create_dir_all") {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these create a directory at the process umask: {offenders:?}. Call \
+         `fanos_node::durable::create_private_dir` — a 0600 secret inside a 0755 directory publishes its \
+         name to every account on the host (#82, #166)."
+    );
+}
