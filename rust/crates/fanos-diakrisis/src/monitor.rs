@@ -60,6 +60,23 @@ impl BehaviorMonitor {
         }
     }
 
+    /// Drop every retained sample, keeping the shape (`n`, `window`).
+    ///
+    /// For the moment the samples stop meaning what their **column index** says they mean. Slot `i` is a
+    /// cell position, and a position's occupant changes at an epoch boundary, so a window that spans one is
+    /// a splice of two different node→seat assignments — the columns are no longer one time series each.
+    /// Measured on the shipped `W = 178`: mean off-diagonal `r` falls from `0.835` to `0.07` mid-splice on a
+    /// cell with 20× load spread, three to four band-widths, for the whole window (`reshuffle_phi.py`).
+    ///
+    /// A cleared monitor is not [`ready`](Self::ready) until it refills, which is the honest state and is
+    /// also what makes the resolution requirement self-enforcing: where the derived window is longer than
+    /// the epoch it must fit inside, refilling never completes and the loop it feeds stays silent.
+    pub fn clear(&mut self) {
+        for deque in &mut self.samples {
+            deque.clear();
+        }
+    }
+
     /// Whether every node has a full window of samples — the point at which the coherence read is stable.
     #[must_use]
     pub fn ready(&self) -> bool {
@@ -110,6 +127,79 @@ mod tests {
         // Constant signals still yield a well-formed matrix (unit diagonal, zero off-diagonal correlation).
         let g = m.coherence().expect("a matrix once there is a window");
         assert_eq!(g.n(), 3);
+    }
+
+    /// **A window that spans a seat permutation reads a perfectly coherent cell as anti-correlated** (#153).
+    ///
+    /// The monitor's slot `i` is a *cell position*, and an epoch boundary re-draws every node's VRF
+    /// coordinate, so the position keeps its name and changes its occupant. Nothing about the cell changes —
+    /// the same seven nodes carry the same seven loads under the same shared demand — yet the window that
+    /// straddles the turn is a splice of two column orderings.
+    ///
+    /// Deterministic, not Monte Carlo: `x_j(t) = μ_j · (10 + sin(2πt/17))` is rank-one, so every pair of
+    /// columns is *exactly* correlated and the settled reading is `1.0` to the last bit. The permutation
+    /// alone takes it to `≈ −0.13`. There is no noise term and no seed — the whole effect is the per-column
+    /// level jump `10·μ_j → 10·μ_σ(j)`, and it needs the loads to DIFFER: on an exchangeable cell
+    /// (`μ_j` all equal) a column permutation is provably harmless, which is why every uniform-load test in
+    /// the suite passes over this.
+    #[test]
+    fn a_window_spanning_a_seat_permutation_reads_a_coherent_cell_as_anti_correlated() {
+        const W: usize = 20;
+        // Heterogeneous per-node load — the §6.7 load-balance prescription exists because these differ.
+        let mu = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+        // A period coprime with the window, so the splice is not an artefact of the signal repeating on it.
+        let shared = |t: usize| (2.0 * core::f64::consts::PI * t as f64 / 17.0).sin();
+        let row = |t: usize| -> Vec<f64> { mu.iter().map(|m| m * (10.0 + shared(t))).collect() };
+        // The same instant, seen through the NEXT epoch's seating: a rotation of the seven seats.
+        let permuted = |t: usize| -> Vec<f64> {
+            let r = row(t);
+            [3, 4, 5, 6, 0, 1, 2].iter().map(|&j| r[j]).collect()
+        };
+
+        let mut m = BehaviorMonitor::new(7, W);
+        for t in 0..W {
+            m.record(&row(t));
+        }
+        let settled = m.coherence().expect("a full window reads").mean_correlation();
+        assert!(settled > 0.999, "a rank-one cell is perfectly coherent, not {settled}");
+
+        // FALSIFICATION — the window rolling is not what breaks it. Another W samples of the SAME seating
+        // evict every original row and the reading is untouched.
+        let mut rolled = m.clone();
+        for t in W..2 * W {
+            rolled.record(&row(t));
+        }
+        let after_roll = rolled.coherence().expect("still full").mean_correlation();
+        assert!(after_roll > 0.999, "rolling the window changes nothing: {after_roll}");
+
+        // THE PROPERTY. One sample in the new seating is already enough to destroy the reading, and it stays
+        // destroyed until the LAST pre-boundary row is evicted — `W − 1` diagnoses, against which the
+        // homeostat's dwell of 3 is no defence. (At `k = W` the window is clean again, which is what makes
+        // the cost of the fix exactly one window and not more; the range says so.)
+        for k in 1..W {
+            let mut spliced = m.clone();
+            for t in W..W + k {
+                spliced.record(&permuted(t));
+            }
+            let r = spliced.coherence().expect("still full").mean_correlation();
+            assert!(
+                r < 0.0,
+                "a splice of {k} rows reads {r}, but the collective-subject band is (0.408, 0.577] — the \
+                 cell has not changed and its own instrument now reports it as anti-correlated",
+            );
+        }
+
+        // THE FIX. Dropping the window at the boundary costs one window of no reading and nothing else: the
+        // refilled monitor recovers the true value exactly.
+        let mut cleared = m.clone();
+        cleared.clear();
+        assert!(!cleared.ready(), "a cleared window has no reading — the honest state");
+        assert!(cleared.coherence().is_none());
+        for t in W..2 * W {
+            cleared.record(&permuted(t));
+        }
+        let recovered = cleared.coherence().expect("refilled").mean_correlation();
+        assert!(recovered > 0.999, "one consistent seating reads the truth again, not {recovered}");
     }
 
     #[test]

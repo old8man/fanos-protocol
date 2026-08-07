@@ -2510,6 +2510,123 @@ mod tests {
         );
     }
 
+    /// **An epoch turn ends the observation it interrupts** (#153) — on *both* paths to a new epoch.
+    ///
+    /// The behavioural window's slot `i` is a cell POSITION, and an epoch re-draws every node's VRF
+    /// coordinate, so the position keeps its name and changes its occupant. A window that spans the turn is a
+    /// splice of two seatings, and on a cell whose members carry different loads that splice reads a
+    /// perfectly coherent cell as *anti*-correlated — measured deterministically one crate down, in
+    /// `monitor::tests::a_window_spanning_a_seat_permutation_reads_a_coherent_cell_as_anti_correlated`.
+    ///
+    /// What *this* pins is the wiring, and specifically that both paths do it. A node reaches a new epoch
+    /// either by its own `AdvanceEpoch` or by adopting a peer's `EpochAgree` gossip, and a fix applied to one
+    /// of them would make whether a cell's self-model is spliced depend on which node happened to drive the
+    /// advance — the identical hazard the store sweep already had to be duplicated for.
+    #[test]
+    fn a_new_epoch_ends_the_coherence_observation_it_interrupts_on_both_paths() {
+        // Drive `windows` full observation rounds and return the first (if any) at which a coherence verdict
+        // escaped. Two traffic shapes, because the homeostat's notifications are deduped per band: the
+        // recovery assertion has to be able to fire, and a repeat of the pre-boundary verdict is silent by
+        // design. `hotspot = false` is the lockstep flood (over-coupled → `Decoupled`); `true` is the k = 4
+        // correlated block inside an otherwise independent cell (under-coupled → `Rebalance`), the same
+        // construction `a_cell_wide_hotspot_drives_the_projective_load_balance` derives.
+        fn run(node: &mut OverlayNode<F2>, t: &mut u64, windows: usize, hotspot: bool) -> Option<usize> {
+            let mut first = None;
+            for w in 0..windows {
+                let bursts = (w % 3) + 1; // identical across peers → correlated at every window length
+                let hot = (w % 5) + 1; // the hot block's shared load this round — this node is its fourth member
+                for i in 1..7usize {
+                    let from = Point::<F2>::at(i).coords();
+                    let count = match (hotspot, i <= 3) {
+                        (false, _) => bursts,
+                        (true, true) => hot,
+                        (true, false) => 1 + (w * (2 * i + 1)) % 7,
+                    };
+                    for _ in 0..count {
+                        node.step(Instant(*t), Input::Message { from, frame: encode(FrameType::Route, b"x") });
+                        *t += 1;
+                    }
+                }
+                if hotspot {
+                    // This node itself is the fourth member of the hot block.
+                    for _ in 0..hot {
+                        node.step(
+                            Instant(*t),
+                            Input::Command(Command::Send {
+                                to: Point::<F2>::at(1).coords(),
+                                payload: b"x".to_vec(),
+                            }),
+                        );
+                        *t += 1;
+                    }
+                }
+                let hb = node.step(Instant(*t), Input::Timer(HEARTBEAT));
+                *t += 1;
+                let spoke = hb.iter().any(|e| {
+                    matches!(
+                        e,
+                        Effect::Notify(
+                            Notification::Decoupled | Notification::Bound | Notification::Rebalance { .. }
+                        )
+                    )
+                });
+                if spoke && first.is_none() {
+                    first = Some(w);
+                }
+            }
+            first
+        }
+
+        let window = Config::default().behavior_window();
+        for own_tick in [true, false] {
+            let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+            node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+            let mut t = 1u64;
+
+            // The mechanism must be live, or every assertion below passes by silence.
+            assert!(
+                run(&mut node, &mut t, window + 4, false).is_some(),
+                "no coherence verdict at all before the boundary — this test would then prove nothing",
+            );
+
+            // The epoch turns. Either this node ticks it, or it adopts a peer's gossip; the engine must not
+                // care which.
+            if own_tick {
+                node.step(Instant(t), Input::Command(Command::AdvanceEpoch));
+            } else {
+                let next = node.epoch().next();
+                node.step(
+                    Instant(t),
+                    Input::Message {
+                        from: Point::<F2>::at(1).coords(),
+                        frame: encode(FrameType::EpochAgree, &next.low32_be_bytes()),
+                    },
+                );
+                assert_eq!(node.epoch(), next, "the gossip path must actually have advanced the epoch");
+            }
+            t += 1;
+
+            // THE PROPERTY: for a whole window afterwards the node has no self-model and says nothing about
+            // coherence — not one verdict drawn from a window that straddles the turn. Driven with the
+            // *hotspot* shape, so the post-boundary rows genuinely disagree with the pre-boundary ones: a
+            // spliced window has something new to say here, and must still say nothing.
+            let escaped = run(&mut node, &mut t, window - 1, true);
+            assert!(
+                escaped.is_none(),
+                "a coherence verdict escaped {} rounds after the epoch turn (own_tick = {own_tick}), from a \
+                 window still holding samples addressed by the PREVIOUS seating",
+                escaped.unwrap_or(0) + 1,
+            );
+
+            // And it recovers: once a full window of one consistent seating exists, the loop speaks again.
+            assert!(
+                run(&mut node, &mut t, window + 4, true).is_some(),
+                "the reflex never recovered (own_tick = {own_tick}) — dropping the window must cost one \
+                 window, not the self-model",
+            );
+        }
+    }
+
     #[test]
     fn behavioural_over_coupling_drives_the_homeostat_to_decouple() {
         // The live homeostat runs on the MEASURED Γ_net (relay activity), not the liveness proxy. Feed a

@@ -4637,3 +4637,52 @@ orders {2, 4, 7, 31} only 2 and 4 admit one; the cell need not be a subplane, be
 cell POSITION; and the roster must be **epoch-stable**, so `[Triple; 7]` is the wrong key while coordinates
 re-draw every epoch. The platform's own primitive for that is `address_point` — identity-hash-derived and
 epoch-independent, already used to keep a descended node's sub-cell placement across a reshuffle.
+
+## §11. The coherence window spans the boundary that permutes the seats it is indexed by (#153)
+
+**HIGH, measured.** `Healer::sample_behavior` builds a seven-slot vector in which
+`sample[i] = activity[cell_coord(i)]` — indexed by **cell position**. `BehaviorMonitor` keeps `W = 178` of
+them. An epoch boundary re-draws every node's VRF coordinate, so a position keeps its *name* and changes its
+*occupant* (`P(a seat keeps its node) = 1/7` on the base cell), and **nothing reset the window**:
+`on_advance_epoch`, `on_epoch_agree` and `on_reseat` all left it alone. For `W − 1` samples after every turn
+the per-slot series was a splice of two different node→seat assignments.
+
+| cell | settled `r` | worst splice `r` | Δ | band crossings |
+|---|---|---|---|---|
+| identical load (exchangeable) | +0.833 | +0.835 | +0.002 | none |
+| 5× load spread | +0.835 | +0.170 | **−0.666** | 173 of 179 |
+| 20× load spread | +0.835 | +0.069 | **−0.766** | 177 of 179 |
+
+The collective-subject band is `(0.4082, 0.5774]` — **0.169 wide**. The displacement is three to four and a
+half band-widths, downward, into `Bind`/`Rebalance`, for ~89 s of every 600 s epoch. `BAND_DWELL = 3` is
+1.5 s of hysteresis and cannot help against 89 s of sustained wrong readings.
+
+**Why no test ever saw it.** On an *exchangeable* cell — every member carrying the same mean load — a column
+permutation is provably harmless: same marginals, same pairwise `r`. Every coherence test in the suite drives
+a uniform cell. The effect is entirely in the per-column level jump `10·μ_j → 10·μ_σ(j)`, so it needs the
+loads to **differ** — which is the condition §6.7's projective load-balance prescription exists to answer, so
+the cells the reflex matters most on are exactly the cells it was wrong on. The unit test is deterministic,
+not Monte Carlo: a rank-one cell reads `1.0` exactly and `≈ −0.13` spliced.
+
+**The fix.** `Healer::on_seating_changed`, called from one new `on_epoch_changed` that both epoch paths share
+— because a fix on one of them would make whether a cell's self-model is spliced depend on which node
+happened to drive the advance, the identical hazard the store sweep already had to be duplicated for. The
+rule is **drop what a seat addresses, keep what a scalar does**: out go the coherence window, the endpoint
+fresh-mask window, the activity accumulator, the retained load vector, the last measured correlation, both
+dwell streaks, the reroute table and the repaired set; `decoupling` stays, because a shed is an actuation
+rather than a claim about a position and dropping it would re-couple a cell at the exact moment it has no
+reading to justify re-applying it.
+
+**`quarantined` is kept, and deliberately.** Audit R-M1 already gave the driver ownership of distrust by
+*identity* (`Distrust::by_identity`, keyed off the authenticated coordinate proof), re-issuing
+`Command::Quarantine`/`Command::Readmit` as occupants move. Clearing the tag at the boundary would silently
+undo that and hand a Byzantine member a clean slate every epoch.
+
+**A second reading from the same derivation.** `resolving_window` is derived against `heartbeats_per_epoch`,
+and below **≈19 s of epoch the window it returns is longer than the epoch it must fit inside**: `W/hpe` is
+`1.50` at a 5 s epoch, `1.30` at 10 s, `0.82` at 30 s, `0.15` at the shipped 600 s. There the instrument
+cannot produce even one uncontaminated reading. The fix enforces this by construction rather than by a new
+gate: a window cleared each boundary never refills, so `ready()` stays false and the band-keeping loop is
+silent — which is the honest behaviour for a deployment whose epoch is too short to resolve its own band.
+`control_confidence`'s own doc already names the epoch as *"when coordinates, rosters, directories and roles
+all change anyway"*; this is that sentence applied to the instrument the same derivation sizes.

@@ -223,6 +223,56 @@ impl Healer {
         }
     }
 
+    /// **The seating changed — drop everything addressed by it** (#153).
+    ///
+    /// An epoch boundary re-draws every node's VRF coordinate, so a cell position keeps its *name* and
+    /// changes its *occupant* (`P(a seat keeps its node) = 1/q²+q+1`; `1/7` on the base cell). Every piece of
+    /// state here that is addressed by a coordinate or a cell index therefore stops describing what its
+    /// address says it describes, at one instant, for all of it at once.
+    ///
+    /// The sharp one is the behavioural window, and it was measured rather than argued
+    /// (`scratchpad/reshuffle_phi.py`, 400 runs): `sample[i] = activity[cell_coord(i)]`, so `W = 178`
+    /// samples after a turn the per-slot series is a splice of two assignments. On an *exchangeable* cell —
+    /// identical mean load — a column permutation is provably harmless and the reading moves by `+0.002`,
+    /// which is why no test ever saw this. On a cell with a 5× load spread the mean off-diagonal `r` falls
+    /// from `+0.835` to `+0.170`, and at 20× to `+0.069`: a displacement of three to four and a half
+    /// **band-widths** (the collective-subject band is `0.169` wide), downward, into `Bind`/`Rebalance`, for
+    /// 173 of the 179 samples of the splice. `BAND_DWELL = 3` is 1.5 s and cannot help against 89 s.
+    ///
+    /// What is dropped is exactly **what a seat addresses**; what is kept is what a scalar does:
+    ///
+    /// * dropped — the coherence window, the endpoint fresh-mask window, the partial activity accumulator,
+    ///   the retained load vector, the last measured correlation, both dwell streaks, the reroute table and
+    ///   the repaired set. Every one is keyed by a coordinate or a cell index.
+    /// * kept — `decoupling` and its dedup flags. A shed is a scalar actuation, not a claim about any
+    ///   position, and dropping it would re-couple a cell that still needs shedding at the exact moment the
+    ///   node has no reading to justify re-applying it. An actuation persists until a *new* measurement
+    ///   overrides it.
+    /// * kept — `last_epoch` / `epoch_cost` / `window_seconds`, which measure the boundary itself and so
+    ///   must survive it. The advance's cost is now read from a full post-boundary window instead of from a
+    ///   spliced one, so it stops charging the advance for the splice artefact.
+    /// * kept, and this is the one to be careful about — **`quarantined`**. Audit R-M1 gave the driver
+    ///   ownership of distrust: it holds the verdict by *identity* (`Distrust::by_identity`, keyed off the
+    ///   authenticated coordinate proof) and re-issues [`Command::Quarantine`]/[`Command::Readmit`] as
+    ///   occupants move. Clearing the tag here would silently undo that re-application and hand a Byzantine
+    ///   member a clean slate every epoch.
+    ///
+    /// [`Command::Quarantine`]: fanos_ports::Command::Quarantine
+    /// [`Command::Readmit`]: fanos_ports::Command::Readmit
+    pub(crate) fn on_seating_changed(&mut self) {
+        self.monitor.clear();
+        self.endpoint_window.clear();
+        self.activity.clear();
+        self.self_activity = 0;
+        self.last_sample = [0.0; 7];
+        self.measured_correlation = None;
+        self.band_streak = 0;
+        self.last_band = None;
+        self.partition_streak = 0;
+        self.reroute.clear();
+        self.repaired.clear();
+    }
+
     /// Count a data-relay (`Route`) frame from `from` toward its behavioural activity — the load signal
     /// folded into the coherence self-model on the next heartbeat sample. Control chatter is excluded.
     pub(crate) fn record_relay(&mut self, from: Triple) {

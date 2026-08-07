@@ -157,12 +157,31 @@ impl<F: Field> OverlayNode<F> {
     /// it. This carries only the epoch ordinal ([`FrameType::EpochAgree`]), never randomness — under a
     /// live threshold-DVRF beacon the composite drives this from an authoritative `Beacon` round instead
     /// and suppresses the flood (audit #102).
-    pub(super) fn on_advance_epoch(&mut self) -> Vec<Effect> {
-        self.epoch = self.epoch.next();
+    /// Everything that must happen because **the epoch is now a different one**, in the one place both paths
+    /// to that fact call — this node's own tick and a peer's gossip.
+    ///
+    /// It was duplicated, and the duplicate was already load-bearing: the sweep had to be repeated in the
+    /// gossip path or whether a store filled depended on which node happened to drive the advance. #153 adds
+    /// a second thing that must happen at exactly the same instant, and two of them is where a third gets
+    /// added to one path only.
+    fn on_epoch_changed(&mut self) {
         // Reclaim the directory slots the advance just killed. Here rather than on a timer, because the
         // epoch IS the lifetime: a slot keyed `(coordinate, epoch)` is dead exactly when the epoch it names
         // has passed, and this is the one place that fact becomes true.
         self.store.sweep_expired(self.epoch);
+        // The epoch re-draws every node's VRF coordinate, so every cell position keeps its name and changes
+        // its occupant. State addressed by a position stops describing what its address says — see
+        // [`Healer::on_seating_changed`] for the measurement and for the two things deliberately kept.
+        self.healer.on_seating_changed();
+        // Coordinate-named, and in the facade rather than the reflex: the dedup for "which node is currently
+        // grey". Left set, the next genuinely-grey node at that point is *not* reported, because the engine
+        // believes it already said so about the node that used to be there.
+        self.grey_reported = None;
+    }
+
+    pub(super) fn on_advance_epoch(&mut self) -> Vec<Effect> {
+        self.epoch = self.epoch.next();
+        self.on_epoch_changed();
         let mut effects = self.flood(&encode(FrameType::EpochAgree, &self.epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(self.epoch)));
         effects
@@ -180,9 +199,9 @@ impl<F: Field> OverlayNode<F> {
         }
         self.epoch = epoch;
         // The gossip path advances the clock too, and a node that learns the epoch from a peer rather than
-        // from its own tick must reclaim exactly as much — otherwise whether a store fills depends on which
-        // node happened to drive the advance.
-        self.store.sweep_expired(self.epoch);
+        // from its own tick must do exactly as much — otherwise whether a store fills, or whether a cell's
+        // self-model is spliced across a reshuffle, depends on which node happened to drive the advance.
+        self.on_epoch_changed();
         let mut effects = self.flood(&encode(FrameType::EpochAgree, &epoch.low32_be_bytes()));
         effects.push(Effect::Notify(Notification::EpochAdvanced(epoch)));
         effects
