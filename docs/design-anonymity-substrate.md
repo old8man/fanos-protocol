@@ -211,6 +211,16 @@ iff `δ=negl`), with the achieved rung *named* in the Kuhn et al. notions (*PoPE
 - **T2 (blinded-rendezvous anonymity).** With one rendezvous input VRF-beacon-blinded, the meet is unpredictable
   and unlinkable to any bounded observer outside the receiver's line; the anonymity set is exactly `points_on(L)`
   (the `q+1` members), proven non-linkable across epochs. (`c` = broken committees, as in T1.)
+
+  **Scope, at the point of the claim rather than 300 lines below it.** "Proven non-linkable across epochs" is
+  about the **receiver's dead-drop line** and nothing else. It does **not** extend to a hidden service's own
+  registration, which carries the identity bundle in the clear beside the rotating tag so the combiner can
+  recompute the binding rather than believe it — making every meeting combiner a linkable, timestamped record
+  of which services exist and when. That is measured over eight epochs by
+  `the_epoch_rotating_tag_is_defeated_by_the_preimage_travelling_beside_it`, is analysed under §6, and needs
+  per-epoch key blinding to close (a field-wide PQ gap, #67). The correction was already written down; it was
+  written *there*, where a reader who stopped at this line would never reach it — which is the same defect as
+  a stale status line, one section over.
 - **T3 (intersection resistance from rotation).** Prove per-epoch coordinate rotation *lowers* the long-term
   `α_RA`-advantage — the non-trivial direction — because the threshold hop's `P_break` (T4) attenuates each
   rotation's predecessor gain below the intersection-attack's sampling gain (§3a). The receiver-side

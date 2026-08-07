@@ -4566,3 +4566,39 @@ moment the membership gate landed, and the reason the two are asserted separatel
 
 Still open, and deliberately: a **rotated** binding admits any index by construction — the documented residual
 that verified resharing closes.
+
+## §9. Three mechanical sweeps that found nothing, and one claim whose correction was in the wrong place
+
+Recorded because a **clean negative is a result**: it says where not to look again, and this session's yield
+came from knowing which axes were already exhausted.
+
+**Counters incremented with no reader — clean.** 5 candidates, all false positives (`fetch_add`'s return value
+bound and used, sim helpers). §5's three were the tail of that class, not the head of it.
+
+**Collections inserted-into with no removal path — clean.** 37 candidates, no defect. Every one is a ledger's
+state (bounded by consensus rules and fees, not eviction), keyed by a `Triple` and therefore bounded by the
+plane's point count, gated behind a local registration (`hierarchy::attested` needs `committees.get(&cell)?`),
+or **aged at read time** — `healer::attested` and `overlay::loss_reports` both linger in their maps but are
+ignored past `liveness_timeout`, which is retention without eviction and is correct here.
+
+**Remote-sized allocations — clean.** Every `seq(bound, ..)` in the wire codecs takes a compile-time constant.
+The two `vec![0u8; len]` sites where `len` comes off a stream both refuse before allocating, with the reason at
+the check: `angelos_driver` against `MAX_FRAME`, `exit::read_target` against `MAX_TARGET_LEN`.
+
+The one axis that *did* pay was **`Option`s whose `None` grants** (§8) — and the distinguishing feature is
+worth stating: in nine of ten sites the `Option` is a *previous value*, where absence means "first time" and
+granting is right. The tenth was a *verification predicate*, where absence means the opposite. **Ask which of
+the two an `is_none_or` is guarding, then ask how many different reasons it can be `None` for.**
+
+### The claim whose correction was 300 lines away
+
+`design-anonymity-substrate.md` §T2 states the anonymity set is `points_on(L)`, "**proven non-linkable across
+epochs**". Three hundred lines below, §6 corrects it: that phrase is about the *receiver's dead-drop line* and
+does **not** extend to a hidden service's registration, which carries its identity bundle in the clear beside
+the rotating tag so a combiner can recompute the binding — making every meeting combiner a linkable,
+timestamped record of which services exist and when, measured over eight epochs.
+
+The correction existed and was accurate. It was simply *somewhere else*, and a reader who stopped at the
+theorem list would take the unqualified claim. **A correction that is not at the claim is a stale status line
+with extra steps** — the same defect §4's `S1-M2` and `§6` markers had, one document over. Now annotated in
+place, naming the measurement and the field-wide gap (#67) that would close it.
