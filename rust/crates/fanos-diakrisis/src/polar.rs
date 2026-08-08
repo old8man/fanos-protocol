@@ -356,6 +356,46 @@ pub fn grey_endpoint(rates: &[[f64; N]; N], tol: f64) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// **A matrix assembled entirely from the fallback cannot fire, on any input** (#230).
+    ///
+    /// `mediator_attestation` is internally consistent for ANY liveness pattern by construction, so a class
+    /// filled by it can never violate. Enumerated over all 256 `degraded` masks: zero violations. That is
+    /// what made "no Byzantine member" a claim with no evidence behind it whenever peers went quiet — and
+    /// it is why `Healer::attested_or_none` now withholds the matrix instead of handing over one that
+    /// cannot disagree.
+    ///
+    /// The second half is the non-vacuity control: the same matrix with one forged pair DOES fire, so the
+    /// zero above is a property of the fallback and not of the checker.
+    #[test]
+    fn a_matrix_built_only_from_the_fallback_can_never_violate() {
+        let build = |degraded: u8| {
+            let mut m = [[0.0f64; N]; N];
+            for k in 0..N {
+                for ((a, b), r) in polar_class(k).into_iter().zip(mediator_attestation(k, degraded)) {
+                    m[a][b] = r;
+                    m[b][a] = r;
+                }
+            }
+            m
+        };
+        for d in 0u16..=255 {
+            let m = build(d as u8);
+            assert!(
+                violated_classes(&m, 1e-9).is_empty(),
+                "degraded={d:08b}: the fallback is self-consistent by construction and must not violate"
+            );
+        }
+        let mut forged = build(0b0000_0011);
+        forged[0][1] = 0.9;
+        forged[1][0] = 0.9;
+        assert_eq!(
+            violated_classes(&forged, 1e-9).len(),
+            1,
+            "one forged pair must still be caught — otherwise the loop above proves nothing about the \
+             fallback and only that the checker is asleep"
+        );
+    }
+
     #[test]
     fn violated_classes_flags_non_finite_rates() {
         // A uniform rate matrix satisfies every polar identity — no violations.

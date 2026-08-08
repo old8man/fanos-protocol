@@ -413,12 +413,22 @@ impl Healer {
         now: Instant,
         degraded: u8,
         timeout: Duration,
-    ) -> [[f64; 7]; 7] {
+    ) -> ([[f64; 7]; 7], u8) {
         let mut matrix = [[0.0f64; 7]; 7];
+        // **Which classes carry a real attestation** (#230). A class filled by the fallback is
+        // `polar::mediator_attestation`, which is internally consistent for ANY liveness pattern by
+        // construction — so it cannot violate, and a matrix assembled entirely from it cannot fire the
+        // localizer at all. Measured over every one of the 256 `degraded` masks: **0 violations**, against
+        // 1 for the same matrix with a single forged pair. The verdict "no Byzantine member" was therefore
+        // carrying no information about how much evidence stood behind it.
+        let mut attested_mask = 0u8;
         for k in 0..7usize {
             let coord = self.cell_coord::<F>(k);
             let triple = match self.attested.get(&coord) {
-                Some((rates, seen)) if now.since(*seen) <= timeout => *rates,
+                Some((rates, seen)) if now.since(*seen) <= timeout => {
+                    attested_mask |= 1u8 << k;
+                    *rates
+                }
                 _ => polar::mediator_attestation(k, degraded),
             };
             for ((a, b), rate) in polar::polar_class(k).into_iter().zip(triple) {
@@ -432,7 +442,7 @@ impl Healer {
                 }
             }
         }
-        matrix
+        (matrix, attested_mask)
     }
 
     /// Fold this window's cell health into a `CoherenceFrame`, record it in local history, and return the
@@ -733,6 +743,41 @@ impl Healer {
         phi_at(self.effective_correlation(healthy_correlation), p)
     }
 
+    /// The polar cross-attestation matrix, plus a count of the live members that did **not** attest.
+    ///
+    /// **The matrix is always handed over, and the first version of this withheld it — which the
+    /// equivocation scenario refuted immediately** (#230). Withholding on incomplete coverage took
+    /// `0 of 6` honest observers where `6 of 6` had localized the equivocator: one quiet honest member
+    /// disabled detection of a Byzantine one that HAD attested. The reason is that a class filled by the
+    /// fallback is *inert*, not misleading — it cannot violate, so it cannot create a false positive, and
+    /// dropping the whole matrix throws away the real evidence sitting beside it.
+    ///
+    /// So coverage qualifies the NEGATIVE, never the positive. A violation found is valid whatever else the
+    /// matrix contains; "no violation found" is a claim only when every live member reported. Measured over
+    /// all 256 `degraded` masks, a matrix built entirely from the fallback fires zero times
+    /// (`polar::a_matrix_built_only_from_the_fallback_can_never_violate`), so an all-fallback "clean"
+    /// verdict carried no evidence at all — and until the verdict can say so, the shortfall is at least
+    /// counted here.
+    ///
+    /// A member attests every heartbeat unconditionally (`liveness::heartbeat`), so silence from a LIVE one
+    /// is a refusal to be checked rather than missing data. One record per silent member, because "how many
+    /// refused" is actionable and "how many windows were skipped" is not.
+    fn attested_with_coverage<F: Field>(
+        &self,
+        now: Instant,
+        degraded: u8,
+        timeout: Duration,
+        stations: &mut crate::ports::stations::Stations,
+    ) -> [[f64; 7]; 7] {
+        let (rates, attested_mask) = self.attested_pairwise_rates::<F>(now, degraded, timeout);
+        let unattested = !degraded & 0x7F & !attested_mask;
+        for _ in 0..unattested.count_ones() {
+            stations.record(crate::ports::stations::Station::StructuralCheckUnattested, None);
+        }
+        rates
+    }
+
+
     /// Diagnose the sensed cell snapshot (`self_index, degraded, alive_count`, produced by the facade's
     /// liveness sensing) and actuate any healing — the DIAKRISIS reflex proper. Feeds the *measured*
     /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
@@ -749,6 +794,7 @@ impl Healer {
         responsive: Option<u8>,
         config: &Config,
         epoch: Epoch,
+        stations: &mut crate::ports::stations::Stations,
     ) -> Vec<Effect> {
         // The base node senses liveness, and — the #74 unification — the *measured* behavioural coherence
         // `Γ_net` (the relay-activity self-model). Feeding `Γ_net` into `diagnose` makes its Systemic
@@ -785,7 +831,7 @@ impl Healer {
         // internally inconsistent and is caught and localized here; an honest cell's is always consistent,
         // so this never pre-empts the ordinary crash/churn path below, however many members are down.
         let pairwise_rates =
-            self.attested_pairwise_rates::<F>(now, degraded, config.liveness_timeout);
+            Some(self.attested_with_coverage::<F>(now, degraded, config.liveness_timeout, stations));
         // §6.5 partition sensor (V14): `healthy_lines` names which cell lines carry live inter-node
         // connectivity, derived from the *measured* per-channel loss (the #106 grey substrate) — an
         // INDEPENDENT signal, not the node-liveness `degraded` mask (that would be redundant with the crash
@@ -820,7 +866,7 @@ impl Healer {
         };
         let verdict = diagnose(&Observation {
             degraded,
-            pairwise_rates: Some(pairwise_rates),
+            pairwise_rates,
             coherence: measured.clone(),
             healthy_lines: trusted_lines,
             responsive,

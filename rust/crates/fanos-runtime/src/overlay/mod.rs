@@ -1393,6 +1393,7 @@ impl<F: Field> OverlayNode<F> {
             Some(responsive),
             &self.config,
             self.epoch,
+            &mut self.stations,
         ));
         // The load this node is carrying, reported every observation — it needs no coherence matrix, only the
         // counts the node already keeps, and the role controller's setpoint is its one real input.

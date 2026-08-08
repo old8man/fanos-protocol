@@ -109,6 +109,20 @@ pub enum Station {
     /// the onion's layer was sealed to an epoch key this relay has already ratcheted past — the responder's
     /// side of the same failure is [`Station::SharePartialFailed`], and the gatherer's had no counter at all.
     GatherSelfShareMissing,
+    /// A live cell member did not attest within `liveness_timeout`, so the structural (Byzantine) check
+    /// was **not run** this window (#230).
+    ///
+    /// Not an error rate and not a fault: it is the localizer declining to conclude. A class filled by
+    /// `polar::mediator_attestation` — the fallback used when no fresh report arrived — is internally
+    /// consistent for ANY liveness pattern, so it can never violate. Measured over all 256 `degraded`
+    /// masks, a matrix assembled entirely from the fallback fired **zero** times, against one for the same
+    /// matrix with a single forged pair. "No Byzantine member" was therefore being reported with the same
+    /// confidence whether seven members had attested or none had.
+    ///
+    /// A member attests every heartbeat unconditionally, so silence from a LIVE one is a refusal to be
+    /// checked rather than absent data — which is why this counts members, not windows.
+    StructuralCheckUnattested,
+
     /// A frame discarded because its sender is **locally quarantined** (spec §6.2/§6.4).
     ///
     /// The one discard that is unambiguously *this node's own decision*, and it was the quietest. Every other
@@ -448,6 +462,7 @@ impl Station {
     pub const ALL: &'static [Self] = &[
         Self::GatherExpired,
         Self::GatherCompleted,
+        Self::StructuralCheckUnattested,
         Self::QuarantineDropped,
         Self::HostForwardUnsealable,
         Self::RequestForUnknownHost,
@@ -497,6 +512,7 @@ impl Station {
         match self {
             Self::GatherExpired => "gather.expired",
             Self::GatherCompleted => "gather.completed",
+            Self::StructuralCheckUnattested => "structural.unattested",
             Self::QuarantineDropped => "quarantine.dropped",
             Self::HostForwardUnsealable => "host.forward_unsealable",
             Self::RequestForUnknownHost => "request.unknown_host",
