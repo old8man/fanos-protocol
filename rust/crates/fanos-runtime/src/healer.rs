@@ -448,6 +448,32 @@ impl Healer {
         degraded: u8,
         healthy_correlation: f64,
     ) -> Effect {
+        // **Report the matrix when there is one** (#226). The path below synthesises an equicorrelated
+        // matrix from a single scalar, and an equicorrelated matrix has `dispersion ≡ 0` and a flat
+        // diagonal BY CONSTRUCTION — so every second-dimension quantity in every production frame was
+        // structurally zero, however uneven the real cell was. Measured on a 4-of-7 clique: the real fold
+        // reads `0.13061224`, the synthesised one `1.31e-8`. Ten million to one.
+        //
+        // The frame's own `dispersion()` doc says a zero reading and a high one "want opposite operator
+        // responses"; only one of the two was reachable, so the operator's second dimension was not merely
+        // unread — it was unrepresentable.
+        //
+        // A measured frame reports the window it observed, with every scalar from one moment. It does NOT
+        // fold in the post-shed `effective_correlation`: that is a *counterfactual* about the window to
+        // come, it lives in [`counterfactual_phi`](Self::counterfactual_phi) where the healing budget reads
+        // it, and mixing the two would put two moments in one frame. A `Decouple` therefore shows in the
+        // frame one window later — which is correct, because one window is the instrument's resolution.
+        if let Some(matrix) = self.monitor.ready().then(|| self.monitor.coherence()).flatten() {
+            let frame = self.observer.observe_measured(
+                now.as_nanos(),
+                epoch.get(),
+                &matrix,
+                degraded,
+                polar_gap_from_liveness(degraded),
+                -1,
+            );
+            return Effect::Notify(Notification::Observed(frame.encode().to_vec()));
+        }
         let correlation = self.effective_correlation(healthy_correlation);
         // **Say which of the two it is** (#154). `effective_correlation` falls back to the configured
         // `healthy_correlation` until a full window exists, and at the shipped `0.45` that fallback produces

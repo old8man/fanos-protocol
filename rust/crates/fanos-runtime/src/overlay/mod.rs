@@ -692,12 +692,9 @@ impl<F: Field> OverlayNode<F> {
         } else {
             None
         };
-        // The observation window is the heartbeat interval; local history stays compact and bounded.
-        let observer = SelfObserver::new(
-            cell_id::<F>(),
-            config.heartbeat.as_nanos(),
-            HistoryConfig::compact(),
-        );
+        // Local history stays compact and bounded. The observer takes no window length: every fold is
+        // stamped with the cell's AGREED epoch by its caller, never with local elapsed time (audit A3).
+        let observer = SelfObserver::new(cell_id::<F>(), HistoryConfig::compact());
         Self {
             coord,
             router: Router::new(coord),

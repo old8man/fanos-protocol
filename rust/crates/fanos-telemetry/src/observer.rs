@@ -11,10 +11,9 @@
 //! Two calls per window:
 //! * [`observe_local`](SelfObserver::observe_local) — record this node's own vitals; returns the
 //!   scalar `pressure` signal the node gossips to its cell.
-//! * [`observe_cell`](SelfObserver::observe_cell) — fold the cell's collected signals (this node's
+//! * [`observe_measured`](SelfObserver::observe_measured) — fold a measured matrix (this node's
 //!   plus its peers', from gossip) into a frame, record its scalars, and return it to publish.
 
-use alloc::vec::Vec;
 
 use fanos_diakrisis::coherence::CoherenceMatrix;
 
@@ -26,18 +25,22 @@ use crate::sysmetrics::SystemSample;
 #[derive(Clone, Debug)]
 pub struct SelfObserver {
     cell_id: CellId,
-    window_nanos: u64,
     history: MetricStore,
     heal_seq: u32,
 }
 
 impl SelfObserver {
-    /// A new observer for the cell `cell_id`, keeping `window_nanos`-spaced history under `config`.
+    /// A new observer for the cell `cell_id`, keeping bounded local history under `config`.
     #[must_use]
-    pub fn new(cell_id: CellId, window_nanos: u64, config: HistoryConfig) -> Self {
+    /// **No window length.** The observer used to carry one, for the sole purpose of computing
+    /// `epoch = now_nanos / window_nanos` inside `observe_cell` — which is the derivation audit A3 removed
+    /// from `observe_liveness`, because under a real transport that quotient is each node's *local*
+    /// elapsed time and two nodes stamp one window with different epochs. Deleting the dead path left the
+    /// field unread, which is the tell: it existed only to serve the wrong epoch. Every fold now takes the
+    /// cell's **agreed** epoch from its caller.
+    pub fn new(cell_id: CellId, config: HistoryConfig) -> Self {
         Self {
             cell_id,
-            window_nanos: window_nanos.max(1),
             history: MetricStore::new(config),
             heal_seq: 0,
         }
@@ -50,33 +53,42 @@ impl SelfObserver {
         sample.pressure()
     }
 
-    /// Fold the cell's collected per-node `signals` (each a short recent window of a node's pressure)
-    /// into a [`CoherenceFrame`], record its scalars into history, and return it to publish. The
-    /// `degraded` bitmask (faulted points) becomes the syndrome; `gap` is the spectral gap `Δ`;
-    /// `forecast` is the cascade lead (`-1` = none). `None` if a coherence matrix cannot be formed
-    /// (too few signals) — the caller still gossips liveness, but there is no cell frame this window.
-    pub fn observe_cell(
+    /// Fold a **measured** coherence matrix into a [`CoherenceFrame`], record it, and return it to publish.
+    ///
+    /// This is the path a node with a full observation window takes, and it exists because the one beside it
+    /// cannot carry what a real matrix knows. [`observe_liveness`](Self::observe_liveness) *synthesises* an
+    /// equicorrelated matrix from a single scalar, and an equicorrelated matrix has
+    /// `dispersion ≡ 0` and a flat diagonal **by construction** — so every second-dimension quantity in the
+    /// frame was structurally zero on every production node, however concentrated the real cell was (#226).
+    /// The frame's own `dispersion()` doc says a zero reading and a high one "want opposite operator
+    /// responses"; only one of the two was reachable.
+    ///
+    /// `epoch` is the cell's **agreed** epoch, passed in for the same reason `observe_liveness` takes it and
+    /// not `now_nanos / window_nanos`: under a real transport that quotient is each node's *local* elapsed
+    /// time, so two nodes stamp one window with different epochs and any `(cell_id, epoch)` roll-up
+    /// mis-buckets (audit A3). The `observe_cell` this replaced computed exactly that quotient — the defect
+    /// A3 removed from the live sibling, still sitting in the one nothing called.
+    pub fn observe_measured(
         &mut self,
         now_nanos: u64,
-        signals: &[Vec<f64>],
+        epoch: u64,
+        matrix: &CoherenceMatrix,
         degraded: u8,
         gap: f64,
         forecast: i16,
-    ) -> Option<CoherenceFrame> {
-        let matrix = CoherenceMatrix::from_signals(signals)?;
-        let epoch = now_nanos / self.window_nanos;
+    ) -> CoherenceFrame {
         let frame = CoherenceFrame::observe(
             self.cell_id,
             epoch,
-            &matrix,
+            matrix,
             degraded,
             gap,
             forecast,
             self.heal_seq,
-            true, // built from real per-node signals — this is the measured case by construction
+            true, // a real matrix — measured by construction, which is what the bit is for (#154)
         );
         self.history.record_frame(now_nanos, &frame);
-        Some(frame)
+        frame
     }
 
     /// Fold a frame from a liveness-only view, when full per-node signal vectors are not (yet)
@@ -150,14 +162,14 @@ impl SelfObserver {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::history::MetricId;
 
     #[test]
     fn observe_local_records_and_returns_pressure() {
-        let mut obs = SelfObserver::new(CellId([1; 16]), 1_000_000_000, HistoryConfig::compact());
+        let mut obs = SelfObserver::new(CellId([1; 16]), HistoryConfig::compact());
         let sample = SystemSample {
             cpu_busy: 0.6,
             mem_used: 0.4,
@@ -178,41 +190,55 @@ mod tests {
     }
 
     #[test]
-    fn observe_cell_folds_signals_into_a_recorded_frame() {
-        let mut obs = SelfObserver::new(CellId([2; 16]), 1_000_000_000, HistoryConfig::compact());
-        // Seven nodes, each a short window of correlated-but-distinct pressure signals.
-        let signals: Vec<Vec<f64>> = (0..7)
-            .map(|k| {
-                (0..8)
-                    .map(|t| 0.3 + 0.1 * f64::from(t) + 0.01 * f64::from(k))
-                    .collect()
-            })
-            .collect();
-        let frame = obs
-            .observe_cell(2_000_000_000, &signals, 0, 0.5, -1)
-            .expect("a matrix forms from 7 signals");
-        assert_eq!(frame.epoch, 2, "epoch = now / window");
-        assert_eq!(frame.cell_id, CellId([2; 16]));
-        // The frame's coherence scalars were recorded into history.
-        assert!(obs.history().series(MetricId::PHI).is_some());
+    fn a_measured_matrix_reaches_the_frame_with_its_second_dimension_intact() {
+        // The property #226 exists for: a frame folded from a REAL matrix carries what that matrix knows,
+        // and in particular a non-zero dispersion — which the synthesised-equicorrelated path can never
+        // produce, because an equicorrelated matrix has `dispersion ≡ 0` by construction.
+        let mut obs = SelfObserver::new(CellId([7; 16]), HistoryConfig::compact());
+        // A 4-of-7 clique with the other three uncoupled — the shape that actually reaches the
+        // under-coupled band on a matrix a cell can HAVE. (A star cannot: positive semi-definiteness puts
+        // `λ_min = 1 − c√6 ≥ 0`, so a star's hub correlation is capped at `1/√6`, and the strongest
+        // admissible star reaches only `Φ = 0.4077`. `from_correlation` refuses the rest, which is how this
+        // test found the constraint.) Here `Φ = 1.0971` with `dispersion = 0.1306` and a mean of `0.2286`,
+        // below the floor: gate open, and open on INEQUALITY rather than on consistency.
+        let n = 7;
+        let mut c = vec![0.0; n * n];
+        for i in 0..n {
+            c[i * n + i] = 1.0;
+            for j in 0..n {
+                if i != j && i < 4 && j < 4 {
+                    c[i * n + j] = 0.8;
+                }
+            }
+        }
+        let uneven = CoherenceMatrix::from_correlation(c, n).expect("a block matrix is PSD");
+        let frame = obs.observe_measured(2_000_000_000, 3, &uneven, 0b0000_0010, 0.4, -1);
         assert!(
-            obs.history()
-                .series(MetricId::MEAN_R)
-                .unwrap()
-                .latest()
-                .is_some()
+            frame.dispersion() > 0.13,
+            "the cell's dispersion must survive the fold, got {}",
+            frame.dispersion()
+        );
+
+        // And the contrast that makes the number mean something: the synthesised path, same cell size,
+        // cannot report any dispersion at all.
+        let flat = obs.observe_liveness(2_000_000_000, 3, 7, 0.45, true, 0, 0.4, -1);
+        // Measured, both: the real cell folds to **0.13061224** — the analytic `0.1306` to the frame's
+        // precision — and the synthesised one to **1.31e-8**, which is zero up to `f32` rounding of the
+        // three scalars `dispersion()` reconstructs from. Ten million to one. The bound below is taken from
+        // those two numbers rather than guessed, and it sits four orders above the residue and four below
+        // the signal.
+        assert!(
+            flat.dispersion() < 1e-6,
+            "the equicorrelated fold reads zero dispersion by construction — that is the defect #226 \
+             names, and it is what every production frame reported: got {}",
+            flat.dispersion()
         );
     }
 
-    #[test]
-    fn too_few_signals_yield_no_frame() {
-        let mut obs = SelfObserver::new(CellId([3; 16]), 1_000_000_000, HistoryConfig::compact());
-        assert!(obs.observe_cell(0, &[], 0, 0.0, -1).is_none());
-    }
 
     #[test]
     fn liveness_frame_carries_the_syndrome_and_is_recorded() {
-        let mut obs = SelfObserver::new(CellId([5; 16]), 1_000_000_000, HistoryConfig::compact());
+        let mut obs = SelfObserver::new(CellId([5; 16]), HistoryConfig::compact());
         // 6 alive, point 0 faulted (bit 0 set), healthy correlation 0.5. The frame stamps the AGREED
         // epoch passed in (3), NOT now_nanos/window (which here would be 9) — so nodes at different local
         // clocks but the same beacon epoch agree on the frame epoch (audit A3).
@@ -233,7 +259,7 @@ mod tests {
 
     #[test]
     fn healing_counter_is_monotone() {
-        let mut obs = SelfObserver::new(CellId([4; 16]), 1_000_000_000, HistoryConfig::compact());
+        let mut obs = SelfObserver::new(CellId([4; 16]), HistoryConfig::compact());
         assert_eq!(obs.heal_seq(), 0);
         assert_eq!(obs.note_healing(), 1);
         assert_eq!(obs.note_healing(), 2);
