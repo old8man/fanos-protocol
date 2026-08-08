@@ -256,6 +256,21 @@ fn the_two_exemptions_stay_distinct() {
 /// defined at 151, called at 522, and the test module opens at 335). Verified by hand on two of them before
 /// these numbers were written down.
 ///
+/// **+58 across 21 crates on 2026-08-08, and NOT because anything was added** (#227). The scan read
+/// comments as code: [`calls`] accepts a name followed by an opening paren, which is ordinary English
+/// punctuation, so a doc line reading "the cascade `lead` (`-1` = none)" registered as a call to `lead()`.
+/// [`code_only`] now strips whole-line comments and the counts below are what was always true.
+///
+/// **The blindness was biased toward exactly what this guard is for.** The more consequential a function,
+/// the likelier a neighbouring comment names it — so the names it hid are not a random sample.
+/// `loadbalance::balance_exact` is the §6.7 rebalance, the platform's ONLY response that could raise `Φ`;
+/// its sole real caller is a test, and the comment that "wired" it is the healer's own prose *describing*
+/// the response (#139). `dispersion` is the second-dimension discriminator no production reader consumes
+/// (#225/#226). Both were found by hand, days apart, while this guard reported them wired.
+///
+/// Each of the 58 is a **candidate**, not an accepted finding: some are reached by paths the scan cannot
+/// model, which is why the positive-control list below exists. Triaging them is its own work.
+///
 /// **These numbers are a debt, not an approval.** Much of it is legitimate — accessors a test asserts on,
 /// analysis functions that exist to be checked rather than called (`chernoff_break_bound`), simulator helpers.
 /// Some is not: `crosscell_dir`'s reading side means a cell publishes its checkpoint and no parent ever reads
@@ -266,10 +281,10 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // the path, which is a different fact from loss and the only evidence that would justify widening it. It
     // has no door because ANGELOS has no call-stats surface yet. Raised rather than wired, because inventing a
     // caller to satisfy the count is the one thing this ratchet must never reward.
-    ("fanos-angelos", 8),
+    ("fanos-angelos", 10),
     ("fanos-aphantos", 5),
-    ("fanos-calypso", 11),
-    ("fanos-code", 7),
+    ("fanos-calypso", 12),
+    ("fanos-code", 11),
     // 15 → 16 (2026-08-06), and the reason is that the ratchet had already slipped: the FIRST honest
     // whole-workspace run measured 16 here, and re-measuring at `e34ab63~1` — before any of that day's
     // changes — returned the identical 16 names. So this was not a regression being waved through; the number
@@ -283,8 +298,8 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // deterministically-divergent one, and wiring it needs a `performed` sensor the platform does not have.
     // Raised rather than satisfied: inventing a caller is the one thing this ratchet must never reward, and
     // that applies to me as much as to anyone.
-    ("fanos-core", 16),
-    ("fanos-diakrisis", 40),
+    ("fanos-core", 17),
+    ("fanos-diakrisis", 43),
     ("fanos-diaulos", 6),
     // **20 → 17 (2026-08-04), LOWERED — the debt was paid, not re-justified.** `fanos term` now builds a
     // term, type-checks it, encodes it canonically and submits it, so `name_register_term` and
@@ -300,7 +315,7 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // vertical-parallelism claim is unfalsifiable. The rest are sub-ledger payload builders (`htlc_*`,
     // `shield*`, `stake_*`, `storage_*`, `mint_shielded`, `name_payload`) whose verbs are not built yet —
     // the same debt `term_payload` just paid, still outstanding for its siblings.
-    ("fanos-dromos", 17),
+    ("fanos-dromos", 20),
     // **5 → 1 (2026-08-04), LOWERED.** `Expr::bin`, `exec::compare`, `Predicate::host_with` and
     // `encode_value` all acquired production callers when `fanos term` landed: it composes a computed
     // argument and a gated term, and `Checked::encode` is what the submitted bytes ARE — the signature
@@ -314,40 +329,40 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // all, so the boundary this codec guards does not exist yet rather than existing unguarded. It acquires
     // a caller when records are persisted, which is #77 (a node persists nothing today), and the canonicity
     // property starts mattering at exactly that moment.
-    ("fanos-ergon", 1),
+    ("fanos-ergon", 3),
     ("fanos-field", 1),
     ("fanos-geometry", 2),
     ("fanos-holarch", 1),
     ("fanos-keygen", 7),
-    ("fanos-node", 40),
-    ("fanos-nyx", 15),
-    ("fanos-obolos", 9),
+    ("fanos-node", 42),
+    ("fanos-nyx", 21),
+    ("fanos-obolos", 11),
     ("fanos-observatory", 2),
-    ("fanos-onoma", 3),
-    ("fanos-pqcrypto", 4),
+    ("fanos-onoma", 5),
+    ("fanos-pqcrypto", 6),
     ("fanos-primitives", 3),
-    ("fanos-proteus", 6),
+    ("fanos-proteus", 7),
     ("fanos-quic", 11),
     ("fanos-rendezvous", 2),
-    ("fanos-runtime", 8),
+    ("fanos-runtime", 9),
     ("fanos-session", 1),
     // 31: `Timeline::revisits` — the oscillation detector added for the role-setpoint measurement. It is a
     // scenario instrument, like most of this crate's entry: `until`, `until_settled`, `frozen`,
     // `changes_after` and `is_reached` are all called only from scenarios, which is what fanos-sim is for.
-    ("fanos-sim", 31),
-    ("fanos-stream", 2),
-    ("fanos-taxis", 18),
-    ("fanos-telemetry", 6),
+    ("fanos-sim", 37),
+    ("fanos-stream", 3),
+    ("fanos-taxis", 22),
+    ("fanos-telemetry", 9),
     // 6 → 7 (2026-08-03): `missed_audits` is the MEASUREMENT that audit AT-H2's missing early-termination
     // policy needs — a consumer whose provider stopped proving still has its escrow locked for the full term
     // precisely because misses were not countable. The count now exists and the policy does not, which is the
     // right order; wiring it would mean inventing the policy inside a getter's caller.
-    ("fanos-thesauros", 7),
+    ("fanos-thesauros", 9),
     ("fanos-threshold", 1),
     ("fanos-vpn", 1),
-    ("fanos-vrf", 6),
+    ("fanos-vrf", 12),
     ("fanos-wasm", 1),
-    ("fanos-wire", 2),
+    ("fanos-wire", 6),
     ("fanos-wire-derive", 1),
 ];
 
@@ -367,6 +382,32 @@ fn production_part(src: &str) -> &str {
         Some(i) => &src[..i],
         None => src,
     }
+}
+
+/// [`production_part`] with whole-line comments removed — the text a **call scan** may read.
+///
+/// **Comments are not code, and the unwired-capability scan used to count them** (#227). `calls` accepts a
+/// name followed by an opening paren, which is ordinary English punctuation: a doc line reading "the cascade
+/// `lead` (`-1` = none)" registered as a call to `lead()`. Measured across the workspace, **83 public
+/// functions were "wired" by nothing but a word in prose** — among them `loadbalance::balance_exact`, whose
+/// only real caller is a test and whose apparent one was the healer comment *describing* the §6.7 response
+/// that does not exist (#139), and `dispersion`, the second-dimension discriminator no production reader
+/// consumes (#225/#226). The blindness was biased toward the load-bearing: the more consequential a
+/// function, the likelier a neighbouring comment names it.
+///
+/// **Separate from [`production_part`] rather than replacing it, and that is the point.** The literal-seed
+/// guard reads the same files looking for a `literal-seed-ok:` marker — which *is* a comment — so the two
+/// scans want opposite things from the same text. One helper serving both would have silently disarmed
+/// #203's marker lookback the moment this one started stripping.
+///
+/// Whole lines only (`//`, `///`, `//!`), where prose lives. A trailing comment after code is left alone
+/// deliberately: cutting at `//` would corrupt any string literal containing it.
+fn code_only(src: &str) -> String {
+    production_part(src)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `pub fn` / `pub const fn` / `pub async fn` / `pub unsafe fn` names declared in `src`.
@@ -453,7 +494,7 @@ fn production_sources() -> Vec<(String, String)> {
                     continue;
                 };
                 if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push((krate, production_part(&text).to_owned()));
+                    out.push((krate, code_only(&text)));
                 }
             }
         }
