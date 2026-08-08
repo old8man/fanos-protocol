@@ -22,10 +22,94 @@ use crate::ports::{Effect, Instant, Notification};
 use crate::store::{PendingGet, PendingSample};
 
 use super::{
-    ContentPoint, DA_SAMPLES, DIGEST, MAX_PENDING_GETS, MAX_READ_VERSIONS, MAX_VALUE_LEN,
-    OverlayNode, PUBLISH_ORIGIN, PUBLISH_SHARD, reconstruct_highest, storage_digest,
-    storage_point,
+    ContentPoint, DA_SAMPLES, DIGEST, MAX_PENDING_GETS, MAX_VALUE_LEN, OverlayNode, PUBLISH_ORIGIN,
+    PUBLISH_SHARD, READ_PEER_SHARD_QUOTA, reconstruct_highest, storage_digest, storage_point,
 };
+
+/// Why a `Value` shard reply was refused on the read path — the tag on
+/// [`Station::ReadShardRefused`](fanos_ports::Station::ReadShardRefused).
+///
+/// Three rules, and an operator reads them as three different accusations rather than three flavours of the
+/// same one. That is the test #208 set for splitting a refusal: *does the operator do something different?*
+/// Here they do — [`Oversize`](Self::Oversize) says a peer is sending bytes no shard of this cell can be,
+/// [`VersionAhead`](Self::VersionAhead) says it is claiming a write from the future (the #79 attack, one path
+/// over), and [`PeerQuota`](Self::PeerQuota) says it is claiming to hold more shards of one key than any node
+/// can. The first two indict a *frame*; the third indicts the *peer*, because reaching a structural quota is
+/// not something a mistake does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadRefusal {
+    /// The shard is longer than [`MAX_VALUE_LEN`](crate::MAX_VALUE_LEN), the cap `Store::admits`
+    /// enforces on the write path.
+    ///
+    /// Not a policy choice: a shard longer than this node would ever have **accepted** cannot be a shard of
+    /// anything the cell holds. Unchecked, the only ceiling was `MAX_FRAME`, and one read was measured
+    /// holding 53.4 MiB of shards that could never reconstruct (#212).
+    Oversize,
+    /// The write-version's epoch field runs past the beacon clock — the bound `on_publish` has applied since
+    /// #79, on this same wire-supplied quantity, and that this path did not.
+    VersionAhead,
+    /// The peer has already contributed [`READ_PEER_SHARD_QUOTA`](crate::READ_PEER_SHARD_QUOTA) shards
+    /// to this read, which is every index
+    /// it could possibly hold.
+    PeerQuota,
+}
+
+impl ReadRefusal {
+    /// Every variant, for the tag-name resolver and the completeness assertion below.
+    pub const ALL: [Self; 3] = [Self::Oversize, Self::VersionAhead, Self::PeerQuota];
+
+    /// The dense tag recorded on the station — a position in [`ALL`](Self::ALL), never a byte off the wire,
+    /// so it cannot exceed the station plane's tag width.
+    #[must_use]
+    pub fn tag(self) -> u64 {
+        match self {
+            Self::Oversize => 0,
+            Self::VersionAhead => 1,
+            Self::PeerQuota => 2,
+        }
+    }
+
+    /// The operator-facing name `fanos status stations` prints beside the tag.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Oversize => "oversize",
+            Self::VersionAhead => "version-ahead",
+            Self::PeerQuota => "peer-quota",
+        }
+    }
+
+    /// Apply all three rules to one reply, cheapest first. `None` means the reply is admissible.
+    ///
+    /// Written as one function taking scalars rather than three checks at the call site so that the *order*
+    /// and the *completeness* are visible in one place — and so a test can drive each rule without standing
+    /// up a node.
+    #[must_use]
+    pub fn of(
+        shard_len: usize,
+        version_epoch: u64,
+        highest_admissible_epoch: u64,
+        already_supplied: usize,
+    ) -> Option<Self> {
+        if shard_len > MAX_VALUE_LEN {
+            return Some(Self::Oversize);
+        }
+        if version_epoch > highest_admissible_epoch {
+            return Some(Self::VersionAhead);
+        }
+        if already_supplied >= READ_PEER_SHARD_QUOTA {
+            return Some(Self::PeerQuota);
+        }
+        None
+    }
+}
+
+/// `ALL` must list every variant, or a rule added later is invisible to the tag-name resolver and its
+/// refusals print as a bare number.
+const _: () = assert!(
+    ReadRefusal::ALL.len() == core::mem::variant_count::<ReadRefusal>(),
+    "ReadRefusal::ALL is missing a variant"
+);
 
 
 /// How many peers beyond the erasure threshold `K` a read asks even at full stress.
@@ -256,6 +340,7 @@ impl<F: Field> OverlayNode<F> {
                 nonce,
                 queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
                 negatives: 0,
+                supplied: BTreeMap::new(),
             },
         );
         peers
@@ -499,7 +584,21 @@ impl<F: Field> OverlayNode<F> {
     /// read's version-grouped shard-set and, once the **highest** recoverable version reconstructs, deliver
     /// that value (last-writer-wins) and retire the read. A `found=false` reply (the peer holds no shard) is
     /// not accumulated; once every queried peer has said so, or the read times out, the value is absent.
-    pub(super) fn on_value(&mut self, now: Instant, body: &[u8]) -> Vec<Effect> {
+    ///
+    /// # Three rules the write path already had and this one did not (#211, #212)
+    ///
+    /// [`on_publish`](Self::on_publish) opens with `store.admits(&digest, payload.len())` — the
+    /// [`MAX_VALUE_LEN`] cap — and rejects a `version` whose epoch field runs ahead of the beacon clock
+    /// (#79). This handler consumes the **same two attacker-supplied quantities** off the wire and checked
+    /// neither, which made the read path the unguarded one: a shard home has to be responsible for a digest
+    /// to publish to it, while *any* queried peer can reply to a `Lookup`.
+    ///
+    /// The third rule has no counterpart on the write path because the accumulator has no counterpart there:
+    /// a peer may contribute at most [`erasure::N`] shards to one read, which is all it can hold
+    /// ([`HeldShards`](crate::overlay::HeldShards) is keyed by point index). That quota is what replaced a
+    /// count-bounded, **version-keyed eviction** — and the eviction was the defect, not a safeguard, because
+    /// the key was attacker-chosen. See [`ReadRefusal`] for what each rule costs an attacker.
+    pub(super) fn on_value(&mut self, now: Instant, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(digest) = parse_digest(body.get(..DIGEST)) else {
             return Vec::new();
         };
@@ -529,6 +628,9 @@ impl<F: Field> OverlayNode<F> {
             }
             return Vec::new();
         }
+        // Read the clock before borrowing the accumulator: the version rule below compares against it, and it
+        // is a property of the node rather than of this read.
+        let highest_admissible_epoch = self.epoch().get().saturating_add(1);
         // Otherwise correlate on the per-request nonce, NOT merely the key: a reply is accepted only for the
         // read currently in flight for this key. A stale/replayed `Value` from a prior get (old nonce), or one
         // with no in-flight read at all, is ignored — so it can never drain a later same-key get with an old
@@ -555,22 +657,37 @@ impl<F: Field> OverlayNode<F> {
             return Vec::new();
         }
         // shard bytes follow: digest(32) ‖ found(1) ‖ index(1) ‖ version(8) ‖ nonce(8) ‖ shard.
-        let shard = body.get(DIGEST + 18..).unwrap_or(&[]).to_vec();
+        let shard = body.get(DIGEST + 18..).unwrap_or(&[]);
+        // The three rules, in the order that costs least to evaluate. Each refusal is *evidence of a
+        // misbehaving cell member* — an honest peer replies with the shards it holds, which pass all three by
+        // construction — so they share one station and differ by tag.
+        if let Some(refusal) = ReadRefusal::of(
+            shard.len(),
+            version >> Self::VERSION_EPOCH_SHIFT,
+            highest_admissible_epoch,
+            pending.supplied.get(&from).copied().unwrap_or(0),
+        ) {
+            self.stations
+                .record_tagged(Station::ReadShardRefused, Some(from), Some(refusal.tag()), 1);
+            return Vec::new();
+        }
+        // The quota counts *replies accepted from this peer*, not slots filled: two peers claiming the same
+        // (version, index) write one slot, and charging only the winner would let the loser retry for free.
+        *pending.supplied.entry(from).or_insert(0) += 1;
         if let Some(slot) = pending
             .by_version
             .entry(version)
             .or_default()
             .get_mut(index as usize)
         {
-            *slot = Some(shard);
+            *slot = Some(shard.to_vec());
         }
-        // Bound the version-grouped accumulator against a Byzantine peer spraying fabricated versions: keep
-        // only the highest [`MAX_READ_VERSIONS`] (the freshest are what last-writer-wins wants anyway).
-        while pending.by_version.len() > MAX_READ_VERSIONS {
-            if let Some(&lowest) = pending.by_version.keys().next() {
-                pending.by_version.remove(&lowest);
-            }
-        }
+        // **Nothing is evicted, and that is the fix.** The accumulator used to keep the highest
+        // `MAX_READ_VERSIONS = 8` version groups and drop the lowest — with `version` arriving off the wire,
+        // so one peer answering first with eight fabricated high versions made every honest write the new
+        // minimum and deleted it on the step it arrived. Measured: `retrieved = None` for a value that
+        // reconstructs from the very shards that were thrown away (#211). The quota above bounds the same
+        // memory without an eviction key an attacker can name.
         // Deliver the highest write-version whose shard-set is now recoverable (a stale version completing
         // first can never mask a fresher one; mixed-version shards are never combined into a garbage value).
         if let Some(value) = reconstruct_highest(&pending.by_version) {

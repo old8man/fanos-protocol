@@ -31,6 +31,7 @@ mod liveness;
 mod membership_ops;
 /// Content storage and retrieval — see [`storage`].
 mod storage;
+pub use storage::ReadRefusal;
 
 /// Storage `Publish` sub-type: the **full value**, sent origin → responsible node, which then
 /// erasure-codes it and distributes the shards. Carries no meaningful shard index (`0`).
@@ -254,11 +255,23 @@ pub const MAX_STORE_ENTRIES: usize = STORE_MEMORY_BUDGET / MAX_VALUE_LEN;
 ///
 /// **Both bounds are derived; the point between them is a stated choice.**
 ///
-/// *Ceiling.* Every cap saturating at once must still fit the recommendation: the other terms are
-/// `HELD_CAP × MAX_VALUE_LEN` = 32 MiB, `PENDING_CAP × MAX_VALUE_LEN` = 4 MiB, in-flight reads < 1 MiB and
-/// 7.6 MB measured resident, so the store may have at most `256 − 45 ≈ 203 MiB`. That is the largest legal
-/// value, not a good one: it leaves a saturated node exactly at its recommendation, where the OS reclaims or
-/// the kernel kills.
+/// *Ceiling.* Every cap saturating at once must still fit the recommendation — and **this paragraph used to
+/// get that sum wrong, in the direction that made the store look affordable** (#213). It read: `HELD_CAP ×
+/// MAX_VALUE_LEN` = 32 MiB, `PENDING_CAP × MAX_VALUE_LEN` = 4 MiB, in-flight reads < 1 MiB and 7.6 MB
+/// measured resident, so `256 − 45 ≈ 203 MiB` was available. Three things were missing or wrong:
+///
+/// * **in-flight reads are not < 1 MiB.** The read path applied no length check to a `Value` shard, so one
+///   read was measured holding **53.4 MiB** and the derived ceiling after the fix is
+///   [`READ_MEMORY_CEILING`] = **2.6 GiB**, not 1 (#212).
+/// * **the session layer is absent from the sum.** `fanos_diaulos::budget::SESSION_MEMORY_BUDGET` is 64 MiB
+///   and was derived, in #205, against "what the store left" — which this paragraph is the statement of.
+/// * **the mixnet router is absent too.** `fanos_aphantos`'s gather cap is a bare `64 * 1024 * 1024` in a
+///   crate nothing here has ever mentioned.
+///
+/// So the honest reading is that the node's shares already exceed its own recommendation before this
+/// constant is chosen, and #213 owns closing that. **128 MiB is kept unchanged rather than adjusted here**:
+/// picking a new number against a sum that does not close would be a fifth budget fitted to the same 256 MiB
+/// as the other four, which is precisely the defect.
 ///
 /// *Floor.* Honest use must be nowhere near it. A fully-provisioned Fano cell writes 4 directory slots per
 /// node per epoch and keeps one epoch of grace, so **56 slots are live at any moment**
@@ -272,14 +285,45 @@ pub const MAX_STORE_ENTRIES: usize = STORE_MEMORY_BUDGET / MAX_VALUE_LEN;
 /// engineering judgement, and saying which is which is the point of writing it down.
 pub(crate) const STORE_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
-pub(crate) const MAX_VALUE_LEN: usize = 65_536;
+pub const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.
-pub(super) const MAX_PENDING_GETS: usize = 1024;
-/// The most distinct shard-versions a single in-flight read accumulates before evicting the lowest (#115
-/// Phase B). A read groups gathered shards by their write-version and reconstructs the highest recoverable
-/// one (last-writer-wins); honestly there are only a handful in flight (the cell converges to one version),
-/// so this bounds a Byzantine peer that sprays fabricated versions to grow the accumulator (A4 DoS).
-pub(super) const MAX_READ_VERSIONS: usize = 8;
+///
+/// **Its product with [`READ_ACCUMULATOR_BYTES`] is stated below and does not fit the node's own memory
+/// recommendation** (#213). That is recorded rather than silently repaired: the count cannot be lowered to
+/// fit inside this crate, because it must clear the read concurrency a full cell's six epoch-keyed
+/// directories generate, and picking a number for it here without the cross-crate apportionment would be a
+/// fourth budget fitted to the same 256 MiB as the other three.
+pub const MAX_PENDING_GETS: usize = 1024;
+
+/// The most shards **one queried peer** may contribute to one in-flight read.
+///
+/// Not a policy number: a peer holds at most one shard per point index
+/// (`HeldShards` is keyed by `u8`), so `on_lookup` sends at most this many `Value` replies and an honest
+/// peer never reaches the quota. It is what replaced a count-bounded eviction keyed on the wire-supplied
+/// `version` — see [`ReadRefusal::PeerQuota`].
+pub const READ_PEER_SHARD_QUOTA: usize = erasure::N;
+
+/// What one in-flight read may hold, in bytes — the quota above times the peers a read fans out to, times
+/// the largest shard the store would ever have accepted.
+///
+/// **This is the term `STORE_MEMORY_BUDGET`'s accounting called "in-flight reads < 1 MiB".** It was not: the
+/// read path applied no length check at all, so the true figure was bounded only by `MAX_FRAME`, and one read
+/// was measured holding **53.4 MiB** (#212). With [`MAX_VALUE_LEN`] enforced on the reply and the per-peer
+/// quota in place it becomes an honest number, and an honest number that is still large — which is the point
+/// of writing it down rather than estimating it again.
+///
+/// The peer count is the base plane's `q² + q = 6`, the cell a deployment runs
+/// (`docs/deployment-minima.md`); a wider plane fans out further and the per-read figure scales with it.
+pub const READ_ACCUMULATOR_BYTES: usize = READ_PEER_SHARD_QUOTA * 6 * MAX_VALUE_LEN;
+
+/// The product [`MAX_PENDING_GETS`] and [`READ_ACCUMULATOR_BYTES`] make, named so that it is a fact in the
+/// code rather than a paragraph — **2.6 GiB**, against a 256 MiB node recommendation (#213).
+///
+/// Deliberately not a `const` assertion against the recommendation. That assertion belongs in the shared
+/// apportionment #213 introduces, where all four subsystem budgets are visible at once; asserting it here
+/// would fail the build of a crate that cannot fix it, and the tree's rule is that a guard names something
+/// its owner can act on.
+pub const READ_MEMORY_CEILING: usize = MAX_PENDING_GETS * READ_ACCUMULATOR_BYTES;
 /// How many distinct Fano lines a [`Command::SampleAvailability`] probes (spec §L4.3). `3` gives an
 /// independent-sampling false-available bound of `(1/7)³ ≈ 0.3%`, and — since `≥2` distinct passing samples
 /// certify availability against any withholding adversary (`fanos_code::da`) — a comfortable margin.
@@ -848,7 +892,7 @@ impl<F: Field> OverlayNode<F> {
             }
             Some(FrameType::Publish) => self.on_publish(now, from, frame.body),
             Some(FrameType::Lookup) => self.on_lookup(from, frame.body),
-            Some(FrameType::Value) => self.on_value(now, frame.body),
+            Some(FrameType::Value) => self.on_value(now, from, frame.body),
             Some(FrameType::Ack) => Self::on_ack(frame.body),
             Some(FrameType::Announce) => self.on_announce(frame.body),
             Some(FrameType::EpochAgree) => self.on_epoch_agree(frame.body),
@@ -3728,5 +3772,168 @@ mod tests {
             (after_dwell - 0.5).abs() < 1e-9,
             "DECAY^DWELL must be 1/2 (half-life = one dwell), got {after_dwell}"
         );
+    }
+
+    /// #211. One queried peer, answering first with eight fabricated high versions, used to delete every
+    /// honest write on the step it arrived — because the accumulator evicted the LOWEST version and `version`
+    /// comes off the wire. Measured before the fix: `retrieved = None` for a value that reconstructs from the
+    /// very shards that were thrown away.
+    ///
+    /// The property is stated as the *outcome an operator cares about* — the value comes back — rather than
+    /// as "the honest version is still in the map", because the second can hold while the first fails.
+    #[test]
+    fn a_peer_spraying_versions_cannot_delete_the_honest_write_from_a_read() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let key = b"k";
+        let (digest, _) = OverlayNode::<F2>::address_of(key);
+        node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
+        let nonce = node.store.pending.get(&digest).expect("the read fanned out").nonce;
+        let mut peers = node.peers.keys().copied();
+        let attacker = peers.next().expect("a cell has peers");
+        let honest = peers.next().expect("and more than one");
+
+        // The attacker answers first — it has nothing to look up, so it always wins that race — claiming
+        // versions that outrank any honest write. One byte each: this was never a memory attack.
+        //
+        // **The versions are the highest the epoch bound ADMITS, not the highest expressible.** `u64::MAX - v`
+        // is the natural thing to write and it makes this test prove nothing: those are refused by
+        // `VersionAhead` before the accumulator sees them, so the eviction under test never runs and the test
+        // passes with the defect restored. Falsified, and it did exactly that. The epoch field is `epoch + 1`
+        // — a real value a peer one tick ahead could legitimately stamp — and the low 32 bits are free.
+        let admissible_epoch = 1u64;
+        for v in 0..12u64 {
+            let version = (admissible_epoch << OverlayNode::<F2>::VERSION_EPOCH_SHIFT) | (0xFFFF_FFFF - v);
+            node.step(Instant(2), Input::Message {
+                from: attacker,
+                frame: encode_value(&digest, true, 0, version, &[0u8], nonce),
+            });
+        }
+        // Now the honest cell answers with the real shards of a real value, at a real write-version.
+        let value = b"the-value-that-is-actually-stored";
+        let shards = erasure::encode(value);
+        let mut retrieved = None;
+        for (i, shard) in shards.iter().enumerate() {
+            for e in node.step(Instant(3), Input::Message {
+                from: honest,
+                frame: encode_value(&digest, true, u8::try_from(i).unwrap(), 3, shard, nonce),
+            }) {
+                if let Effect::Notify(Notification::Retrieved { value, .. }) = e {
+                    retrieved = Some(value);
+                }
+            }
+        }
+        assert_eq!(
+            retrieved,
+            Some(Some(value.to_vec())),
+            "the read must deliver the value the honest cell holds, whatever a member claims about versions"
+        );
+        // And the spray was recorded rather than absorbed: an operator can name the peer.
+        let refused: u64 = node
+            .stations
+            .observations()
+            .iter()
+            .filter(|o| o.station == Station::ReadShardRefused)
+            .map(|o| o.count)
+            .sum();
+        assert!(refused > 0, "the refused replies must reach the data-path plane, not vanish");
+    }
+
+    /// #212. The read path took `body[50..]` and stored it. The only ceiling was `MAX_FRAME`, so one read was
+    /// measured holding **53.4 MiB** — against a store-budget comment claiming "in-flight reads < 1 MiB".
+    ///
+    /// The assertion is against [`READ_ACCUMULATOR_BYTES`], the *derived* ceiling, so that changing either
+    /// factor of that derivation changes what this test permits rather than leaving a stale literal behind.
+    #[test]
+    fn a_read_accumulator_cannot_exceed_what_the_store_would_have_accepted() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let key = b"k";
+        let (digest, _) = OverlayNode::<F2>::address_of(key);
+        node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
+        let nonce = node.store.pending.get(&digest).expect("the read fanned out").nonce;
+        let peers: Vec<_> = node.peers.keys().copied().collect();
+
+        let held = |node: &OverlayNode<F2>| -> usize {
+            node.store.pending.get(&digest).map_or(0, |p| {
+                p.by_version.values().flatten().flatten().map(Vec::len).sum()
+            })
+        };
+        // Phase 1 — every peer sprays every index at many versions with shards STRICTLY over the store's own
+        // cap, at differing lengths so nothing could reconstruct and retire the read.
+        for (p, &peer) in peers.iter().enumerate() {
+            for v in 1..=12u64 {
+                for i in 0..erasure::N {
+                    let shard = alloc::vec![0xAAu8; MAX_VALUE_LEN + 1 + i + p];
+                    node.step(Instant(2), Input::Message {
+                        from: peer,
+                        frame: encode_value(&digest, true, u8::try_from(i).unwrap(), v, &shard, nonce),
+                    });
+                }
+            }
+        }
+        assert_eq!(held(&node), 0, "not one over-size shard is accepted, so the accumulator never opens");
+
+        // Phase 2 — the same flood at EXACTLY the cap, which is admissible and is what the derived ceiling was
+        // computed from. Each peer takes its OWN version, because that is the arrangement that actually
+        // reaches the bound: peers sharing a version share `by_version[v][index]` slots and overwrite each
+        // other, so a flood where everyone starts at version 1 fills only 7 slots and would let this test pass
+        // while proving a sixth of what it claims. Phase 1 charged nothing, so a refusal must not consume
+        // quota either — if it did, this phase would fall short and the ceiling would never be reached.
+        // Each peer also spreads its replies over TWELVE versions rather than repeating one, so that without
+        // the quota it would open `12 x 7` slots instead of 7. Falsified: with the quota deleted and every
+        // peer repeating a single version, the total is unchanged and the test passes on a defect.
+        for (p, &peer) in peers.iter().enumerate() {
+            for v in 1..=12u64 {
+                for i in 0..erasure::N {
+                    let shard = alloc::vec![0xBBu8; MAX_VALUE_LEN];
+                    node.step(Instant(3), Input::Message {
+                        from: peer,
+                        frame: encode_value(
+                            &digest, true, u8::try_from(i).unwrap(), p as u64 * 20 + v, &shard, nonce,
+                        ),
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            held(&node),
+            READ_ACCUMULATOR_BYTES,
+            "the quota admits exactly the derived ceiling and not one shard more"
+        );
+    }
+
+    /// The three rules, each driven on its own — because a test that only ever sees the *first* rule fire has
+    /// not shown the other two are reachable, and [`ReadRefusal::of`] evaluates them in order.
+    #[test]
+    fn every_read_refusal_rule_is_reachable_and_admits_the_honest_reply() {
+        let quota = READ_PEER_SHARD_QUOTA;
+        assert_eq!(ReadRefusal::of(MAX_VALUE_LEN + 1, 0, 9, 0), Some(ReadRefusal::Oversize));
+        assert_eq!(ReadRefusal::of(1, 10, 9, 0), Some(ReadRefusal::VersionAhead));
+        assert_eq!(ReadRefusal::of(1, 0, 9, quota), Some(ReadRefusal::PeerQuota));
+        // The honest reply: a full-size shard, this epoch's version, first contribution.
+        assert_eq!(ReadRefusal::of(MAX_VALUE_LEN, 9, 9, quota - 1), None);
+        // Distinct tags and distinct names, or the operator reads two rules as one.
+        let tags: alloc::collections::BTreeSet<u64> = ReadRefusal::ALL.iter().map(|r| r.tag()).collect();
+        let names: alloc::collections::BTreeSet<&str> = ReadRefusal::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(tags.len(), ReadRefusal::ALL.len(), "tags collide");
+        assert_eq!(names.len(), ReadRefusal::ALL.len(), "names collide");
+    }
+
+    /// The product the read path's two bounds make, asserted as the number it is rather than left implicit
+    /// (#213). This test exists to FAIL when the apportionment lands and the ceiling comes down — a stale
+    /// 2.6 GiB left in the tree unremarked is the shape #212 was.
+    #[test]
+    fn the_read_paths_own_ceiling_is_stated_and_does_not_yet_fit_the_node() {
+        assert_eq!(READ_PEER_SHARD_QUOTA, 7, "a peer holds at most one shard per point");
+        assert_eq!(READ_ACCUMULATOR_BYTES, 2_752_512, "7 shards x 6 peers x 64 KiB");
+        assert_eq!(READ_MEMORY_CEILING, 2_818_572_288, "x MAX_PENDING_GETS = 2.6 GiB");
+        // A `const` block on clippy's advice, and it is the better shape: the day #213 lands and the ceiling
+        // drops below the recommendation, this stops the BUILD rather than one test run — which is the moment
+        // someone must replace this tripwire with the assertion it stands in for.
+        const {
+            assert!(
+                READ_MEMORY_CEILING > 256 * 1024 * 1024,
+                "#213 landed: replace this tripwire with the apportionment assertion it stands in for"
+            );
+        }
     }
 }

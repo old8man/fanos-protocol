@@ -11,6 +11,8 @@ use alloc::vec::Vec;
 use fanos_primitives::codec::{Reader, put_seq, put_u64, put_var_bytes};
 use fanos_primitives::{Epoch, hash::hash_labeled};
 
+use fanos_geometry::Triple;
+
 use crate::overlay::{DIGEST, HeldShards, MAX_STORE_ENTRIES, MAX_VALUE_LEN, VersionedShards};
 use crate::ports::Instant;
 /// An in-flight `Get` gathering erasure shards from the cell (spec §L4). No single node holds the value, so
@@ -35,6 +37,18 @@ pub(crate) struct PendingGet {
     /// reaches [`queried`](Self::queried) and the gathered shards still do not reconstruct, the value is
     /// concluded absent immediately — a fast miss, instead of waiting out the read timeout.
     pub(crate) negatives: u16,
+    /// How many shards each replying peer has contributed, so no one peer can fill the accumulator
+    /// (`READ_PEER_SHARD_QUOTA`, #211).
+    ///
+    /// **This is what bounds the read's memory now, and the reason it is keyed by PEER is that the previous
+    /// key was chosen by the attacker.** [`by_version`](Self::by_version) used to be capped at eight version
+    /// groups with the lowest evicted — and `version` arrives off the wire, so one peer answering first with
+    /// eight fabricated high versions made every honest write the new minimum and deleted it on arrival. A
+    /// peer's coordinate is not something it gets to pick.
+    ///
+    /// Bounded by the fan-out: at most [`queried`](Self::queried) entries, since only a peer this read sent a
+    /// `Lookup` to can reach the accumulator at all.
+    pub(crate) supplied: BTreeMap<Triple, usize>,
 }
 
 /// An in-flight [`Command::SampleAvailability`] (spec §L4.3): the distinct Fano lines being sampled and the

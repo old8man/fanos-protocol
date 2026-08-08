@@ -348,6 +348,9 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::PeerRefused => {
             fanos_wire::ProtocolError::ALL.iter().find(|e| e.index() == tag).map(|e| e.name())
         }
+        Station::ReadShardRefused => {
+            fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
+        }
         _ => None,
     }
 }

@@ -246,6 +246,17 @@ pub enum Station {
     /// The writer learns only from a `put` timing out, which is indistinguishable from an unreachable peer —
     /// the two failures an operator most needs to separate — and the node itself reported nothing at all.
     StoreAtCapacity,
+    /// A `Value` shard reply refused on the **read** path, tagged by which rule refused it
+    /// (`fanos_runtime::ReadRefusal` — named there because that is where the rules are, and this crate sits
+    /// below it).
+    ///
+    /// **The mirror of [`StoreAtCapacity`](Self::StoreAtCapacity), which is the whole point.** The write path
+    /// checked a shard's size and its write-version and counted the refusal; the read path checked neither and
+    /// counted nothing, so the one an attacker reaches without being anyone's shard home was the unguarded one
+    /// (#211, #212). Every reply refused here is evidence of a **cell member misbehaving** — an honest peer
+    /// answers a `Lookup` with the shards it holds, which pass all three rules by construction — so unlike a
+    /// full store this is never a symptom of honest load.
+    ReadShardRefused,
     /// A descriptor share arrived that does **not** open its dealt per-share commitment: not a decode error
     /// and not a stale epoch, but a value provably different from the one the dealer handed that member.
     ///
@@ -459,6 +470,7 @@ impl Station {
         Self::WireOverBound,
         Self::WireUnshaped,
         Self::StoreAtCapacity,
+        Self::ReadShardRefused,
         Self::ExitRefused,
         Self::ExitDialFailed,
         Self::ExitSocketUnavailable,
@@ -495,6 +507,7 @@ impl Station {
             Self::WireOverBound => "wire.over_bound",
             Self::WireUnshaped => "wire.unshaped",
             Self::StoreAtCapacity => "store.at_capacity",
+            Self::ReadShardRefused => "read.shard_refused",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",
             Self::AdmissionPowFailed => "admission.pow_failed",
             Self::AdmissionSybilCapped => "admission.sybil_capped",
