@@ -138,9 +138,19 @@ fn the_cost_gated_list_matches_the_tests_that_exist() {
             all.contains(*name),
             "COST_GATED names `{name}`, which is no longer an #[ignore]d test — delete the row or restore the test"
         );
+        // `contains`, not `starts_with` — and the difference is the whole point of this assertion.
+        //
+        // Two predicates are in play and they are not the same one. **Classification** is by prefix: a
+        // measurement is *named* `measure_…`, which is what the check above tests. **Skip safety** is by
+        // substring, because `cargo test -- --skip probe_` matches anywhere in a test's path, so a declared
+        // assertion called `relay_probe_gate_is_enforced` is silently dropped by the nightly while passing a
+        // prefix check clean. This assertion's own message has always said "`--skip` would drop it" — naming
+        // the substring rule — while testing the prefix rule one line above it, and `ci.yml` calls the skip
+        // set "provably" exact on the strength of it. Empty today; the guard is what keeps it so.
         assert!(
-            !MEASUREMENT_PREFIXES.iter().any(|p| name.starts_with(p)),
-            "`{name}` is declared cost-gated but named like a measurement, so `--skip` would drop it"
+            !MEASUREMENT_PREFIXES.iter().any(|p| name.contains(p)),
+            "`{name}` is declared cost-gated but CONTAINS a measurement prefix, so `cargo test --skip` — which \
+             matches a substring, not a prefix — would drop it from the nightly with nothing reporting the gap"
         );
     }
 }
