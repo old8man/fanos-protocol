@@ -600,11 +600,11 @@ pub fn budget_for(
 
 /// Whether a cell of these parameters can carry **at least one** sealed transaction in a block.
 ///
-/// The security bound on the sealing committee ([`CellParams::seal_committee_size`]) is `m ≥ 2f + 1`, which
+/// The security bound on the sealing committee ([`CellParams::seal_committee_size`](crate::params::CellParams::seal_committee_size)) is `m ≥ 2f + 1`, which
 /// makes `m` grow with the cell — and the seal encapsulates to every member, so a transaction costs
 /// `m · SEALED_SHARE_LEN`. Past some order that exceeds a whole block and the cell can finalize nothing.
 ///
-/// A separate predicate from [`CellParams::seal_is_sound`] because it answers a different question — that one
+/// A separate predicate from [`CellParams::seal_is_sound`](crate::params::CellParams::seal_is_sound) because it answers a different question — that one
 /// asks whether the seal keeps its secret, this one whether it fits on the wire — and a cell can fail either
 /// independently. Both are checked before sealing; a provisioning that passes only the first would look
 /// correct and produce blocks nothing can carry.

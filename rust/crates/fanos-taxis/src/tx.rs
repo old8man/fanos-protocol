@@ -97,7 +97,7 @@ impl SealedTx {
     /// guarantee.
     ///
     /// It used to bind a `line` as well, back when the committee was an epoch-elected Fano line. The
-    /// committee is now the whole cell ([`CellParams::seal_committee_size`], #136), so there is one
+    /// committee is now the whole cell ([`CellParams::seal_committee_size`](crate::params::CellParams::seal_committee_size), #136), so there is one
     /// committee per epoch and no line left to name — a field that could only ever hold one value is not a
     /// binding, it is a decoration that reads like one.
     #[must_use]

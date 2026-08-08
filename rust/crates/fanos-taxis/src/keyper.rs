@@ -15,7 +15,7 @@
 //!   decryption authority to the validator identities — run once at cell formation.
 //! * [`KeyperRegistry::commit`] is the **on-chain decryption-key commitment**: a binding hash of the key set,
 //!   an agreed genesis constant (alongside `verifiers` and the beacon `seed`) that a light client checks.
-//! * [`KeyperRegistry::line_keys`] / [`seal_to_keyper_committee`] are the **only** correct way for a client to
+//! * [`KeyperRegistry::committee_keys`] / [`seal_to_keyper_committee`] are the **only** correct way for a client to
 //!   seal: the keys come from the committed registry, so the transaction is bound to the on-chain authority.
 //!
 //! What this does **not** claim: a hybrid-KEM ciphertext is not publicly verifiable *before opening* to target

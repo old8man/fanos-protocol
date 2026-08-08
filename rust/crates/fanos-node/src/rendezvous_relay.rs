@@ -172,7 +172,7 @@ impl<F: Field> RendezvousRelay<F> {
         }
     }
 
-    /// Adopt `beacon` as the current epoch's seed — the second half of a registration's [`service_tag`].
+    /// Adopt `beacon` as the current epoch's seed — the second half of a registration's [`service_tag`](fanos_rendezvous::service_tag).
     ///
     /// Driven by the composite the moment the beacon adopts a round, alongside the router's own onion-key
     /// rotation, so the relay's tag arithmetic and its epoch never disagree.

@@ -235,7 +235,7 @@ async fn bridge<T: OverlayTransport>(
     }
 }
 
-/// The sans-I/O session surface the async byte-stream [`drive`] loop needs. **Both** the dialing
+/// The sans-I/O session surface the async byte-stream `drive` loop needs. **Both** the dialing
 /// ([`ClientSession`]) and accepting ([`ServerSession`]) sides implement it, so one driver runs a
 /// full-duplex stream in either direction — a service handler gets the same `AsyncRead + AsyncWrite` a
 /// client's dial does, and the flow-control / retransmit logic lives in exactly one place.
@@ -272,7 +272,7 @@ trait SessionStream: Send + 'static {
     /// Fold a received datagram cell into the session.
     fn handle_payload(&mut self, payload: &[u8]);
     /// How many times the most-retransmitted unacknowledged segment has been resent — TCP's `R2`
-    /// statistic (RFC 1122 §4.2.3.5), which is how [`drive`] tells a peer that is **gone** from one
+    /// statistic (RFC 1122 §4.2.3.5), which is how `drive` tells a peer that is **gone** from one
     /// that is merely slow. Zero while handshaking and for a stream whose window is fully acked.
     fn stalled_attempts(&self) -> u32;
 }
@@ -379,7 +379,7 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
 /// **`R2` — the retransmit count at which a session abandons its peer** (RFC 1122 §4.2.3.5), and the
 /// answer to "how long does a dead session live".
 ///
-/// Without it, nothing in the platform ever gave up: [`drive`] returned only on `is_done()` or a closed
+/// Without it, nothing in the platform ever gave up: `drive` returned only on `is_done()` or a closed
 /// transport, and a peer that has vanished satisfies neither — so both ends retransmitted at the tick
 /// cadence *forever*, holding a session slot, a task, and (on a service) a handler each. A dropped client
 /// stream produced exactly that, and the host's idle sweep could not reclaim it because inbound
@@ -398,7 +398,7 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
 /// same question against decades of deployment — matching it is evidence, not coincidence.
 ///
 /// **This bounds only a peer that never acknowledges.** Every ack resets the count for what it covers, and
-/// a SACKed hole is excluded ([`StreamSender::stalled_attempts`](fanos_stream::StreamSender::stalled_attempts)),
+/// a SACKed hole is excluded (`StreamSender::stalled_attempts`),
 /// so a live-but-lossy peer is never abandoned — only an absent one.
 pub const GIVE_UP_ATTEMPTS: u32 = 15;
 

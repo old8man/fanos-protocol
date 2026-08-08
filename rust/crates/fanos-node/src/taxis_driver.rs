@@ -247,7 +247,7 @@ pub struct TaxisParams<S> {
     /// set, each one persists the checkpoint it could serve a peer, and the cell can re-seed itself from any
     /// single survivor's disk.
     ///
-    /// The file is adopted through [`Input::SyncResp`](fanos_taxis::consensus::Input::SyncResp), the same
+    /// The file is adopted through [`Input::SyncResp`], the same
     /// path a peer's answer takes, so a tampered snapshot is refused by the quorum certificate rather than
     /// trusted because it was local: **persistence adds no trust in the filesystem.**
     pub state_dir: Option<std::path::PathBuf>,

@@ -386,7 +386,7 @@ pub fn ingress_walk<F: Field>(
 /// Domain separator for the [`ingress_walk`] permutation.
 const INGRESS_WALK_LABEL: &str = "FANOS-v1/poros-ingress-walk";
 
-/// Domain separator for the [`reshare_contributors`] subset draw.
+/// Domain separator for the `reshare_contributors` subset draw.
 const RESHARE_SUBSET_LABEL: &str = "FANOS-v1/poros-reshare-subset";
 
 /// The **canonical contributor subset** of a rotation into `target_epoch`: the old-line share indices
@@ -872,7 +872,7 @@ struct RotationCtx {
     new_line: Vec<Triple>,
     old_line: Vec<Triple>,
     my_new_x: u8,
-    /// The canonical contributor indices this rotation combines — see [`reshare_contributors`]. Sorted, and
+    /// The canonical contributor indices this rotation combines — see `reshare_contributors`. Sorted, and
     /// the *only* old members whose sub-shares are gathered: a rotation that combined whoever answered first
     /// would leave each member on a different polynomial.
     contributors: Vec<u8>,
@@ -1080,7 +1080,7 @@ impl PorosHost {
     /// current epoch — and calls this before the contributions arrive. `old_line` is the roster whose position
     /// `x-1` a sub-share claiming index `x` must have arrived FROM (sender authentication).
     ///
-    /// The **contributor subset is fixed here**, by [`reshare_contributors`], and not by whoever answers
+    /// The **contributor subset is fixed here**, by `reshare_contributors`, and not by whoever answers
     /// first: every incoming member must combine the *same* old members or they land on different
     /// polynomials and the rotated line cannot reconstruct. A roster that admits no valid subset arms
     /// nothing, which is the honest state rather than a rotation that can never complete.

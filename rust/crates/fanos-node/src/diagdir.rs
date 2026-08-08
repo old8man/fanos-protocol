@@ -17,11 +17,11 @@
 //! score into a function of agreed bytes. A node that read a stale set converges the moment it re-reads,
 //! which an accumulator cannot offer.
 //!
-//! ## Retention, and why it is not [`DIRECTORY_SLOT_EPOCHS`](crate::DIRECTORY_SLOT_EPOCHS)
+//! ## Retention, and why it is not `DIRECTORY_SLOT_EPOCHS`
 //!
 //! The routing directories are retained for one epoch: a *reader* needs only the grace a lagging peer needs.
 //! A diagnosis reader deliberately wants history — `REP_WINDOW` epochs of it — so these records live at
-//! [`DIAGNOSIS_SLOT_EPOCHS`](crate::DIAGNOSIS_SLOT_EPOCHS), which **is** `REP_WINDOW`. The two constants
+//! `DIAGNOSIS_SLOT_EPOCHS`, which **is** `REP_WINDOW`. The two constants
 //! answer different questions and are derived separately for that reason.
 //!
 //! Because the window outlives every other directory's retention, a record cannot refer to anything outside
@@ -58,7 +58,7 @@ fn diagnosis_slot(coord: Coord, epoch: Epoch) -> Vec<u8> {
 /// a reachable identity — it is `H(bundle)` — so the encoding loses nothing.
 const DIAGNOSIS_BYTES: usize = 2 + 7 * 32;
 
-/// The empty-seat sentinel; see [`DIAGNOSIS_BYTES`].
+/// The empty-seat sentinel; see `DIAGNOSIS_BYTES`.
 const NO_SEAT: [u8; 32] = [0u8; 32];
 
 /// Encode `(degraded, responsive, roster)` — the inverse of [`parse_diagnosis`].
@@ -75,7 +75,7 @@ fn encode_diagnosis(degraded: u8, responsive: u8, roster: &Seating) -> [u8; DIAG
     out
 }
 
-/// The masks and seating a record carries, or `None` if it is not exactly [`DIAGNOSIS_BYTES`] wide.
+/// The masks and seating a record carries, or `None` if it is not exactly `DIAGNOSIS_BYTES` wide.
 #[must_use]
 pub fn parse_diagnosis(bytes: &[u8]) -> Option<(u8, u8, Seating)> {
     if bytes.len() != DIAGNOSIS_BYTES {

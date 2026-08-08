@@ -134,7 +134,7 @@ impl CoherenceFrame {
     /// `healthy_correlation = 0.45`, the equicorrelated closed forms give `Φ = (N−1)r² = 1.215 ≥ 1`,
     /// `P = 0.3164 ≥ 2/N`, `R = 0.4514 ≥ 1/3` and `r = 0.45` inside the band `(0.4082, 0.5774]` — so a node
     /// that has observed **nothing** produces a frame that reads as a healthy collective subject, and
-    /// [`SnapshotFrame::ready`](crate::SnapshotFrame) called it *"bound and self-observing"* (#154).
+    /// [`CoherenceSnapshot::from_frame`](crate::CoherenceSnapshot::from_frame) called it *"bound and self-observing"* (#154).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // f64→f32 narrowing is deliberate for the wire frame.
     // Eight distinct inputs to one fold, same as `SelfObserver::observe_liveness`: a params struct would

@@ -130,7 +130,7 @@ pub struct MediaSession {
     recv_key: [u8; 32],
     epoch: u32,
     send_seq: u64,
-    /// The highest sequence accepted this epoch, and a bitmap of which of the [`REPLAY_WINDOW`] frames below
+    /// The highest sequence accepted this epoch, and a bitmap of which of the `REPLAY_WINDOW` frames below
     /// it have already been seen — bit `i` ⇔ `highest_seen − 1 − i`.
     ///
     /// Without this a captured frame re-opens for as long as its epoch is current (audit AT-H3). AEAD proves a
@@ -143,7 +143,7 @@ pub struct MediaSession {
     ///
     /// Counted because the alternative is a silent drop that looks exactly like packet loss, and the two call
     /// for opposite responses: loss is the network's, this is the window being too narrow for the path. A
-    /// nonzero value here is the evidence that would justify a wider bitmap — which is how [`REPLAY_WINDOW`]
+    /// nonzero value here is the evidence that would justify a wider bitmap — which is how `REPLAY_WINDOW`
     /// should ever change, rather than by someone's judgement of what feels roomy.
     reordered_past_window: u64,
 }
@@ -173,7 +173,7 @@ impl MediaSession {
         }
     }
 
-    /// How many frames this session refused for arriving further behind than [`REPLAY_WINDOW`] remembers.
+    /// How many frames this session refused for arriving further behind than `REPLAY_WINDOW` remembers.
     ///
     /// Distinct from loss, and the distinction is the point: loss is the network's business, this is the
     /// window being too narrow for the path it is running on.
@@ -222,7 +222,7 @@ impl MediaSession {
     /// `(sequence, kind, payload)`. `None` if malformed, from a different epoch (a stale frame after a rekey),
     /// failing authentication, or **replayed**.
     ///
-    /// Loss and reordering are still fine — a frame within [`REPLAY_WINDOW`] of the newest one opens whatever
+    /// Loss and reordering are still fine — a frame within `REPLAY_WINDOW` of the newest one opens whatever
     /// order it arrives in. What no longer works is opening the *same* frame twice: AEAD proves a frame was
     /// authentic once, and only the window proves it has not been seen before (RFC 3711 §3.3.2, audit AT-H3).
     ///

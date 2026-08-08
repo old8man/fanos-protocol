@@ -76,7 +76,7 @@ pub(crate) struct Store {
     /// **Durable in the literal sense now, and it was not for a long time.** The word was here before the
     /// mechanism was: nothing in this tree wrote the store to disk, so a record of permanent data loss did
     /// not itself survive a restart, which makes it a record of nothing. It is carried in
-    /// [`Store::snapshot`] and comes back through [`Store::restore`] (#77); a node whose configuration names
+    /// [`Store::snapshot`] and comes back through `Store::restore` (#77); a node whose configuration names
     /// no state directory still keeps nothing, and for that node the old caveat stands unchanged.
     pub(crate) loss_ledger: BTreeMap<[u8; DIGEST], Epoch>,
     /// Digests that **expire**, and the epoch after which each is dead — the soft-state half of the store.
@@ -178,12 +178,12 @@ const SNAPSHOT_VERSION: u32 = 1;
 
 /// Whether `bytes` is a snapshot **this build can adopt** — the question, exposed without the type.
 ///
-/// [`Store`] is deliberately `pub(crate)`, so a host that wants to *report* the outcome of a restore had no
+/// `Store` is deliberately `pub(crate)`, so a host that wants to *report* the outcome of a restore had no
 /// way to learn it: `OverlayNode::restore` returns the verdict but the composition swallows it, and the host
 /// was left holding the byte count instead (#189). A byte count answers *"was there a file?"*; this answers
 /// *"can it be read?"*, which is the fact the startup report claims.
 ///
-/// Defined by calling the same [`Store::restore`] the adoption path uses, so the two **cannot** disagree —
+/// Defined by calling the same `Store::restore` the adoption path uses, so the two **cannot** disagree —
 /// a re-implementation of the header check here would be a second decoder to keep in step, which is the
 /// shape that made the version constant above worth having in the first place.
 ///

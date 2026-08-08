@@ -54,7 +54,7 @@ pub(crate) const DIRECTORY_SLOT_EPOCHS: u32 = 1;
 pub(crate) const DIAGNOSIS_SLOT_EPOCHS: u32 = fanos_core::roles::REP_WINDOW as u32;
 
 /// Which `(coordinate, epoch)` directory a publish belongs to — the sub-kind
-/// [`Station::DirectoryPublishFailed`] is counted under.
+/// [`Station::DirectoryPublishFailed`](fanos_runtime::ports::stations::Station::DirectoryPublishFailed) is counted under.
 ///
 /// Named rather than aggregated because the consequence differs: losing the mix key makes this node
 /// unroutable for the epoch, losing the capability record makes it unassignable, losing the load report makes

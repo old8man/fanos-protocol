@@ -106,7 +106,7 @@ pub struct BeaconRejects {
     pub reshare_forged: u64,
     /// A reshare trigger this build could not parse (the envelope decoded, the body did not).
     pub reshare_malformed: u64,
-    /// A buffered future-epoch partial set discarded at [`MAX_PENDING_EPOCHS`].
+    /// A buffered future-epoch partial set discarded at `MAX_PENDING_EPOCHS`.
     ///
     /// Zero in honest operation: a cell runs one epoch ahead, not eight. A nonzero value means partials are
     /// arriving for epochs far beyond the adopted one — which a committee member can produce validly, so this
@@ -222,7 +222,7 @@ impl<F: Field> BeaconNode<F> {
     ///
     /// This was `pub` on the argument that "is this node buffering for eight epochs ahead?" is a real operator
     /// question. It is, and the operator already has its answer: [`BeaconRejects::partial_epoch_evicted`]
-    /// counts every time [`MAX_PENDING_EPOCHS`] actually bound, which is the *event*, while this is only the
+    /// counts every time `MAX_PENDING_EPOCHS` actually bound, which is the *event*, while this is only the
     /// gauge behind it. A public gauge with no reader is a door onto nothing, and the unwired-capability
     /// ratchet in `fanos-cli/tests/architecture.rs` exists to stop exactly that accumulating — so the gauge
     /// stays where its one caller is: the test that asserts the bound holds.

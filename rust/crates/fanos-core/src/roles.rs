@@ -144,7 +144,7 @@ impl Role {
     /// different emergencies — the second means the `t`-of-`(q+1)` guarantee is not being met at all. An
     /// operator reading `role.under_provisioned … tag 4` could not tell which, so the discrimination the
     /// station was built for stopped at the last inch. Written out rather than derived from `Debug`, for the
-    /// same reason [`Role::tag`] is: a saved query must survive a variant being renamed or reordered.
+    /// same reason [`index`](Self::index) is: a saved query must survive a variant being renamed or reordered.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -862,8 +862,13 @@ impl Reputation {
     /// weight becomes the [`effective_weight`](Self::effective_weight). Feed the result to [`assign`] /
     /// [`RoleController::step`] so reputation shapes who wins scarce roles.
     ///
-    /// **Also the moment the table is trimmed to the roster** ([`retain_members`](Self::retain_members)),
-    /// because it is the one call that is handed the membership.
+    /// **Also the moment the table is trimmed to the roster** (`retain_members`), because it is the one call
+    /// that is handed the membership.
+    //
+    // A code span, not an intra-doc link: `retain_members` is private, and `-D warnings` rejects a public
+    // doc that links into private items. It was a link, and it failed `cargo doc` for the whole crate —
+    // which under `--workspace` leaves every crate downstream of `fanos-core` undocumented as well, exactly
+    // the cascade ci.yml's own comment warns about.
     #[must_use]
     pub fn adjust(&mut self, members: &[(NodeId, Capability)]) -> Vec<(NodeId, Capability)> {
         self.retain_members(members);

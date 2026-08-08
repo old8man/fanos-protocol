@@ -13,7 +13,7 @@
 //!
 //! `fanos-runtime` is sans-I/O and `no_std`: it cannot open a file, and teaching it to would dissolve the seam
 //! the whole codebase is built on. So the engine says *what* is durable and in what bytes
-//! ([`Command::Snapshot`] → [`Notification::Snapshot`]), and this module — which has a filesystem — says
+//! ([`Command::Snapshot`](fanos_runtime::Command::Snapshot) → [`Notification::Snapshot`](fanos_runtime::Notification::Snapshot)), and this module — which has a filesystem — says
 //! *where* and *how often*. Restoring runs the other way and does not use a command at all: adopting a
 //! snapshot is only correct before the engine has served anything, so it is an argument to construction
 //! (`CellComposition::restore`).

@@ -221,7 +221,7 @@ async fn read_mix_key_in_mode<F: Field>(
 /// `coord` its current forward-secure onion public each epoch, so [`build_cell_mix_directory`] always
 /// reads a key the relay can still peel with. This is the async closure of the E4∩E5 loop (see
 /// [`EpochDriver`]): it publishes the genesis-epoch key at once, then follows the relay's own
-/// [`Notification::BeaconReady`] stream — a mirror [`EpochDriver`] seeded from the same `onion_seed`
+/// [`Notification::BeaconReady`](fanos_runtime::Notification::BeaconReady) stream — a mirror [`EpochDriver`] seeded from the same `onion_seed`
 /// derives, without reaching into the spawned engine, exactly the key the relay's hosted router rotates
 /// to, and republishes it at the new epoch's slot. `onion_seed` MUST be the seed the relay's
 /// [`MixRelay`](crate::MixRelay) / [`ThresholdRouter`](fanos_aphantos::ThresholdRouter) was spawned with.

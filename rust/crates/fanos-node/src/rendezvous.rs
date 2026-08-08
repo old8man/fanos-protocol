@@ -188,7 +188,7 @@ pub struct RendezvousRoute {
     pub epoch: Epoch,
     /// The epoch's randomness-beacon seed, folded into **both** halves of the rendezvous rotation: the
     /// meeting-line derivation, so a future epoch's line is unpredictable in advance (audit E5), and the
-    /// host-registration [`service_tag`](fanos_rendezvous::service_tag), so a future epoch's tag is not
+    /// host-registration [`service_tag`], so a future epoch's tag is not
     /// computable against a service's public identity either (#132). Carried beside `epoch` rather than
     /// derived from it because the two must be the same round's — the client obtains both from one `BEACON`
     /// sync, and both parties must use the same epoch's seed to meet. [`BeaconSeed::GENESIS`] before the
@@ -200,7 +200,7 @@ pub struct RendezvousRoute {
 /// Parameters to draw a **fresh unlinkable** rendezvous route *per dial* — the general anonymous proxy
 /// profile (spec §L5, #54). Each connection gets new random forward/reply hops drawn from the live mix
 /// `directory`, so an observer cannot link successive dials by their shared path (the fixed-route
-/// [`FanosDialer::anonymous`] reuses one path across dials and is linkable — a real proxy must use this).
+/// [`FanosDialer::anonymous`](crate::FanosDialer::anonymous) reuses one path across dials and is linkable — a real proxy must use this).
 pub struct AnonRouteParams {
     /// The live mixnet key directory (e.g. from [`build_cell_mix_directory`](crate::build_cell_mix_directory)).
     pub directory: MixDirectory,

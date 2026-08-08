@@ -91,7 +91,7 @@ fn bures_scale(n: usize) -> f64 {
 /// the critical-purity theorem's path 4 singles out independently — the nearest wall state is the one the
 /// spectral derivation already named.
 ///
-/// For general (not one-dominant) spectra this is a **conservative lower bound** (corpus [Г]: 41/41 random
+/// For general (not one-dominant) spectra this is a **conservative lower bound** (corpus \[Г\]: 41/41 random
 /// spectra, ratio ∈ [1.08, 2.52]), which is the safe direction — an alert built on it fires no later than it
 /// should.
 #[must_use]

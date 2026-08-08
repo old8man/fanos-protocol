@@ -472,7 +472,7 @@ impl LiveRoleController {
     /// ## The window is one epoch, and that is forced rather than chosen
     ///
     /// A window of `W` closed setpoints would need `W` readable closed epochs.
-    /// [`DIRECTORY_SLOT_EPOCHS`](crate::DIRECTORY_SLOT_EPOCHS) is `1` — derived from the onion ratchet's
+    /// `DIRECTORY_SLOT_EPOCHS` is `1` — derived from the onion ratchet's
     /// `DEFAULT_RETAIN`, i.e. the grace a lagging *reader* needs — so at epoch `e` the only closed load
     /// directory that still exists is `e − 1`. Smoothing over more history is not a trade-off available here;
     /// it is unreadable. Raising the retention to buy a window would couple two derivations that answer

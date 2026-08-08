@@ -161,8 +161,8 @@ impl Realm {
 /// RFC 1918 address is probing for the cloud metadata endpoint from inside the anonymity set (#170).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitRefusal {
-    /// The target header was unusable: absent, over [`MAX_TARGET_LEN`], truncated, not UTF-8, or not
-    /// `host:port`. **Not** a client that connected and said nothing — see [`TargetRead::Silent`], which is
+    /// The target header was unusable: absent, over `MAX_TARGET_LEN`, truncated, not UTF-8, or not
+    /// `host:port`. **Not** a client that connected and said nothing — see `TargetRead::Silent`, which is
     /// deliberately not counted here, because a session ending before it began is ordinary and would bury
     /// the signal this name carries under it.
     TargetMalformed,
@@ -452,7 +452,7 @@ enum TargetRead {
     Got(String),
     /// EOF before a single byte of the header — nothing was ever asked for.
     Silent,
-    /// Bytes arrived and were not a target: a zero or over-[`MAX_TARGET_LEN`] length, a truncated body, or
+    /// Bytes arrived and were not a target: a zero or over-`MAX_TARGET_LEN` length, a truncated body, or
     /// not UTF-8.
     Malformed,
 }

@@ -22,7 +22,7 @@
 //! ([`crate::mixdir`], [`crate::capdir`]) had been bound under S1-M3 and this one had not — hardening one
 //! member of a family and leaving another asserting a property it cannot back.
 //!
-//! So a report now travels inside the same [`Entitlement`](crate::bound::Entitlement) envelope a capability
+//! So a report now travels inside the same [`Entitlement`] envelope a capability
 //! advertisement does: the publisher's VRF credential for the slot's coordinate, checked on read. `None` for
 //! the prover/beacon keeps the unbound form, which is the honest answer for a pinned cell where no
 //! coordinate is provable — symmetric with the sibling directories, and the `Option` says whether the

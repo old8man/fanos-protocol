@@ -50,7 +50,7 @@ use crate::vote::{Certificate, NIL, Phase, SignedVote, Vote};
 const MAX_REVEAL_SUBSETS: usize = 4096;
 
 /// The most distinct not-yet-finalized transactions for which authenticated-but-unvalidatable reveals are
-/// buffered ([`ConsensusEngine::pending_reveals`]). Reveals are only buffered here after a signature check
+/// buffered (`ConsensusEngine::pending_reveals`). Reveals are only buffered here after a signature check
 /// binds them to a real committee member (audit B1), and this cap bounds the memory even a Byzantine member
 /// can force by streaming distinct commits: at most `MAX_PENDING_REVEAL_COMMITS × committee` reveal messages.
 /// The oldest-keyed commit is evicted past this; a genuine buffered reveal is drained the moment its block
@@ -60,7 +60,7 @@ pub const MAX_PENDING_REVEAL_COMMITS: usize = 4096;
 /// The **reveal window** (in finalized heights): how many blocks a finalized block's execution will wait for
 /// the anti-MEV openings to be **committed** before dropping any transaction still undecryptable.
 ///
-/// It bounds the search in [`ConsensusEngine::execution_height`]: block `H` executes at the first height in
+/// It bounds the search in `ConsensusEngine::execution_height`: block `H` executes at the first height in
 /// `(H, H+REVEAL_WINDOW]` whose committed openings decrypt every transaction in `H`, and at `H+REVEAL_WINDOW`
 /// unconditionally otherwise, dropping whatever still does not open. A liveness parameter, like the round
 /// timeout — network-agreed, not a security threshold.
@@ -822,7 +822,7 @@ const RECENT_BODY_CAP: usize = 64;
 /// construction. What remains is arrival order or the commitment itself, and both are attacker-controlled: a
 /// FIFO victim can be evicted deterministically by out-waiting it, and any function of the commitment can be
 /// ground, since the submitter chose its preimage. Refusing admission has **no victim to choose wrongly**,
-/// which is precisely the argument [`DEFERRAL_CAP`] already makes for the same question one field away.
+/// which is precisely the argument `DEFERRAL_CAP` already makes for the same question one field away.
 ///
 /// The consequence is honest and bounded: an attacker who fills the pool blocks new admissions until it
 /// drains, a liveness denial that is identical for every validator and visible in
@@ -1021,7 +1021,7 @@ pub struct ConsensusEngine<S: StateMachine> {
     /// **A missing record does not fail closed on its own**, and that is what makes the capacity policy load-bearing:
     /// the natural reading of "no record" is "first deferred now", which does not drop the transaction, it *restarts
     /// its give-up clock*. Any rule that lets a record disappear while the transaction lives therefore hands an
-    /// attacker an immortal transaction — measured, before [`DEFERRAL_CAP`]'s fail-closed rule, at a victim occupying
+    /// attacker an immortal transaction — measured, before `DEFERRAL_CAP`'s fail-closed rule, at a victim occupying
     /// every height of a 26-height run instead of expiring after 5.
     ///
     /// FIFO eviction was that rule. `BoundedMap` fixes a key's position at its first insert and never refreshes it on
@@ -1285,7 +1285,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// the one it closes.
     ///
     /// Safe to exempt because the exemption is **already bounded elsewhere**: a deferred transaction has a
-    /// give-up clock and no clock is issued past [`DEFERRAL_CAP`], so at most `DEFERRAL_CAP` entries can ever
+    /// give-up clock and no clock is issued past `DEFERRAL_CAP`, so at most `DEFERRAL_CAP` entries can ever
     /// enter this way. The pool's ceiling becomes `MEMPOOL_CAP + DEFERRAL_CAP`, which is still a constant.
     fn readmit(&mut self, tx: SealedTx) {
         self.mempool.entry(tx.commit()).or_insert(tx);
@@ -1655,7 +1655,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// snapshot it certifies, or `None` when the two are not both in hand.
     ///
     /// Exists so a **disk** can be served the same thing a peer is (#57). Persisting `(cert, snapshot)` and
-    /// feeding it back through [`Input::SyncResp`](crate::consensus::Input::SyncResp) at startup means a file
+    /// feeding it back through [`Input::SyncResp`] at startup means a file
     /// is adopted by exactly the checks that adopt a peer's answer — quorum verified, head bound, root
     /// re-derived from the restored state. A tampered snapshot is refused by the same `cert.verify` that
     /// refuses a forged one on the wire, so persistence adds **no trust in the filesystem**: the disk is just
@@ -3286,7 +3286,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     ///
     /// A **known** transaction is aged against its stored clock and never re-inserted — re-insertion would be a no-op
     /// on `BoundedMap` anyway, and writing it would suggest the clock could move. A **new** one is admitted only if
-    /// there is room for its clock ([`DEFERRAL_CAP`]), because a transaction that cannot be aged must not be retried.
+    /// there is room for its clock (`DEFERRAL_CAP`), because a transaction that cannot be aged must not be retried.
     fn note_deferrals(&mut self, opened_from: &[SealedTx], outcomes: &[ExecOutcome]) {
         for (sealed, outcome) in opened_from.iter().zip(outcomes) {
             let commit = sealed.commit();

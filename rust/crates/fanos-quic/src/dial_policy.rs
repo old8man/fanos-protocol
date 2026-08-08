@@ -12,11 +12,11 @@
 //!
 //! They differ because the questions differ, and collapsing them would break one of the two:
 //!
-//! * [`Policy::Clearnet`] — an exit relays for an anonymous third party to a destination **the operator never
+//! * [`Policy::Clearnet`](crate::dial_policy::Policy::Clearnet) — an exit relays for an anonymous third party to a destination **the operator never
 //!   chose**. The operator's own networks must therefore be unreachable, so: globally routable only. Private,
 //!   CGNAT and link-local are all refused, which is what keeps `169.254.169.254` — every cloud's credential
 //!   endpoint — out of reach.
-//! * [`Policy::Overlay`] — a punch dials a **claimed member of this overlay**. A FANOS peer legitimately sits
+//! * [`Policy::Overlay`](crate::dial_policy::Policy::Overlay) — a punch dials a **claimed member of this overlay**. A FANOS peer legitimately sits
 //!   on `10/8` or `192.168/16`: a datacenter deployment, a home LAN, a local testnet — and NAT traversal is
 //!   exactly what that topology needs. Applying the exit's rule here would break the feature. What is never
 //!   legitimate is an address that cannot *be* a distinct peer.

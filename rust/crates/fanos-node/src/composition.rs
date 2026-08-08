@@ -76,7 +76,7 @@ pub struct CellComposition {
     /// Carried as coordinates rather than a `HierAddr<F>` so this type stays free of the field parameter — the
     /// path is the same numbers either way, and `compose_engine` knows `F`.
     pub hier_path: Option<Vec<Triple>>,
-    /// This node's **durable store**, as written by a previous run of it ([`Command::Snapshot`]).
+    /// This node's **durable store**, as written by a previous run of it ([`Command::Snapshot`](fanos_runtime::Command::Snapshot)).
     ///
     /// Adopted at construction because that is the only correct moment: restoring over an engine that has
     /// already accepted a write would discard it. A snapshot this build cannot read is refused and the node

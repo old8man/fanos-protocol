@@ -337,7 +337,7 @@ const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// speed, so the engine cannot outrun it for long.
 ///
 /// **The same argument was made for the per-peer send queues and it does not hold there** — see
-/// [`MAX_PEER_SEND_QUEUE`]. It bounds the engine's production *rate*, not the queue's *depth*, and a queue
+/// `MAX_PEER_SEND_QUEUE`. It bounds the engine's production *rate*, not the queue's *depth*, and a queue
 /// whose consumer runs at zero grows without limit however slowly it is filled.
 const INPUT_CAP: usize = 1024;
 
@@ -438,7 +438,7 @@ struct Transport {
     directory: Directory,
     /// Identity-keyed distrust, so a quarantine follows the peer rather than the point (audit R-M1).
     distrust: Arc<Distrust>,
-    /// Frames not made because a peer's send queue was at [`MAX_PEER_SEND_QUEUE`] (#89).
+    /// Frames not made because a peer's send queue was at `MAX_PEER_SEND_QUEUE` (#89).
     ///
     /// Zero on a healthy node, and a non-zero value has exactly one meaning: some peer stopped draining and
     /// this node stopped making frames for it. Counted rather than logged-and-forgotten because that is the
@@ -558,7 +558,7 @@ impl NodeHandle {
         self.identity.as_ref().map(|id| id.prove.clone())
     }
 
-    /// Frames this node **did not make** because a peer's send queue was at [`MAX_PEER_SEND_QUEUE`].
+    /// Frames this node **did not make** because a peer's send queue was at `MAX_PEER_SEND_QUEUE`.
     ///
     /// Zero on a healthy node. A non-zero value has one meaning and it is actionable: some peer stopped
     /// draining its connection, so this node stopped queueing for it rather than growing without limit

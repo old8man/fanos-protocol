@@ -32,7 +32,7 @@ impl Morph {
         matches!(self, Self::Polymorph)
     }
 
-    /// Whether this morph can only be honoured by a **plugged [`MorphCodec`]** — the four cover-protocol
+    /// Whether this morph can only be honoured by a **plugged [`MorphCodec`](crate::codec::MorphCodec)** — the four cover-protocol
     /// tunnels.
     ///
     /// Per the "Parrot is Dead" rule the core does not, and must not, fabricate a cover protocol's

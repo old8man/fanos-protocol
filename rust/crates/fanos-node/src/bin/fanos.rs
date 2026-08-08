@@ -143,8 +143,8 @@ fn line_size_arg(args: &[String]) -> Result<usize, NodeError> {
 /// used to state only one.
 ///
 /// It advised "pass `--plane-order 4|7|31`", which is sound advice about the anonymity *set* and was, at the
-/// same time, advice to use the planes where [`slots::plane_can_anonymize`] is false: the fixed-slot header
-/// there carries fewer hops than [`slots::TARGET_DEPTH`], so those deployments cannot build a circuit that
+/// same time, advice to use the planes where [`slots::plane_can_anonymize`](fanos_aphantos::slots::plane_can_anonymize) is false: the fixed-slot header
+/// there carries fewer hops than [`slots::TARGET_DEPTH`](fanos_aphantos::slots::TARGET_DEPTH), so those deployments cannot build a circuit that
 /// hides either endpoint. Two subsystems, opposite counsel, neither aware of the other — so the operator was
 /// being sent from a real weakness to a worse one.
 ///

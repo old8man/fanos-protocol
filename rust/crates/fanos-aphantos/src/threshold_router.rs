@@ -301,7 +301,7 @@ impl<F: Field> ThresholdRouter<F> {
     /// delay of mean `mean_delay` before sending, so a batch of onions leaves reordered (spec §L5, V7).
     /// Zero disables it.
     ///
-    /// **With [`with_cover`](Self::with_cover) set, this value is not read at all** — [`forward_send`] queues
+    /// **With [`with_cover`](Self::with_cover) set, this value is not read at all** — `forward_send` queues
     /// the cell for the next constant-rate slot and returns before it reaches the delay, and the batch is
     /// reordered by the slot's PRF pick instead. The two are alternatives, not layers. Saying so here because
     /// `forward_send`'s doc said it and this one did not, and a builder is where a caller looks (#181).
