@@ -166,3 +166,63 @@ async fn shaped_nodes_deliver_under_a_pluggable_codec() {
     ).unwrap())
     .await;
 }
+
+/// Bytes that do not un-shape are counted, and counted as *that* — not as the other transport discard.
+///
+/// Before #191 this was a bare `continue` in `read_frames`. Two defects lived in that silence: #190's
+/// ceiling mismatch (every full block dropped, `write_all` reporting success) and #196's epoch-turn
+/// blackout. It is also exactly what an active censor probing a PROTEUS bridge produces — so an unprobed
+/// bridge and one under systematic probing were observationally identical.
+///
+/// Driven by giving the two nodes **different community secrets**, which is the same condition a peer in
+/// another epoch or a stranger creates: A's frames are well-formed and B cannot strip them.
+///
+/// The negative half is the point. A counter that rises on everything says nothing, so this asserts the
+/// *other* transport station stays at zero — the frames are the right size, they are simply not ours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_that_do_not_unshape_are_counted_as_that_and_not_as_something_else() {
+    let epoch = fanos_proteus::Epoch::new(3);
+    let dir = Directory::new();
+    let a = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
+        dir.clone(),
+        ProteusConfig::polymorph(b"community-A".to_vec()),
+        epoch,
+    )
+    .await
+    .expect("spawn A");
+    let b = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
+        dir.clone(),
+        ProteusConfig::polymorph(b"community-B-different".to_vec()),
+        epoch,
+    )
+    .await
+    .expect("spawn B");
+
+    let count = |h: &fanos_quic::NodeHandle, want: &str| -> u64 {
+        h.client()
+            .driver_stations()
+            .iter()
+            .filter(|o| o.station.name() == want)
+            .map(|o| o.count)
+            .sum()
+    };
+    assert_eq!(count(&b, "wire.unshaped"), 0, "nothing has been refused before any traffic");
+
+    for _ in 0..8 {
+        a.command(Command::Send { to: b.address(), payload: b"unreadable to B".to_vec() });
+    }
+    // No delivery to await — that is the condition under test — so give the reads a bounded moment to run.
+    tokio::time::sleep(StdDuration::from_secs(2)).await;
+
+    assert!(
+        count(&b, "wire.unshaped") > 0,
+        "B must count the frames it could not strip; a bridge under probing looked idle before this"
+    );
+    assert_eq!(
+        count(&b, "wire.over_bound"),
+        0,
+        "and must not blame the size: these frames are well within the ceiling, they are simply not ours"
+    );
+}

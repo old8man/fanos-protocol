@@ -202,6 +202,28 @@ pub enum Station {
     /// count without the tag cannot answer it, and a count without the line cannot localize it.
     FrameTypeUnknown,
 
+    // --- Transport (`fanos_quic::driver`) ---
+    //
+    // The first stations below the engine. Every other name in this enum is raised by an engine, which sees
+    // only what the transport already accepted — so the layer every byte crosses first, and the only one an
+    // adversary reaches without speaking the protocol, had no name for anything that happened to it (#191).
+
+    /// Wire bytes exceeding `MAX_FRAME + MAX_WIRE_OVERHEAD` — the read refused them before allocating.
+    ///
+    /// Distinct from [`WireUnshaped`](Self::WireUnshaped) because the peer is *speaking our shape* and
+    /// producing something this build will not read: a version disagreement about the ceiling, or a
+    /// deliberate oversize. Before #190 this fired on every full TAXIS block from an honest peer and nobody
+    /// could see it, which is exactly why it is a counter and not a log line.
+    WireOverBound,
+
+    /// Bytes that did not un-shape under this node's community secret and epoch.
+    ///
+    /// Two very different causes share this name today and must be split once the rotation window exists
+    /// (#196): a peer one epoch behind is transient and self-healing, while bytes matching no known shape are
+    /// a stranger — or an **active censor probing a PROTEUS bridge**. Until then a *rise* is the signal; a
+    /// steady low rate at an epoch boundary is the benign half.
+    WireUnshaped,
+
     // --- POROS admission (`fanos_node::PorosHost`) ---
     /// A request arrived from a coordinate other than the one it claims — the identity binding refusing a
     /// relayed or replayed proof.
@@ -366,6 +388,8 @@ impl Station {
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
+        Self::WireOverBound,
+        Self::WireUnshaped,
         Self::StoreAtCapacity,
     ];
 
@@ -395,6 +419,8 @@ impl Station {
             Self::HolonomyRejected => "holonomy.rejected",
             Self::FrameDecodeFailed => "frame.decode_failed",
             Self::FrameTypeUnknown => "frame.type_unknown",
+            Self::WireOverBound => "wire.over_bound",
+            Self::WireUnshaped => "wire.unshaped",
             Self::StoreAtCapacity => "store.at_capacity",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",
             Self::AdmissionPowFailed => "admission.pow_failed",

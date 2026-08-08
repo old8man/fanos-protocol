@@ -414,6 +414,9 @@ struct SendRequest {
 /// The transport's shared context: everything the send and receive paths need besides the destination.
 #[derive(Clone)]
 struct Transport {
+    /// The driver-side data-path plane (#191): discards that stop before the engine, so the engine cannot
+    /// count them. Shared with the `NodeHandle`, whose `driver_stations` merges it into the answer to `Observe`.
+    stations: Arc<Mutex<Stations>>,
     endpoint: Endpoint,
     conns: ConnMap,
     input_tx: mpsc::Sender<Input>,
@@ -1747,9 +1750,16 @@ fn spawn_inner(
     // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
     // coordinate go stale at the first reshuffle.
     let seat = Arc::new(Mutex::new(addr));
+    // The driver-side data-path plane, created **here** rather than at the `NodeHandle` below so the
+    // transport can share it. `Client::record_station` and `driver_stations` already existed and already had
+    // production callers, but `Transport` held no handle to the plane — so the three discards in
+    // `read_frames`, thirty lines from the recorder, could not reach it and stayed uncounted (#191). One
+    // absent field is all that separated a built facility from the place that needed it most.
+    let stations = Arc::new(Mutex::new(Stations::new()));
 
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
+        stations: Arc::clone(&stations),
         endpoint: endpoint.clone(),
         conns,
         input_tx: input_tx.clone(),
@@ -1781,7 +1791,7 @@ fn spawn_inner(
 
     Ok(NodeHandle {
         addr: seat,
-        stations: Arc::new(Mutex::new(Stations::new())),
+        stations,
         local_addr,
         input_tx,
         ctrl_tx,
@@ -2126,7 +2136,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
         // to have proved the coordinate we dialed — otherwise the address resolved to an impostor
         // (or a negotiation-incompatible peer) and we drop it.
         Some(id) => {
-            let peer = hello_exchange(&conn, &t.shaper, id).await;
+            let peer = hello_exchange(&conn, t, id).await;
             if peer != Some(to) {
                 tracing::warn!(
                     ?to,
@@ -2200,8 +2210,8 @@ impl Drop for SourceGuard {
 /// rejected (bad proof / incompatible negotiation) or unreadable.
 async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
     match &t.identity {
-        Some(id) => hello_exchange(conn, &t.shaper, id).await,
-        None => read_hello(conn, &t.shaper).await,
+        Some(id) => hello_exchange(conn, t, id).await,
+        None => read_hello(conn, t).await,
     }
 }
 
@@ -2349,12 +2359,15 @@ async fn send_error(conn: &Connection, shaper: &Shaper, err: ProtocolError) {
 /// another, so no live challenge is needed (spec §7.3).
 async fn read_verified_hello(
     conn: &Connection,
-    shaper: &Shaper,
+    t: &Transport,
     verify: &HelloVerifier,
 ) -> Option<HelloResult> {
     let mut stream = conn.accept_uni().await.ok()?;
     let raw = stream.read_to_end(max_wire()).await.ok()?;
-    let hello = shape_in(shaper, raw)?;
+    let Some(hello) = shape_in(&t.shaper, raw) else {
+        t.record_station(Station::WireUnshaped, None, None);
+        return None;
+    };
     let cert = peer_cert_der(conn)?;
     verify(&cert, &hello)
 }
@@ -2369,13 +2382,13 @@ async fn read_verified_hello(
 /// Both the dialer ([`get_or_connect`]) and the acceptor ([`accept_loop`]) call this same function:
 /// each announces its own HELLO immediately (never waiting on the peer first), so there is no
 /// ordering dependency between the two sides — symmetric, and it cannot deadlock.
-async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Option<Triple> {
+async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Option<Triple> {
     // Snapshot the current-epoch HELLO (an `Arc` clone) and drop the lock before awaiting, so a concurrent
     // reshuffle can rewrite it without blocking on this connection's I/O. A poisoned lock rejects the
     // handshake (`None`), matching the connection-map convention elsewhere in this driver.
     let hello = id.hello.read().ok()?.clone();
-    send_hello(conn, shaper, &hello).await;
-    match read_verified_hello(conn, shaper, &id.verify).await? {
+    send_hello(conn, &t.shaper, &hello).await;
+    match read_verified_hello(conn, t, &id.verify).await? {
         HelloResult::Established {
             coord,
             version,
@@ -2384,7 +2397,7 @@ async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Op
             // place holding the peer's certificate DER — the identity the coordinate VRF binds to.
             peer: _,
         } => {
-            send_hello_ack(conn, shaper, version, capabilities).await;
+            send_hello_ack(conn, &t.shaper, version, capabilities).await;
             Some(coord)
         }
         HelloResult::Incompatible(err) => {
@@ -2392,7 +2405,7 @@ async fn hello_exchange(conn: &Connection, shaper: &Shaper, id: &SelfCert) -> Op
                 ?err,
                 "HELLO negotiation incompatible; sending ERROR and aborting"
             );
-            send_error(conn, shaper, err).await;
+            send_error(conn, &t.shaper, err).await;
             None
         }
     }
@@ -2444,14 +2457,32 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 }
 
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
-async fn read_hello(conn: &Connection, shaper: &Shaper) -> Option<Triple> {
+async fn read_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
     let mut stream = conn.accept_uni().await.ok()?;
     let raw = stream.read_to_end(max_wire()).await.ok()?;
-    let bytes = shape_in(shaper, raw)?;
+    let Some(bytes) = shape_in(&t.shaper, raw) else {
+        // The HELLO path un-shapes too, and it fires FIRST: a peer on another epoch or another community
+        // never reaches `read_frames`, so instrumenting only the steady-state path counts nothing for
+        // exactly the peer an operator wants named. Found by the falsification, not by reading (#191).
+        t.record_station(Station::WireUnshaped, None, None);
+        return None;
+    };
     decode_triple(bytes.get(..HELLO_LEN)?)
 }
 
 /// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
+impl Transport {
+    /// Record one driver-side discard on this node's data-path plane — the same plane `Client` records on
+    /// and `NodeHandle::driver_stations` merges into the answer to `Observe`, reached through the `Arc` this
+    /// struct now shares (#191).
+    fn record_station(&self, station: Station, line: Option<Triple>, tag: Option<u64>) {
+        self.stations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_tagged(station, line, tag, 1);
+    }
+}
+
 async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // Mutable because a peer may **move**: a coordinate is not fixed for the life of a connection (spec §L3 reshuffle, and
     // within an epoch when a better claim displaces the peer). A verified move re-keys this connection and re-attributes
@@ -2460,10 +2491,17 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // `accept_uni` errors when the connection closes, ending the loop; a single malformed or
     // wrongly-shaped stream is skipped without sinking the connection.
     while let Ok(mut stream) = conn.accept_uni().await {
+        // Both discards below were bare `continue`s. They are the two conditions an operator most needs and
+        // could least see: #190 lived in the first for as long as the frame ceiling and the wire ceiling were
+        // one constant, and #196's epoch-turn blackout lives in the second. Counted separately on purpose —
+        // "a peer produces frames this build will not read" and "these bytes are not ours" call for opposite
+        // responses, and one number cannot say which.
         let Ok(raw) = stream.read_to_end(max_wire()).await else {
+            t.record_station(Station::WireOverBound, Some(from), None);
             continue;
         };
         let Some(frame) = shape_in(&t.shaper, raw) else {
+            t.record_station(Station::WireUnshaped, Some(from), None);
             continue;
         };
         // Intercept transport-level signalling before the engine sees it — reflexive discovery and NAT
