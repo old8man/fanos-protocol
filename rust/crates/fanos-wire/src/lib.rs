@@ -19,6 +19,12 @@
 //! The `#[cfg]` gates keep it `#![no_std]` (with `alloc`).
 
 #![cfg_attr(not(test), no_std)]
+// `variant_count` makes "every error class is listed in `ProtocolError::ALL`" a compile-time fact rather
+// than a hand-maintained one. The list is what a reader enumerates to turn an `Observation` tag back into a
+// name, so a variant missing from it renders as a bare integer to the one reader it exists for — and no
+// *test* can catch that, since a test can only visit the variants the list already holds. Same grounds as
+// `fanos-ports`, which uses the feature for `Station::ALL`; nightly is pinned deliberately.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;

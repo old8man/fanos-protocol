@@ -378,6 +378,32 @@ pub enum Station {
     /// the one exit failure that is *this operator's to fix* — so conflating it with a dial failure would
     /// point them at their upstream while the fault is `LimitNOFILE`.
     ExitSocketUnavailable,
+
+    // --- Peer refusals (`fanos_runtime::OverlayNode::on_error`) ---
+
+    /// A peer sent an `ERROR` frame refusing something this node did, and **said why**.
+    ///
+    /// The protocol defines fifteen error classes and the engine acted on one, returning `Vec::new()` for the
+    /// other fourteen — so a peer that refuses us for an unsupported version, a stale epoch or a failed
+    /// coordinate proof told us exactly that and the reason stopped one function short of the operator.
+    /// During a rollout that refusal *is* the whole diagnostic: the joining node otherwise reports nothing
+    /// but a peer that will not talk.
+    ///
+    /// [`Observation::tag`] carries `ProtocolError::index()` — a **dense** index, not the wire code, because
+    /// the codes run to 502 and [`MAX_SKEW_TAG`] would silently fold nine of the fifteen into the untagged
+    /// bucket. A code this build does not recognise is still counted, untagged, on the same reasoning as
+    /// [`FrameTypeUnknown`](Self::FrameTypeUnknown): a rising count with no tag is the honest reading of
+    /// "something is refusing us for a reason we have no name for".
+    PeerRefused,
+
+    /// An `ERROR` frame whose body would not parse at all — not a refusal we can name, a refusal we cannot
+    /// read.
+    ///
+    /// Distinct from [`PeerRefused`](Self::PeerRefused) because the remedy is different and the cause is
+    /// probably ours: #75 found the `ERROR` frame had two incompatible encodings and only one in the
+    /// conformance vector, so a peer speaking the other one lands precisely here. A rise means the two ends
+    /// disagree about the format of the message that explains disagreements.
+    PeerRefusalUnreadable,
 }
 
 /// **`ALL` is complete, proven by the compiler.**
@@ -436,6 +462,8 @@ impl Station {
         Self::ExitRefused,
         Self::ExitDialFailed,
         Self::ExitSocketUnavailable,
+        Self::PeerRefused,
+        Self::PeerRefusalUnreadable,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -481,6 +509,8 @@ impl Station {
             Self::ExitRefused => "exit.refused",
             Self::ExitDialFailed => "exit.dial_failed",
             Self::ExitSocketUnavailable => "exit.socket_unavailable",
+            Self::PeerRefused => "peer.refused",
+            Self::PeerRefusalUnreadable => "peer.refusal_unreadable",
         }
     }
 }

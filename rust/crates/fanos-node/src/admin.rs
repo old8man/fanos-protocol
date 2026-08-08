@@ -345,6 +345,9 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::RoleUnderProvisioned => {
             fanos_core::roles::Role::ALL.iter().find(|r| r.index() as u64 == tag).map(|r| r.name())
         }
+        Station::PeerRefused => {
+            fanos_wire::ProtocolError::ALL.iter().find(|e| e.index() == tag).map(|e| e.name())
+        }
         _ => None,
     }
 }
@@ -938,6 +941,18 @@ mod tests {
                 "role {} renders as a bare number — and this is the station where that costs the most",
                 r.name()
             );
+        }
+        for e in fanos_wire::ProtocolError::ALL {
+            assert_eq!(
+                tag_name(Station::PeerRefused, e.index()),
+                Some(e.name()),
+                "protocol error {} renders as a bare number",
+                e.name()
+            );
+            // And the tag is the DENSE index, never the wire code: `MAX_SKEW_TAG = 255` would fold nine of
+            // the fifteen codes into the untagged bucket, so a mapping keyed by `code()` would resolve the
+            // 1xx/2xx classes and silently lose the rest. Asserted, because that failure is invisible.
+            assert!(e.index() <= fanos_runtime::ports::stations::MAX_SKEW_TAG, "{} tag is clampable", e.name());
         }
         // And the other direction, or the mapping above is indistinguishable from one that names everything:
         // a tag outside a vocabulary, and a station whose tag is a quantity, must both stay unnamed.

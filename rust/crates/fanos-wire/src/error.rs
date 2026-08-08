@@ -93,7 +93,88 @@ pub enum ProtocolError {
     PowRequired = 502,
 }
 
+/// `ProtocolError::ALL` is complete, proven by the compiler — same reasoning as `Station::ALL`. A variant
+/// missing from it is invisible to every reader that enumerates, which here means an operator's counter for
+/// that error class renders as a bare integer.
+const _: () = assert!(
+    ProtocolError::ALL.len() == core::mem::variant_count::<ProtocolError>(),
+    "a ProtocolError variant is missing from ProtocolError::ALL, so its counter has no name"
+);
+
 impl ProtocolError {
+    /// Every error class, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[
+        Self::Unsupported,
+        Self::Malformed,
+        Self::NonCanonical,
+        Self::BadCoord,
+        Self::EpochStale,
+        Self::SybilReject,
+        Self::NoRoute,
+        Self::QuorumUnavail,
+        Self::ThresholdUnmet,
+        Self::PathBroken,
+        Self::HolonomyFail,
+        Self::CoverStarved,
+        Self::SvcUnreachable,
+        Self::RdvExpired,
+        Self::PowRequired,
+    ];
+
+    /// A **dense** index into [`ALL`](Self::ALL) — the discriminant an observation tag carries.
+    ///
+    /// Deliberately not [`code`](Self::code). The wire codes are 100…502, and the data-path plane clamps a
+    /// tag at `MAX_SKEW_TAG = 255` (an attacker-minted key is the one thing its cardinality bound forbids),
+    /// so tagging by wire code would file `Unsupported`(100) under its own name and silently fold
+    /// `NoRoute`(300) and eight others into the untagged bucket — a histogram wrong in a way its reader
+    /// cannot see. The wire code stays on the wire; the counter gets an index.
+    ///
+    /// Written out rather than derived from position, for the same reason `Gate::tag` is: an operator's
+    /// saved query must survive a variant being inserted.
+    #[must_use]
+    pub const fn index(self) -> u64 {
+        match self {
+            Self::Unsupported => 0,
+            Self::Malformed => 1,
+            Self::NonCanonical => 2,
+            Self::BadCoord => 3,
+            Self::EpochStale => 4,
+            Self::SybilReject => 5,
+            Self::NoRoute => 6,
+            Self::QuorumUnavail => 7,
+            Self::ThresholdUnmet => 8,
+            Self::PathBroken => 9,
+            Self::HolonomyFail => 10,
+            Self::CoverStarved => 11,
+            Self::SvcUnreachable => 12,
+            Self::RdvExpired => 13,
+            Self::PowRequired => 14,
+        }
+    }
+
+    /// The short operator-facing label — a counter key, where [`Display`](core::fmt::Display) is a sentence
+    /// for a log line. Both exist because a dashboard column and a warning read differently.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Malformed => "malformed",
+            Self::NonCanonical => "non_canonical",
+            Self::BadCoord => "bad_coord",
+            Self::EpochStale => "epoch_stale",
+            Self::SybilReject => "sybil_reject",
+            Self::NoRoute => "no_route",
+            Self::QuorumUnavail => "quorum_unavail",
+            Self::ThresholdUnmet => "threshold_unmet",
+            Self::PathBroken => "path_broken",
+            Self::HolonomyFail => "holonomy_fail",
+            Self::CoverStarved => "cover_starved",
+            Self::SvcUnreachable => "svc_unreachable",
+            Self::RdvExpired => "rdv_expired",
+            Self::PowRequired => "pow_required",
+        }
+    }
+
     /// The error class digit (`1..=5`) — the caller's coarse reaction bucket (spec §7.5).
     #[must_use]
     pub fn class(self) -> u8 {

@@ -119,7 +119,7 @@ pub(crate) const EPOCH_PERIOD: Duration = Duration::from_millis(600_000);
 /// a single round. The proportional law cannot do that, and says so at its own definition ("never negative,
 /// so it cannot push `r` below the band").
 ///
-/// So there is no step constant any more. [`decouple_ceiling`] is the cap, derived below.
+/// So there is no step constant any more. `decouple_ceiling` is the cap, derived below.
 pub(crate) const DECOUPLE_DECAY: f64 = decouple_decay();
 
 /// The largest shed that still leaves the cell a **collective subject**, for a cell of `n` live nodes at
@@ -392,7 +392,7 @@ impl Config {
     /// ([`fanos_diakrisis::window::control_confidence`], distribution-free by Cantelli).
     ///
     /// One derived quantity now stands where three chosen ones did — this, the window, and the shed's safety
-    /// margin in [`decouple_ceiling`] — and all three move with the plane, the dwell and this node's clock.
+    /// margin in `decouple_ceiling` — and all three move with the plane, the dwell and this node's clock.
     #[must_use]
     pub fn control_confidence(&self) -> f64 {
         fanos_diakrisis::window::control_confidence(BAND_DWELL as usize, self.heartbeats_per_epoch())
@@ -870,7 +870,7 @@ impl<F: Field> OverlayNode<F> {
             // diagnostics for a log, and the engine has nowhere to write. Surfacing this one is what makes an
             // *adaptive* admission price safe to run at all: without it, a joiner priced out between minting its
             // proof and presenting it is refused forever with no way to learn the number that would work.
-            Some(FrameType::Error) => self.on_error(frame.body),
+            Some(FrameType::Error) => self.on_error(from, frame.body),
             // **The reachable version-skew site.** A composite routes by frame type, so a type nobody claims
             // arrives here — this is where a peer on a different release actually lands in a deployed node,
             // not at a threshold engine whose composite filtered the frame away before it could see one.
@@ -901,13 +901,37 @@ impl<F: Field> OverlayNode<F> {
         }
     }
 
-    /// Decode an `Error` frame, act on the one kind a node can act on, and surface it either way.
+    /// Decode an `Error` frame, act on the one kind a node can act on, and **count every kind**.
     ///
     /// A refusal that names a price this node can afford is repaid **here**: the admission difficulty is raised
     /// and the proof re-minted, exactly as [`on_reseat`](Self::reseat) already does when the coordinate moves.
     /// Above [`MAX_INLINE_ADMISSION_BITS`] it is only reported, because the work would block the engine.
-    fn on_error(&mut self, body: &[u8]) -> Vec<Effect> {
-        let Some((code, reason)) = crate::frames::parse_error(body) else { return Vec::new() };
+    ///
+    /// **Having nothing to do is not having nothing to say.** This used to `return Vec::new()` for every code
+    /// but `SybilReject` — fourteen of the fifteen classes the protocol defines. A peer that refuses us states
+    /// why on the wire, and `decode_error`'s own doc keeps the code *unresolved* precisely "so a caller can
+    /// log/react to a future error class this build does not know"; the one caller resolved nothing and
+    /// reacted to one code. During a version rollout that refusal is the entire diagnostic — the joining node
+    /// otherwise reports only a peer that will not talk (#198).
+    ///
+    /// The `SybilReject` asymmetry stays, because it is the only class with an *action*. What changed is that
+    /// the other fourteen now leave a trace, tagged by [`fanos_wire::ProtocolError::index`] so an operator can tell an
+    /// `Unsupported` rollout wall from a `BadCoord` attack.
+    fn on_error(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+        let Some((code, reason)) = crate::frames::parse_error(body) else {
+            // Not a refusal we can name — a refusal we cannot read, which is likelier to be our own fault:
+            // #75 found two incompatible ERROR encodings with only one in the conformance vector.
+            self.stations.record(Station::PeerRefusalUnreadable, Some(from));
+            return Vec::new();
+        };
+        // A code this build does not recognise is still counted, untagged — the honest reading, and the same
+        // rule `FrameTypeUnknown` follows for a wire code outside its registry.
+        self.stations.record_tagged(
+            Station::PeerRefused,
+            Some(from),
+            fanos_wire::ProtocolError::from_code(code).map(fanos_wire::ProtocolError::index),
+            1,
+        );
         if code != fanos_wire::ProtocolError::SybilReject.code() {
             return Vec::new();
         }
@@ -1153,7 +1177,7 @@ impl<F: Field> OverlayNode<F> {
     /// The store is the only thing in a node worth keeping across a restart that the network cannot hand
     /// back for free, and `fanos-runtime` is sans-I/O and `no_std` — it cannot open a file and should not
     /// learn how. So the split is: the engine says *what* is durable and in what bytes, and the host says
-    /// *where* and *when* ([`crate::store::Store::snapshot`] states what is in it and what is deliberately
+    /// *where* and *when* (`Store::snapshot` states what is in it and what is deliberately
     /// left out).
     #[must_use]
     pub fn snapshot(&self) -> Vec<u8> {
@@ -1884,6 +1908,102 @@ mod tests {
         assert_eq!(skew.len(), 1, "the unclaimed type is counted once");
         assert_eq!(skew[0].line, Some(peer), "localized to the sender, so a LINE can be judged against `t`");
         assert_eq!(skew[0].tag, Some(0x7E), "carrying the code the peer used — the evidence of its release");
+    }
+
+    /// **Every reason a peer refuses us is counted, and by reason** (#198).
+    ///
+    /// The engine acted on `SybilReject` and returned `Vec::new()` for the other fourteen classes, so a peer
+    /// that refused us for an unsupported version, a stale epoch or a failed coordinate proof said exactly
+    /// that on the wire and nothing survived one function later. During a rollout that refusal is the entire
+    /// diagnostic.
+    ///
+    /// Three properties, and the second is the one that makes the counter worth having:
+    /// 1. a non-Sybil refusal is counted at all,
+    /// 2. it is counted **under its own tag** — `Unsupported` and `EpochStale` must not share a bucket,
+    /// 3. a code this build does not know is still counted, **untagged** rather than dropped or invented.
+    ///
+    /// The tag is `index()`, never `code()`: the wire codes reach 502 and `record_tagged` clamps at
+    /// `MAX_SKEW_TAG = 255`, so a code-keyed tag would file 1xx/2xx under their names and fold 3xx–5xx into
+    /// the untagged bucket — indistinguishable, here, from property 3 firing.
+    #[test]
+    fn a_peer_that_refuses_us_is_counted_by_the_reason_it_gave() {
+        use fanos_wire::ProtocolError;
+        use fanos_wire::error::encode_error;
+
+        let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+        let peer = Point::<F2>::at(1).coords();
+
+        let refuse = |node: &mut OverlayNode<F2>, at: u64, body: Vec<u8>| {
+            let mut frame = Vec::new();
+            fanos_wire::encode_frame(FrameType::Error.code(), &body, &mut frame);
+            node.step(Instant(at), Input::Message { from: peer, frame });
+        };
+        // Two different refusals, and one this build has no name for (`code 999`, a forward-compatible
+        // peer's new class — `from_code` returns `None` by design).
+        refuse(&mut node, 0, encode_error(ProtocolError::Unsupported, b"v3 required"));
+        refuse(&mut node, 1, encode_error(ProtocolError::EpochStale, b""));
+        let mut unknown = Vec::new();
+        fanos_wire::varint::encode(999, &mut unknown);
+        refuse(&mut node, 2, unknown);
+        // And a body that is not an ERROR at all — the #75 shape, two incompatible encodings.
+        refuse(&mut node, 3, alloc::vec![0xFF; 1]);
+
+        let obs = node
+            .step(Instant(4), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane");
+        let count = |st: Station, tag: Option<u64>| -> u64 {
+            obs.iter().filter(|o| o.station == st && o.tag == tag).map(|o| o.count).sum()
+        };
+
+        assert_eq!(
+            count(Station::PeerRefused, Some(ProtocolError::Unsupported.index())),
+            1,
+            "an unsupported-version refusal is the rollout's whole diagnostic and used to vanish here"
+        );
+        assert_eq!(
+            count(Station::PeerRefused, Some(ProtocolError::EpochStale.index())),
+            1,
+            "and a stale-epoch refusal is a different operator action, so a different tag"
+        );
+        assert_eq!(
+            count(Station::PeerRefused, None),
+            1,
+            "a code this build cannot name is counted untagged — not dropped, and not given an invented name"
+        );
+        assert_eq!(
+            count(Station::PeerRefusalUnreadable, None),
+            1,
+            "and a body that will not parse is a different finding: we cannot read the message that explains \
+             disagreements"
+        );
+        // The negative half. `SybilReject` keeps its ACTION — it is the only class with one — and that is
+        // asserted elsewhere; what must not happen is the action arm skipping the count.
+        refuse(&mut node, 5, encode_error(ProtocolError::SybilReject, b""));
+        let after = node
+            .step(Instant(6), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                _ => None,
+            })
+            .expect("a second sense-only read");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|o| o.station == Station::PeerRefused
+                    && o.tag == Some(ProtocolError::SybilReject.index()))
+                .map(|o| o.count)
+                .sum::<u64>(),
+            1,
+            "the one class with an action is counted too — having something to do is not a reason to say nothing"
+        );
     }
 
     #[test]
