@@ -189,6 +189,70 @@ mod tests {
         assert!((cpu - 0.6).abs() < 1e-6, "recorded the CPU sample");
     }
 
+    /// **The three paths sum to the verdict exactly, and they say something different about each cell**
+    /// (#225, UHM T-311).
+    ///
+    /// The identity `Φ = (n−1)m² + (n−1)v + (Φ − Φ_flat)` is checked here on cells a node can actually hold
+    /// — every one built through `from_correlation`, which enforces positive semi-definiteness. That
+    /// constraint is not decoration: it is what refuted the star this decomposition was first illustrated
+    /// with (a star's `λ_min = 1 − c√6`, so its hub correlation cannot exceed `1/√6` and its `Φ` cannot
+    /// exceed `0.4077`).
+    ///
+    /// **The sum assertion is partly tautological and the separation one is not — falsifying showed which.**
+    /// `concentration` is computed as the residual `Φ − consistency − inequality`, so the sum holds however
+    /// wrong the first two terms are: collapsing `inequality` to zero left the sum intact and was caught
+    /// only by the separation check below. The sum is therefore an arithmetic guard on the reconstruction
+    /// from `(phi, purity, mean_r)`; the content lives in the second half.
+    #[test]
+    fn the_three_paths_sum_to_the_verdict_and_separate_the_cells() {
+        let mut obs = SelfObserver::new(CellId([9; 16]), HistoryConfig::compact());
+        let n = 7;
+        let block = |k: usize, c: f64| {
+            let mut m = vec![0.0; n * n];
+            for i in 0..n {
+                m[i * n + i] = 1.0;
+                for j in 0..n {
+                    if i != j && i < k && j < k {
+                        m[i * n + j] = c;
+                    }
+                }
+            }
+            CoherenceMatrix::from_correlation(m, n).expect("a block matrix is PSD")
+        };
+        let uniform = |r: f64| {
+            let m: Vec<f64> = (0..n * n).map(|i| if i / n == i % n { 1.0 } else { r }).collect();
+            CoherenceMatrix::from_correlation(m, n).expect("an equicorrelated matrix is PSD at this r")
+        };
+
+        for (name, matrix) in [("clique-4", block(4, 0.8)), ("clique-5", block(5, 0.8)), ("uniform", uniform(0.45))] {
+            let f = obs.observe_measured(1_000_000_000, 1, &matrix, 0, 0.4, -1);
+            let (consistency, inequality, concentration) = f.integration_paths();
+            let sum = consistency + inequality + concentration;
+            assert!(
+                (sum - f.phi).abs() < 1e-3,
+                "{name}: the three paths must sum to Phi={}, got {sum} \
+                 ({consistency} + {inequality} + {concentration})",
+                f.phi
+            );
+        }
+
+        // And they SEPARATE, which is the whole point — a sum that is always (Phi, 0, 0) would satisfy the
+        // identity above and carry no information. The clique opens its gate mostly on inequality; the
+        // uniform cell entirely on consistency.
+        let clique = obs.observe_measured(1_000_000_000, 1, &block(4, 0.8), 0, 0.4, -1);
+        let (c_con, c_ineq, _) = clique.integration_paths();
+        assert!(
+            c_ineq > c_con * 2.0,
+            "a 4-of-7 clique opens on INEQUALITY: consistency {c_con}, inequality {c_ineq}"
+        );
+        let even = obs.observe_measured(1_000_000_000, 1, &uniform(0.45), 0, 0.4, -1);
+        let (u_con, u_ineq, _) = even.integration_paths();
+        assert!(
+            u_ineq.abs() < 1e-3 && u_con > 1.0,
+            "an equicorrelated cell opens on CONSISTENCY alone: consistency {u_con}, inequality {u_ineq}"
+        );
+    }
+
     #[test]
     fn a_measured_matrix_reaches_the_frame_with_its_second_dimension_intact() {
         // The property #226 exists for: a frame folded from a REAL matrix carries what that matrix knows,

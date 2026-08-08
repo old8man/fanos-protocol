@@ -505,6 +505,18 @@ pub fn render_coherence(frame: &CoherenceFrame, degraded: u8, alive: u16) -> Str
         frame.syndrome,
         if frame.syndrome == 0 { "no localized fault".to_owned() } else { format!("point {}", frame.syndrome - 1) }
     );
+    // **Which of the three paths carried the gate** (#225, UHM T-311). `Φ` is one number and it has exactly
+    // three exact contributions; the verdict alone cannot say which actuator a shortfall wants. Low
+    // consistency wants `Bind`, high inequality is a load hotspot wanting the §6.7 rebalance, high
+    // concentration wants the node weights spread rather than the couplings. Printed as shares of `Φ`
+    // because the absolute terms mean nothing without their total, and printed at all because until #226
+    // the frame could only ever have reported "100 % consistency" — an equicorrelated fold has zero
+    // dispersion and a flat diagonal by construction.
+    let (consistency, inequality, concentration) = frame.integration_paths();
+    let _ = writeln!(
+        out,
+        "phi_from       : consistency {consistency:.3}, inequality {inequality:.3}, concentration {concentration:.3}"
+    );
     let _ = writeln!(out, "verdict        : {}", frame.verdict);
     let _ = writeln!(out, "forecast       : {}", frame.forecast);
     let _ = writeln!(out, "heal_seq       : {}", frame.heal_seq);
