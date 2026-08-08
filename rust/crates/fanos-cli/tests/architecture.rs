@@ -1190,3 +1190,147 @@ fn regex_literal_arg() -> impl Fn(&str) -> bool {
         arg.starts_with('[') || arg.starts_with("b\"") || arg.starts_with('"')
     }
 }
+
+/// The crates whose **duplication is a security fact rather than a build detail**.
+///
+/// Two copies of `itertools` cost binary size. Two copies of `curve25519-dalek` are two implementations of
+/// the same curve in one address space: two audit surfaces, and a fix landing in one does not reach the
+/// other, because the node ships both. That is the distinction this list draws, and it is why the guard is
+/// keyed on a named set rather than on "any duplicate" — a scan that flags all fifteen of today's duplicates
+/// reads as noise and gets an allow-all exemption within a week.
+///
+/// Everything here either holds key material, produces randomness, or is the arithmetic underneath something
+/// that does.
+const CRYPTO_TCB: &[&str] = &[
+    "curve25519-dalek",
+    "fiat-crypto",
+    "ed25519-dalek",
+    "x25519-dalek",
+    "ml-kem",
+    "ml-dsa",
+    "module-lattice",
+    "vrf-r255",
+    "getrandom",
+    "rand_core",
+    "rand",
+    "sha2",
+    "blake3",
+    "digest",
+    "crypto-common",
+    "block-buffer",
+    "zeroize",
+];
+
+/// The duplications that exist today, each naming **what forces it** (#217).
+///
+/// The list may shrink and never grow. An entry is not an excuse — it is a statement that someone looked and
+/// found the cause, which is the only thing that makes the next reader able to remove it.
+///
+/// They are one migration, not ten accidents: the RustCrypto `0.10 → 0.11` and `rand_core 0.6 → 0.10`
+/// transition, held open on the old side by `vrf-r255 0.1.0`, which `fanos-vrf` — the crate that produces a
+/// node's IDENTITY — depends on. Measured from the lock:
+///
+/// ```text
+/// curve25519-dalek 4.1.3 -> fiat-crypto 0.2.9, rand_core 0.6.4
+/// curve25519-dalek 5.0.0 -> fiat-crypto 0.3.0, rand_core 0.10.1, digest 0.11.3
+/// ```
+///
+/// Two parallel stacks, down to the formally-verified field arithmetic.
+const TOLERATED_DUPLICATES: &[(&str, &str)] = &[
+    ("curve25519-dalek", "4.1.3 under vrf-r255 0.1.0 (fanos-vrf's identity path); 5.0.0 under ed25519-dalek 3"),
+    ("fiat-crypto", "one copy per curve25519-dalek major — the field arithmetic follows the curve"),
+    ("rand_core", "0.6 pinned by the curve25519-dalek 4 branch; 0.9 by rand 0.9; 0.10 by everything current"),
+    ("rand", "0.9.5 reached through rand_core 0.9; 0.10.2 is what this workspace names"),
+    ("getrandom", "0.2 under ring (rustls' backend); 0.3 under rand_core 0.9; 0.4 for fanos' own key paths"),
+    ("sha2", "0.10 and 0.11 — the RustCrypto transition, same root as the rest"),
+    ("digest", "as sha2"),
+    ("crypto-common", "as sha2"),
+    ("block-buffer", "as sha2"),
+];
+
+/// Every `[[package]]` in `Cargo.lock`, as `name -> the versions the build links`.
+fn locked_versions() -> BTreeMap<String, BTreeSet<String>> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let (mut name, mut version) = (None, None);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')) {
+            name = Some(v.to_owned());
+            version = None;
+        } else if let Some(v) = line.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"')) {
+            version = Some(v.to_owned());
+        }
+        if let (Some(n), Some(v)) = (name.as_ref(), version.take()) {
+            out.entry(n.clone()).or_default().insert(v);
+        }
+    }
+    out
+}
+
+/// **No cryptographic crate is linked at two versions without someone having said why** (#206, #217).
+///
+/// The supply-chain gap this closes is narrow and real. There is no `deny.toml`, and no `cargo audit`,
+/// `cargo deny` or `cargo vet` in any of the five CI jobs — measured, not assumed. The `reproducible` job
+/// makes that look covered and does not cover it: reproducibility proves you built what the lockfile says,
+/// never that the lockfile is safe.
+///
+/// A full advisory pipeline needs a tool, a network fetch and a database. **This needs none of them**, runs
+/// in the gate that already exists, and catches the one class that a duplicate-blind advisory scan would
+/// miss anyway: a second copy of the curve arriving quietly under a new dependency, so that the node ships
+/// two implementations and a patched advisory only reaches one.
+///
+/// It is deliberately not "no duplicates at all". Today the lock has fifteen, five of which are ordinary
+/// transition noise (`hashbrown`, `itertools`, `windows-sys`, `bit-vec`, `r-efi`) that nobody should be
+/// asked to justify.
+#[test]
+fn no_cryptographic_crate_is_duplicated_without_a_stated_cause() {
+    let locked = locked_versions();
+    let declared: BTreeSet<&str> = TOLERATED_DUPLICATES.iter().map(|(c, _)| *c).collect();
+    let duplicated: BTreeSet<&str> = CRYPTO_TCB
+        .iter()
+        .copied()
+        .filter(|c| locked.get(*c).is_some_and(|v| v.len() > 1))
+        .collect();
+    let undeclared: Vec<String> = duplicated
+        .difference(&declared)
+        .map(|c| format!("{c}: {:?}", locked.get(*c).cloned().unwrap_or_default()))
+        .collect();
+
+    // Floors first: a lock this parser failed to read reports "clean", and this guard's whole value is that
+    // it cannot.
+    assert!(locked.len() >= 300, "parsed only {} packages from Cargo.lock; the parser is broken", locked.len());
+    assert!(
+        !duplicated.is_empty(),
+        "no TCB crate looks duplicated at all, which contradicts the measurement this guard was written from \
+         — the name list and the lock have drifted apart"
+    );
+    assert!(
+        undeclared.is_empty(),
+        "these cryptographic crates are linked at two or more versions and nothing says why. Two copies of a \
+         curve, an RNG or a digest are two audit surfaces, and a fix to one does not reach the other. Find \
+         what pulls each and add it to TOLERATED_DUPLICATES with the cause, or remove the second copy \
+         (#206, #217). [parsed {} packages, {} TCB crates duplicated, {} declared]:\n  {}",
+        locked.len(),
+        duplicated.len(),
+        declared.len(),
+        undeclared.join("\n  ")
+    );
+
+    // A ratchet, after the finding: an entry that is no longer duplicated is a migration someone finished,
+    // and leaving it here would let the next real one hide behind a stale excuse.
+    let stale: Vec<&str> = declared
+        .iter()
+        .copied()
+        // `is_none_or`, and the `None` arm is deliberate rather than incidental: a declared crate that is not
+        // in the lock at all is not linked, so its entry is stale for the same reason as one that stopped
+        // being duplicated. (Worth stating because this combinator GRANTS on absence, which is how it once
+        // denied a whole bootstrap when the predicate was a verification instead of a staleness test.)
+        .filter(|c| locked.get(*c).is_none_or(|v| v.len() <= 1))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these are no longer duplicated — good news, and the entry must go so it cannot shelter the next \
+         one: {stale:?}"
+    );
+}
