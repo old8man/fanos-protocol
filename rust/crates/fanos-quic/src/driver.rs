@@ -1642,9 +1642,16 @@ async fn reshuffle_loop<F: Field>(
     }
 }
 
-/// Like [`spawn`], but every frame on the wire is PROTEUS-shaped by `proteus` for `epoch` (spec §13.2): the
-/// transport carries no static FANOS signature, and a peer without the secret cannot produce frames this node
-/// will accept. The engine is unchanged — shaping lives entirely in the driver, below the sans-I/O boundary.
+/// Like [`spawn`], but every frame on the wire is PROTEUS-shaped by `proteus` for `epoch` (spec §13.2): a
+/// peer without the secret cannot produce frames this node will accept. The engine is unchanged — shaping
+/// lives entirely in the driver, below the sans-I/O boundary.
+///
+/// **Scope, and it is narrower than §13.3 asks for.** The shaping starts at the QUIC *stream*, so it covers
+/// every frame and nothing before one. The connection itself still opens with a plaintext QUIC Initial
+/// carrying the ALPN and SNI `tls::node_configs` installs, identical under every morph. Measured in
+/// `tests/probe_resistance.rs`: a stranger with no community secret gets a Version Negotiation packet back,
+/// and gets the *same* bytes from a `polymorph` node and a `plain` one. Until the envelope moves down to the
+/// datagram, "carries no static FANOS signature" is true of the frames and false of the connection.
 pub async fn spawn_shaped(
     engine: Box<dyn Engine + Send>,
     directory: Directory,

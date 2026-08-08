@@ -1,7 +1,11 @@
 //! PROTEUS over a real socket: two nodes whose QUIC driver shapes every frame with a shared
 //! community secret still deliver application traffic — the same `OverlayNode` engine, now behind
-//! a polymorph transport that carries no static FANOS signature (spec §13.2). The shaping lives
-//! entirely in the driver; the engine is byte-for-byte the one the simulator runs.
+//! a polymorph transport (spec §13.2). The shaping lives entirely in the driver; the engine is
+//! byte-for-byte the one the simulator runs.
+//!
+//! This file measures *delivery through the shaped path*. It does not measure what an off-path
+//! observer sees, and the two are not the same question: the shaping starts at the QUIC stream, so
+//! the connection still opens in plaintext. `probe_resistance.rs` measures that half.
 //!
 //! Runtime: multi-threaded with **four** workers — a current-thread harness cannot see a parallelism
 //! defect at all (#84), and two workers see it only 3 times in 8 where four see it 8 of 8. Measured

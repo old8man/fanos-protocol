@@ -50,4 +50,6 @@ tracing.workspace = true
 [dev-dependencies]
 fanos-testkit = { path = "../fanos-testkit" }
 fanos-field = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+# `net` is for the raw-UDP prober in `tests/probe_resistance.rs`: measuring what an unauthenticated
+# stranger gets back needs a socket that is NOT a quinn endpoint, or the measurement assumes QUIC.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net"] }

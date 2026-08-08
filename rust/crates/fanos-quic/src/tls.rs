@@ -26,6 +26,11 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 
 /// The ALPN token every FANOS QUIC endpoint negotiates (rejects non-FANOS peers early).
+///
+/// It is also, today, the protocol's **name in plaintext on the wire**: a QUIC Initial is protected with keys
+/// derived from a well-known salt (RFC 9001 §5.2), so any middlebox reads the ClientHello — this token and the
+/// `fanos.node` SNI below with it. No morph changes either, because shaping starts at the stream. See
+/// `tests/probe_resistance.rs` for the measurement and [`crate::spawn_shaped`] for the scope note.
 const ALPN: &[u8] = b"fanos/1";
 
 /// The OID of the custom X.509 extension that carries a node's 32-byte coordinate-VRF public key in its
