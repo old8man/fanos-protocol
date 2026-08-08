@@ -7,7 +7,7 @@
     clippy::float_cmp
 )]
 
-use fanos_diakrisis::coherence::{CoherenceMatrix, phi_equicorrelated, purity_equicorrelated};
+use fanos_diakrisis::coherence::{CoherenceMatrix, phi_at, purity_equicorrelated};
 use fanos_diakrisis::{healing, polar, window};
 use proptest::prelude::*;
 
@@ -41,7 +41,7 @@ proptest! {
     #[test]
     fn equicorrelated_identities(r in -0.16f64..1.0) {
         let g = CoherenceMatrix::equicorrelated(7, r);
-        prop_assert!((g.phi() - phi_equicorrelated(7, r)).abs() < 1e-9);
+        prop_assert!((g.phi() - phi_at(r, 1.0 / 7.0)).abs() < 1e-9);
         prop_assert!((g.purity() - purity_equicorrelated(7, r)).abs() < 1e-9);
         prop_assert!((g.phi() - (7.0 * g.purity() - 1.0)).abs() < 1e-9);
     }

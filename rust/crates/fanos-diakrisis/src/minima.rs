@@ -396,7 +396,7 @@ pub fn viability_is_integration(n: usize, r: f64) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::float_cmp)]
 mod tests {
     use super::*;
-    use crate::coherence::{R_TH, phi_equicorrelated};
+    use crate::coherence::{R_TH, phi_at};
     use crate::stability::{stability_radius, survives};
     use crate::window::{Alarm, collective_subject_window, leading_alarm, phi_of_gamma, purity_of_gamma};
 
@@ -426,14 +426,14 @@ mod tests {
         for n in CELLS {
             let (lo, hi) = collective_subject_window(n);
             assert!(
-                (phi_equicorrelated(n, lo) - PHI_WINDOW.0).abs() < 1e-9,
+                (phi_at(lo, 1.0 / n as f64) - PHI_WINDOW.0).abs() < 1e-9,
                 "N={n}: the lower edge must be Φ=1, got {}",
-                phi_equicorrelated(n, lo)
+                phi_at(lo, 1.0 / n as f64)
             );
             assert!(
-                (phi_equicorrelated(n, hi) - PHI_WINDOW.1).abs() < 1e-9,
+                (phi_at(hi, 1.0 / n as f64) - PHI_WINDOW.1).abs() < 1e-9,
                 "N={n}: the upper edge must be Φ=2, got {}",
-                phi_equicorrelated(n, hi)
+                phi_at(hi, 1.0 / n as f64)
             );
         }
     }
@@ -488,7 +488,7 @@ mod tests {
         let (lo, _hi) = collective_subject_window(2);
         assert!(lo >= 1.0, "at N=2 the window must start at or above the maximum possible correlation");
         // Perfect correlation still fails, since the edge is open.
-        assert!(phi_equicorrelated(2, 1.0) <= PHI_WINDOW.0, "even r=1 gives only Φ=1, which is the boundary");
+        assert!(phi_at(1.0, 0.5) <= PHI_WINDOW.0, "even r=1 gives only Φ=1, which is the boundary");
         assert_eq!(max_stability_radius(2), 0.0, "a sub-viable cell has no stability radius to report");
         assert!(max_stability_radius(MIN_VIABLE_CELL) > 0.0, "three nodes do have one");
     }
@@ -780,7 +780,7 @@ mod tests {
         for n in CELLS {
             let p = optimal_purity(n);
             let r = optimal_correlation(n);
-            assert!((phi_equicorrelated(n, r) - OPTIMAL_INTEGRATION).abs() < 1e-9, "N={n}: r* ↦ Φ*");
+            assert!((phi_at(r, 1.0 / n as f64) - OPTIMAL_INTEGRATION).abs() < 1e-9, "N={n}: r* ↦ Φ*");
             assert!((purity_equicorrelated(n, r) - p).abs() < 1e-12, "N={n}: r* ↦ P*");
             // Half the ceiling is what MAKES it the max-min point, and that survives the metric change —
             // only the ceiling's value moved, from the refuted `1/√N` to `max_stability_radius`.
@@ -853,7 +853,7 @@ mod tests {
         for n in CELLS {
             for phi in [1.0, 1.5, 2.0] {
                 let r = correlation_for_integration(n, phi);
-                assert!((phi_equicorrelated(n, r) - phi).abs() < 1e-9, "N={n} Φ={phi}: round-trip failed");
+                assert!((phi_at(r, 1.0 / n as f64) - phi).abs() < 1e-9, "N={n} Φ={phi}: round-trip failed");
             }
             // Holding Φ fixed while N grows dilutes correlation as 1/√(N−1).
             assert!(

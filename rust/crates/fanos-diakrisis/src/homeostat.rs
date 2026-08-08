@@ -31,7 +31,7 @@
 use crate::coherence::p_crit;
 use crate::healing::KAPPA_BOOTSTRAP;
 use crate::stability::v_preservation_gate;
-use crate::window::{CollectiveState, classify_collective, collective_subject_window};
+use crate::window::{CollectiveState, classify_collective_at, collective_subject_window_at};
 
 /// One corrective decision of the coherence homeostat — the `act` phase for the continuous self-model.
 /// Every non-[`Hold`](BandControl::Hold) action moves `Γ` toward `ρ*`, i.e. lowers the Lyapunov `V`. The
@@ -102,15 +102,22 @@ impl Homeostat {
     ///
     /// Purity is checked *first* (the viability gate), then the direction is set by the correlation band —
     /// so the decision is correct even off the equicorrelated stratum, where `P` and `r` decouple.
+    ///
+    /// **The band's edges come from `diagonal_purity` = `p = Σᵢ dᵢ²`, not from `n`** (UHM T-312/T-314). The
+    /// two purities are different quantities and both are needed: `purity` is `P = Tr(Γ²)`, the viability
+    /// gate, while `p` is the concentration of behavioural weight, which is what moves the phase line. They
+    /// are related — `P = p·(1 + Φ)` — so one cannot substitute for the other. Passing `1.0 / n` recovers
+    /// the flat-stratum behaviour exactly, which is what
+    /// [`CoherenceMatrix::equicorrelated`](crate::CoherenceMatrix::equicorrelated) produces.
     #[must_use]
-    pub fn control(self, purity: f64, mean_r: f64, n: usize) -> BandControl {
+    pub fn control(self, purity: f64, mean_r: f64, diagonal_purity: f64, n: usize) -> BandControl {
         // Below viability the V-preservation gate is zero: no amount of rate `κ` regenerates, external help
         // is required (T-104 §5, the "point of no return without external support").
         if purity <= p_crit(n) {
             return BandControl::Escalate;
         }
-        let (_, hi) = collective_subject_window(n);
-        match classify_collective(mean_r, n) {
+        let (_, hi) = collective_subject_window_at(diagonal_purity);
+        match classify_collective_at(mean_r, diagonal_purity) {
             CollectiveState::CollectiveSubject => BandControl::Hold,
             CollectiveState::OverCoupled => {
                 // Proportional shed: effort ∝ over-excursion, scaled by gain, capped at 1 (cannot shed more
@@ -140,7 +147,16 @@ impl Default for Homeostat {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use crate::coherence::{phi_equicorrelated, purity_equicorrelated};
+
+    /// **These cases live on the equicorrelated stratum, and that is now said rather than assumed.**
+    ///
+    /// Every closed form they check (`phi_equicorrelated`, `purity_equicorrelated`) is the `p = 1/N` case
+    /// of the general law, so the diagonal they belong to is the flat one. Naming it here keeps the
+    /// stratum an explicit input instead of a property the call signature quietly supplied — which is the
+    /// shape UHM T-316 exists to forbid: a result proved on a stratum predicts nothing off it until
+    /// measured off it.
+    const FLAT: f64 = 1.0 / N as f64;
+    use crate::coherence::{phi_at, purity_equicorrelated};
 
     const N: usize = 7;
 
@@ -149,9 +165,9 @@ mod tests {
         // r = 0.5 ∈ (1/√6, 1/√3]; equicorrelated P there is well above 3/7 → viable, in-band → Hold.
         let r = 0.5;
         let p = purity_equicorrelated(N, r);
-        assert!(phi_equicorrelated(N, r) >= 1.0, "integrated");
+        assert!(phi_at(r, FLAT) >= 1.0, "integrated");
         assert_eq!(
-            Homeostat::conservative().control(p, r, N),
+            Homeostat::conservative().control(p, r, FLAT, N),
             BandControl::Hold
         );
     }
@@ -162,7 +178,7 @@ mod tests {
         // sheds correlation rather than escalating. Effort is positive and ≤ 1.
         let r = 0.7;
         let p = purity_equicorrelated(N, r);
-        match Homeostat::new(0.5).control(p, r, N) {
+        match Homeostat::new(0.5).control(p, r, FLAT, N) {
             BandControl::Decouple { effort } => {
                 assert!(
                     effort > 0.0 && effort <= 1.0,
@@ -179,7 +195,7 @@ mod tests {
         // The cell regenerates (Bind) with authority κ·g_V, bounded and positive.
         let p = 0.35;
         let r = 0.30;
-        match Homeostat::new(0.5).control(p, r, N) {
+        match Homeostat::new(0.5).control(p, r, FLAT, N) {
             BandControl::Bind { authority } => {
                 let want = 0.5 * v_preservation_gate(p, N);
                 assert!((authority - want).abs() < 1e-12, "authority = κ·g_V");
@@ -193,15 +209,15 @@ mod tests {
     fn a_collapsed_cell_escalates_regardless_of_correlation() {
         // P ≤ 2/7 ⇒ g_V = 0 ⇒ no self-recovery ⇒ Escalate, whatever r is.
         assert_eq!(
-            Homeostat::conservative().control(0.25, 0.5, N),
+            Homeostat::conservative().control(0.25, 0.5, FLAT, N),
             BandControl::Escalate
         );
         assert_eq!(
-            Homeostat::conservative().control(0.25, 0.05, N),
+            Homeostat::conservative().control(0.25, 0.05, FLAT, N),
             BandControl::Escalate
         );
         assert_eq!(
-            Homeostat::conservative().control(2.0 / 7.0, 0.5, N),
+            Homeostat::conservative().control(2.0 / 7.0, 0.5, FLAT, N),
             BandControl::Escalate
         );
     }

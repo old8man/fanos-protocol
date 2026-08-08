@@ -18,7 +18,7 @@ use crate::ports::{Duration, Effect, Escalation, Instant, Notification};
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use fanos_diakrisis::coherence::phi_equicorrelated;
+use fanos_diakrisis::coherence::phi_at;
 use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
@@ -678,6 +678,35 @@ impl Healer {
         live.set(self.admission.observe(self.admission_floor, stress, retention));
     }
 
+    /// Φ at the correlation a prior shed leaves behind, holding **this cell's measured diagonal** fixed.
+    ///
+    /// **Counterfactual on purpose.** The exact `measures().phi` is not what the healing budget wants: the
+    /// measured matrix is a window of past observations and cannot yet show what a `Decouple` just did.
+    /// What it wants is Φ at the *effective* (post-shed) correlation, so that a prior shed has genuinely
+    /// lowered it (audit C6).
+    ///
+    /// **At the measured diagonal, not a flat one** (UHM T-312/T-314). The general law is
+    /// `Φ = r²(1−p)/p`; the closed form this replaced was `(alive−1)·r²`, its `p = 1/N` case. On a
+    /// concentrated cell — one node relaying for the rest, which is the ordinary shape of a busy cell, not
+    /// a pathology — that over-reports Φ. It gates a healing budget, so the error direction was "believe
+    /// the cell is more integrated than it is".
+    ///
+    /// With no measured matrix there is no diagonal to hold, and flat is the only assumption available.
+    /// `1 / alive_count` says that out loud rather than hiding it inside a closed form whose name mentions
+    /// only the *correlation* stratum and not the diagonal one.
+    fn counterfactual_phi(
+        &self,
+        healthy_correlation: f64,
+        measured: Option<&fanos_diakrisis::CoherenceMatrix>,
+        alive_count: usize,
+    ) -> f64 {
+        let p = measured.map_or_else(
+            || 1.0 / f64::from(u32::try_from(alive_count.max(1)).unwrap_or(u32::MAX)),
+            fanos_diakrisis::CoherenceMatrix::diagonal_purity,
+        );
+        phi_at(self.effective_correlation(healthy_correlation), p)
+    }
+
     /// Diagnose the sensed cell snapshot (`self_index, degraded, alive_count`, produced by the facade's
     /// liveness sensing) and actuate any healing — the DIAKRISIS reflex proper. Feeds the *measured*
     /// behavioural `Γ_net` (the #74 unification) plus the live polar cross-attestation into `diagnose`,
@@ -714,7 +743,12 @@ impl Healer {
         // identical arguments and derive the third from a different signal entirely.
         let band = measured.as_ref().map(|coherence| {
             let m = coherence.measures();
-            self.homeostat.control(m.purity, coherence.mean_correlation(), coherence.n())
+            self.homeostat.control(
+                m.purity,
+                coherence.mean_correlation(),
+                coherence.diagonal_purity(),
+                coherence.n(),
+            )
         });
         // What the shed is reducing, kept for the laws that run outside this diagnosis (#92).
         self.measured_correlation =
@@ -770,13 +804,7 @@ impl Healer {
 
         let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
         if config.self_healing {
-            // Φ from the cell's live membership on the equicorrelated stratum, at the *effective*
-            // (post-shed) correlation — so a prior `Decouple` has genuinely lowered it (audit C6). Gates
-            // the reroute-depth budget.
-            let phi = phi_equicorrelated(
-                alive_count,
-                self.effective_correlation(config.healthy_correlation),
-            );
+            let phi = self.counterfactual_phi(config.healthy_correlation, measured.as_ref(), alive_count);
             self.last_phi = phi; // exposed to the facade's parent-stratum reflex (R-C2)
             let plan = plan_healing(&verdict, self_index, degraded, phi);
             if !plan.is_empty() {

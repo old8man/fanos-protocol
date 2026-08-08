@@ -43,7 +43,7 @@
 //! reachable from `from_signals`, and only from a genuinely concentrated cell.
 //!
 //! What remains genuinely two-dimensional is the gap between the off-diagonals' **RMS** `q` (which `Φ`
-//! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective`] reads). By
+//! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective_at`] reads). By
 //! Cauchy–Schwarz `m² ≤ q²`, with equality exactly on the equicorrelated stratum, so
 //! [`Measures::dispersion`] `v = q² − m²` is the second coordinate. It is not a curiosity: the
 //! under-coupled `Bind` band is `q > lo ≥ m`, which is *unreachable at `v = 0`* — the band exists only for
@@ -58,13 +58,54 @@ use core::simd::num::SimdFloat;
 use crate::eig::eigenvalues_symmetric;
 use crate::mathfns::sqrt;
 
-/// The systemic-correlation threshold `r* = 1/√(N−1)` (spec §2.7). At the mean off-diagonal
-/// correlation `r*`, integration and structure thresholds coincide; above it the cell is in
+/// The systemic-correlation threshold `r* = 1/√(N−1)` (spec §2.7) **at a flat diagonal**. At the mean
+/// off-diagonal correlation `r*`, integration and structure thresholds coincide; above it the cell is in
 /// the cascade-failure regime. For `N = 7` this is `1/√6 ≈ 0.408`.
+///
+/// **The flatness is a second condition, and the stratum's name carries only the first** (UHM T-312/T-314).
+/// The general phase line is [`systemic_correlation_at`]; this is that function at `p = 1/N`, and the
+/// identity is asserted rather than asserted-about. Kept as the `N`-form because the CLI reports it and a
+/// conformance vector pins it, and because a deployment that keeps node weights balanced *is* on the flat
+/// stratum — but nothing here should read `0.408` off a cell whose diagonal it has not looked at.
 #[must_use]
 pub fn systemic_correlation(n: usize) -> f64 {
     debug_assert!(n >= 2);
     1.0 / sqrt((n - 1) as f64)
+}
+
+/// The phase line `r* = √(p/(1−p))` at a stated diagonal purity `p = Σᵢ dᵢ²` — the correlation at which
+/// `Φ` crosses 1, in general rather than on the flat stratum (UHM T-312).
+///
+/// **It rises as the weights concentrate**: a lopsided cell needs *more* correlation to go systemic, not
+/// less, so a monitor reading the flat `1/√(N−1)` off one calls it a collective subject before it is. At a
+/// node carrying 30 % of the behavioural variance the true line is `0.455` against the flat `0.408`, and a
+/// cell measured at `r = 0.45` there has `Φ = 0.977` — an aggregate, read as a subject.
+///
+/// `p` outside `(0, 1)` has no phase line: `p = 0` is an empty cell and `p = 1` is one node carrying
+/// everything, where there is no inter-node correlation to speak of. Both return infinity, which classifies
+/// as [`Aggregate`](crate::window::CollectiveState::Aggregate) — the same fail-safe
+/// [`collective_subject_window`](crate::window::collective_subject_window) takes for `n < 2`.
+#[must_use]
+pub fn systemic_correlation_at(p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        return f64::INFINITY;
+    }
+    sqrt(p / (1.0 - p))
+}
+
+/// Integration at a stated correlation and diagonal purity: `Φ = r²·(1−p)/p` (UHM T-312).
+///
+/// **The only integration law in the crate.** It replaced `phi_equicorrelated(n, r) = (N−1)r²`, which was
+/// this at `p = 1/N` — and having the special case as its own function let a caller evaluate a stratum
+/// result without naming the stratum (UHM T-316). The two differ exactly when the diagonal is not flat, and
+/// that difference is what [`CoherenceMatrix::measures`] has been computing correctly all along while the
+/// *classifiers* assumed it away.
+#[must_use]
+pub fn phi_at(r: f64, p: f64) -> f64 {
+    if p <= 0.0 || p >= 1.0 {
+        return 0.0;
+    }
+    r * r * (1.0 - p) / p
 }
 
 /// The structure critical value `P_crit = 2/N` (spec §2.7).
@@ -92,7 +133,7 @@ pub struct Measures {
     /// Reflection `R = 1/(N·P)` (threshold `1/3`). Also a bijection of `phi`: `R = 1/(1 + Φ)`.
     pub reflection: f64,
     /// **Pairwise dispersion** `v = q² − m²` — the variance of the off-diagonal correlations, where `q` is
-    /// their RMS (`Φ = (N−1)q²`) and `m` their mean (what `classify_collective` reads).
+    /// their RMS (`Φ = (N−1)q²`) and `m` their mean (what `classify_collective_at` reads).
     ///
     /// The genuinely independent second dimension. Zero exactly on the equicorrelated stratum, and strictly
     /// positive whenever the cell couples unevenly — which is the load-hotspot signature the §6.7 response
@@ -473,7 +514,11 @@ impl CoherenceMatrix {
     pub fn is_systemic(&self) -> bool {
         // A degenerate (<2-node) cell has no inter-node correlation — `r*` is undefined and it is
         // never systemic (audit #122: a collapsed cell must be readable, not a panic).
-        self.n >= 2 && self.mean_correlation() > systemic_correlation(self.n) + 1e-12
+        //
+        // Against **this cell's own** phase line, not the flat-stratum one (UHM T-312/T-314): the diagonal
+        // is right here in `self.d`, and reading `1/√(N−1)` off a concentrated cell calls it systemic
+        // early.
+        self.n >= 2 && self.mean_correlation() > systemic_correlation_at(self.diagonal_purity()) + 1e-12
     }
 
     /// Whether the cell is **over-coupled** (`r > √(2/(N−1))`, equivalently `R < 1/3`):
@@ -504,21 +549,43 @@ impl CoherenceMatrix {
         }
     }
 
+    /// The **purity of the diagonal**, `p = Σᵢ dᵢ²` — the cell's concentration of behavioural weight.
+    ///
+    /// Flat activity gives `1/N`; one node carrying everything gives `1`. It is the second condition every
+    /// "equicorrelated" closed form needs and the one that name does not carry (UHM T-312/T-314), and until
+    /// now it had no name at all: it was a local called `diag` inside [`measures`](Self::measures), so no
+    /// caller — not even inside this crate — could pass it to a classifier. That is why
+    /// [`collective_state`](Self::collective_state) was comparing against the flat threshold on a cell whose
+    /// diagonal this very struct had measured as concentrated.
+    ///
+    /// It is also the first of the four instrument families the state carries (UHM T-317) to get a reader
+    /// here; the pairwise moduli are still private.
+    #[must_use]
+    pub fn diagonal_purity(&self) -> f64 {
+        self.d.iter().map(|x| x * x).sum()
+    }
+
     /// The collective-subject classification from the mean correlation (spec §18.2, V19):
     /// `Aggregate` (too weak to bind), `CollectiveSubject` (in the band), or `OverCoupled`.
+    ///
+    /// Classified against **this cell's own** window, which is what [`diagonal_purity`](Self::diagonal_purity)
+    /// exists to supply. On the flat stratum this is exactly the old reading; off it the old one was
+    /// optimistic, and the direction matters — it called an aggregate a subject, never the reverse.
     #[must_use]
     pub fn collective_state(&self) -> crate::window::CollectiveState {
-        crate::window::classify_collective(self.mean_correlation(), self.n)
+        crate::window::classify_collective_at(self.mean_correlation(), self.diagonal_purity())
     }
 }
 
 // --- Equicorrelated closed forms (spec §2.7, V15) ---
 
-/// Closed-form integration on the equicorrelated stratum: `Φ = (N−1) r²`.
-#[must_use]
-pub fn phi_equicorrelated(n: usize, r: f64) -> f64 {
-    (n - 1) as f64 * r * r
-}
+// `phi_equicorrelated(n, r) = (N−1)r²` was here. It is gone, and its absence is the point (UHM
+// T-312/T-314/T-316): it was the `p = 1/N` case of [`phi_at`], and having it as its own function meant a
+// caller could evaluate a stratum result without ever naming the stratum. Every former use is now
+// `phi_at(r, 1.0 / n as f64)` — the flat diagonal is a call site, visible in the argument, rather than a
+// second function that looks like the general one. `purity_equicorrelated` stays: it has a production
+// caller (`minima::viability_is_integration`).
+
 
 /// Closed-form purity on the equicorrelated stratum: `P = (1 + (N−1) r²) / N`.
 #[must_use]
@@ -617,9 +684,64 @@ mod tests {
         }
     }
 
+    /// **A cell that concentrates its behavioural weight is not a collective subject at the flat
+    /// threshold** (UHM T-312/T-314) — the direction that was wrong, and it was wrong optimistically.
+    ///
+    /// The correlations are exact rather than sampled: seven signals built from mutually orthogonal
+    /// Sylvester–Hadamard rows, each loading `√r` on one shared row and `√(1−r)` on a row of its own, so
+    /// every pair correlates at exactly `r`. Scaling node 0's whole signal leaves every correlation
+    /// untouched and moves only the variance shares — which is precisely the axis the flat closed form
+    /// assumes away, isolated.
+    ///
+    /// The last assertion is the one that keeps this honest: it asserts the OLD reading disagrees. Without
+    /// it the test would pass on a cell where both readings say `Aggregate` and would be pinning nothing.
+    #[test]
+    fn a_cell_that_concentrates_its_weight_is_not_called_a_subject_by_the_flat_threshold() {
+        use crate::window::{CollectiveState, classify_collective_at};
+
+        // Sylvester–Hadamard: `H[i][j] = (−1)^popcount(i & j)`. Row 0 is constant (no variance after
+        // centring, so unusable); rows 1.. are zero-mean and mutually orthogonal.
+        let h = |i: usize, t: usize| if (i & t).count_ones().is_multiple_of(2) { 1.0f64 } else { -1.0f64 };
+        let r: f64 = 0.45;
+        let (a, b) = (sqrt(r), sqrt(1.0 - r));
+        let signals: Vec<Vec<f64>> = (0..7)
+            .map(|i| {
+                // Node 0 carries twice the amplitude: same correlations, concentrated diagonal.
+                let scale = if i == 0 { 2.0 } else { 1.0 };
+                (0..16).map(|t| scale * (a * h(1, t) + b * h(i + 2, t))).collect()
+            })
+            .collect();
+        let g = CoherenceMatrix::from_signals(&signals).expect("a well-formed matrix");
+
+        let p = g.diagonal_purity();
+        assert!(p > 1.0 / 7.0 + 1e-6, "the construction must concentrate the diagonal, got p={p}");
+        assert!(
+            (g.mean_correlation() - r).abs() < 1e-9,
+            "the construction must hold the correlation at exactly r, got {}",
+            g.mean_correlation()
+        );
+
+        // The exact measure says aggregate...
+        assert!(g.phi() < 1.0, "Phi={} — this cell is below its own phase line", g.phi());
+        // ...and the classifier now agrees with it.
+        assert_eq!(
+            g.collective_state(),
+            CollectiveState::Aggregate,
+            "p={p}, r={r}, Phi={}: a cell below its own phase line is an aggregate",
+            g.phi()
+        );
+        // The disagreement this fixes, asserted so the test cannot go vacuous: the flat threshold, read off
+        // the same cell, calls it a subject.
+        assert_eq!(
+            classify_collective_at(g.mean_correlation(), 1.0 / 7.0),
+            CollectiveState::CollectiveSubject,
+            "the flat threshold must still disagree, or this test is pinning nothing"
+        );
+    }
+
     #[test]
     fn dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs() {
-        use crate::window::{CollectiveState, classify_collective, collective_subject_window};
+        use crate::window::{CollectiveState, classify_collective_at, collective_subject_window};
 
         // Zero exactly on the equicorrelated stratum — where the three measures really do say everything.
         for &r in &[0.0, 0.3, 0.45, 0.8] {
@@ -648,7 +770,8 @@ mod tests {
         for k in 2..=6usize {
             let g = block(k);
             let m = g.measures();
-            let binds = m.phi > 1.0 && classify_collective(g.mean_correlation(), 7) == CollectiveState::Aggregate;
+            let binds = m.phi > 1.0
+                && classify_collective_at(g.mean_correlation(), 1.0 / 7.0) == CollectiveState::Aggregate;
             assert_eq!(
                 binds,
                 k == 4,
@@ -706,7 +829,7 @@ mod tests {
         for &r in &[0.0, 0.1, 0.3, 0.408, 0.5, 0.7] {
             let g = CoherenceMatrix::equicorrelated(7, r);
             assert!(
-                (g.phi() - phi_equicorrelated(7, r)).abs() < 1e-9,
+                (g.phi() - phi_at(r, 1.0 / 7.0)).abs() < 1e-9,
                 "Φ at r={r}"
             );
             assert!(

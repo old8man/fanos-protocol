@@ -12,7 +12,7 @@
 //! typed the same digits.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fanos_diakrisis::coherence::{PHI_TH, R_TH, phi_equicorrelated, purity_equicorrelated};
+use fanos_diakrisis::coherence::{PHI_TH, R_TH, phi_at, purity_equicorrelated};
 use fanos_diakrisis::minima::{OPTIMAL_INTEGRATION, max_stability_radius, optimal_purity};
 use fanos_diakrisis::partition::{N, algebraic_connectivity};
 use fanos_diakrisis::stability::{stability_radius, stability_radius_exact};
@@ -94,7 +94,7 @@ fn the_equicorrelated_closed_forms_reproduce_the_vectors_critical_point() {
     let want_purity = num(v, "purity");
     let want_reflection = num(v, "reflection");
 
-    let phi = phi_equicorrelated(N, r);
+    let phi = phi_at(r, 1.0 / N as f64);
     let purity = purity_equicorrelated(N, r);
     let reflection = 1.0 / (N as f64 * purity);
 
@@ -109,7 +109,7 @@ fn the_equicorrelated_closed_forms_reproduce_the_vectors_critical_point() {
     // because at r* it degenerates to 1 = 7·(2/7) − 1 and would hold for a wrong formula by coincidence.
     for probe in [0.0, 0.1, r, 0.5, 0.9] {
         let p = purity_equicorrelated(N, probe);
-        let f = phi_equicorrelated(N, probe);
+        let f = phi_at(probe, 1.0 / N as f64);
         assert!(
             (f - (N as f64 * p - 1.0)).abs() < EPS,
             "at r={probe}: Φ={f} but N·P−1={}", N as f64 * p - 1.0
@@ -132,11 +132,11 @@ fn the_collective_subject_band_is_the_vectors_half_open_interval() {
 
     // Φ at the edges: exclusive lower means Φ > 1 strictly inside, inclusive upper means Φ ≤ 2 at the top.
     assert!(
-        (phi_equicorrelated(N, lower) - PHI_TH).abs() < EPS,
+        (phi_at(lower, 1.0 / N as f64) - PHI_TH).abs() < EPS,
         "at the lower edge Φ must equal the threshold exactly — that is what makes it the edge"
     );
     assert!(
-        (phi_equicorrelated(N, upper) - 2.0).abs() < EPS,
+        (phi_at(upper, 1.0 / N as f64) - 2.0).abs() < EPS,
         "at the upper edge Φ must equal 2 — the R = 1/3 boundary, Φ ≤ 2 ⟺ R ≥ R_TH"
     );
     assert!(upper > lower, "a half-open interval with a positive width");

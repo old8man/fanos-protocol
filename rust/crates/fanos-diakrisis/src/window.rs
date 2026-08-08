@@ -9,7 +9,7 @@
 //!   its mean inter-node correlation `r` lies in `(1/√(N−1), √(2/(N−1))]` — integrated, yet
 //!   still self-modelling. For `N = 7` this is `(1/√6, 1/√3] ≈ (0.408, 0.577]`.
 
-use crate::coherence::{p_crit, systemic_correlation};
+use crate::coherence::{p_crit, systemic_correlation, systemic_correlation_at};
 use crate::mathfns::{ceil, nth_root, sqrt};
 
 /// Integration `Φ` computed directly from a raw coherence matrix `Γ` (row-major, `n×n`,
@@ -83,6 +83,50 @@ pub fn collective_subject_window(n: usize) -> (f64, f64) {
         return (f64::INFINITY, f64::INFINITY);
     }
     (systemic_correlation(n), sqrt(2.0 / (n - 1) as f64))
+}
+
+/// The collective-subject window at a stated **diagonal purity** `p = Σᵢ dᵢ²`:
+/// `(√(p/(1−p)), √(2p/(1−p))]` (UHM T-312).
+///
+/// Both edges are the general `Φ = r²(1−p)/p` solved at `Φ = 1` and `Φ = 2` — the same two numbers the
+/// window has always meant, now in the coordinate the cell actually has rather than the one the flat
+/// stratum assumes. `collective_subject_window_at(1/n)` is [`collective_subject_window`] at `p = 1/n` exactly, and
+/// `the_flat_window_is_the_general_one_at_a_flat_diagonal` asserts it on every shipped cell size rather
+/// than leaving the convergence as a remark.
+///
+/// A `p` outside `(0, 1)` returns an unreachable window, so a degenerate cell classifies as
+/// [`Aggregate`](CollectiveState::Aggregate) — the same fail-safe as `n < 2`.
+#[must_use]
+pub fn collective_subject_window_at(p: f64) -> (f64, f64) {
+    if p <= 0.0 || p >= 1.0 {
+        return (f64::INFINITY, f64::INFINITY);
+    }
+    let lo = systemic_correlation_at(p);
+    (lo, lo * sqrt(2.0))
+}
+
+/// Classify against the window this cell's own diagonal puts it in, rather than the flat-stratum one.
+///
+/// **The direction of the old error is the reason this exists.** `r*` *rises* as behavioural weight
+/// concentrates, so the flat `1/√(N−1)` sits below a lopsided cell's true phase line: the old reading
+/// called an [`Aggregate`](CollectiveState::Aggregate) a [`CollectiveSubject`](CollectiveState::CollectiveSubject),
+/// never the reverse. Measured at a node carrying 30 % of the variance: true line `0.455`, flat line
+/// `0.408`, and a cell at `r = 0.45` has `Φ = 0.977`.
+///
+/// The *opposite* disagreement — `Φ > 1` with the mean below the floor — is a different animal and stays:
+/// it is the deliberately-used **under-coupled band**, reachable at exactly one block size and asserted in
+/// `dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs`. One direction was a named
+/// feature and the other was unnamed; they are not the same fact seen twice.
+#[must_use]
+pub fn classify_collective_at(r: f64, p: f64) -> CollectiveState {
+    let (lo, hi) = collective_subject_window_at(p);
+    if r <= lo + 1e-12 {
+        CollectiveState::Aggregate
+    } else if r <= hi + 1e-12 {
+        CollectiveState::CollectiveSubject
+    } else {
+        CollectiveState::OverCoupled
+    }
 }
 
 /// The **sampling standard error** of the mean off-diagonal correlation estimated from `window` samples
@@ -233,17 +277,37 @@ pub enum CollectiveState {
     OverCoupled,
 }
 
-/// Classify a collective by its mean inter-node correlation (spec §18.2).
-#[must_use]
-pub fn classify_collective(r: f64, n: usize) -> CollectiveState {
-    let (lo, hi) = collective_subject_window(n);
-    if r <= lo + 1e-12 {
-        CollectiveState::Aggregate
-    } else if r <= hi + 1e-12 {
-        CollectiveState::CollectiveSubject
-    } else {
-        CollectiveState::OverCoupled
+// `classify_collective(r, n)` was here — the flat-stratum classifier. Removed for the same reason as
+// `phi_equicorrelated`: it is [`classify_collective_at`] at `p = 1/n`, and keeping it as a separate name
+// let a caller read `0.408` off a cell without stating that it had assumed the diagonal flat. Every former
+// use is now `classify_collective_at(r, 1.0 / n as f64)`.
+
+
+/// **The convergence, written down rather than remarked on** (UHM T-312/T-314).
+///
+/// `collective_subject_window(n)` and `collective_subject_window_at(1/n)` are the same two numbers because
+/// `√((1/N)/(1−1/N)) = 1/√(N−1)` — two branches that arrived at one constant independently. Asserted on
+/// every shipped cell size so the `N`-form cannot drift away from the law it is a special case of.
+#[cfg(test)]
+#[test]
+fn the_flat_window_is_the_general_one_at_a_flat_diagonal() {
+    for n in [2usize, 3, 4, 7, 13, 21, 31, 57] {
+        let (flat_lo, flat_hi) = collective_subject_window(n);
+        let (gen_lo, gen_hi) = collective_subject_window_at(1.0 / n as f64);
+        assert!(
+            (flat_lo - gen_lo).abs() < 1e-12 && (flat_hi - gen_hi).abs() < 1e-12,
+            "N={n}: the flat window ({flat_lo}, {flat_hi}] must be the general one at p = 1/N, \
+             got ({gen_lo}, {gen_hi}]"
+        );
     }
+    // And the general one MOVES, which is the whole point — a flat-only law would pass the loop above
+    // while saying nothing.
+    let (concentrated_lo, _) = collective_subject_window_at(0.22);
+    let (flat_lo, _) = collective_subject_window(7);
+    assert!(
+        concentrated_lo > flat_lo + 0.1,
+        "a concentrated diagonal must raise the phase line, else this file has re-derived a constant"
+    );
 }
 
 #[cfg(test)]
@@ -435,11 +499,11 @@ mod tests {
         let (lo, hi) = collective_subject_window(7);
         assert!((lo - 1.0 / sqrt(6.0)).abs() < 1e-12);
         assert!((hi - 1.0 / sqrt(3.0)).abs() < 1e-12);
-        assert_eq!(classify_collective(0.35, 7), CollectiveState::Aggregate);
+        assert_eq!(classify_collective_at(0.35, 1.0 / 7.0), CollectiveState::Aggregate);
         assert_eq!(
-            classify_collective(0.5, 7),
+            classify_collective_at(0.5, 1.0 / 7.0),
             CollectiveState::CollectiveSubject
         );
-        assert_eq!(classify_collective(0.7, 7), CollectiveState::OverCoupled);
+        assert_eq!(classify_collective_at(0.7, 1.0 / 7.0), CollectiveState::OverCoupled);
     }
 }
