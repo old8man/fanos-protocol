@@ -521,6 +521,115 @@ mod tests {
         assert_eq!(back.ingress_path, c.ingress_path, "ingress_params");
     }
 
+    /// **Every field of `NodeConfig` is accounted for — by the compiler, not by a list someone maintains.**
+    ///
+    /// The two tests above assert the round trip field by field, which is the right property and the wrong
+    /// mechanism: whether the list is COMPLETE is exactly what a hand-written list cannot say. Measured when
+    /// this landed: 22 `pub` fields, 17 named across both tests, and the two never checked were
+    /// `proteus_morph` and `proteus_environment` — the settings #113 showed are worth two hops of censorship
+    /// chain depth. A renderer that dropped either would leave a node reverting to the default morph at its
+    /// next restart, with this suite green.
+    ///
+    /// The `let NodeConfig { … } = &c;` below has **no `..`**, so adding a field to the struct stops this
+    /// test compiling. That is the same shape #165 gave `render_health`, and it is stronger than a runtime
+    /// count: the reminder arrives at the moment the field is added rather than at the next full test run.
+    ///
+    /// Three fields are deliberately not compared to a round-tripped value, and each says why below. The
+    /// bindings still exist, so the exemptions are visible here rather than implied by absence.
+    #[test]
+    fn the_round_trip_covers_every_field_the_compiler_knows_about() {
+        let c = NodeConfig {
+            listen: "127.0.0.1:9977".parse().expect("a valid listen address"),
+            plane_order: 4,
+            telemetry_epsilon: Some(0.5),
+            state_path: Some(PathBuf::from("/var/lib/fanos-ratchet")),
+            roles: RoleSet { relay: false, storage: true, service: false, exit: true, rendezvous: true, ingress: false },
+            mix_mean_delay: std::time::Duration::from_millis(31),
+            cover_interval: std::time::Duration::from_millis(777),
+            start_heartbeat: false,
+            epoch_period: std::time::Duration::from_secs(301),
+            admission_difficulty: Some(11),
+            // The two the hand-written list never reached, set to something no default would produce.
+            proteus_morph: fanos_quic::Morph::TlsTunnel,
+            proteus_environment: Some(fanos_quic::Environment::DeepCensorship),
+            ..NodeConfig::default()
+        };
+        let text = render_config(&c, Path::new("/etc/fanos/ratchet.key"));
+        let back = NodeConfig::from_config_str(&text).expect("the wizard's own output must parse");
+
+        // No `..`: a new field is a compile error here, which is the whole point of the test.
+        let NodeConfig {
+            listen,
+            plane_order,
+            telemetry_epsilon,
+            identity_path,
+            service_path,
+            exit_path,
+            ingress_path,
+            state_path,
+            bootstrap,
+            roles,
+            mix_mean_delay,
+            cover_interval,
+            start_heartbeat,
+            beacon,
+            epoch_period,
+            admission_difficulty,
+            service,
+            exit,
+            ingress,
+            proteus_secret,
+            proteus_morph,
+            proteus_environment,
+        } = &c;
+
+        assert_eq!(&back.listen, listen, "listen");
+        assert_eq!(&back.plane_order, plane_order, "plane_order");
+        assert_eq!(&back.telemetry_epsilon, telemetry_epsilon, "telemetry_epsilon");
+        assert_eq!(&back.state_path, state_path, "state_path");
+        assert_eq!(&back.bootstrap, bootstrap, "bootstrap");
+        assert_eq!(back.roles.to_string(), roles.to_string(), "roles");
+        assert_eq!(&back.mix_mean_delay, mix_mean_delay, "mix_mean_delay");
+        assert_eq!(&back.cover_interval, cover_interval, "cover_interval");
+        assert_eq!(&back.start_heartbeat, start_heartbeat, "start_heartbeat");
+        assert_eq!(&back.epoch_period, epoch_period, "epoch_period");
+        assert_eq!(&back.admission_difficulty, admission_difficulty, "admission_difficulty");
+        assert_eq!(&back.proteus_morph, proteus_morph, "proteus_morph — the censorship transform (#113)");
+        assert_eq!(&back.proteus_environment, proteus_environment, "proteus_environment");
+        // The identity is an ARGUMENT to the renderer rather than a field it reads, so the round trip is from
+        // that argument into the parsed config — which is what a caller of `render_config` actually relies on.
+        assert_eq!(
+            back.identity_path.as_deref(),
+            Some(Path::new("/etc/fanos/ratchet.key")),
+            "identity_path comes from the renderer's argument, not from `c`"
+        );
+        assert_eq!(identity_path, &None, "and the fixture deliberately leaves the field unset");
+
+        // --- deliberately not round-tripped, each for its own reason ---
+
+        // A shared community secret does not belong in a file an operator copies between hosts, so the
+        // renderer writes a comment naming it instead of the value. The property worth asserting is
+        // therefore the OPPOSITE one: that the comment does not parse back as a setting.
+        assert_eq!(proteus_secret, &None, "the fixture sets no secret");
+        assert!(back.proteus_secret.is_none(), "a rendered `# proteus_secret` comment must stay a comment");
+
+        // The four provisioning bundles are loaded from FILES the config names. Rendering writes the paths;
+        // parsing re-reads them, and in this fixture no such file exists, so the parsed side is `None` by
+        // construction. `the_rendered_config_reads_back_field_for_field` covers the three paths; the beacon
+        // has no path field at all because the renderer derives it from the config directory
+        // (`dir.join(BEACON_FILE)`, emitted only if the file is there) — a different design from the other
+        // three and a deliberate one, since `ensure_beacon` creates that file at a fixed name.
+        assert!(
+            beacon.is_none() && service.is_none() && exit.is_none() && ingress.is_none(),
+            "no provisioning bundles in this fixture"
+        );
+        assert_eq!(
+            (&back.service_path, &back.exit_path, &back.ingress_path),
+            (service_path, exit_path, ingress_path),
+            "the three provisioning PATHS round-trip; their loaded contents are files, not config"
+        );
+    }
+
     #[test]
     fn a_defaulted_config_also_round_trips() {
         // The commented-out lines must be comments, not settings. A renderer that writes its own documentation as
