@@ -46,9 +46,44 @@ pub struct ProteusShaper {
     /// transform in [`shape`](Self::shape)/[`inbound`](Self::inbound).
     codec: Option<Arc<dyn MorphCodec>>,
     epoch: Epoch,
+    /// The current epoch's shape — the **only** one this node emits with.
     shape: ShapeParams,
+    /// The neighbouring epochs' shapes, accepted on receive only: `[previous, next]`. See
+    /// [`SHAPE_GRACE`] for why both, and why the pair is cached rather than derived per frame.
+    grace: [ShapeParams; 2],
     counter: AtomicU64,
 }
+
+/// How many epochs to either side of the current one a receiver still un-shapes (#196).
+///
+/// **Both sides, and that is the finding.** Epoch advance is driven by the beacon, not a clock
+/// (`fanos_node::epoch_driver` waits on the beacon watch), so at a turn one peer rotates before the other
+/// and the pair disagrees for the flood's spread across the cell. Take A rotating first:
+///
+/// | direction | sender shapes with | receiver holds | receiver needs |
+/// |---|---|---|---|
+/// | A → B | `N+1` | `N` | a **future** shape |
+/// | B → A | `N` | `N+1` | a **past** shape |
+///
+/// A node cannot know whether it is the early one or the late one, so retaining only the past — the obvious
+/// fix, and the one the onion ratchet's `DEFAULT_RETAIN` suggests — leaves whichever node rotated *first*
+/// unreachable for the whole spread. Before this, both directions went dark and stayed dark until both ends
+/// had turned.
+///
+/// **Deliberately its own constant, not the ratchet's.** `fanos-pqcrypto`'s retention bounds how long a
+/// sealed onion stays peelable — a bound on *message flight time*. This bounds how long two peers may
+/// disagree about the epoch — a bound on *beacon propagation*. They share a value today and would diverge on
+/// a cell whose flooding is slow relative to its round trips, so tying them would be one constant standing
+/// for two quantities.
+///
+/// **Emission is unaffected**: [`ProteusShaper::shape`] uses the current epoch alone, so the wire signature
+/// still moves exactly once per epoch and a size/timing detector sees what it saw before. Widening happens
+/// only on the receive side.
+///
+/// The window is **cached**, not derived per frame. Deriving on a miss would make every unrecognised frame
+/// cost two `epoch_shape` hashes, which an attacker sending garbage controls; three `deobfuscate` attempts
+/// on a cached window is constant work with nothing attacker-scaled in it.
+pub const SHAPE_GRACE: u64 = 1;
 
 /// Redacted `Debug`: never render the community secret (which now lives in a production node once PROTEUS is
 /// enabled) — a `{:?}` on the driver's transport state must not leak it (secret hygiene, audit D).
@@ -77,6 +112,7 @@ impl ProteusShaper {
     pub fn with_morph(community_secret: impl Into<Vec<u8>>, epoch: Epoch, morph: Morph) -> Self {
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
+        let grace = grace_shapes(&secret, epoch);
         Self {
             secret,
             morph,
@@ -84,6 +120,7 @@ impl ProteusShaper {
             codec: None,
             epoch,
             shape,
+            grace,
             counter: AtomicU64::new(0),
         }
     }
@@ -111,6 +148,7 @@ impl ProteusShaper {
         }
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
+        let grace = grace_shapes(&secret, epoch);
         Some(Self {
             secret,
             morph: Morph::Pluggable,
@@ -118,6 +156,7 @@ impl ProteusShaper {
             codec: Some(codec),
             epoch,
             shape,
+            grace,
             counter: AtomicU64::new(0),
         })
     }
@@ -155,9 +194,13 @@ impl ProteusShaper {
     }
 
     /// Advance to a new epoch: the shape rotates, so the wire signature moves (§13.4, V22).
+    ///
+    /// The [`SHAPE_GRACE`] window moves with it, so a peer that has not yet turned — or has already turned —
+    /// still un-shapes for the length of the beacon's spread.
     pub fn rotate(&mut self, epoch: Epoch) {
         self.epoch = epoch;
         self.shape = epoch_shape(&self.secret, epoch);
+        self.grace = grace_shapes(&self.secret, epoch);
     }
 
     /// The current epoch.
@@ -218,8 +261,31 @@ impl ProteusShaper {
         if self.morph == Morph::Plain {
             return Some(wire.to_vec());
         }
+        // Current epoch first: in steady state — which is almost all of the time — the first attempt
+        // succeeds and the grace shapes are never touched. See [`SHAPE_GRACE`] for why the other two exist
+        // and why both sides are needed rather than only the past.
         deobfuscate(&self.shape, wire)
+            .or_else(|| deobfuscate(&self.grace[0], wire))
+            .or_else(|| deobfuscate(&self.grace[1], wire))
     }
+}
+
+/// The shapes a receiver accepts besides the current one: `[epoch − SHAPE_GRACE, epoch + SHAPE_GRACE]`.
+///
+/// At genesis there is no earlier epoch, so the past slot repeats the current shape rather than inventing
+/// `Epoch::ZERO − 1`. That costs one redundant `deobfuscate` on a node that has never rotated and keeps the
+/// window a fixed-size array — no allocation, no branch on the receive path, and nothing for a `no_std`
+/// build to special-case.
+///
+/// **Saturating at BOTH ends**, and the first version of this was not: it used `saturating_sub` for the past
+/// and a bare `+` for the future, which panics at `Epoch(u64::MAX)`. `Epoch::next` is saturating for the same
+/// reason and says so — a counter that wraps re-derives a *past* window, which is a replay hazard, not merely
+/// an arithmetic one. Caught on the first run by `the_window_at_genesis_does_not_wrap_below_zero`, which was
+/// written for the other end of the range.
+fn grace_shapes(secret: &[u8], epoch: Epoch) -> [ShapeParams; 2] {
+    let previous = Epoch::new(epoch.get().saturating_sub(SHAPE_GRACE));
+    let following = Epoch::new(epoch.get().saturating_add(SHAPE_GRACE));
+    [epoch_shape(secret, previous), epoch_shape(secret, following)]
 }
 
 #[cfg(test)]
@@ -246,6 +312,68 @@ mod tests {
         let bob = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
         let wire = alice.outbound(b"hi bob");
         assert_eq!(bob.inbound(&wire).unwrap(), b"hi bob");
+    }
+
+    /// **A peer mid-rotation is reachable in BOTH directions, and two epochs apart in neither** (#196).
+    ///
+    /// The shaper held one shape and `rotate` overwrote it, so at every epoch turn the link went dark both
+    /// ways until both ends had rotated — in exactly the censored deployments PROTEUS exists for.
+    ///
+    /// The A→B leg is the half a "retain the previous epoch" fix does not cover, and it is the one that
+    /// matters: the node that rotates **first** is the unreachable one, and a test checking only the late
+    /// peer's inbound would certify the half-fix as done. Both legs are asserted for that reason.
+    ///
+    /// The two-apart case is the negative half. A window that accepts everything is not a window: it would
+    /// mean a stale peer could be shaped-for indefinitely, and the rotation would stop being a rotation.
+    #[test]
+    fn a_peer_one_epoch_behind_is_reachable_both_ways_and_two_epochs_behind_is_not() {
+        let early = ProteusShaper::new(b"s".to_vec(), Epoch::new(10)); // rotated already
+        let late = ProteusShaper::new(b"s".to_vec(), Epoch::new(9)); // beacon has not reached it
+
+        // The half a backward-only retention misses: the EARLY node's frames reaching the late one.
+        let forward = early.outbound(b"from the node that turned first");
+        assert_eq!(
+            late.inbound(&forward).as_deref(),
+            Some(b"from the node that turned first".as_slice()),
+            "a peer that has not yet rotated must still read the one that has — otherwise whichever node \
+             turns first is unreachable for the whole beacon spread"
+        );
+
+        // And the half it does cover, which must not regress.
+        let back = late.outbound(b"from the node still behind");
+        assert_eq!(
+            early.inbound(&back).as_deref(),
+            Some(b"from the node still behind".as_slice()),
+            "and the node that has rotated must still read the one that has not"
+        );
+
+        // Two epochs apart is outside the window, in both directions.
+        let far = ProteusShaper::new(b"s".to_vec(), Epoch::new(12));
+        assert!(
+            far.inbound(&back).is_none() && late.inbound(&far.outbound(b"x")).is_none(),
+            "the grace window is bounded: two epochs apart does not un-shape, or the rotation is not one"
+        );
+    }
+
+    /// Genesis has no earlier epoch, and the window must not invent one.
+    ///
+    /// `Epoch::ZERO − 1` would wrap to `u64::MAX` and derive a shape from a window that will never exist,
+    /// so a node that has never rotated would spend one of its three attempts on nonsense. Saturating makes
+    /// the past slot repeat the present, which is redundant but correct.
+    #[test]
+    fn the_window_at_genesis_does_not_wrap_below_zero() {
+        let genesis = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
+        let next = ProteusShaper::new(b"s".to_vec(), Epoch::new(1));
+        assert_eq!(
+            genesis.inbound(&next.outbound(b"forward from epoch 1")).as_deref(),
+            Some(b"forward from epoch 1".as_slice()),
+            "epoch 0 still accepts epoch 1 — the forward half is what a fresh node needs"
+        );
+        let wrapped = ProteusShaper::new(b"s".to_vec(), Epoch::new(u64::MAX));
+        assert!(
+            genesis.inbound(&wrapped.outbound(b"x")).is_none(),
+            "and it does not accept the shape of `0 - 1` wrapped, which is what a bare subtraction would give"
+        );
     }
 
     #[test]
