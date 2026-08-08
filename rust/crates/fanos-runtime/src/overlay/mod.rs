@@ -4052,4 +4052,60 @@ mod tests {
             "every queried shard home answered and none holds a shard — that IS a definite negative"
         );
     }
+
+    /// The invariant #214's optimisation rests on: **while a read is pending, no version reconstructs.**
+    ///
+    /// `on_value` now attempts only the version whose shard just arrived, instead of walking every group.
+    /// That is exactly equivalent rather than approximate, and this is the claim it rests on — a version
+    /// becomes reconstructable only when a shard arrives for it, and the read is retired the instant one
+    /// does. Written as a test rather than left as an argument, because the argument is short enough to
+    /// believe and the property is what last-writer-wins (#115) is built on.
+    #[test]
+    fn no_version_is_left_reconstructable_while_a_read_is_still_pending() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        seat_every_neighbour(&mut node, Instant(0));
+        let key = b"k";
+        let (digest, _) = OverlayNode::<F2>::address_of(key);
+        node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
+        let nonce = node.store.pending.get(&digest).expect("fanned out").nonce;
+        let peers: Vec<_> = node.peers.keys().copied().collect();
+
+        // Two real values at two write-versions, fed shard by shard and interleaved so that neither
+        // completes before the other has partial coverage — the arrangement that would expose a stale
+        // "higher version was already whole" if one could exist.
+        let low = erasure::encode(b"the-older-write");
+        let high = erasure::encode(b"the-newer-write");
+        let mut retired_at = None;
+        for i in 0..erasure::N {
+            for (version, shards) in [(3u64, &low), (9u64, &high)] {
+                let from = peers[i % peers.len()];
+                for e in node.step(Instant(2), Input::Message {
+                    from,
+                    frame: encode_value(
+                        &digest, true, u8::try_from(i).unwrap(), version,
+                        shards.get(i).map_or(&[][..], Vec::as_slice), nonce,
+                    ),
+                }) {
+                    if let Effect::Notify(Notification::Retrieved { outcome, .. }) = e {
+                        retired_at = Some(outcome);
+                    }
+                }
+                // The property, checked after EVERY accepted shard: **if the entry is still in `pending`,
+                // nothing in the accumulator reconstructs.**
+                //
+                // Keyed on the entry's presence and deliberately NOT on "have we seen a `Retrieved` yet".
+                // That was the first version and it could not fail: `retired_at` goes `Some` on the very
+                // notification that accompanies the violation, so the guard fell silent exactly when the
+                // thing it watches for appears. Falsified — breaking retirement left it green.
+                if let Some(p) = node.store.pending.get(&digest) {
+                    assert!(
+                        reconstruct_highest(&p.by_version).is_none(),
+                        "a version reconstructs while the read is still pending — the equivalence #214 \
+                         relies on does not hold, and `on_value` must go back to walking every version"
+                    );
+                }
+            }
+        }
+        assert!(retired_at.is_some(), "the read must conclude once a full shard-set arrives");
+    }
 }

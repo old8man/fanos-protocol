@@ -839,7 +839,25 @@ impl<F: Field> OverlayNode<F> {
         // memory without an eviction key an attacker can name.
         // Deliver the highest write-version whose shard-set is now recoverable (a stale version completing
         // first can never mask a fresher one; mixed-version shards are never combined into a garbage value).
-        if let Some(value) = reconstruct_highest(&pending.by_version) {
+        // **Only the version this shard belongs to, not every version** (#214).
+        //
+        // `reconstruct_highest` walks all groups descending, and a version whose shard MASK is recoverable
+        // but whose bytes are garbage costs the entire peel — `groups × N` byte operations for a 64 KiB
+        // shard, 65 536 stripes — and is rejected only at the very end, by `unpad`. Re-running that for
+        // every version on every reply is where the time went: measured 11.95 s against 0.11 s in release
+        // when the per-peer quota was removed and the version count grew.
+        //
+        // Attempting only `version` is not an approximation, it is exactly equivalent. A version becomes
+        // reconstructable only when a shard arrives FOR IT, and the read is retired the instant one does —
+        // so while this read is pending, no other version can have become reconstructable since it was last
+        // examined. The `reconstruct_highest` in `on_get` stays, because there the whole locally-seeded set
+        // is being examined for the first time.
+        //
+        // The hoist this task originally proposed — lifting `is_recoverable_fano` out of the stripe loop
+        // because the mask is the same on every stripe — is real but worth nothing: the check sits at the
+        // top of the loop body, so `g = 0` already returns for an unrecoverable mask. Hopeless versions were
+        // never the cost; plausible-but-wrong ones were.
+        if let Some(value) = pending.by_version.get(&version).and_then(erasure::reconstruct) {
             self.store.pending.remove(&digest);
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
