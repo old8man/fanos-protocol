@@ -37,7 +37,17 @@ use tokio::time::Instant;
 /// not admission-gated (unlike overlay membership, §L3), so without a cap a flood of distinct source
 /// coordinates — or handlers that never finish — would grow the peer map without bound (audit A4). At the
 /// cap, the least-recently-active session is evicted (its handler aborted) to admit a new one.
-pub(crate) const MAX_SESSIONS: usize = 1024;
+///
+/// **The value is derived elsewhere and imported** (#205). Bounding the *count* is only half of what this
+/// constant does: each session holds two queues of `ChannelTransport::CAP` cells, so it is also a factor in
+/// the session layer's memory footprint — and while the two lived apart, their product was 2.08 GiB against
+/// a 256 MiB node recommendation. [`fanos_diaulos::budget`] now derives both from one budget with a
+/// compile-time assert over the product; it fell from 1024 to 246 as a result.
+///
+/// It is a **cell-wide denominator** as well: `role_loop` divides the Exit role's measured load by it, so it
+/// must remain a protocol bound. Two nodes computing capacity from different values disagree permanently
+/// about how many exits the cell needs.
+pub(crate) const MAX_SESSIONS: usize = fanos_diaulos::budget::MAX_SESSIONS;
 
 /// A session that has **accepted** no datagram for this long is evicted — its inbound channel closed and
 /// its handler task aborted — reclaiming a wedged or abandoned handler that never signals completion

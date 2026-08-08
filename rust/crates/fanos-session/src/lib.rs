@@ -50,10 +50,18 @@ impl ChannelTransport {
     /// bounded (audit A4b); the outbound side is bounded for symmetry (the loopback wiring uses one
     /// channel as one peer's outbound and the other's inbound, so both halves share a kind). A full
     /// queue **drops** the datagram rather than blocking — DIAULOS retransmits unacked cells, so a
-    /// bounded lossy queue is the correct memory bound (and mirrors the overlay's own lossy
-    /// delivery). The depth sits far above a healthy in-flight window (SACK width 64), so it never
-    /// sheds under honest load; the FIFO drop engages only under a peer flood.
-    pub const CAP: usize = 1024;
+    /// bounded lossy queue is the correct memory bound (and mirrors the overlay's own lossy delivery).
+    ///
+    /// **Imported, not restated** (#205). This depth and `MAX_SESSIONS` multiply into the session layer's
+    /// whole memory footprint, and while each lived in its own crate with its own justification the product
+    /// was 2.08 GiB — 8.3× the node's own RAM recommendation — with nothing multiplying them. Both now come
+    /// from one derivation with a compile-time assert over the product; see
+    /// [`fanos_diaulos::budget`] for the arithmetic and for why a thousand sessions
+    /// at this depth was never affordable.
+    ///
+    /// The old value was `1024`, chosen as "far above a healthy in-flight window (SACK width 64)". The
+    /// window was the right input; what was missing was any bound on how far above.
+    pub const CAP: usize = fanos_diaulos::budget::QUEUE_DEPTH;
 }
 
 /// Drive a dialed [`ClientSession`] as an async duplex byte stream over `transport`. Returns the

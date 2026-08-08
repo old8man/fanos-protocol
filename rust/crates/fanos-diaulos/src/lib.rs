@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod cell;
 pub mod conn;
 pub mod endpoint;
