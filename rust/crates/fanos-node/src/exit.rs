@@ -146,6 +146,88 @@ impl Realm {
     }
 }
 
+/// Why the exit declined a session — the sub-kind
+/// [`Station::ExitRefused`](fanos_runtime::ports::stations::Station::ExitRefused) is counted under.
+///
+/// **The exit is the role whose refusals an operator is accountable for.** The traffic leaves from their
+/// address and the requester is unidentifiable by construction, so "what is my exit turning away" is a
+/// question only this node can answer, and it shipped answering none of it: one `warn!` on the destination
+/// rule and silence everywhere else.
+///
+/// Named rather than aggregated because the three demand different actions. A malformed target is someone
+/// speaking the wrong protocol at the service. A refused port is the operator's own allow-list working, and
+/// its rate is how they learn whether the list is too narrow — or that someone is hunting for an open mail
+/// relay. A refused destination has no benign reading at all: an anonymous client naming a link-local or
+/// RFC 1918 address is probing for the cloud metadata endpoint from inside the anonymity set (#170).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitRefusal {
+    /// The target header was unusable: absent, over [`MAX_TARGET_LEN`], truncated, not UTF-8, or not
+    /// `host:port`. **Not** a client that connected and said nothing — see [`TargetRead::Silent`], which is
+    /// deliberately not counted here, because a session ending before it began is ordinary and would bury
+    /// the signal this name carries under it.
+    TargetMalformed,
+    /// [`ExitPolicy::allows_port`] refused the destination port.
+    PortRefused,
+    /// The destination is not globally routable, or resolves to nothing that is (#170).
+    DestinationRefused,
+}
+
+/// `ExitRefusal::ALL` is complete, proven by the compiler. Same reasoning as [`crate::Gate`], and load-bearing
+/// twice over here: the renderer resolves a tag to a name by enumerating this list, so a missing variant would
+/// print as a bare integer to the one reader it exists for.
+const _: () = assert!(
+    ExitRefusal::ALL.len() == core::mem::variant_count::<ExitRefusal>(),
+    "an ExitRefusal variant is missing from ExitRefusal::ALL, so its counter renders as an opaque number"
+);
+
+impl ExitRefusal {
+    /// Every refusal reason, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[Self::TargetMalformed, Self::PortRefused, Self::DestinationRefused];
+
+    /// The discriminant carried in `Observation::tag`, written out for the same reason [`crate::Gate::tag`]
+    /// is: variant order must not renumber an operator's counters.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::TargetMalformed => 0,
+            Self::PortRefused => 1,
+            Self::DestinationRefused => 2,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TargetMalformed => "target_malformed",
+            Self::PortRefused => "port_refused",
+            Self::DestinationRefused => "destination_refused",
+        }
+    }
+}
+
+/// Record an exit refusal where an operator will see it — the counter carries the *reason*, the log line
+/// carries the *target*.
+///
+/// The split is forced, not stylistic. A destination is a string an anonymous client chooses, so keying a
+/// counter by it would be an attacker-minted key — the one thing the data-path plane's cardinality bound
+/// forbids (`stations.rs` R2), and `record_tagged` would silently fold anything above `MAX_SKEW_TAG` anyway.
+/// So the aggregate stays over a three-value enumeration and the specific target goes to the log, which is
+/// where an operator investigating a *rise* in the counter will look next.
+fn note_refusal(client: &Client, reason: ExitRefusal, target: &str) {
+    client.record_station(
+        fanos_runtime::ports::stations::Station::ExitRefused,
+        Some(client.address()),
+        Some(reason.tag()),
+    );
+    tracing::warn!(
+        reason = reason.name(),
+        target = %target,
+        "exit refused a session; the client is unidentifiable by construction, which is the point of the \
+         network and the reason the operator needs the other half"
+    );
+}
+
 /// What clearnet targets an exit will relay to: a destination **port** rule the operator writes (the common
 /// abuse lever — mail relays, scanning; an empty allow-list means any port, opted into explicitly rather
 /// than by default), and a destination **address** rule that is not the operator's to widen (#170).
@@ -202,29 +284,46 @@ pub fn serve_exit<R>(
     R: CryptoRng + Send + 'static,
 {
     let policy = Arc::new(policy);
+    // The same handle `serve` consumes, kept so each session can count its own refusals — the counters ride
+    // the node's own data-path plane rather than a second surface nothing reads.
+    let recorder = client.clone();
     serve(client, keypair, rng, move |stream| {
         let policy = Arc::clone(&policy);
+        let recorder = recorder.clone();
         // Taken before the session runs and dropped with the future, so every way a session can end — a clean
         // close, a rejected port, an unreachable host, a cancelled task — decrements it.
         let carried = gauge.as_ref().map(LoadGauge::in_flight);
         async move {
-            relay_one(stream, &policy).await;
+            relay_one(stream, &policy, &recorder).await;
             drop(carried);
         }
     });
 }
 
 /// Serve one exit session: read its target, enforce the policy, then splice it — a TCP byte stream or a
-/// UDP datagram relay — until either side closes. Any error (bad header, denied target, unreachable host)
-/// simply ends the session; the stream drops, closing it.
-async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
-    let Some(target) = read_target(&mut stream).await else {
-        return;
+/// UDP datagram relay — until either side closes.
+///
+/// **Every way this ends short is counted.** It shipped with one loud refusal (`#170`'s destination rule)
+/// beside four silent ones, so an operator could see neither that their port policy was doing anything nor
+/// that someone was probing it. `client` is the node's own handle and is what carries those counts to
+/// `fanos data-path`; it is a parameter rather than an option because an observability seam a caller has to
+/// remember to switch on is one production ships without.
+async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy, client: &Client) {
+    let target = match read_target(&mut stream).await {
+        TargetRead::Got(target) => target,
+        // Deliberately uncounted — see `TargetRead`. Nothing was asked for, so nothing was refused.
+        TargetRead::Silent => return,
+        TargetRead::Malformed => {
+            note_refusal(client, ExitRefusal::TargetMalformed, "<unreadable header>");
+            return;
+        }
     };
     let Some((proto, host, port)) = parse_target(&target) else {
+        note_refusal(client, ExitRefusal::TargetMalformed, &target);
         return;
     };
     if !policy.allows_port(port) {
+        note_refusal(client, ExitRefusal::PortRefused, &target);
         return;
     }
     // **Then the destination itself** (#170). The port is only half the question, and it was the only half
@@ -232,26 +331,56 @@ async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
     // `169.254.169.254:80`, the cloud metadata endpoint. Resolved once here so the connect below cannot
     // re-resolve to something else; see `resolve_relayable`.
     let Some(dest) = resolve_relayable(host, port, policy.realm).await else {
-        // Loud, because a refusal and a quiet exit look identical to an operator, and this particular
-        // refusal is the signature of someone probing for the metadata endpoint from inside the anonymity
-        // set. The target is logged; the client is unidentifiable by construction, which is the point of the
-        // network and the reason the operator needs the other half.
-        tracing::warn!(
-            target = %target,
-            "exit refused a non-relayable destination: it resolves to a loopback, private, link-local or \
-             otherwise non-global address"
-        );
+        note_refusal(client, ExitRefusal::DestinationRefused, &target);
         return;
     };
     match proto {
         Protocol::Tcp => {
             let Ok(mut tcp) = TcpStream::connect(dest).await else {
+                // Not a refusal: this node agreed to relay and the destination did not answer. Ordinary one
+                // at a time, and the whole diagnosis if it is the only thing this exit ever reports — an
+                // operator whose upstream is gone otherwise sees a healthy node serving nobody.
+                note_dial_failed(client, dest);
                 return;
             };
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
         }
-        Protocol::Udp => relay_udp(stream, dest).await,
+        Protocol::Udp => relay_udp(stream, dest, client).await,
     }
+}
+
+/// Record a destination this exit agreed to reach and could not.
+fn note_dial_failed(client: &Client, dest: std::net::SocketAddr) {
+    client.record_station(
+        fanos_runtime::ports::stations::Station::ExitDialFailed,
+        Some(client.address()),
+        None,
+    );
+    tracing::debug!(
+        %dest,
+        "exit could not reach a permitted destination"
+    );
+}
+
+/// Record that this node could not obtain a **local** socket — the failure that is the operator's own to fix.
+///
+/// `warn!` where a dial failure is `debug!`, and the asymmetry is the point: a destination that does not
+/// answer is the internet's business and happens constantly, while a node that cannot open a socket is out
+/// of file descriptors or ephemeral ports and will keep failing every session until someone raises
+/// `LimitNOFILE`. Reporting the two at the same level would teach an operator to filter out the one that
+/// matters.
+fn note_socket_unavailable(client: &Client, what: &str, err: &io::Error) {
+    client.record_station(
+        fanos_runtime::ports::stations::Station::ExitSocketUnavailable,
+        Some(client.address()),
+        None,
+    );
+    tracing::warn!(
+        operation = what,
+        error = %err,
+        "exit could not obtain a local socket — this node is out of descriptors or ephemeral ports, and is \
+         serving no UDP session until that is fixed"
+    );
 }
 
 /// Relay UDP datagrams for one exit session: bind an ephemeral socket **connected** to `(host, port)`, and
@@ -259,13 +388,20 @@ async fn relay_one(mut stream: DuplexStream, policy: &ExitPolicy) {
 /// both directions until either closes. A connected socket keeps this a one-target tunnel (the UDP analog
 /// of `CONNECT`) — the target sees the exit's address, never the client's. This serves DNS-over-FANOS (a
 /// resolver at `udp:host:53`) and any single-destination UDP flow.
-async fn relay_udp(stream: DuplexStream, dest: std::net::SocketAddr) {
-    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await else {
-        return;
+async fn relay_udp(stream: DuplexStream, dest: std::net::SocketAddr, client: &Client) {
+    let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            note_socket_unavailable(client, "udp bind", &e);
+            return;
+        }
     };
     // An already-resolved, already-filtered address (#170) — never a name, which `connect` would resolve
     // again and could resolve differently.
-    if socket.connect(dest).await.is_err() {
+    if let Err(e) = socket.connect(dest).await {
+        // A connected UDP socket sends nothing, so this fails on a local condition — no route to that
+        // family, an exhausted port table — which is why it joins the bind rather than the dial.
+        note_socket_unavailable(client, "udp connect", &e);
         return;
     }
     let socket = Arc::new(socket);
@@ -303,17 +439,41 @@ async fn relay_udp(stream: DuplexStream, dest: std::net::SocketAddr) {
     }
 }
 
+/// The outcome of reading a session's target header — **three** states, because the two failures are not
+/// the same event and folding them makes the interesting one unreadable.
+///
+/// A client that opens a session and sends nothing is ordinary: a circuit died, a proxy gave up. A client
+/// that declares a 60 000-byte target, or sends bytes that are not UTF-8, is not speaking this protocol.
+/// One `Option` returning `None` for both would have put the ordinary case into the counter that exists to
+/// show the other, at a rate that buries it — the same three-state split #179 made for "alone on purpose"
+/// versus "alone by accident".
+enum TargetRead {
+    /// A well-formed target header.
+    Got(String),
+    /// EOF before a single byte of the header — nothing was ever asked for.
+    Silent,
+    /// Bytes arrived and were not a target: a zero or over-[`MAX_TARGET_LEN`] length, a truncated body, or
+    /// not UTF-8.
+    Malformed,
+}
+
 /// Read the length-prefixed target header `len(2 BE) ‖ host:port` from the stream.
-async fn read_target(stream: &mut DuplexStream) -> Option<String> {
+async fn read_target(stream: &mut DuplexStream) -> TargetRead {
     let mut len = [0u8; 2];
-    stream.read_exact(&mut len).await.ok()?;
+    // The one read whose failure is not a protocol violation: nothing has been claimed yet, so a closed
+    // stream here is a session that ended before it began.
+    if stream.read_exact(&mut len).await.is_err() {
+        return TargetRead::Silent;
+    }
     let len = usize::from(u16::from_be_bytes(len));
     if len == 0 || len > MAX_TARGET_LEN {
-        return None;
+        return TargetRead::Malformed;
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await.ok()?;
-    String::from_utf8(buf).ok()
+    if stream.read_exact(&mut buf).await.is_err() {
+        return TargetRead::Malformed;
+    }
+    String::from_utf8(buf).map_or(TargetRead::Malformed, TargetRead::Got)
 }
 
 /// Read one length-framed datagram (`len(2 BE) ‖ payload`) from a UDP-tunnel stream. `None` on EOF or a
@@ -547,6 +707,20 @@ pub fn spawn_exit_publisher(
 mod tests {
     use super::*;
 
+    /// One node on loopback, for the tests that need a real [`Client`] to record stations on and nothing
+    /// else. A cell would be seven, and the exit's counters are entirely node-local.
+    async fn spawn_one() -> fanos_quic::NodeHandle {
+        fanos_quic::spawn(
+            Box::new(fanos_runtime::OverlayNode::<fanos_field::F2>::new(
+                Point::at(0),
+                fanos_runtime::Config::default(),
+            )),
+            fanos_quic::Directory::new(),
+        )
+        .await
+        .expect("spawn a node")
+    }
+
     /// **An exit key verifies only at a coordinate its publisher can prove.**
     ///
     /// A key directory nobody signs is a key directory anyone rewrites. Any admitted member could overwrite
@@ -694,6 +868,141 @@ mod tests {
         assert_eq!(refused, 49, "the substitution is refused at 49 of the plane's 57 points");
     }
 
+    /// **Every way the exit declines is counted, distinguishably, and a session it serves is silent.**
+    ///
+    /// The exit shipped with one loud refusal — #170's destination rule, a `warn!` with no counter — beside
+    /// four silent ones, so an operator could not tell a working port policy from a dead service, and could
+    /// not see their exit being probed for the cloud metadata endpoint at all.
+    ///
+    /// Both halves are asserted, and the negative one is what makes the positive mean something: a counter
+    /// that rises on every session says nothing about any of them. So the last case runs a *served* session
+    /// end to end — bytes actually spliced through to an echo server and back — and asserts the plane did
+    /// not move.
+    ///
+    /// The reasons are asserted **by tag**, not merely by station: folding "the port is not allowed" into
+    /// "someone is naming a link-local address" is exactly the discrimination this exists to provide, and a
+    /// test that only counted `exit.refused` would pass with the tags swapped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_way_the_exit_declines_is_counted_and_a_served_session_is_silent() {
+        use std::time::Duration as StdDuration;
+
+        use fanos_runtime::ports::stations::Station;
+        use tokio::net::TcpListener;
+
+        // One node, not a cell: the exit records on its own node's plane and needs no peers to do it, so a
+        // cell fixture here would be measuring the harness.
+        let node = spawn_one().await;
+        let client = node.client();
+
+        // Deltas, never absolutes: a live cell's own publishes share this plane, so an emptiness assertion
+        // would be measuring the fixture rather than the exit.
+        let count = |station: Station, tag: Option<u64>| {
+            client
+                .driver_stations()
+                .iter()
+                .filter(|o| o.station == station && (tag.is_none() || o.tag == tag))
+                .map(|o| o.count)
+                .sum::<u64>()
+        };
+        let refusals = |r: ExitRefusal| count(Station::ExitRefused, Some(r.tag()));
+
+        // A port nobody is listening on: bound, addressed, released. The exit will resolve it (loopback is
+        // dialable in the fixture realm) and the connect will be refused, which is the dial-failure case.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap().local_addr().unwrap();
+
+        // A TCP echo server, for the served session that must NOT move the plane.
+        let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = echo.accept().await {
+                let (mut r, mut w) = sock.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+
+        // Drive one session against `relay_one` over an in-memory duplex, writing `header` verbatim so a
+        // malformed header is expressible — `exit_send_target` would refuse to produce one.
+        let session = |policy: ExitPolicy, header: Vec<u8>| {
+            let client = client.clone();
+            async move {
+                let (mut mine, theirs) = tokio::io::duplex(64 * 1024);
+                let relay = tokio::spawn(async move { relay_one(theirs, &policy, &client).await });
+                if header.is_empty() {
+                    drop(mine); // the client that connects and says nothing
+                } else {
+                    mine.write_all(&header).await.unwrap();
+                    drop(mine);
+                }
+                let _ = tokio::time::timeout(StdDuration::from_secs(5), relay).await;
+            }
+        };
+        // `len(2 BE) ‖ bytes`, the wire form the exit reads.
+        let framed = |t: &str| {
+            let mut v = u16::try_from(t.len()).unwrap().to_be_bytes().to_vec();
+            v.extend_from_slice(t.as_bytes());
+            v
+        };
+        let web = || ExitPolicy::web();
+        let local = |port| ExitPolicy::also_permitting_loopback_for_tests(vec![port]);
+
+        // 1. A client that says nothing. Ordinary — a circuit died — and deliberately NOT a refusal: it
+        //    would outnumber every other reason and bury them.
+        session(web(), Vec::new()).await;
+        assert_eq!(count(Station::ExitRefused, None), 0, "a session that asked for nothing was refused nothing");
+
+        // 2. A declared length of zero: bytes arrived, and they are not a target.
+        session(web(), vec![0, 0]).await;
+        assert_eq!(refusals(ExitRefusal::TargetMalformed), 1, "a zero-length target header is malformed");
+
+        // 3. A header that is not `host:port` at all.
+        session(web(), framed("this is not a target")).await;
+        assert_eq!(refusals(ExitRefusal::TargetMalformed), 2, "and so is a target with no port");
+
+        // 4. The operator's own allow-list. SMTP is the canonical abuse lever and the module doc names it;
+        //    before this, an exit being hunted for an open mail relay looked exactly like an idle one.
+        session(web(), framed("example.com:25")).await;
+        assert_eq!(refusals(ExitRefusal::PortRefused), 1, "port 25 is outside the web policy");
+
+        // 5. The #170 alarm. There is no benign reading of an anonymous client naming this address.
+        session(web(), framed("169.254.169.254:80")).await;
+        assert_eq!(
+            refusals(ExitRefusal::DestinationRefused),
+            1,
+            "the cloud metadata endpoint is refused, and now says so where an operator can see it"
+        );
+
+        // 6. Permitted, resolvable, and nothing listening — this node agreed to relay and could not. A
+        //    separate station because it is not a refusal, and because an exit reporting ONLY this has lost
+        //    its upstream while still calling itself healthy.
+        assert_eq!(count(Station::ExitDialFailed, None), 0);
+        session(local(dead.port()), framed(&dead.to_string())).await;
+        assert_eq!(count(Station::ExitDialFailed, None), 1, "a permitted destination that did not answer");
+        assert_eq!(
+            count(Station::ExitRefused, None),
+            4,
+            "and it is not filed as a refusal: this node did not decline anything"
+        );
+
+        // 7. **The negative half.** A session that is actually served, bytes spliced both ways, must leave
+        //    the plane exactly where it was — otherwise every count above is just "a session happened".
+        let before = client.driver_stations();
+        let (mut mine, theirs) = tokio::io::duplex(64 * 1024);
+        let (policy, recorder) = (local(echo_addr.port()), client.clone());
+        let relay = tokio::spawn(async move { relay_one(theirs, &policy, &recorder).await });
+        mine.write_all(&framed(&echo_addr.to_string())).await.unwrap();
+        mine.write_all(b"ping").await.unwrap();
+        let mut back = [0u8; 4];
+        tokio::time::timeout(StdDuration::from_secs(5), mine.read_exact(&mut back))
+            .await
+            .expect("the splice must carry bytes to the echo server and back")
+            .expect("four bytes come back");
+        assert_eq!(&back, b"ping", "the session was really served, not merely accepted");
+        drop(mine);
+        let _ = tokio::time::timeout(StdDuration::from_secs(5), relay).await;
+        assert_eq!(client.driver_stations(), before, "a served session moves no station at all");
+        node.shutdown();
+    }
+
     #[test]
     fn policy_gates_on_port() {
         let web = ExitPolicy::web();
@@ -749,8 +1058,10 @@ mod tests {
         // echo server is on LOOPBACK, which `is_relayable` refuses: that is correct and is why this test
         // calls `relay_udp` rather than going through `relay_one`. The refusal itself is asserted in
         // `the_exit_refuses_every_destination_it_must_not_dial`.
+        let node = spawn_one().await;
+        let recorder = node.client();
         let (client, exit) = tokio::io::duplex(64 * 1024);
-        let relay = tokio::spawn(async move { relay_udp(exit, echo_addr).await });
+        let relay = tokio::spawn(async move { relay_udp(exit, echo_addr, &recorder).await });
 
         let (mut rd, mut wr) = tokio::io::split(client);
         // Two distinct framed datagrams each round-trip through the exit and the echo server.

@@ -336,6 +336,48 @@ pub enum Station {
     /// [`Observation::tag`] carries which gate, since "someone is forging host registrations" and "someone is
     /// forging capability advertisements" are different attacks with different responses.
     AuthenticationRejected,
+
+    // --- Clearnet exit (`fanos_node::exit`) ---
+    //
+    // The exit is the one role whose refusals an operator is *accountable* for: the traffic leaves from their
+    // address, and the requester is unidentifiable by construction. It shipped with exactly one loud refusal
+    // (the #170 destination rule, a `warn!` and no counter) beside four silent ones, so the operator could
+    // neither prove their policy was working nor see it being probed (#208).
+
+    /// The exit **declined a client's request** before dialling anything.
+    ///
+    /// [`Observation::tag`] carries why — see `fanos_node::ExitRefusal`. The three reasons are one station
+    /// because the operator's question is a single "what is my exit turning away, and how often"; they are
+    /// *tagged* because the answers demand different actions. A malformed target is someone speaking the
+    /// wrong protocol at the service. A refused port is the operator's own allow-list working, and its rate
+    /// is how they learn whether the list is too narrow — or that someone is hunting for an open mail relay.
+    /// A refused destination is the #170 alarm: an anonymous client naming a link-local or RFC 1918 address
+    /// is probing for the cloud metadata endpoint from inside the anonymity set, and there is no benign
+    /// reading of it.
+    ///
+    /// The tag is a bounded enumeration and deliberately **not** the destination port, which an anonymous
+    /// client chooses: [`Stations::record_tagged`] folds anything above [`MAX_SKEW_TAG`] into the untagged
+    /// bucket, so a port histogram would show `25` and silently swallow `443`, and R2 forbids attacker-minted
+    /// keys outright. The specific target belongs in the log line beside the counter, and is logged there.
+    ExitRefused,
+
+    /// The exit accepted a target, dialled it, and the destination did not answer.
+    ///
+    /// Not a refusal — this node agreed to relay and the internet did not cooperate — which is why it is a
+    /// separate station rather than a fourth [`ExitRefused`](Self::ExitRefused) tag. Individually this is the
+    /// most ordinary event an exit has (targets go down, connections time out) and it is worth counting for
+    /// exactly one reason: if it is the *only* thing this station shows, the operator's upstream connectivity
+    /// is gone and the node is still reporting itself healthy and serving nobody.
+    ExitDialFailed,
+
+    /// The exit could not obtain a **local socket** for a session — it never reached the destination at all.
+    ///
+    /// A different failure from every other name here: nothing about the request was wrong and nothing about
+    /// the network failed. This node is out of file descriptors or ephemeral ports. It is the concrete form
+    /// of the abstract worry in `docs/design-hidden-service-hardening.md` about an unbounded unit, and it is
+    /// the one exit failure that is *this operator's to fix* — so conflating it with a dial failure would
+    /// point them at their upstream while the fault is `LimitNOFILE`.
+    ExitSocketUnavailable,
 }
 
 /// **`ALL` is complete, proven by the compiler.**
@@ -391,6 +433,9 @@ impl Station {
         Self::WireOverBound,
         Self::WireUnshaped,
         Self::StoreAtCapacity,
+        Self::ExitRefused,
+        Self::ExitDialFailed,
+        Self::ExitSocketUnavailable,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -433,6 +478,9 @@ impl Station {
             Self::AssignmentWithheld => "assignment.withheld",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
+            Self::ExitRefused => "exit.refused",
+            Self::ExitDialFailed => "exit.dial_failed",
+            Self::ExitSocketUnavailable => "exit.socket_unavailable",
         }
     }
 }

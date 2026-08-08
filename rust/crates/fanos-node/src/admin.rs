@@ -31,7 +31,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use fanos_runtime::ports::stations::{GatherHealth, Observation};
+use fanos_runtime::ports::stations::{GatherHealth, Observation, Station};
 use fanos_telemetry::CoherenceFrame;
 use fanos_wire::activation::Derivation;
 
@@ -312,6 +312,43 @@ fn digest_of<'a>(entries: impl Iterator<Item = (&'a str, u64, Option<u64>)>) -> 
     fanos_primitives::hash::hash_labeled("FANOS-v1/derivation-vector", &input)
 }
 
+/// Resolve an [`Observation::tag`] to the name its station's vocabulary gives it, or `None` where the
+/// station's tag is not drawn from one.
+///
+/// **Deliberately partial, and that is the whole design.** Four stations tag with a small enumeration whose
+/// discriminants are written out precisely so an operator's saved counters survive a variant being added
+/// (`Directory::tag`, `Gate::tag`, `ExitRefusal::tag`, `Role::index`) — those resolve. The rest tag with a
+/// *quantity*: `AssignmentWithheld` carries a roster size, `FrameTypeUnknown` a wire code an enumeration by
+/// definition does not contain, and the skew station a derivation tag. Inventing names for those would put a
+/// fabricated vocabulary in front of the operator, so they print as the numbers they are.
+///
+/// `RoleUnderProvisioned` was very nearly filed as a quantity here — a "role index" reads like one. It is a
+/// discriminant, and the most consequential of the four: the station's own doc says one relay short and one
+/// point short on a rendezvous line are different emergencies, so a number the operator cannot decode
+/// discards exactly the distinction the station was added for.
+///
+/// The mapping lives here rather than beside [`Station`] because `fanos-ports` is `no_std` and knows nothing
+/// of these enums — the direction of the dependency is what forced the two halves apart in the first place,
+/// and this function is the join.
+#[must_use]
+fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
+    // `find` over `ALL` rather than a reverse `match`: the lists are compile-time-proven complete (#197), so
+    // enumerating them cannot go stale, while a hand-written inverse of `tag()` could disagree with it.
+    match station {
+        Station::DirectoryPublishFailed => {
+            crate::Directory::ALL.iter().find(|d| d.tag() == tag).map(|d| d.name())
+        }
+        Station::AuthenticationRejected => crate::Gate::ALL.iter().find(|g| g.tag() == tag).map(|g| g.name()),
+        Station::ExitRefused => {
+            crate::ExitRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
+        }
+        Station::RoleUnderProvisioned => {
+            fanos_core::roles::Role::ALL.iter().find(|r| r.index() as u64 == tag).map(|r| r.name())
+        }
+        _ => None,
+    }
+}
+
 /// Render the data-path plane as the socket's response body.
 ///
 /// One station per line, **only where the count is non-zero**: a node reports `stations × lines` counters and
@@ -328,10 +365,15 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth, epoch: u
     let mut moved = 0usize;
     for o in stations.iter().filter(|o| o.count > 0) {
         moved += 1;
-        // The tag is printed only where a site recorded one, which is only the skew station — an operator
-        // reading `frame.type_unknown  line 1:0:1  tag 47  312` has the whole of §4's question in one line:
-        // what disagrees, where, and how much.
-        let tag = o.tag.map_or_else(String::new, |t| format!("  tag {t}"));
+        // The tag is printed where a site recorded one, RESOLVED to its name where the station has a
+        // vocabulary. Without that resolution an operator reads `auth.rejected  line 1:0:1  tag 3  12` and
+        // has no way to learn that 3 means `bound_capability_advertisement`: the enums carry a `name()`
+        // documented as "the operator-facing name", the `warn!` beside each site prints it, and the
+        // aggregate surface — the one designed as the operator seam — printed a bare integer (#209).
+        let tag = o.tag.map_or_else(String::new, |t| match tag_name(o.station, t) {
+            Some(name) => format!("  tag {t} ({name})"),
+            None => format!("  tag {t}"),
+        });
         match o.line {
             Some([x, y, z]) => {
                 let _ = writeln!(out, "{:<24} line {x}:{y}:{z}{tag}  {}", o.station.name(), o.count);
@@ -818,6 +860,93 @@ mod tests {
             "a station that never fired is not printed: {body}"
         );
         assert!(body.contains("srtt 180 ms") && body.contains("var 40 ms"), "the measured deadline: {body}");
+        // A tag with no vocabulary prints as the number it is. `FrameTypeUnknown`'s 47 is a wire code, and
+        // inventing a name for it would put a fabricated vocabulary in front of an operator.
+        assert!(body.contains("tag 47"), "a quantity tag prints bare: {body}");
+        assert!(!body.contains("tag 47 ("), "and is not dressed up as a name: {body}");
+    }
+
+    /// **A tagged counter reaches the operator as a word, not a number** (#209).
+    ///
+    /// Three stations sub-divide by an enumeration whose `name()` is documented as "the operator-facing
+    /// name" — and the operator's own surface printed the discriminant. `auth.rejected line 1:0:1 tag 3`
+    /// gave no way to learn that 3 is `bound_capability_advertisement`, so the whole reason those tags are
+    /// written out by hand (an operator's saved counters must survive a new variant) bought nothing: the
+    /// numbers were never legible in the first place.
+    ///
+    /// Asserted through `name()` rather than a literal, so a renamed variant cannot leave this passing
+    /// against a string that no longer appears anywhere.
+    #[test]
+    fn a_stations_tag_renders_as_its_name() {
+        let refusal = crate::ExitRefusal::DestinationRefused;
+        let body = render_data_path(
+            &[Observation {
+                station: Station::ExitRefused,
+                line: None,
+                tag: Some(refusal.tag()),
+                count: 9,
+            }],
+            GatherHealth::NoGatherPath,
+            0,
+        );
+        assert!(
+            body.contains(&format!("tag {} ({})", refusal.tag(), refusal.name())),
+            "the refusal reason must be named where the operator reads it: {body}"
+        );
+    }
+
+    /// **Every tag vocabulary resolves, on every member** — the ratchet, and the reason it is a loop.
+    ///
+    /// A variant added to `Gate`, `Directory` or `ExitRefusal` without a line in `tag_name` renders as an
+    /// opaque integer to the one reader it exists for, and nothing else in the tree would notice: the
+    /// `warn!` beside the recording site would still print the name perfectly. So the assertion is over
+    /// `ALL` — which the compiler proves complete (#197) — rather than over a hand-written list, making the
+    /// two guards compose: `ALL` cannot omit a variant, and this cannot omit a name.
+    ///
+    /// The `station` each vocabulary belongs to is named here too, because a mapping keyed by the *wrong*
+    /// station resolves nothing and would otherwise fail silently in exactly the same way.
+    #[test]
+    fn every_tag_vocabulary_resolves_on_every_member() {
+        for d in crate::Directory::ALL {
+            assert_eq!(
+                tag_name(Station::DirectoryPublishFailed, d.tag()),
+                Some(d.name()),
+                "directory {} renders as a bare number",
+                d.name()
+            );
+        }
+        for g in crate::Gate::ALL {
+            assert_eq!(
+                tag_name(Station::AuthenticationRejected, g.tag()),
+                Some(g.name()),
+                "gate {} renders as a bare number",
+                g.name()
+            );
+        }
+        for r in crate::ExitRefusal::ALL {
+            assert_eq!(
+                tag_name(Station::ExitRefused, r.tag()),
+                Some(r.name()),
+                "exit refusal {} renders as a bare number",
+                r.name()
+            );
+        }
+        for r in fanos_core::roles::Role::ALL {
+            assert_eq!(
+                tag_name(Station::RoleUnderProvisioned, r.index() as u64),
+                Some(r.name()),
+                "role {} renders as a bare number — and this is the station where that costs the most",
+                r.name()
+            );
+        }
+        // And the other direction, or the mapping above is indistinguishable from one that names everything:
+        // a tag outside a vocabulary, and a station whose tag is a quantity, must both stay unnamed.
+        assert_eq!(tag_name(Station::ExitRefused, 250), None, "an unknown discriminant invents no name");
+        assert_eq!(
+            tag_name(Station::AssignmentWithheld, 3),
+            None,
+            "a roster size is a quantity, not a vocabulary"
+        );
     }
 
     #[test]

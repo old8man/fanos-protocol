@@ -296,8 +296,8 @@ pub use diaulos::{
 pub use epoch_driver::{EpochDriver, next_epoch};
 pub use error::NodeError;
 pub use exit::{
-    ExitPolicy, build_cell_exit_directory, dial_exit, publish_exit_key, resolve_exit_key, serve_exit,
-    spawn_exit_publisher,
+    ExitPolicy, ExitRefusal, build_cell_exit_directory, dial_exit, publish_exit_key, resolve_exit_key,
+    serve_exit, spawn_exit_publisher,
 };
 pub use fanos_onoma::Epoch;
 pub use fanos_quic::{Environment, Morph, MorphCodec};

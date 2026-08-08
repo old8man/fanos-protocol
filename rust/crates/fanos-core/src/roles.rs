@@ -137,6 +137,26 @@ impl Role {
         self.tag() as usize
     }
 
+    /// The operator-facing name, for the surfaces that report *about* a role rather than to it.
+    ///
+    /// [`index`](Self::index) is what `Station::RoleUnderProvisioned` carries in `Observation::tag`, and that
+    /// station exists precisely because "one relay short" and "one point short on a rendezvous line" are
+    /// different emergencies — the second means the `t`-of-`(q+1)` guarantee is not being met at all. An
+    /// operator reading `role.under_provisioned … tag 4` could not tell which, so the discrimination the
+    /// station was built for stopped at the last inch. Written out rather than derived from `Debug`, for the
+    /// same reason [`Role::tag`] is: a saved query must survive a variant being renamed or reordered.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Role::Relay => "relay",
+            Role::Storage => "storage",
+            Role::Service => "service",
+            Role::Exit => "exit",
+            Role::Rendezvous => "rendezvous",
+            Role::Ingress => "ingress",
+        }
+    }
+
     /// The 1-byte domain tag mixed into the ticket hash (distinct per role).
     #[must_use]
     const fn tag(self) -> u8 {
