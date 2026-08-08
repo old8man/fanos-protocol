@@ -193,10 +193,10 @@ async fn read_load<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Read<Demand> {
-    match tokio::time::timeout(STORE_TIMEOUT, client.get(load_slot(coord, epoch))).await {
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| open_load_record::<F>(&b, coord, epoch, beacon))),
-        Err(_) => Read::Unknown,
-    }
+    Read::of(
+        tokio::time::timeout(STORE_TIMEOUT, client.read(load_slot(coord, epoch))).await.ok(),
+        |b| open_load_record::<F>(b, coord, epoch, beacon),
+    )
 }
 
 /// Keep a node's load report **live**: spawn the task that publishes `load_source()`'s current observed load

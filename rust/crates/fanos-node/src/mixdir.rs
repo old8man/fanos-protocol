@@ -207,13 +207,13 @@ async fn read_mix_key_in_mode<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Read<HybridKemPublic> {
-    match tokio::time::timeout(STORE_TIMEOUT, client.get(mix_key_slot(coord, epoch))).await {
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| match beacon {
-            Some(seed) => parse_bound_record::<F>(&b, coord, epoch, &seed),
-            None => HybridKemPublic::decode(&b),
-        })),
-        Err(_) => Read::Unknown,
-    }
+    Read::of(
+        tokio::time::timeout(STORE_TIMEOUT, client.read(mix_key_slot(coord, epoch))).await.ok(),
+        |b| match beacon {
+            Some(seed) => parse_bound_record::<F>(b, coord, epoch, &seed),
+            None => HybridKemPublic::decode(b),
+        },
+    )
 }
 
 

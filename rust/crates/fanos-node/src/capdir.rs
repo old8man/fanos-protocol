@@ -222,26 +222,26 @@ async fn read_capability<F: Field>(
     beacon: Option<BeaconSeed>,
 ) -> Read<(NodeId, Capability)> {
     let slot = cap_slot(coord, epoch);
-    match tokio::time::timeout(STORE_TIMEOUT, client.get(slot)).await {
-        // Completed. The **caller's** answer is `Absent` either way — there is no usable capability at this
-        // slot whether nothing was published or something unsignable was — and that is right: `Read`'s three
-        // values are about what the reader may conclude, not about why. What was wrong is that the *reason*
-        // died here too (#109). Nothing published is a quiet slot; something published that fails its
-        // signature names an adversary, and only one of the two is worth waking someone for. So the branch
-        // splits, the verdict stays, and the evidence goes to the data-path plane instead of the floor.
-        Ok(None) => Read::Absent,
-        Ok(Some(b)) => {
-            let (gate, parsed) = match beacon {
-                Some(seed) => (
-                    crate::Gate::BoundCapabilityAdvertisement,
-                    parse_bound_advertisement::<F>(&b, coord, epoch, &seed),
-                ),
-                None => (crate::Gate::CapabilityAdvertisement, parse_advertisement(&b, epoch)),
-            };
-            Read::found_or_absent(note_authentication(client, coord, gate, parsed))
-        }
-        Err(_) => Read::Unknown,
-    }
+    // Completed. The **caller's** answer is `Absent` whether nothing was published or something unsignable
+    // was — and that is right: `Read`'s three values are about what the reader may conclude, not about why.
+    // What was wrong is that the *reason* died here too (#109). Nothing published is a quiet slot; something
+    // published that fails its signature names an adversary, and only one of the two is worth waking someone
+    // for. So the branch splits, the verdict stays, and the evidence goes to the data-path plane.
+    //
+    // **What #215 changed is the OTHER axis.** `Ok(None)` used to be this arm's `Absent`, and it arrived for
+    // four different reasons — only one of which was "the cell answered and holds nothing". A read that timed
+    // out now says so, and `Read::of` maps it to `Unknown` instead of quietly shrinking the roster this
+    // function feeds.
+    Read::of(tokio::time::timeout(STORE_TIMEOUT, client.read(slot)).await.ok(), |b| {
+        let (gate, parsed) = match beacon {
+            Some(seed) => (
+                crate::Gate::BoundCapabilityAdvertisement,
+                parse_bound_advertisement::<F>(b, coord, epoch, &seed),
+            ),
+            None => (crate::Gate::CapabilityAdvertisement, parse_advertisement(b, epoch)),
+        };
+        note_authentication(client, coord, gate, parsed)
+    })
 }
 
 /// Keep a node's capability advertisement **live**: spawn the task that (re)publishes its signed descriptor at

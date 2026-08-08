@@ -148,12 +148,10 @@ async fn read_diagnosis<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Read<(u8, u8, Seating)> {
-    match tokio::time::timeout(STORE_TIMEOUT, client.get(diagnosis_slot(coord, epoch))).await {
-        Ok(bytes) => {
-            Read::found_or_absent(bytes.and_then(|b| open_diagnosis::<F>(&b, coord, epoch, beacon)))
-        }
-        Err(_) => Read::Unknown,
-    }
+    Read::of(
+        tokio::time::timeout(STORE_TIMEOUT, client.read(diagnosis_slot(coord, epoch))).await.ok(),
+        |b| open_diagnosis::<F>(b, coord, epoch, beacon),
+    )
 }
 
 /// Collect every member's diagnosis for the **closed** epochs `window`, as the record set

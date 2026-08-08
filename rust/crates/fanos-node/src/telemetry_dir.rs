@@ -149,10 +149,10 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
 /// Three-valued: a read that **timed out** is not the same as a node that published nothing, and collapsing them is how a
 /// monitor comes to believe a quiet cell is a healthy one. Same discipline as `capdir`'s `read_capability`.
 pub async fn read_coherence(client: &Client, coord: Coord, epoch: Epoch) -> Read<CoherenceFrame> {
-    match tokio::time::timeout(STORE_TIMEOUT, client.get(coherence_slot(coord, epoch))).await {
-        Ok(bytes) => Read::found_or_absent(bytes.and_then(|b| CoherenceFrame::decode(&b))),
-        Err(_) => Read::Unknown,
-    }
+    Read::of(
+        tokio::time::timeout(STORE_TIMEOUT, client.read(coherence_slot(coord, epoch))).await.ok(),
+        CoherenceFrame::decode,
+    )
 }
 
 /// Every point of the base cell of plane `F` — the coordinate list a monitor resolves telemetry over.

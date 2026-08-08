@@ -257,6 +257,15 @@ pub enum Station {
     /// answers a `Lookup` with the shards it holds, which pass all three rules by construction — so unlike a
     /// full store this is never a symptom of honest load.
     ReadShardRefused,
+    /// A `Get` settled as [`ReadOutcome::Inconclusive`](crate::ReadOutcome), tagged by why
+    /// (`fanos_runtime::ReadStall`).
+    ///
+    /// **The reason lives here and not in the notification, deliberately.** A caller only ever needs the three
+    /// states — it either has the bytes, knows there are none, or knows nothing. An operator needs to know
+    /// *which* non-conclusion, because a slow cell, a saturated read table and an unseated node call for three
+    /// different actions. Splitting them that way keeps the type the width of the decision and still puts the
+    /// diagnosis somewhere a human can read it (#215).
+    ReadInconclusive,
     /// A descriptor share arrived that does **not** open its dealt per-share commitment: not a decode error
     /// and not a stale epoch, but a value provably different from the one the dealer handed that member.
     ///
@@ -471,6 +480,7 @@ impl Station {
         Self::WireUnshaped,
         Self::StoreAtCapacity,
         Self::ReadShardRefused,
+        Self::ReadInconclusive,
         Self::ExitRefused,
         Self::ExitDialFailed,
         Self::ExitSocketUnavailable,
@@ -508,6 +518,7 @@ impl Station {
             Self::WireUnshaped => "wire.unshaped",
             Self::StoreAtCapacity => "store.at_capacity",
             Self::ReadShardRefused => "read.shard_refused",
+            Self::ReadInconclusive => "read.inconclusive",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",
             Self::AdmissionPowFailed => "admission.pow_failed",
             Self::AdmissionSybilCapped => "admission.sybil_capped",

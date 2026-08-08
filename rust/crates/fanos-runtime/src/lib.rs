@@ -44,7 +44,7 @@ pub use fanos_stream as stream;
 
 pub use overlay::{
     Config, MAX_PENDING_GETS, MAX_STORE_ENTRIES, MAX_VALUE_LEN, OverlayNode, QUARANTINE_TTL,
-    READ_ACCUMULATOR_BYTES, READ_MEMORY_CEILING, READ_PEER_SHARD_QUOTA, ReadRefusal,
+    READ_ACCUMULATOR_BYTES, READ_MEMORY_CEILING, READ_PEER_SHARD_QUOTA, ReadRefusal, ReadStall,
     corroboration_quorum,
 };
 pub use ports::{Command, Duration, Effect, Engine, Escalation, Input, Instant, Notification, TimerToken};

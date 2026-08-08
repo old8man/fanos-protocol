@@ -31,7 +31,7 @@ mod liveness;
 mod membership_ops;
 /// Content storage and retrieval — see [`storage`].
 mod storage;
-pub use storage::ReadRefusal;
+pub use storage::{ReadRefusal, ReadStall};
 
 /// Storage `Publish` sub-type: the **full value**, sent origin → responsible node, which then
 /// erasure-codes it and distributes the shards. Carries no meaningful shard index (`0`).
@@ -1671,6 +1671,22 @@ pub(crate) type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+    use crate::ports::ReadOutcome;
+
+    /// Mark every algebraic neighbour **occupied**, as production does the moment a node hears from its cell.
+    ///
+    /// Six tests used to read from a node that had heard from nobody, and passed because a read fanned out to
+    /// every algebraic point whether or not anyone was there — so the fixture was resting on the very defect
+    /// #216 removes. In production `last_seen` is set by the first frame from a peer, long before any
+    /// directory read; a bare node reading the cell is not a state a deployment passes through.
+    fn seat_every_neighbour<F: Field>(node: &mut OverlayNode<F>, now: Instant) {
+        let coords: Vec<Triple> = node.peers.keys().copied().collect();
+        for c in coords {
+            if let Some(p) = node.peers.get_mut(&c) {
+                p.last_seen = Some(now);
+            }
+        }
+    }
     // Codec helpers the tests build frames with; scoped here so the library build does not carry them.
     use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
@@ -2114,10 +2130,20 @@ mod tests {
         );
 
         // And the mechanism: give it shards to hold, and the storage figure must follow.
+        //
+        // **Delivered as `PUBLISH_SHARD` from a cell member, not as a local `Put`.** A `Put` routes to the
+        // key's responsible point and distributes the shards to their homes, so on a cell this node knows the
+        // membership of, most keys leave rather than land — which is right, and which used to be invisible
+        // because the node believed it was alone and was therefore every key's home (#216). What a storage
+        // node actually experiences is shards arriving from its cell, so that is what this feeds it.
+        let member = Point::<F2>::at(1).coords();
         for i in 0..4u8 {
             node.step(
                 Instant(2),
-                Input::Command(Command::Put { key: alloc::vec![i], value: alloc::vec![7u8; 64] }),
+                Input::Message {
+                    from: member,
+                    frame: encode_publish(PUBLISH_SHARD, 0, 1, &[i; DIGEST], &[7u8; 64]),
+                },
             );
         }
         let busy = load_of(&mut node, 3);
@@ -2141,6 +2167,10 @@ mod tests {
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
             OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+        // Pinning the roster says where the seats are; it does not say anyone is in them. Storage placement
+        // follows CONTACT (`occupied_points`), so the fixture must state contact — which is what a deployed
+        // node has by the time it reads anything (#216).
+        seat_every_neighbour(&mut node, Instant(0));
         let lookups = |effects: &[Effect]| {
             effects
                 .iter()
@@ -3319,6 +3349,7 @@ mod tests {
         // in-flight read, or a stale/replayed one from a superseded prior get (old nonce), is ignored — so it
         // is never accumulated and can never resolve a later same-key get with an old value.
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        seat_every_neighbour(&mut node, Instant(0));
         let key = b"k";
         let (digest, _) = OverlayNode::<F2>::address_of(key);
         let peer = Point::<F2>::at(1).coords();
@@ -3380,7 +3411,7 @@ mod tests {
         assert!(
             fresh.iter().any(|e| matches!(
                 e,
-                Effect::Notify(Notification::Retrieved { key: k, value: Some(v) })
+                Effect::Notify(Notification::Retrieved { key: k, outcome: ReadOutcome::Found(v) })
                     if *k == digest && v.as_slice() == b"the-fresh-value"
             )),
             "the shard-set matching the in-flight nonce reconstructs and resolves the read"
@@ -3784,6 +3815,7 @@ mod tests {
     #[test]
     fn a_peer_spraying_versions_cannot_delete_the_honest_write_from_a_read() {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        seat_every_neighbour(&mut node, Instant(0));
         let key = b"k";
         let (digest, _) = OverlayNode::<F2>::address_of(key);
         node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
@@ -3817,14 +3849,14 @@ mod tests {
                 from: honest,
                 frame: encode_value(&digest, true, u8::try_from(i).unwrap(), 3, shard, nonce),
             }) {
-                if let Effect::Notify(Notification::Retrieved { value, .. }) = e {
-                    retrieved = Some(value);
+                if let Effect::Notify(Notification::Retrieved { outcome, .. }) = e {
+                    retrieved = Some(outcome);
                 }
             }
         }
         assert_eq!(
             retrieved,
-            Some(Some(value.to_vec())),
+            Some(ReadOutcome::Found(value.to_vec())),
             "the read must deliver the value the honest cell holds, whatever a member claims about versions"
         );
         // And the spray was recorded rather than absorbed: an operator can name the peer.
@@ -3846,6 +3878,7 @@ mod tests {
     #[test]
     fn a_read_accumulator_cannot_exceed_what_the_store_would_have_accepted() {
         let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        seat_every_neighbour(&mut node, Instant(0));
         let key = b"k";
         let (digest, _) = OverlayNode::<F2>::address_of(key);
         node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
@@ -3935,5 +3968,88 @@ mod tests {
                 "#213 landed: replace this tripwire with the apportionment assertion it stands in for"
             );
         }
+    }
+
+    /// #215. A read nobody answers must say **"I did not find out"**, not "there is nothing here" — and it
+    /// must say so at the engine's own timeout, which is where the lie used to be told.
+    ///
+    /// The assertion is on the OUTCOME rather than on a station count, because the station is the operator's
+    /// copy and the outcome is what every caller decides on. Both are checked; only one is the property.
+    #[test]
+    fn a_read_that_nobody_answered_is_inconclusive_and_never_a_definite_absence() {
+        let cfg = Config::default();
+        let mut node = OverlayNode::<F2>::new(Point::at(0), cfg);
+        seat_every_neighbour(&mut node, Instant(0));
+        node.step(Instant(0), Input::Command(Command::StartHeartbeat));
+        node.step(Instant(1), Input::Command(Command::Get { key: b"k".to_vec() }));
+        assert_eq!(node.store.pending.len(), 1, "the read fanned out to the algebraic cell");
+
+        // Heartbeats pace the sweep, so the conclusion lands at the first beat past `read_timeout`.
+        let mut concluded = None;
+        let mut t = 0u64;
+        while t < 6_000_000_000 && concluded.is_none() {
+            t += cfg.heartbeat.0;
+            for e in node.step(Instant(t), Input::Timer(HEARTBEAT)) {
+                if let Effect::Notify(Notification::Retrieved { outcome, .. }) = e {
+                    concluded = Some((t, outcome));
+                }
+            }
+        }
+        let (at, outcome) = concluded.expect("the engine must conclude a read it cannot complete");
+        assert_eq!(
+            outcome,
+            ReadOutcome::Inconclusive,
+            "a read that ran out of time established NOTHING; reporting Absent is what silently shrinks a \
+             roster built from directory reads"
+        );
+        // The measurement that made this a defect rather than a preference: it lands well inside the 5 s
+        // wrapper whose elapse used to be the caller's only way to learn a read had not concluded.
+        assert!(
+            at < 5_000_000_000,
+            "the engine concludes at {at} ns, before the 5 s STORE_TIMEOUT — which is precisely why the \
+             two-crate ordering invariant could not save the caller"
+        );
+        // And the operator gets the reason, which the caller deliberately does not.
+        let stalls: u64 = node
+            .stations
+            .observations()
+            .iter()
+            .filter(|o| o.station == Station::ReadInconclusive && o.tag == Some(ReadStall::TimedOut.tag()))
+            .map(|o| o.count)
+            .sum();
+        assert_eq!(stalls, 1, "the non-conclusion is counted, tagged with WHY");
+    }
+
+    /// The other side of the same coin: when the cell genuinely answers "nothing here", that is `Absent` and
+    /// a caller may rely on it.
+    ///
+    /// Written because a three-state type is only worth having if BOTH negatives are reachable — a fix that
+    /// turned every miss into `Inconclusive` would pass the test above and destroy the property it protects
+    /// ([[discrimination-needs-differing-inputs]]).
+    #[test]
+    fn a_cell_that_answers_nothing_here_is_a_definite_absence() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        seat_every_neighbour(&mut node, Instant(0));
+        let key = b"k";
+        let (digest, _) = OverlayNode::<F2>::address_of(key);
+        node.step(Instant(1), Input::Command(Command::Get { key: key.to_vec() }));
+        let nonce = node.store.pending.get(&digest).expect("fanned out").nonce;
+        let peers: Vec<_> = node.peers.keys().copied().collect();
+        let mut outcome = None;
+        for peer in peers {
+            for e in node.step(Instant(2), Input::Message {
+                from: peer,
+                frame: encode_value(&digest, false, 0, 0, &[], nonce),
+            }) {
+                if let Effect::Notify(Notification::Retrieved { outcome: o, .. }) = e {
+                    outcome = Some(o);
+                }
+            }
+        }
+        assert_eq!(
+            outcome,
+            Some(ReadOutcome::Absent),
+            "every queried shard home answered and none holds a shard — that IS a definite negative"
+        );
     }
 }

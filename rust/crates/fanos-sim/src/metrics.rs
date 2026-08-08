@@ -2,6 +2,7 @@
 
 use fanos_diakrisis::Verdict;
 use fanos_runtime::{Notification, Triple};
+use fanos_runtime::ports::ReadOutcome;
 
 /// Aggregate counters over a simulation run. Deterministic for a given `(seed, scenario)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,8 +33,15 @@ pub struct Metrics {
     pub stores: u64,
     /// DHT `Get` completions that returned a value.
     pub retrieval_hits: u64,
-    /// DHT `Get` completions that found nothing.
+    /// DHT `Get`s that **concluded** and found nothing — a definite absence the cell agreed on.
     pub retrieval_misses: u64,
+    /// DHT `Get`s that did **not** conclude: timed out, hit a full read table, or had no peer to ask.
+    ///
+    /// Counted apart from a miss because they are opposite diagnoses (#215). Reads that all miss describe a
+    /// workload asking for keys nobody stored; reads that all end inconclusive describe a cell that cannot
+    /// answer — and under one counter a scenario cannot tell which it just reproduced, which is exactly the
+    /// blindness the simulator exists to not have.
+    pub retrieval_inconclusive: u64,
     /// Values accounted **permanently lost** — a held key became unrecoverable past the erasure tolerance
     /// (audit R-C3): durable loss made visible, distinct from a transient/never-stored miss.
     pub data_losses: u64,
@@ -59,6 +67,7 @@ impl Metrics {
         self.stores += other.stores;
         self.retrieval_hits += other.retrieval_hits;
         self.retrieval_misses += other.retrieval_misses;
+        self.retrieval_inconclusive += other.retrieval_inconclusive;
         self.data_losses += other.data_losses;
         self.observations += other.observations;
     }
@@ -132,7 +141,16 @@ impl Report {
     /// The DHT retrievals observed, as `(observer, key digest, value)`.
     pub fn retrievals(&self) -> impl Iterator<Item = (Triple, [u8; 32], Option<&[u8]>)> {
         self.notifications.iter().filter_map(|o| match &o.note {
-            Notification::Retrieved { key, value } => Some((o.node, *key, value.as_deref())),
+            Notification::Retrieved { key, outcome } => Some((
+                o.node,
+                *key,
+                match outcome {
+                    ReadOutcome::Found(v) => Some(v.as_slice()),
+                    // A miss and a non-conclusion both yield no bytes here, deliberately: this accessor is
+                    // about VALUES. A scenario that needs the distinction reads `retrieval_inconclusive`.
+                    ReadOutcome::Absent | ReadOutcome::Inconclusive => None,
+                },
+            )),
             _ => None,
         })
     }

@@ -18,7 +18,7 @@ use crate::frames::{
     LookupBody, encode,
     encode_lookup, encode_publish, encode_value, fold_seed, parse_digest, parse_u64,
 };
-use crate::ports::{Effect, Instant, Notification};
+use crate::ports::{Effect, Instant, Notification, ReadOutcome};
 use crate::store::{PendingGet, PendingSample};
 
 use super::{
@@ -104,6 +104,54 @@ impl ReadRefusal {
     }
 }
 
+/// Why a `Get` settled as [`ReadOutcome::Inconclusive`] — the tag on
+/// [`Station::ReadInconclusive`](fanos_ports::Station::ReadInconclusive).
+///
+/// Three ways not to conclude, and an operator acts differently on each: a cell that did not answer in time is
+/// a network or liveness problem, a full read table is *this* node saturated, and no peer to ask means this
+/// node is not seated. The caller sees none of this — it gets the three states and nothing more — because a
+/// caller's decision does not vary with the reason and an operator's does (#215).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadStall {
+    /// The cell did not assemble a reconstructable shard-set within `Config::read_timeout`.
+    ///
+    /// **The reachable one.** At 1600 ms swept on the 500 ms heartbeat, a read against a slow or partitioned
+    /// cell settles here at ~2 s — measured — which is three seconds before the 5 s wrapper whose elapse used
+    /// to be the *only* way a caller could learn a read had not concluded.
+    TimedOut,
+    /// The in-flight read table was at `MAX_PENDING_GETS`, so this read was never issued.
+    TableFull,
+}
+
+impl ReadStall {
+    /// Every variant, for the tag-name resolver and the completeness assertion below.
+    pub const ALL: [Self; 2] = [Self::TimedOut, Self::TableFull];
+
+    /// The dense tag recorded on the station.
+    #[must_use]
+    pub fn tag(self) -> u64 {
+        match self {
+            Self::TimedOut => 0,
+            Self::TableFull => 1,
+        }
+    }
+
+    /// The operator-facing name `fanos status stations` prints beside the tag.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed-out",
+            Self::TableFull => "table-full",
+        }
+    }
+}
+
+/// `ALL` must list every way a read can fail to conclude, or one added later prints as a bare number.
+const _: () = assert!(
+    ReadStall::ALL.len() == core::mem::variant_count::<ReadStall>(),
+    "ReadStall::ALL is missing a variant"
+);
+
 /// `ALL` must list every variant, or a rule added later is invisible to the tag-name resolver and its
 /// refusals print as a bare number.
 const _: () = assert!(
@@ -111,6 +159,24 @@ const _: () = assert!(
     "ReadRefusal::ALL is missing a variant"
 );
 
+
+
+impl<F: Field> OverlayNode<F> {
+    /// Conclude a read as **not concluded**: record why on the data-path plane and hand the caller
+    /// [`ReadOutcome::Inconclusive`].
+    ///
+    /// One function so the two halves cannot drift apart. A `Retrieved` that reports a non-conclusion without
+    /// counting it leaves an operator unable to see a node whose reads are all failing; a count without the
+    /// three-state answer leaves the caller believing a definite absence. Both were the state before #215 —
+    /// there was neither.
+    fn read_did_not_conclude(&mut self, digest: [u8; DIGEST], why: ReadStall) -> Vec<Effect> {
+        self.stations.record_tagged(Station::ReadInconclusive, None, Some(why.tag()), 1);
+        alloc::vec![Effect::Notify(Notification::Retrieved {
+            key: digest,
+            outcome: ReadOutcome::Inconclusive,
+        })]
+    }
+}
 
 /// How many peers beyond the erasure threshold `K` a read asks even at full stress.
 ///
@@ -160,13 +226,34 @@ impl<F: Field> OverlayNode<F> {
             .filter(|(_, p)| now.since(p.issued) > timeout)
             .map(|(digest, _)| *digest)
             .collect();
+        // How many of the peers this node asked **could** have answered — recomputed now rather than stored
+        // at issue time, because the occupancy view grows while a read is in flight and the whole point of
+        // waiting for the timeout is to let it.
+        let answerable = self.occupied_points().len().saturating_sub(1); // less this node
         for digest in stale {
+            let negatives = self.store.pending.get(&digest).map_or(0, |p| usize::from(p.negatives));
             self.store.pending.remove(&digest);
             self.account_data_loss(now, digest, effects); // R-C3: a held-but-unrecoverable key is accounted lost
-            effects.push(Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            }));
+            // **The one place a timeout may still be a definite answer, and the reason is exhaustion rather
+            // than the clock.** A read fans out to every algebraic neighbour, most of which may be empty
+            // points that never reply — so `negatives >= queried` is unsatisfiable on a cell that is not
+            // fully occupied, and `Absent` was unreachable there (#216, measured: 4 possible answers of 20
+            // asked at 5 nodes on PG(2,4)).
+            //
+            // The fix is not a smaller denominator on the reply path; that concludes EARLY, because the
+            // occupancy view under-counts while a read is in flight and a peer not yet in it may still be
+            // holding the shard. Measured that way too: a cell froze at 1 readable mix key of 7. Here, at
+            // the timeout, there is nothing left to wait for — so if every peer known to exist has said it
+            // holds nothing, the cell has answered and `Absent` is earned. Otherwise a known peer stayed
+            // silent, and that is a non-conclusion (#215).
+            if negatives >= answerable {
+                effects.push(Effect::Notify(Notification::Retrieved {
+                    key: digest,
+                    outcome: ReadOutcome::Absent,
+                }));
+            } else {
+                effects.extend(self.read_did_not_conclude(digest, ReadStall::TimedOut));
+            }
         }
         // Conclude timed-out DA samples (§L4.3): a sample that never saw every sampled line present within the
         // timeout is inconclusive → `available = false` (a passing sample would have concluded early).
@@ -227,6 +314,12 @@ impl<F: Field> OverlayNode<F> {
                     .filter_map(|&c| Point::<F>::new(c).map(|pt| pt.index())),
             )
             .collect();
+        // **`cell_members` is deliberately NOT in this set, and the distinction cost a run to find.**
+        // A pinned roster is a *configuration* — "these are the seats" — while every other term here is
+        // *evidence*: a peer we have heard from, or one that announced itself. Adding the roster made a
+        // scenario's shards go to seats that were not answering, and `the_spawn_rendezvous_host_driver...`
+        // froze at 1 readable mix key of the cell's. Placement must follow contact, because a shard sent to
+        // a configured-but-absent seat is a shard that does not exist.
         occupied.insert(self.coord.index());
         occupied
     }
@@ -238,7 +331,15 @@ impl<F: Field> OverlayNode<F> {
     /// occupied, else its nearest-occupied successor. The occupied set always contains this node, so this is
     /// total (the `map_or` default is unreachable, kept only for totality).
     pub(super) fn nearest_occupied(&self, ideal_idx: usize) -> Triple {
-        let occupied = self.occupied_points();
+        Self::successor(&self.occupied_points(), ideal_idx)
+    }
+
+    /// The successor rule itself, over an already-computed occupied set — **one rule, three callers.**
+    ///
+    /// Split out so [`shard_homes`](Self::shard_homes) can apply it `N` times without rebuilding the set, and
+    /// so there is exactly one expression of "nearest occupied successor on the index ring". Copying it into
+    /// the read path is how the read and the write came to disagree about where a shard lives.
+    fn successor(occupied: &BTreeSet<usize>, ideal_idx: usize) -> Triple {
         occupied
             .range(ideal_idx..)
             .next()
@@ -247,6 +348,23 @@ impl<F: Field> OverlayNode<F> {
                 || Point::<F>::at(ideal_idx).coords(),
                 |&i| Point::<F>::at(i).coords(),
             )
+    }
+
+    /// Where each of the `N` erasure shards of any key lives: index → its nearest-occupied home.
+    ///
+    /// **The seam a read must use and did not (#216).** `distribute_shards` places shard `i` at
+    /// `nearest_occupied(i)`; `on_get` used to fan its `Lookup` out to `self.peers` — every point on every
+    /// line through this coordinate, occupied or not. On a cell that is not fully occupied those are
+    /// different sets, and the read asked nodes that were never given anything while its `queried` count
+    /// waited on replies from empty space.
+    ///
+    /// Measured consequence: 5 nodes on `PG(2,4)`, 20 algebraic neighbours per point, so 16 of 20 `Lookup`s
+    /// went nowhere, `negatives` could reach at most 4 of 20, and `ReadOutcome::Absent` — whose only path is
+    /// `negatives >= queried` — was **unreachable by construction**. Every read timed out. That was invisible
+    /// for as long as a timeout was reported as an absence (#215): two errors cancelling.
+    pub(super) fn shard_homes(&self) -> [Triple; erasure::N] {
+        let occupied = self.occupied_points();
+        core::array::from_fn(|i| Self::successor(&occupied, i))
     }
 
     /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4). The
@@ -291,7 +409,7 @@ impl<F: Field> OverlayNode<F> {
         if let Some(value) = reconstruct_highest(&by_version) {
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
-                value: Some(value),
+                outcome: ReadOutcome::Found(value),
             })];
         }
         // Cap in-flight reads (A4 DoS backstop): once [`MAX_PENDING_GETS`] distinct reads are outstanding,
@@ -300,10 +418,7 @@ impl<F: Field> OverlayNode<F> {
         // digest is allowed through (it refreshes the existing entry, no growth).
         if self.store.pending.len() >= MAX_PENDING_GETS && !self.store.pending.contains_key(&digest)
         {
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            })];
+            return self.read_did_not_conclude(digest, ReadStall::TableFull);
         }
         // Fan a `Lookup` out across cell peers — each is a potential shard home. Sent directly (not rerouted):
         // a down peer simply does not reply, and the erasure redundancy tolerates it.
@@ -313,6 +428,25 @@ impl<F: Field> OverlayNode<F> {
         // the cell's measured headroom (`stability::read_fanout`). At rest it is every peer, which is the right
         // default for a read: fastest-`K` wins. The floor is the erasure code's own, never policy's — below `K`
         // a read cannot complete at all.
+        // **The fan-out stays wide; what changes is what a CONCLUSION requires** (#216).
+        //
+        // One number was serving two decisions. `queried` was `peers.len()` — the algebraic neighbour set,
+        // every point on every line through this coordinate whether or not a node is there — and it was used
+        // both as *who to ask* and as *what `negatives` must reach for the read to conclude `Absent`*. On a
+        // cell that is not fully occupied those are different quantities: at 5 nodes on `PG(2,4)` a read fans
+        // out to 20 points, at most 4 can ever answer, and `negatives >= queried` is **unsatisfiable**. Every
+        // read timed out, and that was invisible while a timeout was reported as an absence (#215).
+        //
+        // **Narrowing the fan-out is NOT the fix, and two measurements say so.** The obvious move is to ask
+        // only `shard_homes()`, where `distribute_shards` put things. But placement is computed from
+        // `occupied_points()`, a LOCAL view: a writer that knows few peers keeps every shard itself, and a
+        // reader with a different view asks somewhere else and honestly concludes `Absent` about a value one
+        // point over. Tried both narrowings — homes gave rosters frozen at `[3, 3, 4, 4, 3]` of 5, occupancy
+        // gave a cell frozen at 1 readable mix key of 7. Until placement takes an *agreed* input rather than
+        // a local one (`agreed-decisions-need-closed-epochs`), a reader must keep asking broadly.
+        //
+        // So: ask everyone, as before — a `Lookup` into an empty point costs a frame and nothing else — and
+        // count the conclusion against the peers that **could** answer.
         let mut peers: Vec<Triple> = self.peers.keys().copied().collect();
         let width = fanos_diakrisis::stability::read_fanout(
             peers.len(),
@@ -321,13 +455,19 @@ impl<F: Field> OverlayNode<F> {
             self.healer.stress(),
         );
         peers.truncate(width);
-        if peers.is_empty() {
-            // No peer to gather from and the local shards did not reconstruct — the value is unreachable.
-            return alloc::vec![Effect::Notify(Notification::Retrieved {
-                key: digest,
-                value: None,
-            })];
-        }
+        // **No early conclusion here at all, and that is the third repair this branch has had.**
+        //
+        // It briefly held a fast path: if no asked peer is known to be occupied then this node is every shard
+        // home, `seed_versions` above already looked, and the answer is a definite `Absent`. The reasoning is
+        // sound about a node that is *permanently* alone and wrong about every node that has simply not heard
+        // from its cell yet — which, at startup over a real transport, is every node. Measured: a cell froze
+        // at 1 readable mix key of 7, because each reader answered "nothing is published" for six slots
+        // before it had met anyone.
+        //
+        // So absence is concluded in exactly one place, `sweep_pending_gets`, and only once the read has run
+        // out of time to hear more. A solitary node still gets `Absent`; it waits one `read_timeout` for it,
+        // which is the price of not guessing.
+
         // A fresh per-request nonce correlates this read's replies (audit C4); a repeat Get for the same
         // key supersedes the old one with a new nonce, so the old read's in-flight replies go stale.
         self.store.seq = self.store.seq.wrapping_add(1);
@@ -338,6 +478,9 @@ impl<F: Field> OverlayNode<F> {
                 issued: now,
                 by_version,
                 nonce,
+                // The peers actually asked. **Deliberately not the "answerable" subset**, which is the
+                // repair that looks right and concludes early — see `sweep_pending_gets`, where the
+                // narrower count belongs because only there has the read run out of time to hear more.
                 queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
                 negatives: 0,
                 supplied: BTreeMap::new(),
@@ -435,8 +578,9 @@ impl<F: Field> OverlayNode<F> {
         let me = self.coord.coords();
         let shards = erasure::encode(value);
         let mut effects = Vec::new();
+        let homes = self.shard_homes();
         for (i, shard) in shards.into_iter().enumerate() {
-            let home = self.nearest_occupied(i);
+            let home = homes.get(i).copied().unwrap_or(me);
             #[allow(clippy::cast_possible_truncation)] // i < N = 7
             let index = i as u8;
             if home == me {
@@ -651,7 +795,12 @@ impl<F: Field> OverlayNode<F> {
                 self.store.pending.remove(&digest);
                 let mut effects = alloc::vec![];
                 self.account_data_loss(now, digest, &mut effects); // R-C3: all peers answered, none can supply it
-                effects.push(Effect::Notify(Notification::Retrieved { key: digest, value: None }));
+                // **The one place `Absent` is earned**: every queried shard home answered, none holds a shard,
+                // and what was gathered does not reconstruct. A caller may rely on this.
+                effects.push(Effect::Notify(Notification::Retrieved {
+                    key: digest,
+                    outcome: ReadOutcome::Absent,
+                }));
                 return effects;
             }
             return Vec::new();
@@ -694,7 +843,7 @@ impl<F: Field> OverlayNode<F> {
             self.store.pending.remove(&digest);
             return alloc::vec![Effect::Notify(Notification::Retrieved {
                 key: digest,
-                value: Some(value),
+                outcome: ReadOutcome::Found(value),
             })];
         }
         Vec::new()

@@ -289,6 +289,57 @@ pub enum Input {
     Command(Command),
 }
 
+/// What a `Get` established — **three values, because two of them were a lie.**
+///
+/// # The defect this type exists to end (#215)
+///
+/// The notification carried `Option<Vec<u8>>`, and four engine paths produced `None`: the read timed out, the
+/// in-flight table was full, there was no peer to ask, and — the only one that means what `None` says — every
+/// queried shard home answered that it holds nothing. A caller cannot tell those apart, and one of them is a
+/// definite fact about the cell while three are facts about *this node's* luck.
+///
+/// `fanos_node`'s `Read<T>` has said so one layer up for a long time: `Absent` is "a definite negative a
+/// caller may rely on", `Unknown` is "not a negative, and not evidence of anything". It reconstructed that
+/// third value from a **timeout race** — wrapping the store client in a bound shorter than the client's own,
+/// so that an elapse it saw first could be called `Unknown`. That ordering is real and machine-checked, and
+/// it was never enough: the *engine*'s own read timeout is 1.6 s, so it settles a read as a definite absence
+/// three seconds before the 5 s wrapper gets a say. Measured at **2.000 s**.
+///
+/// So the engine hands the distinction over rather than letting a reader re-derive it from which clock won —
+/// the same correction #189 made for snapshot adoption.
+///
+/// **Why the reason is not in here.** An operator wants to know *which* non-conclusion (a slow cell, a
+/// saturated read table, an unseated node call for different actions); a caller only ever needs the three
+/// states. So the reason goes to the data-path plane as a tag on `Station::ReadInconclusive`, where the
+/// operator reads it, and the type stays the width of the decision.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReadOutcome {
+    /// The value was reconstructed from the cell's shards.
+    Found(Vec<u8>),
+    /// **A definite negative.** Every queried shard home answered, none holds a shard for this key, and what
+    /// was gathered does not reconstruct. Nothing is stored here and a caller may rely on that.
+    Absent,
+    /// **The read did not conclude, and this is not evidence of anything.** Treating it as absence is what
+    /// silently shrinks a roster built from directory reads.
+    Inconclusive,
+}
+
+impl ReadOutcome {
+    /// The bytes, if found — for the callers that genuinely only want the value and treat both negatives
+    /// alike (a `.fanos` name that will be retried, a snapshot probe).
+    ///
+    /// Kept as an explicit, named lossy conversion rather than left implicit: every call site of this is a
+    /// place that has *decided* the distinction does not matter to it, which is a claim worth being able to
+    /// grep for.
+    #[must_use]
+    pub fn found(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Found(v) => Some(v),
+            Self::Absent | Self::Inconclusive => None,
+        }
+    }
+}
+
 /// An effect the engine asks the driver to perform — the only things it can cause.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
@@ -572,12 +623,12 @@ pub enum Notification {
     Bound,
     /// A DHT `Put` was acknowledged by the responsible node (spec §L4); carries the key digest.
     Stored([u8; 32]),
-    /// A DHT `Get` completed (spec §L4): the value if found, else `None`; carries the key digest.
+    /// A DHT `Get` reached a conclusion (spec §L4) — **or reached the point of not reaching one**.
     Retrieved {
         /// The 32-byte key digest.
         key: [u8; 32],
-        /// The retrieved value, or `None` if the cell held no value for the key.
-        value: Option<Vec<u8>>,
+        /// What the read established. See [`ReadOutcome`]: three values, because two were a lie.
+        outcome: ReadOutcome,
     },
     /// A DHT value was determined **permanently unrecoverable** (audit R-C3). A node that holds a shard of
     /// `key` — so the value provably WAS stored — gathered every available shard from the cell and the

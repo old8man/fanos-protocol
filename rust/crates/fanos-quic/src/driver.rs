@@ -29,6 +29,7 @@ use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_tripl
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
 use fanos_proteus::{Environment, Morph, MorphCodec, MorphController, ProteusShaper};
 use fanos_runtime::ports::stations::{Observation, Station, Stations};
+use fanos_runtime::ports::ReadOutcome;
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::capability::Capabilities;
 use fanos_wire::error::encode_error;
@@ -661,7 +662,7 @@ impl NodeHandle {
 /// Pending `get` waiters, keyed by the storage digest the engine echoes (a Vec coalesces concurrent
 /// gets of the same key onto one reply). Each carries its registration time so the router can evict a
 /// waiter whose reply never comes, rather than leak its `oneshot::Sender` forever (audit C1).
-type GetWaiters = HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<Option<Vec<u8>>>)>>;
+type GetWaiters = HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<ReadOutcome>)>>;
 /// Pending `put` waiters, keyed by the storage digest — with the same registration-time eviction (C1).
 /// The leak this closes is real: the engine emits `Stored` only on a local hit or a remote `Ack`, so a
 /// put whose responsible node is down/absent/malicious never resolves, and without eviction its entry
@@ -673,7 +674,7 @@ type PutWaiters = HashMap<[u8; 32], Vec<(std::time::Instant, oneshot::Sender<()>
 enum Control {
     Get {
         digest: [u8; 32],
-        reply: oneshot::Sender<Option<Vec<u8>>>,
+        reply: oneshot::Sender<ReadOutcome>,
     },
     Put {
         digest: [u8; 32],
@@ -755,27 +756,44 @@ impl Client {
     }
 
     /// Retrieve `key` from the L4 store, awaiting *this* request's answer (correlated by the storage
-    /// digest, so concurrent `get`s never cross). `None` if no value is stored or the node stopped.
-    pub async fn get(&self, key: Vec<u8>) -> Option<Vec<u8>> {
+    /// digest, so concurrent `get`s never cross) — **and say which of the three things happened**.
+    ///
+    /// The three-state door (#215). `Absent` is a definite negative a caller may rely on; `Inconclusive` is
+    /// not evidence of anything, and every way this call can fail to establish a fact produces it: the
+    /// engine's own read timeout, its full read table, no peer to ask, this bound elapsing, or a stopped
+    /// node. Before, all five and a real absence were one `None`, and callers that carefully distinguished
+    /// them one layer up were reconstructing the difference from which timeout happened to win.
+    pub async fn read(&self, key: Vec<u8>) -> ReadOutcome {
         let digest = storage_digest(&key);
         let (reply, rx) = oneshot::channel();
         // Register the waiter BEFORE issuing the Get, so a fast reply can never be missed.
         if self.ctrl_tx.send(Control::Get { digest, reply }).is_err() {
-            return None;
+            return ReadOutcome::Inconclusive; // the node stopped — nothing was established
         }
         if self
             .input_tx
             .try_send(Input::Command(Command::Get { key }))
             .is_err()
         {
-            return None;
+            return ReadOutcome::Inconclusive;
         }
         // Bound the wait: a key whose responsible node is unreachable (or absent from a sparse cell)
-        // must resolve to `None`, never hang the caller forever (audit C1).
+        // must resolve, never hang the caller forever (audit C1). An elapse here is a non-conclusion —
+        // which is what this bound's ordering against `fanos_node::resolve::STORE_TIMEOUT` used to be the
+        // only expression of.
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(value)) => value,
-            _ => None,
+            Ok(Ok(outcome)) => outcome,
+            _ => ReadOutcome::Inconclusive,
         }
+    }
+
+    /// [`read`](Self::read), for the callers that genuinely treat both negatives alike.
+    ///
+    /// Kept because most call sites want the bytes and will retry regardless of why they are missing — a
+    /// `.fanos` resolution, a snapshot probe. It is a **named lossy conversion**, so the sites that have
+    /// decided the distinction does not matter to them are the ones that say `get`, and they can be found.
+    pub async fn get(&self, key: Vec<u8>) -> Option<Vec<u8>> {
+        self.read(key).await.found()
     }
 
     /// The live epoch as **latest-state**: a receiver that always yields the newest `(epoch, seed)` this node
@@ -956,10 +974,10 @@ async fn router_loop(
                     // broadcast volume, and this channel drops messages when a subscriber falls behind, so
                     // it was buying nothing with the budget an epoch-driven publisher needs to not miss a
                     // `BeaconReady`. The `Snapshot` arm below is the same rule for the same reason.
-                    Notification::Retrieved { key, value } => {
+                    Notification::Retrieved { key, outcome } => {
                         if let Some(waiters) = gets.remove(key) {
                             for (_, tx) in waiters {
-                                let _ = tx.send(value.clone());
+                                let _ = tx.send(outcome.clone());
                             }
                         }
                         continue;

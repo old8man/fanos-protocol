@@ -13,6 +13,7 @@ use fanos_calypso::descriptor::{Descriptor, SealedDescriptor, open, seal};
 use fanos_diaulos::{Coord, service_public_from_bundle};
 use fanos_onoma::{Address, Epoch, lookup_key};
 use fanos_quic::Client;
+use fanos_runtime::ports::ReadOutcome;
 
 use crate::diaulos::ServiceResolver;
 use crate::error::NodeError;
@@ -128,6 +129,28 @@ pub const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 mod timeout_ordering {
     use super::STORE_TIMEOUT;
 
+    /// **Three bounds, not two — and the one this file used to ignore is the one that fires first.**
+    ///
+    /// The chain a store read passes through is
+    ///
+    /// ```text
+    ///   1.6 s  fanos_runtime Config::read_timeout   (the ENGINE gives up and answers)
+    ///   5   s  STORE_TIMEOUT                        (this crate gives up waiting)
+    ///  10   s  fanos_quic::REQUEST_TIMEOUT          (the client gives up waiting)
+    /// ```
+    ///
+    /// The test below asserts `5 < 10` and is right to. What it could not see is that the engine settles
+    /// **first**, at ~2 s — measured — so before #215 the caller learned only `None`, read it as a definite
+    /// `Read::Absent`, and the ordering it protects never got to matter. A two-element comparison in a
+    /// three-element chain is what let that sit.
+    ///
+    /// It is no longer load-bearing, and that is the fix rather than a re-ordering: `Client::read` reports
+    /// [`ReadOutcome`](fanos_runtime::ports::ReadOutcome), so **which clock wins no longer decides what the
+    /// caller is told**. Every one of the three elapses now maps to `Read::Unknown` because each one *is* a
+    /// non-conclusion, not because one of them happens to be shorter. The assertion is kept as a tripwire:
+    /// inverting the two outer bounds would still be a mistake (a caller-side elapse is more informative than
+    /// a client-side one), it is simply no longer the only thing standing between a partition and a silently
+    /// shrinking roster.
     #[test]
     fn the_outer_bound_must_fire_first_or_read_unknown_is_unreachable() {
         // The invariant that makes [`Read`]'s third value exist, and it spans two crates with nothing but this
@@ -143,12 +166,38 @@ mod timeout_ordering {
         // the three-valued read was introduced to end.
         //
         // Found while asking whether `Read::Unknown` ever fires at all. It does — but only because 5 < 10, and
-        // nothing said so.
+        // nothing said so. **And that answer was incomplete**: it made `Unknown` reachable in principle while
+        // the engine's own 1.6 s bound made it nearly unreachable in practice, which is #215. The module doc
+        // above carries the corrected chain; this comment is left as written because it is the reasoning that
+        // was right about its own pair.
         assert!(
             STORE_TIMEOUT < fanos_quic::REQUEST_TIMEOUT,
             "STORE_TIMEOUT ({STORE_TIMEOUT:?}) must be strictly shorter than the store client's own \
              REQUEST_TIMEOUT ({:?}), or a read that did not conclude is reported as a definite absence",
             fanos_quic::REQUEST_TIMEOUT
+        );
+    }
+
+    /// The third bound, **named here so the chain is complete** rather than two thirds of one.
+    ///
+    /// This deliberately asserts the ordering that HOLDS and is not the safe one: the engine answers first.
+    /// That was the defect, and it is now harmless only because the answer carries which of the three states
+    /// it is. If someone ever removes `ReadOutcome` and goes back to an `Option`, this ordering makes the old
+    /// defect immediate — so the fact is worth pinning even though nothing is wrong with it today.
+    #[test]
+    fn the_engine_answers_before_either_wrapper_and_that_is_why_the_outcome_must_be_three_valued() {
+        let engine = std::time::Duration::from_nanos(fanos_runtime::Config::default().read_timeout.0);
+        assert!(
+            engine < STORE_TIMEOUT,
+            "the engine's own read timeout ({engine:?}) settles a read before this crate's bound \
+             ({STORE_TIMEOUT:?}) — so a two-valued answer from it cannot be corrected by any wrapper"
+        );
+        // The sweep runs on the heartbeat, so the conclusion lands at the next beat past the timeout. Even
+        // with that rounding it is inside the wrapper, which is what the measurement showed at 2.000 s.
+        let beat = std::time::Duration::from_nanos(fanos_runtime::Config::default().heartbeat.0);
+        assert!(
+            engine + beat < STORE_TIMEOUT,
+            "even rounded up to the next heartbeat ({beat:?}) the engine concludes first"
         );
     }
 }
@@ -235,6 +284,31 @@ impl<T> Read<T> {
     #[must_use]
     pub fn found_or_absent(value: Option<T>) -> Self {
         value.map_or(Self::Absent, Self::Found)
+    }
+
+    /// Interpret a store read, parsing what it found — **the one place the three states are mapped**.
+    ///
+    /// `outcome` is `None` when the caller's own [`STORE_TIMEOUT`] elapsed, and otherwise whatever
+    /// `Client::read` established. The mapping:
+    ///
+    /// * [`ReadOutcome::Found`] → parse it. Bytes that fail to parse or authenticate are `Absent`, not
+    ///   `Unknown`: the read *concluded*, and what it concluded is that nothing valid is published here.
+    ///   (That is `found_or_absent`'s rule and capdir's doc defends it at length; this does not change it.)
+    /// * [`ReadOutcome::Absent`] → `Absent`. Every queried shard home answered and none holds a shard.
+    /// * [`ReadOutcome::Inconclusive`], or the outer elapse → `Unknown`.
+    ///
+    /// **Before #215 the third case did not exist below this line.** The engine settled a timed-out read as
+    /// `None`, `Client::get` handed that over as `None`, and `None` meant `Absent` — so `Unknown` was
+    /// reachable only when the whole call outran [`STORE_TIMEOUT`], which the engine's own 1.6 s bound made
+    /// nearly impossible. Reads now carry which of the three happened, and this function stops re-deriving it
+    /// from which clock won.
+    #[must_use]
+    pub fn of(outcome: Option<ReadOutcome>, parse: impl FnOnce(&[u8]) -> Option<T>) -> Self {
+        match outcome {
+            Some(ReadOutcome::Found(bytes)) => Self::found_or_absent(parse(&bytes)),
+            Some(ReadOutcome::Absent) => Self::Absent,
+            Some(ReadOutcome::Inconclusive) | None => Self::Unknown,
+        }
     }
 }
 

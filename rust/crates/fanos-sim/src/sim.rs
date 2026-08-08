@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use fanos_runtime::ports::stations::GatherHealth;
+use fanos_runtime::ports::ReadOutcome;
 use fanos_runtime::{Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification, TimerToken, Triple};
 use fanos_wire::decode_frame;
 
@@ -60,6 +61,19 @@ fn cmd_name(cmd: &Command) -> &'static str {
 }
 
 /// A concise description of a notification, for the trace.
+/// The one-word form of a read's verdict, for the trace line.
+///
+/// Split out of `note_desc` because three arms of a `match` inside a `format!` inside a forty-arm `match`
+/// is where a function stops being readable — and because the three words are the distinction #215 exists to
+/// make, so they deserve a name rather than being buried in a formatting expression.
+fn read_word(outcome: &ReadOutcome) -> &'static str {
+    match outcome {
+        ReadOutcome::Found(_) => "hit",
+        ReadOutcome::Absent => "miss",
+        ReadOutcome::Inconclusive => "inconclusive",
+    }
+}
+
 fn note_desc(note: &Notification) -> String {
     match note {
         Notification::Delivered { from, .. } => format!("Delivered from {}", fmt_coord(*from)),
@@ -135,11 +149,9 @@ fn note_desc(note: &Notification) -> String {
         Notification::Decoupled => "Decoupled".to_owned(),
         Notification::Bound => "Bound".to_owned(),
         Notification::Stored(k) => format!("Stored {}", short_digest(k)),
-        Notification::Retrieved { key, value } => format!(
-            "Retrieved {} ({})",
-            short_digest(key),
-            value.as_ref().map_or("miss", |_| "hit")
-        ),
+        Notification::Retrieved { key, outcome } => {
+            format!("Retrieved {} ({})", short_digest(key), read_word(outcome))
+        }
         Notification::DataLost { key, epoch } => {
             format!("DataLost {} @{epoch}", short_digest(key))
         }
@@ -632,8 +644,15 @@ impl Sim {
                         Notification::Escalated(_) => m.escalations += 1,
                         Notification::Decoupled => m.decouples += 1,
                         Notification::Stored(_) => m.stores += 1,
-                        Notification::Retrieved { value: Some(_), .. } => m.retrieval_hits += 1,
-                        Notification::Retrieved { value: None, .. } => m.retrieval_misses += 1,
+                        // Three counters, because the instrument must be able to SEE the distinction
+                        // production now draws (#215). A run whose reads all end inconclusive and one whose
+                        // reads all find nothing look identical under two counters, and only the first is a
+                        // fault of the cell rather than of the workload.
+                        Notification::Retrieved { outcome: ReadOutcome::Found(_), .. } => m.retrieval_hits += 1,
+                        Notification::Retrieved { outcome: ReadOutcome::Absent, .. } => m.retrieval_misses += 1,
+                        Notification::Retrieved { outcome: ReadOutcome::Inconclusive, .. } => {
+                            m.retrieval_inconclusive += 1;
+                        }
                         Notification::DataLost { .. } => m.data_losses += 1,
                         Notification::Observed(_) => m.observations += 1,
                         _ => {}
