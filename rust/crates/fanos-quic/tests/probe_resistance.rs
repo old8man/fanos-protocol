@@ -82,110 +82,72 @@ fn is_version_negotiation(pkt: &[u8]) -> bool {
     pkt.len() >= 5 && pkt[0] & 0x80 != 0 && pkt[1..5] == [0, 0, 0, 0]
 }
 
-/// **A node running the flagship morph answers an unauthenticated prober** — §13.5 says it must not.
+/// **A sealed node is silent to an unauthenticated prober; an unsealed one is not** (spec §13.5).
 ///
-/// PROPERTY: an off-path observer with no community secret can tell a PROTEUS endpoint from an
-/// unresponsive UDP port using one 1200-byte datagram and no cryptography.
+/// PROPERTY: the answer a stranger gets is now a *function of the morph*. Three arms, and all three are
+/// needed — the interesting claim is a difference, and a difference needs both sides plus a floor.
 ///
-/// The control arm (a bound, silent socket) is what makes the positive arm mean anything: it shows the
-/// harness can observe silence, so the node's answer is the node's, not the loopback's.
+/// 1. a bound, silent UDP socket — shows the harness can observe silence at all;
+/// 2. a `Morph::Plain` node — shows the probe still works and native QUIC still answers, so arm 3's
+///    silence is the envelope's doing and not a broken prober;
+/// 3. a `Morph::Polymorph` node — the property.
+///
+/// Before the datagram envelope (#232) arm 3 answered with a Version Negotiation packet byte-identical to
+/// arm 2's but for RFC 9000 §17.2.1's arbitrary low bits. That measurement is what this file was written
+/// to record; this is the same measurement after the mechanism, which is why the `plain` arm stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unauthenticated_prober_can_tell_a_proteus_node_from_a_silent_port() {
+async fn a_sealed_node_is_silent_where_an_unsealed_one_answers() {
     let epoch = fanos_proteus::Epoch::new(7);
-    let dir = Directory::new();
-    let node = spawn_shaped(
-        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
-        dir,
-        ProteusConfig::polymorph(b"a-secret-the-prober-does-not-have".to_vec()),
-        epoch,
-    )
-    .await
-    .expect("spawn a shaped node");
 
-    // The control first, so a harness fault fails here rather than masquerading as a clean result.
+    // Arm 1 — the floor.
     let silent = UdpSocket::bind("127.0.0.1:0").await.expect("bind silent");
     let silent_addr = silent.local_addr().expect("silent addr");
     assert!(
         probe(silent_addr).await.is_none(),
-        "the control must stay silent, or this test cannot distinguish anything",
+        "the floor must stay silent, or this test cannot distinguish anything",
     );
 
-    let answer = probe(node.local_addr()).await;
-    let Some(answer) = answer else {
-        // The day this branch is taken, the finding is closed: keep the message pointing at what
-        // changed rather than just failing.
-        panic!(
-            "the shaped node stayed silent — §13.5 now holds; delete this test's expectation and \
-             record the mechanism that closed it",
-        );
-    };
-    assert!(
-        is_version_negotiation(&answer),
-        "the answer is a QUIC Version Negotiation packet, i.e. the endpoint identified itself as a \
-         QUIC server to a stranger: {:02x?}",
-        &answer[..answer.len().min(16)],
-    );
-}
-
-/// **The stranger's-eye view does not depend on the morph** — which is why rotating morphs cannot
-/// answer a censor who works at this layer, and why the auto-fallback breaker (#231) reads a signal
-/// its own control variable cannot move.
-///
-/// PROPERTY: two nodes differing in *both* inputs a deployment can turn — the community secret and the
-/// morph — return byte-identical answers to the same probe. The morph is not an argument of this
-/// observable.
-///
-/// The probe's connection IDs are fixed by [`version_negotiation_probe`], so a Version Negotiation
-/// packet's only variable content (the echoed IDs) is held constant across the two nodes; any
-/// remaining difference would have to come from the node.
-///
-/// Byte 0 is excluded, and the reason is in RFC 9000 §17.2.1: below the form bit its seven "Unused"
-/// bits are set to an arbitrary value the client must ignore, and quinn randomizes them. Measured:
-/// `0xC3` vs `0xE3` on the first run of this test, with **all 54 remaining bytes identical** — the
-/// echoed IDs and, more to the point, the supported-version list `0a1a2a3a, 00000001,
-/// ff00001d…ff000022`. That list is quinn 0.11's exact advertisement, and it is the same one under
-/// both morphs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_answer_a_stranger_gets_is_the_same_under_every_morph() {
-    let epoch = fanos_proteus::Epoch::new(7);
-
-    let polymorph = spawn_shaped(
-        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
-        Directory::new(),
-        ProteusConfig::polymorph(b"community-A".to_vec()),
-        epoch,
-    )
-    .await
-    .expect("spawn the polymorph node");
-    // `plain` is the other end of the morph axis: no codec at all. If anything a deployment configures
-    // could change what a stranger sees, these two would differ.
+    // Arm 2 — native QUIC, no envelope. `plain` declines the envelope by design.
     let plain = spawn_shaped(
         Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
         Directory::new(),
-        ProteusConfig::with_morph(b"community-B-different".to_vec(), fanos_quic::Morph::Plain),
+        ProteusConfig::with_morph(b"community".to_vec(), fanos_quic::Morph::Plain),
         epoch,
     )
     .await
     .expect("spawn the plain node");
-
-    let a = probe(polymorph.local_addr()).await.expect("polymorph answered");
-    let b = probe(plain.local_addr()).await.expect("plain answered");
-
+    let answer = probe(plain.local_addr()).await;
+    let Some(answer) = answer else {
+        panic!("the `plain` morph must still answer, or arm 3 proves nothing about the envelope");
+    };
     assert!(
-        is_version_negotiation(&a) && is_version_negotiation(&b),
-        "both arms must be QUIC answers, or the comparison below compares nothing",
+        is_version_negotiation(&answer),
+        "and it answers as a QUIC server: {:02x?}",
+        &answer[..answer.len().min(16)],
     );
-    assert_eq!(
-        &a[1..],
-        &b[1..],
-        "the two nodes differ in community secret AND morph and still hand a stranger the same \
-         bytes — the morph is not an input to what a censor sees first",
-    );
-    // Name the fingerprint rather than leaving it implicit in an equality: the supported-version list
-    // is what a censor keys on, and it survives every morph rotation.
+
+    // Arm 3 — the flagship morph, sealed.
+    let sealed = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
+        Directory::new(),
+        ProteusConfig::polymorph(b"a-secret-the-prober-does-not-have".to_vec()),
+        epoch,
+    )
+    .await
+    .expect("spawn the sealed node");
     assert!(
-        a[5..].windows(4).any(|w| w == [0, 0, 0, 1]),
-        "the answer advertises QUIC v1 in the clear: {:02x?}",
-        &a[..a.len().min(32)],
+        probe(sealed.local_addr()).await.is_none(),
+        "a sealed endpoint must not answer a stranger — §13.5's unresponsive UDP port",
     );
+
+    // …and the silence is *counted*, which is the other half. A drop this quiet is invisible on every
+    // other surface a node has, so a bridge under enumeration would read as idle without this counter.
+    let probes: u64 = sealed
+        .client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "wire.foreign_datagram")
+        .map(|o| o.count)
+        .sum();
+    assert!(probes > 0, "the refusal must leave a trace; silence on the wire is not silence in the log");
 }

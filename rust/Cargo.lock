@@ -1247,6 +1247,7 @@ dependencies = [
  "fanos-vrf",
  "fanos-wire",
  "fanos-wire-derive",
+ "getrandom 0.4.3",
  "quinn",
  "rcgen",
  "rustls",

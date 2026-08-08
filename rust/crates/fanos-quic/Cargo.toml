@@ -46,6 +46,10 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 # Structured, level-filtered observability (no-op unless the app installs a subscriber).
 tracing.workspace = true
+# The PROTEUS datagram envelope draws a fresh nonce per datagram from the OS CSPRNG. It cannot be a
+# counter: two peers derive the same epoch shape, so counters that both start at zero would reuse a
+# keystream across two *structured* QUIC Initials. Same version fanos-node and fanos-ffi already use.
+getrandom = "0.4.3"
 
 [dev-dependencies]
 fanos-testkit = { path = "../fanos-testkit" }

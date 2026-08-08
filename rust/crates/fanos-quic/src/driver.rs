@@ -215,7 +215,28 @@ fn apply_outcome(shaper: &Shaper, controller: &MaybeController, success: bool) {
 /// a function of the certificate alone: each side proves its coordinate and verifies the other's.
 /// Verifies a peer's HELLO against its authenticated certificate and this node's own capabilities:
 /// `(peer_cert_der, peer_hello) →` the negotiation outcome, or `None` to silently reject (bad proof).
-type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> Option<HelloResult> + Send + Sync>;
+type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> HelloVerdict + Send + Sync>;
+
+/// Why a peer's HELLO was accepted or refused — **three answers, because two of them call for opposite
+/// operator actions** (#236).
+///
+/// This used to be `Option<HelloResult>`, and the `None` merged a forgery with our own staleness. They are
+/// not the same event: one says a peer is lying to us, the other says we are behind and cannot judge. A
+/// single counter over both is the defect #109 named for POROS's gates — one name on two decisions.
+pub(crate) enum HelloVerdict {
+    /// The proof verified; the negotiation produced a result (established or incompatible).
+    ///
+    /// Boxed because [`HelloResult::Established`] carries the peer's certificate material and dwarfs the two
+    /// refusal variants; without it every verdict on the stack would be sized for the success arm.
+    Ok(Box<HelloResult>),
+    /// The proof did **not** verify against a beacon this node holds — an impostor or a forgery. Actionable
+    /// as an attack.
+    BadProof,
+    /// This node has **no beacon** for the epoch the peer proves, so it cannot judge the claim at all: we
+    /// are behind, not under attack. A node that has just started holds only the genesis beacon, which makes
+    /// this the first thing an operator sees when a join is failing — see #235.
+    EpochUnknown,
+}
 
 #[derive(Clone)]
 struct SelfCert {
@@ -1321,13 +1342,23 @@ where
         }),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
             // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
-            // within the accepted window (safe-stall, R-C1). Outside the window ⇒ reject; poisoned ⇒ reject.
-            let epoch = hello_epoch(peer_hello)?;
-            let beacon = {
-                let window = verify_beacon.read().ok()?;
-                window.beacon_for(epoch)?
+            // within the accepted window (safe-stall, R-C1). **Outside the window is not a bad proof**: it is
+            // this node admitting it cannot judge, and the two are reported apart (#236).
+            let Some(epoch) = hello_epoch(peer_hello) else {
+                return HelloVerdict::BadProof;
             };
-            let result = verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities)?;
+            let beacon = match verify_beacon.read() {
+                Ok(window) => window.beacon_for(epoch),
+                // A poisoned window is a local fault, and a local fault is not the peer's forgery. Reported
+                // as "cannot judge" for the same reason.
+                Err(_) => None,
+            };
+            let Some(beacon) = beacon else {
+                return HelloVerdict::EpochUnknown;
+            };
+            let Some(result) = verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities) else {
+                return HelloVerdict::BadProof;
+            };
             if let HelloResult::Established { peer, .. } = result {
                 // Recorded only on success, so the book holds nothing a remote verifier would reject. A peer proving a
                 // *past* epoch within the safe-stall window is deliberately not recorded: its claim is evidence about that
@@ -1336,7 +1367,7 @@ where
                     verify_book.record::<F>(peer_cert, peer.public, peer.proof, &peer.output);
                 }
             }
-            Some(result)
+            HelloVerdict::Ok(Box::new(result))
         }),
     });
     let dir_for_reshuffle = directory.clone();
@@ -1727,17 +1758,31 @@ fn spawn_inner(
     server_cfg.transport_config(tuned_transport());
     client_cfg.transport_config(tuned_transport());
 
-    let mut endpoint = match fabric {
-        Fabric::Udp(bind) => Endpoint::server(server_cfg, bind)?,
-        // The same endpoint over a caller-supplied socket: identical QUIC/TLS configuration, only the datagram
-        // carrier differs.
-        Fabric::Abstract(socket) => Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
-            Some(server_cfg),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?,
+    // Both carriers go through one abstract socket so the PROTEUS envelope (§13.3/§13.5) can wrap either.
+    // Production used to take `Endpoint::server`, which owns its socket and admits no decorator — the
+    // reason the envelope had nowhere to live and the handshake shipped in plaintext.
+    let carrier: Arc<dyn quinn::AsyncUdpSocket> = match fabric {
+        Fabric::Udp(bind) => {
+            use quinn::Runtime as _;
+            let sock = std::net::UdpSocket::bind(bind)?;
+            quinn::TokioRuntime.wrap_udp_socket(sock)?
+        }
+        Fabric::Abstract(socket) => socket,
     };
+    // The driver-side data-path plane, created **here** rather than at the `NodeHandle` below so the
+    // transport can share it (#191). It now has to exist even earlier than that: the datagram envelope is
+    // the outermost gate, and a refusal there is invisible everywhere else by design (#232).
+    let stations = Arc::new(Mutex::new(Stations::new()));
+    let carrier = match &shaper {
+        Some(s) => crate::proteus_socket::ProteusSocket::wrap(carrier, s, &stations),
+        None => carrier,
+    };
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg),
+        carrier,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
     directory.insert(addr, local_addr);
@@ -1775,12 +1820,11 @@ fn spawn_inner(
     // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
     // coordinate go stale at the first reshuffle.
     let seat = Arc::new(Mutex::new(addr));
-    // The driver-side data-path plane, created **here** rather than at the `NodeHandle` below so the
-    // transport can share it. `Client::record_station` and `driver_stations` already existed and already had
-    // production callers, but `Transport` held no handle to the plane — so the three discards in
-    // `read_frames`, thirty lines from the recorder, could not reach it and stayed uncounted (#191). One
-    // absent field is all that separated a built facility from the place that needed it most.
-    let stations = Arc::new(Mutex::new(Stations::new()));
+    // `stations` is created above, before the carrier, because the PROTEUS envelope needs it. `Client::
+    // record_station` and `driver_stations` already existed and already had production callers, but
+    // `Transport` held no handle to the plane — so the three discards in `read_frames`, thirty lines from the
+    // recorder, could not reach it and stayed uncounted (#191). One absent field is all that separated a
+    // built facility from the place that needed it most.
 
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
@@ -2131,9 +2175,8 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     // loop for the full QUIC handshake timeout. That stall is the #129 availability bug — a `get`'s
     // `Lookup`s to live shard-homes were blocked behind a dead peer's dial, so the erasure shards never
     // gathered even though the redundancy tolerates the loss. A real peer answers in well under this.
-    // A connect failure (the transport refused/timed out) feeds the morph auto-fallback breaker: a censored
-    // morph manifests exactly as connects that never complete (§13.7). A completed handshake resets it — the
-    // shaped transport is getting through, whatever the peer's identity check below concludes.
+    // A connect failure (the transport refused/timed out) feeds the morph auto-fallback breaker. A completed
+    // handshake does **not** reset it — see below.
     let established = match t.endpoint.connect(addr, "fanos.node") {
         Ok(connecting) => tokio::time::timeout(DIAL_TIMEOUT, connecting)
             .await
@@ -2145,11 +2188,14 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
         apply_outcome(&t.shaper, &t.controller, false);
         return None;
     };
-    apply_outcome(&t.shaper, &t.controller, true);
 
     match &t.identity {
-        // HELLO mode: announce our coordinate as the first uni-stream.
+        // HELLO mode: announce our coordinate as the first uni-stream. No reply is awaited, so this mode has
+        // no shaped round trip to read and the QUIC handshake is the only signal there is. Stated rather
+        // than assumed: every shipped composition goes through `spawn_self_certifying_*` (the arm below);
+        // this one is the simulator's and the tests'.
         None => {
+            apply_outcome(&t.shaper, &t.controller, true);
             if let Ok(mut hello) = conn.open_uni().await {
                 let _ = hello
                     .write_all(&shape_out(&t.shaper, &encode_triple(t.me)))
@@ -2161,7 +2207,27 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
         // to have proved the coordinate we dialed — otherwise the address resolved to an impostor
         // (or a negotiation-incompatible peer) and we drop it.
         Some(id) => {
-            let peer = hello_exchange(&conn, t, id).await;
+            // **Bounded by the same deadline the accept side uses** (#233). The QUIC half above has
+            // `DIAL_TIMEOUT`; this half had nothing, on the very loop that bound exists to protect, so a peer
+            // that completed the handshake and then opened no stream wedged the send loop until QUIC's 30 s
+            // idle timeout. The acceptor has always wrapped the whole handshake in `HELLO_DEADLINE`; the
+            // dialer now does too, rather than inventing a second constant for one quantity.
+            let handshake = tokio::time::timeout(HELLO_DEADLINE, hello_exchange(&conn, t, id))
+                .await
+                .unwrap_or(Handshake { peer: None, round_trip: false });
+            // **The breaker reads the shaped round trip, not the QUIC handshake** (#231). Shaping starts at
+            // the stream, so the handshake completing says nothing about the morph — a censor that admits
+            // the handshake and kills the data phase used to be recorded as a success, resetting the breaker
+            // for ever in exactly the case the morph exists to answer. A refused proof still counts as a
+            // success here: the bytes crossed, and we rejected their contents.
+            apply_outcome(&t.shaper, &t.controller, handshake.round_trip);
+            if !handshake.round_trip {
+                // The breaker acts on this; the operator needs to *see* it. A rotation says only that
+                // something tripped, while this says how often the shaped path is cut with the handshake let
+                // through — the number that separates a lossy network from a filter.
+                t.record_station(Station::TransportRoundTripLost, Some(to), None);
+            }
+            let peer = handshake.peer;
             if peer != Some(to) {
                 tracing::warn!(
                     ?to,
@@ -2235,7 +2301,11 @@ impl Drop for SourceGuard {
 /// rejected (bad proof / incompatible negotiation) or unreadable.
 async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
     match &t.identity {
-        Some(id) => hello_exchange(conn, t, id).await,
+        // The accept side wants the coordinate and nothing else. It deliberately does **not** feed the morph
+        // breaker: an inbound exchange reports whether a *peer's* transport reached us, and the breaker
+        // regulates whether ours reaches out. Rotating on someone else's reachability would let one peer
+        // walk this node's morph chain.
+        Some(id) => hello_exchange(conn, t, id).await.peer,
         None => read_hello(conn, t).await,
     }
 }
@@ -2377,24 +2447,69 @@ async fn send_error(conn: &Connection, shaper: &Shaper, err: ProtocolError) {
     send_framed(conn, shaper, FrameType::Error, &body).await;
 }
 
+/// What a peer's first uni-stream produced — **three states, not two** (#231).
+///
+/// The split exists for one reason: only [`Silent`](Self::Silent) is a statement about the *transport*, and
+/// the morph auto-fallback must not rotate on the other two. A refused proof means the shaped round trip
+/// worked perfectly and we did not like what it carried; rotating the morph would answer a question nobody
+/// asked, and — worse — a peer that can make us refuse could then drive our morph chain.
+enum PeerHello {
+    /// Nothing decodable came back: no stream, a read error, or bytes that did not un-shape. The shaped
+    /// round trip did not complete, which is the only outcome here the morph controls.
+    Silent,
+    /// A HELLO arrived, decoded, and produced a negotiation result — established or incompatible.
+    ///
+    /// Boxed because [`HelloResult::Established`] carries the peer's certificate material and dwarfs the two
+    /// unit variants; without it every `PeerHello` on the stack would be sized for the rare arm.
+    Answered(Box<HelloResult>),
+    /// A HELLO arrived and decoded, and we refused it. The transport worked; the identity did not.
+    ///
+    /// **Which of the two reasons it was is recorded where it is known**, at the two stations
+    /// [`HelloProofRejected`](Station::HelloProofRejected) and
+    /// [`HelloEpochUnknown`](Station::HelloEpochUnknown), rather than carried here (#236). The caller needs
+    /// only "not a transport failure"; an operator needs the reason, and the operator's channel is the
+    /// station plane.
+    Refused,
+}
+
 /// Read the peer's first uni-stream as its HELLO, verify its coordinate proof against the peer's
-/// authenticated certificate, and negotiate the session — returning the raw [`HelloResult`] (or
-/// `None` to drop the peer: canonical-decode failure or a bad proof). This is the authenticated-
-/// identity step for a VRF coordinate — a proof for one certificate does not verify against
-/// another, so no live challenge is needed (spec §7.3).
+/// authenticated certificate, and negotiate the session. This is the authenticated-identity step for a VRF
+/// coordinate — a proof for one certificate does not verify against another, so no live challenge is needed
+/// (spec §7.3).
 async fn read_verified_hello(
     conn: &Connection,
     t: &Transport,
     verify: &HelloVerifier,
-) -> Option<HelloResult> {
-    let mut stream = conn.accept_uni().await.ok()?;
-    let raw = stream.read_to_end(max_wire()).await.ok()?;
+) -> PeerHello {
+    let Ok(mut stream) = conn.accept_uni().await else {
+        return PeerHello::Silent;
+    };
+    let Ok(raw) = stream.read_to_end(max_wire()).await else {
+        return PeerHello::Silent;
+    };
     let Some(hello) = shape_in(&t.shaper, raw) else {
         t.record_station(Station::WireUnshaped, None, None);
-        return None;
+        return PeerHello::Silent;
     };
-    let cert = peer_cert_der(conn)?;
-    verify(&cert, &hello)
+    let Some(cert) = peer_cert_der(conn) else {
+        // A QUIC peer with no certificate cannot have proved anything: that is a malformed claim, not a
+        // beacon we are missing.
+        t.record_station(Station::HelloProofRejected, None, None);
+        return PeerHello::Refused;
+    };
+    match verify(&cert, &hello) {
+        HelloVerdict::Ok(result) => PeerHello::Answered(result),
+        HelloVerdict::BadProof => {
+            t.record_station(Station::HelloProofRejected, None, None);
+            PeerHello::Refused
+        }
+        HelloVerdict::EpochUnknown => {
+            // Not keyed by line: the claim is unverified, so the coordinate it names is not yet a fact about
+            // anyone — attaching it would let a stranger choose which line this node's counters accuse.
+            t.record_station(Station::HelloEpochUnknown, None, None);
+            PeerHello::Refused
+        }
+    }
 }
 
 /// The full self-certifying HELLO exchange on a fresh connection (spec §7.3/§7.4): announce our own
@@ -2407,33 +2522,53 @@ async fn read_verified_hello(
 /// Both the dialer ([`get_or_connect`]) and the acceptor ([`accept_loop`]) call this same function:
 /// each announces its own HELLO immediately (never waiting on the peer first), so there is no
 /// ordering dependency between the two sides — symmetric, and it cannot deadlock.
-async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Option<Triple> {
+async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Handshake {
     // Snapshot the current-epoch HELLO (an `Arc` clone) and drop the lock before awaiting, so a concurrent
     // reshuffle can rewrite it without blocking on this connection's I/O. A poisoned lock rejects the
-    // handshake (`None`), matching the connection-map convention elsewhere in this driver.
-    let hello = id.hello.read().ok()?.clone();
+    // handshake, matching the connection-map convention elsewhere in this driver — and it is a *local*
+    // fault, so it says nothing about the transport.
+    let Ok(hello) = id.hello.read().map(|h| h.clone()) else {
+        return Handshake { peer: None, round_trip: false };
+    };
     send_hello(conn, &t.shaper, &hello).await;
-    match read_verified_hello(conn, t, &id.verify).await? {
-        HelloResult::Established {
-            coord,
-            version,
-            capabilities,
-            // The claim material is recorded by the verifier closure itself (`spawn_self_certifying`), which is the only
-            // place holding the peer's certificate DER — the identity the coordinate VRF binds to.
-            peer: _,
-        } => {
-            send_hello_ack(conn, &t.shaper, version, capabilities).await;
-            Some(coord)
-        }
-        HelloResult::Incompatible(err) => {
-            tracing::warn!(
-                ?err,
-                "HELLO negotiation incompatible; sending ERROR and aborting"
-            );
-            send_error(conn, &t.shaper, err).await;
-            None
-        }
+    match read_verified_hello(conn, t, &id.verify).await {
+        PeerHello::Answered(result) => match *result {
+            HelloResult::Established {
+                coord,
+                version,
+                capabilities,
+                // The claim material is recorded by the verifier closure itself (`spawn_self_certifying`),
+                // which is the only place holding the peer's certificate DER — the identity the coordinate
+                // VRF binds to.
+                peer: _,
+            } => {
+                send_hello_ack(conn, &t.shaper, version, capabilities).await;
+                Handshake { peer: Some(coord), round_trip: true }
+            }
+            HelloResult::Incompatible(err) => {
+                tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
+                send_error(conn, &t.shaper, err).await;
+                // A version disagreement is proof the shaped bytes crossed intact — we read and parsed them.
+                Handshake { peer: None, round_trip: true }
+            }
+        },
+        PeerHello::Refused => Handshake { peer: None, round_trip: true },
+        PeerHello::Silent => Handshake { peer: None, round_trip: false },
     }
+}
+
+/// The outcome of a HELLO exchange, split along the line the two consumers actually need (#231).
+///
+/// `peer` answers "who is this?" — the connection is kept or dropped on it. `round_trip` answers a
+/// different question, "did a shaped frame make it there and back?", and only the morph auto-fallback reads
+/// it. Before this they were one `Option<Triple>`, so the breaker had nothing to read at this layer and was
+/// fed the QUIC handshake instead — an event the morph cannot influence, since shaping starts above it.
+struct Handshake {
+    /// The peer's certified coordinate, if the exchange established one.
+    peer: Option<Triple>,
+    /// Whether a shaped frame completed the round trip. **A refusal counts as `true`**: we decoded what the
+    /// peer sent and rejected its contents, so the transport is not what failed.
+    round_trip: bool,
 }
 
 /// Tell every live peer when this node moves, by re-sending its (already updated) `HELLO` on each open connection.
@@ -2475,9 +2610,21 @@ async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notificati
 fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) -> Option<Triple> {
     let id = t.identity.as_ref()?;
     let cert = peer_cert_der(conn)?;
-    match (id.verify)(&cert, frame)? {
-        HelloResult::Established { coord, .. } => (coord != known).then_some(coord),
-        HelloResult::Incompatible(_) => None,
+    // The mid-connection move is counted at the same two gates as the initial HELLO (#236): a re-announced
+    // coordinate this node cannot judge is the peer moving past our stale beacon, not the peer lying.
+    match (id.verify)(&cert, frame) {
+        HelloVerdict::Ok(result) => match *result {
+            HelloResult::Established { coord, .. } => (coord != known).then_some(coord),
+            HelloResult::Incompatible(_) => None,
+        },
+        HelloVerdict::BadProof => {
+            t.record_station(Station::HelloProofRejected, Some(known), None);
+            None
+        }
+        HelloVerdict::EpochUnknown => {
+            t.record_station(Station::HelloEpochUnknown, Some(known), None);
+            None
+        }
     }
 }
 
@@ -3440,6 +3587,159 @@ mod tests {
             shaper.as_ref().unwrap().read().unwrap().morph(),
             Morph::Polymorph,
             "a fixed morph never rotates"
+        );
+    }
+
+    /// Bring up a censor: FANOS's own server config over a real sealed socket keyed by `secret`, which
+    /// completes everything the transport asks for and then withholds the one shaped frame the exchange
+    /// needs. Returns its address.
+    ///
+    /// `hold` picks which of the two censors this is, and the distinction is the whole reason there are two
+    /// tests below: **holding** the connection open exercises the deadline, **closing** it exercises the
+    /// classification. A test that conflated them would pass with either half of the fix reverted.
+    fn silent_censor(secret: &[u8], hold: bool) -> SocketAddr {
+        use quinn::Runtime as _;
+        let creds = NodeCredentials::generate().expect("censor credentials");
+        let (server, _client, _cert) = node_configs_mutual_from(&creds).expect("censor tls");
+        let shaper = Arc::new(RwLock::new(ProteusShaper::with_morph(
+            secret.to_vec(),
+            Epoch::ZERO,
+            Morph::Polymorph,
+        )));
+        let stations = Arc::new(Mutex::new(Stations::new()));
+        let raw = std::net::UdpSocket::bind("127.0.0.1:0").expect("censor bind");
+        let carrier = quinn::TokioRuntime.wrap_udp_socket(raw).expect("censor carrier");
+        let carrier = crate::proteus_socket::ProteusSocket::wrap(carrier, &shaper, &stations);
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server),
+            carrier,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .expect("censor endpoint");
+        let addr = endpoint.local_addr().expect("censor addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                if let Ok(conn) = incoming.await
+                    && hold
+                {
+                    held.push(conn);
+                }
+            }
+        });
+        addr
+    }
+
+    /// A shipped self-certifying dialer sharing `secret`, plus a directory pointing `target` at `addr`.
+    fn dialer_pointed_at(secret: &[u8], addr: SocketAddr) -> (NodeHandle, Triple) {
+        let dir = Directory::new();
+        let creds = NodeCredentials::generate().expect("dialer credentials");
+        let node = spawn_self_certifying_persistent_over::<F2>(
+            Fabric::Udp("127.0.0.1:0".parse().unwrap()),
+            &creds,
+            |coord| {
+                Box::new(fanos_runtime::OverlayNode::<F2>::new(
+                    coord,
+                    fanos_runtime::Config::default(),
+                ))
+            },
+            dir.clone(),
+            Some(ProteusConfig::polymorph(secret.to_vec())),
+        )
+        .expect("spawn the dialer");
+        let target: Triple = if node.address() == [1, 0, 0] { [0, 1, 0] } else { [1, 0, 0] };
+        dir.insert(target, addr);
+        (node, target)
+    }
+
+    /// How many transport round trips this node has concluded lost.
+    fn round_trips_lost(node: &NodeHandle) -> u64 {
+        node.client()
+            .driver_stations()
+            .iter()
+            .filter(|o| o.station.name() == "transport.round_trip_lost")
+            .map(|o| o.count)
+            .sum()
+    }
+
+    /// Poll `f` until it is non-zero, or give up after `ceiling`.
+    async fn wait_nonzero(
+        ceiling: std::time::Duration,
+        mut f: impl FnMut() -> u64,
+    ) -> Option<u64> {
+        tokio::time::timeout(ceiling, async {
+            loop {
+                let n = f();
+                if n > 0 {
+                    return n;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// **#231 — a peer that completes the handshake and never speaks is a TRANSPORT failure.**
+    ///
+    /// PROPERTY: the outcome fed to the morph breaker comes from the shaped round trip, not from the QUIC
+    /// handshake. Before this, `apply_outcome(true)` fired the moment `connect` returned, so a censor that
+    /// admits the handshake and kills the data phase reset the breaker for ever — silent in exactly the case
+    /// the morph exists to answer.
+    ///
+    /// The censor here **closes** the connection after the handshake, so the failure is reached by
+    /// classification and not by any deadline: the assertion on elapsed time is what separates this test
+    /// from the one below. Falsified by mapping `PeerHello::Silent` to `round_trip: true` — this test then
+    /// fails, while the deadline test still passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handshake_without_a_shaped_round_trip_is_recorded_as_a_transport_failure() {
+        let secret = b"round-trip-classification".to_vec();
+        let addr = silent_censor(&secret, false);
+        let (node, target) = dialer_pointed_at(&secret, addr);
+
+        let started = std::time::Instant::now();
+        node.command(Command::Send { to: target, payload: b"into the void".to_vec() });
+        let lost = wait_nonzero(HELLO_DEADLINE, || round_trips_lost(&node))
+            .await
+            .expect("a peer that hangs up unspoken is a transport failure");
+
+        assert!(lost > 0);
+        assert!(
+            started.elapsed() < HELLO_DEADLINE,
+            "this must be reached by CLASSIFICATION, not by the deadline — took {:?}",
+            started.elapsed(),
+        );
+    }
+
+    /// **#233 — the caller's half of the handshake is bounded by the same deadline the acceptor uses.**
+    ///
+    /// PROPERTY: a peer that completes the QUIC handshake and then holds the connection open in silence is
+    /// abandoned within `HELLO_DEADLINE`, not held to QUIC's 30 s idle timeout. The dial runs on the send
+    /// loop, which is the very path `DIAL_TIMEOUT` exists to keep clear — and only its QUIC half was bounded.
+    ///
+    /// The ceiling sits between the two: above `HELLO_DEADLINE` (10 s) and well below the idle timeout
+    /// (30 s), so a run that satisfies it is a statement about which bound fired. Falsified by removing the
+    /// `timeout` wrapper — measured at 18 s and failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_holds_the_connection_silent_is_abandoned_at_the_handshake_deadline() {
+        let secret = b"round-trip-deadline".to_vec();
+        let addr = silent_censor(&secret, true);
+        let (node, target) = dialer_pointed_at(&secret, addr);
+
+        let started = std::time::Instant::now();
+        node.command(Command::Send { to: target, payload: b"into the void".to_vec() });
+        let ceiling = HELLO_DEADLINE + std::time::Duration::from_secs(8);
+        let lost = wait_nonzero(ceiling, || round_trips_lost(&node))
+            .await
+            .expect("the held-open peer must be abandoned inside the handshake deadline");
+
+        assert!(lost > 0);
+        assert!(
+            started.elapsed() < ceiling,
+            "the dial concluded in {:?}, which must be under {:?} and nowhere near the 30 s idle timeout",
+            started.elapsed(),
+            ceiling,
         );
     }
 }

@@ -35,6 +35,7 @@ mod directory;
 mod driver;
 mod harness;
 mod identity;
+mod proteus_socket;
 mod reflexive;
 mod tls;
 

@@ -212,7 +212,7 @@ async fn bytes_that_do_not_unshape_are_counted_as_that_and_not_as_something_else
             .map(|o| o.count)
             .sum()
     };
-    assert_eq!(count(&b, "wire.unshaped"), 0, "nothing has been refused before any traffic");
+    assert_eq!(count(&b, "wire.foreign_datagram"), 0, "nothing has been refused before any traffic");
 
     for _ in 0..8 {
         a.command(Command::Send { to: b.address(), payload: b"unreadable to B".to_vec() });
@@ -221,12 +221,22 @@ async fn bytes_that_do_not_unshape_are_counted_as_that_and_not_as_something_else
     tokio::time::sleep(StdDuration::from_secs(2)).await;
 
     assert!(
-        count(&b, "wire.unshaped") > 0,
-        "B must count the frames it could not strip; a bridge under probing looked idle before this"
+        count(&b, "wire.foreign_datagram") > 0,
+        "B must count what it refused; a bridge under probing looked idle before this"
     );
     assert_eq!(
         count(&b, "wire.over_bound"),
         0,
-        "and must not blame the size: these frames are well within the ceiling, they are simply not ours"
+        "and must not blame the size: these datagrams are well within the ceiling, they are simply not ours"
+    );
+    // The gate MOVED, and that is the finding this assertion carries (#232). Before the datagram envelope,
+    // A's frames reached B's frame decoder and were refused there as `wire.unshaped`. Now A's very first
+    // datagram — its QUIC Initial — is refused, so the two never share a connection and the frame layer
+    // never sees anything. A counter left behind at the old gate would read zero for ever and be mistaken
+    // for "no probing".
+    assert_eq!(
+        count(&b, "wire.unshaped"),
+        0,
+        "with the envelope on, a foreign community is refused a layer earlier and never reaches the frames"
     );
 }

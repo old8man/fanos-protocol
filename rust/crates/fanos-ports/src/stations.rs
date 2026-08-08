@@ -236,7 +236,51 @@ pub enum Station {
     /// (#196): a peer one epoch behind is transient and self-healing, while bytes matching no known shape are
     /// a stranger — or an **active censor probing a PROTEUS bridge**. Until then a *rise* is the signal; a
     /// steady low rate at an epoch boundary is the benign half.
+    ///
+    /// **Scope narrowed by the datagram envelope (#232).** With sealing on, a stranger no longer reaches the
+    /// frame layer at all — it is refused a layer earlier and counted as
+    /// [`WireForeignDatagram`](Self::WireForeignDatagram). What still lands here is the `plain` morph and the
+    /// pluggable-codec path, where there is no envelope below to catch it first.
     WireUnshaped,
+
+    /// A datagram that did not open under this node's community secret and epoch — refused **before quinn
+    /// parses it**, which is what makes the port unresponsive to an unauthenticated prober (spec §13.5).
+    ///
+    /// This is now the outermost gate on the receive path, so it is the first place an active censor's probe
+    /// becomes visible — and the only place, since by design nothing downstream ever hears about it. A node
+    /// under enumeration looks idle on every other counter.
+    ///
+    /// Distinct from [`WireUnshaped`](Self::WireUnshaped) by *layer*, not by cause: same question (is this
+    /// ours?), asked of a datagram rather than a frame, and answered before any QUIC state exists to attach a
+    /// coordinate to — which is why this one is never keyed by line.
+    WireForeignDatagram,
+
+    /// A dial whose QUIC handshake **completed** and whose shaped HELLO round trip then did not (#231).
+    ///
+    /// This is the data-phase censor's signature, and it had no name: the connection is established, so
+    /// nothing reports a dial failure, and no frame ever arrives, so nothing reports a delivery failure. The
+    /// morph auto-fallback reads the same event, but a breaker only tells an operator *that* it rotated —
+    /// this says how often the shaped path is being cut while the handshake is let through, which is the
+    /// number that distinguishes "the network is lossy" from "someone is filtering us".
+    ///
+    /// Keyed by the peer's coordinate: a rise against one line is a peer problem, a rise across the cell is
+    /// the censor.
+    TransportRoundTripLost,
+
+    /// A peer's HELLO decoded and its coordinate proof did **not** verify against a beacon this node holds
+    /// — a forgery or an impostor (#236). Actionable as an attack.
+    ///
+    /// Not keyed by line: the claim is unverified, so the coordinate it names is not a fact about anyone.
+    /// Keying it would let a stranger choose which of this node's lines its own counters accuse.
+    HelloProofRejected,
+
+    /// A peer proved an epoch this node has **no beacon for**, so it could not judge the claim at all.
+    ///
+    /// This is *our* staleness, not the peer's dishonesty, and merging the two into one counter is the
+    /// defect #109 named for POROS's gates. It is also the first thing an operator sees when a node cannot
+    /// join a running cell (#235): a freshly-started node holds only the genesis beacon, so every live
+    /// peer's claim lands here and nothing else moves at all.
+    HelloEpochUnknown,
 
     // --- POROS admission (`fanos_node::PorosHost`) ---
     /// A request arrived from a coordinate other than the one it claims — the identity binding refusing a
@@ -493,6 +537,10 @@ impl Station {
         Self::FrameTypeUnknown,
         Self::WireOverBound,
         Self::WireUnshaped,
+        Self::WireForeignDatagram,
+        Self::TransportRoundTripLost,
+        Self::HelloProofRejected,
+        Self::HelloEpochUnknown,
         Self::StoreAtCapacity,
         Self::ReadShardRefused,
         Self::ReadInconclusive,
@@ -532,6 +580,10 @@ impl Station {
             Self::FrameTypeUnknown => "frame.type_unknown",
             Self::WireOverBound => "wire.over_bound",
             Self::WireUnshaped => "wire.unshaped",
+            Self::WireForeignDatagram => "wire.foreign_datagram",
+            Self::TransportRoundTripLost => "transport.round_trip_lost",
+            Self::HelloProofRejected => "hello.proof_rejected",
+            Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::StoreAtCapacity => "store.at_capacity",
             Self::ReadShardRefused => "read.shard_refused",
             Self::ReadInconclusive => "read.inconclusive",

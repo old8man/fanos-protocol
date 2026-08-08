@@ -16,6 +16,7 @@ use fanos_primitives::Epoch;
 use fanos_primitives::hash::hash_xof;
 
 use crate::codec::MorphCodec;
+use crate::datagram::{open_in_place, seal};
 use crate::morph::Morph;
 use crate::obfuscate::{NONCE_LEN, deobfuscate, obfuscate};
 use crate::profile::ShapingProfile;
@@ -267,6 +268,34 @@ impl ProteusShaper {
         deobfuscate(&self.shape, wire)
             .or_else(|| deobfuscate(&self.grace[0], wire))
             .or_else(|| deobfuscate(&self.grace[1], wire))
+    }
+
+    /// Seal one **datagram** — the layer below the frame (spec §13.3/§13.5, see
+    /// [`crate::datagram`]). `nonce` must not repeat for this epoch's shape; the caller draws it,
+    /// because only the caller knows how many sockets share the community secret.
+    ///
+    /// The shaper owns both directions of the envelope for the same reason it owns the frame codec: the
+    /// epoch shape and its grace window live here, so a datagram and a frame can never disagree about
+    /// which epoch they are in.
+    #[must_use]
+    pub fn seal_datagram(&self, payload: &[u8], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
+        seal(&self.shape, payload, nonce)
+    }
+
+    /// Open one datagram in place, returning the plaintext length; `None` means "not from this
+    /// community" and the caller drops it without replying.
+    ///
+    /// Tries the current shape, then the [`SHAPE_GRACE`] window, exactly as [`inbound`](Self::inbound)
+    /// does — a peer that turned the epoch a moment before or after this node must still be able to
+    /// *connect*, and at this layer a failure is not one lost frame but a dead handshake.
+    ///
+    /// A failed attempt leaves the buffer untouched (`open_in_place` verifies the tag before it writes),
+    /// which is what makes trying three shapes in sequence safe.
+    #[must_use]
+    pub fn open_datagram(&self, buf: &mut [u8]) -> Option<usize> {
+        open_in_place(&self.shape, buf)
+            .or_else(|| open_in_place(&self.grace[0], buf))
+            .or_else(|| open_in_place(&self.grace[1], buf))
     }
 }
 
