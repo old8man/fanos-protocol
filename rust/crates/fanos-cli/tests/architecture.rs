@@ -1079,3 +1079,114 @@ fn a_test_that_spawns_a_peer_does_not_run_on_a_current_thread_runtime() {
         offenders.join("\n  ")
     );
 }
+
+/// The types a literal must never reach: **key material**.
+///
+/// Keyed on the *type*, not on the constructor, and that distinction is the whole guard. `from_seed` has 85
+/// call sites in production and a scan on the name alone would report all of them — the unreadable-first-run
+/// failure #168's inflated 19-of-25 warned about. More to the point, most of those literals are **required**:
+/// a `HashParams::from_seed(b"FANOS-obolos-v1/nullifier")` is a public common reference string, and a CRS
+/// that is not a reproducible nothing-up-my-sleeve constant is itself the defect. So the noise and the signal
+/// are not distinguished by the call — they are distinguished by what is being built.
+///
+/// The survey that produced this list, run before the guard was written: of the literal-argument calls in
+/// production, most were CRS values and domain separators (`b"FANOS-obolos-v1/nullifier"` and siblings), two
+/// were placeholders overwritten before use beside `Vec::new()`, one was a public network name — and exactly
+/// two touched key material, both in `demo()`, both now justified in place.
+///
+/// **The counts are deliberately not quoted here.** That survey was a separate script with its own file
+/// walk, and a number from one scan pasted into the doc of another is a claim about the wrong instrument.
+/// The live figures travel with the failure message below, where they are measured by the code that reports
+/// them.
+const SECRET_TYPES: [&str; 5] =
+    ["VrfSecret", "SeedRng", "HybridKemSecret", "EdSigningKey", "SigningKey"];
+
+/// The marker a call site uses to declare a literal seed deliberate, with its reason **at the code**.
+///
+/// Not a path list in this file. A list here would let the justification rot away from the thing it
+/// justifies, and it would make the exemption invisible to anyone reading the call — which is precisely how
+/// a "temporary" fixed key survives into a release. The scanner counts markers, so an exemption that stops
+/// being needed shows up as a marker with no call beneath it.
+const JUSTIFIED: &str = "literal-seed-ok:";
+
+/// **A secret key built from a literal is catastrophic, silent, and mechanically detectable** (#203).
+///
+/// Catastrophic because every node that ships the constant shares one identity — coordinates, VRF proofs and
+/// signatures all collapse. Silent because nothing fails: the key is well-formed, the handshake completes,
+/// and the network works right up until two nodes meet. Detectable because the literal is *right there in the
+/// source*, which is what makes the absence of a guard worth fixing rather than worth arguing about.
+///
+/// This is the one class of this kind the tree did not guard. It guards five others — crate reachability,
+/// unwired public capability, workspace membership, undocumented constants, single-threaded async tests —
+/// and each exists because the defect it names is invisible to review at the moment it is introduced. So does
+/// this one.
+///
+/// **What it does not claim.** It sees literals, not weakness. A seed read from a world-readable file, or
+/// derived from a hostname, is just as fatal and completely invisible here. This closes the floor: the state
+/// in which the key is a constant in the binary.
+#[test]
+fn no_key_material_is_built_from_a_literal() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let literal_arg = regex_literal_arg();
+    let (mut examined, mut calls, mut justified) = (0usize, 0usize, 0usize);
+    let mut offenders = Vec::new();
+    for file in rust_sources(&root.join("crates")) {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let ships = production_part(&text);
+        examined += 1;
+        let lines: Vec<&str> = ships.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("from_seed(") {
+                continue;
+            }
+            calls += 1;
+            if !SECRET_TYPES.iter().any(|t| line.contains(&format!("{t}::from_seed("))) {
+                continue; // a CRS, a domain separator, a network name — a literal there is the requirement
+            }
+            if !literal_arg(line) {
+                continue;
+            }
+            // The justification may sit on the call's own line or the one above it, because rustfmt splits
+            // long calls and a marker that only works on one of the two shapes is a marker that will be lost.
+            let prev = i.checked_sub(1).and_then(|j| lines.get(j)).copied().unwrap_or("");
+            if line.contains(JUSTIFIED) || prev.contains(JUSTIFIED) {
+                justified += 1;
+                continue;
+            }
+            offenders.push(format!("{}:{}  {}", file.display(), i + 1, line.trim()));
+        }
+    }
+    // **Floors first, ratchets last, and the order is load-bearing.** These two say the scan can see; a scan
+    // that examined nothing reports "clean", which is the third guard in this file to carry that floor.
+    assert!(examined >= 200, "only {examined} production parts examined; the walk is broken, not the tree");
+    assert!(calls >= 40, "only {calls} `from_seed` calls seen ({examined} files); the scan cannot discriminate");
+    assert!(
+        offenders.is_empty(),
+        "these build KEY MATERIAL from a literal — every node shipping the constant shares one identity, and \
+         nothing fails until two of them meet. Derive it from OS entropy, or write `{JUSTIFIED} <reason>` \
+         directly above the call if it is a demonstration that must be reproducible (#203). \
+         [examined {examined} files, {calls} from_seed calls, {justified} justified]:\n  {}",
+        offenders.join("\n  ")
+    );
+    // **After** the finding, deliberately. This is a ratchet on the known exemptions, not evidence the scan
+    // works — and put before the assertion above it masked the two real offenders on this guard's first run,
+    // reporting "the markers are gone" about a tree that had simply never had them. A floor proves the
+    // instrument; a ratchet guards a specific fact; only the first may pre-empt a finding.
+    assert!(
+        justified >= 2,
+        "the two justified demo seeds are gone ({justified} markers) — if `demo()` stopped needing fixed \
+         identities that is good news, and this floor should be lowered deliberately rather than drift"
+    );
+}
+
+/// `Type::from_seed(<literal>)` — an array literal, a byte string or a string, with or without a leading `&`.
+///
+/// Hand-rolled rather than a regex crate: this test binary has no such dependency and the grammar is small.
+/// A literal argument is one that starts with `[`, `b"` or `"` after the paren.
+fn regex_literal_arg() -> impl Fn(&str) -> bool {
+    |line: &str| {
+        let Some(after) = line.split_once("from_seed(").map(|(_, r)| r) else { return false };
+        let arg = after.trim_start().trim_start_matches('&').trim_start();
+        arg.starts_with('[') || arg.starts_with("b\"") || arg.starts_with('"')
+    }
+}

@@ -250,13 +250,20 @@ fn verify_lrc_and_polar(r: &mut Report) {
 /// End-to-end demonstration of the overlay flow.
 fn demo() {
     println!("\n Demo — identity → rendezvous → diagnosis → threshold\n");
+    // A demonstration PRINTS the coordinates it derives, so the two identities must be the same on every
+    // machine or the output is not a demonstration of anything. These keys never leave this function:
+    // nothing here joins a cell, publishes a descriptor or signs for a peer — `demo()` writes to stdout and
+    // returns. A node's real identity comes from `spawn_self_certifying_persistent_over`, which takes OS
+    // entropy and is the only path that produces one.
     let alice = Node::<F31>::open(
+        // literal-seed-ok: fixed so the printed coordinate is reproducible; see above (#203).
         &VrfSecret::from_seed([0xA1; 32]),
         NodeId([0xA1; 32]),
         Epoch::new(42),
         &BeaconSeed::GENESIS,
     );
     let bob = Node::<F31>::open(
+        // literal-seed-ok: the second half of the same fixed pair.
         &VrfSecret::from_seed([0xB0; 32]),
         NodeId([0xB0; 32]),
         Epoch::new(42),
