@@ -278,11 +278,25 @@ impl CoherenceMatrix {
         // away. A cell with no variance anywhere (every node idle) has no shares to speak of, so it falls
         // back to uniform rather than to zeros, which would make every measure `NaN`.
         let total: f64 = std.iter().map(|s| s * s).sum();
-        let d = if total > 1e-12 {
-            std.iter().map(|s| s * s / total).collect()
-        } else {
-            vec![1.0 / n as f64; n]
-        };
+        if total <= 1e-12 {
+            // **No variance anywhere is not a measurement of zero correlation** (#229). The old fallback
+            // returned a uniform diagonal here, and the resulting matrix was BIT-IDENTICAL to a cell of
+            // genuinely independent busy nodes: `Φ = 0`, `P = 1/7`, `p = 1/7`, `r = 0`, `v = 0`, alarm
+            // `Structure`. Three distinguishable conditions — real distributed work, total silence, and a
+            // steady unchanging load — all read as the platform's most severe coherence alarm, from the one
+            // input that could have separated them and was then discarded.
+            //
+            // `None` is the honest answer and it already has a consumer: `BehaviorMonitor::coherence`
+            // propagates it, and `Healer::emit_observation` then takes the synthesised path, which stamps
+            // the frame `measured = false`. That bit exists for exactly this distinction (#154) — it was
+            // introduced for "no window yet" and the case one step over, "a full window with nothing in
+            // it", slipped past it. Same guard, same reason, the twin that was left unguarded.
+            //
+            // A cell that is merely *quiet* is not collapsed. A cell that is quiet and reports collapse
+            // sends its parent an escalation about nothing.
+            return None;
+        }
+        let d: Vec<f64> = std.iter().map(|s| s * s / total).collect();
         Some(Self { n, c, d })
     }
 
@@ -682,6 +696,54 @@ mod tests {
             assert_eq!(m.phi >= 1.0, m.purity >= p_crit(n), "Φ ≥ 1 ⟺ P ≥ 2/N, with no stratum assumed");
             assert_eq!(m.phi <= 2.0, m.reflection >= R_TH, "Φ ≤ 2 ⟺ R ≥ 1/3");
         }
+    }
+
+    /// **Three distinguishable cells no longer read identically** (#229).
+    ///
+    /// Measured before the fix, all four through the production constructor:
+    ///
+    /// ```text
+    /// busy, genuinely independent   Φ=0  P=0.1429  p=0.1429  Structure
+    /// silent, nothing happened      Φ=0  P=0.1429  p=0.1429  Structure
+    /// steady equal load             Φ=0  P=0.1429  p=0.1429  Structure
+    /// one node active, six silent   Φ=0  P=1.0000  p=1.0000  Integration
+    /// ```
+    ///
+    /// The first three were bit-identical: real distributed work indistinguishable from total silence, all
+    /// three raising the platform's most severe coherence alarm, and — through `Homeostat::control`'s
+    /// purity gate — escalating a collapse to the parent. The one input that separates them is whether
+    /// there was any variance at all, and the old fallback discarded it.
+    ///
+    /// A correlation needs variance. Two of the three have none, so their correlation is UNDEFINED, and
+    /// `None` says that where a zero matrix asserted a measurement. The third does have variance and still
+    /// reads `Structure` — that part is untouched here and is the arguable half of #229, because UHM T-319
+    /// says a holon with no integration genuinely cannot self-recover.
+    #[test]
+    fn a_cell_with_no_variance_is_refused_rather_than_read_as_collapsed() {
+        let h = |i: usize, t: usize| if (i & t).count_ones().is_multiple_of(2) { 1.0f64 } else { -1.0f64 };
+        let silent: Vec<Vec<f64>> = (0..7).map(|_| vec![0.0f64; 16]).collect();
+        let steady: Vec<Vec<f64>> = (0..7).map(|_| vec![5.0f64; 16]).collect();
+        let independent: Vec<Vec<f64>> =
+            (0..7).map(|i| (0..16).map(|t| h(i + 1, t)).collect()).collect();
+
+        assert!(
+            CoherenceMatrix::from_signals(&silent).is_none(),
+            "a cell where nothing happened has no correlation to report"
+        );
+        assert!(
+            CoherenceMatrix::from_signals(&steady).is_none(),
+            "a cell at an unchanging load has no correlation to report either — same reason, and it used \
+             to be the one that looked most like a real reading"
+        );
+
+        // The busy independent cell still reads, and still reads uncorrelated — which is the honest answer
+        // for it. The point is that it is now DISTINGUISHABLE from the two above.
+        let g = CoherenceMatrix::from_signals(&independent).expect("variance is present");
+        assert!(g.phi() < 1e-9, "independent nodes are uncorrelated, Φ={}", g.phi());
+        assert!(
+            (g.diagonal_purity() - 1.0 / 7.0).abs() < 1e-9,
+            "and evenly active, so p = 1/7 — the value that used to be shared with silence"
+        );
     }
 
     /// **A cell that concentrates its behavioural weight is not a collective subject at the flat

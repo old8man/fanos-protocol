@@ -124,8 +124,25 @@ mod tests {
             m.record(&[1.0, 2.0, 3.0]);
         }
         assert!(m.ready(), "the window is full");
-        // Constant signals still yield a well-formed matrix (unit diagonal, zero off-diagonal correlation).
-        let g = m.coherence().expect("a matrix once there is a window");
+        // **A constant window yields NO matrix, and this line used to assert the opposite** (#229). It read
+        // "constant signals still yield a well-formed matrix (unit diagonal, zero off-diagonal
+        // correlation)", which encoded the defect as a property: a Pearson correlation needs variance, so a
+        // window with none has an UNDEFINED correlation, not a zero one. The matrix it used to produce was
+        // bit-identical to a cell of genuinely independent busy nodes and to a cell where nothing happened
+        // — `Φ = 0`, `P = 1/7`, alarm `Structure` — and that reading escalated a coherence collapse.
+        //
+        // `ready()` is still true: the window IS full. Readiness is about samples, `coherence()` about
+        // whether they say anything. Keeping both assertions here is the point — they are different
+        // questions and the old test conflated them.
+        assert!(
+            m.coherence().is_none(),
+            "a full window of constant samples has no definable correlation — `None`, not a zero matrix"
+        );
+        // Vary one node and the reading returns: the refusal above is about variance, not about the window.
+        for i in 0..4 {
+            m.record(&[1.0 + f64::from(i), 2.0, 3.0]);
+        }
+        let g = m.coherence().expect("variance restores a reading");
         assert_eq!(g.n(), 3);
     }
 
@@ -247,9 +264,12 @@ mod tests {
         m.record(&[4.0, 5.0]);
         // Node 0 got 4 samples (capped to 3); node 1 only the two finite ones — ragged, so no reading yet.
         assert!(m.coherence().is_none() || m.coherence().is_some());
-        // After enough finite samples on both, a matrix is available and finite.
-        for _ in 0..3 {
-            m.record(&[1.0, 2.0]);
+        // After enough finite samples on both, a matrix is available and finite. The samples have to VARY
+        // — a constant window is refused now (#229), and this loop used to record `[1.0, 2.0]` three times,
+        // which is exactly that. The property under test is that nothing non-finite survives, so the fix is
+        // to give it varying finite input rather than to weaken the refusal.
+        for i in 0..3 {
+            m.record(&[1.0 + f64::from(i), 2.0 - f64::from(i)]);
         }
         let g = m.coherence().expect("finite window");
         assert!(g.phi().is_finite() && g.purity().is_finite());
