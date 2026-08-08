@@ -52,16 +52,58 @@ const TAG_DROP: u8 = 0xE3;
 /// The anonymous-source sentinel in a delivery notification (the endpoint learns no originator).
 pub const ANONYMOUS: Triple = [0, 0, 0];
 
+/// What the threshold router may hold in pending gathers, across every gather at once.
+///
+/// The value is unchanged from the bare literal it replaces. It is named here because a budget that is not
+/// a constant cannot be summed with its neighbours, and #213 is about the fact that nobody had summed them:
+/// this 64 MiB, `fanos_diaulos::budget::SESSION_MEMORY_BUDGET`'s 64 MiB and `fanos_runtime`'s
+/// `STORE_MEMORY_BUDGET` of 128 MiB were each chosen as "a share of the 256 MiB node", by three authors who
+/// could not see each other, and they sum to the whole recommendation before the process's own resident set.
+const GATHER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// What **one** pending gather costs at its worst, in bytes the wire supplied.
+///
+/// Both terms are now enforced widths rather than assumed ones (#218):
+/// * the onion is [`THRESHOLD_ONION_LEN`](threshold::THRESHOLD_ONION_LEN), checked by [`decode_onion`];
+/// * the candidate shares are [`MAX_CANDIDATES`] × [`SHARE_LEN`](fanos_threshold::SHARE_LEN), checked by
+///   [`decode_rep`].
+///
+/// **The second term is the one this constant exists to add.** `MAX_PENDING`'s previous doc said each entry
+/// holds "one `THRESHOLD_ONION_LEN` onion **plus its shares**" and then divided by the onion alone — the
+/// prose named the term and the arithmetic dropped it, which is [`GATHER_MEMORY_BUDGET`]'s own defect one
+/// level in. With the shares unbounded the omission was not a rounding error: 64 frames were measured
+/// leaving 62 MiB in a single gather.
+const PENDING_ENTRY_BYTES: usize =
+    threshold::THRESHOLD_ONION_LEN + MAX_CANDIDATES * fanos_threshold::SHARE_LEN;
+
 /// Cap on concurrently-pending gathers, so **memory is bounded by count rather than by the deadline**.
 ///
 /// This is what makes the deadline free to be measured. Previously the only bound on `pending` was the
 /// timeout — every gather sat in a `BTreeMap` until its deadline fired — which quietly made the timing
 /// constant a *memory-safety* parameter, so lengthening it to fix liveness would have traded one defect for
-/// another. Derived from a budget rather than picked: each entry holds one `THRESHOLD_ONION_LEN` onion plus
-/// its shares, so `64 MiB / 20480 B ≈ 3276`. At the cap the oldest incomplete gather is dropped — correct
-/// here, unlike the eviction hazard a keyed cache has, because the oldest gather is precisely the one most
-/// likely already dead, and its client retransmits.
-const MAX_PENDING: usize = (64 * 1024 * 1024) / fanos_threshold::THRESHOLD_ONION_LEN;
+/// another. At the cap the oldest incomplete gather is dropped — correct here, unlike the eviction hazard a
+/// keyed cache has, because the oldest gather is precisely the one most likely already dead, and its client
+/// retransmits.
+///
+/// It is what the budget buys at the true per-entry cost, so it is not a round number and should not be
+/// made one — the same discipline `fanos_diaulos::budget::MAX_SESSIONS` states.
+const MAX_PENDING: usize = GATHER_MEMORY_BUDGET / PENDING_ENTRY_BYTES;
+
+/// The product the budget was never checked against, now checked by the compiler.
+///
+/// The assertion whose absence *was* the defect: `MAX_PENDING` divided by one of the two terms it needed to
+/// divide by, and nothing multiplied the result back out.
+const _: () = assert!(
+    MAX_PENDING * PENDING_ENTRY_BYTES <= GATHER_MEMORY_BUDGET,
+    "the pending gathers' worst case exceeds GATHER_MEMORY_BUDGET — raise the budget deliberately or lower a factor"
+);
+
+/// [`MAX_PENDING`] is the **largest** count the budget buys, not merely a count that fits — without this the
+/// assertion above is satisfied by any small number and neither says the count was derived.
+const _: () = assert!(
+    (MAX_PENDING + 1) * PENDING_ENTRY_BYTES > GATHER_MEMORY_BUDGET,
+    "MAX_PENDING is below what the budget buys, so it was chosen rather than derived"
+);
 
 /// High bit marking a *mixing* timer token, distinguishing it from a gather-deadline token (which
 /// carries a small request id). No real request id reaches `2^63`.
@@ -1001,9 +1043,24 @@ fn encode_onion(line: Triple, onion: &[u8]) -> Vec<u8> {
     v
 }
 
+/// Decode a launch frame. **Fail-closed on width**, the same rule [`decode_drop`] states and for the same
+/// two reasons (#218).
+///
+/// A threshold onion is [`THRESHOLD_ONION_LEN`](threshold::THRESHOLD_ONION_LEN) on **every** plane —
+/// `slots::Packet` is a fixed-slot layout whose total is that constant by construction, which is what makes
+/// the plane order "invisible from length alone" (`slots`, the module doc). This decoder read `body[12..]`,
+/// everything, and handed the result to [`ThresholdRouter::on_onion`], which retains it in `Pending::onion`
+/// for the gather's whole lifetime.
+///
+/// So the width the protocol guarantees was never checked at the one place it arrives from a stranger, and
+/// [`MAX_PENDING`] — `budget / THRESHOLD_ONION_LEN` — was dividing by a length nothing enforced.
 fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
     let line = fanos_geometry::decode_triple(body.get(..12)?)?;
-    Some((line, body.get(12..)?.to_vec()))
+    let onion = body.get(12..)?;
+    if onion.len() != threshold::THRESHOLD_ONION_LEN {
+        return None;
+    }
+    Some((line, onion.to_vec()))
 }
 
 /// A NOSTOS dead-drop cell: `TAG ‖ line(12) ‖ [len(4 BE) ‖ body ‖ filler]`, where the bracketed region is
@@ -1073,11 +1130,19 @@ fn encode_req(req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<
     v
 }
 
+/// Decode a share request. Width-checked like [`decode_onion`] — it carries the same object, and a line
+/// member that peels a partial from an off-width blob is doing work no honest combiner ever asks for. This
+/// one borrows rather than copies, so it was never the memory defect; it is here because the rule is the
+/// onion's, not the decoder's, and a rule enforced on one of two paths is the shape #218 is about.
 fn decode_req(body: &[u8]) -> Option<(u64, Triple, Triple, &[u8])> {
     let req_id = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let combiner = fanos_geometry::decode_triple(body.get(8..20)?)?;
     let line = fanos_geometry::decode_triple(body.get(20..32)?)?;
-    Some((req_id, combiner, line, body.get(32..)?))
+    let onion = body.get(32..)?;
+    if onion.len() != threshold::THRESHOLD_ONION_LEN {
+        return None;
+    }
+    Some((req_id, combiner, line, onion))
 }
 
 fn encode_rep(req_id: u64, share: &Share) -> Vec<u8> {
@@ -1089,7 +1154,21 @@ fn encode_rep(req_id: u64, share: &Share) -> Vec<u8> {
     v
 }
 
+/// Decode a share reply. **The share's on-wire length is fixed by the sealing side** (#218).
+///
+/// `ThresholdOnion::seal` Shamir-splits a `[u8; 32]` layer key, so a share's `y` is 32 bytes for every
+/// legitimate share at every plane order and every threshold — and `fanos_threshold::share_to_bytes`, the
+/// encoder used for the shares sealed *inside* the onion, already returns `None` for any other length.
+/// This decoder is the **other** path a share crosses the wire on, and it read `body[9..]`: everything.
+///
+/// A longer share cannot even be useful to an attacker's own goal of forcing a wrong peel —
+/// `shamir::reconstruct` refuses a subset whose `y` lengths differ — so what it bought was memory and
+/// nothing else. Measured before this check: 64 frames left **62 MiB** in one gather, and
+/// `MAX_PENDING × 62 MiB` is 201 GiB against a 64 MiB stated budget.
 fn decode_rep(body: &[u8]) -> Option<(u64, Share)> {
+    if body.len() != 8 + fanos_threshold::SHARE_LEN {
+        return None;
+    }
     let req_id = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let x = *body.get(8)?;
     let y = body.get(9..)?.to_vec();
@@ -1366,6 +1445,102 @@ mod tests {
         assert!(
             has_delivery(&e2, payload),
             "the honest share completes the hop despite the forged one"
+        );
+    }
+
+    /// The budget's arithmetic, written out — so a reader can check it by eye and a change to any input
+    /// shows up here as a diff rather than as a silently different bound (#213/#218).
+    #[test]
+    fn the_pending_cap_is_what_the_gather_budget_buys() {
+        assert_eq!(threshold::THRESHOLD_ONION_LEN, 20480, "the constant bucket, on every plane");
+        assert_eq!(fanos_threshold::SHARE_LEN, 33, "x(1) ‖ y(32), the Shamir split of a 32-byte layer key");
+        assert_eq!(PENDING_ENTRY_BYTES, 22592, "20480 onion + 64 × 33 candidate shares");
+        assert_eq!(MAX_PENDING, 2970, "64 MiB / 22592 B");
+        // The two invariants are `const` assertions above, so they fail the BUILD rather than a run.
+        // What is left here is what the old divisor bought and what it left out.
+        let onion_only = GATHER_MEMORY_BUDGET / threshold::THRESHOLD_ONION_LEN;
+        assert_eq!(onion_only, 3276, "what dividing by the onion alone bought");
+        assert!(
+            onion_only * PENDING_ENTRY_BYTES > GATHER_MEMORY_BUDGET,
+            "the previous cap does not fit the true per-entry cost — the dropped term was not a rounding error"
+        );
+    }
+
+    /// **A gather cannot be made to hold more than the budget says it holds** (#218).
+    ///
+    /// The two widths a stranger supplies — the onion and every candidate share — are fixed by the sealing
+    /// side, and this asserts the router enforces both, by measuring what one gather retains under a flood
+    /// that tries to exceed them. Measured before the checks: **62 MiB in one gather from 64 frames**, and
+    /// `MAX_PENDING × 62 MiB = 201 GiB` against a stated 64 MiB budget.
+    ///
+    /// The assertion is against [`PENDING_ENTRY_BYTES`] rather than a literal, so a future change to either
+    /// width moves the test with the constant instead of leaving it pinning a number nothing else believes.
+    #[test]
+    fn a_gather_cannot_be_flooded_past_the_width_the_sealing_side_produces() {
+        let line_coord = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
+        let t = 2usize;
+        let onion_seed = |i: u8| {
+            let mut s = [0x5Au8; 32];
+            s[31] = i;
+            s
+        };
+        let m0 = OnionKeyRatchet::new(onion_seed(0), Epoch::ZERO);
+        let m1 = OnionKeyRatchet::new(onion_seed(1), Epoch::ZERO);
+        let m2 = OnionKeyRatchet::new(onion_seed(2), Epoch::ZERO);
+        let pubs = [m0.public(), m1.public(), m2.public()];
+        let hop = HopLine { line: line_coord, members: &pubs };
+        let onion = seal_onion(&[hop], t as u8, b"anon-payload", b"seed-router").unwrap();
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let (identity0, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"identity-0"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity0, t, onion_seed(0));
+        router.step(Instant(0), Input::Message { from: [9, 9, 9], frame: launch_frame(line_coord, &onion) });
+
+        // The wire ceiling on a frame body is `fanos_wire::MAX_FRAME`; a TAG_REP's `y` is everything
+        // after `tag(1) ‖ req_id(8) ‖ x(1)`.
+        // The sealing side's own width, asserted first: this is the number both checks are keyed on, and if
+        // it ever stopped being constant the flood below would be measuring the wrong thing.
+        assert_eq!(
+            onion.len(),
+            threshold::THRESHOLD_ONION_LEN,
+            "a sealed onion is the constant bucket on every plane (`slots`), which is what makes the width \
+             checkable at all"
+        );
+        assert_eq!(router.pending.len(), 1, "the launch frame armed a gather");
+
+        // Flood: more candidates than the cap, each far wider than a share can legitimately be, each with a
+        // distinct `y` so the exact-repeat dedup does not absorb them, at a valid member index so the
+        // out-of-range gate does not either. The wire ceiling on a frame body is `fanos_wire::MAX_FRAME`.
+        let oversize = (1usize << 20) - 10;
+        for i in 0..MAX_CANDIDATES * 2 {
+            let mut y = alloc::vec![0u8; oversize];
+            y[0] = u8::try_from(i % 251).unwrap();
+            router.step(
+                Instant(1),
+                Input::Message { from: [8, 8, 8], frame: encode_rep(0, &Share::new(1, y)) },
+            );
+        }
+        let retained: usize = router
+            .pending
+            .values()
+            .map(|p| p.onion.len() + p.shares.iter().map(|s| s.y().len()).sum::<usize>())
+            .sum();
+        assert!(
+            retained <= PENDING_ENTRY_BYTES,
+            "one gather retained {retained} B, above the {PENDING_ENTRY_BYTES} B the budget divides by — \
+             MAX_PENDING is then a count of entries that do not cost what it assumed"
+        );
+
+        // The other half of the same rule, on the launch path: an off-width onion is refused outright
+        // rather than retained at whatever width arrived.
+        let before = router.pending.len();
+        let mut wide = onion.clone(); // a real, peelable onion — one byte too wide is the only difference
+        wide.push(0);
+        router.step(Instant(2), Input::Message { from: [7, 7, 7], frame: launch_frame(line_coord, &wide) });
+        assert_eq!(
+            router.pending.len(),
+            before,
+            "an onion that is not the constant bucket armed a gather anyway"
         );
     }
 
