@@ -137,4 +137,22 @@ fn a_decorrelated_flood_of_equal_volume_does_not_decouple() {
         !sim.report().any_decoupled(),
         "a decorrelated flood of equal volume does not trigger a spurious shed (load ≠ over-coupling)"
     );
+    // **TRIPWIRE, and it pins a defect rather than a property** (#229). This case is the scenario's own
+    // healthy control, and it ESCALATES a coherence collapse to the parent. The assertion above proves the
+    // cell does not shed and was silent about what it does instead; asked directly, `any_escalated()` is
+    // `true`.
+    //
+    // The mechanism is the purity gate, not the correlation band: `Homeostat::control` returns `Escalate`
+    // whenever `P ≤ 2/N` before it ever looks at `r`, and an uncorrelated cell has `P = Σdᵢ²·(1 + Φ)` =
+    // `1/7 < 2/7` at `Φ = 0` — so seven nodes doing genuinely independent work read as collapsed. Measured
+    // on `from_signals` directly, that reading is bit-identical to a cell where NOTHING happened, and
+    // strictly more severe than one where a single node works and six are silent (`P = 1`, `Integration`).
+    //
+    // **Left asserting the wrong behaviour on purpose.** Deleting it would hide the defect again; asserting
+    // the right one would fail the gate and block every other change. When #229 lands this flips to
+    // `!any_escalated()` and the two must move together — the repo's `..._must_be_fixed_together` pattern.
+    assert!(
+        sim.report().any_escalated(),
+        "#229: this control escalates a coherence collapse — if it no longer does, flip this assertion"
+    );
 }
