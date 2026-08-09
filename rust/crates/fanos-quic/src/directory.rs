@@ -245,14 +245,36 @@ impl Directory {
         Some((binding.index, binding.rank?))
     }
 
-    /// Unbind a coordinate — a node vacating a point on a per-epoch reshuffle (§L3), so a stale
-    /// coordinate → address binding does not linger and misroute after the occupant has moved. No-op if the
-    /// coordinate is not bound. (In a full deployment the DHT ages these out; here the reshuffling node
-    /// clears its own vacated point.)
-    pub fn remove(&self, coord: Triple) {
-        if let Ok(mut map) = self.inner.write() {
+    /// Unbind a coordinate **only while it still names `addr`** — the vacating half of #241, and a
+    /// compare-and-remove rather than a bare delete.
+    ///
+    /// Returns whether the entry was taken. `false` covers both "already gone" and "someone else's now",
+    /// and the caller almost never needs to tell those apart: in both the point is not this node's to clear.
+    ///
+    /// **Why the comparison cannot live at the call site.** It used to, at one of the two: `get_or_connect`
+    /// reads `resolve(to)`, compares, and then removes. That is a read followed by a write on a shared
+    /// `RwLock<HashMap>`, so a rebinding that lands between them is deleted by a decision taken before it
+    /// existed — and the repair #240 added would then undo a *fresher* correction than its own. Inside one
+    /// write lock the pair is atomic and the race cannot be written by accident.
+    ///
+    /// **The other caller had no comparison at all.** `Reseater::apply` cleared its vacated point
+    /// unconditionally, so a node walking off a point that a better claim had meanwhile taken deleted the
+    /// rightful occupant's binding and made it unroutable in this node's table until it announced again.
+    /// That is the #240 family for the third time: a write keyed on a coordinate, executed without asking
+    /// whether the coordinate is still the one the caller was thinking of.
+    ///
+    /// There is deliberately **no unconditional `remove`** beside this: the point of the change is that the
+    /// dangerous form cannot be written, which is the same reason `WriteOutcome` replaced `()` above rather
+    /// than being offered alongside it (#105's shape, not repeated).
+    pub fn remove_if(&self, coord: Triple, addr: SocketAddr) -> bool {
+        let Ok(mut map) = self.inner.write() else {
+            return false;
+        };
+        if map.get(&coord).is_some_and(|b| b.addr == addr) {
             map.remove(&coord);
+            return true;
         }
+        false
     }
 
     /// How many coordinate collisions this directory has observed (distinct addresses claiming one
@@ -429,8 +451,13 @@ mod tests {
         assert_eq!(dir.claim_at([0, 0, 1]), Some((0, low)), "an unqualified ranked insert is a claim at index 0");
         let _ = dir.insert_claimed([0, 1, 0], sa(5), low, 3);
         assert_eq!(dir.claim_at([0, 1, 0]), Some((3, low)), "and a displaced claim reports the index it proved");
-        dir.remove([0, 0, 1]);
+        assert!(dir.remove_if([0, 0, 1], sa(4)), "the occupant vacates its own point");
         assert_eq!(dir.claim_at([0, 0, 1]), None, "vacating clears the claim with the address");
+        assert!(
+            !dir.remove_if([0, 1, 0], sa(9)),
+            "and a stranger's address does not vacate someone else's point — the compare is the guard (#241)"
+        );
+        assert_eq!(dir.claim_at([0, 1, 0]), Some((3, low)), "the rightful occupant is untouched");
     }
 
     #[test]

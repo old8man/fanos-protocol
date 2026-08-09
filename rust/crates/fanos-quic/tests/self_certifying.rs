@@ -105,7 +105,11 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     // The realistic stale entry: B vacates its point (an epoch reshuffle does exactly this) and C is bound there
     // afterwards, so a send to B's *old* coordinate reaches C. Nothing about that is forgery — it is why the dialer must
     // still check the certificate against the coordinate it asked for.
-    dir.remove(b.address());
+    assert!(
+        dir.remove_if(b.address(), b.local_addr()),
+        "B vacates the point it actually holds — a compare-and-remove, so the setup cannot silently \
+         delete someone else's binding and leave the precondition unmet (#241)"
+    );
     let _ = dir.insert(b.address(), c.local_addr());
     assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
 
@@ -153,7 +157,11 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
 
     // B vacates its point and C is bound there, exactly as the sibling test does: a send to B's old
     // coordinate now resolves to C's address.
-    dir.remove(b.address());
+    assert!(
+        dir.remove_if(b.address(), b.local_addr()),
+        "B vacates the point it actually holds — a compare-and-remove, so the setup cannot silently \
+         delete someone else's binding and leave the precondition unmet (#241)"
+    );
     let _ = dir.insert(b.address(), c.local_addr());
     assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
     assert_eq!(stale_repairs(&a), 0, "nothing has been diagnosed before the dial");

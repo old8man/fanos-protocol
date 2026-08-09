@@ -1572,7 +1572,10 @@ impl Reseater {
             return false;
         }
         if point != at.coord {
-            self.directory.remove(at.coord);
+            // Compare-and-remove: the vacated point is cleared only while it still names THIS node. A better
+            // claim may have taken it while this walk was deciding, and deleting that binding would make the
+            // rightful occupant unroutable here until it announced again (#241).
+            let _ = self.directory.remove_if(at.coord, self.local_addr);
         }
         if let Ok(mut h) = self.hello.write() {
             *h = Arc::new(hello_bytes::<F>(at.epoch, point, claim, self.capabilities));
@@ -2347,9 +2350,10 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // Retract the stale binding only if it still names this address — a concurrent refresh
                     // may already have corrected it, and clobbering that would trade one stale entry for
                     // another.
-                    if t.directory.resolve(to) == Some(addr) {
-                        t.directory.remove(to);
-                    }
+                    // Read-then-write was the first form of this and had a window: a rebinding landing
+                    // between the `resolve` and the `remove` was deleted by a decision taken before it
+                    // existed. `remove_if` closes the pair inside one write lock (#241).
+                    let _ = t.directory.remove_if(to, addr);
                     // The live connection is dropped rather than re-filed under `actual`. Caching a
                     // connection that arrived through a *failed* dial is a new state for the connection map,
                     // and this change is about the directory; the next send to `actual` dials it cleanly.
