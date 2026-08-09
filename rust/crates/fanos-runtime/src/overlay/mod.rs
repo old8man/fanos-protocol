@@ -747,10 +747,25 @@ impl<F: Field> OverlayNode<F> {
 
     /// The cell position (`0..7`) of transport coordinate `coord`, if it is a member of this cell — the
     /// inverse of [`cell_coord`](Self::cell_coord), used to fold gossiped rows back onto cell positions.
+    ///
+    /// **`None` for every coordinate when there is no cell to be a position in**, and that is the fourth
+    /// place the same invariant is written. The reflex is index-addressed over a **Fano** cell: seven points,
+    /// seven lines, no three collinear. Without an explicit roster the fallback is the base plane's
+    /// `Point::at(0..6)` — which is that cell only when `N == 7`. Measured on `PG(2,7)`: `at(0..6)` are
+    /// `[1,0,0]…[1,0,6]`, **all seven on the single line `[0,1,0]`**, and the pairs of that set span exactly
+    /// **one** line where a Fano cell spans seven. Answering `Some(i)` there is answering confidently and
+    /// wrongly, which is worse than declining ([[a-probe-must-admit-only-reachable-states]]).
+    ///
+    /// The emitting side is already closed and by a different mechanism: all three diagnostic frames are
+    /// built inside one `cell_liveness(..)?`, whose first line is `self.self_index?`, and the constructor
+    /// leaves `self_index = None` unless `N == 7`. So on a larger plane this node sends no diagnostics — but
+    /// it would still have *accepted* them, folding a stranger's row onto a position of a set that is not a
+    /// cell. Guarding both ends means the pair cannot drift apart silently (#242).
     fn cell_position(&self, coord: Triple) -> Option<usize> {
         match &self.cell_members {
             Some(members) => members.iter().position(|&m| m == coord),
-            None => (0..7usize).find(|&i| Point::<F>::at(i).coords() == coord),
+            None if Plane::<F>::N == 7 => (0..7usize).find(|&i| Point::<F>::at(i).coords() == coord),
+            None => None,
         }
     }
 
@@ -1689,6 +1704,39 @@ mod tests {
     use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
     use fanos_field::{F2, F7};
+
+    /// **The Fano-only invariant is written in four places now, and this pins the fourth.**
+    ///
+    /// The reflex is index-addressed over a cell of seven points where no three are collinear. Without an
+    /// explicit roster the fallback is `Point::at(0..6)` — which is that cell only on the base plane.
+    /// Measured on `PG(2,7)`: those seven are `[1,0,0]…[1,0,6]`, **all on the one line `[0,1,0]`**, so the
+    /// set spans one line where a Fano cell spans seven. `cell_position` used to answer `Some(i)` for them.
+    ///
+    /// Two worlds differing only in the plane order, because a test that checked F7 alone could pass with
+    /// `cell_position` hardwired to `None` and would then be pinning nothing.
+    #[test]
+    fn a_larger_plane_has_no_implicit_cell_so_no_coordinate_holds_a_position_in_one() {
+        // F2 — the base plane IS the cell: every one of the seven points has a position.
+        let node = OverlayNode::<F2>::new(Point::<F2>::at(0), Config::default());
+        for i in 0..7 {
+            assert_eq!(
+                node.cell_position(Point::<F2>::at(i).coords()),
+                Some(i),
+                "on the base Fano cell, point {i} is cell position {i}"
+            );
+        }
+
+        // F7 — `at(0..6)` are collinear, so they are not a cell and no coordinate has a position in one.
+        let big = OverlayNode::<F7>::new(Point::<F7>::at(0), Config::default());
+        for i in 0..7 {
+            assert_eq!(
+                big.cell_position(Point::<F7>::at(i).coords()),
+                None,
+                "on PG(2,7) the fallback seven are collinear — answering a position would be confident and \
+                 wrong (#242)"
+            );
+        }
+    }
 
     #[test]
     fn a_refusal_that_names_an_affordable_price_is_repaid_on_the_spot() {
