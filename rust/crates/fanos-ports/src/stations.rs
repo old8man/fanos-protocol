@@ -365,6 +365,26 @@ pub enum Station {
     /// The writer learns only from a `put` timing out, which is indistinguishable from an unreachable peer —
     /// the two failures an operator most needs to separate — and the node itself reported nothing at all.
     StoreAtCapacity,
+    /// A snapshot write to the state directory **failed**, so this node is running without durable state.
+    ///
+    /// The counterpart of [`StoreAtCapacity`](Self::StoreAtCapacity) one layer down: that one is a node
+    /// refusing content it cannot hold, this one is a node holding content it cannot keep. Neither is fatal
+    /// and both are invisible from outside — a node with a full disk serves every read and answers every
+    /// probe exactly as a healthy one does, right up to the restart where #77's whole subject (the store, the
+    /// ledger, the loss record) turns out to be the state of some earlier hour.
+    ///
+    /// **Why a counter beside the `Health` level rather than instead of it.** `fanos_node::Durability` is a
+    /// *level* — an operator asking "is this node durable right now" gets a straight answer, which is what
+    /// they need during an incident. A level cannot answer "has this disk been flapping all week", because a
+    /// run of failures that ended leaves no trace in it by design. Both questions are real and one field
+    /// cannot hold both, which is the same split [`ReadInconclusive`](Self::ReadInconclusive) draws between
+    /// the caller's three-state answer and the operator's diagnosis (#200).
+    ///
+    /// [`Observation::tag`] carries `fanos_node::PersistFailure` — whether another tick will retry, or the
+    /// process was already on its way out. The second is not a worse instance of the first: on the stopping
+    /// path there is no retry, so everything since the last successful write is *gone*, and #178 exists
+    /// because that path is the one where nothing needed to be lost.
+    SnapshotWriteFailed,
     /// A `Value` shard reply refused on the **read** path, tagged by which rule refused it
     /// (`fanos_runtime::ReadRefusal` — named there because that is where the rules are, and this crate sits
     /// below it).
@@ -607,6 +627,7 @@ impl Station {
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
         Self::StoreAtCapacity,
+        Self::SnapshotWriteFailed,
         Self::ReadShardRefused,
         Self::ReadInconclusive,
         Self::ExitRefused,
@@ -654,6 +675,7 @@ impl Station {
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
             Self::StoreAtCapacity => "store.at_capacity",
+            Self::SnapshotWriteFailed => "store.snapshot_write_failed",
             Self::ReadShardRefused => "read.shard_refused",
             Self::ReadInconclusive => "read.inconclusive",
             Self::AdmissionIdentityUnbound => "admission.identity_unbound",

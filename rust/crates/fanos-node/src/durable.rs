@@ -183,6 +183,85 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Whether this node is keeping durable state — **three answers, because two would lie** (#200).
+///
+/// A full disk degrades a node to the pre-#77 behaviour rather than stopping it: the persister reports the
+/// failure and retries on the next tick, which is right — the cell still wants this node serving. But the
+/// report was an `eprintln!` per tick and nothing else, so "I am running without durable state" existed only
+/// as a line in a stream. An operator who attached later, read `fanos status health`, or scraped metrics saw
+/// a node indistinguishable from a healthy one.
+///
+/// `NotConfigured` and `Failing` must not collapse: a node with no state directory is a legitimate
+/// deployment (a test, a proxy-only client) and needs no action, while a node whose writes are failing needs
+/// one now. Today they are equally silent, and the first does not even print — so the absence of a line is
+/// currently *both* answers at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Durability {
+    /// No state directory was configured: this node deliberately keeps nothing across a restart.
+    #[default]
+    NotConfigured,
+    /// A state directory is configured and the last write succeeded.
+    Persisting,
+    /// A state directory is configured and writes are failing, with how many in a row have failed.
+    ///
+    /// The count rather than a bare flag because one failed tick on a momentarily full disk is not the same
+    /// event as a hundred: the first may clear itself, the second is a node that has been running on volatile
+    /// state for `count × snapshot_interval` and will lose everything since the last success.
+    Failing {
+        /// Consecutive failed writes; `1` on the first.
+        consecutive: u32,
+    },
+}
+
+/// Which snapshot write failed — the sub-kind
+/// [`Station::SnapshotWriteFailed`](fanos_runtime::ports::stations::Station::SnapshotWriteFailed) is counted
+/// under.
+///
+/// **The two are not degrees of the same event.** A periodic write that fails is retried in
+/// [`snapshot_interval`] and the only loss is the window; the node keeps serving and an operator has time.
+/// The write on the *stopping* path has no next tick behind it, so its failure loses everything since the
+/// last success — and #178 moved that write here precisely because a clean stop is the one case where
+/// nothing needs to be lost. Folded into one count, a node that has never once persisted on shutdown looks
+/// like a node with an occasionally slow disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PersistFailure {
+    /// A periodic write failed. Another tick will retry.
+    Periodic,
+    /// The **final** write failed, on the way out. There is no retry, and the window since the last success
+    /// is gone.
+    Final,
+}
+
+/// `PersistFailure::ALL` is complete, proven by the compiler — same reasoning as `crate::Gate`.
+const _: () = assert!(
+    PersistFailure::ALL.len() == core::mem::variant_count::<PersistFailure>(),
+    "a PersistFailure variant is missing from ALL, so it is invisible to every reader that enumerates"
+);
+
+impl PersistFailure {
+    /// Every failure kind, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[Self::Periodic, Self::Final];
+
+    /// The discriminant carried in `Observation::tag`, written out for the same reason
+    /// [`crate::Gate::tag`] is: variant order must not renumber an operator's counters.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::Periodic => 0,
+            Self::Final => 1,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Periodic => "periodic",
+            Self::Final => "final",
+        }
+    }
+}
+
 /// A running store persister, and the two signals that let a clean stop wait for its last write (#178).
 ///
 /// Both are `watch` channels rather than a `oneshot` pair because [`crate::Node::shutdown`] takes `&self` and
@@ -196,9 +275,23 @@ pub struct StorePersister {
     stop: watch::Sender<bool>,
     /// Flipped by the persister once that final write has returned. A clean stop waits on this.
     done: watch::Receiver<bool>,
+    /// The persister's current verdict about durability, for `Health` to read (#200).
+    ///
+    /// A `watch` rather than a counter because the interesting value is a *level* — what is true now — and a
+    /// reader that arrives late must still get it. A counter would answer "how many failures ever", which is
+    /// not the question an operator asks at the console.
+    state: watch::Receiver<Durability>,
 }
 
 impl StorePersister {
+    /// This node's durability right now — `Persisting` until a write fails, then `Failing` with the run
+    /// length. Never `NotConfigured`: a persister only exists when a state directory was configured, and the
+    /// node reports that case from the absence of one.
+    #[must_use]
+    pub fn state(&self) -> Durability {
+        *self.state.borrow()
+    }
+
     /// Ask for a final snapshot and wait until it has been written.
     ///
     /// Returns as soon as the persister is finished — or immediately if it has already exited, since the
@@ -234,6 +327,10 @@ impl StorePersister {
 pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration) -> StorePersister {
     let (stop, mut stop_rx) = watch::channel(false);
     let (done_tx, done) = watch::channel(false);
+    // Starts at `Persisting`: a persister exists only because a state directory was configured, and nothing
+    // has failed yet. The first failed write moves it, and a success moves it back — the level is about now,
+    // not about the run's history.
+    let (state_tx, state) = watch::channel(Durability::Persisting);
     let task = tokio::spawn(async move {
         let mut last: Option<Vec<u8>> = None;
         // Every exit from the loop goes through this, so "the persister is finished" cannot be signalled by
@@ -269,11 +366,39 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
                 continue;
             }
             match write_snapshot(&state_dir, &bytes) {
-                Ok(()) => last = Some(bytes),
+                Ok(()) => {
+                    last = Some(bytes);
+                    // Back to healthy, and said as a level rather than counted: an operator wants to know
+                    // whether the disk is working now, and a run of failures that has ended is not a fact
+                    // about the present.
+                    let _ = state_tx.send(Durability::Persisting);
+                }
                 // Reported and retried on the next tick rather than fatal: a full disk should degrade a node
                 // to the pre-#77 behaviour, not stop it serving the cell. On the *stopping* path there is no
                 // next tick, so the report is all there is — and it is why this is `eprintln!` and not silence.
-                Err(e) => eprintln!("fanos: could not persist the store to {}: {e}", state_dir.display()),
+                Err(e) => {
+                    let consecutive = match *state_tx.borrow() {
+                        Durability::Failing { consecutive } => consecutive.saturating_add(1),
+                        _ => 1,
+                    };
+                    let _ = state_tx.send(Durability::Failing { consecutive });
+                    // The counter answers the question the level cannot: whether this has been happening.
+                    // Only the failure is recorded — a successful write happens every `every` for the life of
+                    // the node, so counting it would put the plane's largest number on its least informative
+                    // event, the mistake `ShareLateAfterPeel`'s doc records paying for.
+                    let kind =
+                        if stopping { PersistFailure::Final } else { PersistFailure::Periodic };
+                    client.record_station(
+                        fanos_runtime::ports::stations::Station::SnapshotWriteFailed,
+                        Some(client.address()),
+                        Some(kind.tag()),
+                    );
+                    eprintln!(
+                        "fanos: could not persist the store to {} ({} write, {consecutive} in a row): {e}",
+                        state_dir.display(),
+                        kind.name()
+                    );
+                }
             }
             if stopping {
                 finish(&done_tx);
@@ -281,7 +406,7 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
             }
         }
     });
-    StorePersister { _task: task, stop, done }
+    StorePersister { _task: task, stop, done, state }
 }
 
 #[cfg(test)]

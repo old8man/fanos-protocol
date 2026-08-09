@@ -230,6 +230,29 @@ pub fn render_health(health: &Health) -> String {
              the readings below describe transport only"
         );
     }
+    // Second, and unconditionally, for the reason `reflexive` is first: it qualifies what every reading
+    // below is worth keeping. A node that is not persisting still serves the cell correctly — that is the
+    // deliberate degradation #77 chose — but everything it has learned dies with the process, and the three
+    // answers call for three different actions from the operator (#200).
+    match health.durable {
+        crate::durable::Durability::Persisting => {
+            let _ = writeln!(s, "durable: yes");
+        }
+        crate::durable::Durability::NotConfigured => {
+            let _ = writeln!(
+                s,
+                "durable: NOT CONFIGURED — no state directory, so this node keeps nothing across a restart \
+                 (legitimate for a test or a proxy-only client; nothing to do)"
+            );
+        }
+        crate::durable::Durability::Failing { consecutive } => {
+            let _ = writeln!(
+                s,
+                "durable: FAILING — {consecutive} consecutive snapshot write(s) have failed; this node is \
+                 running on volatile state and will lose everything since its last successful write"
+            );
+        }
+    }
     let _ = writeln!(s, "coordinate: {x}:{y}:{z}");
     let _ = writeln!(s, "listen: {}", health.local_addr);
     let _ = writeln!(s, "known_peers: {}", health.known_peers);
@@ -315,9 +338,10 @@ fn digest_of<'a>(entries: impl Iterator<Item = (&'a str, u64, Option<u64>)>) -> 
 /// Resolve an [`Observation::tag`] to the name its station's vocabulary gives it, or `None` where the
 /// station's tag is not drawn from one.
 ///
-/// **Deliberately partial, and that is the whole design.** Four stations tag with a small enumeration whose
+/// **Deliberately partial, and that is the whole design.** Seven stations tag with a small enumeration whose
 /// discriminants are written out precisely so an operator's saved counters survive a variant being added
-/// (`Directory::tag`, `Gate::tag`, `ExitRefusal::tag`, `Role::index`) — those resolve. The rest tag with a
+/// (`Directory::tag`, `Gate::tag`, `ExitRefusal::tag`, `Role::index`, `ProtocolError::index`,
+/// `ReadRefusal::tag`, `PersistFailure::tag`) — those resolve. The rest tag with a
 /// *quantity*: `AssignmentWithheld` carries a roster size, `FrameTypeUnknown` a wire code an enumeration by
 /// definition does not contain, and the skew station a derivation tag. Inventing names for those would put a
 /// fabricated vocabulary in front of the operator, so they print as the numbers they are.
@@ -350,6 +374,9 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         }
         Station::ReadShardRefused => {
             fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
+        }
+        Station::SnapshotWriteFailed => {
+            crate::durable::PersistFailure::ALL.iter().find(|f| f.tag() == tag).map(|f| f.name())
         }
         _ => None,
     }
@@ -657,6 +684,7 @@ mod tests {
             verified_claims: Some(46),
             probe_index: Some(47),
             roles: crate::config::RoleSet::default(),
+            durable: crate::durable::Durability::Failing { consecutive: 48 },
         };
         let out = render_health(&health);
         // Values, not key names: a renderer that prints `collisions: 0` for a `Health` carrying 44 is exactly
@@ -670,6 +698,7 @@ mod tests {
             ("unresolved_drops", "45"),
             ("verified_claims", "46"),
             ("probe_index", "47"),
+            ("durable", "48"),
         ] {
             assert!(out.contains(needle), "`{what}` is in Health and not in the rendering:\n{out}");
         }
@@ -680,6 +709,19 @@ mod tests {
         let reflexive = render_health(&Health { reflexive: true, ..health });
         assert!(reflexive.contains("reflexive: yes"), "a present reflex says so too:\n{reflexive}");
         assert!(!reflexive.contains("reflexive: NO"));
+
+        // `durable` is three-valued and each value is a different operator action, so one negation is not
+        // enough: the two states that are NOT failing must also be distinguishable from each other. A
+        // renderer collapsing "no store configured" into "persisting" is the failure this pins (#200).
+        for (state, wanted, forbidden) in [
+            (crate::durable::Durability::Persisting, "durable: yes", "NOT CONFIGURED"),
+            (crate::durable::Durability::NotConfigured, "NOT CONFIGURED", "durable: yes"),
+        ] {
+            let out = render_health(&Health { durable: state, ..health });
+            assert!(out.contains(wanted), "{state:?} must render `{wanted}`:\n{out}");
+            assert!(!out.contains(forbidden), "{state:?} must not render `{forbidden}`:\n{out}");
+            assert!(!out.contains("FAILING"), "{state:?} is not a failure:\n{out}");
+        }
     }
 
     #[test]
@@ -968,6 +1010,15 @@ mod tests {
             // the fifteen codes into the untagged bucket, so a mapping keyed by `code()` would resolve the
             // 1xx/2xx classes and silently lose the rest. Asserted, because that failure is invisible.
             assert!(e.index() <= fanos_runtime::ports::stations::MAX_SKEW_TAG, "{} tag is clampable", e.name());
+        }
+        for f in crate::durable::PersistFailure::ALL {
+            assert_eq!(
+                tag_name(Station::SnapshotWriteFailed, f.tag()),
+                Some(f.name()),
+                "persist failure {} renders as a bare number — and `periodic` versus `final` is the whole \
+                 reason the station is tagged",
+                f.name()
+            );
         }
         // And the other direction, or the mapping above is indistinguishable from one that names everything:
         // a tag outside a vocabulary, and a station whose tag is a quantity, must both stay unnamed.

@@ -932,6 +932,13 @@ pub struct Health {
     /// `plane_order == 2` (or an explicit roster, which no deployment path sets today), and nothing at run
     /// time can change it.
     pub reflexive: bool,
+    /// Whether this node is keeping durable state, and if not, which of the two reasons (#200).
+    ///
+    /// `NotConfigured` is a legitimate deployment and needs nothing; `Failing` is a node running on volatile
+    /// state that will lose everything since its last successful write. They were equally invisible here
+    /// before — the persister said so once per tick on stderr and nowhere else, so an operator who attached
+    /// after the first failure, or who reads this at all, saw a node that looked healthy.
+    pub durable: crate::durable::Durability,
     /// Frames this node did **not** make because a peer's send queue was full (#89).
     ///
     /// Zero on a healthy node, and one meaning when it is not: some peer stopped draining its connection, so
@@ -1333,6 +1340,12 @@ impl Node {
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
             reflexive: self.reflexive,
+            // The absence of a persister IS the `NotConfigured` answer — there is no other way to be without
+            // one — so the two sources cannot disagree about which of the three states this node is in.
+            durable: self
+                .store_persister
+                .as_ref()
+                .map_or(crate::durable::Durability::NotConfigured, crate::durable::StorePersister::state),
             send_drops: self.handle.send_drops(),
             collisions: self.directory.collisions(),
             unresolved_drops: self.directory.unresolved_drops(),
