@@ -122,29 +122,16 @@ fn sources_of(crate_name: &str) -> Vec<(PathBuf, String)> {
 
 /// Lines that are neither comments nor inside a `#[cfg(test)]` module — a test may build whatever it needs to
 /// exercise one layer in isolation, which is a legitimate thing to do and not a second production path.
+///
+/// This was the one hand-rolled slice in the tree that already balanced braces and so did NOT lose the code
+/// below a test module (#252). It goes through the shared one anyway: being right by accident and being right
+/// on purpose look identical until the next edit.
 fn shipping_lines(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut in_tests = false;
-    let mut depth = 0i32;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with("#[cfg(test)]") {
-            in_tests = true;
-            depth = 0;
-        }
-        if in_tests {
-            depth += i32::try_from(t.matches('{').count()).unwrap_or(0);
-            depth -= i32::try_from(t.matches('}').count()).unwrap_or(0);
-            if depth <= 0 && t.contains('}') {
-                in_tests = false;
-            }
-            continue;
-        }
-        if !t.starts_with("//") {
-            out.push(line);
-        }
-    }
-    out
+    fanos_testkit::source::shipping_lines(text)
+        .into_iter()
+        .map(|(_, l)| l)
+        .filter(|l| !l.trim().starts_with("//"))
+        .collect()
 }
 
 #[test]

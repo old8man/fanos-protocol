@@ -140,6 +140,10 @@ fn closure(deps: &BTreeMap<String, BTreeSet<String>>, roots: &BTreeSet<String>) 
 /// Failing this test means one of two things, and the message says which to check: a new crate was added
 /// and nothing wires it up (write the wiring, or add it to the list with its reason), or an orphan was
 /// finally wired (delete its row — the list is the record of what remains unwired).
+/// The shipping-code slice, shared (#252). Seven copies of it existed; each cut at the FIRST
+/// `#[cfg(test)]` and so examined only the head of any file with a test module in the middle.
+use fanos_testkit::source::{code_only, production_part};
+
 #[test]
 fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
     let (deps, binaries) = workspace();
@@ -373,41 +377,90 @@ const UNWIRED_SKIP: &[&str] = &[
     "verify", "sign", "hash",
 ];
 
-/// The part of a source file that ships: everything before a module-level `#[cfg(test)]`.
+/// **No second slice.** Nothing outside `fanos-testkit` may split a source file on the test attribute itself.
 ///
-/// A call that exists only in a crate's own test module is not wiring — that is exactly how a built-and-unused
-/// capability looks reachable.
-fn production_part(src: &str) -> &str {
-    match src.find("\n#[cfg(test)]") {
-        Some(i) => &src[..i],
-        None => src,
+/// Seven places did, across five files, and every one shared the defect: cut at the FIRST marker, keep the
+/// head, lose whatever ships below it. Two of the seven were in this very file. A guard reading less than it
+/// claims cannot be caught by its own green result, so the rule has to be about the SHAPE, checked from
+/// outside.
+///
+/// **The scanner cannot exempt itself, because it never spells the needle.** An allow-list would have to
+/// name this file, and a scanner that skips a file is one edit away from skipping the file that matters
+/// (#227's rule, applied to itself). Assembling the pattern at runtime means this source contains no literal
+/// occurrence to find — the exemption is structural, not a decision anyone can widen.
+#[test]
+fn no_source_scan_rolls_its_own_test_block_slice() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let needle = format!("\"#[cfg{}\"", "(test)]");
+    let home = root.join("crates/fanos-testkit/src/lib.rs");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path == home {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&path) else { continue };
+            for (n, line) in src.lines().enumerate() {
+                if line.contains(&needle) && !line.trim_start().starts_with("//") {
+                    offenders.push(format!("{}:{}", path.strip_prefix(&root).unwrap_or(&path).display(), n + 1));
+                }
+            }
+        }
     }
+
+    assert!(
+        offenders.is_empty(),
+        "these scan for the test attribute themselves instead of calling \
+         `fanos_testkit::source::{{production_part, shipping_lines}}`: {offenders:?}. Every hand-rolled copy \
+         so far cut at the FIRST marker and silently dropped the shipping code below it (#252) — including \
+         the two that lived in this file."
+    );
 }
 
-/// [`production_part`] with whole-line comments removed — the text a **call scan** may read.
+/// **The corpus half of #252**: these three files really do declare shipping code below a test module, and
+/// every guard here had been examining them only down to that line.
 ///
-/// **Comments are not code, and the unwired-capability scan used to count them** (#227). `calls` accepts a
-/// name followed by an opening paren, which is ordinary English punctuation: a doc line reading "the cascade
-/// `lead` (`-1` = none)" registered as a call to `lead()`. Measured across the workspace, **83 public
-/// functions were "wired" by nothing but a word in prose** — among them `loadbalance::balance_exact`, whose
-/// only real caller is a test and whose apparent one was the healer comment *describing* the §6.7 response
-/// that does not exist (#139), and `dispersion`, the second-dimension discriminator no production reader
-/// consumes (#225/#226). The blindness was biased toward the load-bearing: the more consequential a
-/// function, the likelier a neighbouring comment names it.
-///
-/// **Separate from [`production_part`] rather than replacing it, and that is the point.** The literal-seed
-/// guard reads the same files looking for a `literal-seed-ok:` marker — which *is* a comment — so the two
-/// scans want opposite things from the same text. One helper serving both would have silently disarmed
-/// #203's marker lookback the moment this one started stripping.
-///
-/// Whole lines only (`//`, `///`, `//!`), where prose lives. A trailing comment after code is left alone
-/// deliberately: cutting at `//` would corrupt any string literal containing it.
-fn code_only(src: &str) -> String {
-    production_part(src)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n")
+/// A synthetic self-test cannot hold this — the old slice passed every synthetic case that did not put code
+/// after a test block, which is exactly why it survived. Named files, so that restoring the cut-at-first
+/// form fails with the name of what it would blind.
+#[test]
+fn the_slice_reaches_the_shipping_code_that_sits_below_a_test_module() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    // (file, a declaration that sits BELOW that file's first `#[cfg(test)]`)
+    let cases = [
+        ("crates/fanos-field/src/lib.rs", "pub trait Field"),
+        ("crates/fanos-node/src/resolve.rs", "pub struct NodeResolver"),
+        ("crates/fanos-node/src/telemetry_dir.rs", "pub struct Census"),
+    ];
+    for (path, decl) in cases {
+        let src = std::fs::read_to_string(root.join(path)).expect("file is readable");
+        let cut = src.find("\n#[cfg(test)]").expect("the file has a test block");
+        let below = src[cut..].contains(decl);
+        assert!(below, "{path} no longer declares `{decl}` below a test block — update this case, do not delete it");
+        assert!(
+            production_part(&src).contains(decl),
+            "`{decl}` ships in {path} and the production slice does not see it. Every guard in this file \
+             reads through that slice, so all of them would be quietly examining a subset (#252)."
+        );
+    }
+
+    // And the other direction on the same corpus: a `#[cfg(test)]` fixture stays out. `PassThroughFabric` is
+    // the one that matters — it implements `quinn::AsyncUdpSocket`, so admitting it would make the transport
+    // guards read a test double as the shipping datapath.
+    let driver = std::fs::read_to_string(root.join("crates/fanos-quic/src/driver.rs")).unwrap();
+    assert!(
+        !production_part(&driver).contains("struct PassThroughFabric"),
+        "a #[cfg(test)] fixture must not be readmitted as production by the wider slice"
+    );
 }
 
 /// `pub fn` / `pub const fn` / `pub async fn` / `pub unsafe fn` names declared in `src`.
@@ -665,8 +718,9 @@ fn every_numeric_constant_carries_a_comment() {
     let mut total = 0usize;
     for file in rust_sources(&root.join("crates")) {
         let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let text = production_part(&text); // one slice for every guard (#252)
         let lines: Vec<&str> = text.lines().collect();
-        let stop = lines.iter().position(|l| l.contains("#[cfg(test)]")).unwrap_or(lines.len());
+        let stop = lines.len();
         let mut run = false;
         for (i, line) in lines.iter().take(stop).enumerate() {
             let Some(name) = const_name(line) else {
@@ -704,6 +758,121 @@ fn every_numeric_constant_carries_a_comment() {
         "these numeric constants carry no comment at all, so nothing says where the value comes from — \
          which is the state in which the question cannot even be asked (#45):\n  {}",
         undocumented.join("\n  ")
+    );
+}
+
+/// **The transport's stream credit is derived from the number of openers — so a new opener must move it.**
+///
+/// `MAX_PEER_UNI_STREAMS` is not a comfortable number: `tuned_transport` credits a peer exactly as many
+/// concurrent uni-streams as this crate has `open_uni()` sites, because every one of them writes a single
+/// frame and finishes (#245). That derivation is only true while the count is true, and nothing else in the
+/// build checks it: a fifth opener would compile, run, and silently contend for four credits — frames
+/// delayed or dropped on a path whose failure mode is "the peer went quiet".
+///
+/// Counted by NAME, not by `open_uni(`, because a call may be written `conn.open_uni()` on its own line or
+/// wrapped; and comments are stripped first, because a mention in prose is not a call (#227).
+#[test]
+fn the_uni_stream_credit_matches_the_number_of_openers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let driver = root.join("crates/fanos-quic/src/driver.rs");
+    let src = std::fs::read_to_string(&driver).expect("driver.rs is readable");
+    let code = code_only(&src); // `code_only` already drops the test blocks
+
+    let openers = code.matches("open_uni").count();
+    let credit: usize = code
+        .split("const MAX_PEER_UNI_STREAMS: u32 = ")
+        .nth(1)
+        .and_then(|t| t.split(';').next())
+        .and_then(|t| t.trim().parse().ok())
+        .expect("MAX_PEER_UNI_STREAMS is declared as a literal");
+
+    assert_eq!(
+        openers, credit,
+        "`tuned_transport` credits a peer {credit} concurrent uni-streams because this crate opens streams \
+         at {credit} sites — but production now has {openers}. Either raise the constant WITH the reason, or \
+         route the new send through an existing opener. Leaving them apart makes the credit a chosen number \
+         and the excess frames a silent loss (#245)."
+    );
+}
+
+/// **No subsystem may declare its memory share as a literal** — it must take it from the one module that
+/// sums them.
+///
+/// This started as a guard comparing copies, because `fanos-primitives` is below every consumer and cannot
+/// import from them. Then the direction turned out to be available the other way: all four consumers already
+/// depend on `fanos-primitives`, so the share can *live* there and each subsystem take it. That deletes the
+/// drift instead of detecting it — the compiler now holds what a ratchet was going to watch. What remains
+/// worth guarding is the door back: a new literal reintroduces the split silently, and it is one keystroke.
+#[test]
+fn no_subsystem_declares_its_memory_share_as_a_literal() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let crates = root.join("crates");
+    let budget_path = crates.join("fanos-primitives/src/budget.rs");
+
+    for path in rust_sources(&crates) {
+        if path == budget_path {
+            continue; // the register may not count itself (#227's rule)
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        for line in code_only(&src).lines() {
+            let Some(name) = const_name(line) else { continue };
+            if !name.ends_with("_MEMORY_BUDGET") {
+                continue;
+            }
+            let value = line.split_once('=').map_or("", |(_, v)| v.trim());
+            assert!(
+                value.contains("fanos_primitives::budget::"),
+                "{name} in {} is declared as `{value}` instead of taking its share from \
+                 `fanos_primitives::budget`. Two numbers for one quantity is how #213 happened: three \
+                 subsystems each sized their share against the same 256 MiB and no one could see the sum.",
+                path.strip_prefix(&root).unwrap_or(&path).display()
+            );
+        }
+    }
+}
+
+/// **A fourth subsystem reserving "a share" must appear in the sum**, or #213 is back with one more term.
+///
+/// The first three were invisible to each other because nothing enumerated them. Enumerating by name is the
+/// cheapest thing that fails when a fourth arrives — and the failure lands on the author adding it, which is
+/// the only moment anyone can weigh it against the rest.
+#[test]
+fn every_memory_budget_in_the_tree_is_one_of_the_summed_shares() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let crates = root.join("crates");
+    let budget_path = crates.join("fanos-primitives/src/budget.rs");
+    let budget = std::fs::read_to_string(&budget_path).expect("the budget module is readable");
+
+    let mut found: Vec<String> = Vec::new();
+    for path in rust_sources(&crates) {
+        if path == budget_path {
+            continue; // the register may not count itself (#227's rule)
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else { continue };
+        for line in code_only(&src).lines() {
+            if let Some(name) = const_name(line)
+                && name.ends_with("_MEMORY_BUDGET")
+            {
+                found.push(format!("{name} ({})", path.strip_prefix(&root).unwrap_or(&path).display()));
+                assert!(
+                    budget.contains(name),
+                    "{name} reserves a share of the node's memory and `fanos_primitives::budget` has never \
+                     heard of it. Add it to SHARES with its derivation, and take the new overcommit against \
+                     the sum rather than against a comment in its own crate (#213)."
+                );
+            }
+        }
+    }
+
+    let summed = budget.split("SHARES: [(&str, usize); ").nth(1).and_then(|t| {
+        t.split(']').next().and_then(|n| n.trim().parse::<usize>().ok())
+    });
+    assert_eq!(
+        summed,
+        Some(found.len()),
+        "SHARES declares {summed:?} terms and the tree declares {} memory budgets: {found:?}. The two must \
+         be the same list, or the sum is over a subset nobody chose.",
+        found.len()
     );
 }
 
@@ -922,10 +1091,10 @@ fn no_production_code_creates_a_directory_at_the_umask() {
                 continue;
             }
             let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            // Everything from the first `#[cfg(test)]` on is a test module — exempt, and excluded by
-            // POSITION rather than by "the file mentions cfg(test)", which would exempt nearly every
-            // `src/` module in this workspace and make the check vacuous.
-            let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+            // Test modules are exempt, and excluded by POSITION rather than by "the file mentions
+            // cfg(test)", which would exempt nearly every `src/` module here and make the check vacuous.
+            // The slice is shared: cutting at the FIRST marker dropped shipping code below it (#252).
+            let production = production_part(&src);
             // `create_private_dir` is the sanctioned wrapper and calls `create_dir_all` itself.
             if path.file_name().is_some_and(|n| n == "durable.rs") {
                 continue;
@@ -995,7 +1164,7 @@ fn every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy() 
                     continue;
                 }
                 let Ok(src) = std::fs::read_to_string(&path) else { continue };
-                let production = src.split("#[cfg(test)]").next().unwrap_or(&src);
+                let production = production_part(&src);
                 examined += 1;
                 // Keyed by crate-relative PATH, not basename: `driver.rs` exists in both `fanos-quic` and
                 // `fanos-vpn`, and matching on the name alone applied the quic row's liveness requirement to

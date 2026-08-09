@@ -24,6 +24,9 @@ fanos-primitives = { workspace = true, features = ["std"] }
 fanos-core = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+# The shipping-code slice every source-scanning guard reads through — one implementation, unit-tested
+# in both directions, because seven hand-rolled copies all shared the same blindness (#252).
+fanos-testkit = { path = "../fanos-testkit" }
 # Parse the language-agnostic conformance vectors so the Rust impl is pinned to them directly
 # (the interop contract cannot silently drift from the code).
 serde_json = "1"

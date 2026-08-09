@@ -32,8 +32,9 @@ fn sources() -> Vec<(String, String)> {
             } else if p.extension().is_some_and(|x| x == "rs")
                 && let Ok(text) = std::fs::read_to_string(&p)
             {
-                let production = text.find("#[cfg(test)]").map_or(text.as_str(), |i| &text[..i]);
-                out.push((p.display().to_string(), production.to_owned()));
+                // The shared slice (#252): the old form cut at the first `#[cfg(test)]` and lost any
+                // shipping code below it.
+                out.push((p.display().to_string(), fanos_testkit::source::production_part(&text)));
             }
         }
     }

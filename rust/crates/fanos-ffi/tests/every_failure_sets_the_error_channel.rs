@@ -17,7 +17,7 @@ const FULL: &str = include_str!("../src/lib.rs");
 /// mention the same constants a bare return would. Scanning them reported the tests as defects, which is the
 /// scan measuring itself.
 fn src() -> &'static str {
-    FULL.split("#[cfg(test)]").next().unwrap_or(FULL)
+    Box::leak(fanos_testkit::source::production_part(FULL).into_boxed_str()) // #252
 }
 
 /// The body of every function, with the two helpers' own definitions removed — they are where the bare

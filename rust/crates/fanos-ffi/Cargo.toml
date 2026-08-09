@@ -24,5 +24,10 @@ fanos-pqcrypto.workspace = true
 getrandom = "0.4.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 
+[dev-dependencies]
+# The shipping-code slice every source-scanning guard reads through — one implementation, unit-tested
+# in both directions, because seven hand-rolled copies all shared the same blindness (#252).
+fanos-testkit = { path = "../fanos-testkit" }
+
 [lints]
 workspace = true

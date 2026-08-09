@@ -41,15 +41,16 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The lines of `text` that are neither documentation nor inside the file's test module.
 ///
-/// Crude on purpose. The property — "a running node decided its network by naming a constant" — is not
-/// expressible in the type system, and a scan that a reader can verify by eye is worth more here than a
-/// precise one they must trust. Test modules sit at the bottom of a file in this workspace, so truncating at
-/// the first `#[cfg(test)]` is exact for the layout that actually exists.
+/// The property — "a running node decided its network by naming a constant" — is not expressible in the type
+/// system, so this is a text scan; what it must not be is a scan that quietly reads less than the file.
+///
+/// It used to truncate at the first `#[cfg(test)]`, justified by "test modules sit at the bottom of a file in
+/// this workspace". That was untrue in thirteen files and shipping code in three of them (#252). The shared
+/// slice keeps the real line numbers, which a truncate-then-enumerate cannot.
 fn production_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    text.lines()
-        .take_while(|l| !l.trim_start().starts_with("#[cfg(test)]"))
-        .enumerate()
-        .map(|(i, l)| (i + 1, l.trim()))
+    fanos_testkit::source::shipping_lines(text)
+        .into_iter()
+        .map(|(n, l)| (n, l.trim()))
         .filter(|(_, l)| !l.starts_with("//"))
 }
 
