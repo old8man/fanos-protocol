@@ -425,6 +425,11 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     let _ = writeln!(s);
     let _ = writeln!(s, "# --- timing ---");
     let _ = writeln!(s, "epoch_period = {}", config.epoch_period.as_secs());
+    // **Say what the operator pays, not just what the knob is.** These two carry a value the file otherwise
+    // renders as a bare number, and a number with no stated cost gets tuned for the thing it visibly affects
+    // — latency — by someone who cannot see what it buys. `mix_mean_delay` IS the mixing: lowering it makes
+    // the node faster and narrows the window in which its traffic is indistinguishable from anyone else's.
+    let _ = writeln!(s, "# mix_mean_delay is the anonymity/latency trade itself: lower is faster AND less mixed.");
     let _ = writeln!(s, "mix_mean_delay = {}", config.mix_mean_delay.as_millis());
     let _ = writeln!(s, "cover_interval = {}", config.cover_interval.as_millis());
     if config.start_heartbeat != d.start_heartbeat {
@@ -442,6 +447,12 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     }
     let _ = writeln!(s);
     let _ = writeln!(s, "# --- health telemetry (opt-in, differentially private) ---");
+    // The differential-privacy budget, and the file said only its name. ε is not a quality setting: it is how
+    // much a reading is allowed to reveal about this node, and it does not reset — repeated publications
+    // compose, so a larger ε spends the budget faster as well as deeper. Stated here because the operator
+    // edits this file, and a bare `telemetry_epsilon = 1.0` invites tuning for signal quality.
+    let _ = writeln!(s, "# telemetry_epsilon is a PRIVACY BUDGET (smaller = less revealed), not a precision dial;");
+    let _ = writeln!(s, "# repeated publications compose, so it is spent over time rather than set once.");
     match config.telemetry_epsilon {
         Some(eps) => {
             let _ = writeln!(s, "telemetry_epsilon = {eps}");
