@@ -810,6 +810,27 @@ pub enum Sybil {
     Capped(BTreeSet<Triple>),
 }
 
+/// What [`PorosHost::begin_rotation`] actually did.
+///
+/// Three-valued because the two ways of arming nothing call for opposite responses, and until #243 both were
+/// a bare `return`: `NotOnNewLine` is the ordinary case for most members every epoch and means the node has
+/// nothing to prepare, while `NoContributorSubset` means the community has drifted below the threshold its
+/// line was dealt at and **the line stops serving when the current share's epoch expires**. Folding them
+/// together reports a routine non-event and a slow outage with the same silence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "a rotation that armed nothing looks exactly like one that armed; branch on it, or discard it \
+              with the reason at the call site"]
+pub enum RotationArmed {
+    /// The receive side is prepared: this node is on the new line and a valid contributor subset exists.
+    Armed,
+    /// This node is not on the incoming line, so there is nothing for it to receive. Informational.
+    NotOnNewLine,
+    /// This node IS on the new line, but the outgoing roster admits no valid contributor subset at the line's
+    /// threshold — no rotation can complete, and the node keeps serving its current share until that share's
+    /// epoch expires. Counted as `Station::PorosRotationUnarmed`.
+    NoContributorSubset,
+}
+
 /// One member of a **threshold-hosted POROS ingress line**, as a sans-I/O engine. It holds only *one*
 /// descriptor share (dealt via [`shard_descriptor`] for this epoch's line), so seizing it discloses
 /// nothing; a threshold `t` of members collectively reconstruct the descriptor and serve. The combiner
@@ -1084,22 +1105,32 @@ impl PorosHost {
     /// first: every incoming member must combine the *same* old members or they land on different
     /// polynomials and the rotated line cannot reconstruct. A roster that admits no valid subset arms
     /// nothing, which is the honest state rather than a rotation that can never complete.
-    pub fn begin_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>, old_line: Vec<Triple>) {
-        if let Some(my_new_x) = self.my_x_in(&new_line) {
-            let contributors =
-                reshare_contributors(&self.community, target_epoch, &old_line, self.threshold);
-            if contributors.is_empty() {
-                return;
-            }
-            self.rotation = Some(RotationCtx {
-                target_epoch,
-                new_line,
-                old_line,
-                my_new_x,
-                contributors,
-                gather: BTreeMap::new(),
-            });
+    pub fn begin_rotation(
+        &mut self,
+        target_epoch: Epoch,
+        new_line: Vec<Triple>,
+        old_line: Vec<Triple>,
+    ) -> RotationArmed {
+        let Some(my_new_x) = self.my_x_in(&new_line) else {
+            return RotationArmed::NotOnNewLine;
+        };
+        let contributors =
+            reshare_contributors(&self.community, target_epoch, &old_line, self.threshold);
+        if contributors.is_empty() {
+            // **This node's own stop, and the one the instrument set was missing.** Eleven stations in this
+            // file count a peer's lie; none counted the node falling silent by itself (#243).
+            self.stations.record(Station::PorosRotationUnarmed, None);
+            return RotationArmed::NoContributorSubset;
         }
+        self.rotation = Some(RotationCtx {
+            target_epoch,
+            new_line,
+            old_line,
+            my_new_x,
+            contributors,
+            gather: BTreeMap::new(),
+        });
+        RotationArmed::Armed
     }
 
     /// A reshare sub-share arrived from transport source `from`: authenticate it to its genuine old member
@@ -1473,6 +1504,73 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// **A rotation that arms nothing is now a REPORTED outcome, and the two ways of arming nothing are
+    /// different answers.**
+    ///
+    /// Before #243 both were a bare `return`, so a line that had drifted below its dealt threshold prepared
+    /// nothing and kept serving until its share's epoch expired — with eleven stations in this file counting
+    /// a peer's lie and none counting the node's own stop.
+    ///
+    /// Three worlds over ONE node, differing only in the rosters handed in. A counter that fired in more
+    /// than the first would be measuring "a rotation was attempted", not "the rotation could not arm".
+    #[test]
+    fn a_rotation_that_cannot_arm_says_which_of_the_two_reasons_and_counts_only_the_costly_one() {
+        let desc = descriptor(6);
+        let threshold = 2usize;
+        let (old_epoch, new_epoch) = (Epoch::new(7), Epoch::new(8));
+        let beacon = BeaconSeed::new([0x5c; 32]);
+        let line: Vec<Triple> = (0..3).map(coord).collect();
+        let randomness = vec![0x2Bu8; desc.to_bytes().len() * (threshold - 1) + 8];
+        let dealt = shard_descriptor(&desc, threshold as u8, line.len() as u8, &randomness).unwrap();
+        let (shares, binding) = (dealt.shares, dealt.binding);
+        let host = || {
+            PorosHost::new(
+                line[0],
+                shares[0].clone(),
+                binding.clone(),
+                line.clone(),
+                threshold,
+                b"gates".to_vec(),
+                old_epoch,
+                beacon,
+                8,
+                Sybil::Uncapped,
+            )
+        };
+        let unarmed = |h: &PorosHost| -> u64 {
+            h.stations()
+                .observations()
+                .into_iter()
+                .filter(|o| o.station == Station::PorosRotationUnarmed)
+                .map(|o| o.count)
+                .sum()
+        };
+
+        // World 1 — on the new line, but the OUTGOING roster admits no contributor subset.
+        let mut h = host();
+        assert_eq!(
+            h.begin_rotation(new_epoch, line.clone(), Vec::new()),
+            RotationArmed::NoContributorSubset,
+            "an outgoing roster that admits no subset arms nothing, and must say so"
+        );
+        assert_eq!(unarmed(&h), 1, "the node's own stop is counted");
+
+        // World 2, the discriminator — same node, same epoch, a HEALTHY outgoing roster. Arming succeeds and
+        // the counter must NOT move, or it measures the rotation rather than the refusal.
+        let mut ok = host();
+        assert_eq!(ok.begin_rotation(new_epoch, line.clone(), line.clone()), RotationArmed::Armed);
+        assert_eq!(unarmed(&ok), 0, "a healthy rotation is silent on this station");
+
+        // World 3 — not on the incoming line at all. Ordinary for most members every epoch, so informational
+        // and deliberately UNcounted: folding it in would bury the costly case under routine traffic.
+        let mut off = host();
+        assert_eq!(
+            off.begin_rotation(new_epoch, vec![line[1], line[2]], line.clone()),
+            RotationArmed::NotOnNewLine
+        );
+        assert_eq!(unarmed(&off), 0, "not being on the incoming line is not a stop");
     }
 
     #[test]
@@ -2195,7 +2293,11 @@ mod tests {
                 Sybil::Uncapped,
             )
                     .with_kem_secret(secret);
-                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+                assert_eq!(
+                    h.begin_rotation(new_epoch, new_line.clone(), old_line.clone()),
+                    RotationArmed::Armed,
+                    "the receive side must arm, or this test measures a rotation that never started (#243)"
+                );
                 h
             })
             .collect();
@@ -2233,7 +2335,11 @@ mod tests {
                 Sybil::Uncapped,
             )
             .with_kem_secret(fresh_secret);
-        fresh.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+        assert_eq!(
+            fresh.begin_rotation(new_epoch, new_line.clone(), old_line.clone()),
+            RotationArmed::Armed,
+            "the receive side must arm, or this test measures a rotation that never started (#243)"
+        );
         let stale = old_host(0).emit_reshare(Epoch::new(99), &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xC0]);
         if let Some(Effect::Send { frame, .. }) = stale.into_iter().next() {
             fresh.step(Instant(0), Input::Message { from: old_line[0], frame });
@@ -2269,7 +2375,11 @@ mod tests {
                 Sybil::Uncapped,
             )
             .with_kem_secret(secret);
-        victim.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+        assert_eq!(
+            victim.begin_rotation(new_epoch, new_line.clone(), old_line.clone()),
+            RotationArmed::Armed,
+            "the receive side must arm, or this test measures a rotation that never started (#243)"
+        );
 
         // Old member 0's genuine contribution to new member 0, but delivered from an IMPOSTOR coordinate.
         let frames = old_host(0).emit_reshare(new_epoch, &new_line, &new_keys, &vec![0x1u8; secret_len + 8], &[0xB0]);
@@ -2334,7 +2444,11 @@ mod tests {
                 Sybil::Uncapped,
             )
                     .with_kem_secret(secret);
-                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+                assert_eq!(
+                    h.begin_rotation(new_epoch, new_line.clone(), old_line.clone()),
+                    RotationArmed::Armed,
+                    "the receive side must arm, or this test measures a rotation that never started (#243)"
+                );
                 h
             })
             .collect();
@@ -2384,7 +2498,11 @@ mod tests {
                 Sybil::Uncapped,
             )
                     .with_kem_secret(secret);
-                h.begin_rotation(new_epoch, new_line.clone(), old_line.clone());
+                assert_eq!(
+                    h.begin_rotation(new_epoch, new_line.clone(), old_line.clone()),
+                    RotationArmed::Armed,
+                    "the receive side must arm, or this test measures a rotation that never started (#243)"
+                );
                 h
             })
             .collect();

@@ -296,6 +296,21 @@ pub enum Station {
     /// Keyed by the coordinate we *dialed* — our own resolution, not a value a stranger chose.
     DirectoryStaleCoordinate,
 
+    /// A POROS line rotation **did not arm**: the outgoing roster admits no valid contributor subset at the
+    /// line's threshold, so this node prepared nothing and will keep serving on the share it already holds
+    /// until that share's epoch expires (#243).
+    ///
+    /// Not an error and not an attack — a roster that cannot supply `t` contributors arms nothing, which is
+    /// the honest state rather than a rotation that can never complete. What makes it worth a counter is that
+    /// it is **this node's own stop**, and `poros.rs` counts eleven ways a *peer* can lie while counting no
+    /// way for the node to fall silent by itself. A rise here means the community has drifted below the
+    /// threshold its line was dealt at, which no other reading states and which an operator must answer by
+    /// re-dealing rather than by waiting.
+    ///
+    /// Deliberately distinct from "this node is not on the new line", which is the ordinary case for most
+    /// members every epoch and carries no information.
+    PorosRotationUnarmed,
+
     /// This node tried to bind **its own coordinate** in its local address book and the arbitration rule
     /// refused: an incumbent holds the better claim, so the node is not resolvable at the point it believes
     /// it occupies (#241).
@@ -588,6 +603,7 @@ impl Station {
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::DirectoryStaleCoordinate,
+        Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
         Self::StoreAtCapacity,
@@ -634,6 +650,7 @@ impl Station {
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
+            Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
             Self::StoreAtCapacity => "store.at_capacity",

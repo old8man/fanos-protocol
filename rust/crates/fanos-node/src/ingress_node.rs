@@ -43,7 +43,7 @@ use fanos_rendezvous::{BeaconSeed, Epoch};
 use fanos_runtime::{Command, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_wire::{FrameType, decode_frame};
 
-use crate::poros::PorosHost;
+use crate::poros::{PorosHost, RotationArmed};
 
 /// The four-bit tag (bits 63,62,61,60) that marks a timer token as the ingress host's: bits 63 and 61 clear,
 /// bits 62 and 60 set. Chosen disjoint from every token an inner cell engine or a [`ServiceNode`] emits (see
@@ -102,8 +102,13 @@ impl IngressNode {
     /// ([`emit_reshares`](Self::emit_reshares)) and this new-receive role are independent — a node on both lines
     /// (they meet in one point) calls both. `old_line` is the current-epoch roster the driver computed from the
     /// beacon; a sub-share claiming old index `x` must have arrived from `old_line[x-1]`.
-    pub fn arm_rotation(&mut self, target_epoch: Epoch, new_line: Vec<Triple>, old_line: Vec<Triple>) {
-        self.host.begin_rotation(target_epoch, new_line, old_line);
+    pub fn arm_rotation(
+        &mut self,
+        target_epoch: Epoch,
+        new_line: Vec<Triple>,
+        old_line: Vec<Triple>,
+    ) -> RotationArmed {
+        self.host.begin_rotation(target_epoch, new_line, old_line)
     }
 
     /// **Arm the receive side of a rotation from the cell's own epoch clock.**
@@ -126,7 +131,21 @@ impl IngressNode {
             return; // not a rotation: the clock has not moved past the epoch this host serves
         }
         let (old_line, new_line) = self.host.rotation_rosters(epoch, &BeaconSeed::new(seed));
-        self.host.begin_rotation(epoch, new_line, old_line);
+        // The outcome is decided here rather than returned, because this path is driven by the beacon and has
+        // no caller to hand it to. `NotOnNewLine` is the ordinary case for most members every epoch and says
+        // nothing; `NoContributorSubset` means the community has drifted below the threshold its line was
+        // dealt at, so the line will stop serving when the current share expires — the station records it and
+        // the log names it, because an operator's answer is to re-deal rather than to wait (#243).
+        match self.host.begin_rotation(epoch, new_line, old_line) {
+            RotationArmed::Armed | RotationArmed::NotOnNewLine => {}
+            RotationArmed::NoContributorSubset => {
+                tracing::warn!(
+                    ?epoch,
+                    "poros: the outgoing line admits no valid contributor subset — this rotation arms nothing \
+                     and the line stops serving when its current share expires; re-deal the line"
+                );
+            }
+        }
     }
 
     /// Whether `frame` is one of the POROS host wire types the [`PorosHost`] owns (the combiner/member frames,
@@ -403,7 +422,7 @@ mod tests {
         // the new line for target_epoch), passing the OLD roster so each sub-share is authenticated to its old
         // member.
         for n in &mut new_nodes {
-            n.arm_rotation(new_epoch, new_coords.clone(), old_coords.clone());
+            let _ = n.arm_rotation(new_epoch, new_coords.clone(), old_coords.clone());
         }
         // **Every** outgoing member emits, because that is what production does — `spawn_ingress_rotation`
         // says "Only an OUTGOING member emits" and all `n` of them are outgoing. Collect first and deliver
