@@ -565,6 +565,35 @@ pub enum Station {
     PeerRefusalUnreadable,
 }
 
+/// What a station's [`Observation::tag`] *means* — declared where the station is, so a reader outside this
+/// crate can tell a decodable discriminant from a raw number without guessing.
+///
+/// **This exists because no scan can answer the question.** The join that turns a tag into a name
+/// (`fanos_node::admin::tag_name`) lives in a downstream crate, where [`Station`] is `#[non_exhaustive]` and
+/// a `match` therefore needs a wildcard arm — so the compiler cannot notice a tagged station with no arm,
+/// and the operator gets a bare integer. Five separate scans were tried for the missing list and each was
+/// wrong in a different way: doc phrasing varies ("tag carries" / "tagged by why"), one site builds its tag
+/// with `.map()` rather than `Some(...)`, two stations have *both* tagged and untagged call sites, the two
+/// recording wrappers (`record_tagged` and the driver's `record_station`) split the sites between them, and
+/// three stations reach `record_n` through a `match` that names the variant on another line.
+///
+/// The knowledge is the author's, at the moment they add the variant. So it is asked for there: the `match`
+/// in [`Station::tag_kind`] is inside the defining crate, where `#[non_exhaustive]` does not apply and the
+/// compiler makes it exhaustive. A new station does not build until its tag kind is declared, and a
+/// downstream guard can then enumerate the ones that owe a vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TagKind {
+    /// Every observation of this station carries `tag: None`.
+    Untagged,
+    /// The tag is a **number that means itself** — a roster size, a wire code outside any registry. There is
+    /// nothing to decode, and inventing a name for it would put a fabricated vocabulary in front of an
+    /// operator.
+    Quantity,
+    /// The tag is a **discriminant of a small enumeration**, so a reader that does not decode it is
+    /// discarding the distinction the station was tagged for.
+    Vocabulary,
+}
+
 /// **`ALL` is complete, proven by the compiler.**
 ///
 /// `ALL` is what a reader enumerates, so a variant missing from it is invisible *exactly* where a new
@@ -694,6 +723,85 @@ impl Station {
             Self::ExitSocketUnavailable => "exit.socket_unavailable",
             Self::PeerRefused => "peer.refused",
             Self::PeerRefusalUnreadable => "peer.refusal_unreadable",
+        }
+    }
+
+    /// What this station's tag means — see [`TagKind`] for why the question is asked here rather than
+    /// answered by a scan downstream.
+    ///
+    /// **Exhaustive on purpose, with no wildcard.** `Station` is `#[non_exhaustive]`, but that attribute
+    /// binds other crates, not this one: inside the defining crate the `match` below must cover every
+    /// variant, so adding a station without saying what its tag means is a build error rather than a bare
+    /// number on an operator's console.
+    #[must_use]
+    pub const fn tag_kind(self) -> TagKind {
+        match self {
+            // --- The tag is a discriminant somebody can name. ---
+            //
+            // Each of these is written out in its own enum's `tag()`/`index()` precisely so an operator's
+            // saved counters survive a variant being added, and each has a resolving arm in
+            // `fanos_node::admin::tag_name`. That correspondence is what the guard checks.
+            Self::AuthenticationRejected      // fanos_node::Gate
+            | Self::DirectoryPublishFailed    // fanos_node::Directory
+            | Self::ExitRefused               // fanos_node::ExitRefusal
+            | Self::PeerRefused               // fanos_wire::ProtocolError (dense index)
+            | Self::ReadInconclusive          // fanos_runtime::ReadStall
+            | Self::ReadShardRefused          // fanos_runtime::ReadRefusal
+            | Self::RoleUnderProvisioned      // fanos_core::roles::Role
+            | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
+            => TagKind::Vocabulary,
+
+            // --- The tag is a number that means itself. ---
+            //
+            // `AssignmentWithheld` carries the roster size it withheld against; `FrameTypeUnknown` carries a
+            // wire code that by definition is not in the registry — an enumeration cannot contain it, and
+            // that is the whole reason the station exists.
+            Self::AssignmentWithheld | Self::FrameTypeUnknown => TagKind::Quantity,
+
+            // --- No tag. ---
+            //
+            // Not a default: each of these records `None`, and a station that starts carrying a tag must
+            // move out of this arm, which is a change to this list rather than a silent widening.
+            Self::GatherExpired
+            | Self::GatherCompleted
+            | Self::GatherUnpeelable
+            | Self::ShareLateAfterPeel
+            | Self::ShareAfterDeadline
+            | Self::GatherSelfShareMissing
+            | Self::StructuralCheckUnattested
+            | Self::QuarantineDropped
+            | Self::HostForwardUnsealable
+            | Self::RequestForUnknownHost
+            | Self::GatherEvicted
+            | Self::GatherOpenFailed
+            | Self::ShareRequestNotAMember
+            | Self::SharePartialFailed
+            | Self::ShareForUnknownRequest
+            | Self::ShareIndexOutOfRange
+            | Self::ShareFloodCapped
+            | Self::HolonomyRejected
+            | Self::FrameDecodeFailed
+            | Self::WireOverBound
+            | Self::WireUnshaped
+            | Self::WireForeignDatagram
+            | Self::TransportRoundTripLost
+            | Self::HelloProofRejected
+            | Self::HelloEpochUnknown
+            | Self::DirectoryStaleCoordinate
+            | Self::PorosRotationUnarmed
+            | Self::DirectorySeatSuperseded
+            | Self::DirectoryRouteSuperseded
+            | Self::AdmissionIdentityUnbound
+            | Self::AdmissionPowFailed
+            | Self::AdmissionSybilCapped
+            | Self::AdmissionNoCapacity
+            | Self::StoreAtCapacity
+            | Self::ShareOffCommitment
+            | Self::DescriptorUnrecoverable
+            | Self::ReseatOutOfCell
+            | Self::ExitDialFailed
+            | Self::ExitSocketUnavailable
+            | Self::PeerRefusalUnreadable => TagKind::Untagged,
         }
     }
 }

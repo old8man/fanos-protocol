@@ -341,10 +341,15 @@ fn digest_of<'a>(entries: impl Iterator<Item = (&'a str, u64, Option<u64>)>) -> 
 /// **Deliberately partial, and that is the whole design.** Seven stations tag with a small enumeration whose
 /// discriminants are written out precisely so an operator's saved counters survive a variant being added
 /// (`Directory::tag`, `Gate::tag`, `ExitRefusal::tag`, `Role::index`, `ProtocolError::index`,
-/// `ReadRefusal::tag`, `PersistFailure::tag`) — those resolve. The rest tag with a
-/// *quantity*: `AssignmentWithheld` carries a roster size, `FrameTypeUnknown` a wire code an enumeration by
-/// definition does not contain, and the skew station a derivation tag. Inventing names for those would put a
-/// fabricated vocabulary in front of the operator, so they print as the numbers they are.
+/// `ReadRefusal::tag`, `ReadStall::tag`, `PersistFailure::tag`) — those resolve. Two tag with a
+/// *quantity*: `AssignmentWithheld` carries a roster size and `FrameTypeUnknown` a wire code an enumeration
+/// by definition does not contain. Inventing names for those would put a fabricated vocabulary in front of
+/// the operator, so they print as the numbers they are.
+///
+/// **Which station is in which group is not decided here.** It is declared at the station, as
+/// [`Station::tag_kind`](fanos_runtime::ports::stations::Station::tag_kind), because `Station` is
+/// `#[non_exhaustive]` and the `match` below therefore needs the wildcard arm that hides a missing entry.
+/// `every_tagged_station_has_a_resolver` joins the two and fails when they disagree — in either direction.
 ///
 /// `RoleUnderProvisioned` was very nearly filed as a quantity here — a "role index" reads like one. It is a
 /// discriminant, and the most consequential of the four: the station's own doc says one relay short and one
@@ -374,6 +379,13 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         }
         Station::ReadShardRefused => {
             fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
+        }
+        // Missing until #256's coverage guard asked for it — and `ReadStall::ALL`'s own doc already said it
+        // was "for the tag-name resolver", so this was a promise the resolver did not keep. Every
+        // `read.inconclusive` an operator has ever seen was a bare `0` or `1` where "the cell was slow" and
+        // "this node's read table was full" are different problems with different remedies (#215).
+        Station::ReadInconclusive => {
+            fanos_runtime::ReadStall::ALL.iter().find(|s| s.tag() == tag).map(|s| s.name())
         }
         Station::SnapshotWriteFailed => {
             crate::durable::PersistFailure::ALL.iter().find(|f| f.tag() == tag).map(|f| f.name())
@@ -965,6 +977,48 @@ mod tests {
     ///
     /// The `station` each vocabulary belongs to is named here too, because a mapping keyed by the *wrong*
     /// station resolves nothing and would otherwise fail silently in exactly the same way.
+    /// **Every station that tags with a vocabulary has a resolver, and no other station has one.**
+    ///
+    /// The sibling test below proves each *existing* arm is complete over its own vocabulary. It cannot
+    /// prove an arm exists: `tag_name`'s `_ => None` is mandatory — `Station` is `#[non_exhaustive]`, so a
+    /// `match` in this crate must have a wildcard — and a newly-tagged station that nobody added an arm for
+    /// falls into it and prints as a bare integer, silently. That is the [[coverage-guard-finds-the-defect]]
+    /// shape: a guard with no measure of what it covered is green on the empty set.
+    ///
+    /// So the obligation is declared where the knowledge is, at `Station::tag_kind`, whose `match` lives in
+    /// the defining crate and is therefore exhaustive — a new station does not compile until its author says
+    /// what its tag means. This test is only the join. Five separate scans were tried instead of it and each
+    /// was wrong differently; the reasons are recorded on `TagKind`.
+    ///
+    /// Both directions, because one alone is satisfiable by a degenerate implementation: a `tag_name` that
+    /// named everything would pass the first half, and one that named nothing would pass the second.
+    #[test]
+    fn every_tagged_station_has_a_resolver() {
+        use fanos_runtime::ports::stations::{MAX_SKEW_TAG, TagKind};
+
+        for &station in Station::ALL {
+            // The whole recordable range, not tag 0: densities differ between vocabularies and assuming one
+            // starts at zero would be this test making a claim about the enums instead of about the join.
+            let resolves = (0..=MAX_SKEW_TAG).filter(|&t| tag_name(station, t).is_some()).count();
+            match station.tag_kind() {
+                TagKind::Vocabulary => assert!(
+                    resolves > 0,
+                    "`{}` declares its tag is a vocabulary and `tag_name` has no arm for it, so every count \
+                     it raises reaches the operator as a bare number — exactly the distinction the station \
+                     was tagged to make (#256)",
+                    station.name()
+                ),
+                TagKind::Quantity | TagKind::Untagged => assert_eq!(
+                    resolves,
+                    0,
+                    "`{}` carries a quantity (or no tag) and `tag_name` invents {resolves} name(s) for it — \
+                     a fabricated vocabulary in front of an operator is worse than the number",
+                    station.name()
+                ),
+            }
+        }
+    }
+
     #[test]
     fn every_tag_vocabulary_resolves_on_every_member() {
         for d in crate::Directory::ALL {
@@ -1010,6 +1064,15 @@ mod tests {
             // the fifteen codes into the untagged bucket, so a mapping keyed by `code()` would resolve the
             // 1xx/2xx classes and silently lose the rest. Asserted, because that failure is invisible.
             assert!(e.index() <= fanos_runtime::ports::stations::MAX_SKEW_TAG, "{} tag is clampable", e.name());
+        }
+        for s in fanos_runtime::ReadStall::ALL {
+            assert_eq!(
+                tag_name(Station::ReadInconclusive, s.tag()),
+                Some(s.name()),
+                "read stall {} renders as a bare number — `a slow cell` and `this node's read table is \
+                 full` are different remedies (#215)",
+                s.name()
+            );
         }
         for f in crate::durable::PersistFailure::ALL {
             assert_eq!(
