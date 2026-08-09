@@ -46,14 +46,76 @@ use crate::identity::{
 };
 use crate::tls::{NodeCredentials, TlsError, node_configs, node_configs_mutual_from};
 
-/// Production transport tuning: a keep-alive so idle overlay links survive NAT/firewall timeouts,
-/// and a bounded idle timeout so a dead peer's connection is reaped rather than lingering.
+/// How many uni-streams one peer may have open on one connection at a time.
+///
+/// **Derived by enumerating this crate's own openers, not chosen.** Every stream FANOS opens is a
+/// `conn.open_uni()`, and there are exactly four sites: [`send_uni`] (the data path), `send_hello`,
+/// `send_framed` (HelloAck/Error), and the HELLO-mode announcement. Each writes one frame and finishes the
+/// stream, and `peer_send_worker` awaits `send_uni` in a serial loop — so one peer's legitimate concurrency
+/// is bounded by the number of *sites*, not by traffic.
+///
+/// quinn's default is **100**, which is not a FANOS number: it is a general-purpose default for protocols
+/// that multiplex. Against a peer that simply opens streams and sends, every credited stream is memory this
+/// node commits before the application has accepted it — `read_frames` accepts serially, so the other 99
+/// fill their buffers while the first is read. The bound below is what the protocol actually needs.
+///
+/// The ratchet in `tests/` keeps this honest: adding a fifth `open_uni` site without raising this constant
+/// is a change that would silently drop frames, so it must fail the build rather than the wire.
+const MAX_PEER_UNI_STREAMS: u32 = 4;
+
+/// Per-stream flow-control credit: exactly what a reader is willing to read.
+///
+/// [`max_wire`] is the largest byte string `read_frames` will accept (`MAX_FRAME` + relay wrapper + PROTEUS
+/// overhead, every term derived in #190). A sender that exceeds it has its stream dropped by the reader, so
+/// crediting more than this buys a peer buffer space for bytes this node has already decided to refuse.
+///
+/// quinn's default is 1.25 MB — close to this by coincidence rather than derivation. Tying the credit to the
+/// reader's own ceiling makes the two move together: raise `MAX_FRAME` and the credit follows, with no second
+/// place to remember.
+fn max_stream_credit() -> u64 {
+    max_wire() as u64
+}
+
+/// Production transport tuning.
+///
+/// Two liveness settings — a keep-alive so idle overlay links survive NAT/firewall timeouts, and a bounded
+/// idle timeout so a dead peer's connection is reaped — **and four memory bounds**, which quinn's defaults
+/// leave at values a peer chooses the cost of (#245).
+///
+/// **What the defaults cost, measured against the node's own 256 MiB recommendation.** quinn credits 100
+/// uni-streams *and* 100 bidi-streams at 1.25 MB each, sets `receive_window` to `VarInt::MAX` (so the
+/// connection-level sum is never capped), and reserves datagram buffers. That is ≈250 MB of receive credit
+/// per connection, and `MAX_INBOUND_CONNECTIONS = 512` of them — three orders of magnitude past the budget,
+/// committed before the application sees a byte.
+///
+/// **Bidirectional streams are set to zero because FANOS has none.** A scan of the whole workspace finds no
+/// `open_bi` and no `accept_bi`: every frame rides a uni-stream. Crediting 100 bidi-streams is therefore
+/// strictly worse than crediting uni ones — a stream the application never accepts is never drained either,
+/// so its buffer is held for the life of the connection. Zero is not a tightening; it is the true number.
 fn tuned_transport() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
         tc.max_idle_timeout(Some(idle));
     }
     tc.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+
+    // The protocol opens uni-streams only; see `MAX_PEER_UNI_STREAMS` for the enumeration.
+    tc.max_concurrent_uni_streams(MAX_PEER_UNI_STREAMS.into());
+    tc.max_concurrent_bidi_streams(0u32.into());
+
+    // Per-stream credit = what the reader will read; connection credit = the product, so the sum a peer can
+    // pin is stated rather than unbounded. `VarInt::MAX` was the default and made the product meaningless.
+    let per_stream = max_stream_credit();
+    tc.stream_receive_window(per_stream.try_into().unwrap_or(quinn::VarInt::MAX));
+    let per_conn = per_stream.saturating_mul(u64::from(MAX_PEER_UNI_STREAMS));
+    tc.receive_window(per_conn.try_into().unwrap_or(quinn::VarInt::MAX));
+
+    // The QUIC DATAGRAM extension is unused: `fanos_node::exit::read_datagram` is a length-prefixed helper
+    // over a stream, not this. Reserving nothing for it removes ~2.25 MB per connection that no code path
+    // can ever consume.
+    tc.datagram_receive_buffer_size(None);
+    tc.datagram_send_buffer_size(0);
+
     Arc::new(tc)
 }
 
@@ -2349,10 +2411,9 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     }
                     // Retract the stale binding only if it still names this address — a concurrent refresh
                     // may already have corrected it, and clobbering that would trade one stale entry for
-                    // another.
-                    // Read-then-write was the first form of this and had a window: a rebinding landing
-                    // between the `resolve` and the `remove` was deleted by a decision taken before it
-                    // existed. `remove_if` closes the pair inside one write lock (#241).
+                    // another. Read-then-write was the first form of this and had a window: a rebinding
+                    // landing between the `resolve` and the `remove` was deleted by a decision taken before
+                    // it existed. `remove_if` closes the pair inside one write lock (#241).
                     let _ = t.directory.remove_if(to, addr);
                     // The live connection is dropped rather than re-filed under `actual`. Caching a
                     // connection that arrived through a *failed* dial is a new state for the connection map,
@@ -3878,6 +3939,41 @@ mod tests {
             "the dial concluded in {:?}, which must be under {:?} and nowhere near the 30 s idle timeout",
             started.elapsed(),
             ceiling,
+        );
+    }
+}
+
+/// **#245: what one inbound connection may pin, as a number rather than a library default.**
+///
+/// The product is the claim. Per-stream credit × concurrent streams is what a peer makes this node hold
+/// before the application has read a byte. quinn's defaults credited 100 uni **and** 100 bidi at 1.25 MB with
+/// `receive_window = VarInt::MAX` — ≈250 MB per connection, times `MAX_INBOUND_CONNECTIONS = 512`, against a
+/// node recommendation of 256 MiB. Three orders of magnitude, committed before a byte is seen.
+///
+/// Asserted as arithmetic rather than by reading the setters back: `TransportConfig` has no getters, and the
+/// arithmetic is the thing that must stay true when either factor moves.
+#[cfg(test)]
+mod transport_bounds {
+    use super::{MAX_PEER_UNI_STREAMS, max_stream_credit};
+    use fanos_wire::MAX_FRAME;
+
+    #[test]
+    fn one_connection_pins_exactly_the_frames_it_is_allowed_to_send() {
+        let per_stream = max_stream_credit();
+        let per_conn = per_stream.saturating_mul(u64::from(MAX_PEER_UNI_STREAMS));
+
+        // A full-size frame must fit, or a legitimate producer stalls its own stream.
+        assert!(
+            per_stream >= MAX_FRAME as u64,
+            "per-stream credit {per_stream} is below MAX_FRAME {MAX_FRAME}: a full frame cannot arrive"
+        );
+        // …and the whole connection must stay within a few frames, not a few hundred.
+        let ceiling = 8 * 1024 * 1024;
+        assert!(
+            per_conn < ceiling,
+            "one connection may pin {per_conn} bytes, over the {ceiling}-byte sanity ceiling. The derivation \
+             is `four openers × one frame each`; a jump means MAX_FRAME or the opener count moved and the \
+             budget was not redone (#245, #213)."
         );
     }
 }
