@@ -461,6 +461,19 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     if config.proteus_secret.is_some() {
         let _ = writeln!(s, "# proteus_secret is set out-of-band — a shared community secret does not belong in a");
         let _ = writeln!(s, "# generated file that gets copied between hosts.");
+    } else {
+        // **The line above says `proteus_morph = polymorph`, and without this one that reads as "obfuscation
+        // is on".** It is not: `proteus_morph`'s own doc says it "only takes effect when `proteus_secret` is
+        // set", and a fresh config sets none. So the generated file displayed a security setting in its
+        // enabled-looking form while the thing that activates it was invisible — the operator had no way to
+        // learn the key exists, because the branch above only mentions it once it is already configured.
+        //
+        // Stated here rather than left to the docs for the same reason `proteus_environment` states its
+        // values here: the file an operator edits is the surface they read. The secret itself still is not
+        // written — that part was right, and the comment above says why.
+        let _ = writeln!(s, "# proteus_morph above does NOTHING until a shared community secret is set. It is");
+        let _ = writeln!(s, "# supplied out-of-band (never in this file, which gets copied between hosts), and");
+        let _ = writeln!(s, "# until then this node speaks unshaped FANOS on the wire.");
     }
     s
 }
@@ -612,6 +625,18 @@ mod tests {
         // therefore the OPPOSITE one: that the comment does not parse back as a setting.
         assert_eq!(proteus_secret, &None, "the fixture sets no secret");
         assert!(back.proteus_secret.is_none(), "a rendered `# proteus_secret` comment must stay a comment");
+        // **Not-round-tripped is not the same as not-mentioned, and this is the half that was missing.** The
+        // destructure above makes a NEW field a compile error, but a field the renderer never writes is
+        // invisible to it — the round trip has nothing to compare. So `proteus_secret` was absent from a
+        // fresh config entirely, while `proteus_morph = polymorph` sat one line up reading as "obfuscation is
+        // on". Its own doc says the morph "only takes effect when `proteus_secret` is set".
+        //
+        // Asserted on the UNSET branch specifically: the `is_some()` branch already mentioned the key, so a
+        // test that only checked "the word appears somewhere" would have passed all along.
+        assert!(
+            text.contains("does NOTHING until a shared community secret is set"),
+            "a config with no secret must say that the morph it displays is inert:\n{text}"
+        );
 
         // The four provisioning bundles are loaded from FILES the config names. Rendering writes the paths;
         // parsing re-reads them, and in this fixture no such file exists, so the parsed side is `None` by
