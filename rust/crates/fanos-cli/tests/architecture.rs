@@ -1046,6 +1046,19 @@ fn every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy() 
 /// The filter is `spawns ∧ current-thread`, not "is async" — a sequential async test needs no threads and
 /// paying for them is waste.
 ///
+/// **"Spawns" cannot mean the literal `tokio::spawn`, and reading it that way is how this guard came to
+/// report a clean tree while fifteen tests had exactly the property it exists to prevent.** They raise their
+/// peers through a *fixture* — `NodeFleet::spawn`, `spawn_cell`, `spawn_pinned`, `spawn_self_certifying` —
+/// so the `tokio::spawn` happens one frame down, inside the helper, and never appears in the test's own
+/// body. Fourteen were in `fanos-sim/src/fabric.rs`, whose fleet of five real nodes then interleaved on one
+/// thread; one of them spent a 240 s convergence budget and failed the gate as an *uninterpretable* red,
+/// which cost more to diagnose than the change it was accusing.
+///
+/// So the predicate is any `spawn`-shaped call, not one spelling of it. That is deliberately broader than
+/// the property: a test that names `spawn` without creating a task pays one attribute, which is cheap, while
+/// the alternative — a list of fixtures known to spawn — is a list of exemptions wearing a different hat,
+/// and would go stale the first time a fixture is renamed.
+///
 /// **`worker_threads` is not checked here, and two is not the answer.** Two is the smallest count that makes
 /// concurrency *possible*, which is a different property from making a race *observable* — the only
 /// measurement in this tree says so directly: `fanos-quic/tests/proteus.rs` records "two workers see it 3
@@ -1096,7 +1109,18 @@ fn a_test_that_spawns_a_peer_does_not_run_on_a_current_thread_runtime() {
                         continue;
                     }
                     let body = &body[..body.len().min(4000)];
-                    if body.contains("tokio::spawn") {
+                    // Any `spawn`-shaped call, per the paragraph above: `tokio::spawn`, `NodeFleet::spawn`,
+                    // `spawn_cell(`, `spawn_self_certifying::<F>(`. Matching the bare word would also catch
+                    // it inside a comment or a string, so the call shape is required — an identifier ending
+                    // in `spawn`, optionally with a turbofish, followed by `(`.
+                    let spawns = body.split("spawn").skip(1).any(|after| {
+                        let rest = after.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+                        let rest = rest.strip_prefix("::<").map_or(rest, |t| {
+                            t.split_once('>').map_or(t, |(_, tail)| tail.trim_start_matches("::"))
+                        });
+                        rest.starts_with('(')
+                    });
+                    if spawns {
                         let name = body
                             .split("async fn ")
                             .nth(1)

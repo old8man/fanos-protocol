@@ -28,7 +28,7 @@ async fn greet(client: &mut TcpStream) {
     assert_eq!(method, [5, 0], "server selects no-auth");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks5_connect_and_echo_through_the_proxy() {
     let proxy = spawn_proxy().await;
     let mut client = TcpStream::connect(proxy).await.unwrap();
@@ -53,7 +53,7 @@ async fn socks5_connect_and_echo_through_the_proxy() {
     assert_eq!(&buf, b"hello onion");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ipv4_connect_is_supported() {
     let proxy = spawn_proxy().await;
     let mut client = TcpStream::connect(proxy).await.unwrap();
@@ -73,7 +73,7 @@ async fn ipv4_connect_is_supported() {
     assert_eq!(&buf, b"ping");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_associate_relays_a_datagram_and_back() {
     let proxy = spawn_proxy().await;
     // The control connection must stay open for the association to live (RFC 1928 §7).
@@ -118,7 +118,7 @@ async fn udp_associate_relays_a_datagram_and_back() {
     assert_eq!(&buf[10..n2], b"second");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_associate_ignores_a_fragmented_datagram() {
     let proxy = spawn_proxy().await;
     let mut control = TcpStream::connect(proxy).await.unwrap();

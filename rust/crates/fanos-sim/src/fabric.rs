@@ -802,7 +802,7 @@ mod tests {
         node.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fleet_of_composed_nodes_self_organizes_over_the_carrier() {
         // A fleet of REAL deployed nodes, bootstrapping off each other over the modelled carrier. The assertion is
         // that every member's composition completes — each must publish a capability, publish a load report, scan the
@@ -816,10 +816,30 @@ mod tests {
         // near-certain and two nodes on one coordinate would confound what this asserts.
         let fleet = NodeFleet::spawn::<F4>(5, Link::default(), roles).await.expect("a fleet starts");
         assert_eq!(fleet.nodes().len(), 5);
-        let all_assigned = fleet
-            .until(|f| f.nodes().iter().all(|n| n.assigned_roles().any()))
+        // Three-valued, not `until` — this call site is why. Under the whole `--lib` binary it exhausted the
+        // 240 s budget and reported `false`, which reads as "the composition does not assign" and is what a
+        // red gate then accuses the last commit of. Run alone on the same loaded host it settles in 68 s. The
+        // discriminator is the trajectory: while any member is still completing its composition the count
+        // moves, and a fleet that has stopped moving for `FROZEN_SPAN` with members unassigned has genuinely
+        // failed. `Inconclusive` is then a measurement that did not finish, which is the honest verdict for a
+        // contended host and the one `until` cannot express.
+        // The observable is the ROSTER VECTOR, not the assigned count, and the difference is not cosmetic:
+        // the count changes at most five times in the whole run, so between two of those steps it is
+        // indistinguishable from a frozen fleet and `FROZEN_SPAN` expires against a system that is still
+        // working. Measured — with the count it reported `Refuted { frozen_for: 30s, last: 4 }` on a fleet
+        // that reaches 5/5. A trajectory has to move while the thing being waited on is still happening, and
+        // the roster does: it grows with every peer each member learns, which is the very scan the
+        // composition is blocked on. Same observable the two fleet assertions below already use.
+        let assigned = fleet
+            .until_settled(
+                |f| f.nodes().iter().all(|n| n.assigned_roles().any()),
+                |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
+            )
             .await;
-        assert!(all_assigned, "every member's composition produced an assignment over the carrier");
+        assert!(
+            !assigned.is_refuted(),
+            "every member's composition must produce an assignment over the carrier: {assigned:?}"
+        );
         // Every member offered rendezvous, so the cell should be serving it — the property NOSTOS hosting coverage
         // depends on, now observable end to end rather than asserted of a controller in isolation.
         assert!(
@@ -830,7 +850,7 @@ mod tests {
         fleet.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_node_that_can_reach_nobody_reports_a_solitary_assignment() {
         // The §5.3 finding, now detectable. A node's own capability and load slots are LOCAL reads, so an isolated
         // node still computes a valid-looking assignment — over a roster of one. Before `Assignment::roster` existed
@@ -856,7 +876,7 @@ mod tests {
         fleet.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_cell_converges_without_freezing_or_oscillating() {
         // The observatory applied to the subsystem that motivated it — three defect classes in one pass, each invisible
         // to an assertion over the final state alone:
@@ -1135,7 +1155,7 @@ mod tests {
         assert!(expected_distinct(0, 5).abs() < f64::EPSILON);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_whole_cell_resolves_every_member() {
         // The property the deterministic cell-wide assignment REQUIRES: every node resolves every member, so all compute
         // over the same roster.
@@ -1243,7 +1263,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_isolated_member_does_not_make_the_cell_retire_a_role() {
         // The condition the hold rule was written for, found by asking what actually produces `Read::Unknown`.
         // Loss does not: a lossy read still concludes inside `STORE_TIMEOUT` (5 s), which is why
@@ -1304,7 +1324,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_lossy_cell_does_not_churn_its_role_assignment() {
         // The question the setpoint work left open, measured where it can actually be answered. Until the load
         // sensors went live the setpoint was supply standing in for demand and could not oscillate; now it can.
@@ -1362,7 +1382,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_harness_tells_a_refutation_apart_from_an_unfinished_measurement() {
         // The harness asserting about ITSELF, and the reason it exists: a two-valued `until` reports "the property is
         // false" and "I could not tell" identically, and on a contended host the second is the common one. That cost three
@@ -1419,7 +1439,7 @@ mod tests {
         assert!(matches!(inconclusive, Settled::Inconclusive { .. }), "{inconclusive:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reseat_moves_the_coordinate_every_layer_reports() {
         // The instrument check, and it is not hypothetical: `Node::health().address` was a field captured at spawn while
         // the engine reseated underneath it, so from the first epoch reshuffle onward every layer reported the GENESIS
@@ -1449,7 +1469,7 @@ mod tests {
         assert_eq!(after, target, "and every layer reads the same live value");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_node_records_the_claims_of_peers_it_meets() {
         // The observable that makes a resolution failure *localisable*: `verified_claims` counts peers whose coordinate
         // claim this node has checked, which is the input `fanos_vrf::settle_index` runs on. A node stuck on a contested
@@ -1472,7 +1492,7 @@ mod tests {
         assert!(recorded, "a node that completes a handshake must record the peer's verified claim, saw {counts:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_a_collided_draw_now_resolves_itself() {
         // Forces the condition with `spawn_as_drawn` — at 7 nodes on `PG(2,4)`'s 21 points a draw collides in ~67% of runs,
@@ -1531,7 +1551,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_roster_convergence_with_collisions_allowed() {
         // THE COMBINATION ITEM 2 TURNS ON, and which no other test covered: a draw that is allowed to **collide**, plus
@@ -1579,7 +1599,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_roster_convergence_against_cell_occupancy() {
         // Hypothesis for the open finding: the capability/load directories ride the erasure-coded L4 store, whose
@@ -1607,7 +1627,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_does_the_roster_grow_at_later_epochs() {
         // Verifying a claim I made in docs §5.3 rather than trusting it: that cell-wide agreement is a property of
@@ -1631,7 +1651,7 @@ mod tests {
         fleet.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_loss_tolerance_of_the_composition() {
         use fanos_field::F2;

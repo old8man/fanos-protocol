@@ -3074,7 +3074,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "heavy real-node fixture, superseded by fanos-sim's fabric suite — see the note above"]
     async fn the_fabric_seam_carries_real_node_traffic() {
         // The transport-injection seam (docs/design-testing.md §5.1): a node spawned over Fabric::Abstract is the
