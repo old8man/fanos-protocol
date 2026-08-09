@@ -999,6 +999,40 @@ impl Node {
                 config.plane_order
             );
         }
+        // **What this node's subsystems have reserved, against what it is documented to run within (#213).**
+        //
+        // The three named shares — store, sessions, gathers — were each sized against "the 256 MiB node" by
+        // authors who could not see one another, and their sum plus the measured resident set exceeds it. An
+        // operator setting `MemoryMax=` (#207) needs that number, and needed it before the OOM killer
+        // supplied it. Reported at start rather than counted at a station, because it is a property of the
+        // build, not of the traffic: it cannot change while the node runs, and a reading that never moves is
+        // a condition, not an event.
+        //
+        // Both directions are stated: a tree whose accounting closes says how much is still unclaimed, so
+        // "no line" never has to be read as "nothing to say".
+        {
+            use fanos_primitives::budget;
+            let mib = 1024 * 1024;
+            if budget::overcommit() > 0 {
+                tracing::warn!(
+                    "fanos: memory accounting does not close — {} MiB of named subsystem budgets plus ~{} \
+                     MiB resident exceed the {} MiB this node is documented to run within, by {} MiB, and \
+                     the QUIC transport and VPN datapath are not in that sum at all. Size `MemoryMax=` \
+                     against the real figure, not the recommendation (#213/#207).",
+                    budget::allocated() / mib,
+                    budget::PROCESS_RESIDENT / mib,
+                    budget::NODE_MEMORY_BUDGET / mib,
+                    budget::overcommit() / mib,
+                );
+            } else {
+                tracing::info!(
+                    unallocated_mib = budget::unallocated() / mib,
+                    allocated_mib = budget::allocated() / mib,
+                    "memory accounting closes"
+                );
+            }
+        }
+
         match config.plane_order {
             2 => Self::start::<fanos_field::F2>(config).await,
             4 => Self::start::<fanos_field::F4>(config).await,

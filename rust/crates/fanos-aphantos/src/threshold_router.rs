@@ -59,7 +59,7 @@ pub const ANONYMOUS: Triple = [0, 0, 0];
 /// this 64 MiB, `fanos_diaulos::budget::SESSION_MEMORY_BUDGET`'s 64 MiB and `fanos_runtime`'s
 /// `STORE_MEMORY_BUDGET` of 128 MiB were each chosen as "a share of the 256 MiB node", by three authors who
 /// could not see each other, and they sum to the whole recommendation before the process's own resident set.
-const GATHER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+const GATHER_MEMORY_BUDGET: usize = fanos_primitives::budget::GATHER_SHARE;
 
 /// What **one** pending gather costs at its worst, in bytes the wire supplied.
 ///

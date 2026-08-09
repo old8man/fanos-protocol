@@ -283,7 +283,7 @@ pub const MAX_STORE_ENTRIES: usize = STORE_MEMORY_BUDGET / MAX_VALUE_LEN;
 /// 9× the floor that test enforces, so honest use is untouched, while a flooded node occupies half its
 /// budget instead of all of it. The bounds are arithmetic; picking the round number inside them is
 /// engineering judgement, and saying which is which is the point of writing it down.
-pub(crate) const STORE_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
+pub(crate) const STORE_MEMORY_BUDGET: usize = fanos_primitives::budget::STORE_SHARE;
 /// The largest value the store will hold, in bytes — bounds per-entry memory and rejects amplification.
 pub const MAX_VALUE_LEN: usize = 65_536;
 /// The most concurrent in-flight `Get`s tracked at once; further reads are refused until some resolve.

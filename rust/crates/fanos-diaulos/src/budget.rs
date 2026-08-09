@@ -41,7 +41,7 @@ use crate::cell::CELL_LEN;
 /// recommendation is 256 MiB, `STORE_MEMORY_BUDGET` takes 128 MiB, and taking the whole remainder would put
 /// a saturated node exactly at its recommendation — "the largest legal value, not a good one", in that
 /// constant's own words. The other half covers the driver, the engine and the consensus paths.
-pub const SESSION_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+pub const SESSION_MEMORY_BUDGET: usize = fanos_primitives::budget::SESSION_SHARE;
 
 /// How many cells one direction of one session may hold before the queue drops the oldest.
 ///
