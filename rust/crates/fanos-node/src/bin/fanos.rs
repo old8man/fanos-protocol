@@ -30,7 +30,7 @@ use fanos_node::{
 // Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
 #[cfg(feature = "vpn")]
 use fanos_node::StaticResolver;
-use fanos_runtime::{Escalation, Notification};
+use fanos_runtime::{AdmissionOutcome, Escalation, Notification};
 use fanos_vrf::vss::{DeterministicRng, deal};
 use tokio::io::{DuplexStream, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
@@ -3361,10 +3361,31 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
             warn!(?old, ?new, "this node moved coordinate — recorded addresses for it are stale");
         }
 
-        // Being refused entry. Repeated refusals mean this node will not join until something changes.
-        Notification::AdmissionRefused { required } => {
-            warn!(?required, "a peer refused this node's admission");
-        }
+        // Being refused entry — and the four outcomes are split by whether anything will change on its own
+        // (#199). Two are dead ends and get `warn!` because they need a person; the two that resolve
+        // themselves get `info!`, because an operator woken for a node that is already fixing itself learns
+        // to ignore the channel.
+        Notification::AdmissionRefused { outcome } => match outcome {
+            AdmissionOutcome::Repaid { bits } => {
+                info!(bits, "a peer refused this node's admission; re-minted the proof at its price");
+            }
+            AdmissionOutcome::AlreadySufficient { paid, asked } => info!(
+                paid,
+                asked,
+                "a peer refused this node's admission while it already pays at least the price asked — the \
+                 refusal is for some other reason, or that peer misreports its price"
+            ),
+            AdmissionOutcome::AboveCeiling { asked, ceiling } => warn!(
+                asked,
+                ceiling,
+                "a peer demands more admission work than this node will ever solve inline; NOTHING was \
+                 spent and this node will not join through it until the ceiling is raised or the price drops"
+            ),
+            AdmissionOutcome::NoGuidance => warn!(
+                "a peer refused this node's admission and named no price, so there is nothing to solve for \
+                 — an older peer, or one whose policy is not a difficulty"
+            ),
+        },
 
         // The positive confirmation an operator starting a hidden service is waiting for. Without it,
         // success and silent failure look identical at the console.

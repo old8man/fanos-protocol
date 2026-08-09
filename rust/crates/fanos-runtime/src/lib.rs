@@ -47,7 +47,10 @@ pub use overlay::{
     READ_ACCUMULATOR_BYTES, READ_MEMORY_CEILING, READ_PEER_SHARD_QUOTA, ReadRefusal, ReadStall,
     corroboration_quorum,
 };
-pub use ports::{Command, Duration, Effect, Engine, Escalation, Input, Instant, Notification, TimerToken};
+pub use ports::{
+    AdmissionOutcome, Command, Duration, Effect, Engine, Escalation, Input, Instant, Notification,
+    TimerToken,
+};
 
 // Re-export the wire address type so drivers and apps speak the same coordinates.
 pub use fanos_geometry::Triple;

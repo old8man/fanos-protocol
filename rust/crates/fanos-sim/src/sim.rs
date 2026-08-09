@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BinaryHeap};
 
 use fanos_runtime::ports::stations::GatherHealth;
 use fanos_runtime::ports::ReadOutcome;
-use fanos_runtime::{Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification, TimerToken, Triple};
+use fanos_runtime::{
+    AdmissionOutcome, Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification,
+    TimerToken, Triple,
+};
 use fanos_wire::decode_frame;
 
 use fanos_diakrisis::Verdict;
@@ -74,6 +77,25 @@ fn read_word(outcome: &ReadOutcome) -> &'static str {
     }
 }
 
+/// What the node did about an admission refusal, for the trace line.
+///
+/// Split out for the same reason [`read_word`] was: a four-arm `match` inside a forty-arm `match` is where a
+/// function stops being readable, and the split the words carry is the one #199 exists to make. Two of the
+/// four are marked DEAD END in the text, because a scenario reading a trace needs to see at a glance that
+/// the run is not going to resolve itself — the number alone reads like progress.
+fn admission_desc(outcome: &AdmissionOutcome) -> String {
+    match outcome {
+        AdmissionOutcome::Repaid { bits } => format!("AdmissionRefused (re-minted at {bits} bits)"),
+        AdmissionOutcome::AlreadySufficient { paid, asked } => {
+            format!("AdmissionRefused (already pays {paid} >= {asked} asked)")
+        }
+        AdmissionOutcome::AboveCeiling { asked, ceiling } => {
+            format!("AdmissionRefused (DEAD END: {asked} asked, ceiling {ceiling}, spent nothing)")
+        }
+        AdmissionOutcome::NoGuidance => "AdmissionRefused (DEAD END: no price given)".to_owned(),
+    }
+}
+
 fn note_desc(note: &Notification) -> String {
     match note {
         Notification::Delivered { from, .. } => format!("Delivered from {}", fmt_coord(*from)),
@@ -130,10 +152,7 @@ fn note_desc(note: &Notification) -> String {
             Some(ms) => format!("EpochFloor {ms}ms"),
             None => "EpochFloor (no sustainable cadence)".to_owned(),
         },
-        Notification::AdmissionRefused { required } => match required {
-            Some(bits) => format!("AdmissionRefused (needs {bits} bits)"),
-            None => "AdmissionRefused (no price given)".to_owned(),
-        },
+        Notification::AdmissionRefused { outcome } => admission_desc(outcome),
         Notification::Verdict(v) => format!("Verdict {v:?}"),
         Notification::Rerouted { around, via } => {
             format!("Rerouted {}→via {}", fmt_coord(*around), fmt_coord(*via))

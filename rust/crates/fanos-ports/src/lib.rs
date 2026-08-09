@@ -584,15 +584,16 @@ pub enum Notification {
     /// cost is honest, correct, and one number away from being admitted; without this notification it has a
     /// permanent unexplained refusal, which is the attacker's goal reached through the defence.
     ///
-    /// `required` is `None` when the refusing peer said nothing (an older build, or a policy where difficulty
-    /// is not a number). A driver must read that as *no guidance* and not as zero: re-solving at zero against a
-    /// gate that wants work is an infinite loop.
+    /// Carries the **outcome**, not the request (#199). The number the peer asked for says nothing about
+    /// whether this node did anything with it, and the four things it can do are not variations on one
+    /// event: two of them are dead ends where nothing further will happen until something changes outside
+    /// this node, and one of those two is the case that *reads* most reassuring. See [`AdmissionOutcome`].
     ///
     /// Re-solving is the **driver's** job, not the engine's — proof-of-work is compute, and this engine is
     /// sans-I/O by construction.
     AdmissionRefused {
-        /// The difficulty the refusing peer says it requires, in proof-of-work bits.
-        required: Option<u32>,
+        /// What this node did about the refusal.
+        outcome: AdmissionOutcome,
     },
     /// Self-healing: traffic for the (down) node `around` is now served by the co-linear
     /// survivor `via` — the projective LRC reroute (spec §L4, §6.7).
@@ -697,6 +698,74 @@ pub enum Notification {
         /// The measured per-point relay load over the base Fano cell (index = canonical point index).
         loads: [u32; 7],
     },
+}
+
+/// What a node did about an admission refusal — the payload of
+/// [`Notification::AdmissionRefused`].
+///
+/// **Four outcomes, and the difficulty the peer asked for does not separate them (#199).** The refusal path
+/// used to carry `required: Option<u32>` and nothing else, so an operator saw one line for all four —
+/// `warn!(?required, "a peer refused this node's admission")` — while the node's actual behaviour ranged
+/// from "retrying, this will resolve itself" to "this node will never join and nothing here will change
+/// that".
+///
+/// The split is by **what happens next**, which is the only thing an operator can act on:
+///
+/// | outcome | did the node spend? | will a retry help? |
+/// |---|---|---|
+/// | [`Repaid`](Self::Repaid) | yes | yes — the proof now meets the price |
+/// | [`AlreadySufficient`](Self::AlreadySufficient) | no, nothing to buy | no — the refusal is about something else |
+/// | [`AboveCeiling`](Self::AboveCeiling) | **no, deliberately** | no — not until the operator or the cell moves |
+/// | [`NoGuidance`](Self::NoGuidance) | no, nothing to spend on | no — there is no number to solve for |
+///
+/// **`AboveCeiling` is why this is not cosmetic.** It reads *most* reassuring of the four — the old line
+/// printed `required: Some(40)`, which looks like a node hard at work — and it is the one where nothing was
+/// spent and nothing will be. `MAX_INLINE_ADMISSION_BITS`'s own doc calls that boundary "the boundary
+/// between a defence and a remote CPU-exhaustion primitive" and says the refusal past it "is reported";
+/// reported it was, as the same variant as success.
+///
+/// Same shape as [`Notification::Snapshot`]'s adoption verdict (#189) and `fanos_node::Durability` (#200):
+/// hand the reader the conclusion the code already reached, rather than the input it reached it from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "an admission refusal that is read and dropped is the single warn! this type replaced"]
+pub enum AdmissionOutcome {
+    /// The price was payable and was paid: the node re-minted its proof at `bits` and a retry can succeed.
+    ///
+    /// The only self-correcting outcome, and the only one where the node spent CPU.
+    Repaid {
+        /// The difficulty now paid, in proof-of-work bits.
+        bits: u32,
+    },
+    /// This node already pays **at least** what the peer asked for, so there was nothing to buy.
+    ///
+    /// Actionable, and not as a success: a proof is monotone — one at difficulty `d` satisfies every
+    /// requirement `≤ d` — so a peer refusing an already-sufficient proof is refusing for a *different*
+    /// reason it did not state, or is misreporting its price. Either way the admission gate is not the
+    /// thing to adjust.
+    AlreadySufficient {
+        /// What this node pays today, in bits.
+        paid: u32,
+        /// What the peer said it wanted — no greater than `paid`, which is the point.
+        asked: u32,
+    },
+    /// The peer asked for more than this node will ever pay inline, so **nothing was spent, deliberately**.
+    ///
+    /// A dead end by design: "solve harder" on demand is a remote CPU-exhaustion primitive aimed at honest
+    /// joiners, so the engine refuses to grind. Nothing changes until an operator raises the ceiling, or the
+    /// cell lowers its price, or this peer turns out to be hostile and is replaced as an entry point.
+    AboveCeiling {
+        /// What the peer demanded, in bits.
+        asked: u32,
+        /// `MAX_INLINE_ADMISSION_BITS` — the most this node solves for without being asked by its operator.
+        ceiling: u32,
+    },
+    /// The refusing peer named no difficulty at all — an older build, or a policy where the price is not a
+    /// number.
+    ///
+    /// The other dead end. **Not zero**: re-solving at zero against a gate that wants work is an infinite
+    /// loop, so a driver must read this as *no guidance* rather than as a cheap price. Carrying it as a
+    /// variant instead of `None` is what stops it being read as one.
+    NoGuidance,
 }
 
 /// The sans-I/O node engine: a pure state machine over virtual time.

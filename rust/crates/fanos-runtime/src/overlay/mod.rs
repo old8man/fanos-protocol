@@ -60,7 +60,9 @@ use crate::healer::Healer;
 use crate::membership::Membership;
 use crate::router::{Peer, Router};
 use crate::store::Store;
-use crate::ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
+use crate::ports::{
+    AdmissionOutcome, Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken,
+};
 
 /// The single heartbeat timer token.
 pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
@@ -991,11 +993,14 @@ impl<F: Field> OverlayNode<F> {
         if code != fanos_wire::ProtocolError::SybilReject.code() {
             return Vec::new();
         }
-        let required = crate::frames::decode_required_difficulty(reason);
-        if let Some(bits) = required {
-            self.repay_admission(bits);
-        }
-        alloc::vec![Effect::Notify(Notification::AdmissionRefused { required })]
+        // The outcome is the engine's to determine and the driver's to act on: only this function knows
+        // which of `repay_admission`'s three guards fired, and re-deriving it outside would mean a second
+        // copy of the ceiling and of `paid_difficulty` (#199).
+        let outcome = match crate::frames::decode_required_difficulty(reason) {
+            Some(bits) => self.repay_admission(bits),
+            None => AdmissionOutcome::NoGuidance,
+        };
+        alloc::vec![Effect::Notify(Notification::AdmissionRefused { outcome })]
     }
 
     /// Re-mint this node's admission proof at `required`, if that is a price worth and safe to pay here.
@@ -1011,15 +1016,27 @@ impl<F: Field> OverlayNode<F> {
     ///   (`admission::a_solution_for_high_difficulty_also_satisfies_lower_thresholds`), so one solve serves
     ///   every peer, and a crowd of peers all demanding the maximum costs exactly one solve rather than one
     ///   each.
-    fn repay_admission(&mut self, required: u32) {
+    ///
+    /// Returns which of the three guards decided, because "did this node spend anything, and will a retry
+    /// help" is not recoverable from `required` alone — and it is the whole of what a driver and an operator
+    /// need (#199). The two early returns are dead ends and used to be indistinguishable from the one that
+    /// self-corrects.
+    fn repay_admission(&mut self, required: u32) -> AdmissionOutcome {
         let current = self.membership.paid_difficulty.unwrap_or(0);
-        if required <= current || required > MAX_INLINE_ADMISSION_BITS {
-            return;
+        if required <= current {
+            return AdmissionOutcome::AlreadySufficient { paid: current, asked: required };
+        }
+        if required > MAX_INLINE_ADMISSION_BITS {
+            return AdmissionOutcome::AboveCeiling {
+                asked: required,
+                ceiling: MAX_INLINE_ADMISSION_BITS,
+            };
         }
         let coord = self.coord.coords();
         self.membership.paid_difficulty = Some(required);
         self.membership.admission_proof = PowAdmission::new(required)
             .solve(&admission_challenge(&self.membership.identity, coord, self.epoch));
+        AdmissionOutcome::Repaid { bits: required }
     }
 
     /// Force the measured stress, so a test can exercise a law that normally waits on an observation.
@@ -2239,37 +2256,75 @@ mod tests {
         );
     }
 
+    /// **A refusal reports what this node DID, and the four things it can do are four values (#199).**
+    ///
+    /// The return path is what makes an *adaptive* admission price safe to run: a joiner priced out between
+    /// minting its proof and presenting it would otherwise be refused permanently, with the number that
+    /// would work sitting unread in a frame nothing dispatched — the attacker's outcome, produced by the
+    /// defence.
+    ///
+    /// But the price alone does not say whether anything happened. Two of the four outcomes are dead ends,
+    /// and `AboveCeiling` — the one where this node deliberately spends nothing — used to print the most
+    /// reassuring line of the four, because `required: Some(40)` reads like work in progress.
+    ///
+    /// All four worlds are built here and the outcomes must be **pairwise different**. Folding any two
+    /// together fails on the `distinct` check rather than on a hand-written expectation, so the test cannot
+    /// be satisfied by a payload that merely echoes its input.
     #[test]
-    fn a_refused_join_surfaces_the_price_that_would_have_passed() {
-        // The return path that makes an *adaptive* admission price safe to run. Without it a joiner priced out
-        // between minting its proof and presenting it is refused permanently, with the number that would work
-        // sitting unread in a frame nothing dispatched — the attacker's outcome, produced by the defence.
-        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
-        let refusal = crate::frames::encode_error_with(
-            fanos_wire::ProtocolError::SybilReject,
-            &17u32.to_le_bytes(),
-        );
-        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
-        let told = effects.iter().find_map(|e| match e {
-            Effect::Notify(Notification::AdmissionRefused { required }) => Some(*required),
-            _ => None,
-        });
-        assert_eq!(told, Some(Some(17)), "the refusal must reach the node carrying its price: {effects:?}");
-    }
+    fn a_refusal_reports_which_of_the_four_things_this_node_did_about_it() {
+        let refused = |node: &mut OverlayNode<F2>, body: &[u8]| {
+            let frame = crate::frames::encode_error_with(fanos_wire::ProtocolError::SybilReject, body);
+            let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame });
+            effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::AdmissionRefused { outcome }) => Some(*outcome),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a SybilReject must surface as a refusal: {effects:?}"))
+        };
 
-    #[test]
-    fn a_refusal_without_a_price_is_no_guidance_rather_than_zero() {
-        // An older peer, or a policy where difficulty is not a number, says nothing. A driver that read that as
-        // `0` would re-solve at zero against a gate demanding work — an infinite loop.
-        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
-        let refusal =
-            crate::frames::encode_error_with(fanos_wire::ProtocolError::SybilReject, &[]);
-        let effects = node.step(Instant(0), Input::Message { from: [1, 0, 0], frame: refusal });
-        let told = effects.iter().find_map(|e| match e {
-            Effect::Notify(Notification::AdmissionRefused { required }) => Some(*required),
-            _ => None,
-        });
-        assert_eq!(told, Some(None), "a silent refusal must surface as `None`, never as a difficulty");
+        // (D) A payable price: solved, and a retry can now succeed. The only self-correcting outcome.
+        let mut fresh = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let repaid = refused(&mut fresh, &17u32.to_le_bytes());
+        assert_eq!(repaid, AdmissionOutcome::Repaid { bits: 17 }, "a payable price must be paid");
+        assert_eq!(fresh.paid_difficulty_for_test(), Some(17), "and the proof must actually move");
+
+        // (B) The same node asked for less than it now pays. A proof is monotone, so there is nothing to
+        // buy — and the refusal is therefore about something the peer did not say.
+        let sufficient = refused(&mut fresh, &5u32.to_le_bytes());
+        assert_eq!(sufficient, AdmissionOutcome::AlreadySufficient { paid: 17, asked: 5 });
+        assert_eq!(fresh.paid_difficulty_for_test(), Some(17), "and nothing was re-solved");
+
+        // (C) Above the ceiling: nothing is spent, deliberately, because "solve harder" on demand is a
+        // remote CPU-exhaustion primitive. The proof must be untouched — this assertion is the one that
+        // separates a dead end from work in progress.
+        let before = fresh.admission_proof_for_test().to_vec();
+        let over = refused(&mut fresh, &(MAX_INLINE_ADMISSION_BITS + 1).to_le_bytes());
+        assert_eq!(
+            over,
+            AdmissionOutcome::AboveCeiling {
+                asked: MAX_INLINE_ADMISSION_BITS + 1,
+                ceiling: MAX_INLINE_ADMISSION_BITS
+            }
+        );
+        assert_eq!(fresh.admission_proof_for_test(), before.as_slice(), "not one hash was spent");
+
+        // (A) No price at all — an older peer, or a policy where difficulty is not a number. Carried as its
+        // own variant precisely so a driver cannot read it as zero and re-solve for ever against a gate
+        // that wants work.
+        let mut silent_peer = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let none = refused(&mut silent_peer, &[]);
+        assert_eq!(none, AdmissionOutcome::NoGuidance);
+
+        // And the property the four assertions above do not state on their own: no two of these worlds
+        // report the same thing. This is what fails if a later change folds a dead end into a success.
+        let all = [repaid, sufficient, over, none];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two different outcomes report identically: {a:?}");
+            }
+        }
     }
 
     #[test]
