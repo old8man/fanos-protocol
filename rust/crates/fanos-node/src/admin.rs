@@ -31,7 +31,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use fanos_runtime::ports::stations::{GatherHealth, Observation, Station};
+use fanos_runtime::ports::stations::{GatherHealth, Observation, Station, TagKind};
 use fanos_telemetry::CoherenceFrame;
 use fanos_wire::activation::Derivation;
 
@@ -415,8 +415,18 @@ pub fn render_data_path(stations: &[Observation], gather: GatherHealth, epoch: u
         // has no way to learn that 3 means `bound_capability_advertisement`: the enums carry a `name()`
         // documented as "the operator-facing name", the `warn!` beside each site prints it, and the
         // aggregate surface — the one designed as the operator seam — printed a bare integer (#209).
+        // An unresolved tag is ambiguous in a way the station itself can settle, and the two readings call
+        // for opposite responses. On a `Quantity` station the number *is* the answer and there was never a
+        // name to find. On a `Vocabulary` station it means this build could not decode a discriminant it
+        // declares it has one for — a defect in the node, not a fact about the network — and an operator
+        // staring at `tag 3` has no way to tell those apart. `Station::tag_kind` is the station's own
+        // declaration of which, so the rendering says it rather than leaving the reader to guess. #256's
+        // guard makes the second case fail a build; this is what an operator sees if one ever slips past it.
         let tag = o.tag.map_or_else(String::new, |t| match tag_name(o.station, t) {
             Some(name) => format!("  tag {t} ({name})"),
+            None if o.station.tag_kind() == TagKind::Vocabulary => {
+                format!("  tag {t} (UNRESOLVED — this build has no name for it)")
+            }
             None => format!("  tag {t}"),
         });
         match o.line {
@@ -938,6 +948,43 @@ mod tests {
         assert!(!body.contains("tag 47 ("), "and is not dressed up as a name: {body}");
     }
 
+    /// **A discriminant this build cannot decode says so, and a quantity does not (#256).**
+    ///
+    /// Both print a bare number today, and an operator cannot tell them apart — yet they are opposite
+    /// findings. On `ExitRefused` the tag is drawn from a small enumeration, so a value with no name means
+    /// *this node cannot decode its own vocabulary*: a defect in the build, not a fact about the network.
+    /// On `FrameTypeUnknown` the tag is a wire code outside any registry, and there is nothing to decode by
+    /// construction. The station's own `tag_kind` is what separates them, which is why the renderer reads it.
+    ///
+    /// **Reachable by data, not only in theory** — which is the question worth asking before adding a branch
+    /// ([[an-alarm-that-cannot-fire]]). Every recording site derives its tag from a compiler-complete `ALL`,
+    /// so a live node should never produce one; but `Observation::tag` is a `u64` the plane accepts, and the
+    /// sibling ratchet already pins `tag_name(ExitRefused, 250) == None`. This drives exactly that value.
+    #[test]
+    fn an_undecodable_discriminant_is_marked_and_a_quantity_is_not() {
+        let one = |station, tag| Observation { station, line: None, tag: Some(tag), count: 1 };
+        let body = render_data_path(
+            &[one(Station::ExitRefused, 250), one(Station::FrameTypeUnknown, 250)],
+            GatherHealth::Unmeasured,
+            0,
+        );
+        assert!(
+            body.contains("tag 250 (UNRESOLVED"),
+            "a vocabulary station with an undecodable discriminant must say the build could not name it, \
+             or it is indistinguishable from a quantity: {body}"
+        );
+        // And the same number on a quantity station stays a plain number. Without this the marker could be
+        // unconditional, which would put a defect label on every wire code an exit ever sees.
+        let quantity_line = body
+            .lines()
+            .find(|l| l.starts_with(Station::FrameTypeUnknown.name()))
+            .unwrap_or_else(|| panic!("the quantity station must be rendered: {body}"));
+        assert!(
+            quantity_line.contains("tag 250") && !quantity_line.contains("UNRESOLVED"),
+            "a wire code outside every registry is not a defect in this build: {quantity_line}"
+        );
+    }
+
     /// **A tagged counter reaches the operator as a word, not a number** (#209).
     ///
     /// Three stations sub-divide by an enumeration whose `name()` is documented as "the operator-facing
@@ -994,7 +1041,7 @@ mod tests {
     /// named everything would pass the first half, and one that named nothing would pass the second.
     #[test]
     fn every_tagged_station_has_a_resolver() {
-        use fanos_runtime::ports::stations::{MAX_SKEW_TAG, TagKind};
+        use fanos_runtime::ports::stations::MAX_SKEW_TAG;
 
         for &station in Station::ALL {
             // The whole recordable range, not tag 0: densities differ between vocabularies and assuming one

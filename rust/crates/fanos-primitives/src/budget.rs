@@ -12,13 +12,20 @@
 //! | store | 128 MiB | derived in #118 |
 //! | sessions | 64 MiB | derived in #205 |
 //! | gathers | 64 MiB | per-entry cost corrected in #218 |
+//! | exit datagrams | 16 MiB | named in #254 — spent all along, counted only now |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
 //! | inbound QUIC credit | **unnamed** | ≈250 MB *per connection* by quinn's defaults (#245) |
-//! | VPN tunnel queues | **unnamed** | 34 GB across the tunnel map (#247) |
+//! | SOCKS5 UDP associations | **unnamed** | 64 KiB each, and nothing bounds how many (#254) |
 //!
-//! So the three stated shares plus the measured resident cost are **301 MiB against a 256 MiB
-//! recommendation** — a 45 MiB overcommit before the transport and the datapath take a byte. Unnamed is not
-//! zero; it is unbounded.
+//! So the named shares plus the measured resident cost are **317 MiB against a 256 MiB recommendation** — a
+//! 61 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
+//!
+//! **The overcommit rising is the module working, not the node getting heavier.** It read 45 MiB when three
+//! shares were named and 61 once the exit's receive buffers were; nothing was allocated in between. Every
+//! future naming moves it the same way, and a reader who treats the figure as a health score rather than as
+//! a coverage report will draw the opposite conclusion from the one the evidence supports. The VPN datapath
+//! left this table on the other side: #247 cut its per-flow buffer by 51× and it now fits inside ordinary
+//! process residency rather than needing a share.
 //!
 //! ## Why this module states the deficit instead of removing it
 //!
@@ -70,15 +77,36 @@ pub const SESSION_SHARE: usize = 64 * 1024 * 1024;
 /// APHANTOS pending gathers (`fanos_aphantos`'s `GATHER_MEMORY_BUDGET`; per-entry cost corrected in #218).
 pub const GATHER_SHARE: usize = 64 * 1024 * 1024;
 
+/// Clearnet exit UDP receive buffers (`fanos_node::exit::EXIT_DATAGRAM_MEMORY_BUDGET`) — one
+/// `MAX_DATAGRAM_LEN` per live session, and `MAX_UDP_DATAGRAM_SESSIONS` is what this share then buys (#254).
+///
+/// **A ceiling this share grants, not a copy of a product computed elsewhere.** The real cost is
+/// `fanos_diaulos::budget::MAX_SESSIONS × fanos_node::exit::MAX_DATAGRAM_LEN`, and this crate sits below
+/// both and cannot see either — the same direction problem this module's header describes. So the share is
+/// the budgeted ceiling, and `fanos-node`'s
+/// `the_exit_datagram_buffers_fit_the_share_the_budget_grants_them` proves the product fits under it. That
+/// is the shape `STORE_SHARE → MAX_STORE_ENTRIES` already uses, one crate over.
+///
+/// 65535 per session is **not** the #247 defect repeated. That one was a buffer sized for a datagram the
+/// stack could not produce; this is a raw UDP socket facing the internet, where the kernel really does
+/// reassemble up to 65507 bytes. The size is right and the *accounting* was missing: 246 sessions × 64 KiB
+/// = 15.4 MiB that no share named. 16 MiB is the next binary step above it, so a session count that moves
+/// slightly does not immediately breach.
+pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
+
 /// Every named share, so a reader cannot see the sum without seeing the terms.
-pub const SHARES: [(&str, usize); 3] =
-    [("store", STORE_SHARE), ("sessions", SESSION_SHARE), ("gathers", GATHER_SHARE)];
+pub const SHARES: [(&str, usize); 4] = [
+    ("store", STORE_SHARE),
+    ("sessions", SESSION_SHARE),
+    ("gathers", GATHER_SHARE),
+    ("exit datagrams", EXIT_DATAGRAM_SHARE),
+];
 
 /// The sum of every **named** share. Two known consumers are absent from it by their own defect, not by
 /// design: inbound QUIC credit (#245) and the VPN datapath (#247) have never claimed one.
 #[must_use]
 pub const fn allocated() -> usize {
-    STORE_SHARE + SESSION_SHARE + GATHER_SHARE
+    STORE_SHARE + SESSION_SHARE + GATHER_SHARE + EXIT_DATAGRAM_SHARE
 }
 
 /// How far the named shares plus the measured resident cost exceed the recommendation. **Zero would mean the
@@ -101,16 +129,25 @@ mod tests {
 
     const MIB: usize = 1024 * 1024;
 
-    /// **The ratchet.** The overcommit is 45 MiB today. It may shrink — a rebalance is exactly the decision
-    /// this module exists to inform — but it must not grow, and a fourth subsystem taking "a share" must fail
-    /// here rather than in a deployment.
+    /// **The ratchet.** The overcommit is 61 MiB today. It may shrink — a rebalance is exactly the decision
+    /// this module exists to inform — but it must not grow, and a further subsystem taking "a share" must
+    /// fail here rather than in a deployment.
+    ///
+    /// **It went 45 → 61 MiB when `EXIT_DATAGRAM_SHARE` was named (#254), and that is not a regression.**
+    /// Those 16 MiB were already being spent — one 64 KiB receive buffer per live exit session, every day,
+    /// on every node running the exit role. What changed is that the sum can now see them. A reader who
+    /// takes the rise as "the node got heavier" has it exactly backwards: the earlier 45 was understated,
+    /// and the two consumers this module's header still lists as unnamed mean it is understated now too.
+    /// The number only becomes trustworthy by going *up* first.
     #[test]
     fn the_overcommit_does_not_grow() {
         assert!(
-            overcommit() <= 45 * MIB,
+            overcommit() <= 61 * MIB,
             "the named shares plus the measured resident cost now exceed the node recommendation by {} MiB, \
-             up from 45. Either a share grew or one was added; both are decisions that must be taken against \
-             this sum rather than against a comment in one subsystem (#213).",
+             up from 61. Either a share grew or one was added. If it was added, that is progress and this \
+             bound moves WITH a note saying whether the bytes are new or merely newly counted; if a share \
+             grew, it is a decision to take against this sum rather than against a comment in one subsystem \
+             (#213, #254).",
             overcommit() / MIB
         );
     }
@@ -118,10 +155,15 @@ mod tests {
     /// The arithmetic the tree could not do before, kept as a number rather than a memory — the shape
     /// `fanos_diaulos::budget` already uses for the bound it replaced.
     #[test]
-    fn the_three_stated_shares_leave_nothing_for_the_process_or_the_wire() {
-        assert_eq!(allocated(), 256 * MIB, "exactly the whole recommendation, before anything else");
-        assert_eq!(unallocated(), 0, "a fourth consumer would be dividing zero");
-        assert_eq!(overcommit(), 45 * MIB, "and the process's own resident set is already over the line");
+    fn the_stated_shares_leave_nothing_for_the_process_or_the_wire() {
+        assert_eq!(
+            STORE_SHARE + SESSION_SHARE + GATHER_SHARE,
+            256 * MIB,
+            "the three shares written before anyone summed them were exactly the whole recommendation"
+        );
+        assert_eq!(allocated(), 272 * MIB, "and the exit's buffers, once named, are over it on their own");
+        assert_eq!(unallocated(), 0, "a further consumer would be dividing zero");
+        assert_eq!(overcommit(), 61 * MIB, "before the transport and the datapath take a byte");
     }
 
     /// Every share is listed, so the sum cannot drift away from the terms it is made of.

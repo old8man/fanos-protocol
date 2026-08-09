@@ -44,7 +44,32 @@ const MAX_TARGET_LEN: usize = 256;
 
 /// The maximum UDP datagram payload the exit tunnel carries (a `u16` length prefix bounds it; comfortably
 /// above a jumbo DNS response).
+///
+/// **One of these is allocated per live session, and until #254 no memory share named the product.** The
+/// size itself is right — this is a raw UDP socket facing the internet, where the kernel really does
+/// reassemble up to 65507 bytes, unlike the VPN's stack-fed buffer that #247 cut by 51× because the packets
+/// it sized for could not exist. What was missing was the accounting, and
+/// `tests::the_exit_datagram_buffers_fit_the_share_the_budget_grants_them` now holds the product under
+/// `fanos_primitives::budget::EXIT_DATAGRAM_SHARE`. (Not an intra-doc link: rustdoc does not see
+/// `#[cfg(test)]` items, so one would never resolve.)
 pub const MAX_DATAGRAM_LEN: usize = 65535;
+
+/// This node's share of memory for exit UDP receive buffers — **taken from
+/// `fanos_primitives::budget`, not restated here** (#213's direction, #254's term).
+///
+/// `fanos-primitives` sits below every consumer, so the share is declared there where it can be summed with
+/// its neighbours, and each owner imports it under its own name. Drift is deleted rather than detected.
+pub const EXIT_DATAGRAM_MEMORY_BUDGET: usize = fanos_primitives::budget::EXIT_DATAGRAM_SHARE;
+
+/// How many concurrent UDP sessions the exit's own share of memory buys: one
+/// [`MAX_DATAGRAM_LEN`] receive buffer each.
+///
+/// **The exit's ceiling, derived from the exit's budget** — not a second use of a number derived for
+/// something else. `fanos_diaulos::budget::MAX_SESSIONS` bounds *session queues*, a different quantity out of
+/// a different share, and it happened to be the only cap in sight. Two quantities sharing one constant is
+/// how a budget stops meaning anything, so this states the one that governs these buffers and
+/// `tests::the_exit_datagram_buffers_fit_the_share_the_budget_grants_them` checks the two against each other.
+pub const MAX_UDP_DATAGRAM_SESSIONS: usize = EXIT_DATAGRAM_MEMORY_BUDGET / MAX_DATAGRAM_LEN;
 
 /// Whether `addr` is a destination an exit may relay to: **globally routable, and nothing else** (#170).
 ///
@@ -706,6 +731,37 @@ pub fn spawn_exit_publisher(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// **The exit's receive buffers fit the share the budget grants them (#254).**
+    ///
+    /// This is the join `fanos-primitives` cannot make. The share is declared there, below everything; the
+    /// two factors live in `fanos-diaulos` and here; only a crate that sees all three can multiply. So the
+    /// share is a *ceiling the budget grants* and this is the proof that the real cost is under it — the
+    /// same arrangement `STORE_SHARE → MAX_STORE_ENTRIES` uses, and deliberately not a second copy of the
+    /// product sitting in the budget module where it would drift.
+    ///
+    /// It fails in either direction, which is the point: raise `MAX_SESSIONS` or `MAX_DATAGRAM_LEN` and the
+    /// exit outgrows its share; shrink the share and the same. Both are decisions to take against
+    /// `budget::overcommit()`, which is already 61 MiB over the recommendation.
+    #[test]
+    fn the_exit_datagram_buffers_fit_the_share_the_budget_grants_them() {
+        let admitted = fanos_diaulos::budget::MAX_SESSIONS;
+        assert!(
+            admitted <= MAX_UDP_DATAGRAM_SESSIONS,
+            "the session layer admits {admitted} sessions and this share buys receive buffers for only \
+             {MAX_UDP_DATAGRAM_SESSIONS}, so {} of them would allocate past the budget — a share is not \
+             advice, it is the term this node's sum is built from (#213, #254)",
+            admitted - MAX_UDP_DATAGRAM_SESSIONS
+        );
+
+        // And the share is not wildly generous either. A ceiling with room for twice the sessions that can
+        // exist would have the budget counting bytes no deployment will spend, which understates what is
+        // left for everyone else — a budget wrong in the safe direction is still wrong.
+        assert!(
+            MAX_UDP_DATAGRAM_SESSIONS < 2 * admitted,
+            "the share buys {MAX_UDP_DATAGRAM_SESSIONS} buffers for a layer that admits {admitted} sessions"
+        );
+    }
 
     /// One node on loopback, for the tests that need a real [`Client`] to record stations on and nothing
     /// else. A cell would be seven, and the exit's counters are entirely node-local.
