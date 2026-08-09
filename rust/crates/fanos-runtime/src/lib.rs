@@ -31,7 +31,7 @@ mod membership;
 mod router;
 /// The local content store and in-flight request state — see [`store`].
 mod store;
-pub use store::snapshot_is_readable;
+pub use store::{snapshot_is_readable, snapshot_losses};
 pub mod overlay;
 
 // The sans-I/O contract now lives in the leaf crate `fanos-ports` (audit #73/#125); re-exported here as

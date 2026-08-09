@@ -712,10 +712,31 @@ const ROLE_GAIN_SEVENTH: u8 = 7;
 ///
 /// Returns `(bytes for the engine builder, (len, adoptable) for the report)`; both `None` on a first boot or
 /// an ephemeral node that configured no state directory.
-fn read_restore(state_dir: Option<&Path>) -> (Option<Vec<u8>>, Option<(usize, bool)>) {
+fn read_restore(state_dir: Option<&Path>) -> (Option<Vec<u8>>, Option<Restored>) {
     let bytes = state_dir.and_then(crate::durable::read_snapshot);
-    let report = bytes.as_ref().map(|b| (b.len(), fanos_runtime::snapshot_is_readable(b)));
+    let report = bytes.as_ref().map(|b| Restored {
+        len: b.len(),
+        adoptable: fanos_runtime::snapshot_is_readable(b),
+        // Counted from the same bytes the engine is about to adopt, so the sentence and the state agree.
+        losses: fanos_runtime::snapshot_losses(b),
+    });
     (bytes, report)
+}
+
+/// What a restart recovered, as three separate facts an operator needs apart (#189, #172).
+#[derive(Clone, Copy, Debug)]
+struct Restored {
+    /// Bytes on disk.
+    len: usize,
+    /// Whether this build could decode them — a refusal is deliberate, not a fault.
+    adoptable: bool,
+    /// Permanent losses in the restored ledger, `None` when the bytes did not decode.
+    ///
+    /// Separate from `adoptable` because the two answer different questions: a refused snapshot has no
+    /// ledger to report, while an adopted one with `Some(0)` is the healthy case and `Some(n)` is data this
+    /// node is known to have lost for good. Their notifications were emitted in a previous process; without
+    /// this line the fact survives the restart and the report does not.
+    losses: Option<usize>,
 }
 
 /// Keep this node's durable store on disk, and say at startup whether the previous run's came back.
@@ -729,7 +750,7 @@ fn read_restore(state_dir: Option<&Path>) -> (Option<Vec<u8>>, Option<(usize, bo
 fn spawn_store_role(
     handle: &NodeHandle,
     state_dir: Option<PathBuf>,
-    restored: Option<(usize, bool)>,
+    restored: Option<Restored>,
 ) -> Option<crate::durable::StorePersister> {
     let Some(dir) = state_dir else {
         // Said once, rather than left to be discovered after a restart. A node with no state directory is a
@@ -745,11 +766,21 @@ fn spawn_store_role(
     // member's shards — but it must be a sentence the operator read, because by this function's own argument
     // there is no other way to observe it.
     match restored {
-        Some((len, true)) => eprintln!(
-            "fanos: restored {len} bytes of store state from {}",
-            dir.join(crate::durable::STORE_FILE).display()
+        // The loss count rides with the success line rather than in one of its own: a ledger is only
+        // meaningful about a snapshot that was actually adopted, and an operator reading two sentences would
+        // have to join them to know that.
+        Some(Restored { len, adoptable: true, losses }) => eprintln!(
+            "fanos: restored {len} bytes of store state from {} — {}",
+            dir.join(crate::durable::STORE_FILE).display(),
+            match losses {
+                Some(0) => "no accounted losses in the ledger".to_string(),
+                Some(n) => format!(
+                    "WARNING: carrying {n} accounted permanent loss(es) (audit R-C3) from a previous run"
+                ),
+                None => "loss ledger unreadable".to_string(),
+            }
         ),
-        Some((len, false)) => eprintln!(
+        Some(Restored { len, adoptable: false, .. }) => eprintln!(
             "fanos: REFUSED the {len}-byte store snapshot in {} — it does not decode for this build \
              (format change, or a damaged file); starting empty, and the cell's erasure code re-heals \
              this node's shards",

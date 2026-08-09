@@ -211,6 +211,23 @@ pub fn snapshot_is_readable(bytes: &[u8]) -> bool {
     Store::restore(bytes).is_some()
 }
 
+/// How many permanent losses the snapshot's **loss ledger** (audit R-C3) carries, or `None` if the bytes do
+/// not restore.
+///
+/// **Why a restart needs its own reader (#172).** A loss is announced when it is accounted:
+/// `account_data_loss` emits `Notification::DataLost`, and the binary warns on it. That covers losses that
+/// happen while someone is watching. It cannot cover the ledger a node comes back with — the entries were
+/// accounted in a previous process, their notifications went to a log that may be long rotated, and the
+/// ledger itself is restored silently along with the shards. So an operator restarting a node has no way to
+/// learn that it carries accounted, permanent loss; the fact survives the restart and the report does not.
+///
+/// Reads through the same `Store::restore` the adoption path uses, so the count cannot disagree with what
+/// the engine then holds — the rule `snapshot_is_readable` above already follows, for the same reason.
+#[must_use]
+pub fn snapshot_losses(bytes: &[u8]) -> Option<usize> {
+    Store::restore(bytes).map(|s| s.loss_ledger.len())
+}
+
 impl Store {
     /// This node's **durable** state as canonical bytes: the held shards, the expiry schedule, the loss
     /// ledger, and the read-nonce counter.
@@ -323,5 +340,47 @@ impl Store {
             expiry,
             seq,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// **A restart must be able to say what it came back carrying (#172).**
+    ///
+    /// Three worlds, and the middle one is the reason this is not a `bool`: a snapshot that restores with an
+    /// empty ledger is the healthy cell, one that restores with entries is a node knowingly holding
+    /// permanent loss, and bytes that do not restore have no ledger to report at all. Folding the first two
+    /// together is the shape #154 already cost this tree once — absence read as assurance.
+    #[test]
+    fn a_snapshot_reports_how_many_losses_its_ledger_carries() {
+        let healthy = Store::default();
+        assert_eq!(snapshot_losses(&healthy.snapshot()), Some(0), "an empty ledger is a fact, not silence");
+
+        let mut lossy = Store::default();
+        lossy.loss_ledger.insert([1u8; DIGEST], Epoch::new(7));
+        lossy.loss_ledger.insert([2u8; DIGEST], Epoch::new(9));
+        assert_eq!(snapshot_losses(&lossy.snapshot()), Some(2), "both accounted losses survive the round trip");
+
+        assert_eq!(snapshot_losses(b"not a snapshot"), None, "unreadable bytes carry no ledger to report");
+    }
+
+    /// The count is read through the **same** `Store::restore` the adoption path uses, so the sentence the
+    /// operator reads cannot disagree with the state the engine then holds — the rule
+    /// [`snapshot_is_readable`] already follows. Asserted as an equality between the two readers rather than
+    /// trusted: they are two call sites of one function today, and nothing but this stops them diverging.
+    #[test]
+    fn the_loss_count_and_the_adoption_verdict_read_the_same_bytes() {
+        let mut store = Store::default();
+        store.loss_ledger.insert([3u8; DIGEST], Epoch::new(1));
+        let bytes = store.snapshot();
+        assert!(snapshot_is_readable(&bytes));
+        assert!(snapshot_losses(&bytes).is_some(), "readable bytes must yield a count");
+
+        let corrupt = b"\x00\x01\x02".to_vec();
+        assert!(!snapshot_is_readable(&corrupt));
+        assert!(snapshot_losses(&corrupt).is_none(), "and unreadable bytes must yield none, from both");
     }
 }
