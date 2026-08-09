@@ -14,8 +14,18 @@ use fanos_proxy::{Dialer, Target, UdpDialer};
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
-/// The read buffer for a UDP flow (the IP maximum — a datagram is one read from the stack's UDP stream).
-const UDP_BUF: usize = 65535;
+/// The MTU this build configures the userspace stack with, and therefore the largest IP packet it will ever
+/// hand up.
+///
+/// **Set explicitly rather than inherited from `IpStackConfig::default()`, because [`UDP_BUF`] is derived
+/// from it.** The default happens to be the same value today (ipstack's `MIN_MTU`), but a buffer sized from
+/// a dependency's default is sized from something that can change in a patch release without this crate
+/// noticing — and the failure would be a truncated datagram, not a build error. Stating it makes the
+/// derivation below true by construction instead of true by reading someone else's source.
+///
+/// 1280 is the IPv6 minimum link MTU (RFC 8200 §5) and ipstack's own floor; a tunnel that stays at or below
+/// it is deliverable over any path without path-MTU discovery, which is the property a VPN datapath wants.
+const STACK_MTU: u16 = 1280;
 
 /// Run full-tunnel mode over `device` (a TUN presented as an async byte device): accept each TCP/UDP flow
 /// the kernel routes to the TUN and bridge it to the exit via `dialer`. Returns when the device closes.
@@ -27,14 +37,24 @@ where
     Dev: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     D: Dialer + UdpDialer + Send + Sync + 'static,
 {
-    let mut stack = IpStack::new(IpStackConfig::default(), device);
+    let mut config = IpStackConfig::default();
+    // Request `STACK_MTU`, then **read back what the config actually holds** and size every flow buffer from
+    // that (#247). The setter is fallible — it refuses anything below ipstack's own minimum — and the two
+    // ways of coping with a refusal are both wrong: panicking turns a dependency bump into a node that will
+    // not start, and ignoring it leaves the stack at an MTU larger than the buffer, which truncates
+    // datagrams and looks like packet loss on the tunnel. Reading the value back removes the question: the
+    // buffer is whatever the stack is going to use, by construction, so there is nothing left to keep in
+    // sync.
+    let _ = config.mtu(STACK_MTU);
+    let flow_buf = config.mtu as usize;
+    let mut stack = IpStack::new(config, device);
     while let Ok(stream) = stack.accept().await {
         match stream {
             IpStackStream::Tcp(tcp) => {
                 tokio::spawn(bridge_tcp(tcp, Arc::clone(&dialer)));
             }
             IpStackStream::Udp(udp) => {
-                tokio::spawn(bridge_udp(udp, Arc::clone(&dialer)));
+                tokio::spawn(bridge_udp(udp, Arc::clone(&dialer), flow_buf));
             }
             // ICMP / unparsable network packets are not tunnelled.
             IpStackStream::UnknownTransport(_) | IpStackStream::UnknownNetwork(_) => {}
@@ -52,12 +72,16 @@ async fn bridge_tcp<D: Dialer>(mut tcp: IpStackTcpStream, dialer: Arc<D>) {
 
 /// Bridge one UDP flow: open an exit UDP tunnel to the destination and shuttle datagrams both ways (each
 /// read from the stack's UDP stream is one datagram; the tunnel carries them to the exit and back).
-async fn bridge_udp<D: UdpDialer>(mut udp: IpStackUdpStream, dialer: Arc<D>) {
+/// `buf_len` is the stack's own MTU, handed down rather than re-derived: a read from the UDP stream yields at
+/// most `mtu − (ip_header_len + udp_header_len)` (`ipstack::stream::udp`), so one MTU is a strict upper bound
+/// with the header slack as margin, and the IPv4/IPv6 header difference stays inside the dependency where it
+/// belongs.
+async fn bridge_udp<D: UdpDialer>(mut udp: IpStackUdpStream, dialer: Arc<D>, buf_len: usize) {
     let dst = udp.peer_addr();
     let Ok(mut tunnel) = dialer.dial_udp(&Target::Ip(dst)).await else {
         return;
     };
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = vec![0u8; buf_len];
     loop {
         tokio::select! {
             read = udp.read(&mut buf) => {
@@ -80,5 +104,45 @@ async fn bridge_udp<D: UdpDialer>(mut udp: IpStackUdpStream, dialer: Arc<D>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The theoretical IP datagram maximum — what the per-flow buffer used to be. Only the ratchet needs it,
+    /// so it lives here: a production constant nothing reads is the next thing someone reaches for.
+    const IP_MAXIMUM: usize = 65535;
+
+    /// **Every flow buffer is the MTU the stack is actually running at, not a number someone liked (#247).**
+    ///
+    /// The buffer is no longer a constant at all — `run_fulltunnel` reads `config.mtu` back after asking for
+    /// [`STACK_MTU`] and hands that down — so the two cannot drift and there is no equality left to restate.
+    /// What this checks is the pair of facts that make the arrangement worth anything:
+    ///
+    /// 1. The config really carries `STACK_MTU` after production's own sequence. If the setter had refused
+    ///    or clamped, flows would be sized from a different number than this test reasons about, and the
+    ///    ratchet below would be guarding the wrong quantity.
+    /// 2. That number is nowhere near the IP maximum. This is the ratchet: the buffer was
+    ///    `IP_MAXIMUM` **per flow**, and `crate::mux::MAX_UDP_FLOWS` of those is 268 MB of resident memory
+    ///    against a documented 256 MiB node — for packets that could never exceed ~1252 bytes, so 1.9 % of
+    ///    each buffer was reachable. An edit that "restores the safe ceiling" fails here.
+    #[test]
+    fn a_flow_buffer_is_one_mtu_of_the_stack_this_build_configures() {
+        let mut config = IpStackConfig::default();
+        let _ = config.mtu(STACK_MTU);
+        assert_eq!(
+            config.mtu, STACK_MTU,
+            "the stack refused or clamped the requested MTU, so flows are sized from something this test \
+             does not know about"
+        );
+
+        let flow_buf = config.mtu as usize;
+        assert!(
+            flow_buf * 8 < IP_MAXIMUM,
+            "a flow buffer of {flow_buf} is within a factor of 8 of the IP maximum — it is allocated PER \
+             FLOW, and MAX_UDP_FLOWS of them is what made this 268 MB of resident buffer (#247)"
+        );
     }
 }
