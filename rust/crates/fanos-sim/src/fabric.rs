@@ -25,6 +25,7 @@
 //! that is discharged by `UnboundedReceiver::poll_recv`, which registers on the channel.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
@@ -518,6 +519,35 @@ impl NodeFleet {
         &self.nodes
     }
 
+    /// Every member's non-zero driver stations, as one line per node — for a failure message.
+    ///
+    /// **A counter, deliberately, rather than a log.** Chasing #250 I ran the failing test under
+    /// `RUST_LOG=fanos_quic=debug` and read three zeroes as "those events did not happen". This crate has
+    /// no `tracing` dependency at all and installs no subscriber, so the zeroes were the *absence of a
+    /// sink*, not the absence of events — and two conclusions had already been drawn on them. A station is
+    /// data the test reads directly: no subscriber, no `RUST_LOG`, no `--nocapture`, and "nothing was
+    /// discarded" becomes an observation instead of an empty buffer.
+    ///
+    /// Empty output therefore means exactly one thing: every node discarded nothing that carries a
+    /// station. If a frame is going missing, it is going missing somewhere that does not count — which is
+    /// itself the finding, and the reason this renders *all* nodes rather than a total.
+    #[must_use]
+    pub fn stations(&self) -> String {
+        let mut out = String::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let seen = node.client().driver_stations();
+            let _ = write!(out, "\n  node {i}: ");
+            if seen.is_empty() {
+                out.push_str("(nothing discarded)");
+                continue;
+            }
+            for o in seen {
+                let _ = write!(out, "{}={} ", o.station.name(), o.count);
+            }
+        }
+        out
+    }
+
     /// Member `index`, if it exists.
     #[must_use]
     pub fn node(&self, index: usize) -> Option<&fanos_node::Node> {
@@ -838,7 +868,9 @@ mod tests {
             .await;
         assert!(
             !assigned.is_refuted(),
-            "every member's composition must produce an assignment over the carrier: {assigned:?}"
+            "every member's composition must produce an assignment over the carrier: {assigned:?}\
+             \nstations at the fixed point:{}",
+            fleet.stations()
         );
         // Every member offered rendezvous, so the cell should be serving it — the property NOSTOS hosting coverage
         // depends on, now observable end to end rather than asserted of a controller in isolation.
