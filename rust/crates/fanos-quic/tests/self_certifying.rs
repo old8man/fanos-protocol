@@ -123,6 +123,82 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     let _ = c; // keep C alive for the duration
 }
 
+/// The same construction as the test above, asking the other half of the question (#240).
+///
+/// **Non-delivery was never the whole property.** Its sibling asserts that B receives nothing, and that
+/// assertion is satisfied by a dial that was refused *and* by a dial that never happened — three separate
+/// harnesses were built against this code path before that was noticed, and each failed because the path
+/// only exists in self-certifying mode. `directory.stale_coordinate` is the discriminator: it is written on
+/// exactly one arm, so a non-zero count is proof the dialer reached the peer, read its proof, and judged it.
+///
+/// **What the judgement must be.** `peer != Some(to)` used to cover two situations with one `return None`:
+/// a peer that proved nothing (an impostor), and a peer that proved a *different* coordinate. The second is
+/// a seat rotation — routine under §L3, where every coordinate is redrawn each epoch — and the correction
+/// travels inside the rejection, because the peer has just proved where it actually is. Discarding it left
+/// the stale entry in place, so the next frame dialed the same wrong address and got the same right answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entry() {
+    let dir = Directory::new();
+    let a = spawn_distinct(&dir, &[]).await;
+    let b = spawn_distinct(&dir, &[a.address()]).await;
+    let c = spawn_distinct(&dir, &[a.address(), b.address()]).await;
+
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while dir.claim_at(b.address()).is_none() {
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("B's own claim must be seated before it can be made stale");
+
+    // B vacates its point and C is bound there, exactly as the sibling test does: a send to B's old
+    // coordinate now resolves to C's address.
+    dir.remove(b.address());
+    dir.insert(b.address(), c.local_addr());
+    assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
+    assert_eq!(stale_repairs(&a), 0, "nothing has been diagnosed before the dial");
+
+    a.command(Command::Send {
+        to: b.address(),
+        payload: b"addressed to a seat its occupant has left".to_vec(),
+    });
+
+    let repairs = tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            let n = stale_repairs(&a);
+            if n > 0 {
+                return n;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a dial answered by a different PROVED coordinate is a stale directory entry, not a forgery, and must be counted as one");
+    assert_eq!(repairs, 1, "one dial, one diagnosis");
+
+    // The repair itself, and the reason it is not asserted as `resolve(..) == None`: B is still running, so
+    // its own reshuffle loop may re-seat its proven binding at any moment after the retraction. The property
+    // is that B's coordinate no longer names C's address — which is true whether the slot is now empty or
+    // holds B's real one.
+    assert_ne!(
+        dir.resolve(b.address()),
+        Some(c.local_addr()),
+        "the entry that sent the dial to the wrong node must not survive the dial that proved it wrong"
+    );
+    // And the coordinate C proved is bound to the address it was proved at.
+    assert_eq!(dir.resolve(c.address()), Some(c.local_addr()));
+}
+
+/// Count of `directory.stale_coordinate` on a node's transport driver.
+fn stale_repairs(node: &NodeHandle) -> u64 {
+    node.client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "directory.stale_coordinate")
+        .map(|o| o.count)
+        .sum()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_credentials_keep_the_same_coordinate_across_restarts() {
     // Mint an identity, persist it to bytes, and reload it (as an app would across a restart).

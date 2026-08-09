@@ -2227,14 +2227,53 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                 // through — the number that separates a lossy network from a filter.
                 t.record_station(Station::TransportRoundTripLost, Some(to), None);
             }
-            let peer = handshake.peer;
-            if peer != Some(to) {
-                tracing::warn!(
-                    ?to,
-                    ?peer,
-                    "peer did not prove the dialed coordinate (or negotiation failed); rejecting"
-                );
-                return None;
+            // **A peer that proved a DIFFERENT coordinate has moved; it has not lied** (#240). One message
+            // and one `return None` used to cover both, and the two call for opposite responses:
+            //
+            // * `Some(actual)` — the HELLO verified. This address hosts `actual` and does not host `to`, so
+            //   our directory entry is stale. Seats rotate every epoch by §L3, which makes this routine
+            //   rather than exceptional, and **the correction arrives inside the rejection**: the peer just
+            //   proved where it is. Throwing that away left the dial failing on every retry while the answer
+            //   came back each time.
+            // * `None` — nothing was proved: an impostor, or an epoch we cannot judge (already counted at
+            //   `hello.epoch_unknown` / `hello.proof_rejected`). Unchanged: drop, and tell it nothing (§L0).
+            //
+            // The payload is NOT redirected to `actual`. A coordinate is the overlay identity, so delivering
+            // it there would be a misdelivery, not a repair — this fixes the map and fails the send.
+            match handshake.peer {
+                Some(actual) if actual == to => {}
+                Some(actual) => {
+                    t.record_station(Station::DirectoryStaleCoordinate, Some(to), None);
+                    // Sound by the same rule `spawn_punch` already follows: an address binding is recorded
+                    // only for a coordinate that was *proved* at it, and this one was, over mutual TLS to an
+                    // address we chose ourselves.
+                    //
+                    // **Unranked on purpose, and not for want of a rank.** The handshake did recover the
+                    // peer's VRF output — `PeerClaimed::output` *is* its rank — but `insert_ranked` writes a
+                    // claim of `(rank, probe index)` and the index is the half a handshake cannot supply:
+                    // `PeerClaimed` deliberately omits it so that verifying a witness never unfolds into the
+                    // witness's own chain. Writing rank with a fabricated index 0 would let this entry win
+                    // an arbitration against a peer legitimately seated further along its walk. Unranked is
+                    // the honest encoding of what was proved, and it yields to the peer's own ranked claim —
+                    // which is better evidence than our observation and may already be present, in which
+                    // case this write is correctly a no-op.
+                    t.directory.insert(actual, addr);
+                    // Retract the stale binding only if it still names this address — a concurrent refresh
+                    // may already have corrected it, and clobbering that would trade one stale entry for
+                    // another.
+                    if t.directory.resolve(to) == Some(addr) {
+                        t.directory.remove(to);
+                    }
+                    // The live connection is dropped rather than re-filed under `actual`. Caching a
+                    // connection that arrived through a *failed* dial is a new state for the connection map,
+                    // and this change is about the directory; the next send to `actual` dials it cleanly.
+                    tracing::debug!(?to, ?actual, "dialed coordinate has moved; directory corrected");
+                    return None;
+                }
+                None => {
+                    tracing::warn!(?to, "peer proved no coordinate (impostor or unjudgeable epoch); rejecting");
+                    return None;
+                }
             }
         }
     }

@@ -282,6 +282,20 @@ pub enum Station {
     /// peer's claim lands here and nothing else moves at all.
     HelloEpochUnknown,
 
+    /// A dialed coordinate was **vacant at the address the directory named**, and the peer that answered
+    /// proved a *different* one — the peer moved and our entry is stale (#240).
+    ///
+    /// Not a refusal of a liar: the HELLO verified perfectly. Recording it apart from
+    /// [`HelloProofRejected`](Self::HelloProofRejected) is the whole point, because the two call for
+    /// opposite responses — this one is repaired by updating the directory, that one by dropping the peer.
+    ///
+    /// **A rise here means the epoch period is shorter than directory propagation**, which is a deployment
+    /// fact no other counter states: seats rotate every epoch by §L3, so every stale entry is one dial
+    /// wasted, and a cell that rotates faster than it republishes wastes all of them.
+    ///
+    /// Keyed by the coordinate we *dialed* — our own resolution, not a value a stranger chose.
+    DirectoryStaleCoordinate,
+
     // --- POROS admission (`fanos_node::PorosHost`) ---
     /// A request arrived from a coordinate other than the one it claims — the identity binding refusing a
     /// relayed or replayed proof.
@@ -541,6 +555,7 @@ impl Station {
         Self::TransportRoundTripLost,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
+        Self::DirectoryStaleCoordinate,
         Self::StoreAtCapacity,
         Self::ReadShardRefused,
         Self::ReadInconclusive,
@@ -584,6 +599,7 @@ impl Station {
             Self::TransportRoundTripLost => "transport.round_trip_lost",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
+            Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::StoreAtCapacity => "store.at_capacity",
             Self::ReadShardRefused => "read.shard_refused",
             Self::ReadInconclusive => "read.inconclusive",
