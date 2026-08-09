@@ -39,7 +39,64 @@ use crate::target::Target;
 
 /// The largest datagram the relay socket reads — the SOCKS5 header plus payload. A UDP datagram carries at
 /// most 65535 bytes total, so this bounds the whole wrapped frame.
-const MAX_UDP: usize = 65535;
+///
+/// One of these is allocated **per live association**, which is why [`MAX_ASSOCIATIONS`] exists.
+pub const MAX_UDP: usize = 65535;
+
+/// This process's share of memory for SOCKS5 UDP association buffers — taken from
+/// `fanos_primitives::budget`, never restated here (#213's direction, #254's term).
+pub const ASSOCIATION_MEMORY_BUDGET: usize = fanos_primitives::budget::PROXY_ASSOCIATION_SHARE;
+
+/// How many UDP associations may be live at once: one [`MAX_UDP`] receive buffer each.
+///
+/// **Naming the share is what created this bound; before it there was none at all.** Neither accept loop —
+/// `crate::serve` nor `fanos_node::proxy::serve_proxy` — limits concurrency, so the number of associations
+/// was whatever a client opened, each holding 64 KiB. "The client is local and trusted" was true and was
+/// also a qualification that lived only in an author's head: a looping application, not an attacker, is
+/// enough to exhaust a node with it.
+pub const MAX_ASSOCIATIONS: usize = ASSOCIATION_MEMORY_BUDGET / MAX_UDP;
+
+/// **The cap spends the share and does not exceed it — both directions, at compile time.**
+///
+/// `const` asserts rather than a test, following #205: the quantities are constants, so a violation is a
+/// build error on the author who changed one, not a red suite someone reads later. The second half matters
+/// as much as the first: a cap far under what the share buys would have the budget counting bytes no
+/// deployment can use, which understates what is left for every other subsystem.
+const _: () = assert!(
+    MAX_ASSOCIATIONS * MAX_UDP <= ASSOCIATION_MEMORY_BUDGET,
+    "the association cap needs more memory than the share this crate was granted"
+);
+const _: () = assert!(
+    (MAX_ASSOCIATIONS + 1) * MAX_UDP > ASSOCIATION_MEMORY_BUDGET,
+    "the share buys more associations than the cap allows, so the budget is reserving memory nothing uses"
+);
+
+/// The permits [`associate`] holds while an association is live.
+///
+/// **Process-wide on purpose, and this is the opposite call from the one `stations.rs` makes.** A station
+/// counter must never be a global, because `fanos-sim` runs many nodes in one process and a shared counter
+/// would blend their data paths into one unreadable sum. A memory limit is the reverse: the memory really is
+/// shared by everything in the process, so a bound that is *not* global would let N in-process proxies
+/// allocate N times the share this crate was granted. The quantity decides the scope, not the convention.
+static ASSOCIATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_ASSOCIATIONS);
+
+/// What happened to a client's `ASSOCIATE` — [`associate`]'s own outcome, so a refusal for want of capacity
+/// is not indistinguishable from a client that hung up.
+///
+/// The forms in #199 and #243: a refusal that returns `Ok(())` and logs nothing is a dead end an operator
+/// cannot see, and "the proxy is at its association cap" is precisely the reading they need before
+/// concluding their application is broken.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "a refused association must reach the client and the operator, not be dropped"]
+pub enum Associated {
+    /// The association ran and has now ended (the control connection closed, or the client went away).
+    Served,
+    /// Refused before binding anything: [`MAX_ASSOCIATIONS`] are already live.
+    AtCapacity {
+        /// The cap that was reached, so the log line carries the number an operator would change.
+        cap: usize,
+    },
+}
 
 /// Cap on the distinct destinations one association relays to concurrently (audit A4: bound every per-flow
 /// map). A client addressing many destinations (a UDP scanner, a DHT) would otherwise grow the tunnel map —
@@ -71,7 +128,24 @@ fn evict_lru(tunnels: &mut HashMap<Target, Flow>) {
 /// # Errors
 /// Propagates I/O errors from binding the relay socket or writing the reply; a per-datagram failure (bad
 /// header, undialable destination) is dropped, never returned — matching UDP's own delivery model.
-pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::Result<()> {
+pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::Result<Associated> {
+    // The permit is taken BEFORE the socket is bound and the buffer allocated, and held for the whole
+    // association — `try_acquire`, never `acquire`: a client made to wait for a slot is a client holding a
+    // TCP connection open against a proxy that has already decided it has no room, which converts a memory
+    // bound into a connection bound one layer up. Refuse now, say so, and let it retry.
+    let Ok(_permit) = ASSOCIATIONS.try_acquire() else {
+        // RFC 1928 §6: `0x01` is "general SOCKS server failure", the only reply code for "not right now".
+        // Sent rather than dropped, so a client sees a refusal instead of a hang, and logged with the cap
+        // because that is the number an operator would change.
+        let _ = write_capacity_refusal(&mut control).await;
+        tracing::warn!(
+            cap = MAX_ASSOCIATIONS,
+            "refused a SOCKS5 UDP association: this process is at its association cap and each one holds a \
+             64 KiB receive buffer (fanos_primitives::budget::PROXY_ASSOCIATION_SHARE)"
+        );
+        return Ok(Associated::AtCapacity { cap: MAX_ASSOCIATIONS });
+    };
+
     // Bind the relay on the same local IP the control connection arrived on, so the address we hand back is
     // one the client can reach; an ephemeral port.
     let local_ip = control.local_addr()?.ip();
@@ -123,7 +197,7 @@ pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::
             }
         }
     }
-    Ok(())
+    Ok(Associated::Served)
 }
 
 /// Pump one destination's replies back to the client: wrap each inbound datagram in a SOCKS5 UDP header
@@ -146,6 +220,20 @@ fn spawn_reply_pump(
 
 /// Send the SOCKS5 reply to a UDP ASSOCIATE request: success, with `BND` = the relay socket the client
 /// sends its datagrams to.
+/// Tell the client the proxy has no association slot: reply code `0x01` with a null bind address.
+///
+/// A reply, not a dropped connection. A SOCKS5 client that gets neither reply nor close waits out its own
+/// timeout and reports something unrelated, so the one refusal an operator can actually act on would arrive
+/// as "the proxy is slow".
+async fn write_capacity_refusal(control: &mut TcpStream) -> io::Result<()> {
+    // RFC 1928 §6's reply field: `0x01` is "general SOCKS server failure", the only code in the
+    // registry that fits "correct request, no capacity right now". There is no `try again later`.
+    const REP_GENERAL_FAILURE: u8 = 0x01;
+    let mut reply = vec![VER, REP_GENERAL_FAILURE, 0x00];
+    push_addr(&mut reply, &Target::Ip(SocketAddr::from(([0u8, 0, 0, 0], 0))));
+    control.write_all(&reply).await
+}
+
 async fn write_associate_reply(control: &mut TcpStream, bnd: SocketAddr) -> io::Result<()> {
     let mut reply = vec![VER, REP_SUCCESS, 0x00];
     push_addr(&mut reply, &Target::Ip(bnd)); // a socket address never overflows the header
@@ -243,8 +331,45 @@ impl<'a> Cursor<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
+
+    /// **At the cap a client is refused with a reply, not left hanging (#199's form, #254's bound).**
+    ///
+    /// The refusal path is the whole reason the bound is acceptable: a SOCKS5 client that gets neither reply
+    /// nor close waits out its own timeout and reports something unrelated, so the one event an operator
+    /// could act on would arrive as "the proxy is slow". The permits are taken and released inside the test,
+    /// so no other test in this binary sees the static exhausted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_arriving_at_the_cap_is_told_so() {
+        use tokio::io::AsyncReadExt as _;
+
+        let held = ASSOCIATIONS
+            .acquire_many(u32::try_from(MAX_ASSOCIATIONS).expect("the cap fits a u32"))
+            .await
+            .expect("the semaphore is never closed");
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            associate(sock, &crate::dialer::EchoDialer).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.expect("a refusal is a REPLY, not a dropped connection");
+        assert_eq!(reply[0], VER, "the refusal is still SOCKS5: {reply:?}");
+        assert_eq!(reply[1], 0x01, "general SOCKS server failure is how RFC 1928 says `not right now`");
+
+        let outcome = server.await.expect("the task joins").expect("no I/O error");
+        assert_eq!(
+            outcome,
+            Associated::AtCapacity { cap: MAX_ASSOCIATIONS },
+            "and the caller is told which it was, so a refusal is not read as a served association"
+        );
+        drop(held);
+    }
     use super::*;
 
     #[test]

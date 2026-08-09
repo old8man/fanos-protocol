@@ -135,7 +135,16 @@ pub async fn handle<D: Dialer + UdpDialer>(
     }
     let target = match read_request(&mut client).await? {
         Request::Connect(t) => t,
-        Request::Associate => return crate::udp::associate(client, dialer).await,
+        // The outcome is read here rather than discarded: `associate` refusing for want of capacity is a
+        // different event from one that served and ended, and `Associated` is `#[must_use]` so a caller
+        // cannot quietly lose the distinction (#254).
+        Request::Associate => {
+            return crate::udp::associate(client, dialer).await.map(|outcome| {
+                if let crate::udp::Associated::AtCapacity { cap } = outcome {
+                    tracing::debug!(cap, "socks5 connection ended: no association slot");
+                }
+            });
+        }
         Request::Reject(code) => {
             write_reply(&mut client, code).await?;
             return Ok(());

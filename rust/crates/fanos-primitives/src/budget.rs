@@ -13,12 +13,12 @@
 //! | sessions | 64 MiB | derived in #205 |
 //! | gathers | 64 MiB | per-entry cost corrected in #218 |
 //! | exit datagrams | 16 MiB | named in #254 — spent all along, counted only now |
+//! | proxy associations | 8 MiB | named in #254 — and the naming is what created the bound |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
 //! | inbound QUIC credit | **unnamed** | ≈250 MB *per connection* by quinn's defaults (#245) |
-//! | SOCKS5 UDP associations | **unnamed** | 64 KiB each, and nothing bounds how many (#254) |
 //!
-//! So the named shares plus the measured resident cost are **317 MiB against a 256 MiB recommendation** — a
-//! 61 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
+//! So the named shares plus the measured resident cost are **325 MiB against a 256 MiB recommendation** — a
+//! 69 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
 //!
 //! **The overcommit rising is the module working, not the node getting heavier.** It read 45 MiB when three
 //! shares were named and 61 once the exit's receive buffers were; nothing was allocated in between. Every
@@ -94,19 +94,35 @@ pub const GATHER_SHARE: usize = 64 * 1024 * 1024;
 /// slightly does not immediately breach.
 pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 
+/// SOCKS5 UDP association receive buffers (`fanos_proxy::udp::ASSOCIATION_MEMORY_BUDGET`) — one
+/// `MAX_UDP` per live association, and `MAX_ASSOCIATIONS` is what this share then buys (#254).
+///
+/// **The one place in this table where naming the share also had to create the bound.** The exit's count was
+/// capped already and only the accounting was missing; here nothing limited how many associations could
+/// exist — the accept loop spawns per connection and never counts — so "unbounded, but the client is local
+/// and trusted" was a qualification living in an author's head rather than in the code. A share with no
+/// enforcement is a wish.
+///
+/// 8 MiB is half the exit's, and the asymmetry is the point: the exit serves a cell, a SOCKS5 proxy serves
+/// one operator's own applications. 128 concurrent UDP associations is far past what a desktop's browser,
+/// resolver and torrent client hold at once, and the bound exists to stop a runaway loop taking the node
+/// down with it, not to ration ordinary use.
+pub const PROXY_ASSOCIATION_SHARE: usize = 8 * 1024 * 1024;
+
 /// Every named share, so a reader cannot see the sum without seeing the terms.
-pub const SHARES: [(&str, usize); 4] = [
+pub const SHARES: [(&str, usize); 5] = [
     ("store", STORE_SHARE),
     ("sessions", SESSION_SHARE),
     ("gathers", GATHER_SHARE),
     ("exit datagrams", EXIT_DATAGRAM_SHARE),
+    ("proxy associations", PROXY_ASSOCIATION_SHARE),
 ];
 
 /// The sum of every **named** share. Two known consumers are absent from it by their own defect, not by
 /// design: inbound QUIC credit (#245) and the VPN datapath (#247) have never claimed one.
 #[must_use]
 pub const fn allocated() -> usize {
-    STORE_SHARE + SESSION_SHARE + GATHER_SHARE + EXIT_DATAGRAM_SHARE
+    STORE_SHARE + SESSION_SHARE + GATHER_SHARE + EXIT_DATAGRAM_SHARE + PROXY_ASSOCIATION_SHARE
 }
 
 /// How far the named shares plus the measured resident cost exceed the recommendation. **Zero would mean the
@@ -129,22 +145,22 @@ mod tests {
 
     const MIB: usize = 1024 * 1024;
 
-    /// **The ratchet.** The overcommit is 61 MiB today. It may shrink — a rebalance is exactly the decision
+    /// **The ratchet.** The overcommit is 69 MiB today. It may shrink — a rebalance is exactly the decision
     /// this module exists to inform — but it must not grow, and a further subsystem taking "a share" must
     /// fail here rather than in a deployment.
     ///
-    /// **It went 45 → 61 MiB when `EXIT_DATAGRAM_SHARE` was named (#254), and that is not a regression.**
-    /// Those 16 MiB were already being spent — one 64 KiB receive buffer per live exit session, every day,
-    /// on every node running the exit role. What changed is that the sum can now see them. A reader who
-    /// takes the rise as "the node got heavier" has it exactly backwards: the earlier 45 was understated,
-    /// and the two consumers this module's header still lists as unnamed mean it is understated now too.
-    /// The number only becomes trustworthy by going *up* first.
+    /// **It went 45 → 61 → 69 MiB as #254 named two consumers, and neither step is a regression.** The
+    /// exit's 16 MiB were already being spent, every day, on every node running the exit role; the proxy's
+    /// 8 MiB were *unbounded* until the share created the bound. What changed is that the sum can see them.
+    /// A reader who takes the rise as "the node got heavier" has it exactly backwards: 45 was understated,
+    /// and the consumer this module's header still lists as unnamed means 69 is understated too. The figure
+    /// only becomes trustworthy by going *up* first.
     #[test]
     fn the_overcommit_does_not_grow() {
         assert!(
-            overcommit() <= 61 * MIB,
+            overcommit() <= 69 * MIB,
             "the named shares plus the measured resident cost now exceed the node recommendation by {} MiB, \
-             up from 61. Either a share grew or one was added. If it was added, that is progress and this \
+             up from 69. Either a share grew or one was added. If it was added, that is progress and this \
              bound moves WITH a note saying whether the bytes are new or merely newly counted; if a share \
              grew, it is a decision to take against this sum rather than against a comment in one subsystem \
              (#213, #254).",
@@ -161,9 +177,9 @@ mod tests {
             256 * MIB,
             "the three shares written before anyone summed them were exactly the whole recommendation"
         );
-        assert_eq!(allocated(), 272 * MIB, "and the exit's buffers, once named, are over it on their own");
+        assert_eq!(allocated(), 280 * MIB, "and the two consumers #254 named are over it on their own");
         assert_eq!(unallocated(), 0, "a further consumer would be dividing zero");
-        assert_eq!(overcommit(), 61 * MIB, "before the transport and the datapath take a byte");
+        assert_eq!(overcommit(), 69 * MIB, "before the transport takes a byte");
     }
 
     /// Every share is listed, so the sum cannot drift away from the terms it is made of.

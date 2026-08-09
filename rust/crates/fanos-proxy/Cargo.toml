@@ -20,6 +20,9 @@ tokio = { workspace = true, features = [
     "sync",
 ] }
 tracing.workspace = true
+# For the memory share this crate's UDP associations are bounded by — declared where it can be summed
+# with its neighbours (#213/#254), never restated here.
+fanos-primitives = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [
