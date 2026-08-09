@@ -86,8 +86,8 @@ async fn a_hub_brokers_a_direct_hole_punched_connection() {
     let mut b = node(1, &dir_b).await;
     let mut h = node(2, &dir_h).await;
 
-    dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_b.insert(h.address(), h.local_addr());
 
     // Precondition: A has no address for B, so it cannot reach it directly.
     assert!(
@@ -159,8 +159,8 @@ async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
     let mut b = node(1, &dir_b).await;
     let h = node(2, &dir_h).await;
 
-    dir_a.insert(h.address(), h.local_addr());
-    dir_h.insert(b.address(), b.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_h.insert(b.address(), b.local_addr());
     a.command(Command::Send {
         to: h.address(),
         payload: vec![0xAA],
@@ -224,8 +224,8 @@ async fn a_relaying_peer_asks_its_hub_to_punch_instead_of_relaying_for_ever() {
     let mut b = node(1, &dir_b).await;
     let mut h = node(2, &dir_h).await;
 
-    dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_b.insert(h.address(), h.local_addr());
 
     // Both ends dial the hub, so it holds each one's observed address — the material it brokers with.
     b.command(Command::Send { to: h.address(), payload: b"b-warms-the-hub".to_vec() });

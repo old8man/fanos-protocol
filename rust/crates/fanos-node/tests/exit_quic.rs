@@ -131,7 +131,7 @@ async fn exit_and_client() -> (Node, Node, StaticKeypair, SocketAddr) {
         &[e_addr],
     )
     .await;
-    e.directory().insert(c.address(), c.local_addr());
+    let _ = e.directory().insert(c.address(), c.local_addr());
     warm(&e, &c);
     tokio::time::sleep(Duration::from_millis(500)).await;
 

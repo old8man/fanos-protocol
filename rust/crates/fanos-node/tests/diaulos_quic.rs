@@ -98,7 +98,7 @@ async fn diaulos_request_response_over_quic() {
         &[a_addr],
     )
     .await; // client
-    a.directory().insert(b.address(), b.local_addr());
+    let _ = a.directory().insert(b.address(), b.local_addr());
     warm(&a, &b);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -140,7 +140,7 @@ async fn diaulos_full_duplex_service_over_quic() {
         &[a_addr],
     )
     .await; // client
-    a.directory().insert(b.address(), b.local_addr());
+    let _ = a.directory().insert(b.address(), b.local_addr());
     warm(&a, &b);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -198,8 +198,8 @@ async fn diaulos_serves_two_clients_concurrently() {
     }];
     let c1 = start_distinct(boot.clone(), &[s_addr]).await;
     let c2 = start_distinct(boot.clone(), &[s_addr, c1.address()]).await;
-    s.directory().insert(c1.address(), c1.local_addr());
-    s.directory().insert(c2.address(), c2.local_addr());
+    let _ = s.directory().insert(c1.address(), c1.local_addr());
+    let _ = s.directory().insert(c2.address(), c2.local_addr());
     warm(&s, &c1);
     warm(&s, &c2);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -248,7 +248,7 @@ async fn fanos_dialer_reaches_a_service_by_name() {
         &[a_addr],
     )
     .await; // client
-    a.directory().insert(b.address(), b.local_addr());
+    let _ = a.directory().insert(b.address(), b.local_addr());
     warm(&a, &b);
     tokio::time::sleep(Duration::from_millis(500)).await;
 

@@ -56,6 +56,42 @@ impl Binding {
     }
 }
 
+/// What a directory write actually did.
+///
+/// **Three-valued, because "the binding is unchanged" has two causes that call for opposite responses**, and
+/// because until now it had none at all: every write returned `()`, so the arbitration rule above could
+/// refuse one and the caller could not tell. That cost three harnesses during #240 — each was built on a
+/// write that never landed, and a refused write is indistinguishable from a successful one when neither says
+/// anything. It is also the shape #106 closed one layer up, at the publisher.
+///
+/// The rule for a caller is the one #244 derives: **does your next decision depend on the write having
+/// landed?** If it does, branch here. If it does not, discard it with the reason at the call — an explicit
+/// discard is a claim that can be checked, and silence is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a write the arbitration rule refused looks exactly like one that landed; branch on it, or \
+              discard it with the reason at the call site"]
+pub enum WriteOutcome {
+    /// The binding is now this write's. Either the point was free, or the incoming claim superseded the
+    /// incumbent — from the writer's side those are the same outcome, since in both the map now says what it
+    /// was asked to say.
+    Bound,
+    /// This exact address was already bound here. Not a collision (no second claimant) and not a refusal
+    /// (nothing was rejected) — a re-publish of what the table already held. Kept distinct from [`Bound`]
+    /// because a caller asking "did anything change" gets a different answer, and folding it into
+    /// `Superseded` would report a healthy refresh as a lost arbitration.
+    ///
+    /// [`Bound`]: WriteOutcome::Bound
+    Unchanged,
+    /// An incumbent holds the better claim, so **the write did not land** and `keeping` is what the table
+    /// still says. Not an error: seats are arbitrated by proof rather than arrival order, and losing is the
+    /// rule working. What it obliges is a decision — a node whose own coordinate was refused must walk on
+    /// (`fanos_vrf::settle_index`), while a node recording a *peer* usually should not care.
+    Superseded {
+        /// The address the table keeps — the incumbent's, not the rejected writer's.
+        keeping: SocketAddr,
+    },
+}
+
 /// A shared, cloneable coordinate → address table. Cheap to clone (shares one map).
 #[derive(Clone, Default)]
 pub struct Directory {
@@ -118,8 +154,8 @@ impl Directory {
     /// directories keyed by something other than a node's epoch coordinate. Without a rank there is no basis on which to
     /// arbitrate a collision, so a later binding replaces an earlier one, exactly as before. Prefer
     /// [`insert_ranked`](Self::insert_ranked) wherever a `HELLO` proof has been verified.
-    pub fn insert(&self, coord: Triple, addr: SocketAddr) {
-        self.bind(coord, Binding { addr, rank: None, index: 0 });
+    pub fn insert(&self, coord: Triple, addr: SocketAddr) -> WriteOutcome {
+        self.bind(coord, Binding { addr, rank: None, index: 0 })
     }
 
     /// Bind a coordinate to an address **with the occupant's rank** — its coordinate-VRF output, as verified from a
@@ -139,8 +175,8 @@ impl Directory {
     ///
     /// A ranked binding is never displaced by a rank-*less* one: an unranked claim carries no evidence, and letting it
     /// win would reintroduce the eviction it exists to prevent.
-    pub fn insert_ranked(&self, coord: Triple, addr: SocketAddr, rank: VrfOutput) {
-        self.insert_claimed(coord, addr, rank, 0);
+    pub fn insert_ranked(&self, coord: Triple, addr: SocketAddr, rank: VrfOutput) -> WriteOutcome {
+        self.insert_claimed(coord, addr, rank, 0)
     }
 
     /// As [`insert_ranked`](Self::insert_ranked), but for a claim at probe **index** `index` — a node seated somewhere
@@ -149,18 +185,30 @@ impl Directory {
     /// The index is the first component of the arbitration order ([`fanos_vrf::claim_beats`]), so it must be the one the
     /// peer *proved* (`fanos_vrf::verify_coordinate_claim`), never a local guess. `insert_ranked` is exactly this at index
     /// 0, which is what an uncontested node claims.
-    pub fn insert_claimed(&self, coord: Triple, addr: SocketAddr, rank: VrfOutput, index: u16) {
-        self.bind(coord, Binding { addr, rank: Some(rank), index });
+    pub fn insert_claimed(&self, coord: Triple, addr: SocketAddr, rank: VrfOutput, index: u16) -> WriteOutcome {
+        self.bind(coord, Binding { addr, rank: Some(rank), index })
     }
 
     /// The shared binding path: apply the arbitration rule, count and log genuine collisions.
-    fn bind(&self, coord: Triple, incoming: Binding) {
-        if let Ok(mut map) = self.inner.write() {
-            if let Some(existing) = map.get(&coord)
-                && existing.addr != incoming.addr
-            {
+    fn bind(&self, coord: Triple, incoming: Binding) -> WriteOutcome {
+        let Ok(mut map) = self.inner.write() else {
+            // A poisoned lock is a local fault, not an arbitration result. Reported as `Superseded` against
+            // this node's own address so a caller that branches on it does the conservative thing — treats
+            // the binding as not-ours — rather than the optimistic one.
+            return WriteOutcome::Superseded { keeping: incoming.addr };
+        };
+        {
+            if let Some(existing) = map.get(&coord) {
+                if existing.addr == incoming.addr {
+                    // Not a collision and not a refusal: the same address is already bound here. Distinct from
+                    // `Bound` because a caller asking "did my write change anything" gets a different answer,
+                    // and distinct from `Superseded` because nothing was rejected and nothing is stale.
+                    map.insert(coord, incoming);
+                    return WriteOutcome::Unchanged;
+                }
                 self.collisions.fetch_add(1, Ordering::Relaxed);
                 if !incoming.supersedes(existing) {
+                    let keeping = existing.addr;
                     tracing::warn!(
                         ?coord,
                         keeping = %existing.addr,
@@ -168,7 +216,7 @@ impl Directory {
                         "overlay coordinate collision: the incumbent holds the better claim, so the newcomer must \
                          advance along its own probe walk (fanos_vrf::settle_index) — the binding is unchanged"
                     );
-                    return;
+                    return WriteOutcome::Superseded { keeping };
                 }
                 tracing::warn!(
                     ?coord,
@@ -179,6 +227,7 @@ impl Directory {
                 );
             }
             map.insert(coord, incoming);
+            WriteOutcome::Bound
         }
     }
 
@@ -262,6 +311,62 @@ mod tests {
     }
 
     #[test]
+    fn a_write_reports_which_of_the_three_things_it_did() {
+        // The PROPERTY: `Bound`, `Unchanged` and `Superseded` are each reachable, and no two of them are the same
+        // observation. Before #241 all three returned `()`, so the arbitration rule above could refuse a write and the
+        // caller could not tell — which cost three harnesses during #240, each built on a precondition that never
+        // happened. The test that would have caught it is this one, and it is four lines.
+        let (low, high) = ranks();
+        let coord = [1, 2, 3];
+        let dir = Directory::new();
+
+        assert_eq!(dir.insert_ranked(coord, sa(1), low), WriteOutcome::Bound, "a free point takes the write");
+        assert_eq!(
+            dir.insert_ranked(coord, sa(1), low),
+            WriteOutcome::Unchanged,
+            "the same address re-published is not a collision and not a refusal — nothing changed and nothing was lost"
+        );
+        assert_eq!(
+            dir.insert_ranked(coord, sa(2), high),
+            WriteOutcome::Superseded { keeping: sa(1) },
+            "a worse claim is refused, and the outcome names the address the table KEEPS — not the one it rejected, \
+             because the caller\'s next move depends on where the point actually points"
+        );
+        assert_eq!(dir.resolve(coord), Some(sa(1)), "and the refusal is real: the table still holds the incumbent");
+
+        // The displacing direction reports `Bound`, not a fourth value: from the writer's side "the point was free" and
+        // "I beat the incumbent" are the same outcome, since in both the map now says what it was asked to say. The
+        // displacer must win on the INDEX, because `low` is already the minimum rank and an equal claim does not beat
+        // an incumbent — which is what the first draft of this assertion got wrong, and what the run said.
+        let dir = Directory::new();
+        let _ = dir.insert_claimed(coord, sa(1), low, 2);
+        assert_eq!(dir.insert_claimed(coord, sa(3), high, 0), WriteOutcome::Bound, "fewer probe steps wins");
+    }
+
+    #[test]
+    fn an_unranked_write_is_refused_by_a_proven_claim_and_says_so() {
+        // The exact shape that made #240 cost three harnesses: a test pins a coordinate with `insert`, the rank rule
+        // refuses it against a proven binding, and the precondition silently never holds. The refusal is unchanged —
+        // it is the correct rule — but it is no longer silent.
+        let (low, _) = ranks();
+        let coord = [4, 5, 6];
+        let dir = Directory::new();
+        let _ = dir.insert_ranked(coord, sa(1), low);
+
+        assert_eq!(
+            dir.insert(coord, sa(9)),
+            WriteOutcome::Superseded { keeping: sa(1) },
+            "an unranked newcomer carries no evidence and must not displace a proven claim"
+        );
+
+        // ...and the converse, so the assertion above is a discriminator rather than a constant: over an UNRANKED
+        // incumbent (a bootstrap seed, a pinned fixture) the same unranked write lands.
+        let dir = Directory::new();
+        let _ = dir.insert(coord, sa(1));
+        assert_eq!(dir.insert(coord, sa(9)), WriteOutcome::Bound, "an unranked incumbent yields to anyone");
+    }
+
+    #[test]
     fn a_ranked_collision_is_decided_by_rank_not_by_arrival_order() {
         // The security property. Before ranks the later binding always won, so a node whose coordinate landed on a
         // victim's point could **evict** the victim simply by connecting after it — and arrival order is
@@ -272,15 +377,15 @@ mod tests {
 
         // Incumbent outranks the newcomer ⇒ the binding is unchanged, whichever order they arrive in.
         let dir = Directory::new();
-        dir.insert_ranked(coord, sa(1), low);
-        dir.insert_ranked(coord, sa(2), high);
+        let _ = dir.insert_ranked(coord, sa(1), low);
+        let _ = dir.insert_ranked(coord, sa(2), high);
         assert_eq!(dir.resolve(coord), Some(sa(1)), "the incumbent keeps the point it outranks for");
         assert_eq!(dir.claim_at(coord), Some((0, low)));
 
         // Newcomer outranks the incumbent ⇒ it takes the point, and the incumbent must advance its own probe walk.
         let dir = Directory::new();
-        dir.insert_ranked(coord, sa(2), high);
-        dir.insert_ranked(coord, sa(1), low);
+        let _ = dir.insert_ranked(coord, sa(2), high);
+        let _ = dir.insert_ranked(coord, sa(1), low);
         assert_eq!(dir.resolve(coord), Some(sa(1)), "the lower rank takes the point");
         assert_eq!(dir.claim_at(coord), Some((0, low)));
 
@@ -296,18 +401,18 @@ mod tests {
 
         // Unranked newcomer vs proven incumbent: rejected. Otherwise a caller with no proof could still evict.
         let dir = Directory::new();
-        dir.insert_ranked(coord, sa(1), low);
-        dir.insert(coord, sa(9));
+        let _ = dir.insert_ranked(coord, sa(1), low);
+        let _ = dir.insert(coord, sa(9));
         assert_eq!(dir.resolve(coord), Some(sa(1)), "no evidence, no eviction");
 
         // Unranked incumbent (a bootstrap seed or pinned fixture) yields to a proven claim, and to another seed.
         let dir = Directory::new();
-        dir.insert(coord, sa(9));
-        dir.insert_ranked(coord, sa(1), low);
+        let _ = dir.insert(coord, sa(9));
+        let _ = dir.insert_ranked(coord, sa(1), low);
         assert_eq!(dir.resolve(coord), Some(sa(1)), "a seed entry is not a proven claim");
         let dir = Directory::new();
-        dir.insert(coord, sa(9));
-        dir.insert(coord, sa(8));
+        let _ = dir.insert(coord, sa(9));
+        let _ = dir.insert(coord, sa(8));
         assert_eq!(dir.resolve(coord), Some(sa(8)), "two unranked bindings keep the pre-existing last-writer rule");
     }
 
@@ -318,11 +423,11 @@ mod tests {
         let (low, _) = ranks();
         let dir = Directory::new();
         assert_eq!(dir.claim_at([1, 0, 0]), None, "unbound");
-        dir.insert([1, 0, 0], sa(3));
+        let _ = dir.insert([1, 0, 0], sa(3));
         assert_eq!(dir.claim_at([1, 0, 0]), None, "bound but unranked reads as free for settling");
-        dir.insert_ranked([0, 0, 1], sa(4), low);
+        let _ = dir.insert_ranked([0, 0, 1], sa(4), low);
         assert_eq!(dir.claim_at([0, 0, 1]), Some((0, low)), "an unqualified ranked insert is a claim at index 0");
-        dir.insert_claimed([0, 1, 0], sa(5), low, 3);
+        let _ = dir.insert_claimed([0, 1, 0], sa(5), low, 3);
         assert_eq!(dir.claim_at([0, 1, 0]), Some((3, low)), "and a displaced claim reports the index it proved");
         dir.remove([0, 0, 1]);
         assert_eq!(dir.claim_at([0, 0, 1]), None, "vacating clears the claim with the address");
@@ -337,21 +442,21 @@ mod tests {
         let coord = [1, 1, 0];
 
         let dir = Directory::new();
-        dir.insert_claimed(coord, sa(1), low, 2); // better rank, but displaced here
-        dir.insert_claimed(coord, sa(2), high, 0); // worse rank, but this is its preference
+        let _ = dir.insert_claimed(coord, sa(1), low, 2); // better rank, but displaced here
+        let _ = dir.insert_claimed(coord, sa(2), high, 0); // worse rank, but this is its preference
         assert_eq!(dir.resolve(coord), Some(sa(2)), "the cheaper claim wins the point");
         assert_eq!(dir.claim_at(coord), Some((0, high)));
 
         // Symmetric: the same two claims in the other arrival order reach the same holder.
         let dir = Directory::new();
-        dir.insert_claimed(coord, sa(2), high, 0);
-        dir.insert_claimed(coord, sa(1), low, 2);
+        let _ = dir.insert_claimed(coord, sa(2), high, 0);
+        let _ = dir.insert_claimed(coord, sa(1), low, 2);
         assert_eq!(dir.resolve(coord), Some(sa(2)), "and arrival order still decides nothing");
 
         // At EQUAL index the rank breaks the tie, exactly as before.
         let dir = Directory::new();
-        dir.insert_claimed(coord, sa(2), high, 2);
-        dir.insert_claimed(coord, sa(1), low, 2);
+        let _ = dir.insert_claimed(coord, sa(2), high, 2);
+        let _ = dir.insert_claimed(coord, sa(1), low, 2);
         assert_eq!(dir.resolve(coord), Some(sa(1)), "equal claims fall back to lowest rank");
     }
 
@@ -362,21 +467,21 @@ mod tests {
     #[test]
     fn collisions_are_observed_but_rebinding_the_same_address_is_not() {
         let dir = Directory::new();
-        dir.insert([1, 2, 3], sa(1000));
+        let _ = dir.insert([1, 2, 3], sa(1000));
         assert_eq!(dir.collisions(), 0);
 
         // Re-binding the identical address (a node reconnecting) is not a collision.
-        dir.insert([1, 2, 3], sa(1000));
+        let _ = dir.insert([1, 2, 3], sa(1000));
         assert_eq!(dir.collisions(), 0);
 
         // A different address on the same coordinate is a collision; last-writer-wins for routing.
-        dir.insert([1, 2, 3], sa(2000));
+        let _ = dir.insert([1, 2, 3], sa(2000));
         assert_eq!(dir.collisions(), 1);
         assert_eq!(dir.resolve([1, 2, 3]), Some(sa(2000)));
 
         // The counter is shared across clones (a node's health surface reads the same table).
         let clone = dir.clone();
-        clone.insert([1, 2, 3], sa(3000));
+        let _ = clone.insert([1, 2, 3], sa(3000));
         assert_eq!(
             dir.collisions(),
             2,
@@ -384,7 +489,7 @@ mod tests {
         );
 
         // A distinct coordinate is unaffected.
-        dir.insert([4, 5, 6], sa(4000));
+        let _ = dir.insert([4, 5, 6], sa(4000));
         assert_eq!(dir.collisions(), 2);
     }
 

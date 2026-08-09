@@ -722,6 +722,40 @@ pub struct Peer {
     pub addr: SocketAddr,
 }
 
+/// Seed a transport address book from a provisioned peer list, refusing a list that names one coordinate twice.
+///
+/// A duplicate coordinate is not a routing question, it is a **file** question: two entries for one seat mean the
+/// operator wrote two addresses for one node, and an address book holds one. The write cannot report it — both
+/// entries are unranked, an unranked incumbent yields to anyone (`Directory::supersedes`), so the later line wins
+/// and the earlier peer is simply absent from the bootstrap set. The number of peers the operator listed and the
+/// number the node can dial then differ, with nothing in between that says why (#241).
+///
+/// Fatal rather than a warning, and for `fanos keygen` the reason is sharper: the ceremony derives the network's
+/// **name** from the roster it was handed, so a founder whose file repeats a coordinate computes the same name as
+/// everyone else while holding one fewer reachable seat — the ceremony then stalls, and the only visible symptom
+/// blames the network.
+///
+/// # Errors
+/// [`NodeError::Config`] naming the repeated coordinate and both addresses claiming it.
+pub fn seed_directory(peers: &[Peer], directory: &fanos_quic::Directory) -> Result<(), NodeError> {
+    for peer in peers {
+        // `resolve` rather than the write's outcome, because the outcome cannot carry this: the second unranked
+        // write is `Bound`, which is the arbitration rule behaving exactly as designed. Only the *input* is wrong.
+        if let Some(held) = directory.resolve(peer.coord)
+            && held != peer.addr
+        {
+            return Err(NodeError::Config(format!(
+                "coordinate {}:{}:{} is listed twice, at {held} and at {} — one seat cannot hold two addresses",
+                peer.coord[0], peer.coord[1], peer.coord[2], peer.addr
+            )));
+        }
+        // Discarded deliberately: into a directory this function is seeding, an unranked write over an unranked
+        // incumbent always lands, and the one input that could make it not land is refused above.
+        let _ = directory.insert(peer.coord, peer.addr);
+    }
+    Ok(())
+}
+
 /// The inverse of [`Peer::parse`] — the `x:y:z@host:port` seed form.
 impl fmt::Display for Peer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1244,6 +1278,41 @@ impl NodeConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **A provisioning file that names one seat twice is refused, and an idempotent repeat is not.**
+    ///
+    /// The PROPERTY, and the discriminator is the pair: the guard must reject exactly the input that would silently
+    /// shrink the bootstrap set, and accept the one that would not. Without the second half it would pass just as well
+    /// if `seed_directory` rejected every list with a repeated coordinate, including the harmless one an operator
+    /// writes when the same peer appears in two merged fragments of a config.
+    ///
+    /// The write itself cannot make this distinction (#241): both entries are unranked, an unranked incumbent yields
+    /// to anyone, so BOTH lists produce `Bound` and the second address quietly wins. Only the input is wrong, so only
+    /// the input can be checked.
+    #[test]
+    fn a_seat_listed_twice_at_two_addresses_is_refused_and_a_repeat_of_one_address_is_not() {
+        let coord = [1, 2, 3];
+        let a: SocketAddr = "10.0.0.1:9000".parse().expect("addr");
+        let b: SocketAddr = "10.0.0.2:9000".parse().expect("addr");
+
+        let doubled = [Peer { coord, addr: a }, Peer { coord, addr: b }];
+        let err = seed_directory(&doubled, &fanos_quic::Directory::new())
+            .expect_err("one seat cannot hold two addresses");
+        let text = format!("{err:?}");
+        assert!(text.contains("1:2:3"), "the refusal must name the repeated coordinate: {text}");
+        assert!(
+            text.contains("10.0.0.1:9000") && text.contains("10.0.0.2:9000"),
+            "and both addresses claiming it, or the operator cannot find the two lines: {text}"
+        );
+
+        // The same coordinate at the SAME address: two config fragments naming one peer. Nothing is lost, so nothing
+        // is refused — and the directory holds exactly one binding either way.
+        let dir = fanos_quic::Directory::new();
+        let repeated = [Peer { coord, addr: a }, Peer { coord, addr: a }];
+        seed_directory(&repeated, &dir).expect("an idempotent repeat is not a misconfiguration");
+        assert_eq!(dir.resolve(coord), Some(a));
+        assert_eq!(dir.len(), 1);
+    }
+
     /// **The censorship horizon is stated in epochs and justified in years — pin the conversion.**
     ///
     /// `CENSORSHIP_HORIZON_EPOCHS` is a *policy* number whose entire warrant is a span of time: "at most one

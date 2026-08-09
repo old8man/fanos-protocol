@@ -479,8 +479,8 @@ async fn filtering_nat_lets_a_hole_punch_succeed() {
     let mut b = node_over(Fabric::Abstract(b_sock.clone()), &dir_b, 2);
 
     // Both peers can reach the hub directly — it is the rendezvous, never hidden.
-    dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_b.insert(h.address(), h.local_addr());
 
     // B dials in first, so the hub observes (and remembers) B's mapping before anyone asks it to broker.
     b.command(Command::Send { to: h.address(), payload: b"warm".to_vec() });
@@ -533,8 +533,8 @@ async fn symmetric_nat_defeats_the_punch_and_the_relay_carries_the_pair() {
     let mut a = node_over(Fabric::Abstract(a_sock.clone()), &dir_a, 1);
     let mut b = node_over(Fabric::Abstract(b_sock.clone()), &dir_b, 2);
 
-    dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_b.insert(h.address(), h.local_addr());
 
     // Both warm the hub — exactly hole_punch.rs's automatic-trigger test. Nobody calls `hole_punch` here;
     // the send path below must ask on its own.
@@ -602,8 +602,8 @@ async fn a_hub_that_cannot_broker_a_punch_is_asked_at_most_once() {
     let a = node_over(Fabric::Abstract(a_sock.clone()), &dir_a, 1);
     let mut b = node_over(Fabric::Abstract(b_sock.clone()), &dir_b, 2);
 
-    dir_a.insert(h.address(), h.local_addr());
-    dir_b.insert(h.address(), h.local_addr());
+    let _ = dir_a.insert(h.address(), h.local_addr());
+    let _ = dir_b.insert(h.address(), h.local_addr());
 
     a.command(Command::Send { to: h.address(), payload: b"a-warm".to_vec() });
     assert_eq!(await_delivery(&mut h, a.address(), 5).await, b"a-warm");
@@ -698,7 +698,7 @@ async fn a_flood_of_punch_frames_cannot_aim_this_node_at_a_third_party() {
 
     // X is an ordinary, admitted peer: it completes the handshake like any cell member. The fault budget
     // tolerates `f` of these, so "an established peer is hostile" is inside the threat model, not outside.
-    dir_x.insert(a.address(), a.local_addr());
+    let _ = dir_x.insert(a.address(), a.local_addr());
     x.command(Command::Send { to: a.address(), payload: b"hello".to_vec() });
     assert_eq!(await_delivery(&mut a, x.address(), 5).await, b"hello", "X is an established peer of A");
 

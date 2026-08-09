@@ -39,7 +39,7 @@ mod proteus_socket;
 mod reflexive;
 mod tls;
 
-pub use directory::Directory;
+pub use directory::{Directory, WriteOutcome};
 pub use reflexive::ReflexiveAddr;
 pub use driver::{Beacons, CoordinateProver, REQUEST_TIMEOUT, reflexive_quorum,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,

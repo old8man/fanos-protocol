@@ -36,7 +36,7 @@ use fanos_wire::error::encode_error;
 use fanos_wire::{FrameType, ProtocolError, decode_frame, encode_frame, varint};
 use quinn::{ClientConfig, ServerConfig};
 
-use crate::directory::Directory;
+use crate::directory::{Directory, WriteOutcome};
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
 use fanos_vrf::{CoordinateClaim, VrfProof, VrfPublic};
 
@@ -1406,8 +1406,20 @@ where
         // Contested: restore the incumbent's binding, which `spawn_inner` just overwrote. Being unbound ourselves is the
         // honest state — it is what the arbitration would have produced — and it keeps the one route by which we can ask
         // the incumbent for its claim.
-        Some(addr) => dir_for_reshuffle.insert(coord.coords(), addr),
-        None => dir_for_reshuffle.insert_ranked(coord.coords(), handle.local_addr(), rank),
+        //
+        // The one production write whose outcome is unconditionally discardable: the goal is that the point NOT resolve
+        // to us, and all three outcomes reach it — `Superseded` means a peer's *ranked* claim landed since `spawn_inner`,
+        // which is a better occupant than the unranked seed this line was putting back.
+        Some(addr) => { let _ = dir_for_reshuffle.insert(coord.coords(), addr); }
+        // Our own seat, with its rank. A refusal is a peer holding a better claim to the point this node derived, so
+        // the node must walk on — which the reshuffle loop below does on the first `Wake::Resettle`.
+        None => bind_own_seat(
+            &dir_for_reshuffle,
+            &handle.client().stations,
+            coord.coords(),
+            handle.local_addr(),
+            Some(rank),
+        ),
     }
     // Drive the per-epoch coordinate reshuffle off the live beacon (spec §L3, §3.2): on each `BeaconReady`
     // the loop re-derives this node's VRF coordinate for the new epoch, re-seats the engine, rebinds its
@@ -1521,18 +1533,44 @@ struct Reseater {
 impl Reseater {
     /// Re-seat the node at `index` on its own probe walk: engine, directory, HELLO.
     ///
-    /// Returns `false` only if the engine is gone, which ends the loop. The order matters and is the one the epoch
-    /// reshuffle has always used: seat the engine first, then rebind the directory (the new point bound *before* the old
-    /// one is cleared, so there is no window in which the node is unroutable), then publish the HELLO.
+    /// Returns `false` only if the engine is gone, which ends the loop. A directory bind the arbitration rule
+    /// **refuses** leaves all three surfaces untouched and returns `true`: the node stays exactly where it was, which is
+    /// the only self-consistent answer available (see below).
+    ///
+    /// The order is: bind the directory, then seat the engine, then clear the old point, then publish the HELLO. The
+    /// invariant the old ordering existed to protect — the new point bound *before* the old one is cleared, so there is
+    /// no window in which the node is unroutable — is preserved, and the reason the bind moved to the front is that it
+    /// is now the step that can **fail**. Seating the engine first and discovering afterwards that the point belongs to
+    /// someone else left the node at a coordinate its own table routed elsewhere, and nothing said so. The mirror risk
+    /// the reorder introduces — bind lands, engine is gone — happens only on the shutdown path, where the loop breaks
+    /// immediately and the entry outlives the node by the length of one teardown.
+    ///
+    /// **What a refusal here means, and why it is not retried.** The walk settles against the *claim book*
+    /// (`claims::settle`) and the refusal comes from the *directory* — two stores of one fact, each able to hold a claim
+    /// the other has never seen. `WriteOutcome::Superseded` carries the incumbent's address, not its claim, so there is
+    /// nothing to feed back into the book and re-settling would land on the same index and lose again. Holding the
+    /// current placement is correct rather than a concession: the loop is event-driven, and the next `BeaconReady`
+    /// re-derives everything from a fresh rank anyway.
     fn apply<F: Field>(&self, at: &mut Placement, index: u16, claim: &CoordinateClaim) -> bool {
         let point = fanos_vrf::probe_point::<F>(&at.output, index).coords();
-        if !self.client.command(Command::Reseat { coord: point }) {
-            return false;
-        }
         // Bound with this epoch's rank AND the probed index: the arbitration order is the claim *pair*, so a table
         // recording only the rank would disagree with what every node's own `settle_index` concludes
         // (`Directory::supersedes`).
-        self.directory.insert_claimed(point, self.local_addr, at.output, index);
+        if let WriteOutcome::Superseded { keeping } =
+            self.directory.insert_claimed(point, self.local_addr, at.output, index)
+        {
+            self.client.record_station(Station::DirectorySeatSuperseded, Some(point), None);
+            tracing::debug!(
+                ?point,
+                index,
+                ?keeping,
+                "the settled seat is held by a better claim the book has not seen; holding position"
+            );
+            return true;
+        }
+        if !self.client.command(Command::Reseat { coord: point }) {
+            return false;
+        }
         if point != at.coord {
             self.directory.remove(at.coord);
         }
@@ -1738,6 +1776,43 @@ impl core::fmt::Debug for Fabric {
     }
 }
 
+/// Bind this node's **own** coordinate in its address book, and say so when the arbitration rule refuses.
+///
+/// Shared by the two startup writes of a node's own seat, because a refusal means the same thing at each: a
+/// *proven* claim already holds the point, so this node is missing from its own directory at the very
+/// coordinate it is about to announce — every reflexive lookup then answers with someone else, and the settle
+/// walk (`fanos_vrf::settle_index`) is what repairs it. Losing is the rule working; being unable to tell was
+/// #241, so reporting is this helper's whole reason to exist.
+///
+/// `rank` is `None` where no coordinate proof exists yet (the pre-rank bind in [`spawn_inner`]). An unranked
+/// write yields to any proven claim, which is exactly why the refusal is worth recording there.
+fn bind_own_seat(
+    directory: &Directory,
+    stations: &Arc<Mutex<Stations>>,
+    coord: Triple,
+    addr: SocketAddr,
+    rank: Option<fanos_vrf::VrfOutput>,
+) {
+    let outcome = match rank {
+        Some(rank) => directory.insert_ranked(coord, addr, rank),
+        None => directory.insert(coord, addr),
+    };
+    if let WriteOutcome::Superseded { keeping } = outcome {
+        stations.lock().unwrap_or_else(PoisonError::into_inner).record_tagged(
+            Station::DirectorySeatSuperseded,
+            Some(coord),
+            None,
+            1,
+        );
+        tracing::warn!(
+            ?coord,
+            ?keeping,
+            own = ?addr,
+            "a proven claim holds this node's own seat; it is absent from its own directory"
+        );
+    }
+}
+
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
 /// `tokio::spawn`s tasks); the public wrappers stay `async` for API stability.
 #[allow(clippy::too_many_arguments)]
@@ -1785,7 +1860,8 @@ fn spawn_inner(
     )?;
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
-    directory.insert(addr, local_addr);
+    // Unranked: no coordinate proof exists this early, and the caller rebinds with a rank immediately after.
+    bind_own_seat(&directory, &stations, addr, local_addr, None);
     // Read before the directory is moved into the transport: this is the network identity every task above
     // the transport asks the handle for, so it is captured once rather than re-derived.
     let genesis = directory.genesis();
@@ -2257,7 +2333,17 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // the honest encoding of what was proved, and it yields to the peer's own ranked claim —
                     // which is better evidence than our observation and may already be present, in which
                     // case this write is correctly a no-op.
-                    t.directory.insert(actual, addr);
+                    // The outcome is deliberately not branched on, because all three lead here anyway and
+                    // the *send* has already failed above regardless: `Bound` recorded the peer's new
+                    // address, `Unchanged` means it was already known, and `Superseded` means the peer's own
+                    // ranked claim for `actual` is in the table at some other address — better evidence than
+                    // this observation, which is exactly the arbitration this write submits itself to. It is
+                    // counted, though: a rise means a *ranked* entry is squatting a point a peer just proved
+                    // at a different address, which no other reading names.
+                    if let WriteOutcome::Superseded { keeping } = t.directory.insert(actual, addr) {
+                        t.record_station(Station::DirectoryRouteSuperseded, Some(actual), None);
+                        tracing::debug!(?actual, ?addr, ?keeping, "proved route not recorded; a better claim holds the point");
+                    }
                     // Retract the stale binding only if it still names this address — a concurrent refresh
                     // may already have corrected it, and clobbering that would trade one stale entry for
                     // another.
@@ -2913,7 +2999,16 @@ fn accept_holepunch(t: &Transport, body: &[u8]) {
             // Proven: whoever answered at that address proved the dialed coordinate. Only now is the
             // address worth recording, so subsequent overlay sends resolve directly and stop needing the
             // hub.
-            t.directory.insert(peer, addr);
+            //
+            // A refusal costs the whole punch. The hole is open and reachability is proved, but the route is
+            // not in the table, so the very next overlay frame resolves the incumbent's address and goes back
+            // through the relay — the #54 state, re-entered silently and for as long as the better-claimed
+            // entry stands. Nothing here can override it (that is the arbitration rule, and an unranked
+            // observation must not beat a proven claim), so what this site owes is the count.
+            if let WriteOutcome::Superseded { keeping } = t.directory.insert(peer, addr) {
+                t.record_station(Station::DirectoryRouteSuperseded, Some(peer), None);
+                tracing::debug!(?peer, ?addr, ?keeping, "punched route refused by arbitration; traffic stays on the relay");
+            }
         }
         if let Ok(mut set) = t.punching.lock() {
             set.remove(&peer);
@@ -3276,7 +3371,7 @@ mod tests {
         let beacon = Arc::new(RwLock::new(BeaconWindow::genesis(BeaconSeed::GENESIS)));
         let directory = Directory::new();
         let local_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 40_000).into();
-        directory.insert(genesis_coord, local_addr);
+        let _ = directory.insert(genesis_coord, local_addr);
 
         // Channels: the loop's `Client` sends `Reseat` down `input_rx`; we push `BeaconReady` via `events`.
         let (input_tx, mut input_rx) = mpsc::channel::<Input>(8);
@@ -3688,7 +3783,7 @@ mod tests {
         )
         .expect("spawn the dialer");
         let target: Triple = if node.address() == [1, 0, 0] { [0, 1, 0] } else { [1, 0, 0] };
-        dir.insert(target, addr);
+        let _ = dir.insert(target, addr);
         (node, target)
     }
 

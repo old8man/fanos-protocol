@@ -2465,9 +2465,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
     getrandom::fill(&mut session).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
 
     let directory = fanos_quic::Directory::new();
-    for peer in &roster {
-        directory.insert(peer.coord, peer.addr);
-    }
+    fanos_node::config::seed_directory(&roster, &directory)?;
     let listen: SocketAddr = match flag(args, "--listen") {
         Some(a) => a.parse().map_err(|_| NodeError::Config(format!("bad --listen '{a}'")))?,
         None => "0.0.0.0:0".parse().map_err(|_| NodeError::Identity)?,
@@ -3113,14 +3111,21 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     };
 
     // The other validators' coordinates → sockets (this node reaches its peers by coordinate). Same
-    // `<coord>@host:port` form as `fanos node --bootstrap`, but here every peer is a fixed cell seat.
-    let directory = Directory::new();
+    // `<coord>@host:port` form as `fanos node --bootstrap`, but here every peer is a fixed cell seat —
+    // which is why the duplicate-seat refusal matters more here than anywhere: a repeated coordinate does
+    // not lose a bootstrap hint, it loses a **cell member**, and the validator then runs against a quorum
+    // one seat smaller than the one its own config describes.
+    //
+    // Collected first, then seeded, because the check is on the whole list: two `--bootstrap` flags may each
+    // be well-formed and contradict each other, and a per-flag check could not see that (#241).
+    let mut peers: Vec<Peer> = Vec::new();
     for value in flag_all(args, "--bootstrap") {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let peer = Peer::parse(part)?;
-            directory.insert(peer.coord, peer.addr);
+            peers.push(Peer::parse(part)?);
         }
     }
+    let directory = Directory::new();
+    fanos_node::config::seed_directory(&peers, &directory)?;
 
     // Seat the node at Point::at(me) (grind an identity that hits it) and bind the consensus listen socket.
     let target = Point::<F2>::at(usize::from(me));

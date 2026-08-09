@@ -1038,9 +1038,7 @@ impl Node {
             Some(bp) => Directory::new().for_network(genesis_seed(&bp.network_id)),
             None => Directory::new(),
         };
-        for peer in &config.bootstrap {
-            directory.insert(peer.coord, peer.addr);
-        }
+        crate::config::seed_directory(&config.bootstrap, &directory)?;
 
         // Compose the engine per coordinate: a bare overlay by default, or — when beacon params are
         // configured — an `OverlayBeaconNode` that runs the live threshold-DVRF epoch clock (§7.6). A

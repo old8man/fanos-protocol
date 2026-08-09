@@ -99,14 +99,14 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     // A naive overwrite no longer poisons anything, and that is the rank rule working: B's binding was made *with* its
     // verified rank when B spawned, and an unranked write carries no evidence, so it cannot evict a proven claim
     // (`Directory::supersedes`). This assertion is the reason the test below has to reach for a realistic stale entry.
-    dir.insert(b.address(), c.local_addr());
+    let _ = dir.insert(b.address(), c.local_addr());
     assert_eq!(dir.resolve(b.address()), Some(b.local_addr()), "an unranked write must not evict a proven binding");
 
     // The realistic stale entry: B vacates its point (an epoch reshuffle does exactly this) and C is bound there
     // afterwards, so a send to B's *old* coordinate reaches C. Nothing about that is forgery — it is why the dialer must
     // still check the certificate against the coordinate it asked for.
     dir.remove(b.address());
-    dir.insert(b.address(), c.local_addr());
+    let _ = dir.insert(b.address(), c.local_addr());
     assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
 
     // A dials "B" but reaches C, whose certificate certifies C's coordinate, not B's → A rejects
@@ -154,7 +154,7 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
     // B vacates its point and C is bound there, exactly as the sibling test does: a send to B's old
     // coordinate now resolves to C's address.
     dir.remove(b.address());
-    dir.insert(b.address(), c.local_addr());
+    let _ = dir.insert(b.address(), c.local_addr());
     assert_eq!(dir.resolve(b.address()), Some(c.local_addr()), "a vacated point is free to rebind");
     assert_eq!(stale_repairs(&a), 0, "nothing has been diagnosed before the dial");
 
@@ -197,6 +197,69 @@ fn stale_repairs(node: &NodeHandle) -> u64 {
         .filter(|o| o.station.name() == "directory.stale_coordinate")
         .map(|o| o.count)
         .sum()
+}
+
+fn seat_refusals(node: &NodeHandle) -> u64 {
+    node.client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "directory.seat_superseded")
+        .map(|o| o.count)
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_whose_own_seat_is_already_proven_taken_says_so_instead_of_writing_nothing() {
+    // The PROPERTY: when the arbitration rule refuses this node's write of its OWN coordinate, the node reports it.
+    // Before #241 every `Directory` write returned `()`, so a node could start up, announce a coordinate, and be
+    // absent from its own address book at that very point with nothing anywhere saying so.
+    //
+    // Constructed with persistent credentials because the seat has to be known BEFORE the node exists: a
+    // self-certifying coordinate is `MapToPoint(H(cert))`, so the same credentials land on the same point twice, and
+    // the first spawn is only there to learn where the second one will sit.
+    let creds = NodeCredentials::generate().expect("generate credentials");
+    let probe = spawn_self_certifying_persistent::<F7>(&creds, make_node, Directory::new())
+        .await
+        .expect("spawn to learn the seat");
+    let seat = probe.address();
+    probe.shutdown();
+    let decoy: std::net::SocketAddr = "127.0.0.1:9".parse().expect("decoy address");
+
+    // World 1 — the seat is held by a PROVEN claim (index 0, the minimum rank, so nothing beats it). The node's own
+    // write must lose, and the loss must be visible.
+    let contested = Directory::new();
+    assert_eq!(
+        contested.insert_claimed(seat, decoy, [0u8; 64], 0),
+        fanos_quic::WriteOutcome::Bound,
+        "the setup write itself must land, or this test measures an empty directory"
+    );
+    let node = spawn_self_certifying_persistent::<F7>(&creds, make_node, contested.clone())
+        .await
+        .expect("spawn onto a contested seat");
+    assert_eq!(node.address(), seat, "the same credentials must land on the same point, or nothing is contested");
+    assert!(
+        seat_refusals(&node) >= 1,
+        "a node refused its own seat must count it; stations: {:?}",
+        node.client().driver_stations()
+    );
+    assert_eq!(
+        contested.resolve(seat),
+        Some(decoy),
+        "and the refusal is real rather than reported — the proven claim still holds the point"
+    );
+    node.shutdown();
+
+    // World 2 — the discriminator. The same seat, the same decoy, the same startup path, and the ONLY difference is
+    // that the incumbent is unranked (a bootstrap seed, which is what a directory is normally pre-filled with). That
+    // write lands, so the station must stay silent: a counter that fires in both worlds measures the startup, not the
+    // refusal.
+    let seeded = Directory::new();
+    let _ = seeded.insert(seat, decoy);
+    let node = spawn_self_certifying_persistent::<F7>(&creds, make_node, seeded)
+        .await
+        .expect("spawn onto a seeded seat");
+    assert_eq!(seat_refusals(&node), 0, "an unranked seed yields to this node, so there is nothing to report");
+    node.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -52,8 +52,8 @@ async fn a_nodes_health_reports_the_directory_counters_it_is_documented_to_repor
         .expect("a seven-point plane has a point that is not this node's");
     let a: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
     let b: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
-    node.directory().insert(coord, a);
-    node.directory().insert(coord, b);
+    let _ = node.directory().insert(coord, a);
+    let _ = node.directory().insert(coord, b);
     // And a drop for an unresolvable destination.
     node.directory().note_unresolved_drop([0, 1, 1]);
 
@@ -70,7 +70,7 @@ async fn a_nodes_health_reports_the_directory_counters_it_is_documented_to_repor
     );
     // Same coordinate, same address is a re-bind, not a collision: a counter that also counted those would
     // read nonzero on every healthy node and mean nothing.
-    node.directory().insert(coord, b);
+    let _ = node.directory().insert(coord, b);
     assert_eq!(node.health().collisions, 1, "a repeat of the SAME binding is not a collision");
 
     node.shutdown().await;

@@ -296,6 +296,38 @@ pub enum Station {
     /// Keyed by the coordinate we *dialed* — our own resolution, not a value a stranger chose.
     DirectoryStaleCoordinate,
 
+    /// This node tried to bind **its own coordinate** in its local address book and the arbitration rule
+    /// refused: an incumbent holds the better claim, so the node is not resolvable at the point it believes
+    /// it occupies (#241).
+    ///
+    /// Not an error — losing an arbitration is the rule working, and the answer is to walk on
+    /// (`fanos_vrf::settle_index`). What makes it worth a counter is that the walk and the table are **two
+    /// stores of one fact**: the walk settles against the claim book, the refusal comes from the directory,
+    /// and each can hold a claim the other has never seen. A rise here is that disagreement, and it is
+    /// invisible in every other reading — the node reports a coordinate, announces it in its HELLO, and
+    /// peers resolve someone else.
+    ///
+    /// Keyed by the point this node was trying to take: its own derived seat, never a value a peer supplied.
+    DirectorySeatSuperseded,
+
+    /// A route to a **peer** that this node *proved* — it completed a mutual-TLS handshake and verified the
+    /// coordinate at that address — was refused by the arbitration rule, so the table keeps another
+    /// occupant's address for that point (#241).
+    ///
+    /// Split from [`DirectorySeatSuperseded`](Self::DirectorySeatSuperseded) because the response is the
+    /// opposite one. There the node must move; here the node keeps working and simply does not get the route
+    /// it earned — the hole it punched goes unused and the next frame falls back to the relay, or the send
+    /// that discovered the move fails again. Both are quiet by construction: the write returns and nothing
+    /// downstream changes.
+    ///
+    /// Nonzero without a matching [`DirectoryStaleCoordinate`](Self::DirectoryStaleCoordinate) rise means a
+    /// *ranked* binding is squatting the point — a peer's verified claim that is better than our unranked
+    /// observation, which is the arbitration behaving correctly, and also exactly what a node that has
+    /// legitimately moved leaves behind for an epoch.
+    ///
+    /// Keyed by the coordinate the peer **proved**, so the key is evidence rather than an assertion.
+    DirectoryRouteSuperseded,
+
     // --- POROS admission (`fanos_node::PorosHost`) ---
     /// A request arrived from a coordinate other than the one it claims — the identity binding refusing a
     /// relayed or replayed proof.
@@ -556,6 +588,8 @@ impl Station {
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::DirectoryStaleCoordinate,
+        Self::DirectorySeatSuperseded,
+        Self::DirectoryRouteSuperseded,
         Self::StoreAtCapacity,
         Self::ReadShardRefused,
         Self::ReadInconclusive,
@@ -600,6 +634,8 @@ impl Station {
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
+            Self::DirectorySeatSuperseded => "directory.seat_superseded",
+            Self::DirectoryRouteSuperseded => "directory.route_superseded",
             Self::StoreAtCapacity => "store.at_capacity",
             Self::ReadShardRefused => "read.shard_refused",
             Self::ReadInconclusive => "read.inconclusive",
