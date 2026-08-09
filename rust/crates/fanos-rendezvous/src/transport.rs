@@ -417,6 +417,101 @@ mod tests {
         );
     }
 
+    /// **How long one `seal_reply` takes — the number #248 turns on.**
+    ///
+    /// `rendezvous_host`'s driver loop is the sole owner of `rservice`, so the `seal_rx` arm and the
+    /// `deliveries.recv()` arm are branches of one `select!`: while a reply is being sealed, no new request
+    /// is accepted. Whether that is a defect or a theoretical quibble is entirely a question of this
+    /// duration, and nothing had ever measured it — so any restructuring of that loop would have been
+    /// justified by taste.
+    ///
+    /// A `measure_` name: it prints for a person and never gates (the convention the workspace gate skips by
+    /// `--skip measure_`). Run it with `cargo test -p fanos-rendezvous measure_ -- --nocapture` on a quiet
+    /// box; a loaded one measures the box.
+    ///
+    /// Both branches, because they are different work: the legacy path is one threshold onion, the NOSTOS
+    /// path adds an end-to-end hybrid-KEM seal to the client's reply key on top of it, and production takes
+    /// the second.
+    #[test]
+    fn measure_the_cost_of_sealing_one_reply() {
+        use std::time::Instant as Clock;
+
+        const ROUNDS: u32 = 50;
+        let hop = line(3);
+        let rp = line(2);
+
+        let bind = |reply_pub: Vec<u8>, tag: &[u8]| {
+            let mut svc = RendezvousService::<F2>::new(fano_directory(), 2, tag);
+            let cookie = *b"a-client-cookie!";
+            let req = Request {
+                cookie,
+                service_tag: [0; 32],
+                reply_circuit: vec![hop, rp],
+                payload: b"inner".to_vec(),
+                reply_pub,
+            }
+            .encode();
+            svc.ingest(&req).expect("the request binds");
+            (svc, cookie)
+        };
+
+        let (_, reply_pub) = session_reply_keypair(b"a-measured-client");
+        for (name, mut svc, cookie) in [
+            ("legacy (cookie-tagged onion)", bind(vec![], b"legacy").0, *b"a-client-cookie!"),
+            ("NOSTOS (e2e seal + onion)", bind(reply_pub, b"nostos").0, *b"a-client-cookie!"),
+        ] {
+            // One warm-up outside the timer: the first call pays lazy allocation this measurement is not about.
+            let _ = svc.seal_reply(&cookie, b"a typical reply payload");
+            let start = Clock::now();
+            for _ in 0..ROUNDS {
+                let sealed = svc.seal_reply(&cookie, b"a typical reply payload");
+                assert!(sealed.is_some(), "{name}: the measurement must be of work that happened");
+            }
+            let each = start.elapsed() / ROUNDS;
+            println!(
+                "MEASURE seal_reply {name}: {:>8.1} us each over {ROUNDS} rounds  =>  {:.0} replies/s on one \
+                 core, which is the ceiling on how fast rendezvous_host's loop can also ACCEPT requests (#248)",
+                each.as_secs_f64() * 1e6,
+                1.0 / each.as_secs_f64()
+            );
+        }
+
+        // **The other branch of the same `select!`, because a ratio needs both terms.** Calling the reply
+        // path "head-of-line blocking" only means something if accepting a request is CHEAP; if ingest costs
+        // the same, the loop is crypto-bound on both sides and splitting it buys one core, not a pathology
+        // removed. Nothing had compared them.
+        // A DISTINCT cookie per round. Re-ingesting one already bound measures the WARM path — the first
+        // attempt read 0.1 us and that was the route table answering "known", not a route being bound. A
+        // number is a claim about the measurement before it is a claim about the code.
+        let mut svc = RendezvousService::<F2>::new(fano_directory(), 2, b"ingest");
+        let requests: Vec<Vec<u8>> = (0..ROUNDS)
+            .map(|i| {
+                let mut cookie = *b"measured-cookie!";
+                cookie[0..4].copy_from_slice(&i.to_le_bytes());
+                Request {
+                    cookie,
+                    service_tag: [0; 32],
+                    reply_circuit: vec![hop, rp],
+                    payload: b"inner".to_vec(),
+                    reply_pub: vec![],
+                }
+                .encode()
+            })
+            .collect();
+        let start = Clock::now();
+        for req in &requests {
+            assert!(svc.ingest(req).is_some(), "the measurement must be of work that happened");
+        }
+        let each = start.elapsed() / ROUNDS;
+        println!(
+            "MEASURE ingest, FIRST CONTACT (the ACCEPT branch):  {:>8.1} us each over {ROUNDS} rounds. The \
+             ratio against seal_reply is what decides #248's head-of-line reading. NOTE: `open_forwarded`, \
+             the dead-drop opening that runs BEFORE ingest on the same branch, is NOT measured here and is \
+             the other half of the accept cost.",
+            each.as_secs_f64() * 1e6
+        );
+    }
+
     #[test]
     fn ingest_binds_the_cookie_and_unknown_cookies_have_no_reply() {
         let dir = fano_directory();
