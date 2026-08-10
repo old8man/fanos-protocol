@@ -437,6 +437,10 @@ mod tests {
         use std::time::Instant as Clock;
 
         const ROUNDS: u32 = 50;
+
+        // What this reading is worth, before the reading itself (#255): a µs figure with no host
+        // beside it gets quoted, and a busy box measures the box.
+        println!("{}", fanos_testkit::measurement_conditions());
         let hop = line(3);
         let rp = line(2);
 

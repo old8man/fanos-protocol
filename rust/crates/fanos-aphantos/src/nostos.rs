@@ -289,6 +289,10 @@ mod tests {
         /// and not the other way round. A measurement, not a bound — nothing derives from this copy.
         const RING: usize = 2;
 
+        // What this reading is worth, before the reading itself (#255): a µs figure with no host
+        // beside it gets quoted, and a busy box measures the box.
+        println!("{}", fanos_testkit::measurement_conditions());
+
         let ring: Vec<(ReplyKeys, HybridKemPublic)> =
             (0..RING).map(|i| ReplyKeys::generate(&[b'e', i as u8])).collect();
         // Sealed to the key the walk reaches LAST, so the hit costs the whole ring. Sealing to the first —

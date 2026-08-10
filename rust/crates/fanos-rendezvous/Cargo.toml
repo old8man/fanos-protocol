@@ -27,5 +27,9 @@ fanos-primitives.workspace = true
 fanos-wire.workspace = true
 fanos-wire-derive.workspace = true
 
+[dev-dependencies]
+# The measurement-conditions stamp: a wall-clock number must publish what it is worth (#255).
+fanos-testkit = { path = "../fanos-testkit" }
+
 [lints]
 workspace = true

@@ -74,6 +74,39 @@ pub fn require_quiet_host(what: &str) {
     );
 }
 
+/// **What a wall-clock number taken right now is worth** — one line a timing measurement prints before its
+/// readings (#255).
+///
+/// Not [`require_quiet_host`], and the difference is the point. That one *declines*, which is right for a
+/// liveness assertion: a starved box and a defect look the same, so the honest answer is INCONCLUSIVE. A
+/// measurement is not an assertion — it exists to be read — so refusing to produce a number is worse than
+/// producing one, and what it owes instead is its own conditions. A µs figure with no host beside it gets
+/// quoted; this tree has been burned twice by exactly that (a gauge wrong by 81.7×, and load figures that
+/// turned out to be the measurer's own leaked processes).
+///
+/// Only timing readings need it. A correlation, a linkability count or a roster size over a seeded simulator
+/// is the same on any box, and stamping those would be ceremony that teaches a reader to skip the line.
+///
+/// The verdict is against [`QUIET_ENOUGH`], the same floor `require_quiet_host` declines below — imported,
+/// not restated, so the two can never drift into disagreeing about what "quiet" means.
+#[must_use]
+pub fn measurement_conditions() -> String {
+    let cores = u32::try_from(std::thread::available_parallelism().map_or(1, NonZeroUsize::get)).unwrap_or(1);
+    let load = read_load_average();
+    let share = cpu_share();
+    let load_text = load.map_or_else(|| "unknown".to_owned(), |l| format!("{l:.2}"));
+    let verdict = if load.is_none() {
+        "load UNREADABLE on this host, so the numbers below carry no conditions at all — treat them as \
+         anecdote until re-taken somewhere the load can be read"
+    } else if share >= QUIET_ENOUGH {
+        "at or above the quiet floor, so the numbers below are a fair reading of this machine"
+    } else {
+        "BELOW the quiet floor — the numbers below measure the BOX, not the code, and must not be quoted as \
+         a cost of the implementation"
+    };
+    format!("CONDITIONS {cores} cores, load {load_text}, share {share:.2}/core (floor {QUIET_ENOUGH:.2}): {verdict}")
+}
+
 /// How many times to re-measure before declining.
 ///
 /// The load average this reads is a **one-minute** average, so successive samples inside a minute are not

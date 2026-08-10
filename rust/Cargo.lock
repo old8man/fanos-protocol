@@ -908,6 +908,7 @@ dependencies = [
  "fanos-ports",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-testkit",
  "fanos-threshold",
  "fanos-wire",
  "proptest",
@@ -1271,6 +1272,7 @@ dependencies = [
  "fanos-nyx",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-testkit",
  "fanos-wire",
  "fanos-wire-derive",
 ]
@@ -1328,6 +1330,7 @@ dependencies = [
  "fanos-rendezvous",
  "fanos-runtime",
  "fanos-telemetry",
+ "fanos-testkit",
  "fanos-thesauros",
  "fanos-vrf",
  "fanos-wire",

@@ -32,6 +32,8 @@ fanos-threshold = { workspace = true, features = [] }
 rand_core.workspace = true
 
 [dev-dependencies]
+# The measurement-conditions stamp: a wall-clock number must publish what it is worth (#255).
+fanos-testkit = { path = "../fanos-testkit" }
 proptest.workspace = true
 
 [lints]

@@ -44,6 +44,8 @@ name = "fanos-sim-experiment"
 path = "src/bin/experiment.rs"
 
 [dev-dependencies]
+# The measurement-conditions stamp: a wall-clock number must publish what it is worth (#255).
+fanos-testkit = { path = "../fanos-testkit" }
 proptest.workspace = true
 # For the DIAULOS-over-overlay scenario (a reliable encrypted session over the datagram transport).
 fanos-diaulos.workspace = true

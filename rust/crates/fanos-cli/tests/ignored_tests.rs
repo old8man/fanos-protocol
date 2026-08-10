@@ -185,6 +185,97 @@ fn every_retracted_metric_is_declared_and_still_says_so_at_the_test() {
     }
 }
 
+/// Markers that make a diagnostic's output **host-dependent**: it reads a clock and reports what it read.
+///
+/// Deliberately about the clock rather than about the name. `sweep_timing_correlation_against_the_mix_delay`
+/// has "timing" in its name and is not host-dependent at all — it correlates events in the simulator's
+/// *virtual* time, so a seeded run gives the same answer on any box. Three of eighteen diagnostics actually
+/// read a wall clock, and stamping the other fifteen would teach a reader to skip the line.
+const WALL_CLOCK: [&str; 4] = ["Instant::now()", ".elapsed()", "as_micros", "as_secs_f"];
+
+/// **A wall-clock measurement publishes what its number is worth (#255).**
+///
+/// A µs figure with no host beside it gets quoted, and this tree has been burned twice by exactly that — a
+/// viability gauge wrong by 81.7×, and load figures that turned out to be the measurer's own leaked
+/// processes. The fix is not `require_quiet_host`, which *declines*: declining is right for a liveness
+/// assertion, where a starved box and a defect are indistinguishable, and wrong for a measurement, whose
+/// whole job is to produce a number a person reads. What it owes instead is its conditions, printed beside
+/// the reading — `fanos_testkit::measurement_conditions`.
+///
+/// This is what makes an executor for #255 safe to build: the job can publish output that says, per
+/// measurement, whether the machine it ran on could support the claim.
+#[test]
+fn every_wall_clock_measurement_states_the_conditions_it_was_taken_under() {
+    let myself = fanos_testkit::corpus::workspace_root().join(file!()).canonicalize().ok();
+    let mut checked = 0usize;
+    let mut bare = Vec::new();
+
+    for src in rust_sources() {
+        if src.path.canonicalize().ok() == myself {
+            continue; // this file names the markers in order to look for them
+        }
+        for (name, body) in measurement_bodies(&src.text) {
+            if !WALL_CLOCK.iter().any(|m| body.contains(m)) {
+                continue; // host-independent: a correlation or a count over a seeded simulator
+            }
+            checked += 1;
+            if !body.contains("measurement_conditions()") {
+                bare.push(format!("{name} ({})", src.rel));
+            }
+        }
+    }
+
+    assert!(checked > 0, "no wall-clock measurement found at all — the marker set has stopped matching");
+    assert!(
+        bare.is_empty(),
+        "these measurements report a wall-clock number and never say what it is worth: {bare:#?}\n\
+         Print `fanos_testkit::measurement_conditions()` before the reading. A duration published with no \
+         host beside it is quoted as a cost of the code, and on a shared runner it is a cost of the runner."
+    );
+}
+
+/// Each measurement-named **test** in `text`, with its body — for a rule that has to look at what the test
+/// DOES rather than at what it is called.
+///
+/// **The prefix is a convention about test names, and production code shares the words.** The first version
+/// of this dropped the attribute check and immediately reported `sweep_idle_sessions`, a shipping function in
+/// `rendezvous_host.rs` that times nothing and prints nothing. `probe_point`, `probe_index_of` and
+/// `sweep_expired` are the same shape. Requiring a test attribute above the `fn` is what makes the population
+/// the one [`MEASUREMENT_PREFIXES`] is about.
+fn measurement_bodies(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for prefix in MEASUREMENT_PREFIXES {
+        for (before, chunk) in text.split(&format!("fn {prefix}")).zip(text.split(&format!("fn {prefix}")).skip(1))
+        {
+            // The attribute block immediately above, and nothing further back than the last blank line.
+            let attrs = before.rsplit("\n\n").next().unwrap_or_default();
+            if !attrs.contains("#[test") && !attrs.contains("#[tokio::test") {
+                continue;
+            }
+            let Some(name) = chunk.split(['(', '<']).next() else { continue };
+            // Brace-matched, so a later function in the same file is not read as part of this one.
+            let Some(open) = chunk.find('{') else { continue };
+            let mut depth = 0i32;
+            let mut end = chunk.len();
+            for (i, c) in chunk[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push((format!("{prefix}{name}"), chunk[open..end].to_owned()));
+        }
+    }
+    out
+}
+
 /// The reverse direction: every declared cost-gated assertion still exists, and none of them is named like a
 /// measurement — otherwise the `--skip` selection would silently drop it.
 #[test]

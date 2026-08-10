@@ -1688,6 +1688,9 @@ mod tests {
     async fn probe_loss_tolerance_of_the_composition() {
         use fanos_field::F2;
         use fanos_node::RoleSet;
+        // This probe prints `started.elapsed()`, so it is a wall-clock reading like the two in
+        // fanos-rendezvous and fanos-aphantos — and it owes the same statement of conditions (#255).
+        println!("{}", fanos_testkit::measurement_conditions());
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         for loss in [0u8, 10, 25, 50, 75, 90] {
             let started = std::time::Instant::now();
