@@ -9,7 +9,6 @@
 //! forget it. What the eleventh *publisher* could forget is calling it at all, which is what this ratchet is
 //! for: a `put_ephemeral` in this crate that no `note_publish` follows is a new silent directory.
 
-use std::path::Path;
 
 use fanos_node::{Directory, Gate};
 
@@ -23,23 +22,15 @@ use fanos_node::{Directory, Gate};
 ///
 /// A false positive is the right direction for this to fail in, and it did.
 fn sources() -> Vec<(String, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs")
-                && let Ok(text) = std::fs::read_to_string(&p)
-            {
-                // The shared slice (#252): the old form cut at the first `#[cfg(test)]` and lost any
-                // shipping code below it.
-                out.push((p.display().to_string(), fanos_testkit::source::production_part(&text)));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").as_path(), &mut out);
+    // The shared corpus (#253) and the shared slice (#252): one walk that reports its coverage, and one
+    // definition of "shipping code" — the old form here cut at the first `#[cfg(test)]` and lost anything
+    // below it, and skipped in silence any file it could not open.
+    let out: Vec<(String, String)> = fanos_testkit::corpus::rust_sources()
+        .into_iter()
+        .filter(|s| s.krate == "fanos-node" && s.is_crate_src())
+        .map(|s| (s.rel, fanos_testkit::source::production_part(&s.text)))
+        .collect();
+    assert!(!out.is_empty(), "fanos-node contributed no source — the filter, not the crate, is empty");
     out
 }
 

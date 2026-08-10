@@ -12,6 +12,8 @@
 //! holds two of the three known load-sensitive tests — could not reach it at all. A guard that the paths
 //! needing it most cannot call is the same shape as a guard those paths simply do not call (#87).
 
+pub mod corpus;
+
 use std::num::NonZeroUsize;
 use std::time::Duration;
 

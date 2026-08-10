@@ -14,7 +14,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+
+use fanos_testkit::corpus::rust_sources;
 
 /// Name prefixes that mark a test as a measurement rather than an assertion.
 const MEASUREMENT_PREFIXES: [&str; 3] = ["measure_", "probe_", "sweep_"];
@@ -54,8 +55,11 @@ const COST_GATED: &[&str] = &[
 ];
 
 /// Every `#[ignore]`d test in a file, by the name of the function that follows the attribute.
-fn ignored_in(path: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+///
+/// Takes the already-read text rather than a path: a read that fails here used to yield an empty string, so
+/// the one file this guard could not open contributed zero ignored tests and the guard stayed green about it
+/// (#253). [`rust_sources`] does the reading, and refuses to hand over a file it could not open.
+fn ignored_in(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
@@ -77,26 +81,7 @@ fn ignored_in(path: &Path) -> Vec<String> {
     names
 }
 
-/// Every `.rs` file under `crates/`, so a test added anywhere is covered.
-fn sources() -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != "target") {
-                    stack.push(path);
-                }
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
+
 
 /// Every ignored test is a measurement by name, or a declared cost-gated assertion — never neither.
 ///
@@ -108,12 +93,12 @@ fn every_ignored_test_declares_whether_it_is_a_measurement_or_a_cost_gated_asser
     let declared: BTreeSet<&str> = COST_GATED.iter().copied().collect();
     let mut found = 0usize;
     let mut unclassified = Vec::new();
-    for path in sources() {
-        for name in ignored_in(&path) {
+    for src in rust_sources() {
+        for name in ignored_in(&src.text) {
             found += 1;
             let is_measurement = MEASUREMENT_PREFIXES.iter().any(|p| name.starts_with(p));
             if !is_measurement && !declared.contains(name.as_str()) {
-                unclassified.push(format!("{name} ({})", path.display()));
+                unclassified.push(format!("{name} ({})", src.rel));
             }
         }
     }
@@ -130,8 +115,8 @@ fn every_ignored_test_declares_whether_it_is_a_measurement_or_a_cost_gated_asser
 #[test]
 fn the_cost_gated_list_matches_the_tests_that_exist() {
     let mut all = BTreeSet::new();
-    for path in sources() {
-        all.extend(ignored_in(&path));
+    for src in rust_sources() {
+        all.extend(ignored_in(&src.text));
     }
     for name in COST_GATED {
         assert!(

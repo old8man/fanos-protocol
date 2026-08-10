@@ -20,24 +20,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::{Path, PathBuf};
+use fanos_testkit::corpus::rust_sources;
 
-fn rust_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
-}
-
-/// Every `.rs` file under a directory, recursively.
-fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// The lines of `text` that are neither documentation nor inside the file's test module.
 ///
@@ -64,18 +48,18 @@ fn is_the_derivation_fallback(line: &str) -> bool {
 
 #[test]
 fn nothing_in_a_running_node_picks_its_network_by_naming_the_constant() {
-    let root = rust_root().join("crates/fanos-node/src");
-    let mut files = Vec::new();
-    sources(&root, &mut files);
-    assert!(files.len() > 20, "the source scan found {} files — it is looking in the wrong place", files.len());
+    // The corpus reports its own coverage — every crate reached, every file actually read (#253). The
+    // `files.len() > 20` this used to carry was a number someone picked; the shared walk derives the floor
+    // from the workspace layout instead, and a read that fails is fatal rather than skipped.
+    let files: Vec<_> =
+        rust_sources().into_iter().filter(|s| s.krate == "fanos-node" && s.is_crate_src()).collect();
+    assert!(!files.is_empty(), "fanos-node contributed no source — the filter, not the crate, is empty");
 
     let mut offenders = Vec::new();
     for file in &files {
-        let text = std::fs::read_to_string(file).unwrap();
-        for (n, line) in production_lines(&text) {
+        for (n, line) in production_lines(&file.text) {
             if line.contains("BeaconSeed::GENESIS") && !is_the_derivation_fallback(line) {
-                let rel = file.strip_prefix(rust_root()).unwrap_or(file);
-                offenders.push(format!("{}:{n}: {line}", rel.display()));
+                offenders.push(format!("{}:{n}: {line}", file.rel));
             }
         }
     }
@@ -99,19 +83,13 @@ fn nothing_in_a_running_node_picks_its_network_by_naming_the_constant() {
 /// grinding — the exact failure the derivation exists to prevent.
 #[test]
 fn the_genesis_seed_has_exactly_one_derivation() {
-    let root = rust_root().join("crates");
-    let mut files = Vec::new();
-    sources(&root, &mut files);
-
     let label = "FANOS-v1/genesis-beacon";
     let mut sites = Vec::new();
     // Shipping code only: this file names the label too, and a test that counts itself never passes.
-    for file in files.iter().filter(|f| f.components().any(|c| c.as_os_str() == "src")) {
-        let text = std::fs::read_to_string(file).unwrap();
-        for (n, line) in production_lines(&text) {
+    for file in rust_sources().iter().filter(|f| f.is_crate_src()) {
+        for (n, line) in production_lines(&file.text) {
             if line.contains(label) && !line.starts_with('*') {
-                let rel = file.strip_prefix(rust_root()).unwrap_or(file);
-                sites.push(format!("{}:{n}", rel.display()));
+                sites.push(format!("{}:{n}", file.rel));
             }
         }
     }

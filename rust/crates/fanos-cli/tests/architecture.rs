@@ -10,6 +10,7 @@
 //! A closure computed over the manifests cannot make that mistake, and a test cannot go stale quietly.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+use fanos_testkit::corpus::{RustSource, rust_sources as corpus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -395,24 +396,13 @@ fn no_source_scan_rolls_its_own_test_block_slice() {
     let home = root.join("crates/fanos-testkit/src/lib.rs");
 
     let mut offenders: Vec<String> = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != "target") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") || path == home {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            for (n, line) in src.lines().enumerate() {
-                if line.contains(&needle) && !line.trim_start().starts_with("//") {
-                    offenders.push(format!("{}:{}", path.strip_prefix(&root).unwrap_or(&path).display(), n + 1));
-                }
+    for file in corpus() {
+        if file.path == home {
+            continue;
+        }
+        for (n, line) in file.text.lines().enumerate() {
+            if line.contains(&needle) && !line.trim_start().starts_with("//") {
+                offenders.push(format!("{}:{}", file.rel, n + 1));
             }
         }
     }
@@ -526,33 +516,11 @@ fn calls(hay: &str, name: &str) -> bool {
 
 /// Every `crates/*/src/**/*.rs`, as `(crate name, production text)`.
 fn production_sources() -> Vec<(String, String)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && path.components().any(|c| c.as_os_str() == "src")
-            {
-                let Some(krate) = path
-                    .strip_prefix(root.join("crates"))
-                    .ok()
-                    .and_then(|p| p.components().next())
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                else {
-                    continue;
-                };
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    out.push((krate, code_only(&text)));
-                }
-            }
-        }
-    }
-    out
+    corpus()
+        .into_iter()
+        .filter(RustSource::is_crate_src)
+        .map(|s| (s.krate, code_only(&s.text)))
+        .collect()
 }
 
 /// The unwired public functions, by crate.
@@ -713,12 +681,11 @@ fn every_crate_directory_is_a_workspace_member() {
 /// and nothing about 0.25. Those are #45's real content and they need judgement, one at a time.
 #[test]
 fn every_numeric_constant_carries_a_comment() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
     let mut undocumented = Vec::new();
     let mut total = 0usize;
-    for file in rust_sources(&root.join("crates")) {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let text = production_part(&text); // one slice for every guard (#252)
+    // One walk that reports what it reached (#253) and one slice that defines shipping code (#252).
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        let text = production_part(&file.text);
         let lines: Vec<&str> = text.lines().collect();
         let stop = lines.len();
         let mut run = false;
@@ -747,8 +714,7 @@ fn every_numeric_constant_carries_a_comment() {
             if commented || run {
                 run = true;
             } else if numeric {
-                let rel = file.strip_prefix(&root).unwrap_or(&file).display();
-                undocumented.push(format!("{rel}:{} {name}", i + 1));
+                undocumented.push(format!("{}:{} {name}", file.rel, i + 1));
             }
         }
     }
@@ -809,12 +775,11 @@ fn no_subsystem_declares_its_memory_share_as_a_literal() {
     let crates = root.join("crates");
     let budget_path = crates.join("fanos-primitives/src/budget.rs");
 
-    for path in rust_sources(&crates) {
-        if path == budget_path {
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        if file.path == budget_path {
             continue; // the register may not count itself (#227's rule)
         }
-        let Ok(src) = std::fs::read_to_string(&path) else { continue };
-        for line in code_only(&src).lines() {
+        for line in code_only(&file.text).lines() {
             let Some(name) = const_name(line) else { continue };
             if !name.ends_with("_MEMORY_BUDGET") {
                 continue;
@@ -825,7 +790,7 @@ fn no_subsystem_declares_its_memory_share_as_a_literal() {
                 "{name} in {} is declared as `{value}` instead of taking its share from \
                  `fanos_primitives::budget`. Two numbers for one quantity is how #213 happened: three \
                  subsystems each sized their share against the same 256 MiB and no one could see the sum.",
-                path.strip_prefix(&root).unwrap_or(&path).display()
+                file.rel
             );
         }
     }
@@ -844,16 +809,15 @@ fn every_memory_budget_in_the_tree_is_one_of_the_summed_shares() {
     let budget = std::fs::read_to_string(&budget_path).expect("the budget module is readable");
 
     let mut found: Vec<String> = Vec::new();
-    for path in rust_sources(&crates) {
-        if path == budget_path {
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        if file.path == budget_path {
             continue; // the register may not count itself (#227's rule)
         }
-        let Ok(src) = std::fs::read_to_string(&path) else { continue };
-        for line in code_only(&src).lines() {
+        for line in code_only(&file.text).lines() {
             if let Some(name) = const_name(line)
                 && name.ends_with("_MEMORY_BUDGET")
             {
-                found.push(format!("{name} ({})", path.strip_prefix(&root).unwrap_or(&path).display()));
+                found.push(format!("{name} ({})", file.rel));
                 assert!(
                     budget.contains(name),
                     "{name} reserves a share of the node's memory and `fanos_primitives::budget` has never \
@@ -874,27 +838,6 @@ fn every_memory_budget_in_the_tree_is_one_of_the_summed_shares() {
          be the same list, or the sum is over a subset nobody chose.",
         found.len()
     );
-}
-
-/// Every `.rs` under a crate's `src/`.
-fn rust_sources(crates: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![crates.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for e in entries.filter_map(Result::ok) {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|x| x == "rs")
-                && p.components().any(|c| c.as_os_str() == "src")
-            {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    out
 }
 
 /// The name of the constant this line declares, if it declares one.
@@ -1360,13 +1303,13 @@ const JUSTIFIED: &str = "literal-seed-ok:";
 /// in which the key is a constant in the binary.
 #[test]
 fn no_key_material_is_built_from_a_literal() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
     let literal_arg = regex_literal_arg();
     let (mut examined, mut calls, mut justified) = (0usize, 0usize, 0usize);
     let mut offenders = Vec::new();
-    for file in rust_sources(&root.join("crates")) {
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
-        let ships = production_part(&text);
+    // The corpus reads; a file it could not open is fatal there rather than an empty `text` here, which is
+    // what `unwrap_or_default` used to turn an unreadable file into — zero key sites, silently (#253).
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        let ships = production_part(&file.text);
         examined += 1;
         let lines: Vec<&str> = ships.lines().collect();
         for (i, line) in lines.iter().enumerate() {
@@ -1387,7 +1330,7 @@ fn no_key_material_is_built_from_a_literal() {
                 justified += 1;
                 continue;
             }
-            offenders.push(format!("{}:{}  {}", file.display(), i + 1, line.trim()));
+            offenders.push(format!("{}:{}  {}", file.rel, i + 1, line.trim()));
         }
     }
     // **Floors first, ratchets last, and the order is load-bearing.** These two say the scan can see; a scan

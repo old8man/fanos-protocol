@@ -19,6 +19,8 @@
 
 use std::path::PathBuf;
 
+use fanos_testkit::corpus::rust_sources;
+
 /// Constructors that assemble a node engine. Seeing one outside `composition.rs` means a second assembly path
 /// has appeared, which is how the two sides drifted in the first place.
 ///
@@ -96,28 +98,18 @@ fn workspace() -> PathBuf {
 
 /// Every `.rs` file of `crate_name`, excluding the file that is allowed to assemble.
 fn sources_of(crate_name: &str) -> Vec<(PathBuf, String)> {
-    let root = workspace().join("crates").join(crate_name).join("src");
-    let allowed = root.join("composition.rs");
-    let mut out = Vec::new();
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && path != allowed
-                && !path
-                    .file_name()
-                    .is_some_and(|n| TOPOLOGY_FIXTURES.iter().any(|(f, _)| std::ffi::OsStr::new(f) == n))
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                out.push((path, text));
-            }
-        }
-    }
-    out
+    // The shared corpus (#253): it reports what it reached and refuses a file it could not open, so the
+    // exemptions below are the only reason a file is missing — which is what makes them reviewable.
+    let allowed = workspace().join("crates").join(crate_name).join("src/composition.rs");
+    rust_sources()
+        .into_iter()
+        .filter(|s| s.krate == crate_name && s.is_crate_src())
+        .filter(|s| s.path != allowed)
+        .filter(|s| {
+            !s.path.file_name().is_some_and(|n| TOPOLOGY_FIXTURES.iter().any(|(f, _)| std::ffi::OsStr::new(f) == n))
+        })
+        .map(|s| (s.path, s.text))
+        .collect()
 }
 
 /// Lines that are neither comments nor inside a `#[cfg(test)]` module — a test may build whatever it needs to
@@ -212,25 +204,7 @@ const ROLE_BRANCHES: &[&str] = &[
 /// scenario standing up a bare cell is the defect this file exists to prevent, not a unit test exercising one
 /// layer in isolation.
 fn all_sim_files() -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    let mut stack = vec![
-        workspace().join("crates/fanos-sim/src"),
-        workspace().join("crates/fanos-sim/tests"),
-    ];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && let Ok(text) = std::fs::read_to_string(&path)
-            {
-                out.push((path, text));
-            }
-        }
-    }
-    out
+    rust_sources().into_iter().filter(|s| s.krate == "fanos-sim").map(|s| (s.path, s.text)).collect()
 }
 
 /// Lines that are not comments. Unlike [`shipping_lines`] this keeps `#[cfg(test)]` modules, because in

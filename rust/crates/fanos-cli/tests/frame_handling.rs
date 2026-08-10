@@ -20,6 +20,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use fanos_testkit::corpus::{RustSource, rust_sources};
+
 /// Frames deliberately sent with **no reader**, each with the reason it is sound.
 ///
 /// A short list on purpose. "Fire-and-forget" is a real design, but it is a claim about the protocol that has to
@@ -48,27 +50,7 @@ const SEND_ONLY: &[(&str, &str)] = &[(
 /// below. The intended steady state is empty.
 const RESERVED_UNIMPLEMENTED: &[(&str, &str)] = &[];
 
-/// Every `.rs` file under `crates/`, so a handler added anywhere counts.
-fn sources() -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != "target") {
-                    stack.push(path);
-                }
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
+/// Every `.rs` file under `crates/`, so a handler added anywhere counts — read through the shared corpus,
 /// The path of the file that *defines* `FrameType` — excluded when looking for handlers, since the definition
 /// and its own decoder mention every variant by construction.
 fn definition() -> PathBuf {
@@ -104,23 +86,22 @@ fn variants() -> Vec<String> {
 /// Comment lines are skipped, and that is not a detail: the first version of this check called `HelloAck`
 /// handled because a **doc link** — ``[`HelloAck`](crate::frame::FrameType::HelloAck)`` — matched the pattern.
 /// A reachability check that counts prose is worse than none, because it reports coverage that does not exist.
-fn is_handled(variant: &str, files: &[PathBuf]) -> bool {
+fn is_handled(variant: &str, files: &[RustSource]) -> bool {
     let def = definition();
     let arm = format!("FrameType::{variant})");
     let arrow = format!("FrameType::{variant} =>");
-    files.iter().filter(|p| **p != def).any(|p| {
-        std::fs::read_to_string(p).is_ok_and(|text| {
-            text.lines()
-                .map(str::trim_start)
-                .filter(|line| !line.starts_with("//"))
-                .any(|line| line.contains(&arm) || line.contains(&arrow))
-        })
+    files.iter().filter(|s| s.path != def).any(|s| {
+        s.text
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .any(|line| line.contains(&arm) || line.contains(&arrow))
     })
 }
 
 #[test]
 fn every_frame_type_is_handled_or_declared_unhandled_with_a_reason() {
-    let files = sources();
+    let files = rust_sources();
     let send_only: BTreeSet<&str> = SEND_ONLY.iter().map(|(n, _)| *n).collect();
     let reserved: BTreeSet<&str> = RESERVED_UNIMPLEMENTED.iter().map(|(n, _)| *n).collect();
 
@@ -146,7 +127,7 @@ fn every_frame_type_is_handled_or_declared_unhandled_with_a_reason() {
 fn the_declared_exceptions_are_still_exceptions() {
     // The reverse direction, and the one that keeps the lists honest: a frame that has *since been given* a
     // handler must come off the exception list, or the list becomes a place where truth goes to rot.
-    let files = sources();
+    let files = rust_sources();
     let mut now_handled = Vec::new();
     for (name, _) in SEND_ONLY.iter().chain(RESERVED_UNIMPLEMENTED) {
         if is_handled(name, &files) {
