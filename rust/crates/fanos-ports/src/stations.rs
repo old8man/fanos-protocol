@@ -497,6 +497,19 @@ pub enum Station {
     /// boundary, close enough to the settled answer to be misread as it.
     SeatCommitted,
 
+    /// An anonymous **RPC request exceeded the bound its host was constructed with**, and was refused (#194).
+    ///
+    /// The `_rpc` conveniences in `fanos_node::rendezvous_host` buffer a whole request before the handler
+    /// sees a byte, and the client sending it is unauthenticated *by construction* — anonymity is the point,
+    /// so there is nobody to hold responsible for a request that never ends. The read used to have no
+    /// ceiling at all; now the caller states one, and this is what a client hitting it looks like.
+    ///
+    /// A rise separates the two readings an operator must act on differently: a service whose legitimate
+    /// clients have outgrown the bound it was given (raise it, and re-do the `bound × MAX_SESSIONS` sum),
+    /// against a service being leaned on by someone who costs nothing to be (the bound is working). Neither
+    /// is visible from a dropped session, which is why the refusal is counted rather than merely taken.
+    HostRequestOverBound,
+
     /// A datagram opened under the **genesis** shape: the sender does not know the cell's live epoch, which
     /// is what a node joining for the first time necessarily looks like (#234).
     ///
@@ -745,6 +758,7 @@ impl Station {
         Self::DirectoryPointTaken,
         Self::DirectorySeatOutranked,
         Self::SeatCommitted,
+        Self::HostRequestOverBound,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
@@ -828,6 +842,7 @@ impl Station {
             Self::DirectoryPointTaken => "directory.point_taken",
             Self::DirectorySeatOutranked => "directory.seat_outranked",
             Self::SeatCommitted => "seat.committed",
+            Self::HostRequestOverBound => "host.request_over_bound",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
@@ -882,6 +897,7 @@ impl Station {
             | Self::DirectoryPointTaken
             | Self::DirectorySeatOutranked
             | Self::SeatCommitted
+            | Self::HostRequestOverBound
             | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable

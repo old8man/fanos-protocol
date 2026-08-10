@@ -357,7 +357,7 @@ pub use fanos_quic::{Environment, Morph, MorphCodec};
 pub use fanos_rendezvous::{BeaconSeed, MixDirectory};
 pub use mix_relay::MixRelay;
 pub use rendezvous_host::{
-    HostedService, HostEpoch, serve_anonymous, serve_anonymous_rpc, spawn_rendezvous_host, spawn_rendezvous_host_rpc,
+    HostedService, HostEpoch, RpcService, serve_anonymous, serve_anonymous_rpc, spawn_rendezvous_host, spawn_rendezvous_host_rpc,
 };
 pub use mixdir::{
     build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,

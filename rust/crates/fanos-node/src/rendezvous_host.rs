@@ -36,6 +36,7 @@ use fanos_pqcrypto::HybridSigSecret;
 use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_quic::Client;
+use fanos_runtime::ports::stations::Station;
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, Epoch, HostRegister, MixDirectory, RendezvousService, SessionId,
     line_member_coords, meeting_lines, seal_host_register,
@@ -279,9 +280,32 @@ pub fn serve_anonymous<R, H, Fut>(
 }
 
 /// The **request/response** convenience over [`serve_anonymous`] (the anonymous mirror of
-/// [`serve_rpc`](crate::diaulos::serve_rpc)): read the whole request (until the client half-closes), call
-/// `handler(&request)`, write the response, and close. Streaming or full-duplex hidden services use
-/// [`serve_anonymous`] directly.
+/// [`serve_rpc`](crate::diaulos::serve_rpc)): read the request up to `max_request` bytes (the client
+/// half-closes to end it), call `handler(&request)`, write the response, and close. Streaming or
+/// full-duplex hidden services use [`serve_anonymous`] directly.
+///
+/// ## Why `max_request` is a positional argument and not a default (#194)
+///
+/// This convenience buffers a whole request in memory before the handler sees a byte, and the client that
+/// sends it is **unauthenticated by construction** — anonymity is the point, so there is nobody to hold
+/// responsible for a request that never ends. Before this the read was `read_to_end` with no bound at all,
+/// and the doc said "read the whole request" without saying that "whole" had no ceiling.
+///
+/// It is mandatory and positional for the reason [`ExitPolicy`](crate::exit::ExitPolicy)'s loopback hatch is
+/// (#170): a limit the caller may omit is a limit production ships without. There is deliberately **no
+/// default constant** here, because the honest value depends on an accounting this crate cannot close for
+/// the caller — see below.
+///
+/// ## What the caller is committing to, stated because it does not currently close
+///
+/// The host admits at most `MAX_SESSIONS` concurrent sessions (`fanos_diaulos::budget::MAX_SESSIONS`,
+/// 246 at the shipping budget), so the worst case this buffer adds is
+/// `max_request × MAX_SESSIONS`. That memory is **on top of** `fanos_diaulos::budget::SESSION_MEMORY_BUDGET`,
+/// which is already spent in full: `MAX_SESSIONS` is *defined* as that budget divided by the transport
+/// queues' per-session cost, with a const assert that the product does not exceed it. So there is no slice
+/// left to derive a default from, and inventing one by halving a neighbour's share is exactly the mistake
+/// `fanos_primitives::budget` exists to prevent. Pick `max_request` from what the *service* needs, and add
+/// `max_request × MAX_SESSIONS` to the node's memory plan yourself.
 pub fn serve_anonymous_rpc<R, H>(
     client: Client,
     keypair: StaticKeypair,
@@ -289,29 +313,89 @@ pub fn serve_anonymous_rpc<R, H>(
     rservice: RendezvousService<F2>,
     reply_keys: Vec<ReplyKeys>,
     epoch_updates: Option<UnboundedReceiver<HostEpoch>>,
-    handler: H,
+    rpc: RpcService<H>,
 ) where
     R: CryptoRng + Send + 'static,
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
+    let RpcService { max_request, handler } = rpc;
     let handler = Arc::new(handler);
+    let stations = client.clone();
     serve_anonymous(client, keypair, rng, rservice, reply_keys, epoch_updates, move |stream| {
-        run_rpc(handler.clone(), stream)
+        run_rpc(handler.clone(), stations.clone(), max_request, stream)
     });
 }
 
-/// Drive one anonymous session in **request/response** shape: read the whole request (until the client
-/// half-closes), call `handler(&request)`, write the response, and close. Shared by the `_rpc`
-/// conveniences so the adapter lives in exactly one place.
-async fn run_rpc<H>(handler: Arc<H>, mut stream: DuplexStream)
+/// A request/response hidden service: **what answers, and what it will spend answering**.
+///
+/// Grouped for the reason [`HostedService`] is, and the file's own history is the argument: threading these
+/// individually reached the `too_many_arguments` ceiling, and a suppressed lint is a place a reviewer stops
+/// reading. But the cohesion is real rather than a workaround — `max_request` exists *only* because
+/// `handler` is fed a whole buffer, so a caller with one and not the other has said nothing complete. A
+/// struct with no `Default` also makes the bound un-omittable, which is the point of #194.
+pub struct RpcService<H> {
+    /// The largest request body assembled before `handler` sees a byte. Read
+    /// [`serve_anonymous_rpc`]'s doc before choosing it: the number commits the node to
+    /// `max_request` × `fanos_diaulos::budget::MAX_SESSIONS` of memory that no existing budget accounts for.
+    pub max_request: usize,
+    /// Produces the response from the whole request.
+    pub handler: H,
+}
+
+/// What reading one anonymous RPC request produced — three answers, because they call for three actions.
+///
+/// Folding `OverBound` into `Broken` would be the shape #109 keeps finding: a refusal the caller cannot
+/// distinguish from a transport that died, so the one that an operator must act on is invisible. Folding it
+/// into `Body` is worse — a truncated request served as a whole one.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestRead {
+    /// A complete request, within the bound.
+    Body(Vec<u8>),
+    /// The client sent more than the bound allows; nothing is served.
+    OverBound,
+    /// The transport failed before the request ended. Not the client's fault and not a refusal.
+    Broken,
+}
+
+/// Read one request, refusing at `max_request` rather than growing to whatever arrives.
+///
+/// **Reads `max_request + 1`, not `max_request`.** Stopping exactly at the bound makes a request that *fits*
+/// indistinguishable from one that was cut off there, and serving a silent prefix of what the client sent is
+/// worse than refusing — neither side can tell. That one extra byte is the whole discriminator, and it is
+/// the only byte ever read past the bound.
+async fn read_bounded(stream: &mut DuplexStream, max_request: usize) -> RequestRead {
+    use tokio::io::AsyncReadExt;
+    let ceiling = u64::try_from(max_request).unwrap_or(u64::MAX).saturating_add(1);
+    let mut request = Vec::new();
+    if stream.take(ceiling).read_to_end(&mut request).await.is_err() {
+        return RequestRead::Broken;
+    }
+    if request.len() > max_request {
+        return RequestRead::OverBound;
+    }
+    RequestRead::Body(request)
+}
+
+/// Drive one anonymous session in **request/response** shape: read the request (bounded by `max_request`,
+/// ended by the client half-closing), call `handler(&request)`, write the response, and close. Shared by the
+/// `_rpc` conveniences so the adapter lives in exactly one place.
+async fn run_rpc<H>(handler: Arc<H>, client: Client, max_request: usize, mut stream: DuplexStream)
 where
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut request = Vec::new();
-    if stream.read_to_end(&mut request).await.is_err() {
-        return;
-    }
+    use tokio::io::AsyncWriteExt;
+    let request = match read_bounded(&mut stream, max_request).await {
+        RequestRead::Body(body) => body,
+        RequestRead::OverBound => {
+            // Counted, not merely dropped: an unauthenticated client can produce this at will, so a rise is
+            // the one reading that separates "a service whose clients outgrew its bound" from "a service
+            // being leaned on" — and an uncounted refusal is indistinguishable from silence (#109).
+            client.record_station(Station::HostRequestOverBound, None, None);
+            tracing::warn!(bound = max_request, "anonymous RPC request exceeds this host's bound; refusing");
+            return;
+        }
+        RequestRead::Broken => return,
+    };
     // **An empty request is an abandoned session, not a request.** A client that hedges across meeting points
     // drops the attempts that lose the race, which closes their transports — so the service reads EOF with
     // nothing in hand. Calling the handler there invents a request the client never sent: measured as one
@@ -434,21 +518,26 @@ where
 }
 
 /// The **request/response** convenience over [`spawn_rendezvous_host`]: each anonymous session's request is
-/// read whole, `handler(&request)` produces the response, and the session closes. A streaming hidden service
-/// (forward each session to a local port) uses [`spawn_rendezvous_host`] directly.
+/// read up to `max_request` bytes, `handler(&request)` produces the response, and the session closes. A
+/// streaming hidden service (forward each session to a local port) uses [`spawn_rendezvous_host`] directly.
+///
+/// [`RpcService::max_request`] carries the same obligation it does on [`serve_anonymous_rpc`], and for the
+/// same reason: read that function's doc before choosing a number.
 pub fn spawn_rendezvous_host_rpc<H>(
     client: Client,
     coord: Triple,
     hosted: HostedService,
     initial: (Epoch, [u8; 32]),
-    handler: H,
+    rpc: RpcService<H>,
 ) -> JoinHandle<()>
 where
     H: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
 {
+    let RpcService { max_request, handler } = rpc;
     let handler = Arc::new(handler);
+    let stations = client.clone();
     spawn_rendezvous_host(client, coord, hosted, initial, move |stream| {
-        run_rpc(handler.clone(), stream)
+        run_rpc(handler.clone(), stations.clone(), max_request, stream)
     })
 }
 
@@ -696,6 +785,33 @@ where
 mod tests {
     use super::*;
     use fanos_aphantos::nostos::seal_to_receiver;
+
+    /// The bound's three answers, at the boundary itself (#194).
+    ///
+    /// `max` and `max + 1` are the only pair that can distinguish a working bound from an off-by-one, and
+    /// the `max` case is the one that matters most: a limit that refuses a request which *fits* is a service
+    /// that looks broken to its own clients, and would be blamed on the network rather than on this line.
+    #[tokio::test]
+    async fn a_request_is_refused_at_one_byte_past_the_bound_and_served_at_the_bound() {
+        const BOUND: usize = 64;
+        for (len, want) in [
+            (BOUND - 1, RequestRead::Body(vec![7u8; BOUND - 1])),
+            (BOUND, RequestRead::Body(vec![7u8; BOUND])),
+            (BOUND + 1, RequestRead::OverBound),
+        ] {
+            // Written and half-closed before the read, with a pipe wider than the largest case: no task, so
+            // no reason for this to want a multi-threaded runtime (#201). The client's shutdown is what
+            // ends the request, exactly as a real one does.
+            let (mut host, mut client) = tokio::io::duplex(4 * BOUND);
+            {
+                use tokio::io::AsyncWriteExt;
+                client.write_all(&vec![7u8; len]).await.unwrap();
+                client.shutdown().await.unwrap();
+            }
+            let got = read_bounded(&mut host, BOUND).await;
+            assert_eq!(got, want, "a {len}-byte request against a bound of {BOUND}");
+        }
+    }
 
     /// Both directions of the registration gate, which is the only way to tell a working refusal from one
     /// that never registers at all.

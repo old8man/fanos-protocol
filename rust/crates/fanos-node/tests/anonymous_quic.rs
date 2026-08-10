@@ -59,9 +59,18 @@ use fanos_geometry::{Line, Point};
 use fanos_keygen::BeaconNode;
 use fanos_node::rendezvous_relay::RendezvousRelay;
 use fanos_node::spawn_mix_directory_feeder;
+/// The request ceiling every hidden service in this file is constructed with (#194).
+///
+/// `serve_anonymous_rpc` takes it positionally and offers no default, because the honest value depends on an
+/// accounting the library cannot close for its caller — see that function's doc. These tests send requests of
+/// a few dozen bytes, so any bound above that exercises the same path; 64 KiB is picked to be visibly larger
+/// than every request here, which is what makes a refusal in these tests a real failure rather than a
+/// too-tight limit.
+const RPC_REQUEST_BOUND: usize = 64 * 1024;
+
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
-    build_cell_mix_directory, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
+    build_cell_mix_directory, RpcService, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, HybridSigSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -431,11 +440,11 @@ async fn a_full_anonymous_session_completes_over_real_quic() {
         rservice,
         vec![svc_reply_keys], // opens the dead-drops its own registration points at
         None,   // no epoch-rotation driver: a fixed single-epoch test
-        |req| {
+        RpcService { max_request: RPC_REQUEST_BOUND, handler: |req: &[u8]| -> Vec<u8> {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
             resp
-        },
+        } },
     );
 
     let client_node = nodes[rp_index].take().unwrap();
@@ -570,11 +579,11 @@ async fn a_fresh_anonymous_session_completes_over_a_cell_of_composites() {
         rservice,
         vec![svc_reply_keys], // opens the dead-drops its own registration points at
         None,   // no epoch-rotation driver: a fixed single-epoch test
-        |req| {
+        RpcService { max_request: RPC_REQUEST_BOUND, handler: |req: &[u8]| -> Vec<u8> {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
             resp
-        },
+        } },
     );
 
     // A different cell node is the anonymous client. Its coordinate is not the service's combiner, so its
@@ -778,12 +787,12 @@ impl OffCombiner {
         rservice,
         vec![host_reply_keys], // the off-combiner host opens forwarded dead-drops with this key
         None,                  // fixed genesis epoch — no rotation driver
-        |req| {
+        RpcService { max_request: RPC_REQUEST_BOUND, handler: |req: &[u8]| -> Vec<u8> {
             SERVED.fetch_add(1, Ordering::Relaxed);
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
             resp
-        },
+        } },
     );
     await_every_meeting_member_binds(
         &mut nodes,
@@ -1369,11 +1378,11 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         // could drift from `TEST_BEACON` and the drift would show up as an unroutable service, not as a
         // failed assertion.
         (epoch, *TEST_BEACON.as_bytes()),
-        |req| {
+        RpcService { max_request: RPC_REQUEST_BOUND, handler: |req: &[u8]| -> Vec<u8> {
             let mut resp = b"anon-quic-200:".to_vec();
             resp.extend_from_slice(req);
             resp
-        },
+        } },
     );
     // Same observable as the manual case: the driver's registration has actually bound at the combiner.
     common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
