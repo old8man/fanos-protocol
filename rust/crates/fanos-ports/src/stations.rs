@@ -330,6 +330,20 @@ pub enum Station {
     /// Keyed by the coordinate we *dialed* — our own resolution, not a value a stranger chose.
     DirectoryStaleCoordinate,
 
+    /// A peer that proved a **different** coordinate had its connection KEPT, filed at the point it proved
+    /// (#264) — the companion to [`DirectoryStaleCoordinate`](Self::DirectoryStaleCoordinate), which counts
+    /// the diagnosis while this counts what was salvaged from it.
+    ///
+    /// **Two counters because the outcomes differ and only one is good.** Every mismatch raises the stale
+    /// counter; this one rises only when the connection became a usable route. It stays flat when a live
+    /// connection already held that point — our new one was redundant and correctly discarded — so
+    /// `stale_coordinate` minus this is the number of moves that cost a connection setup and bought nothing.
+    ///
+    /// Before #264 this was zero by construction: the connection was always dropped, which also closed the
+    /// route the *answering* peer had just filed for us. Keyed by the coordinate the peer PROVED, which is
+    /// the one fact the handshake established.
+    DirectoryMovedPeerRetained,
+
     /// A POROS line rotation **did not arm**: the outgoing roster admits no valid contributor subset at the
     /// line's threshold, so this node prepared nothing and will keep serving on the share it already holds
     /// until that share's epoch expires (#243).
@@ -808,6 +822,7 @@ impl Station {
         Self::RestrictedFrameAdmitted,
         Self::RestrictedFrameDropped,
         Self::DirectoryStaleCoordinate,
+        Self::DirectoryMovedPeerRetained,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
@@ -860,6 +875,7 @@ impl Station {
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
+            Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
@@ -967,6 +983,7 @@ impl Station {
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedFrameDropped
             | Self::DirectoryStaleCoordinate
+            | Self::DirectoryMovedPeerRetained
             | Self::PorosRotationUnarmed
             | Self::DirectorySeatSuperseded
             | Self::DirectoryRouteSuperseded

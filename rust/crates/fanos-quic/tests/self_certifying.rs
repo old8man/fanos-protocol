@@ -195,6 +195,44 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
     );
     // And the coordinate C proved is bound to the address it was proved at.
     assert_eq!(dir.resolve(c.address()), Some(c.local_addr()));
+
+    // **The connection is KEPT, not thrown away** (#264) — the half this test did not ask about.
+    //
+    // A dialed C, C's accept loop filed that connection under A's coordinate as its route back (#119), and
+    // that write is unconditional — so it replaced whatever live connection C held for A. A then discarding
+    // its end closed the very connection C's map now points at. A coordinate move is routine (this test is
+    // the routine case), so the throwaway was routine too, and each one silently cost the answering peer its
+    // route home.
+    //
+    // Asserted on the retention counter rather than on a delivery, because a delivery cannot discriminate:
+    // A holds C's address in the shared directory, so a send to C would dial cleanly whether or not this
+    // connection survived, and the test would pass against the defect. The counter fires on exactly the
+    // branch under test.
+    let retained = tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            let n = moved_peers_retained(&a);
+            if n > 0 {
+                return n;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "the dial proved C at its own coordinate, so A holds a live authenticated connection to a proven \
+         peer — exactly what the connection map is for. Dropping it is what closed C's route back to A.",
+    );
+    assert_eq!(retained, 1, "one dial, one diagnosis, one connection kept");
+}
+
+/// Count of `directory.moved_peer_retained` on a node's transport driver.
+fn moved_peers_retained(node: &NodeHandle) -> u64 {
+    node.client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "directory.moved_peer_retained")
+        .map(|o| o.count)
+        .sum()
 }
 
 /// Count of `directory.stale_coordinate` on a node's transport driver.

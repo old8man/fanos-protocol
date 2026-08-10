@@ -2738,10 +2738,46 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // landing between the `resolve` and the `remove` was deleted by a decision taken before
                     // it existed. `remove_if` closes the pair inside one write lock (#241).
                     let _ = t.directory.remove_if(to, addr);
-                    // The live connection is dropped rather than re-filed under `actual`. Caching a
-                    // connection that arrived through a *failed* dial is a new state for the connection map,
-                    // and this change is about the directory; the next send to `actual` dials it cleanly.
-                    tracing::debug!(?to, ?actual, "dialed coordinate has moved; directory corrected");
+                    // **The connection is KEPT, filed under the coordinate it proved** (#264). It used to be
+                    // dropped here, with the reason "caching a connection that arrived through a *failed*
+                    // dial is a new state for the connection map, and this change is about the directory".
+                    // The second half is a statement of that change's scope, not a safety argument, and the
+                    // first does not survive reading: the handshake **proved** this peer sits at `actual`, so
+                    // a live authenticated connection to a proven coordinate is exactly what this map holds —
+                    // it is what the accept path files for every inbound peer. The dial "failed" only in that
+                    // it did not reach `to`, and the send still fails, which is #240's behaviour unchanged.
+                    //
+                    // **What dropping it cost, measured.** The peer that answered has already filed this
+                    // connection under *our* coordinate as its route back to us (`accept_loop`, #119), and
+                    // that write is unconditional — so it replaced whatever live connection it had for us.
+                    // Discarding our end then closed the connection its map now points at, and its route to
+                    // us was gone until something else re-established one. A coordinate move is routine (that
+                    // is why #240 exists), so these throwaway dials are routine too. Keeping the connection
+                    // removes them at the source, which is better than teaching the acceptor to defend
+                    // against them: that defence costs a reconnect delay, this costs nothing.
+                    //
+                    // **Compare-and-insert under one lock**, never a blind overwrite — the very hazard above,
+                    // one table over. If a live connection already holds `actual` it stays, and ours is the
+                    // redundant one; the read-then-write form of this is the window #241 closed in the
+                    // directory with `remove_if`.
+                    let filed = match t.conns.lock() {
+                        Ok(mut map) => match map.get(&actual) {
+                            Some(live) if live.close_reason().is_none() => false,
+                            _ => {
+                                map.insert(actual, conn.clone());
+                                true
+                            }
+                        },
+                        Err(_) => false,
+                    };
+                    if filed {
+                        t.record_station(Station::DirectoryMovedPeerRetained, Some(actual), None);
+                        tokio::spawn(read_frames(conn.clone(), actual, t.clone()));
+                    }
+                    // No `spawn_observed_addr` and no `peer_addrs` entry: both are about an address the peer
+                    // dialed in *from*, and here we dialed out to a listen address the directory named. The
+                    // binding worth recording was `actual → addr`, and the write above already made it.
+                    tracing::debug!(?to, ?actual, filed, "dialed coordinate has moved; directory corrected");
                     return None;
                 }
                 // **We could not judge it, so we keep the connection and fail only the send** (#235). This
