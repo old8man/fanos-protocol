@@ -52,7 +52,51 @@ pub struct ProteusShaper {
     /// The neighbouring epochs' shapes, accepted on receive only: `[previous, next]`. See
     /// [`SHAPE_GRACE`] for why both, and why the pair is cached rather than derived per frame.
     grace: [ShapeParams; 2],
+    /// The **genesis** shape, accepted on receive only, and only once the epoch has moved far enough that
+    /// [`grace`](Self::grace) no longer covers it. See [`OpenedUnder::Genesis`] for the deadlock it breaks.
+    ///
+    /// Cached like the grace pair and for the same reason: it must cost one `deobfuscate` on a frame nobody
+    /// recognises, never a hash, or an attacker sending garbage chooses this node's CPU bill.
+    genesis: ShapeParams,
     counter: AtomicU64,
+}
+
+/// Which of a shaper's accepted shapes opened an inbound datagram.
+///
+/// **Returned because a reply has to be readable by whoever asked**, and at the join that is not decidable
+/// from the receiver's own epoch. The epoch shape is `PRF(community secret, epoch)`, so a node holding the
+/// secret can compute any epoch's shape and simply does not know which is current — a *search* problem, not
+/// a cryptographic one. The two ends share exactly one epoch they can both name without talking, **zero**,
+/// and that is what makes the deadlock breakable at constant cost.
+///
+/// The deadlock, on `SHAPE_GRACE = 1`: a node joining a cell at epoch `N ≥ 2` emits the epoch-0 shape, which
+/// is outside the cell's `{N−1, N, N+1}` window, and its own `{0, 1}` window rejects the cell's replies. Both
+/// directions are dark, and nothing can teach either side the epoch because teaching requires a frame to
+/// cross. To speak you must know the epoch; to learn it you must speak.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenedUnder {
+    /// This node's current epoch — the steady state, and the first attempt, so it is what almost every
+    /// datagram costs.
+    Current,
+    /// A neighbouring epoch inside the [`SHAPE_GRACE`] window: the peer turned a moment before or after this
+    /// node. Transient by construction and self-correcting, so a reply in the *current* shape still lands.
+    Grace,
+    /// The **genesis** shape, from a peer that has not yet learned the cell's epoch — reported only when the
+    /// epoch has moved beyond the grace window, so at `epoch ≤ SHAPE_GRACE` this variant never occurs (the
+    /// genesis shape is then already `Current` or `Grace`).
+    ///
+    /// A reply in the current shape would be unreadable, so the caller MUST seal it under
+    /// [`seal_datagram_at_genesis`](ProteusShaper::seal_datagram_at_genesis) — the whole point of returning
+    /// which shape opened the datagram.
+    ///
+    /// **The cost, stated where it is paid.** The genesis shape does not rotate, so for an observer who has
+    /// somehow obtained the community secret it is a signature that stands for the life of the network,
+    /// which is exactly the static signature §13.4 rotates the shape to remove. It is bounded to the join at
+    /// both ends: the arriving node leaves it on its first `BeaconReady`, and the answering node stops using
+    /// it for a peer as soon as that peer's datagrams open under the current shape. Against an observer
+    /// *without* the secret nothing changes — the bytes are PRF output either way, and community membership
+    /// is precisely what the secret certifies.
+    Genesis,
 }
 
 /// How many epochs to either side of the current one a receiver still un-shapes (#196).
@@ -114,6 +158,7 @@ impl ProteusShaper {
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
         let grace = grace_shapes(&secret, epoch);
+        let genesis = epoch_shape(&secret, Epoch::ZERO);
         Self {
             secret,
             morph,
@@ -122,6 +167,7 @@ impl ProteusShaper {
             epoch,
             shape,
             grace,
+            genesis,
             counter: AtomicU64::new(0),
         }
     }
@@ -150,6 +196,7 @@ impl ProteusShaper {
         let secret = community_secret.into();
         let shape = epoch_shape(&secret, epoch);
         let grace = grace_shapes(&secret, epoch);
+        let genesis = epoch_shape(&secret, Epoch::ZERO);
         Some(Self {
             secret,
             morph: Morph::Pluggable,
@@ -158,6 +205,7 @@ impl ProteusShaper {
             epoch,
             shape,
             grace,
+            genesis,
             counter: AtomicU64::new(0),
         })
     }
@@ -202,6 +250,9 @@ impl ProteusShaper {
         self.epoch = epoch;
         self.shape = epoch_shape(&self.secret, epoch);
         self.grace = grace_shapes(&self.secret, epoch);
+        // `genesis` is deliberately NOT re-derived: it is `epoch_shape(secret, 0)` by definition and does not
+        // move. That immobility is the whole reason it can serve as a rendezvous shape for a node that knows
+        // no epoch, and it is also its only cost — see [`OpenedUnder::Genesis`].
     }
 
     /// The current epoch.
@@ -268,6 +319,20 @@ impl ProteusShaper {
         deobfuscate(&self.shape, wire)
             .or_else(|| deobfuscate(&self.grace[0], wire))
             .or_else(|| deobfuscate(&self.grace[1], wire))
+            // Last, and only past the grace window: a peer that has not yet learned the epoch
+            // ([`OpenedUnder::Genesis`]). Fourth in the chain because it is the rarest, so the steady state
+            // never pays for it beyond the miss it was already paying.
+            .or_else(|| self.beyond_grace().then(|| deobfuscate(&self.genesis, wire)).flatten())
+    }
+
+    /// Whether the genesis shape is a *distinct* fourth candidate rather than one already inside the
+    /// `{epoch − 1, epoch, epoch + 1}` window.
+    ///
+    /// Below this threshold the genesis shape is `Current` or `Grace` and trying it again would be a wasted
+    /// `deobfuscate` — and, worse, would report [`OpenedUnder::Genesis`] for an ordinary peer, so a node at
+    /// epoch 1 would answer the whole cell in the genesis shape and pin itself there.
+    fn beyond_grace(&self) -> bool {
+        self.epoch.get() > SHAPE_GRACE
     }
 
     /// Seal one **datagram** — the layer below the frame (spec §13.3/§13.5, see
@@ -292,10 +357,53 @@ impl ProteusShaper {
     /// A failed attempt leaves the buffer untouched (`open_in_place` verifies the tag before it writes),
     /// which is what makes trying three shapes in sequence safe.
     #[must_use]
-    pub fn open_datagram(&self, buf: &mut [u8]) -> Option<usize> {
-        open_in_place(&self.shape, buf)
-            .or_else(|| open_in_place(&self.grace[0], buf))
-            .or_else(|| open_in_place(&self.grace[1], buf))
+    pub fn open_datagram(&self, buf: &mut [u8]) -> Option<(usize, OpenedUnder)> {
+        if let Some(len) = open_in_place(&self.shape, buf) {
+            return Some((len, OpenedUnder::Current));
+        }
+        if let Some(len) = open_in_place(&self.grace[0], buf).or_else(|| open_in_place(&self.grace[1], buf)) {
+            return Some((len, OpenedUnder::Grace));
+        }
+        if self.beyond_grace()
+            && let Some(len) = open_in_place(&self.genesis, buf)
+        {
+            return Some((len, OpenedUnder::Genesis));
+        }
+        None
+    }
+
+    /// Seal one datagram under the **genesis** shape rather than this node's current one — the reply half of
+    /// [`OpenedUnder::Genesis`], and the only way an established node can answer a peer that has not yet
+    /// learned the epoch.
+    ///
+    /// Separate from [`seal_datagram`](Self::seal_datagram) instead of a parameter on it, because the default
+    /// must stay "the current epoch": a shape argument on the hot path is a shape argument someone eventually
+    /// passes `Epoch::ZERO` to by accident, and that is the static wire signature §13.4 exists to remove.
+    /// Use it only for a peer this node has just *observed* speaking genesis, never speculatively.
+    #[must_use]
+    pub fn seal_datagram_at_genesis(&self, payload: &[u8], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
+        seal(&self.genesis, payload, nonce)
+    }
+
+    /// Wrap an outbound **frame** under the genesis shape — the frame-layer twin of
+    /// [`seal_datagram_at_genesis`](Self::seal_datagram_at_genesis), for the same peer and the same reason.
+    ///
+    /// Both layers are needed, and that is not redundancy: the datagram envelope carries the QUIC packet and
+    /// the frame codec carries what is inside it, each keyed independently on the epoch. Fixing only the
+    /// envelope gets a joining node's handshake through and then loses its first HELLO.
+    #[must_use]
+    pub fn outbound_at_genesis(&self, frame: &[u8]) -> Vec<u8> {
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+        if self.morph == Morph::Plain {
+            return frame.to_vec();
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        let mut material = self.genesis.scramble_seed.to_vec();
+        material.extend_from_slice(&seq.to_be_bytes());
+        hash_xof(NONCE_LABEL, &material, &mut nonce);
+        let mut wire = obfuscate(&self.genesis, frame, &nonce);
+        self.profile.pad_to_target(&mut wire, &self.genesis.scramble_seed, seq);
+        wire
     }
 }
 

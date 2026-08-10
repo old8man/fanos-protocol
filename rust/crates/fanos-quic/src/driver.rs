@@ -395,7 +395,7 @@ fn max_wire() -> usize {
 /// the task/handshake count without limit. The accept loop takes a permit per connection and holds it for
 /// the task's life, so once this many are in flight, new accepts back-pressure (QUIC queues/rejects) until
 /// one finishes. Generous next to a cell's `N-1` real neighbours; it only bounds abuse.
-const MAX_INBOUND_CONNECTIONS: usize = 512;
+pub(crate) const MAX_INBOUND_CONNECTIONS: usize = 512;
 
 /// Per-source-IP inbound cap (audit A6, #69). A single host can hold at most this many of the
 /// [`MAX_INBOUND_CONNECTIONS`] slots, so monopolizing the accept path — a slowloris / connection-pinning
@@ -554,7 +554,7 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// fail fast so it cannot stall the send loop behind it — the erasure store fans reads to every cell
 /// point and a dead point's dial would otherwise block the live ones. A reachable peer's QUIC handshake
 /// completes in a small fraction of this even under load.
-const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The node's **current epoch and beacon seed**, as latest-state rather than as an event.
 ///

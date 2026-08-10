@@ -40,16 +40,20 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
 use fanos_runtime::ports::stations::{Station, Stations};
 use fanos_proteus::obfuscate::NONCE_LEN;
+use fanos_primitives::collections::BoundedMap;
+use fanos_proteus::shaper::OpenedUnder;
 use fanos_proteus::{Morph, ProteusShaper};
 
+use crate::driver::{DIAL_TIMEOUT, MAX_INBOUND_CONNECTIONS};
+
 /// A socket that seals every outbound datagram and opens every inbound one, dropping what does not open.
-#[derive(Debug)]
 pub(crate) struct ProteusSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     /// The same shaper the frame layer uses, so the datagram envelope rotates on the same epoch turn and
@@ -59,6 +63,25 @@ pub(crate) struct ProteusSocket {
     /// downstream — so if it is not counted at this exact spot, a node under active probing reads as idle on
     /// every surface it has. This is the outermost gate; there is no later one to catch it.
     stations: Arc<Mutex<Stations>>,
+    /// Addresses whose last datagram opened under the **genesis** shape, with when it did (#234).
+    ///
+    /// A joining node cannot know the cell's live epoch — nothing in `BeaconParams` carries a time or an
+    /// epoch number, and `BeaconWindow::genesis` starts at zero — so it necessarily speaks epoch 0 while the
+    /// cell is at `N`. Past `N = 2` that is outside the cell's `{N−1, N, N+1}` window in both directions and
+    /// the handshake cannot start. The shaper answers half of it by accepting the genesis shape as a fourth
+    /// candidate; this map answers the other half, because a reply sealed at `N` is one the joiner's own
+    /// window `{0, 0, 1}` cannot open. **The reply goes out in the shape the request arrived in.**
+    ///
+    /// Both bounds are read off constants that already exist rather than chosen here. Capacity is
+    /// [`MAX_INBOUND_CONNECTIONS`]: an entry past it is a handshake this node would refuse anyway. An entry
+    /// expires after [`DIAL_TIMEOUT`], the window a handshake is given — past it the exchange has either
+    /// completed or failed, and in both cases the peer now knows the live epoch and speaks it.
+    ///
+    /// The eviction hazard this class usually carries does not apply, and the reason is worth stating: an
+    /// entry is only created by a datagram that **opened** under the genesis shape, which takes the community
+    /// secret. A stranger cannot flood the map to evict a real joiner, because a stranger's datagram never
+    /// opens at all.
+    genesis_speakers: Mutex<BoundedMap<SocketAddr, Instant>>,
 }
 
 impl ProteusSocket {
@@ -81,6 +104,7 @@ impl ProteusSocket {
             return inner;
         }
         Arc::new(Self {
+            genesis_speakers: Mutex::new(BoundedMap::new(MAX_INBOUND_CONNECTIONS)),
             inner,
             shaper: Arc::clone(shaper),
             stations: Arc::clone(stations),
@@ -105,6 +129,37 @@ impl ProteusSocket {
     }
 }
 
+/// Hand-written rather than derived, for one reason: `genesis_speakers` is keyed by peer address, and a
+/// derived `Debug` would print the address of every node currently mid-join into whatever log the socket is
+/// formatted into. The count answers the operational question ("is anyone joining?") without naming who.
+impl std::fmt::Debug for ProteusSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let joining = self.genesis_speakers.lock().unwrap_or_else(PoisonError::into_inner).len();
+        f.debug_struct("ProteusSocket").field("joining", &joining).finish_non_exhaustive()
+    }
+}
+
+impl ProteusSocket {
+    /// Whether the next datagram to `dst` must be sealed under the genesis shape.
+    ///
+    /// Expiry is read here rather than swept on a timer: the answer is only ever needed at send time, so a
+    /// stale row costs nothing until it is asked about, and asking is where it is cheapest to discard.
+    fn speaks_genesis(&self, dst: SocketAddr) -> bool {
+        let map = self.genesis_speakers.lock().unwrap_or_else(PoisonError::into_inner);
+        map.get(&dst).is_some_and(|at| at.elapsed() < DIAL_TIMEOUT)
+    }
+
+    /// Remember that these addresses reached us under the genesis shape, and drop rows past their window.
+    fn note_genesis_speakers(&self, addrs: &[SocketAddr]) {
+        let now = Instant::now();
+        let mut map = self.genesis_speakers.lock().unwrap_or_else(PoisonError::into_inner);
+        map.retain(|_, at: &Instant| now.duration_since(*at) < DIAL_TIMEOUT);
+        for addr in addrs {
+            map.insert(*addr, now);
+        }
+    }
+}
+
 impl AsyncUdpSocket for ProteusSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         Arc::clone(&self.inner).create_io_poller()
@@ -115,11 +170,16 @@ impl AsyncUdpSocket for ProteusSocket {
         if nonce == [0u8; NONCE_LEN] {
             return Err(io::Error::other("no OS entropy for a PROTEUS datagram nonce"));
         }
-        let sealed = self
-            .shaper
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .seal_datagram(transmit.contents, &nonce);
+        // Answer in the shape the question arrived in. A peer that reached us under the genesis shape is
+        // mid-join and holds the window `{0, 0, 1}`; sealing the reply at the live epoch would leave it
+        // unreadable and the handshake would fail from the other side — the asymmetry #235 measured.
+        let shaper = self.shaper.read().unwrap_or_else(PoisonError::into_inner);
+        let sealed = if self.speaks_genesis(transmit.destination) {
+            shaper.seal_datagram_at_genesis(transmit.contents, &nonce)
+        } else {
+            shaper.seal_datagram(transmit.contents, &nonce)
+        };
+        drop(shaper);
         self.inner.try_send(&Transmit {
             destination: transmit.destination,
             ecn: transmit.ecn,
@@ -145,14 +205,18 @@ impl AsyncUdpSocket for ProteusSocket {
             // simply not carried forward — no reply, no error, no trace on the wire, which is §13.5.
             let mut kept = 0usize;
             let mut refused = 0u64;
+            let mut joining: Vec<SocketAddr> = Vec::new();
             for i in 0..n {
                 let (Some(buf), Some(m)) = (bufs.get_mut(i), meta.get(i).copied()) else {
                     continue;
                 };
-                let Some(len) = shaper.open_datagram(buf.get_mut(..m.len).unwrap_or(&mut [])) else {
+                let Some((len, under)) = shaper.open_datagram(buf.get_mut(..m.len).unwrap_or(&mut [])) else {
                     refused += 1;
                     continue;
                 };
+                if under == OpenedUnder::Genesis {
+                    joining.push(m.addr);
+                }
                 if kept != i {
                     let (left, right) = bufs.split_at_mut(i);
                     let (Some(dst), Some(src)) = (left.get_mut(kept), right.first()) else {
@@ -172,6 +236,9 @@ impl AsyncUdpSocket for ProteusSocket {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .record_n(Station::WireForeignDatagram, None, refused);
+            }
+            if !joining.is_empty() {
+                self.note_genesis_speakers(&joining);
             }
             // Every datagram in this batch was a stranger's. Returning `Ok(0)` would tell quinn a readiness
             // event produced nothing and risks a spin; go back to the socket instead, which either yields
