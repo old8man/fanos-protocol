@@ -1725,6 +1725,84 @@ mod tests {
         fleet.shutdown().await;
     }
 
+    /// **What a five-node cell actually assigns, under latency and without it** (#250).
+    ///
+    /// Both worlds in one run, because the question is a comparison and two separate test runs are two
+    /// separate hosts an hour apart. `Link::ideal()` is all zeroes; `Link::default()` is 20 ms of latency and
+    /// 10 ms of jitter, with **no loss on either side**.
+    ///
+    /// It exists because three stories about the fleet assertion died here, each to one run:
+    ///
+    /// * *the trajectory freezes in the gap before the first assignment* — refuted: the withheld scan is `0`,
+    ///   so `withhold` is never reached;
+    /// * *the address book is the frozen thing* — refuted: under `ideal` the book stands at `[1, 2, 5, 5, 5]`
+    ///   from five seconds in and never moves again, and four of five nodes are assigned anyway. A frozen
+    ///   book is the healthy case too, so it cannot be the cause. An earlier run of this very probe on the
+    ///   WRONG world (`F2`, `relay + storage`) had both links converge, which is what exposed the mistake;
+    /// * *epoch skew mismatches the slot-keyed records* — refuted: every epoch is `0` and no node has a
+    ///   beacon.
+    ///
+    /// What it reports instead, on the real world (`F4`, `relay + rendezvous`, five nodes):
+    ///
+    /// ```text
+    /// ideal    roster=[4, 4, 5, 5, 5]  has_role=[false, true, true, true, true]   roles: 4×RoleSet(17), 1×0
+    /// default  roster=[4, 3, 4, 2, 4]  has_role=[false, false, false, false, false]  roles: 5×RoleSet(0)
+    /// ```
+    ///
+    /// Two things worth separating. Under `ideal` one member is assigned **nothing**, stably, on a roster of
+    /// four — so "every member has a role" is not a property this cell has even at zero latency. Under
+    /// `default` **no member is assigned anything at all** for a full minute, while assignments are being
+    /// produced (the roster moves, and it even shrinks: 5 → 4 on one node). Nothing reports either: the
+    /// stations plane is empty, `AssignmentWithheld` never fires, and neither does `RoleUnderProvisioned`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
+    async fn probe_what_a_five_node_cell_assigns_under_latency() {
+        // The SAME world as the assertion under investigation: `F4` and `relay + rendezvous`. The first two
+        // runs of this probe used `F2` with `relay + storage` and converged under BOTH links — which refuted
+        // the address-book story rather than confirming it, and only because the worlds differed.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        const NODES: usize = 5;
+        const SAMPLES: usize = 12;
+        const EVERY: Duration = Duration::from_secs(5);
+
+        // Host-sensitive by construction — it is about wall-clock convergence — so it says what it is worth
+        // even though no clock is read directly (#255).
+        println!("{}", fanos_testkit::measurement_conditions());
+
+        for (label, link) in [("ideal   ", Link::ideal()), ("default ", Link::default())] {
+            let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+            let Ok(fleet) = NodeFleet::spawn::<F4>(NODES, link, roles).await else {
+                println!("PROBE {label}: fleet did not start");
+                continue;
+            };
+            // Roles beside the book, because the predicate is "every member has SOME role" and the controller
+            // is free to assign fewer roles than there are members. A node stably without a role on a
+            // COMPLETE roster is a different finding from a node that never learned the cell.
+            let book = fleet
+                .observe(SAMPLES, EVERY, |n| {
+                    (n.health().known_peers, n.assignment().roster, n.assigned_roles().any())
+                })
+                .await;
+            for (t, seen) in book.samples() {
+                let peers: Vec<usize> = seen.iter().map(|(p, _, _)| *p).collect();
+                let roster: Vec<usize> = seen.iter().map(|(_, r, _)| *r).collect();
+                let served: Vec<bool> = seen.iter().map(|(_, _, a)| *a).collect();
+                println!(
+                    "PROBE {label} t={:>3}s  known_peers={peers:?}  roster={roster:?}  has_role={served:?}",
+                    t.as_secs()
+                );
+            }
+            println!(
+                "PROBE {label} final roles={:?}  widest withheld scan={}",
+                fleet.nodes().iter().map(|n| format!("{:?}", n.assignment().roles)).collect::<Vec<_>>(),
+                fleet.widest_withheld_scan()
+            );
+            fleet.shutdown().await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "probe, not an assertion — run with --ignored --nocapture"]
     async fn probe_loss_tolerance_of_the_composition() {
