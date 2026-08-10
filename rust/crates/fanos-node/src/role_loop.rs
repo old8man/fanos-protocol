@@ -281,12 +281,20 @@ impl LoadSensor {
     /// The gauge counts work **in flight** rather than work completed. That is the quantity `capacity` is
     /// defined against — "the load one node absorbs" — and it needs no observation window to be meaningful,
     /// where a completion rate would have to be reconciled with whatever window the engine's own counters use.
+    /// **One open gauge per role.** Cloning is the supported way to share it (every clone addresses the same
+    /// slot); opening a second, independent one would give the role two tokens, and the first to drop would
+    /// mark it unsensed while the other driver is still running. A `debug_assert` makes that a loud test
+    /// failure instead of a silent under-report, because production has exactly one opener per role.
     pub(crate) fn gauge(self: &Arc<Self>, role: Role) -> LoadGauge {
+        debug_assert!(
+            self.gauged.load(Ordering::Relaxed) & (1u32 << role.index()) == 0,
+            "a second gauge for a role already gauged: the first to drop would unsense a running driver"
+        );
         // Some(0): sensed, carrying nothing. `fetch_add`/`fetch_sub` then work directly on the encoding.
         self.slot(role).store(1, Ordering::Relaxed);
         // This slot's writer is the caller's task from here on, so the feeder's fate does not decide it.
         self.gauged.fetch_or(1u32 << role.index(), Ordering::Relaxed);
-        LoadGauge { sensor: Arc::clone(self), role }
+        LoadGauge { token: Arc::new(GaugeToken { sensor: Arc::clone(self), role }) }
     }
 
     /// This role's slot.
@@ -332,8 +340,32 @@ impl LoadSensor {
 /// can see. Cheap to clone; every clone addresses the same slot.
 #[derive(Clone)]
 pub struct LoadGauge {
+    token: Arc<GaugeToken>,
+}
+
+/// **The role's driver is running** — held jointly by every [`LoadGauge`] clone and every live [`LoadGuard`],
+/// and dropped when the last of them is gone (#258).
+///
+/// Without it a dead driver is indistinguishable from an idle one. [`LoadGuard`]'s `Drop` correctly releases
+/// each unit of work however the flow ends, so a task that dies takes its guards with it and the slot falls to
+/// `Some(0)` — "running, carrying nothing", which is exactly the reading that earns a role *more* work. The
+/// distinction the sensor's encoding already draws is between measured and absent, so a driver that stopped
+/// must return its slot to absent and let the offer stand in, the same conservative direction the feeder's
+/// death takes ([`LoadSensor`]).
+///
+/// Guards hold it too, not just gauges: while a flow is still in flight the role is being served, whatever
+/// became of the handle that started it, and the two drop orders must give the same answer.
+struct GaugeToken {
     sensor: Arc<LoadSensor>,
     role: Role,
+}
+
+impl Drop for GaugeToken {
+    fn drop(&mut self) {
+        // Clear the marker first: from here the slot is the feeder's business again, and it has none.
+        self.sensor.gauged.fetch_and(!(1u32 << self.role.index()), Ordering::Relaxed);
+        self.sensor.slot(self.role).store(0, Ordering::Relaxed); // 0 is absent, not `Some(0)`
+    }
 }
 
 impl LoadGauge {
@@ -345,22 +377,22 @@ impl LoadGauge {
     /// saturated node, so the controller would keep provisioning for work that finished long ago.
     #[must_use]
     pub fn in_flight(&self) -> LoadGuard {
-        self.sensor.slot(self.role).fetch_add(1, Ordering::Relaxed);
-        LoadGuard { sensor: Arc::clone(&self.sensor), role: self.role }
+        self.token.sensor.slot(self.token.role).fetch_add(1, Ordering::Relaxed);
+        LoadGuard { token: Arc::clone(&self.token) }
     }
 }
 
 /// One unit of in-flight work; the gauge falls when this drops. See [`LoadGauge::in_flight`].
 pub struct LoadGuard {
-    sensor: Arc<LoadSensor>,
-    role: Role,
+    token: Arc<GaugeToken>,
 }
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
         // Saturating: the slot is `Some(n)` encoded as `n + 1`, so it must never fall below 1 — that would
         // decode as "no sensor" and hand the role back to the offer fallback while the driver is still running.
-        let slot = self.sensor.slot(self.role);
+        // Handing it back is [`GaugeToken`]'s job, and only once nothing is left to run.
+        let slot = self.token.sensor.slot(self.token.role);
         let _ = slot.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1).max(1)));
     }
 }
@@ -1366,6 +1398,55 @@ pub fn spawn_self_organization<F: Field>(
 
 #[cfg(test)]
 mod tests {
+    /// **A dead driver is not an idle driver (#258).**
+    ///
+    /// [`LoadGuard`]'s `Drop` releases each unit of work however the flow ends, which is right for a flow and
+    /// creates the question for the role: when the *task* dies, all its guards fall and the slot reads
+    /// `Some(0)` — "running, carrying nothing". That is the reading the controller rewards with more work, so
+    /// a dead exit attracts exactly the traffic it cannot serve.
+    ///
+    /// Three cases, because the wrong fix is easy in two directions: absenting on an idle gauge would throw
+    /// away the true reading of a role that legitimately went quiet, and absenting on the first clone's drop
+    /// would unsense a driver that is still running through another.
+    #[test]
+    fn a_dropped_driver_unsenses_its_role_while_an_idle_one_stays_measured() {
+        use super::{LoadSensor, Role};
+
+        let (sensor, _feeding) = LoadSensor::new();
+        let sensor = Arc::new(sensor);
+        let gauge = sensor.gauge(Role::Exit);
+
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(0),
+            "an idle driver is measured at zero — unsensing it here is how a quiet exit loses its true reading"
+        );
+
+        let shared = gauge.clone();
+        drop(gauge);
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(0),
+            "one clone going does not stop the role: every clone addresses the same slot, and another holds it"
+        );
+
+        let flow = shared.in_flight();
+        drop(shared);
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(1),
+            "a flow still in flight IS the role being served, whatever became of the handle that started it"
+        );
+
+        drop(flow); // the last holder — the driver is gone
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            None,
+            "with nothing left to run, the role is unsensed and the offer stands in — `Some(0)` here would \
+             advertise a dead exit as an idle one, which is what the controller gives more work to"
+        );
+    }
+
     /// **A load reading with nobody feeding it reads absent, not stale — and only where that is true (#251).**
     ///
     /// The engine slots are a level with one writer. When the feeder dies they keep decoding to their last
