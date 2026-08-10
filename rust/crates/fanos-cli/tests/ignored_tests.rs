@@ -20,6 +20,35 @@ use fanos_testkit::corpus::rust_sources;
 /// Name prefixes that mark a test as a measurement rather than an assertion.
 const MEASUREMENT_PREFIXES: [&str; 3] = ["measure_", "probe_", "sweep_"];
 
+/// **Retracted metrics: shaped like instruments, kept as counter-examples, and they must never be run as
+/// instruments** (#255).
+///
+/// The third meaning. This file split `#[ignore]` into two — measurement and cost-gated assertion — and the
+/// measurement class turns out to hold two different things. Most of its members are live instruments whose
+/// numbers a person should read. These two are *retracted*: the metric was found invalid, and the test is
+/// kept, `#[ignore]`d and labelled, because a deleted mistake teaches nothing and the next person re-derives
+/// it. Both facts live only in free-text `#[ignore]` reasons today, where no selection can see them.
+///
+/// That matters the moment anything **selects** the class. An executor keyed on the `measure_` prefix — the
+/// obvious way to give #255's measurements the job they lack — would run these two and publish their output
+/// beside the real readings, which is precisely republishing a retracted number as a measurement. The
+/// category read as one thing and contained two, so every consumer of it was wrong for half its members.
+///
+/// Declared as a list with a reason, in the shape [`COST_GATED`] already uses: adding one is a decision,
+/// and the guards below hold the rows to the tree in both directions.
+const RETRACTED: &[(&str, &str)] = &[
+    (
+        "measure_gpa_timing_on_the_shipping_router",
+        "a lone flow's in/out rate correlation is high for ANY conserving relay, ideal ones included — the \
+         metric measures the physics, not the implementation. The valid experiment is linkability among \
+         CONCURRENT flows, which lives beside it.",
+    ),
+    (
+        "measure_the_timing_channel_at_the_shipping_defaults",
+        "the same retracted metric at the shipping defaults; it inherits the flaw of the one above.",
+    ),
+];
+
 /// Cost-gated assertions: expensive, but they check a property and must run somewhere. Listed explicitly so
 /// that adding one is a decision — a new `#[ignore]`d test is a measurement by its name or it is here, and the
 /// nightly job's selection is meaningful either way.
@@ -108,6 +137,52 @@ fn every_ignored_test_declares_whether_it_is_a_measurement_or_a_cost_gated_asser
         "these #[ignore]d tests declare no class: {unclassified:#?}\n\
          Name a measurement `measure_`/`probe_`/`sweep_`, or add a cost-gated assertion to COST_GATED."
     );
+}
+
+/// **A retracted metric is declared, still exists, and still says so where a person reads it (#255).**
+///
+/// Three obligations, because a row that drifts from the tree is worse than no row: it makes the class look
+/// classified while the selection it authorises is wrong.
+///
+/// * the test still exists and is still `#[ignore]`d — otherwise the row governs nothing;
+/// * it is named like a measurement, because that is the class this list carves a third meaning out of;
+/// * its own `#[ignore]` reason still marks it retracted, so the two places cannot disagree. That last one
+///   is what keeps the list from becoming the only witness — a reader who never opens this file must still
+///   be told at the test.
+#[test]
+fn every_retracted_metric_is_declared_and_still_says_so_at_the_test() {
+    let sources = rust_sources();
+    let ignored: BTreeSet<String> = sources.iter().flat_map(|s| ignored_in(&s.text)).collect();
+
+    for (name, why) in RETRACTED {
+        assert!(!why.trim().is_empty(), "`{name}` is declared retracted with no reason, which teaches nothing");
+        assert!(
+            ignored.contains(*name),
+            "RETRACTED names `{name}`, which is no longer an #[ignore]d test — delete the row, or the class              it carves out is describing something that does not exist"
+        );
+        assert!(
+            MEASUREMENT_PREFIXES.iter().any(|p| name.starts_with(p)),
+            "`{name}` is declared retracted but is not named like a measurement, so it was never in the              class this list narrows"
+        );
+        // The reason at the test, not only here — and the first version of this **could not fail**. It asked
+        // `sources.iter().any(..)` with a first arm true for every file that does NOT contain the name, which
+        // is nearly all of them, so the whole predicate was satisfied by any unrelated file. Removing the
+        // marker from the source left it green; that is how it was caught ([[an-alarm-that-cannot-fire]]).
+        // The fix is to find THE file and read the attributes that precede THIS function, with no `any` to
+        // hide behind and a hard failure if the definition is not found at all.
+        let decl = format!("fn {name}(");
+        let home = sources
+            .iter()
+            .find(|s| s.text.contains(&decl))
+            .unwrap_or_else(|| panic!("`{name}` is declared retracted and is defined in no file at all"));
+        let before = home.text.split(&decl).next().unwrap_or_default();
+        let attrs = before.rsplit("\n\n").next().unwrap_or_default();
+        assert!(
+            attrs.contains("INVALID METRIC"),
+            "`{name}` is declared retracted here and its own #[ignore] reason no longer says so — a reader at \
+             the test would take its output for a measurement. Attributes found:\n{attrs}"
+        );
+    }
 }
 
 /// The reverse direction: every declared cost-gated assertion still exists, and none of them is named like a
