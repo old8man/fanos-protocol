@@ -1227,6 +1227,30 @@ fn note_deficit(client: &Client, epoch: Epoch, deficit: Demand) {
     }
 }
 
+/// Whether the role controller is still deciding, or the assignment a reader takes is **frozen** (#251).
+///
+/// [`SelfOrganization::assigned`] is a level: a value a reader polls, maintained by exactly one task. When
+/// that task dies the level does not go absent — `borrow()` keeps returning whatever it last said, which on a
+/// working node is a *healthy* assignment. So the node goes on reporting roles it has stopped being told to
+/// hold, the cell counts them covered, and every surface agrees. The upgrade from silence to a level is what
+/// created that: an absent signal a reader can detect became a confident wrong one.
+///
+/// One mechanism covers both ways the controller can end, which is why there is no orderly-exit message to
+/// send: the `watch::Sender` is owned by the role-loop task alone, so a panic, a cancellation and a clean
+/// return all drop it, and `has_changed()` answers `Err` from then on.
+///
+/// Two states, not three: unlike [`crate::durable::Durability`] there is no *not configured* case — every
+/// node builds a `SelfOrganization`, because a node that offers nothing still has to be told it was assigned
+/// nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoleStanding {
+    /// The controller is running, so the assignment is its current decision.
+    Deciding,
+    /// The controller has **stopped**. The assignment is frozen at its last value: this node still runs those
+    /// role behaviours, but nothing is checking whether the cell still wants them there.
+    Stopped,
+}
+
 /// The running self-organizing subsystem of a node: the three background tasks (capability publisher, load
 /// publisher, role loop) and the `watch` receiver carrying this node's currently-assigned roles.
 pub struct SelfOrganization {
@@ -1238,6 +1262,18 @@ pub struct SelfOrganization {
     pub role_loop: JoinHandle<()>,
     /// This node's currently-assigned roles — the node subscribes and actuates its role behaviors from it.
     pub assigned: watch::Receiver<Assignment>,
+}
+
+impl SelfOrganization {
+    /// Whether [`Self::assigned`] is still being decided — see [`RoleStanding`].
+    ///
+    /// `has_changed()` answers `Err` exactly when every sender is gone, and the only sender is inside the
+    /// role-loop task. So this asks "is the writer alive?" rather than "has the value moved lately?", which
+    /// matters because a correct assignment on a settled cell does not move for epochs at a time.
+    #[must_use]
+    pub fn standing(&self) -> RoleStanding {
+        if self.assigned.has_changed().is_err() { RoleStanding::Stopped } else { RoleStanding::Deciding }
+    }
 }
 
 /// A node's inputs to the self-organizing subsystem: its identity (`node_id`, `vrf_secret`), the `capability`
@@ -1288,6 +1324,50 @@ pub fn spawn_self_organization<F: Field>(
 
 #[cfg(test)]
 mod tests {
+    /// **A role controller that died stops claiming it is deciding (#251).**
+    ///
+    /// The level's writer is one task. While it lives, `assigned` is the cell's current decision; when it
+    /// dies, `borrow()` does not go absent — it keeps handing back the last decision, which on a working node
+    /// is a perfectly healthy assignment. So the node reports roles nothing is maintaining, the cell counts
+    /// them covered, and no epoch corrects it.
+    ///
+    /// Both directions, because a predicate that answered `Stopped` unconditionally would close the defect
+    /// and make the reading useless — and because a `watch` with an unread value must still read `Deciding`:
+    /// the question is whether the WRITER is alive, not whether the value moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_role_controller_that_died_stops_claiming_it_is_deciding() {
+        use super::{Assignment, Epoch, RoleSet, RoleStanding, SelfOrganization, watch};
+
+        let (tx, rx) = watch::channel(Assignment::NONE);
+        let org = SelfOrganization {
+            capability_publisher: tokio::spawn(async {}),
+            load_publisher: tokio::spawn(async {}),
+            role_loop: tokio::spawn(async {}),
+            assigned: rx,
+        };
+        assert_eq!(
+            org.standing(),
+            RoleStanding::Deciding,
+            "a live controller must read as deciding, or the reading says nothing about anything"
+        );
+
+        // An unread new value is still a live controller — a settled cell reassigns nothing for epochs.
+        let _ = tx.send(Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1) });
+        assert_eq!(org.standing(), RoleStanding::Deciding, "an unread update is not a dead writer");
+
+        drop(tx); // what a panic, a cancellation and a clean return all do
+        assert_eq!(
+            org.standing(),
+            RoleStanding::Stopped,
+            "with its only writer gone the assignment is a fossil, and saying so is the whole point"
+        );
+        assert_eq!(
+            *org.assigned.borrow(),
+            Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1) },
+            "and the frozen value is STILL readable — that is exactly why it needs the state beside it"
+        );
+    }
+
     /// **A tripwire on a defect that is deliberately unfixed, because fixing half of it is worse than
     /// neither half.**
     ///

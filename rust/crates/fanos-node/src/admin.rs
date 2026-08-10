@@ -290,6 +290,22 @@ pub fn render_health(health: &Health) -> String {
         }
     }
     let _ = writeln!(s, "roles_offered: {:?}", health.roles);
+    // Beside the offer, because the offer is the field an operator mistakes for the answer. The offer is
+    // config and cannot go stale; the *assignment* is the cell's decision, maintained by one task, and when
+    // that task dies the assignment freezes at a healthy-looking value that every surface repeats (#251).
+    match health.organizing {
+        crate::role_loop::RoleStanding::Deciding => {
+            let _ = writeln!(s, "organizing: yes");
+        }
+        crate::role_loop::RoleStanding::Stopped => {
+            let _ = writeln!(
+                s,
+                "organizing: STOPPED — the role controller is GONE, so the assignment below is frozen at \
+                 whatever it last decided; this node keeps running those roles while the cell counts them \
+                 covered, and no epoch will correct it. Restart the node"
+            );
+        }
+    }
     s
 }
 
@@ -725,6 +741,8 @@ mod tests {
             probe_index: Some(47),
             roles: crate::config::RoleSet::default(),
             durable: crate::durable::Durability::Failing { consecutive: 48 },
+            // The state whose whole point is that it must be SAID: a frozen assignment reads healthy.
+            organizing: crate::role_loop::RoleStanding::Stopped,
         };
         let out = render_health(&health);
         // Values, not key names: a renderer that prints `collisions: 0` for a `Health` carrying 44 is exactly
@@ -739,6 +757,7 @@ mod tests {
             ("verified_claims", "46"),
             ("probe_index", "47"),
             ("durable", "48"),
+            ("organizing", "STOPPED"),
         ] {
             assert!(out.contains(needle), "`{what}` is in Health and not in the rendering:\n{out}");
         }

@@ -469,7 +469,15 @@ impl Controllable for Node {
         fanos_node::admin::render_health(&self.health())
     }
     fn roles_line(&self) -> String {
-        format!("{:?}\n", self.assigned_roles())
+        // The verb that prints the assignment is the one that must say when nothing is maintaining it: an
+        // operator reading `roles` is asking what the cell wants here *now*, and a frozen answer looks
+        // identical to a settled one (#251).
+        match self.health().organizing {
+            fanos_node::role_loop::RoleStanding::Deciding => format!("{:?}\n", self.assigned_roles()),
+            fanos_node::role_loop::RoleStanding::Stopped => {
+                format!("{:?} (FROZEN — the role controller is gone; no epoch will change this)\n", self.assigned_roles())
+            }
+        }
     }
     fn census_source(&self) -> (fanos_quic::Client, Epoch) {
         (self.client(), self.live_beacon().map_or(Epoch::ZERO, |(e, _)| e))

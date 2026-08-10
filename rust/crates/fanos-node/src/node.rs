@@ -988,6 +988,15 @@ pub struct Health {
     pub unresolved_drops: usize,
     /// The advertised roles.
     pub roles: RoleSet,
+    /// Whether the cell's **assignment** is still being decided, or frozen at whatever the role controller
+    /// last said before it died (#251).
+    ///
+    /// Reported beside `roles` because the two are easy to confuse and answer different questions: `roles` is
+    /// the *offer* this node's config makes and cannot go stale, while the assignment is the cell's *decision*
+    /// and is maintained by one task. `Stopped` means [`Node::assigned_roles`] is a fossil — the node still
+    /// runs those behaviours, but nothing is checking whether the cell still wants them here, and the cell
+    /// goes on counting them covered.
+    pub organizing: crate::role_loop::RoleStanding,
 }
 
 impl Node {
@@ -1355,6 +1364,7 @@ impl Node {
             collisions: self.directory.collisions(),
             unresolved_drops: self.directory.unresolved_drops(),
             roles: self.roles,
+            organizing: self.self_org.standing(),
         }
     }
 
@@ -1876,6 +1886,13 @@ mod tests {
             "the cell assigned the roles this node offered (assigned = {assigned:?})"
         );
         assert!(node.serves(Role::Rendezvous), "…including the NOSTOS rendezvous role");
+        // The wiring, on a live node: a running controller must say so, or the state added to close #251
+        // would be reporting `Stopped` for every healthy node and mean nothing when it mattered.
+        assert_eq!(
+            node.health().organizing,
+            crate::role_loop::RoleStanding::Deciding,
+            "a node whose controller just assigned it roles must report that the controller is alive"
+        );
         // A role the node never offered is never assigned — the offer is a ceiling, not a hint.
         assert!(!node.serves(Role::Exit), "an unoffered role is not assigned");
         node.shutdown().await;
