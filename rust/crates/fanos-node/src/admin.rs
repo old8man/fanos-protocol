@@ -394,8 +394,14 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::ReadInconclusive => {
             fanos_runtime::ReadStall::ALL.iter().find(|s| s.tag() == tag).map(|s| s.name())
         }
-        // #251: which of the six long-lived driver loops died decides what stopped working, and the
-        // whole point of supervising them was that "something is wrong" was already available — silence.
+        // #251: the node's own long-lived actors, in a tag range disjoint from `DriverActor`'s — asserted
+        // in `the_two_actor_vocabularies_do_not_collide`, not merely intended.
+        Station::ActorDied if tag >= crate::supervise::NODE_ACTOR_TAG_BASE => {
+            crate::supervise::NodeActor::ALL.iter().find(|a| a.tag() == tag).map(|a| a.name())
+        }
+        // The driver's six transport loops. This arm is UNGUARDED and must therefore come second: match
+        // arms are tried in order, so putting it first would swallow every node-actor tag silently. #256's
+        // coverage guard caught exactly that when the arms were written the other way round.
         Station::ActorDied => {
             fanos_quic::DriverActor::ALL.iter().find(|a| a.tag() == tag).map(|a| a.name())
         }
@@ -1078,6 +1084,26 @@ mod tests {
         }
     }
 
+    /// **Two vocabularies share `Station::ActorDied`, and their tag ranges must not overlap (#251).**
+    ///
+    /// `fanos_quic::DriverActor` names the six transport loops, `NodeActor` the node's own publishers; the
+    /// two crates cannot see each other's list, so nothing but this stops them from both claiming tag 3 and
+    /// an operator getting whichever arm `tag_name` happens to try first. `NODE_ACTOR_TAG_BASE` is the
+    /// separation and this is the proof — a comment asserting it would be exactly the kind of unkept promise
+    /// this codebase keeps finding.
+    #[test]
+    fn the_two_actor_vocabularies_do_not_collide() {
+        let driver: Vec<u64> = fanos_quic::DriverActor::ALL.iter().map(|a| a.tag()).collect();
+        let node: Vec<u64> = crate::supervise::NodeActor::ALL.iter().map(|a| a.tag()).collect();
+        for d in &driver {
+            assert!(
+                !node.contains(d),
+                "tag {d} is claimed by both a DriverActor and a NodeActor; one of them will never be named"
+            );
+            assert!(*d < crate::supervise::NODE_ACTOR_TAG_BASE, "driver tag {d} is inside the node range");
+        }
+    }
+
     #[test]
     fn every_tag_vocabulary_resolves_on_every_member() {
         for d in crate::Directory::ALL {
@@ -1123,6 +1149,14 @@ mod tests {
             // the fifteen codes into the untagged bucket, so a mapping keyed by `code()` would resolve the
             // 1xx/2xx classes and silently lose the rest. Asserted, because that failure is invisible.
             assert!(e.index() <= fanos_runtime::ports::stations::MAX_SKEW_TAG, "{} tag is clampable", e.name());
+        }
+        for a in crate::supervise::NodeActor::ALL {
+            assert_eq!(
+                tag_name(Station::ActorDied, a.tag()),
+                Some(a.name()),
+                "node actor {} renders as a bare number (#251)",
+                a.name()
+            );
         }
         for a in fanos_quic::DriverActor::ALL {
             assert_eq!(

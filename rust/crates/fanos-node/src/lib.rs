@@ -257,6 +257,8 @@ pub mod crosscell_dir;
 pub mod diagdir;
 pub mod loaddir;
 pub mod role_loop;
+/// **Supervision for the node's long-lived actors** — a task nobody joins cannot report its own death (#251).
+pub mod supervise;
 pub mod taxis_driver;
 /// Validator provisioning for running the TAXIS blockchain from the binary (`fanos taxis-deal` / `validator`).
 #[cfg(feature = "validator")]

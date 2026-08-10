@@ -240,7 +240,10 @@ pub fn spawn_mix_publisher(
     onion_seed: [u8; 32],
     prover: Option<CoordinateProver>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut driver = EpochDriver::new(client.address(), onion_seed);
         let mut beacons = client.beacons();
         // A coordinate-**bound** record (S1-M3), which a `Node` can always produce because it always runs VRF coordinates.
@@ -268,7 +271,8 @@ pub fn spawn_mix_publisher(
                 publish(&client, driver.epoch(), &beacon, driver.public()).await;
             }
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::MixPublisher, &supervised, task)
 }
 
 /// Keep this node's **combiner** side supplied with the epoch's mix directory.
@@ -288,7 +292,10 @@ pub fn spawn_mix_publisher(
 /// start an epoch incomplete; it is replaced whole on the next advance, and a combiner that cannot seal simply
 /// does not forward. That is the correct failure: a partial directory never produces a *wrong* route.
 pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: bool) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut beacons = client.beacons();
         let install = async |client: &Client, epoch: Epoch, beacon: BeaconSeed| {
             // `.0`: a partial view is *safe* on this side, for the reason the doc above gives — a combiner
@@ -315,7 +322,8 @@ pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: boo
             cur = epoch;
             install(&client, epoch, seed).await;
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::MixFeeder, &supervised, task)
 }
 
 #[cfg(test)]

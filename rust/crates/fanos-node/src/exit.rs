@@ -703,7 +703,10 @@ pub fn spawn_exit_publisher(
     public: HybridKemPublic,
     prover: Option<CoordinateProver>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         // This network's epoch-0 seed, not the constant (`docs/design-genesis.md`) — a record bound against
@@ -724,7 +727,8 @@ pub fn spawn_exit_publisher(
             seed = s;
             publish(epoch, seed, &public).await;
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::ExitPublisher, &supervised, task)
 }
 
 #[cfg(test)]

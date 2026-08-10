@@ -156,7 +156,10 @@ pub fn spawn_health_publisher(
     cell: u32,
     health: impl Fn() -> Report + Send + 'static,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         publish_health(&client, cell, epoch, health()).await;
@@ -166,7 +169,8 @@ pub fn spawn_health_publisher(
             epoch = e;
             publish_health(&client, cell, epoch, health()).await;
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::HealthPublisher, &supervised, task)
 }
 
 /// Publish a cross-cell `receipt` into the destination cell's inbox (addressed by source cell + message nonce).

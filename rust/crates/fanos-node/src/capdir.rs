@@ -268,6 +268,9 @@ pub fn spawn_capability_publisher(
     prover: Option<CoordinateProver>,
 ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = oneshot::channel();
+    // Supervised: this actor's death is a capability the node loses, and #106's failure counter — the one
+    // an operator would watch — is written by the actor itself, so it goes flat rather than up (#251).
+    let supervised = client.clone();
     let handle = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut beacons = client.beacons();
@@ -323,7 +326,7 @@ pub fn spawn_capability_publisher(
             }
         }
     });
-    (handle, ready_rx)
+    (crate::supervise::supervise(crate::supervise::NodeActor::CapabilityPublisher, &supervised, handle), ready_rx)
 }
 
 #[cfg(test)]

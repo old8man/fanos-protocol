@@ -206,7 +206,10 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
     community: Vec<u8>,
     kem_seed: [u8; 32],
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let (_secret, public) = ingress_keypair(&kem_seed);
         let mut beacons = client.beacons();
         // Genesis first, so a line rotating out of epoch 0 can already resolve this member.
@@ -256,7 +259,8 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
                 body,
             });
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::IngressRotation, &supervised, task)
 }
 
 #[cfg(test)]

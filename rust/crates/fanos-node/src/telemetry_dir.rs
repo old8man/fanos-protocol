@@ -168,7 +168,10 @@ pub fn cell_telemetry_coords<F: Field>() -> Vec<Coord> {
 /// stream closes; must run inside a tokio runtime.
 #[must_use]
 pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this actor's death is a capability the node loses, and the counters that would
+    // have shown it are written by the actor itself (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut events = client.subscribe();
         let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
@@ -191,7 +194,8 @@ pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinH
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::CoherencePublisher, &supervised, task)
 }
 
 #[cfg(test)]
