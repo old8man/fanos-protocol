@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use rand_core::{CryptoRng, RngCore};
+use rand_core::{CryptoRng, Rng};
 use subtle::ConstantTimeEq;
 
 use fanos_primitives::hash::hash_xof;
@@ -331,7 +331,7 @@ impl CreditIssuer {
 
 /// Client step 1 — blind a fresh random input into a token the issuer will sign.
 #[must_use]
-pub fn request<R: RngCore + CryptoRng>(rng: &mut R) -> (TokenRequest, BlindedToken) {
+pub fn request<R: Rng + CryptoRng>(rng: &mut R) -> (TokenRequest, BlindedToken) {
     let mut input = [0u8; INPUT_LEN];
     rng.fill_bytes(&mut input);
     let blind = Scalar::random(rng);
@@ -363,8 +363,15 @@ pub fn finalize(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    // Only the test generator implements these; the crate's public bound is the infallible pair.
+    use rand_core::{TryCryptoRng, TryRng};
 
-    /// A tiny deterministic rand_core 0.6 RNG for reproducible tests.
+    /// A tiny deterministic RNG for reproducible tests.
+    ///
+    /// `rand_core 0.10` renamed the implementable trait (#217): `RngCore` is deprecated and now
+    /// blanket-implemented for `DerefMut`, so a generator implements **`Rng`** — the old three methods. What
+    /// did go is `try_fill_bytes`: a generator that cannot fail has nothing to report, which is the same
+    /// "an outcome nobody can act on is not an outcome" this tree keeps arriving at from other directions.
     struct TestRng([u8; 32], u64);
     impl TestRng {
         fn new(tag: &str) -> Self {
@@ -373,29 +380,31 @@ mod tests {
             Self(s, 0)
         }
     }
-    impl RngCore for TestRng {
-        fn next_u32(&mut self) -> u32 {
+    // `Rng: TryRng<Error = Infallible>`, so the fallible trait comes first and the infallible one is defined
+    // in terms of it. That ordering is the API saying what this codebase keeps concluding on its own: the
+    // three-valued question is the primitive, and "cannot fail" is a *narrowing* of it rather than a
+    // separate thing.
+    impl TryRng for TestRng {
+        type Error = core::convert::Infallible;
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
             let mut b = [0u8; 4];
-            self.fill_bytes(&mut b);
-            u32::from_le_bytes(b)
+            self.try_fill_bytes(&mut b)?;
+            Ok(u32::from_le_bytes(b))
         }
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let mut b = [0u8; 8];
-            self.fill_bytes(&mut b);
-            u64::from_le_bytes(b)
+            self.try_fill_bytes(&mut b)?;
+            Ok(u64::from_le_bytes(b))
         }
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             let mut input = self.0.to_vec();
             input.extend_from_slice(&self.1.to_le_bytes());
             self.1 += 1;
-            hash_xof("test-rng-block", &input, dest);
-        }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            self.fill_bytes(dest);
+            hash_xof("test-rng-block", &input, dst);
             Ok(())
         }
     }
-    impl CryptoRng for TestRng {}
+    impl TryCryptoRng for TestRng {}
 
     #[test]
     fn a_credit_issues_finalizes_and_redeems() {

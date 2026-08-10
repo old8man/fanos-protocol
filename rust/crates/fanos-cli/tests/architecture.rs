@@ -1424,7 +1424,7 @@ const CRYPTO_TCB: &[&str] = &[
 ///
 /// Two parallel stacks, down to the formally-verified field arithmetic.
 const TOLERATED_DUPLICATES: &[(&str, &str)] = &[
-    ("curve25519-dalek", "4.1.3 under vrf-r255 0.1.0 (fanos-vrf's identity path); 5.0.0 under ed25519-dalek 3"),
+    ("curve25519-dalek", "4.1.3 under vrf-r255 0.1.0 and fanos-vrf alone (the identity path); 5.0.0 everywhere else"),
     ("fiat-crypto", "one copy per curve25519-dalek major — the field arithmetic follows the curve"),
     ("rand_core", "0.6 pinned by the curve25519-dalek 4 branch; 0.9 by rand 0.9; 0.10 by everything current"),
     ("rand", "0.9.5 reached through rand_core 0.9; 0.10.2 is what this workspace names"),
