@@ -294,6 +294,20 @@ pub enum Station {
     /// Not keyed by line, for the same reason as its companion: the coordinate is a stranger's claim.
     PeerUnjudged,
 
+    /// A beacon round **crossed** a restricted connection and was handed to the engine (#235).
+    ///
+    /// **The success half of the pair, and the pair is the point.** Its companion
+    /// [`RestrictedFrameDropped`](Self::RestrictedFrameDropped) counts only refusals, and a refusal counter
+    /// alone cannot answer the question the restricted state exists for — "did the beacon get through?" —
+    /// because a round that *does* get through is admitted, so it never appears there. Six measured runs
+    /// showed hundreds of drops and left "no round ever arrived" and "a round arrived and the engine
+    /// rejected it" as the same reading. They are different defects, in different crates, and this counter
+    /// is the discriminator: zero here means the cell is not flooding to this peer at all; non-zero with no
+    /// adoption sends the question to the beacon engine's own reject counters (#161).
+    ///
+    /// Not keyed by line, like the rest of this group: the sender's coordinate is an unproven claim.
+    RestrictedFrameAdmitted,
+
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
     /// The restricted set admits exactly the frames whose handler does **not** read `from`, because an
@@ -791,6 +805,7 @@ impl Station {
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::PeerUnjudged,
+        Self::RestrictedFrameAdmitted,
         Self::RestrictedFrameDropped,
         Self::DirectoryStaleCoordinate,
         Self::PorosRotationUnarmed,
@@ -842,6 +857,7 @@ impl Station {
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::PeerUnjudged => "hello.peer_unjudged",
+            Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
@@ -948,6 +964,7 @@ impl Station {
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
             | Self::PeerUnjudged
+            | Self::RestrictedFrameAdmitted
             | Self::RestrictedFrameDropped
             | Self::DirectoryStaleCoordinate
             | Self::PorosRotationUnarmed

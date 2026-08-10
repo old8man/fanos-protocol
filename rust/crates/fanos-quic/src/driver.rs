@@ -3273,6 +3273,11 @@ async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
             t.record_station(Station::RestrictedFrameDropped, None, None);
             continue;
         }
+        // Counted BEFORE the send, and counted at all because the drop counter alone is one-sided: it says
+        // how many frames were refused and never how many crossed, so "no round ever arrived" and "a round
+        // arrived and was rejected downstream" read identically. The engine's own reject counters (#161)
+        // pick the question up from here.
+        t.record_station(Station::RestrictedFrameAdmitted, None, None);
         if t.input_tx.send(Input::Message { from: claimed, frame }).await.is_err() {
             break; // engine actor gone
         }
