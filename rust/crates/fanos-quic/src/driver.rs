@@ -1704,9 +1704,16 @@ impl Reseater {
         // Bound with this epoch's rank AND the probed index: the arbitration order is the claim *pair*, so a table
         // recording only the rank would disagree with what every node's own `settle_index` concludes
         // (`Directory::supersedes`).
-        if let WriteOutcome::Superseded { keeping } =
-            self.directory.insert_claimed(point, self.local_addr, at.output, index)
-        {
+        // Exhaustive, not `if let` (#260). A new outcome must be a compile error here: the variant that
+        // was added — "we took the point from a live holder" — fell straight through the old `if let` and
+        // was recorded nowhere, which is how a node could displace two incumbents and show an empty plane.
+        match self.directory.insert_claimed(point, self.local_addr, at.output, index) {
+            WriteOutcome::Displaced { evicted } => {
+                self.client.record_station(Station::DirectoryPointTaken, Some(point), None);
+                tracing::debug!(?point, index, ?evicted, "settled seat taken from its holder; it must walk on");
+            }
+            WriteOutcome::Bound | WriteOutcome::Unchanged => {}
+            WriteOutcome::Superseded { keeping } => {
             self.client.record_station(Station::DirectorySeatSuperseded, Some(point), None);
             tracing::debug!(
                 ?point,
@@ -1714,7 +1721,8 @@ impl Reseater {
                 ?keeping,
                 "the settled seat is held by a better claim the book has not seen; holding position"
             );
-            return true;
+                return true;
+            }
         }
         if !self.client.command(Command::Reseat { coord: point }) {
             return false;
@@ -1948,6 +1956,17 @@ fn bind_own_seat(
         Some(rank) => directory.insert_ranked(coord, addr, rank),
         None => directory.insert(coord, addr),
     };
+    // Exhaustive for the reason at `apply` above (#260): the winning half of a collision is a fact about
+    // the cell, and an `if let` on the losing one silently drops it.
+    if let WriteOutcome::Displaced { evicted } = outcome {
+        stations.lock().unwrap_or_else(PoisonError::into_inner).record_tagged(
+            Station::DirectoryPointTaken,
+            Some(coord),
+            None,
+            1,
+        );
+        tracing::debug!(?coord, ?evicted, "took the point from its holder; the evicted node must walk on");
+    }
     if let WriteOutcome::Superseded { keeping } = outcome {
         stations.lock().unwrap_or_else(PoisonError::into_inner).record_tagged(
             Station::DirectorySeatSuperseded,
@@ -2622,9 +2641,16 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // this observation, which is exactly the arbitration this write submits itself to. It is
                     // counted, though: a rise means a *ranked* entry is squatting a point a peer just proved
                     // at a different address, which no other reading names.
-                    if let WriteOutcome::Superseded { keeping } = t.directory.insert(actual, addr) {
-                        t.record_station(Station::DirectoryRouteSuperseded, Some(actual), None);
-                        tracing::debug!(?actual, ?addr, ?keeping, "proved route not recorded; a better claim holds the point");
+                    match t.directory.insert(actual, addr) {
+                        WriteOutcome::Superseded { keeping } => {
+                            t.record_station(Station::DirectoryRouteSuperseded, Some(actual), None);
+                            tracing::debug!(?actual, ?addr, ?keeping, "proved route not recorded; a better claim holds the point");
+                        }
+                        WriteOutcome::Displaced { evicted } => {
+                            t.record_station(Station::DirectoryPointTaken, Some(actual), None);
+                            tracing::debug!(?actual, ?addr, ?evicted, "proved route took the point from its holder");
+                        }
+                        WriteOutcome::Bound | WriteOutcome::Unchanged => {}
                     }
                     // Retract the stale binding only if it still names this address — a concurrent refresh
                     // may already have corrected it, and clobbering that would trade one stale entry for
@@ -3309,9 +3335,16 @@ fn accept_holepunch(t: &Transport, body: &[u8]) {
             // through the relay — the #54 state, re-entered silently and for as long as the better-claimed
             // entry stands. Nothing here can override it (that is the arbitration rule, and an unranked
             // observation must not beat a proven claim), so what this site owes is the count.
-            if let WriteOutcome::Superseded { keeping } = t.directory.insert(peer, addr) {
-                t.record_station(Station::DirectoryRouteSuperseded, Some(peer), None);
-                tracing::debug!(?peer, ?addr, ?keeping, "punched route refused by arbitration; traffic stays on the relay");
+            match t.directory.insert(peer, addr) {
+                WriteOutcome::Superseded { keeping } => {
+                    t.record_station(Station::DirectoryRouteSuperseded, Some(peer), None);
+                    tracing::debug!(?peer, ?addr, ?keeping, "punched route refused by arbitration; traffic stays on the relay");
+                }
+                WriteOutcome::Displaced { evicted } => {
+                    t.record_station(Station::DirectoryPointTaken, Some(peer), None);
+                    tracing::debug!(?peer, ?addr, ?evicted, "punched route took the point from its holder");
+                }
+                WriteOutcome::Bound | WriteOutcome::Unchanged => {}
             }
         }
         if let Ok(mut set) = t.punching.lock() {

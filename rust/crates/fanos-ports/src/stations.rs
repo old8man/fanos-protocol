@@ -452,6 +452,19 @@ pub enum Station {
     /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
+    /// This node's claim **took an occupied point from its holder** — arbitration went our way and a live
+    /// binding was evicted (#260).
+    ///
+    /// The counterpart of [`Self::DirectorySeatSuperseded`], and the half that was silent. `WriteOutcome`
+    /// used to fold "bound a free point" and "displaced an incumbent" into one value on the reasoning that
+    /// the writer cannot tell them apart — which is true and beside the point, because the *cell* can: the
+    /// evicted address was reachable at that coordinate a moment ago and is not now, until it walks on.
+    ///
+    /// [`Observation::line`] carries the contested coordinate. A run of these is the plane approaching its
+    /// occupancy bound rather than one unlucky draw, and that is the reading an operator needs: a cell holds
+    /// about `q` nodes before collisions become routine, not `q² + q + 1`.
+    DirectoryPointTaken,
+
     /// A datagram opened under the **genesis** shape: the sender does not know the cell's live epoch, which
     /// is what a node joining for the first time necessarily looks like (#234).
     ///
@@ -697,6 +710,7 @@ impl Station {
         Self::AssignmentWithheld,
         Self::SetpointHeld,
         Self::WireGenesisShaped,
+        Self::DirectoryPointTaken,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
@@ -777,6 +791,7 @@ impl Station {
             Self::AssignmentWithheld => "assignment.withheld",
             Self::SetpointHeld => "setpoint.held",
             Self::WireGenesisShaped => "wire.genesis_shaped",
+            Self::DirectoryPointTaken => "directory.point_taken",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
@@ -828,6 +843,7 @@ impl Station {
             // move out of this arm, which is a change to this list rather than a silent widening.
             Self::EscalationUnbudgeted
             | Self::WireGenesisShaped
+            | Self::DirectoryPointTaken
             | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable

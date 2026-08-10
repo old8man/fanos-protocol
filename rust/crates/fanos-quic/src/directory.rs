@@ -71,10 +71,26 @@ impl Binding {
 #[must_use = "a write the arbitration rule refused looks exactly like one that landed; branch on it, or \
               discard it with the reason at the call site"]
 pub enum WriteOutcome {
-    /// The binding is now this write's. Either the point was free, or the incoming claim superseded the
-    /// incumbent — from the writer's side those are the same outcome, since in both the map now says what it
-    /// was asked to say.
+    /// The binding is now this write's, and **the point was free**.
+    ///
+    /// It used to also cover "the incoming claim beat an incumbent", on the reasoning that from the writer's
+    /// side those are the same outcome. They are — and the writer is not the only reader (#260). Taking an
+    /// occupied point *evicts a live binding*: some other node is now unreachable there until it walks on,
+    /// and that is a fact about the cell rather than about this write. Measured consequence of the
+    /// conflation: `Directory::collisions` counts a clash on **both** branches while only the losing one
+    /// reached a station, so a node that displaced two incumbents reported `collisions=2` on its health
+    /// surface and an entirely empty stations plane.
     Bound,
+    /// The binding is now this write's, and it **took the point from a live incumbent** whose claim it beat.
+    ///
+    /// The other half of what `Bound` used to mean. Distinct because the obligation is: `evicted` is an
+    /// address that was reachable at this coordinate a moment ago and is not now, so a reader watching the
+    /// cell — not this writer — needs it, and a run of them is the plane approaching its occupancy bound
+    /// rather than one unlucky draw.
+    Displaced {
+        /// The address that held the point and no longer does.
+        evicted: SocketAddr,
+    },
     /// This exact address was already bound here. Not a collision (no second claimant) and not a refusal
     /// (nothing was rejected) — a re-publish of what the table already held. Kept distinct from [`Bound`]
     /// because a caller asking "did anything change" gets a different answer, and folding it into
@@ -225,6 +241,9 @@ impl Directory {
                     "overlay coordinate collision: the newcomer holds the better claim and takes the point; the \
                      incumbent must advance along its own probe walk (fanos_vrf::settle_index)"
                 );
+                let evicted = existing.addr;
+                map.insert(coord, incoming);
+                return WriteOutcome::Displaced { evicted };
             }
             map.insert(coord, incoming);
             WriteOutcome::Bound
@@ -333,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_reports_which_of_the_three_things_it_did() {
+    fn a_write_reports_which_of_the_four_things_it_did() {
         // The PROPERTY: `Bound`, `Unchanged` and `Superseded` are each reachable, and no two of them are the same
         // observation. Before #241 all three returned `()`, so the arbitration rule above could refuse a write and the
         // caller could not tell — which cost three harnesses during #240, each built on a precondition that never
@@ -356,13 +375,26 @@ mod tests {
         );
         assert_eq!(dir.resolve(coord), Some(sa(1)), "and the refusal is real: the table still holds the incumbent");
 
-        // The displacing direction reports `Bound`, not a fourth value: from the writer's side "the point was free" and
-        // "I beat the incumbent" are the same outcome, since in both the map now says what it was asked to say. The
-        // displacer must win on the INDEX, because `low` is already the minimum rank and an equal claim does not beat
-        // an incumbent — which is what the first draft of this assertion got wrong, and what the run said.
+        // The displacing direction reports a FOURTH value, and this comment used to argue it should not (#260):
+        // "from the writer's side the point was free and I beat the incumbent are the same outcome". True of the
+        // writer, and the writer is not the only reader — `evicted` was reachable at this coordinate a moment ago
+        // and is not now. Folding it into `Bound` is what left the winning half of every collision off the stations
+        // plane while `Directory::collisions` counted it.
+        //
+        // The displacer must win on the INDEX, because `low` is already the minimum rank and an equal claim does not
+        // beat an incumbent — which is what the first draft of this assertion got wrong, and what the run said.
         let dir = Directory::new();
         let _ = dir.insert_claimed(coord, sa(1), low, 2);
-        assert_eq!(dir.insert_claimed(coord, sa(3), high, 0), WriteOutcome::Bound, "fewer probe steps wins");
+        assert_eq!(
+            dir.insert_claimed(coord, sa(3), high, 0),
+            WriteOutcome::Displaced { evicted: sa(1) },
+            "fewer probe steps wins, and the outcome names WHO was evicted — the address that is now unreachable here"
+        );
+
+        // And the discriminator that keeps the split honest: binding a FREE point is still plain `Bound`. Without
+        // this arm `Displaced` could be returned unconditionally and every assertion above would still pass.
+        let dir = Directory::new();
+        assert_eq!(dir.insert_claimed(coord, sa(7), high, 0), WriteOutcome::Bound, "a free point is not a displacement");
     }
 
     #[test]
@@ -385,7 +417,11 @@ mod tests {
         // incumbent (a bootstrap seed, a pinned fixture) the same unranked write lands.
         let dir = Directory::new();
         let _ = dir.insert(coord, sa(1));
-        assert_eq!(dir.insert(coord, sa(9)), WriteOutcome::Bound, "an unranked incumbent yields to anyone");
+        assert_eq!(
+            dir.insert(coord, sa(9)),
+            WriteOutcome::Displaced { evicted: sa(1) },
+            "an unranked incumbent yields to anyone — and yielding is a displacement, not a plain bind (#260)"
+        );
     }
 
     #[test]
