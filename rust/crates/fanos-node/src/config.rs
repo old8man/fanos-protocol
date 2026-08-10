@@ -752,6 +752,13 @@ pub fn seed_directory(peers: &[Peer], directory: &fanos_quic::Directory) -> Resu
         // Discarded deliberately: into a directory this function is seeding, an unranked write over an unranked
         // incumbent always lands, and the one input that could make it not land is refused above.
         let _ = directory.insert(peer.coord, peer.addr);
+        // **And the address again, without the coordinate** (#263). The binding above is perishable by
+        // design: `coord` is where that peer sat when this file was written, §L3 redraws it every epoch, and
+        // as an *unranked* entry it loses to every ranked write — including this node's own reseat onto the
+        // same point, which then deletes the only address it was given. Measured: the arrival ends with
+        // `known_peers = 1` in 2 runs of 5. The address alone is what does not perish, so it is kept where
+        // no arbitration can reach it and the send ladder can fall back to it.
+        directory.note_entry(peer.addr);
     }
     Ok(())
 }

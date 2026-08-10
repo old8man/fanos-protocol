@@ -6,7 +6,7 @@
 //! cloneable table the harness fills once endpoints are bound — the single seam that a real
 //! discovery layer slots into without touching the engine or the driver.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -135,6 +135,21 @@ pub struct Directory {
     /// no epoch clock and no reshuffle, so it has no placement defence at *any* epoch and nothing here can
     /// give it one (`docs/design-genesis.md` §7). Where a beacon IS configured, `Node::start` binds this.
     genesis: Option<BeaconSeed>,
+    /// The **configured entry addresses** of this network — where a node was told it can reach *somebody*,
+    /// held apart from the coordinate map on purpose (#263).
+    ///
+    /// A bootstrap line is `coord@addr`, and only the address is durable. The coordinate is where that peer
+    /// sat when the file was written, and §L3 redraws every coordinate each epoch — so the pair is stale
+    /// after the network's first turn, while the address stays good. Worse, as a *binding* it is the weakest
+    /// entry the table can hold: `seed_directory` writes it unranked, everything a node writes about its own
+    /// seat is ranked ([`Reseater::apply`]), and [`Binding::supersedes`] lets any claim displace an unranked
+    /// incumbent. So the one address a node cannot re-derive was stored as the one entry guaranteed to lose
+    /// every contest it entered, and a node's own lawful reseat onto that point deleted it.
+    ///
+    /// Kept as a set of addresses with no coordinate attached, because that is what the fact actually is:
+    /// not "the node at point P is at A" but "this network answers at A". Nothing arbitrates it and nothing
+    /// evicts it. Bounded by the operator's own list.
+    entries: Arc<RwLock<BTreeSet<SocketAddr>>>,
 }
 
 impl Directory {
@@ -304,6 +319,26 @@ impl Directory {
         self.collisions.load(Ordering::Relaxed)
     }
 
+    /// Remember a **configured entry address** for this network (#263). See the `entries` field.
+    ///
+    /// Deliberately takes no coordinate. One is available at the only call site (`seed_directory` reads a
+    /// `coord@addr` line) and is deliberately dropped: attaching it is what made this fact perishable and
+    /// evictable in the first place.
+    pub fn note_entry(&self, addr: SocketAddr) {
+        if let Ok(mut set) = self.entries.write() {
+            set.insert(addr);
+        }
+    }
+
+    /// The configured entry addresses, in a stable order.
+    ///
+    /// Empty for a node with no bootstrap list — a founder, or a test fixture that seeds the map directly —
+    /// and an empty answer must read as "no entry point was configured", never as "the entry points failed".
+    #[must_use]
+    pub fn entries(&self) -> Vec<SocketAddr> {
+        self.entries.read().map(|set| set.iter().copied().collect()).unwrap_or_default()
+    }
+
     /// Record that a send to `coord` was dropped for want of an address — so the transport's drop of an
     /// unroutable coordinate is *observable* (counted + logged) rather than silent.
     pub fn note_unresolved_drop(&self, coord: Triple) {
@@ -349,6 +384,48 @@ mod tests {
         let mut high = [0u8; 64];
         high[0] = 1;
         (low, high)
+    }
+
+    /// **A configured entry address outlives the binding that named it** (#263).
+    ///
+    /// The measured failure: a node's own reseat lands on the point its bootstrap line named, the arbitration
+    /// correctly hands the point to the ranked claim, and the address the operator *gave* this node — the one
+    /// thing it cannot re-derive — is gone with it. Two runs in five ended at `known_peers = 1` that way.
+    ///
+    /// The eviction is asserted here rather than assumed, so the surviving entry is not surviving trivially:
+    /// the binding really is destroyed by the same call, and the entry really is somewhere else.
+    ///
+    /// Falsified by deleting the `entries` set (have `entries()` return empty): the last assertion reddens.
+    /// Falsified the other way by making `note_entry` store the coordinate too and putting it under the same
+    /// arbitration — then it is evicted exactly like the binding, which is the defect restated.
+    #[test]
+    fn a_configured_entry_address_outlives_the_binding_that_named_it() {
+        let (low, _high) = ranks();
+        let dir = Directory::new();
+        let seed = sa(9000);
+        let coord = [1, 0, 0];
+
+        // The bootstrap line, exactly as `seed_directory` writes it: an unranked binding, plus the address on
+        // its own.
+        assert_eq!(dir.insert(coord, seed), WriteOutcome::Bound);
+        dir.note_entry(seed);
+        assert_eq!(dir.entries(), vec![seed]);
+
+        // This node reseats onto the same point and writes a RANKED claim — the strongest write there is, and
+        // the one an unranked incumbent always loses to.
+        assert_eq!(
+            dir.insert_ranked(coord, sa(1), low),
+            WriteOutcome::Displaced { evicted: seed },
+            "the arbitration rule is working: an unranked seed yields to a proven claim"
+        );
+        assert_eq!(dir.resolve(coord), Some(sa(1)), "and the loss is real — the map no longer names the seed");
+
+        assert_eq!(
+            dir.entries(),
+            vec![seed],
+            "but the address we were GIVEN survives, because it is not a claim about a coordinate — it is where \
+             this network answers, and nothing arbitrates that"
+        );
     }
 
     #[test]
