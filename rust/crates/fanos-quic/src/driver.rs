@@ -1864,7 +1864,23 @@ async fn reshuffle_loop<F: Field>(
                     break;
                 }
             }
-            Wake::Resettle => {}
+            // **The established node says so instead (#260).** Two rules, each sound alone, deadlock together:
+            // `claim_beats` can decide the *seated* node lost, and the rule above forbids exactly that node to walk
+            // on. Both then hold one point until the epoch turns. The loser is not uninformed — the winning claim is
+            // in its own book, which is what woke this arm — it is **forbidden to act**, so a notification would have
+            // fixed nothing. What was missing is that the state was invisible: measured on the two-node join probe,
+            // the frozen side reported `collisions = 0` and looked healthy while the cell was split.
+            Wake::Resettle => {
+                if let Some(point) = book.outranked_at::<F>(&at.output, at.index) {
+                    seat.client.record_station(Station::DirectorySeatOutranked, Some(point), None);
+                    tracing::warn!(
+                        ?point,
+                        index = at.index,
+                        "a peer proved a better claim to the point this node is seated on, and an established node \
+                         must not move mid-epoch: both hold it until the next beacon re-derives placement"
+                    );
+                }
+            }
             Wake::Stop => break,
         }
     }

@@ -465,6 +465,23 @@ pub enum Station {
     /// about `q` nodes before collisions become routine, not `q² + q + 1`.
     DirectoryPointTaken,
 
+    /// A peer proved a **better claim to the point this node is seated on**, and this node may not move (#260).
+    ///
+    /// Not a third spelling of the two above. Those are outcomes of a *write this node made*; this is a standing
+    /// condition it discovered and cannot act on. The coordinate rule (`fanos_vrf::claim_beats`) can decide that the
+    /// seated node lost, while the placement rule forbids an established node to re-seat mid-epoch — because the cell
+    /// has already derived committee membership, shard placement and routing from where it sits. Each rule is right
+    /// alone; together they leave two nodes on one point until the next beacon re-derives placement.
+    ///
+    /// The frozen node is **not** uninformed: the winning claim is in its own claim book, which is what raised this.
+    /// It is forbidden to act, so no message would help — the missing thing was that the state was invisible. Measured
+    /// on the two-node join probe, the frozen side reported zero collisions and looked healthy while the cell was
+    /// split, because a collision is counted where a *binding* is refused and this node never attempted one.
+    ///
+    /// [`Observation::line`] carries the contested coordinate. A nonzero count that does not clear at the next epoch
+    /// is the settling window (`docs/design-coordinates.md`) being needed rather than one unlucky draw.
+    DirectorySeatOutranked,
+
     /// A datagram opened under the **genesis** shape: the sender does not know the cell's live epoch, which
     /// is what a node joining for the first time necessarily looks like (#234).
     ///
@@ -711,6 +728,7 @@ impl Station {
         Self::SetpointHeld,
         Self::WireGenesisShaped,
         Self::DirectoryPointTaken,
+        Self::DirectorySeatOutranked,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
@@ -792,6 +810,7 @@ impl Station {
             Self::SetpointHeld => "setpoint.held",
             Self::WireGenesisShaped => "wire.genesis_shaped",
             Self::DirectoryPointTaken => "directory.point_taken",
+            Self::DirectorySeatOutranked => "directory.seat_outranked",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
@@ -844,6 +863,7 @@ impl Station {
             Self::EscalationUnbudgeted
             | Self::WireGenesisShaped
             | Self::DirectoryPointTaken
+            | Self::DirectorySeatOutranked
             | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable

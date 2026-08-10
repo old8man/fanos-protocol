@@ -205,6 +205,23 @@ impl ClaimBook {
         book.best.get(&point.coords()).map(|b| (b.index, b.output))
     }
 
+    /// The seat at probe step `index`, when a recorded peer's claim to it **beats this node's own**.
+    ///
+    /// [`settle`] answers "where should I sit"; this answers the narrower question "is where I already sit still mine".
+    /// The two differ only for a node that may not act on the answer — an established one, which the reshuffle loop
+    /// forbids to move mid-epoch (see `spawn_self_certifying`). It cannot resolve the contest, so what it can do is
+    /// *say* so, and that is why this exists apart from [`settle`] rather than inside it.
+    ///
+    /// Both halves read the same `best` table under the same [`claim_beats`] order as `settle` and
+    /// [`witness_for`](Self::witness_for), so a node reporting itself outranked here and a peer concluding it won there
+    /// cannot disagree.
+    #[must_use]
+    pub(crate) fn outranked_at<F: Field>(&self, mine: &VrfOutput, index: u16) -> Option<Triple> {
+        let seat = probe_point::<F>(mine, index);
+        let (their_index, their_output) = self.contender::<F>(&seat)?;
+        claim_beats((their_index, &their_output), (index, mine)).then(|| seat.coords())
+    }
+
     /// The witness proving a node with `mine` was displaced from its `j`-th probe point, if one is recorded.
     ///
     /// Returns the *best* claimant on that point, which is the strongest witness available and the one whose claim most
@@ -427,6 +444,54 @@ mod tests {
             settle::<F7>(&other, &winner.3, winner.2).map(|(k, _)| k),
             Some(0),
             "the better claim is the one that stays"
+        );
+    }
+
+    /// The three answers `outranked_at` must give, on one constructed collision (#260).
+    ///
+    /// The reason it exists apart from `settle` is that its *caller* cannot act: an established node is forbidden to
+    /// re-seat mid-epoch, so it needs the question "is my seat still mine?" answered on its own. The asymmetry is the
+    /// property under test — the same pair must answer yes for the loser and no for the winner. A predicate that
+    /// simply reported "somebody else claims this point" would pass the first assertion and fail the second, and it
+    /// is the one an operator would have been shown.
+    #[test]
+    fn only_the_side_that_lost_the_arbitration_reports_its_seat_outranked() {
+        let epoch = Epoch::new(5);
+        let beacon = BeaconSeed::GENESIS;
+        let peers: Vec<_> = (0..80u8).map(|s| peer(s, epoch, &beacon)).collect();
+        let pair = peers.iter().enumerate().find_map(|(i, a)| {
+            peers.iter().skip(i + 1).find_map(|b| {
+                if probe_point::<F7>(&a.3, 0) != probe_point::<F7>(&b.3, 0) || walks_coincide(&a.3, &b.3) {
+                    return None;
+                }
+                Some(if claim_beats((0, &b.3), (0, &a.3)) { (a, b) } else { (b, a) })
+            })
+        });
+        let (loser, winner) = pair.expect("two of 80 identities collide on a point but not on a whole walk");
+        let contested = probe_point::<F7>(&loser.3, 0).coords();
+
+        // An empty book contests nothing: the alarm must not fire merely because the node is seated somewhere.
+        let empty = ClaimBook::new();
+        empty.adopt(epoch);
+        assert_eq!(empty.outranked_at::<F7>(&loser.3, 0), None, "no recorded peer ⇒ the seat is uncontested");
+
+        let book = ClaimBook::new();
+        book.adopt(epoch);
+        book.record::<F7>(&winner.0, winner.1, winner.2, &winner.3);
+        assert_eq!(
+            book.outranked_at::<F7>(&loser.3, 0),
+            Some(contested),
+            "the loser is seated on a point a recorded peer claims better, and must be able to say which"
+        );
+
+        // The other direction, on the same collision: the winner is contested too, and is not outranked.
+        let mirror = ClaimBook::new();
+        mirror.adopt(epoch);
+        mirror.record::<F7>(&loser.0, loser.1, loser.2, &loser.3);
+        assert_eq!(
+            mirror.outranked_at::<F7>(&winner.3, 0),
+            None,
+            "a peer merely *wanting* our point is not us losing it — that is the whole content of `claim_beats`"
         );
     }
 
