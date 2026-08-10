@@ -305,24 +305,38 @@ impl ProteusShaper {
     /// a peer without the community secret cannot produce a frame this shaper will accept. [`Morph::Plain`]
     /// is identity (the frame passed through unshaped). Size-shaping padding on the wire is transparent here:
     /// the codec's length field bounds the payload, so trailing pad is ignored.
+    /// **Returns the arm as well as the bytes, and the caller must act on it** (#234). A frame that opened
+    /// under [`OpenedUnder::Genesis`] came from a peer that does not yet know the live epoch, so a reply
+    /// shaped at the live epoch is one it cannot read — the handshake would connect and then go silent in
+    /// one direction. `Current` and `Grace` are the same instruction to the caller (reply normally) and are
+    /// kept distinct anyway, because "we are inside the grace window" is a different thing for an operator
+    /// to see than "we are in step".
     #[must_use]
-    pub fn inbound(&self, wire: &[u8]) -> Option<Vec<u8>> {
+    pub fn inbound(&self, wire: &[u8]) -> Option<(Vec<u8>, OpenedUnder)> {
         if let Some(codec) = &self.codec {
-            return codec.decode(wire);
+            return codec.decode(wire).map(|f| (f, OpenedUnder::Current));
         }
         if self.morph == Morph::Plain {
-            return Some(wire.to_vec());
+            return Some((wire.to_vec(), OpenedUnder::Current));
         }
         // Current epoch first: in steady state — which is almost all of the time — the first attempt
         // succeeds and the grace shapes are never touched. See [`SHAPE_GRACE`] for why the other two exist
         // and why both sides are needed rather than only the past.
-        deobfuscate(&self.shape, wire)
-            .or_else(|| deobfuscate(&self.grace[0], wire))
-            .or_else(|| deobfuscate(&self.grace[1], wire))
-            // Last, and only past the grace window: a peer that has not yet learned the epoch
-            // ([`OpenedUnder::Genesis`]). Fourth in the chain because it is the rarest, so the steady state
-            // never pays for it beyond the miss it was already paying.
-            .or_else(|| self.beyond_grace().then(|| deobfuscate(&self.genesis, wire)).flatten())
+        if let Some(frame) = deobfuscate(&self.shape, wire) {
+            return Some((frame, OpenedUnder::Current));
+        }
+        if let Some(frame) = deobfuscate(&self.grace[0], wire).or_else(|| deobfuscate(&self.grace[1], wire)) {
+            return Some((frame, OpenedUnder::Grace));
+        }
+        // Last, and only past the grace window: a peer that has not yet learned the epoch. Fourth in the
+        // chain because it is the rarest, so the steady state never pays for it beyond the miss it was
+        // already paying.
+        if self.beyond_grace()
+            && let Some(frame) = deobfuscate(&self.genesis, wire)
+        {
+            return Some((frame, OpenedUnder::Genesis));
+        }
+        None
     }
 
     /// Whether the genesis shape is a *distinct* fourth candidate rather than one already inside the
@@ -428,6 +442,13 @@ fn grace_shapes(secret: &[u8], epoch: Epoch) -> [ShapeParams; 2] {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// The bytes alone. Every assertion below predates [`ProteusShaper::inbound`] reporting its arm and is
+    /// about *reachability*; the arm has its own tests, and folding it into each of these would add noise
+    /// to claims that are not about it.
+    fn opened(shaper: &ProteusShaper, wire: &[u8]) -> Option<Vec<u8>> {
+        shaper.inbound(wire).map(|(frame, _)| frame)
+    }
+
     use super::*;
 
     #[test]
@@ -440,7 +461,7 @@ mod tests {
             frame,
             "the wire carries no raw frame bytes"
         );
-        assert_eq!(shaper.inbound(&wire).unwrap(), frame);
+        assert_eq!(opened(&shaper, &wire).unwrap(), frame);
     }
 
     #[test]
@@ -448,7 +469,7 @@ mod tests {
         let alice = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
         let bob = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
         let wire = alice.outbound(b"hi bob");
-        assert_eq!(bob.inbound(&wire).unwrap(), b"hi bob");
+        assert_eq!(opened(&bob, &wire).unwrap(), b"hi bob");
     }
 
     /// **A peer mid-rotation is reachable in BOTH directions, and two epochs apart in neither** (#196).
@@ -470,7 +491,7 @@ mod tests {
         // The half a backward-only retention misses: the EARLY node's frames reaching the late one.
         let forward = early.outbound(b"from the node that turned first");
         assert_eq!(
-            late.inbound(&forward).as_deref(),
+            opened(&late, &forward).as_deref(),
             Some(b"from the node that turned first".as_slice()),
             "a peer that has not yet rotated must still read the one that has — otherwise whichever node \
              turns first is unreachable for the whole beacon spread"
@@ -479,7 +500,7 @@ mod tests {
         // And the half it does cover, which must not regress.
         let back = late.outbound(b"from the node still behind");
         assert_eq!(
-            early.inbound(&back).as_deref(),
+            opened(&early, &back).as_deref(),
             Some(b"from the node still behind".as_slice()),
             "and the node that has rotated must still read the one that has not"
         );
@@ -487,7 +508,7 @@ mod tests {
         // Two epochs apart is outside the window, in both directions.
         let far = ProteusShaper::new(b"s".to_vec(), Epoch::new(12));
         assert!(
-            far.inbound(&back).is_none() && late.inbound(&far.outbound(b"x")).is_none(),
+            opened(&far, &back).is_none() && opened(&late, &far.outbound(b"x")).is_none(),
             "the grace window is bounded: two epochs apart does not un-shape, or the rotation is not one"
         );
     }
@@ -502,13 +523,13 @@ mod tests {
         let genesis = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
         let next = ProteusShaper::new(b"s".to_vec(), Epoch::new(1));
         assert_eq!(
-            genesis.inbound(&next.outbound(b"forward from epoch 1")).as_deref(),
+            opened(&genesis, &next.outbound(b"forward from epoch 1")).as_deref(),
             Some(b"forward from epoch 1".as_slice()),
             "epoch 0 still accepts epoch 1 — the forward half is what a fresh node needs"
         );
         let wrapped = ProteusShaper::new(b"s".to_vec(), Epoch::new(u64::MAX));
         assert!(
-            genesis.inbound(&wrapped.outbound(b"x")).is_none(),
+            opened(&genesis, &wrapped.outbound(b"x")).is_none(),
             "and it does not accept the shape of `0 - 1` wrapped, which is what a bare subtraction would give"
         );
     }
@@ -536,7 +557,7 @@ mod tests {
 
         let shaped = sender.shape(b"post-rotation frame");
         assert_eq!(
-            receiver.inbound(&shaped.wire).as_deref(),
+            opened(&receiver, &shaped.wire).as_deref(),
             Some(&b"post-rotation frame"[..]),
             "a peer on the same morph decodes — the codec is shared"
         );
@@ -596,9 +617,9 @@ mod tests {
 
         // A peer running the same codec recovers it; the built-in polymorph decode does NOT.
         let receiver = ProteusShaper::with_codec(b"s".to_vec(), Epoch::ZERO, Arc::new(MockCodec)).unwrap();
-        assert_eq!(receiver.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(opened(&receiver, &shaped.wire).as_deref(), Some(&b"hello"[..]));
         let builtin = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
-        assert_ne!(builtin.inbound(&shaped.wire).as_deref(), Some(&b"hello"[..]));
+        assert_ne!(opened(&builtin, &shaped.wire).as_deref(), Some(&b"hello"[..]));
     }
 
     #[test]
@@ -609,7 +630,7 @@ mod tests {
         // The built-in codec is back: a plain Polymorph shaper decodes the frame (the mock codec would not).
         let shaped = shaper.shape(b"builtin again");
         let rx = ProteusShaper::new(b"s".to_vec(), Epoch::ZERO);
-        assert_eq!(rx.inbound(&shaped.wire).as_deref(), Some(&b"builtin again"[..]));
+        assert_eq!(opened(&rx, &shaped.wire).as_deref(), Some(&b"builtin again"[..]));
     }
 
     #[test]
@@ -619,7 +640,7 @@ mod tests {
         let frame = b"unshaped";
         let shaped = shaper.shape(frame);
         assert_eq!(shaped.wire, frame, "Plain passes the frame through unshaped");
-        assert_eq!(shaper.inbound(frame).as_deref(), Some(&frame[..]));
+        assert_eq!(opened(&shaper, frame).as_deref(), Some(&frame[..]));
     }
 
     #[test]
@@ -629,7 +650,7 @@ mod tests {
         let wire = sender.outbound(b"secret payload");
         // Different junk length ⇒ the recovered bytes are not the original frame.
         assert_ne!(
-            eavesdropper.inbound(&wire).as_deref(),
+            opened(&eavesdropper, &wire).as_deref(),
             Some(&b"secret payload"[..])
         );
     }
@@ -648,7 +669,7 @@ mod tests {
         );
         // The receiver (fresh counter is irrelevant — it only skips fixed widths) recovers both.
         let rx = ProteusShaper::new(b"community".to_vec(), Epoch::new(7));
-        assert_eq!(rx.inbound(&w0).unwrap(), frame);
-        assert_eq!(rx.inbound(&w1).unwrap(), frame);
+        assert_eq!(opened(&rx, &w0).unwrap(), frame);
+        assert_eq!(opened(&rx, &w1).unwrap(), frame);
     }
 }

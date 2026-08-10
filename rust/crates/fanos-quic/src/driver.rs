@@ -27,6 +27,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use fanos_field::Field;
 use fanos_geometry::{Point, TRIPLE_WIRE_LEN, Triple, decode_triple, encode_triple};
 use fanos_primitives::{BeaconSeed, Epoch, storage_digest};
+use fanos_proteus::shaper::OpenedUnder;
 use fanos_proteus::{Environment, Morph, MorphCodec, MorphController, ProteusShaper};
 use fanos_runtime::ports::stations::{Observation, Station, Stations};
 use fanos_runtime::ports::ReadOutcome;
@@ -346,13 +347,19 @@ fn shape_out_timed(shaper: &Shaper, frame: &[u8]) -> (Vec<u8>, std::time::Durati
     }
 }
 
-/// Recover an inbound frame from the wire, or `None` if it wasn't shaped by our secret+epoch.
-fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<Vec<u8>> {
+/// Recover an inbound frame from the wire with the shape that opened it, or `None` if it wasn't shaped by
+/// our secret+epoch.
+///
+/// The second value is [`OpenedUnder::Genesis`] exactly when the sender does not know the live epoch yet
+/// (#234), and a caller that will *reply* must carry it to the reply — see [`shape_out_to`]. With no shaper
+/// configured there is one shape and it is the current one, which is what `Current` means here.
+fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<(Vec<u8>, OpenedUnder)> {
     match shaper {
         Some(s) => s.read().unwrap_or_else(PoisonError::into_inner).inbound(&wire),
-        None => Some(wire),
+        None => Some((wire, OpenedUnder::Current)),
     }
 }
+
 
 /// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
 const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
@@ -2856,7 +2863,12 @@ async fn read_verified_hello(
     let Ok(raw) = stream.read_to_end(max_wire()).await else {
         return PeerHello::Silent;
     };
-    let Some(hello) = shape_in(&t.shaper, raw) else {
+    // **The arm is available here and deliberately not acted on yet** (#234). Answering a genesis-shaped
+    // HELLO in the genesis shape is right, but it is not sufficient and would look like a fix: both sides
+    // `send_hello` BEFORE they read one, so the member's own HELLO is already on the wire — shaped at the
+    // live epoch — by the time this line runs, and a joiner cannot read it. Closing that needs the arm
+    // known at SEND time, which means sharing the datagram layer's `genesis_speakers` map with the driver.
+    let Some((hello, _under)) = shape_in(&t.shaper, raw) else {
         t.record_station(Station::WireUnshaped, None, None);
         return PeerHello::Silent;
     };
@@ -3001,7 +3013,9 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 async fn read_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
     let mut stream = conn.accept_uni().await.ok()?;
     let raw = stream.read_to_end(max_wire()).await.ok()?;
-    let Some(bytes) = shape_in(&t.shaper, raw) else {
+    // This mode sends no reply, so the arm has nowhere to be carried; `read_verified_hello` is the one
+    // that answers, and it threads it (#234).
+    let Some((bytes, _under)) = shape_in(&t.shaper, raw) else {
         // The HELLO path un-shapes too, and it fires FIRST: a peer on another epoch or another community
         // never reaches `read_frames`, so instrumenting only the steady-state path counts nothing for
         // exactly the peer an operator wants named. Found by the falsification, not by reading (#191).
@@ -3041,7 +3055,10 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
             t.record_station(Station::WireOverBound, Some(from), None);
             continue;
         };
-        let Some(frame) = shape_in(&t.shaper, raw) else {
+        // The steady loop: by the time a peer is framing here the handshake has completed, so it has
+        // learned the live epoch and `_under` is `Current` or `Grace`. Named rather than dropped so the
+        // next reader sees there is nothing to reply-shape on this path.
+        let Some((frame, _under)) = shape_in(&t.shaper, raw) else {
             t.record_station(Station::WireUnshaped, Some(from), None);
             continue;
         };
