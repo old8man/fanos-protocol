@@ -1614,8 +1614,25 @@ struct BeaconWindow {
 }
 
 impl BeaconWindow {
-    /// Accept the current epoch plus this many previous epochs' beacons.
-    const DEPTH: usize = 3;
+    /// How many epochs' beacons the window holds — the current one and `SHAPE_GRACE` before it.
+    ///
+    /// **Derived, and derived from the transport, because a verifier cannot usefully be wider than the wire
+    /// that feeds it** (#261). It was `3` with no derivation at all, while both neighbouring "epochs of
+    /// grace" constants carry careful ones and each says explicitly why it is its own number:
+    /// `fanos_proteus::SHAPE_GRACE` bounds *beacon propagation*, `HOST_GRACE_EPOCHS` is pinned by the onion
+    /// ratchet's retain window. This one is the propagation question again — a peer proving `N−1` is the
+    /// transition race — so it is `SHAPE_GRACE`, not a third opinion about the same quantity.
+    ///
+    /// **What the old `3` bought: nothing.** The shapes a node can open are `{N−1, N, N+1}` plus the genesis
+    /// shape (#234). A peer two epochs behind seals at `N−2`, which is in neither set, so for `N ≥ 3` its
+    /// frame is never opened and its HELLO never reaches this window at all. The third slot was unreachable
+    /// width that *read*, in the doc above, as tolerance for a lagging node.
+    ///
+    /// **And the safe-stall case in that doc is not served here — say so rather than imply it.** A node more
+    /// than `SHAPE_GRACE` behind cannot get a frame across in either direction, so no width of this window
+    /// reaches it; it has to re-learn the epoch, which is the §7.8 bootstrap (#235) and not a beacon cache.
+    /// Widening this constant to "help" such a node is the shape that made `3` look reasonable.
+    const DEPTH: usize = 1 + fanos_proteus::SHAPE_GRACE as usize;
 
     fn genesis(seed: BeaconSeed) -> Self {
         let mut recent = VecDeque::with_capacity(Self::DEPTH);
@@ -3770,6 +3787,45 @@ mod tests {
         assert_eq!(decode_relay(decoded.body), Some((target, origin, inner)));
         // A body too short for both coordinates is rejected, not mis-parsed.
         assert_eq!(decode_relay(&[0u8; 2 * TRIPLE_WIRE_LEN - 1]), None);
+    }
+
+    /// **Every epoch the verifier admits must be one the wire can deliver** (#261).
+    ///
+    /// A relation between two crates, which is why neither can state it alone: `BeaconWindow` decides whose
+    /// HELLO is judged, `ProteusShaper` decides whose frame is opened, and a HELLO that cannot be opened is
+    /// never judged. Asserting `DEPTH == 1 + SHAPE_GRACE` would be vacuous now that DEPTH is defined that
+    /// way; this drives the actual shapers instead, so it fails if either side moves on its own.
+    #[test]
+    fn the_verifier_admits_no_epoch_the_wire_would_refuse() {
+        const N: u64 = 8; // far enough that the genesis door is open and cannot mask a grace failure
+        let secret = b"window-vs-wire".to_vec();
+        let mut here = ProteusShaper::new(secret.clone(), Epoch::ZERO);
+        here.rotate(Epoch::new(N));
+
+        // The window admits `N` down to `N - (DEPTH - 1)`. Every one of those must cross the wire.
+        for back in 0..BeaconWindow::DEPTH as u64 {
+            let peer_epoch = N - back;
+            let mut peer = ProteusShaper::new(secret.clone(), Epoch::ZERO);
+            peer.rotate(Epoch::new(peer_epoch));
+            let mut wire = peer.seal_datagram(b"hello-ish", &[7u8; fanos_proteus::NONCE_LEN]);
+            assert!(
+                here.open_datagram(&mut wire).is_some(),
+                "the window admits epoch {peer_epoch} (N={N}, DEPTH={}), so the wire must carry it —                  otherwise that slot is width nobody can reach",
+                BeaconWindow::DEPTH
+            );
+        }
+
+        // And the first epoch OUTSIDE the window is one the wire refuses too, so the window is not the
+        // narrower of the two gates either: neither side is silently deciding for the other.
+        let outside = N - BeaconWindow::DEPTH as u64;
+        let mut peer = ProteusShaper::new(secret, Epoch::ZERO);
+        peer.rotate(Epoch::new(outside));
+        let mut wire = peer.seal_datagram(b"hello-ish", &[7u8; fanos_proteus::NONCE_LEN]);
+        assert!(
+            here.open_datagram(&mut wire).is_none(),
+            "epoch {outside} is outside the verification window, and the wire agrees — if the wire carried \
+             it, the window would be the gate turning a reachable peer away"
+        );
     }
 
     #[test]

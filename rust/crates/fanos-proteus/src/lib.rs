@@ -39,10 +39,14 @@ pub use controller::{DEFAULT_TRIP, MorphController};
 pub use datagram::{DATAGRAM_OVERHEAD, open_in_place, seal};
 pub use fanos_primitives::Epoch;
 pub use morph::{Environment, Morph};
-pub use obfuscate::{MAX_WIRE_OVERHEAD, deobfuscate, obfuscate};
+pub use obfuscate::{MAX_WIRE_OVERHEAD, NONCE_LEN, deobfuscate, obfuscate};
 pub use profile::ShapingProfile;
 pub use shape::{ShapeParams, epoch_shape};
-pub use shaper::{ProteusShaper, Shaped};
+// `SHAPE_GRACE` is re-exported because another crate now DERIVES from it: `fanos-quic`'s HELLO
+// verification window is `1 + SHAPE_GRACE` epochs wide, since a verifier cannot usefully admit an
+// epoch this shaper would refuse to open (#261). A cross-crate derivation should read from the
+// root, not reach into a module path.
+pub use shaper::{ProteusShaper, SHAPE_GRACE, Shaped};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -64,7 +68,7 @@ mod tests {
         // It derives this epoch's shape and obfuscates a transport packet with a per-packet nonce.
         let shape = epoch_shape(secret, epoch);
         let packet = b"encrypted FANOS transport frame";
-        let wire = obfuscate(&shape, packet, &[0u8; obfuscate::NONCE_LEN]);
+        let wire = obfuscate(&shape, packet, &[0u8; NONCE_LEN]);
 
         // The bridge (holding the same secret) derives the same shape and strips it.
         let bridge_shape = epoch_shape(secret, epoch);
