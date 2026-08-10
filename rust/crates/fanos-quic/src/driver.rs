@@ -337,8 +337,16 @@ fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
 /// data path waits before transmitting (`ZERO` when no shaper is set or the morph does not time-shape). The
 /// clock stays in the driver — the shaper only computes the delay — keeping PROTEUS below the sans-I/O
 /// boundary. Used on the data path (`send_uni`); control frames keep the untimed [`shape_out`].
-fn shape_out_timed(shaper: &Shaper, frame: &[u8]) -> (Vec<u8>, std::time::Duration) {
+fn shape_out_timed(shaper: &Shaper, joining: bool, frame: &[u8]) -> (Vec<u8>, std::time::Duration) {
     match shaper {
+        // A joining peer reads only the genesis shape, and that is true of *data* frames as well as
+        // handshake ones (#234). The pin found this: the handshake completed and the first payload was
+        // unreadable, because the data path has its own shaping call and it was not on the list. Pacing is
+        // unaffected — the delay is a property of the morph, not of which shape sealed the bytes.
+        Some(s) if joining => {
+            let wire = s.read().unwrap_or_else(PoisonError::into_inner).outbound_at_genesis(frame);
+            (wire, std::time::Duration::ZERO)
+        }
         Some(s) => {
             let shaped = s.read().unwrap_or_else(PoisonError::into_inner).shape(frame);
             (shaped.wire, shaped.delay)
@@ -2424,7 +2432,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             _ => cached(&t.conns, to),
         };
         if let Some(conn) = direct {
-            send_uni(&conn, &t.shaper, &frame).await;
+            send_uni(&conn, &t.shaper, t.joining(&conn), &frame).await;
         } else if let Some((hub_coord, hub)) = pick_relay_hub(&t.conns, to) {
             // **Try to stop relaying before settling into it.** The relay below is the fallback for the case
             // a hole-punch cannot fix, but nothing in a running node ever *asked* for a punch — `hole_punch`
@@ -2439,7 +2447,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // *different* hub is genuinely new information — it observed a different mapping — so it gets its
             // own attempt. That needs no timer and no chosen period, and it is bounded by the peer count.
             if asked.insert(hub_coord) {
-                send_uni(&hub, &t.shaper, &connect_req_frame(to)).await;
+                send_uni(&hub, &t.shaper, t.joining(&hub), &connect_req_frame(to)).await;
             }
             // Symmetric-NAT relay fallback (#119): `to` is unreachable directly (no address, no cached
             // connection — the case a symmetric NAT leaves after even a hole-punch fails). Wrap the frame
@@ -2448,7 +2456,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // peer it already holds a connection to, so this reaches `to` iff some common node connects both
             // ends — exactly the topology the overlay's cell membership creates. This frame relays either
             // way: a punch is asynchronous, and the traffic must not wait on it.
-            send_uni(&hub, &t.shaper, &encode_relay(to, t.me, &frame)).await;
+            send_uni(&hub, &t.shaper, t.joining(&hub), &encode_relay(to, t.me, &frame)).await;
         } else {
             // Genuinely unroutable (no direct path and no hub): drop, counted + logged so it is observable.
             t.directory.note_unresolved_drop(to);
@@ -2459,8 +2467,8 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
 /// Write one frame as a single shaped uni-stream on `conn` (the shared send primitive). When the active
 /// morph time-shapes (§13.3), the frame is paced by the shaper's per-packet delay first — the traffic-shaper
 /// applied at the one point every data frame passes through.
-async fn send_uni(conn: &Connection, shaper: &Shaper, frame: &[u8]) {
-    let (wire, delay) = shape_out_timed(shaper, frame);
+async fn send_uni(conn: &Connection, shaper: &Shaper, joining: bool, frame: &[u8]) {
+    let (wire, delay) = shape_out_timed(shaper, joining, frame);
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
@@ -3171,7 +3179,7 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                             }
                         } else if let Some(hub_conn) = cached(&t.conns, target) {
                             // We are the hub: pass the whole Relay on to the target (re-shaped for that hop).
-                            send_uni(&hub_conn, &t.shaper, &frame).await;
+                            send_uni(&hub_conn, &t.shaper, t.joining(&hub_conn), &frame).await;
                         }
                     }
                     continue;

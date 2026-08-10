@@ -142,6 +142,130 @@ async fn deliver_under(proteus: ProteusConfig) {
     assert_eq!(got, payload);
 }
 
+/// **A node that does not know the cell's epoch can still join it** (#234).
+///
+/// The asymmetry the shipping path is stuck in. Nothing a joining node holds carries a time or an epoch
+/// number — `BeaconParams` has neither and `BeaconWindow::genesis` starts at zero — so it necessarily
+/// shapes at epoch 0 while the cell is at `N`. With `SHAPE_GRACE = 1` the cell accepts `{N−1, N, N+1}` and
+/// the joiner accepts `{0, 0, 1}`, so from **N = 2** the two sets are disjoint and neither side can read
+/// the other. This is the one test where the two nodes are deliberately on different epochs; every other
+/// test in this file puts both at `11`, which is exactly why none of them could see it.
+///
+/// Both directions are asserted, and separately, because the two halves are fixed by different mechanisms
+/// and a single direction would pass with either one missing: joiner → member needs the *shaper* to accept
+/// the genesis shape as a fourth candidate, member → joiner needs the *envelope* to have remembered the
+/// address and to answer in the shape it was asked in.
+///
+/// Falsified against the pre-fix shaper: both directions time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_at_epoch_zero_joins_a_cell_that_has_already_turned() {
+    let proteus = ProteusConfig::polymorph(b"community-transport-secret".to_vec());
+    let dir = Directory::new();
+
+    // Two, not one-and-a-bit: at `N = 1` the genesis shape is still inside the member's grace window and
+    // the exchange works without any of #234. The twin below pins that, so a pass here is about the window
+    // rather than about the harness.
+    let member = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
+        dir.clone(),
+        proteus.clone(),
+        fanos_proteus::Epoch::new(2),
+    )
+    .await
+    .expect("spawn the seated member");
+    let joiner = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
+        dir.clone(),
+        proteus,
+        fanos_proteus::Epoch::new(0),
+    )
+    .await
+    .expect("spawn the joining node");
+
+    both_ways(member, joiner, "a cell at epoch 2 and a joiner at epoch 0").await;
+}
+
+/// **The twin, and it is what makes the test above a test of the WINDOW** (#234).
+///
+/// At `N = 1` the genesis shape is the member's own `grace[0]`, so the exchange has always worked and must
+/// keep working. If this one ever fails the fix has broken the ordinary case; if it ever *starts* being the
+/// only one that passes, the fourth candidate has been lost again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_at_epoch_zero_reaches_a_cell_one_epoch_ahead_as_it_always_could() {
+    let proteus = ProteusConfig::polymorph(b"community-transport-secret".to_vec());
+    let dir = Directory::new();
+    let member = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(0), Config::default())),
+        dir.clone(),
+        proteus.clone(),
+        fanos_proteus::Epoch::new(1),
+    )
+    .await
+    .expect("spawn the seated member");
+    let joiner = spawn_shaped(
+        Box::new(OverlayNode::<F2>::new(Point::at(1), Config::default())),
+        dir.clone(),
+        proteus,
+        fanos_proteus::Epoch::new(0),
+    )
+    .await
+    .expect("spawn the joining node");
+
+    both_ways(member, joiner, "a cell at epoch 1, inside the grace window").await;
+}
+
+/// One payload each way, each with its own deadline and its own message — a single combined assertion would
+/// not say which half broke, and the two halves have different causes.
+async fn both_ways(mut member: fanos_quic::NodeHandle, mut joiner: fanos_quic::NodeHandle, world: &str) {
+    // **The joiner speaks first, and that ordering is a property of the problem rather than of this test.**
+    // A member cannot know that an address it has never heard from is at epoch 0 — nothing on the wire says
+    // so, and an unencrypted hint that did would restore the static signature PROTEUS exists to remove
+    // (#232). So the answer is necessarily reactive: the joiner reaches out in the only shape it can
+    // compute, the member recognises it and answers in kind. Written the other way round this test fails on
+    // the member's very first datagram, which is the correct behaviour and not the scenario joining is.
+    //
+    // Written out twice rather than looped: `next_notification` needs `&mut`, so a loop over both
+    // directions would hold two mutable borrows of the pair at once. Two blocks also mean the failure
+    // message names the direction, which is the whole reason the halves are asserted separately.
+    let (member_at, joiner_at) = (member.address(), joiner.address());
+
+    joiner.command(Command::Send { to: member_at, payload: b"joiner to cell".to_vec() });
+    let got = deliver(&mut member, joiner_at).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(b"joiner to cell".as_slice()),
+        "{world}: the CELL could not read the joiner. This half is the shaper accepting the genesis shape \
+         as a fourth candidate past the grace window."
+    );
+
+    member.command(Command::Send { to: joiner_at, payload: b"cell to joiner".to_vec() });
+    let got = deliver(&mut joiner, member_at).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(b"cell to joiner".as_slice()),
+        "{world}: the JOINER could not read the cell's reply. Its accept window is `{{0, 0, 1}}`, so this \
+         half is the envelope having remembered the address and answered in the shape it was asked in."
+    );
+}
+
+/// The next payload `to` delivers from `from`, or `None` if none arrives in time.
+///
+/// Returns rather than panics so the caller's assertion carries the direction; a timeout here with an
+/// `expect` would report the same string for both halves.
+async fn deliver(to: &mut fanos_quic::NodeHandle, from: fanos_geometry::Triple) -> Option<Vec<u8>> {
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        loop {
+            match to.next_notification().await {
+                Some(Notification::Delivered { from: f, payload }) if f == from => return Some(payload),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaped_nodes_deliver_over_a_polymorph_transport() {
     // The flagship codec: no static signature, no size/timing shaping (zero-cost default).
