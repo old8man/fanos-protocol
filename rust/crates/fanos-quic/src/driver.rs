@@ -606,6 +606,9 @@ pub struct NodeHandle {
     beacons: Beacons,
     /// Frames not made because a peer's send queue was full (#89) — shared with the transport.
     send_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// **This node was asked to stop** — the discriminator every supervisor reads (#257). See
+    /// [`Client::is_stopping`] for why an actor's ending cannot be judged without it.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     endpoint: Endpoint,
     reflexive: Reflexive,
     /// The **network's genesis seed** — the value epoch-0 coordinates on this network are drawn against
@@ -623,6 +626,13 @@ impl NodeHandle {
     /// plane `Observe` merges, long after this handle was built, so it needs the handle and not a snapshot.
     pub(crate) const fn stations_handle(&self) -> &Arc<Mutex<Stations>> {
         &self.stations
+    }
+
+    /// The shared "this node was asked to stop" flag, for a supervisor spawned after the handle exists
+    /// (#257) — the reshuffle loop is the one such actor. Same reasoning as [`Self::stations_handle`]: the
+    /// supervisor must read the flag at the moment its actor ends, so it needs the cell, not a reading.
+    pub(crate) const fn stopping_handle(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        &self.stopping
     }
 
     /// This node's overlay coordinate, as of now.
@@ -729,6 +739,7 @@ impl NodeHandle {
             events_tx: self.events_tx.clone(),
             beacons: self.beacons.clone(),
             genesis: self.genesis,
+            stopping: Arc::clone(&self.stopping),
         }
     }
 
@@ -739,7 +750,13 @@ impl NodeHandle {
     }
 
     /// Close the QUIC endpoint and stop serving. Idempotent.
+    ///
+    /// **The flag is raised before the endpoint closes, and the order is load-bearing** (#257):
+    /// `accept_loop` ends the instant `Endpoint::accept()` answers `None`, so a supervisor that read the
+    /// flag after the close would race the very ending it is trying to classify. Raised first, the ending is
+    /// always judged against a `true`. `Release`/`Acquire` pair the store with those reads.
     pub fn shutdown(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::Release);
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
@@ -798,6 +815,8 @@ pub struct Client {
     events_tx: broadcast::Sender<Notification>,
     beacons: Beacons,
     genesis: BeaconSeed,
+    /// Whether this node is on its way out — see [`Client::is_stopping`].
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Client {
@@ -816,6 +835,31 @@ impl Client {
     #[must_use]
     pub fn driver_stations(&self) -> Vec<Observation> {
         self.stations.lock().unwrap_or_else(PoisonError::into_inner).observations()
+    }
+
+    /// **Is this node on its way out?** — the discriminator that makes an actor's ending readable (#257).
+    ///
+    /// A supervisor sees a task end and has to say whether that is an outage. It cannot: the same `Ok(())`
+    /// arrives from a loop that fell out of its own accord and from one whose input was taken away because
+    /// the node is stopping. `accept_loop` is the sharp case — it is written as
+    /// `while let Some(i) = endpoint.accept().await`, and [`NodeHandle::shutdown`] closing the endpoint makes
+    /// that `None`. So *every* orderly stop retires it, and a supervisor without this predicate files the
+    /// shutdown as a death. One false alarm per stop is enough to make the true one unreadable: a publisher
+    /// that really died at 03:00 sits in the record beside the stop at 09:00 with nothing to sort them by.
+    ///
+    /// Two ways a node goes away, and both count, because both are somebody's decision rather than a fault:
+    ///
+    /// * **the endpoint was closed** — [`NodeHandle::shutdown`], which is what the binary does on SIGTERM;
+    /// * **the engine is gone** — every `Input` sender dropped, which is what an *embedder* does when it
+    ///   drops its `Node` while the process keeps running (`fanos-ffi`, and every test). There the actors
+    ///   really do run to completion with the supervisors still alive to misreport them, so this half is not
+    ///   hypothetical — it is the deterministic case, where the first is only a race.
+    ///
+    /// A panic is deliberately **not** excused by either: a defect during shutdown is still a defect, and it
+    /// is the one ending that says the code is wrong rather than that the operator asked.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire) || self.input_tx.is_closed()
     }
 
     /// This node's overlay coordinate, as of now — the same shared cell [`NodeHandle::address`] reads.
@@ -1496,7 +1540,7 @@ where
     // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
     // the current placement.
     let local_addr = handle.local_addr();
-    supervise(DriverActor::Reshuffle, handle.stations_handle(), tokio::spawn(reshuffle_loop::<F>(
+    supervise(DriverActor::Reshuffle, handle.stations_handle(), handle.stopping_handle(), tokio::spawn(reshuffle_loop::<F>(
         creds.clone(),
         Placement {
             coord: coord.coords(),
@@ -1958,14 +2002,37 @@ impl DriverActor {
 ///
 /// The cost is one task parked on a `JoinHandle` that wakes exactly once, ever.
 ///
+/// ## An ending is only an outage if nobody asked for it
+///
 /// Three endings, kept apart in the line because the operator's next move differs — a panic is a defect, a
-/// cancellation is an orderly stop, and a plain return from a `loop {}` is neither and should never happen.
-/// One station for all three: the counter is the alarm, the line says which of them rang it.
-fn supervise(actor: DriverActor, stations: &Arc<Mutex<Stations>>, handle: tokio::task::JoinHandle<()>) {
+/// cancellation is an orderly stop, and a plain return is neither. But *which* of them is an alarm depends
+/// on something the ending itself does not carry: whether the node is going away. `accept_loop` returns by
+/// design the moment [`NodeHandle::shutdown`] closes the endpoint, so judged on the ending alone every
+/// orderly stop of every node files an outage against `Accept` (#257). `stopping` is that missing half —
+/// see [`Client::is_stopping`] for both ways a node goes away and why a panic is excused by neither.
+///
+/// Returns the **watcher's** handle, which callers drop — dropping a `JoinHandle` detaches, so it changes
+/// nothing in production. A test can `await` it instead, which is the only way to assert that a supervisor
+/// stayed *silent*: waiting on the actor proves the actor ended, not that the watcher has spoken.
+fn supervise(
+    actor: DriverActor,
+    stations: &Arc<Mutex<Stations>>,
+    stopping: &Arc<std::sync::atomic::AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::JoinHandle<()> {
     let stations = Arc::clone(stations);
+    let stopping = Arc::clone(stopping);
     tokio::spawn(async move {
-        let how = match handle.await {
-            Ok(()) => "returned, which these loops are not meant to do",
+        let ending = handle.await;
+        let panicked = ending.as_ref().err().is_some_and(tokio::task::JoinError::is_panic);
+        // Read the flag AFTER awaiting the ending: `shutdown` raises it before closing the endpoint, so an
+        // actor that ended because of the stop always finds it already `true`.
+        if !panicked && stopping.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::debug!(actor = actor.name(), "a driver actor retired because the node is stopping");
+            return;
+        }
+        let how = match ending {
+            Ok(()) => "returned, which these loops are not meant to do while the node runs",
             Err(e) if e.is_panic() => "PANICKED",
             Err(_) => "was cancelled",
         };
@@ -1978,7 +2045,7 @@ fn supervise(actor: DriverActor, stations: &Arc<Mutex<Stations>>, handle: tokio:
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .record_tagged(Station::ActorDied, None, Some(actor.tag()), 1);
-    });
+    })
 }
 
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
@@ -2061,6 +2128,9 @@ fn spawn_inner(
     let distrust: Arc<Distrust> = Arc::new(Distrust::default());
     // Shared with the handle, so `fanos status health` can report it (#89).
     let send_drops: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Shared with every supervisor, the handle and each `Client`: the one place that says whether an actor's
+    // ending was asked for (#257). See [`Client::is_stopping`].
+    let stopping: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
     // coordinate go stale at the first reshuffle.
     let seat = Arc::new(Mutex::new(addr));
@@ -2088,10 +2158,10 @@ fn spawn_inner(
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
     };
-    supervise(DriverActor::AnnounceMoves, &stations, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
-    supervise(DriverActor::Accept, &stations, tokio::spawn(accept_loop(transport.clone())));
-    supervise(DriverActor::Transport, &stations, tokio::spawn(transport_loop(transport, send_rx)));
-    supervise(DriverActor::Engine, &stations, tokio::spawn(engine_loop(
+    supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
+    supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(accept_loop(transport.clone())));
+    supervise(DriverActor::Transport, &stations, &stopping, tokio::spawn(transport_loop(transport, send_rx)));
+    supervise(DriverActor::Engine, &stations, &stopping, tokio::spawn(engine_loop(
         engine,
         input_rx,
         input_tx.clone(),
@@ -2103,12 +2173,14 @@ fn spawn_inner(
     supervise(
         DriverActor::Router,
         &stations,
+        &stopping,
         tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), beacon_tx, seat.clone())),
     );
 
     Ok(NodeHandle {
         addr: seat,
         stations,
+        stopping,
         local_addr,
         input_tx,
         ctrl_tx,
@@ -3308,6 +3380,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_actor_is_named_and_a_finished_one_is_not() {
         let stations = Arc::new(Mutex::new(Stations::new()));
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let count = |tag: u64| {
             stations
                 .lock()
@@ -3319,9 +3392,9 @@ mod tests {
                 .sum::<u64>()
         };
 
-        // A task that finishes normally is NOT an outage — but these loops never return, so `supervise`
-        // records that too. What must differ is which actor is named, so the two are given different tags.
-        supervise(DriverActor::Accept, &stations, tokio::spawn(async { panic!("the accept loop fell over") }));
+        // While the node is running, every ending is an alarm — including a plain return, because none of
+        // these loops is meant to reach its end with the node still up.
+        supervise(DriverActor::Accept, &stations, &running, tokio::spawn(async { panic!("the accept loop fell over") }));
         for _ in 0..200 {
             if count(DriverActor::Accept.tag()) > 0 {
                 break;
@@ -3339,9 +3412,95 @@ mod tests {
             "and only the one that died — a supervisor that tagged them all would say nothing useful"
         );
     }
+
+    /// **A stopping node retires its actors; it does not lose them (#257).**
+    ///
+    /// `accept_loop` is `while let Some(i) = endpoint.accept().await`, and `shutdown` closes that endpoint —
+    /// so a clean stop ends it *by design*. Judged on the ending alone, every orderly shutdown of every node
+    /// files an outage against `Accept`, and the comment this test used to carry ("these loops never
+    /// return") was the fossil of exactly that mistake.
+    ///
+    /// The second half is the one that keeps the excuse honest: a panic is a defect whether or not the
+    /// operator asked for a stop, so `stopping` must not silence it. A predicate that returned early before
+    /// looking at the ending would pass the first assertion and fail this one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retiring_actor_is_silent_but_a_panic_during_shutdown_is_not() {
+        let stations = Arc::new(Mutex::new(Stations::new()));
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let count = |tag: u64| {
+            stations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observations()
+                .iter()
+                .filter(|o| o.station == Station::ActorDied && o.tag == Some(tag))
+                .map(|o| o.count)
+                .sum::<u64>()
+        };
+
+        // Await the WATCHER, not the actor: the actor ends immediately either way, and what is under test is
+        // what the watcher does with that. Waiting on the actor would prove only that it ended, and the
+        // silence assertion below would then be measuring a watcher that had not run yet — green for the
+        // wrong reason.
+        let watcher = supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(async {}));
+        watcher.await.expect("the watcher must survive the actor it watches");
+        supervise(DriverActor::Engine, &stations, &stopping, tokio::spawn(async { panic!("during shutdown") }));
+        for _ in 0..200 {
+            if count(DriverActor::Engine.tag()) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            count(DriverActor::Engine.tag()),
+            1,
+            "a panic is a defect even while stopping — excusing it would hide the one ending that says the \
+             code is wrong rather than that the operator asked"
+        );
+        assert_eq!(
+            count(DriverActor::Accept.tag()),
+            0,
+            "an actor that ended because the node is stopping must not be filed as an outage: one false \
+             alarm per shutdown is what makes the true one unreadable"
+        );
+    }
     use super::*;
     use crate::identity::verifiable_coordinate;
     use fanos_field::F2;
+
+    /// **An embedder that drops its `Node` is stopping too, and only the channel says so (#257).**
+    ///
+    /// The other half of [`Client::is_stopping`]. `shutdown` covers the binary, which closes the endpoint;
+    /// a library user — `fanos-ffi`, and every test — instead drops the last handle while the process keeps
+    /// running. The engine's receiver goes with it, the actors run to completion, and the supervisors are
+    /// still alive to misreport them, so this is the *deterministic* case where the flag alone is only a
+    /// race. Nothing was asked of the flag here: it stays `false` throughout, and the verdict comes from the
+    /// closed channel.
+    #[test]
+    fn a_client_whose_engine_is_gone_reports_that_the_node_is_stopping() {
+        let (input_tx, input_rx) = mpsc::channel::<Input>(8);
+        let client = Client {
+            addr: Arc::new(Mutex::new([1, 0, 1])),
+            stations: Arc::new(Mutex::new(Stations::new())),
+            input_tx,
+            ctrl_tx: mpsc::unbounded_channel::<Control>().0,
+            events_tx: broadcast::channel::<Notification>(8).0,
+            beacons: tokio::sync::watch::channel(None).1,
+            genesis: BeaconSeed::GENESIS,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        assert!(
+            !client.is_stopping(),
+            "a running node must not read as stopping, or the predicate excuses every real death"
+        );
+        drop(input_rx); // the engine actor is gone — what dropping the last `Node` does
+        assert!(
+            client.is_stopping(),
+            "an actor that ends because the engine went away ended for a reason somebody chose"
+        );
+    }
 
     /// The driver's plane records what the engine cannot see, and every `Client` clone writes to the one
     /// plane an operator reads (#106).
@@ -3363,6 +3522,7 @@ mod tests {
             events_tx,
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Silent until something stops. A plane that reports counts before any work failed would make
@@ -3601,6 +3761,7 @@ mod tests {
             events_tx: events_tx.clone(),
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // A PROTEUS shaper started at genesis — the reshuffle must rotate its shape to the new epoch (§13.4).
@@ -3696,6 +3857,7 @@ mod tests {
             events_tx: events_tx.clone(),
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         tokio::spawn(reshuffle_loop::<F2>(
             creds,

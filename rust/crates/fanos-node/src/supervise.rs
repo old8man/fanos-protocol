@@ -36,7 +36,7 @@ use std::sync::Arc;
 use fanos_quic::Client;
 use fanos_runtime::ports::stations::Station;
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{debug, error};
 
 /// Which long-lived node actor a [`Station::ActorDied`] observation is about.
 ///
@@ -170,10 +170,25 @@ impl NodeActor {
 /// Three endings, kept apart in the log line because the operator's next move differs — a panic is a defect,
 /// a cancellation is an orderly stop, and a plain return from a loop that should not return is neither. One
 /// station for all three: the counter is the alarm, the line says which of them rang it.
+///
+/// ## Only if nobody asked for it
+///
+/// Every actor here ends when the node does: the publishers hang on `next_epoch`, whose `watch` sender lives
+/// inside the engine, so dropping the last `Client` retires all twelve at once. Judged on the ending alone
+/// that is twelve outages per orderly stop, and one false alarm per stop is enough to bury the true one — a
+/// publisher that really died at 03:00 sits in the record beside the stop at 09:00 with nothing to sort them
+/// by (#257). [`Client::is_stopping`] is the missing half. A panic is excused by neither of its two ways: a
+/// defect during shutdown is still a defect.
 pub fn supervise(actor: NodeActor, client: &Client, task: JoinHandle<()>) -> JoinHandle<()> {
     let client = Arc::new(client.clone());
     tokio::spawn(async move {
-        let how = match task.await {
+        let ending = task.await;
+        let panicked = ending.as_ref().err().is_some_and(tokio::task::JoinError::is_panic);
+        if !panicked && client.is_stopping() {
+            debug!(actor = actor.name(), "a node actor retired because the node is stopping");
+            return;
+        }
+        let how = match ending {
             Ok(()) => "returned, which this actor is not meant to do while the node runs",
             Err(e) if e.is_panic() => "PANICKED",
             Err(_) => "was cancelled",
@@ -236,6 +251,68 @@ mod tests {
             count(NodeActor::LoadPublisher.tag()),
             0,
             "and only the one that died — naming them all would say nothing an operator can act on"
+        );
+    }
+
+    /// **A stopping node retires its actors; it does not lose them (#257).**
+    ///
+    /// Every actor here ends when the node does — the publishers hang on the beacon `watch`, whose sender
+    /// lives inside the engine — so judged on the ending alone an orderly stop files twelve outages. One
+    /// false alarm per stop is enough to bury the true one: a publisher that really died at 03:00 would sit
+    /// in the record beside the stop at 09:00 with nothing to sort them by.
+    ///
+    /// Driven through the real [`fanos_quic::NodeHandle::shutdown`], so the *ordering* is under test too and
+    /// not just the predicate: the flag is raised before the endpoint closes, and a version that raised it
+    /// after would leave this racing the ending it is meant to classify.
+    ///
+    /// What this does **not** cover is `is_stopping`'s other half — an embedder dropping its `Node` while
+    /// the runtime lives, which closes the engine's input instead of the endpoint. That half cannot be
+    /// staged from here, because reading the plane afterwards requires holding a `Client`, and holding one
+    /// is exactly what keeps the engine alive. It is covered in `fanos-quic`, next to the channel it reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retiring_actor_is_silent_but_a_panic_during_shutdown_is_not() {
+        let node = fanos_quic::spawn(
+            Box::new(fanos_runtime::OverlayNode::<fanos_field::F2>::new(
+                fanos_geometry::Point::at(0),
+                fanos_runtime::Config::default(),
+            )),
+            fanos_quic::Directory::new(),
+        )
+        .await
+        .expect("a node on loopback");
+        let client = node.client();
+        let count = |tag: u64| {
+            client
+                .driver_stations()
+                .iter()
+                .filter(|o| o.station == Station::ActorDied && o.tag == Some(tag))
+                .map(|o| o.count)
+                .sum::<u64>()
+        };
+
+        node.shutdown();
+        assert!(client.is_stopping(), "shutdown must be visible to a supervisor, or the rest proves nothing");
+
+        // Await the WATCHER, not the actor: waiting on the actor would prove only that it ended, leaving the
+        // silence below to be read off a watcher that had not run yet — green for the wrong reason.
+        supervise(NodeActor::MixPublisher, &client, tokio::spawn(async {}))
+            .await
+            .expect("the watcher must survive the actor it watches");
+        supervise(NodeActor::LoadPublisher, &client, tokio::spawn(async { panic!("during shutdown") }))
+            .await
+            .expect("the watcher must survive the actor it watches");
+
+        assert_eq!(
+            count(NodeActor::MixPublisher.tag()),
+            0,
+            "an actor that ended because the node is stopping must not be filed as an outage: one false \
+             alarm per shutdown is how the one true alarm becomes unreadable"
+        );
+        assert_eq!(
+            count(NodeActor::LoadPublisher.tag()),
+            1,
+            "a panic is a defect even while stopping — excusing it would hide the one ending that says the \
+             code is wrong rather than that the operator asked"
         );
     }
 }
