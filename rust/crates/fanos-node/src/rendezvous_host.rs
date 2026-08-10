@@ -70,6 +70,41 @@ use crate::diaulos::{MAX_SESSIONS, SESSION_IDLE_TIMEOUT, SESSION_SWEEP_INTERVAL,
 /// its own registration. That is what makes the bound tight rather than optimistic.
 const MAX_REPLY_KEYS: usize = 1 + crate::rendezvous_relay::HOST_GRACE_EPOCHS as usize;
 
+/// The measured cost of one [`RendezvousService::seal_reply`], rounded up (#248).
+///
+/// A threshold onion through the reply circuit, plus a hybrid-KEM seal to the client's reply key on the
+/// NOSTOS path. `fanos_rendezvous`'s `measure_the_cost_of_sealing_one_reply` reads 509 us (legacy) and
+/// 591 us (NOSTOS) in release on a quiet box; 600 is the larger of the two rounded up, which is the
+/// conservative direction — a cost *under*-stated would let [`MAX_SEAL_QUEUE`] be too deep.
+///
+/// Microseconds as a plain integer rather than a `Duration`, so the bound below is a compile-time check.
+const SEAL_REPLY_COST_US: u64 = 600;
+
+/// How many outbound cells may wait to be sealed: **one per live session**.
+///
+/// Derived, not chosen. The loop seals one cell at a time, so the queue's only job is to let every session
+/// that is behaving hand over a cell without waiting on a neighbour. One slot each does exactly that, and a
+/// session wanting a *second* slot while its first is unsealed is producing faster than the host can seal —
+/// which is the case backpressure exists for. Deeper buys nothing: the cell would still be sealed in the
+/// same order, only later, and with the tail waiting longer.
+///
+/// Two consequences worth naming, both checked below:
+/// * **Latency.** A cell at the back waits `MAX_SEAL_QUEUE × SEAL_REPLY_COST` ≈ 148 ms, comfortably inside
+///   the platform's own `INITIAL_GATHER_DEADLINE` of 2 s — so a queued reply is not one the client's
+///   threshold round has already given up on.
+/// * **Memory.** `MAX_SEAL_QUEUE × (SessionId + CELL_LEN)` ≈ 266 KiB. Small enough that it needs no share
+///   of its own in `fanos_primitives::budget` — stated so the next reader does not have to re-derive that
+///   it was considered (#254's whole subject was costs nobody had added up).
+const MAX_SEAL_QUEUE: usize = MAX_SESSIONS;
+
+/// The tail of a full seal queue must still be inside the threshold round it belongs to. A deeper queue, or
+/// a slower seal, is a reply the client stopped waiting for — and the failure would look like a dead host.
+const _: () = assert!(
+    (MAX_SEAL_QUEUE as u64) * SEAL_REPLY_COST_US
+        < fanos_runtime::ports::gather::INITIAL_GATHER_DEADLINE.as_nanos() / 1_000,
+    "a cell at the back of the seal queue waits past the gather deadline it is answering inside"
+);
+
 /// One epoch's rotating host material, pushed to a running [`serve_anonymous`] loop by the
 /// `spawn_rendezvous_host` driver: the fresh dead-drop [`ReplyKeys`] (to open forwarded requests) and the
 /// current mix directory (the members' onion keys the reply onions seal to, which rotate each epoch, E4).
@@ -174,7 +209,7 @@ pub fn serve_anonymous<R, H, Fut>(
         let (done_tx, mut done_rx) = unbounded_channel::<SessionId>();
         // Every session's outbound cells funnel here as `(cookie, cell)`; the loop — the sole owner of
         // `rservice` — seals each through that cookie's reply route and raw-emits it.
-        let (seal_tx, mut seal_rx) = unbounded_channel::<(SessionId, Vec<u8>)>();
+        let (seal_tx, mut seal_rx) = channel::<(SessionId, Vec<u8>)>(MAX_SEAL_QUEUE);
         let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
         loop {
             tokio::select! {
@@ -612,7 +647,7 @@ fn spawn_anonymous_session<H, Fut>(
     rng: SeedRng,
     cookie: SessionId,
     handler: Arc<H>,
-    seal_tx: UnboundedSender<(SessionId, Vec<u8>)>,
+    seal_tx: Sender<(SessionId, Vec<u8>)>,
     done_tx: UnboundedSender<SessionId>,
 ) -> (Sender<Vec<u8>>, JoinHandle<()>)
 where
@@ -624,7 +659,14 @@ where
     // Outbound: this session's cells are funnelled to the central loop for sealing through its reply route.
     tokio::spawn(async move {
         while let Some(cell) = out_rx.recv().await {
-            if seal_tx.send((cookie, cell)).is_err() {
+            // `send().await`, not `try_send` — the queue is bounded now (#248) and a full one must apply
+            // BACKPRESSURE rather than drop. This await blocks only this session's forwarder, which fills
+            // its own bounded `out_rx`, which stalls its own DIAULOS server: a client producing faster than
+            // the host can seal throttles ITSELF, and no cell is lost. Dropping here would have needed a
+            // refusal outcome and would still have lost a reply the client is waiting for.
+            //
+            // It cannot deadlock: the loop drains `seal_rx` and never waits on this task.
+            if seal_tx.send((cookie, cell)).await.is_err() {
                 break; // the accept loop is gone; nothing left to seal through.
             }
         }
