@@ -1455,6 +1455,63 @@ fn locked_versions() -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
+/// Everything that depends on `name version`, read from the lock's dependency lists.
+fn dependents_of(name: &str, version: &str) -> BTreeSet<String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
+    let want = format!("{name} {version}");
+    let mut out = BTreeSet::new();
+    for block in text.split("[[package]]").skip(1) {
+        let Some(who) = block.lines().find_map(|l| l.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')))
+        else {
+            continue;
+        };
+        for dep in block.lines().skip_while(|l| !l.starts_with("dependencies")).skip(1) {
+            let dep = dep.trim().trim_matches(|c| c == '"' || c == ',');
+            if dep == "]" {
+                break;
+            }
+            if dep == want {
+                out.insert(who.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// **The one dependency holding the curve split open, and a tripwire for the day it stops** (#217).
+///
+/// The split is down to a single external pin: `vrf-r255 0.1.0` needs `curve25519-dalek 4`, and `fanos-vrf`
+/// — the crate that produces a node's IDENTITY — needs `vrf-r255`. Everything else in the tree is on 5.
+/// `fanos-incentives` was the third member of that set and moved off it once measured, which is how the set
+/// got small enough to pin here.
+///
+/// **Why the pin stays rather than being replaced.** The surface is narrow — three newtypes
+/// (`VrfSecret`, `VrfPublic`, `VrfProof`) over seven operations, and none of `fanos-vrf`'s other 4 300 lines
+/// touch the dependency — so replacing it *looks* cheap. It is not the right trade: the crate's own header
+/// says it uses "the vetted `vrf_r255` crate" deliberately, and hand-rolling ECVRF-RISTRETTO255-SHA512 to
+/// win a version unification would swap a stated duplication for an unvetted implementation of the
+/// primitive that decides who a node *is*. A duplication you can see beats a primitive you wrote yourself.
+///
+/// So this is the tripwire instead. The obligation is conditional — "unify when the upstream moves" — and a
+/// conditional obligation with nothing watching its condition is one that comes true unnoticed. If
+/// `vrf-r255` publishes against curve 5, or if a *fourth* crate joins the old branch, this set changes and
+/// someone has to look.
+///
+/// Falsified by expecting a third name: the assertion prints the set actually locked.
+#[test]
+fn the_old_curve_branch_is_held_by_vrf_r255_alone_and_nothing_else_has_joined_it() {
+    let old: BTreeSet<String> = dependents_of("curve25519-dalek", "4.1.3");
+    let expected: BTreeSet<String> = ["fanos-vrf", "vrf-r255"].iter().map(|s| (*s).to_owned()).collect();
+    assert_eq!(
+        old, expected,
+        "the dependents of curve25519-dalek 4.1.3 changed. If the set SHRANK, vrf-r255 has moved and the \
+         whole split can now collapse — take the 4.x pin out of the workspace and delete its row from \
+         TOLERATED_DUPLICATES. If it GREW, a new crate joined the old branch: that is the thing this guard \
+         exists to stop, and the fix is to move that crate rather than to widen this expectation."
+    );
+}
+
 /// Which `getrandom` each package reaches, read from the lock's dependency lists.
 ///
 /// A version set alone cannot answer the question that matters here. `TOLERATED_DUPLICATES` says "0.4 for
