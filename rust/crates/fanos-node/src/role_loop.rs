@@ -217,17 +217,44 @@ const fn saturating_cap(bound: usize) -> u16 {
 /// and an encoding whose zero meant `Some(0)` would have the loop read a node that has not yet observed as a node
 /// measuring no demand — the same conflation the `Option` in `Notification::LoadReport` exists to remove. Getting
 /// it backwards here would reintroduce the defect one layer down, where no type would catch it.
+///
+/// # A frozen reading is worse than an absent one, and the array cannot tell them apart
+///
+/// The slots have two independent writers. Engine-measured roles are written by the feeder task
+/// ([`spawn_load_sensor`]); driver-side roles are written by their own task through a [`LoadGauge`]. When the
+/// **feeder** dies, the engine slots keep decoding to their last value — a plausible, measured-looking number
+/// that has stopped tracking anything, which this node then publishes as its load and the whole cell divides
+/// by. An `AtomicU32` has no way to say "nobody is writing me any more", so the level lies (#251).
+///
+/// `feeding` is that missing half: a `watch::Receiver` whose sender belongs to whoever writes through
+/// [`Self::record`]. With the writer gone, an engine-fed slot reads **absent** rather than stale — and absent
+/// is a state the consumer already handles, by standing the offer in for the role
+/// ([`RoleReading::to_load`]). That errs toward "this node is at capacity", so the cell provisions more nodes
+/// for the role instead of piling work onto one whose reported load stopped moving.
+///
+/// `gauged` is why the rule is per slot and not per sensor. Blanket-absenting on a dead feeder would erase a
+/// live gauge's reading, which is precisely the failure [`Self::record`] refuses a `None` to avoid.
 pub(crate) struct LoadSensor {
     /// Latest reading per role, indexed by `Role::index`, in the encoding above.
     latest: [AtomicU32; Role::COUNT],
+    /// Bit `Role::index` set once a [`LoadGauge`] is opened for that role: its writer is the role's own task,
+    /// not the feeder, so the feeder's death says nothing about it.
+    gauged: AtomicU32,
+    /// Alive while whoever calls [`Self::record`] still exists — see the type doc.
+    feeding: watch::Receiver<()>,
 }
 
 // Every index below is `Role::index()`, which `fanos_core::roles` proves `< Role::COUNT`.
 #[allow(clippy::indexing_slicing)]
 impl LoadSensor {
-    /// A sensor with nothing reported yet — every role absent.
-    fn new() -> Self {
-        Self { latest: core::array::from_fn(|_| AtomicU32::new(0)) }
+    /// A sensor with nothing reported yet — every role absent — **and the token its feeder must hold**.
+    ///
+    /// Two values, so the writer cannot forget: whoever calls [`Self::record`] keeps the `Sender`, and when
+    /// that owner is gone the engine-fed slots stop claiming to be measured. A caller that drops it
+    /// immediately is declaring it will never feed this sensor, which is the truth for a gauge-only node.
+    fn new() -> (Self, watch::Sender<()>) {
+        let (tx, feeding) = watch::channel(());
+        (Self { latest: core::array::from_fn(|_| AtomicU32::new(0)), gauged: AtomicU32::new(0), feeding }, tx)
     }
 
     /// Record a load report from the engine: latest-wins for a role the engine **measured**, and no-op for one
@@ -257,6 +284,8 @@ impl LoadSensor {
     pub(crate) fn gauge(self: &Arc<Self>, role: Role) -> LoadGauge {
         // Some(0): sensed, carrying nothing. `fetch_add`/`fetch_sub` then work directly on the encoding.
         self.slot(role).store(1, Ordering::Relaxed);
+        // This slot's writer is the caller's task from here on, so the feeder's fate does not decide it.
+        self.gauged.fetch_or(1u32 << role.index(), Ordering::Relaxed);
         LoadGauge { sensor: Arc::clone(self), role }
     }
 
@@ -267,7 +296,16 @@ impl LoadSensor {
 
     /// The most recent reading, as the role vocabulary the setpoint is derived in.
     pub(crate) fn reading(&self) -> RoleReading {
+        // Asked once, not per role: `has_changed` is a load on the shared channel state, and every slot is
+        // judged against the same instant — two readings taken either side of the feeder's death would be a
+        // reading of two different sensors.
+        let feeding = self.feeding.has_changed().is_ok();
+        let gauged = self.gauged.load(Ordering::Relaxed);
         RoleReading::per_role(|role| {
+            // Engine-fed and nobody is feeding: absent, which is TRUE, where the last value merely looks it.
+            if !feeding && gauged & (1u32 << role.index()) == 0 {
+                return None;
+            }
             let raw = self.latest[role.index()].load(Ordering::Relaxed);
             // `0` is absent; anything else decodes to `raw - 1`, which fits `u16` because `record` is the only
             // writer and it only ever stores `u16 + 1`.
@@ -333,7 +371,8 @@ impl Drop for LoadGuard {
 /// ignored rather than treated as an error: the sensor is a *latest-value* register, so dropped intermediate
 /// reports cost nothing — the next observation refreshes it in full.
 pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
-    let sensor = Arc::new(LoadSensor::new());
+    let (sensor, feeding) = LoadSensor::new();
+    let sensor = Arc::new(sensor);
     let sink = Arc::clone(&sensor);
     let mut reports = client.subscribe();
     // Supervised (#251): the sensor's readings are atomics with no channel behind them, so a dead feeder
@@ -342,6 +381,9 @@ pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
     // can tell has stopped, and that is tracked separately.
     let supervised = client.clone();
     let task = tokio::spawn(async move {
+        // Moved in, never sent on: its DROP is the signal. However this task ends — a panic, a cancellation,
+        // the stream closing — the engine-fed slots stop claiming to be measured from that moment.
+        let _feeding = feeding;
         loop {
             match reports.recv().await {
                 Ok(Notification::LoadReport { per_role }) => sink.record(RoleReading::from_array(per_role)),
@@ -1324,6 +1366,45 @@ pub fn spawn_self_organization<F: Field>(
 
 #[cfg(test)]
 mod tests {
+    /// **A load reading with nobody feeding it reads absent, not stale — and only where that is true (#251).**
+    ///
+    /// The engine slots are a level with one writer. When the feeder dies they keep decoding to their last
+    /// value, so this node publishes a measured-looking load that stopped tracking anything and the whole
+    /// cell divides by it. Absent is the honest answer, and it is one the consumer already has a rule for:
+    /// the offer stands in, which errs toward "this node is full" rather than toward piling work on it.
+    ///
+    /// The second half is what makes it a per-slot rule. Blanket-absenting on a dead feeder would erase a
+    /// live gauge's reading — the exact failure `record` refuses a `None` to avoid, reintroduced one layer
+    /// up. A gauge's writer is the role's own task and knows nothing about the feeder's fate.
+    #[test]
+    fn a_dead_feeder_absents_the_engine_slots_and_leaves_a_live_gauge_alone() {
+        use super::{LoadSensor, Role};
+
+        let (sensor, feeding) = LoadSensor::new();
+        let sensor = Arc::new(sensor);
+        sensor.record(RoleReading::blind().measuring(Role::Relay, 7));
+        let gauge = sensor.gauge(Role::Exit);
+        let _flow = gauge.in_flight();
+
+        assert_eq!(sensor.reading().of(Role::Relay), Some(7), "a fed slot reads what was fed");
+        assert_eq!(sensor.reading().of(Role::Exit), Some(1), "and the gauge reads what it carries");
+
+        drop(feeding); // the feeder task is gone — panicked, cancelled, or simply ended
+
+        assert_eq!(
+            sensor.reading().of(Role::Relay),
+            None,
+            "with nobody feeding it, 7 is a fossil: reporting it makes the cell divide by a number that \
+             stopped moving, and absent is the state the consumer already knows how to be careful about"
+        );
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(1),
+            "the gauge's writer is the exit's own task, so the feeder's death says nothing about it — \
+             absenting this too is the `record`-must-not-store-None defect, one layer up"
+        );
+    }
+
     /// **A role controller that died stops claiming it is deciding (#251).**
     ///
     /// The level's writer is one task. While it lives, `assigned` is the cell's current decision; when it
@@ -1561,7 +1642,8 @@ mod tests {
         // relay and storage: a cell could not conclude "nobody here needs relays".
         let offered = RoleSet::of(&[Role::Relay, Role::Storage, Role::Service]);
         let cap = role_capacity();
-        let sensor = LoadSensor::new();
+        // The feeder's token, held for the test's lifetime: the TEST is the feeder here.
+        let (sensor, _feeding) = LoadSensor::new();
 
         // Nothing reported yet is genuinely absent — the array's initial state must not read as `Some(0)`.
         assert_eq!(sensor.reading(), RoleReading::blind(), "an unreported sensor holds no reading");
@@ -1610,7 +1692,8 @@ mod tests {
         // divided the sum by capacity again. At capacity 4 they diverge, and the cell under-provisions.
         let cap = Demand::per_role(|_| 4);
         let offered = RoleSet::of(&[Role::Relay, Role::Service]);
-        let sensor = LoadSensor::new();
+        // The feeder's token, held for the test's lifetime: the TEST is the feeder here.
+        let (sensor, _feeding) = LoadSensor::new();
         sensor.record(RoleReading::blind().measuring(Role::Relay, 8));
 
         let published = sensor.load(offered, cap);
@@ -1692,7 +1775,8 @@ mod tests {
     fn the_sensor_round_trips_every_reading_it_can_be_handed() {
         // The `0 = absent, v + 1 = Some(v)` encoding is the one place a `Some(0)` could silently become a
         // `None` again, one layer below where the type would catch it.
-        let sensor = LoadSensor::new();
+        // The feeder's token, held for the test's lifetime: the TEST is the feeder here.
+        let (sensor, _feeding) = LoadSensor::new();
         let sent = RoleReading::blind()
             .measuring(Role::Relay, 0)
             .measuring(Role::Storage, 1)
@@ -1711,7 +1795,9 @@ mod tests {
         // Exit and service work happens in async tasks, so no engine counts it and the report carries `None`.
         // A gauge is how that role becomes measured — and opening one must survive the engine's next report,
         // which will say `None` for it again.
-        let sensor = Arc::new(LoadSensor::new());
+        // The token stays held: this fixture feeds Relay through `record` below, so it IS the feeder.
+        let (sensor, _feeding) = LoadSensor::new();
+        let sensor = Arc::new(sensor);
         assert_eq!(sensor.reading().of(Role::Exit), None, "unsensed before the role's task starts");
 
         let gauge = sensor.gauge(Role::Exit);
