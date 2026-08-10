@@ -1175,6 +1175,9 @@ impl Node {
         // configured no state directory, which is what an ephemeral node means.
         let state_dir = config.state_path.clone();
         let (restore, restored) = read_restore(state_dir.as_deref());
+        // Read before the engine closure captures `config`: the reflex's `cell_id` folds it, and the
+        // closure is `move`, so taking it here is what keeps one network name serving both derivations.
+        let genesis = config.genesis_seed();
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -1195,6 +1198,11 @@ impl Node {
                         epoch_period: fanos_runtime::Duration(
                             u64::try_from(config.epoch_period.as_nanos()).unwrap_or(u64::MAX),
                         ),
+                        // And this node's *network*, for the same reason and by the same route: the reflex
+                        // derives its `cell_id` from it, and a default seed would make two unrelated
+                        // deployments report one cell (#210). Same derivation as the address space uses
+                        // (`Directory::for_network`, node.rs:1128) — one network name, one seed, both places.
+                        genesis,
                         ..OverlayConfig::default()
                     },
                     admission,

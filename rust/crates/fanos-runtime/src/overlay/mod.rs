@@ -18,7 +18,7 @@ use fanos_diakrisis::polar;
 use fanos_diakrisis::regeneration::spectral_gap;
 use fanos_field::Field;
 use fanos_geometry::{HierAddr, Plane, Point, Triple, fano};
-use fanos_primitives::{Epoch, hash_labeled, storage_digest, storage_point};
+use fanos_primitives::{BeaconSeed, Epoch, hash_labeled, storage_digest, storage_point};
 use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
 use fanos_wire::{FrameType, decode_frame};
 
@@ -355,6 +355,14 @@ pub struct Config {
     /// `epoch_period`; a simulation that runs a short epoch gets a correspondingly short window, which is
     /// the same derivation rather than a shortcut around it.
     pub epoch_period: Duration,
+    /// This network's genesis seed — the value that tells one deployment from another (#98).
+    ///
+    /// Carried here for the same reason `epoch_period` is: it is a property of the *network* the reflex runs
+    /// in, and the reflex derives something from it that must not silently agree across networks — the
+    /// `CellId` its coherence frames are keyed by. `BeaconSeed::GENESIS` (the default) is the honest value
+    /// for a deployment that has not
+    /// named itself, and it reproduces the pre-#210 identifier exactly.
+    pub genesis: BeaconSeed,
     /// A peer unheard-from for longer than this is considered degraded.
     pub liveness_timeout: Duration,
     /// The healthy mean inter-node correlation `r` used to estimate the cell's integration `Φ`
@@ -478,6 +486,7 @@ impl Default for Config {
         Self {
             heartbeat: HEARTBEAT_PERIOD,
             epoch_period: EPOCH_PERIOD,
+            genesis: BeaconSeed::GENESIS,
             liveness_timeout: Duration::from_millis(1600),
             healthy_correlation: 0.45,
             self_healing: true,
@@ -618,11 +627,23 @@ pub struct OverlayNode<F: Field> {
     load_sensors: RoleReading,
 }
 
-/// A stable 16-byte identifier for a node's cell — a domain-separated hash of the canonical Fano
-/// point coordinates, so every node in the cell derives the *same* id and their coherence frames
-/// agree on which cell they describe.
-pub(super) fn cell_id<F: Field>() -> CellId {
-    let mut input = Vec::with_capacity(7 * 12);
+/// A stable 16-byte identifier for a node's cell — a domain-separated hash of **this network's genesis seed**
+/// and the canonical Fano point coordinates, so every node in the cell derives the *same* id and their
+/// coherence frames agree on which cell they describe.
+///
+/// **The seed is what makes the id a cell's and not a plane's (#210).** Without it this is a pure function of
+/// the plane order: every FANOS deployment ever founded on Fano emits the identical 16 bytes, so a `(cell_id,
+/// epoch)` roll-up — the one thing the id exists for — silently merges frames from unrelated networks, and the
+/// merge looks like agreement rather than an error. Folding the seed is the same move the platform already
+/// makes for the address space (`fanos_quic::Directory::for_network`) and for rendezvous slots (`service_tag`),
+/// and it costs nothing: the seed is public, `Copy`, and already in every node's config.
+///
+/// What it does **not** buy: two cells of the *same* deployment still collide, because the runtime has no
+/// identity above the base cell to fold in. That is the open cell-identity question (#167), not this function's
+/// to answer — and stating it here is deliberate, because a per-network id reads like a per-cell id.
+pub(super) fn cell_id<F: Field>(genesis: BeaconSeed) -> CellId {
+    let mut input = Vec::with_capacity(32 + 7 * 12);
+    input.extend_from_slice(genesis.as_bytes());
     for i in 0..7usize {
         for x in Point::<F>::at(i).coords() {
             input.extend_from_slice(&x.to_be_bytes());
@@ -696,7 +717,7 @@ impl<F: Field> OverlayNode<F> {
         };
         // Local history stays compact and bounded. The observer takes no window length: every fold is
         // stamped with the cell's AGREED epoch by its caller, never with local elapsed time (audit A3).
-        let observer = SelfObserver::new(cell_id::<F>(), HistoryConfig::compact());
+        let observer = SelfObserver::new(cell_id::<F>(config.genesis), HistoryConfig::compact());
         Self {
             coord,
             router: Router::new(coord),
@@ -1702,6 +1723,38 @@ pub(crate) type ParsedAnnounce<F> = (Triple, HierAddr<F>, Vec<u8>, Vec<u8>, Vec<
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use crate::ports::ReadOutcome;
+
+    /// Two deployments must not report one cell, and one deployment must report one cell (#210).
+    ///
+    /// Both halves, because either alone is passable by a wrong function: a constant id satisfies "every node
+    /// agrees", and a per-*node* id satisfies "two networks differ". The pair is the property — and the second
+    /// assertion is the one the pre-#210 code passed, which is why it looked correct for as long as it did.
+    #[test]
+    fn a_cell_id_names_the_network_and_not_merely_the_plane() {
+        use fanos_field::{F2, F7};
+
+        let alpha = BeaconSeed::new([0xA1; 32]);
+        let beta = BeaconSeed::new([0xB2; 32]);
+        assert_ne!(
+            cell_id::<F2>(alpha),
+            cell_id::<F2>(beta),
+            "two networks on the same plane must not roll up as one cell"
+        );
+        assert_eq!(
+            cell_id::<F2>(alpha),
+            cell_id::<F2>(alpha),
+            "and every node of one network must derive the same id, or the frames cannot be joined at all"
+        );
+        // The plane still separates: folding the seed adds an axis, it does not replace the one that was there.
+        assert_ne!(cell_id::<F2>(alpha), cell_id::<F7>(alpha), "the plane axis survives");
+        // The unnamed deployment keeps the pre-#210 identifier exactly, so an operator's dashboards do not
+        // silently re-key on upgrade — the change costs a name, not a discontinuity.
+        assert_eq!(
+            cell_id::<F2>(BeaconSeed::GENESIS),
+            cell_id::<F2>(BeaconSeed::default()),
+            "GENESIS is the default, so an unconfigured network is one network and not many"
+        );
+    }
 
     /// Mark every algebraic neighbour **occupied**, as production does the moment a node hears from its cell.
     ///
