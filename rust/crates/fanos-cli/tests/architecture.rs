@@ -1512,6 +1512,46 @@ fn the_old_curve_branch_is_held_by_vrf_r255_alone_and_nothing_else_has_joined_it
     );
 }
 
+/// **A test-only feature must stay in `[dev-dependencies]`** (#194).
+///
+/// `fanos-proxy`'s `testing` feature carries the SOCKS5 loopback fixtures — `EchoDialer`, whose stream echoes
+/// the client's own bytes back at it. An embedder that picked it would ship a proxy that looks alive and
+/// reaches nowhere, which is why the types now gate it rather than a comment saying "test fixture".
+///
+/// Cargo unifies features across a build, so one `[dependencies]` entry asking for `testing` anywhere in the
+/// graph puts those fixtures back into every shipped artifact — silently, with nothing failing. This reads
+/// the manifests and insists the request appears only under a dev section. It is a *manifest* claim, and the
+/// compile-time gate cannot check it: `cargo build --workspace --all-targets` enables dev features by
+/// design, so the very command that proves the fixtures compile is the one that hides this.
+#[test]
+fn the_proxy_test_fixtures_are_asked_for_only_by_dev_dependencies() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let mut offenders: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("crates")).expect("the crates directory") {
+        let manifest = entry.expect("a crate directory").path().join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else { continue };
+        // Track the section each line sits in; a `testing` request is judged by where it was written.
+        let mut section = String::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('[') && t.ends_with(']') {
+                section = t.to_owned();
+            }
+            let asks = t.contains("fanos-proxy") && t.contains("\"testing\"");
+            if asks && !section.contains("dev-dependencies") {
+                offenders.push(format!("{} in {section}", manifest.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "fanos-proxy's `testing` feature is requested outside [dev-dependencies]: {offenders:?}. Cargo \
+         unifies features, so this puts EchoDialer — a dialer that echoes the client back at itself — into \
+         every shipped build. Move the request to a dev section, or if a production caller genuinely needs \
+         a loopback dialer, give it one that is not a test fixture."
+    );
+}
+
 /// **The same tripwire on the RNG half of the split, and it was already tripped** (#210/#217).
 ///
 /// `TOLERATED_DUPLICATES` explains `rand_core 0.6` as "pinned by the curve25519-dalek 4 branch". That sentence

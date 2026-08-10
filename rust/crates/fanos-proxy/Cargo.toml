@@ -24,7 +24,17 @@ tracing.workspace = true
 # with its neighbours (#213/#254), never restated here.
 fanos-primitives = { workspace = true, features = ["std"] }
 
+[features]
+# The in-process loopback fixtures (`dialer::EchoDialer`, `dialer::RefuseDialer`) — off in every shipped
+# build (#194). They were `pub` and ungated, so an embedder could pick a dialer that echoes the client's
+# own traffic back at it: a SOCKS5 proxy that looks alive and reaches nowhere. Their own docs said "test
+# fixture" and the types said nothing, which is the difference this feature closes.
+testing = []
+
 [dev-dependencies]
+# This crate's own integration tests link the library as an external crate, so `cfg(test)` inside it is
+# FALSE for them — the feature is how `tests/socks5.rs` reaches the fixtures.
+fanos-proxy = { path = ".", features = ["testing"] }
 tokio = { workspace = true, features = [
     "net",
     "io-util",

@@ -85,6 +85,8 @@ vpn = ["fanos-vpn/device"]
 validator = ["dep:fanos-dromos", "dep:fanos-obolos"]
 
 [dev-dependencies]
+# Test-only fixtures from fanos-proxy (#194): enabled for tests, absent from the shipped build.
+fanos-proxy = { workspace = true, features = ["testing"] }
 fanos-testkit = { path = "../fanos-testkit" }
 # `getloadavg`, for the integration harness's contention-aware budget (tests/common). Test-only.
 libc = { workspace = true }

@@ -31,6 +31,8 @@ ipstack = { version = "1.0.1", optional = true }
 device = ["dep:tun", "dep:ipstack"]
 
 [dev-dependencies]
+# Test-only fixtures from fanos-proxy (#194): enabled for tests, absent from the shipped build.
+fanos-proxy = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 
 [lints]

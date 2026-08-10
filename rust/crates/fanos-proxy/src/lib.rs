@@ -10,7 +10,9 @@
 //! so it is the dialer (an exit) that resolves it, not the local machine.
 //!
 //! * [`target`] — the SOCKS5 destination ([`Target`]).
-//! * [`dialer`] — the [`Dialer`] / [`UdpDialer`] seams and their errors; [`dialer::EchoDialer`] for tests.
+//! * [`dialer`] — the [`Dialer`] / [`UdpDialer`] seams and their errors. The loopback fixtures live behind
+//!   the `testing` feature and are absent from a shipped build (#194); a comment saying "for tests" is not
+//!   a thing an embedder's compiler can enforce, and this one was not enforcing it.
 //! * [`socks5`] — the wire protocol: [`socks5::serve`] and [`socks5::handle`] (CONNECT + UDP ASSOCIATE).
 //! * [`udp`] — the SOCKS5 UDP ASSOCIATE datagram relay (DNS-over-FANOS and any datagram flow).
 

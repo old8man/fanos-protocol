@@ -2,7 +2,8 @@
 //!
 //! The proxy is generic over a `Dialer`, so the reachability policy (resolve a `.fanos` service
 //! over the overlay, refuse the clear net until an exit exists) is entirely pluggable and testable
-//! in isolation. [`EchoDialer`] is the in-process loopback used by the SOCKS5 tests.
+//! in isolation. The in-process loopback fixtures live behind the `testing` feature (#194), so a shipped
+//! build has no dialer that answers a client with the client's own bytes.
 
 use std::future::Future;
 
@@ -106,8 +107,10 @@ pub trait UdpDialer {
 
 /// A loopback dialer whose stream echoes everything written to it — the SOCKS5 test fixture.
 #[derive(Clone, Copy, Default, Debug)]
+#[cfg(any(test, feature = "testing"))]
 pub struct EchoDialer;
 
+#[cfg(any(test, feature = "testing"))]
 impl Dialer for EchoDialer {
     type Stream = tokio::io::DuplexStream;
 
@@ -125,6 +128,7 @@ impl Dialer for EchoDialer {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl UdpDialer for EchoDialer {
     fn dial_udp(
         &self,
@@ -145,8 +149,10 @@ impl UdpDialer for EchoDialer {
 
 /// A dialer that refuses every target — a safe default before any transport is wired.
 #[derive(Clone, Copy, Default, Debug)]
+#[cfg(any(test, feature = "testing"))]
 pub struct RefuseDialer;
 
+#[cfg(any(test, feature = "testing"))]
 impl Dialer for RefuseDialer {
     type Stream = tokio::io::DuplexStream;
 
@@ -158,6 +164,7 @@ impl Dialer for RefuseDialer {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl UdpDialer for RefuseDialer {
     fn dial_udp(
         &self,

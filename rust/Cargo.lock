@@ -1234,6 +1234,7 @@ name = "fanos-proxy"
 version = "0.1.0"
 dependencies = [
  "fanos-primitives",
+ "fanos-proxy",
  "tokio",
  "tracing",
 ]
