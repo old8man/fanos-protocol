@@ -81,7 +81,30 @@ pub(crate) struct ProteusSocket {
     /// entry is only created by a datagram that **opened** under the genesis shape, which takes the community
     /// secret. A stranger cannot flood the map to evict a real joiner, because a stranger's datagram never
     /// opens at all.
-    genesis_speakers: Mutex<BoundedMap<SocketAddr, Instant>>,
+    genesis_speakers: GenesisSpeakers,
+}
+
+/// The joining-peer map, shared between the datagram envelope that *learns* it and the frame layer that
+/// must *act* on it (#234).
+///
+/// Shared rather than socket-private, and the reason is an ordering the code makes plain: both sides call
+/// `send_hello` **before** they read one, so by the time the frame layer sees a genesis-shaped HELLO its own
+/// HELLO is already on the wire in the live shape — unreadable to the joiner, and the exchange dies there.
+/// The envelope, one layer down, knew the peer was mid-join before the driver wrote a byte. This handle is
+/// how that answer reaches the layer that needs it in time.
+pub(crate) type GenesisSpeakers = Arc<Mutex<BoundedMap<SocketAddr, Instant>>>;
+
+/// A fresh map, sized and expiring as [`ProteusSocket::genesis_speakers`] documents.
+pub(crate) fn genesis_speakers() -> GenesisSpeakers {
+    Arc::new(Mutex::new(BoundedMap::new(MAX_INBOUND_CONNECTIONS)))
+}
+
+/// Whether the next frame or datagram to `dst` must go out under the genesis shape.
+///
+/// Free rather than a method, because the socket and the driver ask it of the same handle.
+pub(crate) fn speaks_genesis(map: &GenesisSpeakers, dst: SocketAddr) -> bool {
+    let map = map.lock().unwrap_or_else(PoisonError::into_inner);
+    map.get(&dst).is_some_and(|at| at.elapsed() < DIAL_TIMEOUT)
 }
 
 impl ProteusSocket {
@@ -94,6 +117,7 @@ impl ProteusSocket {
         inner: Arc<dyn AsyncUdpSocket>,
         shaper: &Arc<RwLock<ProteusShaper>>,
         stations: &Arc<Mutex<Stations>>,
+        speakers: &GenesisSpeakers,
     ) -> Arc<dyn AsyncUdpSocket> {
         let seals = shaper
             .read()
@@ -104,7 +128,7 @@ impl ProteusSocket {
             return inner;
         }
         Arc::new(Self {
-            genesis_speakers: Mutex::new(BoundedMap::new(MAX_INBOUND_CONNECTIONS)),
+            genesis_speakers: Arc::clone(speakers),
             inner,
             shaper: Arc::clone(shaper),
             stations: Arc::clone(stations),
@@ -144,11 +168,6 @@ impl ProteusSocket {
     ///
     /// Expiry is read here rather than swept on a timer: the answer is only ever needed at send time, so a
     /// stale row costs nothing until it is asked about, and asking is where it is cheapest to discard.
-    fn speaks_genesis(&self, dst: SocketAddr) -> bool {
-        let map = self.genesis_speakers.lock().unwrap_or_else(PoisonError::into_inner);
-        map.get(&dst).is_some_and(|at| at.elapsed() < DIAL_TIMEOUT)
-    }
-
     /// Remember that these addresses reached us under the genesis shape, and drop rows past their window.
     fn note_genesis_speakers(&self, addrs: &[SocketAddr]) {
         let now = Instant::now();
@@ -174,7 +193,7 @@ impl AsyncUdpSocket for ProteusSocket {
         // mid-join and holds the window `{0, 0, 1}`; sealing the reply at the live epoch would leave it
         // unreadable and the handshake would fail from the other side — the asymmetry #235 measured.
         let shaper = self.shaper.read().unwrap_or_else(PoisonError::into_inner);
-        let sealed = if self.speaks_genesis(transmit.destination) {
+        let sealed = if speaks_genesis(&self.genesis_speakers, transmit.destination) {
             shaper.seal_datagram_at_genesis(transmit.contents, &nonce)
         } else {
             shaper.seal_datagram(transmit.contents, &nonce)
@@ -238,6 +257,14 @@ impl AsyncUdpSocket for ProteusSocket {
                     .record_n(Station::WireForeignDatagram, None, refused);
             }
             if !joining.is_empty() {
+                // Counted before the map is written, so the number is "genesis datagrams that arrived",
+                // not "distinct peers currently mid-join" — a repeat from one address is a retry an
+                // operator wants to see, and the map would swallow it.
+                self.stations.lock().unwrap_or_else(PoisonError::into_inner).record_n(
+                    Station::WireGenesisShaped,
+                    None,
+                    joining.len() as u64,
+                );
                 self.note_genesis_speakers(&joining);
             }
             // Every datagram in this batch was a stranger's. Returning `Ok(0)` would tell quinn a readiness

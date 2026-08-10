@@ -452,6 +452,20 @@ pub enum Station {
     /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
+    /// A datagram opened under the **genesis** shape: the sender does not know the cell's live epoch, which
+    /// is what a node joining for the first time necessarily looks like (#234).
+    ///
+    /// The one observable for "somebody is trying to join". Before it, the whole exchange — accepted or not
+    /// — was indistinguishable from silence on every surface this node has: an unshaped datagram is counted
+    /// as [`Self::WireForeignDatagram`], but a *correctly* genesis-shaped one is simply handled, and joining
+    /// is the case an operator most wants to see succeed or fail.
+    ///
+    /// Also the rate an operator should watch for the second cost this path carries: the genesis shape is
+    /// static for the network's whole life, so an observer holding the community secret sees a fixed
+    /// signature. Bounded by admission — `MAX_INBOUND_CONNECTIONS` rows, each expiring after one
+    /// `DIAL_TIMEOUT` — but bounded is not zero, and this counter is where a flood of it would show.
+    WireGenesisShaped,
+
     /// A child cell's escalation was decided **without a coherence budget**: this node holds no `Φ` for the
     /// stratum it was asked to absorb the fault into, so it declined and handed the aggregate up.
     ///
@@ -682,6 +696,7 @@ impl Station {
         Self::RoleUnderProvisioned,
         Self::AssignmentWithheld,
         Self::SetpointHeld,
+        Self::WireGenesisShaped,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
@@ -761,6 +776,7 @@ impl Station {
             Self::RoleUnderProvisioned => "role.under_provisioned",
             Self::AssignmentWithheld => "assignment.withheld",
             Self::SetpointHeld => "setpoint.held",
+            Self::WireGenesisShaped => "wire.genesis_shaped",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
@@ -811,6 +827,7 @@ impl Station {
             // Not a default: each of these records `None`, and a station that starts carrying a tag must
             // move out of this arm, which is a change to this list rather than a silent widening.
             Self::EscalationUnbudgeted
+            | Self::WireGenesisShaped
             | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable

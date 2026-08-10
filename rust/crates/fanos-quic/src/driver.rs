@@ -361,6 +361,21 @@ fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<(Vec<u8>, OpenedUnder)> {
 }
 
 
+/// Shape an outbound frame **for a peer that may not know the live epoch yet** (#234).
+///
+/// A joining node's accept window is `{0, 0, 1}`, so a frame shaped at the cell's live epoch is one it
+/// cannot open. This is asked at SEND time — not derived from a frame we have read — because both sides
+/// emit their HELLO before reading one, and by the time the arm is visible in an inbound frame the
+/// outbound one has already gone. The answer comes from the datagram envelope, which saw the peer's shape
+/// one layer down and one round earlier.
+fn shape_out_joining(shaper: &Shaper, joining: bool, frame: &[u8]) -> Vec<u8> {
+    match (shaper, joining) {
+        (Some(s), true) => s.read().unwrap_or_else(PoisonError::into_inner).outbound_at_genesis(frame),
+        (Some(s), false) => s.read().unwrap_or_else(PoisonError::into_inner).outbound(frame),
+        (None, _) => frame.to_vec(),
+    }
+}
+
 /// Bytes of a HELLO: three little-endian `u32`s (a projective coordinate).
 const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
 /// Per-frame receive cap — **re-exported from the wire authority, not defined here**.
@@ -508,6 +523,10 @@ struct Transport {
     /// The driver-side data-path plane (#191): discards that stop before the engine, so the engine cannot
     /// count them. Shared with the `NodeHandle`, whose `driver_stations` merges it into the answer to `Observe`.
     stations: Arc<Mutex<Stations>>,
+    /// Which peers reached us under the genesis shape, shared with the datagram envelope that learns it.
+    /// Read at SEND time by [`Transport::joining`] — see `proteus_socket::GenesisSpeakers` for why the
+    /// answer has to arrive from one layer down (#234).
+    joining: crate::proteus_socket::GenesisSpeakers,
     endpoint: Endpoint,
     conns: ConnMap,
     input_tx: mpsc::Sender<Input>,
@@ -2090,8 +2109,11 @@ fn spawn_inner(
     // transport can share it (#191). It now has to exist even earlier than that: the datagram envelope is
     // the outermost gate, and a refusal there is invisible everywhere else by design (#232).
     let stations = Arc::new(Mutex::new(Stations::new()));
+    // Learned by the envelope, acted on by the frame layer — see `proteus_socket::GenesisSpeakers` for why
+    // it cannot live in either alone (#234).
+    let joining = crate::proteus_socket::genesis_speakers();
     let carrier = match &shaper {
-        Some(s) => crate::proteus_socket::ProteusSocket::wrap(carrier, s, &stations),
+        Some(s) => crate::proteus_socket::ProteusSocket::wrap(carrier, s, &stations, &joining),
         None => carrier,
     };
     let mut endpoint = Endpoint::new_with_abstract_socket(
@@ -2150,6 +2172,7 @@ fn spawn_inner(
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
         stations: Arc::clone(&stations),
+        joining: Arc::clone(&joining),
         endpoint: endpoint.clone(),
         conns,
         input_tx: input_tx.clone(),
@@ -2617,7 +2640,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     // Tell the peer the address we observe its connection arriving from — its reflexive/public address
     // for NAT traversal (#119) — on a spawned task, so this side-channel never delays the connection
     // becoming usable. Our own reflexive address arrives symmetrically on the peer's `ObservedAddr`.
-    spawn_observed_addr(conn.clone(), t.shaper.clone());
+    spawn_observed_addr(conn.clone(), t.shaper.clone(), t.joining(&conn));
     // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
     tokio::spawn(read_frames(conn.clone(), to, t.clone()));
     if let Ok(mut map) = t.conns.lock() {
@@ -2761,7 +2784,7 @@ async fn accept_loop(t: Transport) {
             // Tell the dialing peer the source address we observe it at — its reflexive/public address
             // for NAT traversal (#119), the STUN-like feedback — on a spawned task so it never delays
             // reading this peer's frames (a blocking send here can stall a busy cell, worsening #129).
-            spawn_observed_addr(conn.clone(), t.shaper.clone());
+            spawn_observed_addr(conn.clone(), t.shaper.clone(), t.joining(&conn));
             // Subsequent uni-streams are this peer's frames.
             read_frames(conn, from, t).await;
         });
@@ -2770,9 +2793,9 @@ async fn accept_loop(t: Transport) {
 
 /// Announce our HELLO (a pre-built [`FrameType::Hello`] frame: negotiation parameters ‖ `epoch` ‖
 /// `coord` ‖ proof-of-coordinate) as a uni-stream, shaped like any frame.
-async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
+async fn send_hello(conn: &Connection, shaper: &Shaper, joining: bool, hello: &[u8]) {
     if let Ok(mut stream) = conn.open_uni().await {
-        let _ = stream.write_all(&shape_out(shaper, hello)).await;
+        let _ = stream.write_all(&shape_out_joining(shaper, joining, hello)).await;
         let _ = stream.finish();
     }
 }
@@ -2780,20 +2803,20 @@ async fn send_hello(conn: &Connection, shaper: &Shaper, hello: &[u8]) {
 /// Fire-and-forget a reflexive-address report to `conn`'s peer (the source address we observe it at,
 /// #119) on a spawned task, so this side-channel never blocks the connection's critical path — reading
 /// the peer's frames or completing setup. A blocking send here can stall a busy cell (worsening #129).
-fn spawn_observed_addr(conn: Connection, shaper: Shaper) {
+fn spawn_observed_addr(conn: Connection, shaper: Shaper, joining: bool) {
     let observed = conn.remote_address();
     tokio::spawn(async move {
-        send_framed(&conn, &shaper, FrameType::ObservedAddr, &encode_addr(observed)).await;
+        send_framed(&conn, &shaper, joining, FrameType::ObservedAddr, &encode_addr(observed)).await;
     });
 }
 
 /// Write one framed message as a fresh uni-stream, shaped like any frame — the shared send
 /// primitive [`send_hello_ack`] and [`send_error`] build on (spec §7.2 framing).
-async fn send_framed(conn: &Connection, shaper: &Shaper, ty: FrameType, body: &[u8]) {
+async fn send_framed(conn: &Connection, shaper: &Shaper, joining: bool, ty: FrameType, body: &[u8]) {
     let mut frame = Vec::new();
     encode_frame(ty.code(), body, &mut frame);
     if let Ok(mut stream) = conn.open_uni().await {
-        let _ = stream.write_all(&shape_out(shaper, &frame)).await;
+        let _ = stream.write_all(&shape_out_joining(shaper, joining, &frame)).await;
         let _ = stream.finish();
     }
 }
@@ -2806,21 +2829,22 @@ async fn send_framed(conn: &Connection, shaper: &Shaper, ty: FrameType, body: &[
 async fn send_hello_ack(
     conn: &Connection,
     shaper: &Shaper,
+    joining: bool,
     version: u16,
     capabilities: Capabilities,
 ) {
     let mut body = Vec::with_capacity(6);
     body.extend_from_slice(&version.to_be_bytes());
     body.extend_from_slice(&capabilities.bits().to_be_bytes());
-    send_framed(conn, shaper, FrameType::HelloAck, &body).await;
+    send_framed(conn, shaper, joining, FrameType::HelloAck, &body).await;
 }
 
 /// Send an `ERROR` frame (spec §7.5) reporting `err` with no reason text — the handshake's
 /// incompatibility path (state diagram: `HELLO_SENT → CLOSED`). Best-effort: the connection is
 /// being abandoned regardless of whether this write lands.
-async fn send_error(conn: &Connection, shaper: &Shaper, err: ProtocolError) {
+async fn send_error(conn: &Connection, shaper: &Shaper, joining: bool, err: ProtocolError) {
     let body = encode_error(err, b"");
-    send_framed(conn, shaper, FrameType::Error, &body).await;
+    send_framed(conn, shaper, joining, FrameType::Error, &body).await;
 }
 
 /// What a peer's first uni-stream produced — **three states, not two** (#231).
@@ -2911,7 +2935,10 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
     let Ok(hello) = id.hello.read().map(|h| h.clone()) else {
         return Handshake { peer: None, round_trip: false };
     };
-    send_hello(conn, &t.shaper, &hello).await;
+    // Asked BEFORE the first byte goes out, which is the whole point: by the time an inbound frame could
+    // tell us, ours has already left in the wrong shape (#234).
+    let joining = t.joining(conn);
+    send_hello(conn, &t.shaper, joining, &hello).await;
     match read_verified_hello(conn, t, &id.verify).await {
         PeerHello::Answered(result) => match *result {
             HelloResult::Established {
@@ -2923,12 +2950,12 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
                 // VRF binds to.
                 peer: _,
             } => {
-                send_hello_ack(conn, &t.shaper, version, capabilities).await;
+                send_hello_ack(conn, &t.shaper, joining, version, capabilities).await;
                 Handshake { peer: Some(coord), round_trip: true }
             }
             HelloResult::Incompatible(err) => {
                 tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
-                send_error(conn, &t.shaper, err).await;
+                send_error(conn, &t.shaper, joining, err).await;
                 // A version disagreement is proof the shaped bytes crossed intact — we read and parsed them.
                 Handshake { peer: None, round_trip: true }
             }
@@ -2975,7 +3002,7 @@ async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notificati
                     Err(_) => continue,
                 };
                 for conn in peers {
-                    send_hello(&conn, &t.shaper, &hello).await;
+                    send_hello(&conn, &t.shaper, t.joining(&conn), &hello).await;
                 }
             }
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -3027,6 +3054,12 @@ async fn read_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
 
 /// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
 impl Transport {
+    /// Whether frames to this peer must go out under the genesis shape: it reached us not knowing the live
+    /// epoch, and until the handshake ends it cannot read anything else (#234).
+    fn joining(&self, conn: &Connection) -> bool {
+        crate::proteus_socket::speaks_genesis(&self.joining, conn.remote_address())
+    }
+
     /// Record one driver-side discard on this node's data-path plane — the same plane `Client` records on
     /// and `NodeHandle::driver_stations` merges into the answer to `Observe`, reached through the `Arc` this
     /// struct now shares (#191).
@@ -3182,6 +3215,7 @@ async fn broker_holepunch(t: &Transport, requester: Triple, req_conn: &Connectio
         send_framed(
             &target_conn,
             &t.shaper,
+            t.joining(&target_conn),
             FrameType::PunchTo,
             &encode_punch(requester, requester_addr),
         )
@@ -3191,6 +3225,7 @@ async fn broker_holepunch(t: &Transport, requester: Triple, req_conn: &Connectio
     send_framed(
         req_conn,
         &t.shaper,
+        t.joining(req_conn),
         FrameType::PunchTo,
         &encode_punch(target, target_addr),
     )
@@ -4138,7 +4173,12 @@ mod tests {
         let stations = Arc::new(Mutex::new(Stations::new()));
         let raw = std::net::UdpSocket::bind("127.0.0.1:0").expect("censor bind");
         let carrier = quinn::TokioRuntime.wrap_udp_socket(raw).expect("censor carrier");
-        let carrier = crate::proteus_socket::ProteusSocket::wrap(carrier, &shaper, &stations);
+        let carrier = crate::proteus_socket::ProteusSocket::wrap(
+            carrier,
+            &shaper,
+            &stations,
+            &crate::proteus_socket::genesis_speakers(),
+        );
         let endpoint = Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(server),
