@@ -464,8 +464,15 @@ where
         }
     });
 
+    // Supervised (#251): a dead engine means this validator silently falls out of the chain and the cell
+    // loses one member of its fault budget with nobody told.
+    let supervised = client.clone();
     let task = tokio::spawn(async move {
-        let _drainer = drainer; // tie the drainer's lifetime to the engine task
+        // Holding the drainer's handle does NOT abort it — a dropped `JoinHandle` detaches, and the task
+        // "continues running in the background" (tokio's own words). What actually stops the drainer is its
+        // own `note_tx.send(..).is_err()` break, which fires once this task's receiver is gone. Kept here so
+        // the handle is not dropped early, but the mechanism is the channel, not this binding.
+        let _drainer = drainer;
         let mut engine = ConsensusEngine::new(
             params.cell,
             params.me,
@@ -757,6 +764,7 @@ where
         }
     });
 
+    let task = crate::supervise::supervise(crate::supervise::NodeActor::TaxisEngine, &supervised, task);
     TaxisHandle { task, submit: submit_tx, events: events_tx, query: query_tx, probe: probe_tx }
 }
 

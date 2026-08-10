@@ -336,7 +336,12 @@ pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
     let sensor = Arc::new(LoadSensor::new());
     let sink = Arc::clone(&sensor);
     let mut reports = client.subscribe();
-    tokio::spawn(async move {
+    // Supervised (#251): the sensor's readings are atomics with no channel behind them, so a dead feeder
+    // leaves every role's load frozen at its last value — measured-looking and stale, which the controller
+    // then divides by. The station is what makes that visible; the frozen READING is still a level nobody
+    // can tell has stopped, and that is tracked separately.
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         loop {
             match reports.recv().await {
                 Ok(Notification::LoadReport { per_role }) => sink.record(RoleReading::from_array(per_role)),
@@ -345,6 +350,7 @@ pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
             }
         }
     });
+    crate::supervise::supervise(crate::supervise::NodeActor::LoadSensor, &supervised, task);
     sensor
 }
 
@@ -603,6 +609,9 @@ pub fn spawn_role_loop<F: Field>(
     prover: Option<CoordinateProver>,
 ) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
     let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
+    // Supervised (#251): `Node::assigned` reads this watch, so a dead controller leaves the node reporting
+    // roles it is no longer maintaining and the cell counting it as covering them.
+    let supervised = client.clone();
     let handle = tokio::spawn(async move {
         let mut live = LiveRoleController::new(node_id, controller);
         let mut events = client.subscribe();
@@ -772,7 +781,7 @@ pub fn spawn_role_loop<F: Field>(
             }
         }
     });
-    (handle, roles_rx)
+    (crate::supervise::supervise(crate::supervise::NodeActor::RoleController, &supervised, handle), roles_rx)
 }
 
 /// How often the role loop re-assigns at the **current** epoch, so a roster that was incomplete at startup converges.
@@ -949,7 +958,10 @@ fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand,
 fn spawn_liveness_watch(client: &Client) -> watch::Receiver<Option<(Epoch, u8, u8)>> {
     let (tx, rx) = watch::channel(None);
     let mut events = client.subscribe();
-    tokio::spawn(async move {
+    // Supervised (#251): the controller reads this watch every epoch, and a dead watcher freezes it — the
+    // controller then keeps deciding against a snapshot of the cell that stopped advancing.
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(Notification::Liveness { epoch, degraded, responsive, .. }) => {
@@ -962,6 +974,7 @@ fn spawn_liveness_watch(client: &Client) -> watch::Receiver<Option<(Epoch, u8, u
             }
         }
     });
+    crate::supervise::supervise(crate::supervise::NodeActor::LivenessWatch, &supervised, task);
     rx
 }
 

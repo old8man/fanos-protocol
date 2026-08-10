@@ -64,6 +64,18 @@ pub enum NodeActor {
     ExitPublisher,
     /// Publishes this node's cross-cell health record. Dead: the parent cell stops seeing it.
     HealthPublisher,
+    /// Feeds the per-role load sensor from the engine's reports. Dead: every reading freezes at its last
+    /// value and the role controller divides by a number that stopped moving — while looking measured.
+    LoadSensor,
+    /// Drives role assignment each epoch. Dead: `Node::assigned` freezes, so this node reports roles it is
+    /// no longer maintaining and the cell counts it as covering them.
+    RoleController,
+    /// Watches cell liveness for the role controller. Dead: the controller keeps deciding against a
+    /// snapshot of the cell that has stopped advancing.
+    LivenessWatch,
+    /// Steps the TAXIS consensus engine. Dead: this validator falls out of the chain in silence, and the
+    /// cell loses one member of its fault budget without anyone being told.
+    TaxisEngine,
 }
 
 /// `NodeActor::ALL` is complete, proven by the compiler — same reasoning as `Station::ALL`.
@@ -102,6 +114,10 @@ impl NodeActor {
         Self::IngressRotation,
         Self::ExitPublisher,
         Self::HealthPublisher,
+        Self::LoadSensor,
+        Self::RoleController,
+        Self::LivenessWatch,
+        Self::TaxisEngine,
     ];
 
     /// The discriminant carried in `Observation::tag`, written out so variant order never renumbers an
@@ -118,6 +134,10 @@ impl NodeActor {
                 Self::IngressRotation => 5,
                 Self::ExitPublisher => 6,
                 Self::HealthPublisher => 7,
+                Self::LoadSensor => 8,
+                Self::RoleController => 9,
+                Self::LivenessWatch => 10,
+                Self::TaxisEngine => 11,
             }
     }
 
@@ -133,6 +153,10 @@ impl NodeActor {
             Self::IngressRotation => "ingress_rotation",
             Self::ExitPublisher => "exit_publisher",
             Self::HealthPublisher => "health_publisher",
+            Self::LoadSensor => "load_sensor",
+            Self::RoleController => "role_controller",
+            Self::LivenessWatch => "liveness_watch",
+            Self::TaxisEngine => "taxis_engine",
         }
     }
 }
