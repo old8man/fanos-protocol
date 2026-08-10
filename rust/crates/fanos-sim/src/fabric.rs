@@ -905,7 +905,10 @@ mod tests {
         assert!(
             !assigned.is_refuted(),
             "every member's composition must produce an assignment over the carrier: {assigned:?}\
-             \nstations at the fixed point:{}",
+             \nassignment epochs: {:?}\nlive beacons: {:?}\nknown peers: {:?}\nstations at the fixed point:{}",
+            fleet.nodes().iter().map(|n| n.assignment().epoch.get()).collect::<Vec<_>>(),
+            fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect::<Vec<_>>(),
+            fleet.nodes().iter().map(|n| n.health().known_peers).collect::<Vec<_>>(),
             fleet.stations()
         );
         // Every member offered rendezvous, so the cell should be serving it — the property NOSTOS hosting coverage
