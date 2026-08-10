@@ -34,6 +34,12 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+/// The persister tick every test here drives, so the derived budgets below are about the same clock.
+const TICK: Duration = Duration::from_millis(20);
+/// For waits on the persister's own loop, which turns on `TICK` — generous by two orders of magnitude, so
+/// a loaded box does not turn a logic assertion into a timing one.
+const QUICK: Duration = Duration::from_secs(10);
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -80,15 +86,19 @@ fn config() -> NodeConfig {
 /// A bound rather than a fixed sleep: the persister's tick is 20 ms, so a sleep long enough to be safe on a
 /// loaded machine would be most of this test's runtime on an idle one — and a sleep *just* long enough is
 /// the load-sensitive shape #159 keeps producing.
-async fn until(label: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..400 {
+async fn until(label: &str, budget: Duration, mut f: impl FnMut() -> bool) {
+    const STEP: Duration = Duration::from_millis(25);
+    let mut waited = Duration::ZERO;
+    while waited < budget {
         if f() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(STEP).await;
+        waited += STEP;
     }
-    panic!("{label} did not happen within 10 s");
+    panic!("{label} did not happen within {budget:?}");
 }
+
 
 /// **The property: the persister's verdict tracks the disk, in both directions, and the failure is counted.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -98,7 +108,7 @@ async fn a_persister_that_cannot_write_reports_it_as_a_level_and_counts_it_as_an
 
     let node = Node::start::<F2>(config()).await.expect("node starts");
     let client = node.client();
-    let persister = spawn_store_persister(client.clone(), state.clone(), Duration::from_millis(20));
+    let persister = spawn_store_persister(client.clone(), state.clone(), TICK);
 
     let failures = |kind: PersistFailure| {
         client
@@ -115,7 +125,7 @@ async fn a_persister_that_cannot_write_reports_it_as_a_level_and_counts_it_as_an
     // what it last wrote and skips an unchanged store, which means a test that stored nothing would observe
     // a persister that never touched the disk at all and could not tell that from a working one.
     assert!(client.put(b"first".to_vec(), b"before the disk goes".to_vec()).await, "the put is accepted");
-    until("the first snapshot", || state.join(fanos_node::durable::STORE_FILE).exists()).await;
+    until("the first snapshot", QUICK, || state.join(fanos_node::durable::STORE_FILE).exists()).await;
 
     assert_eq!(
         persister.state(),
@@ -133,7 +143,8 @@ async fn a_persister_that_cannot_write_reports_it_as_a_level_and_counts_it_as_an
     // Change the store again, or the tick has nothing to write and the failure never happens.
     assert!(client.put(b"second".to_vec(), b"after the disk goes".to_vec()).await, "the put is accepted");
 
-    until("the persister to notice", || matches!(persister.state(), Durability::Failing { .. })).await;
+    until("the persister to notice", QUICK, || matches!(persister.state(), Durability::Failing { .. }))
+        .await;
     let Durability::Failing { consecutive } = persister.state() else {
         unreachable!("the wait above only returns on Failing")
     };
@@ -159,9 +170,57 @@ async fn a_persister_that_cannot_write_reports_it_as_a_level_and_counts_it_as_an
     // easier to set than to clear.
     std::fs::remove_file(&state).expect("take the file away again");
     assert!(client.put(b"third".to_vec(), b"after the disk returns".to_vec()).await, "the put is accepted");
-    until("the persister to recover", || persister.state() == Durability::Persisting).await;
+    until("the persister to recover", QUICK, || persister.state() == Durability::Persisting).await;
 
     node.shutdown().await;
+}
+
+/// **A dead persister stops claiming it is persisting (#251).**
+///
+/// The level is published through a `watch` whose sender the persister task owns, and `borrow()` on a
+/// channel with no senders keeps returning the last value. So a persister that panicked while `Persisting`
+/// left every reader — `Health`, `fanos status health`, an operator mid-incident — being told `durable: yes`
+/// for the rest of the node's life. #200 made the write failure visible and in the same stroke gave the
+/// task's *death* a comfortable place to hide: the one state that reads best.
+///
+/// This is why the fix is in the type and not in a supervisor task. A dropped sender IS the fact that needs
+/// reporting; a third party watching the handle would be a second thing to keep in sync with the first.
+///
+/// **What this test does NOT show.** `Durability::Stopped` is produced by two mechanisms — the task sends it
+/// on the way out, and `state()` also reports it when the channel has no senders left. Removing *either*
+/// leaves this test green, because after `drain` returns the task is usually far enough along for the second
+/// to cover the first. So this pins the orderly path and nothing more; the panic path has no coverage here,
+/// since nothing outside `durable` can make the persister task panic. Both mechanisms are kept on an
+/// argument from the code, and the module says so rather than letting a green suite imply otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_persister_that_died_stops_claiming_it_is_persisting() {
+    let scratch = Scratch::new("stopped");
+    let state = scratch.path().join("state");
+
+    let node = Node::start::<F2>(config()).await.expect("node starts");
+    let client = node.client();
+    let persister = spawn_store_persister(client.clone(), state.clone(), TICK);
+
+    // Alive and writing, so the reading below is a CHANGE and not the initial value.
+    assert!(client.put(b"k".to_vec(), b"v".to_vec()).await, "the put is accepted");
+    until("the first snapshot", QUICK, || state.join(fanos_node::durable::STORE_FILE).exists()).await;
+    assert_eq!(persister.state(), Durability::Persisting, "alive and landing writes");
+
+    // End the persister through its own clean-stop path and WAIT for it: `drain` asks for a final snapshot
+    // and returns once the task has written it and finished, so the sender is dropped by the time this
+    // returns. Deterministic, and the same ending a panic produces as far as the channel is concerned.
+    //
+    // The first version of this test used `node.shutdown()` and waited for the state to change. It never
+    // did, at 10 s and again at 20 s — which refuted the assumption behind it: shutting the node down does
+    // not stop a persister someone else spawned against its client. Waiting longer would have hidden that;
+    // the number is what said the mechanism was wrong ([[measure-the-mechanism-not-the-story]]).
+    persister.drain().await;
+    assert_eq!(
+        persister.state(),
+        Durability::Stopped,
+        "a persister whose task has ended must not keep reporting the state it held when it died"
+    );
+    assert_ne!(persister.state(), Durability::Persisting, "and specifically not the one that reads best");
 }
 
 /// **The two states a node can be started in, through `Node` and its own `Health` — the production reader.**

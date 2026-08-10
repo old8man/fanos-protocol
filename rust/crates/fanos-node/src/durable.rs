@@ -211,6 +211,19 @@ pub enum Durability {
         /// Consecutive failed writes; `1` on the first.
         consecutive: u32,
     },
+    /// The persister **task itself is gone** — it panicked, or was cancelled.
+    ///
+    /// **Strictly worse than [`Failing`](Self::Failing), and it existed as a lie before it existed as a
+    /// state (#251).** A failing persister retries on the next tick and can recover; a dead one never will,
+    /// and nothing will ever write this node's store again. Yet the level is published through a `watch`
+    /// whose sender the task owns, and `borrow()` on a channel with no senders keeps returning the last
+    /// value — so a persister that panicked mid-`Persisting` left `Health` reporting `durable: yes` for the
+    /// rest of the node's life. #200 made the *write* failure visible and, in the same stroke, gave the
+    /// death a comfortable place to hide.
+    ///
+    /// Detected from the channel rather than by a supervisor task: a dropped sender is exactly the fact
+    /// that needs reporting, and reading it costs nothing. There is no third party to keep in sync.
+    Stopped,
 }
 
 /// Which snapshot write failed — the sub-kind
@@ -289,6 +302,26 @@ impl StorePersister {
     /// node reports that case from the absence of one.
     #[must_use]
     pub fn state(&self) -> Durability {
+        // The sender lives inside the persister task, so a channel with no senders left means the task is
+        // gone — panicked or cancelled. `borrow()` would happily keep returning whatever it last said,
+        // which is how a dead persister went on reporting `Persisting` (#251).
+        // TWO mechanisms, because there are two ways for the task to end and only one of them can speak.
+        // An orderly stop sends `Stopped` itself (see `finish`); a panic or a cancellation cannot send
+        // anything, and shows up here as a channel with no senders left. `borrow()` alone would keep
+        // returning whatever the task last said, which is how a dead persister went on reporting
+        // `Persisting` (#251).
+        //
+        // **Both are kept on an argument from the code, NOT from a test, and that distinction is recorded
+        // because it was tested for.** Removing either one leaves
+        // `a_persister_that_died_stops_claiming_it_is_persisting` green: after `drain` returns, the task is
+        // usually far enough along that the closed channel is already visible, so the explicit send and the
+        // channel check cover for each other *on that path*. What the test cannot reach is a panicking
+        // persister — nothing outside this module can make the task panic — so the channel check is a
+        // backstop with no coverage, and saying so is the honest form of [[a-silent-guard-is-not-evidence]].
+        // The explicit send is what removes the race window; the channel check is what survives a panic.
+        if self.state.has_changed().is_err() {
+            return Durability::Stopped;
+        }
         *self.state.borrow()
     }
 
@@ -335,7 +368,12 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
         let mut last: Option<Vec<u8>> = None;
         // Every exit from the loop goes through this, so "the persister is finished" cannot be signalled by
         // one path and forgotten by another.
-        let finish = |done_tx: &watch::Sender<bool>| {
+        let finish = |done_tx: &watch::Sender<bool>, state_tx: &watch::Sender<Durability>| {
+            // Say `Stopped` on the way out, rather than leaving it to be inferred. A clean stop is the one
+            // ending the task can announce, and `drain` returns on `done` while this task's locals are
+            // still alive — so a reader that only watched for a closed channel would see `Persisting` for
+            // the window between the two, which is exactly the lie #251 is about, merely shorter.
+            let _ = state_tx.send(Durability::Stopped);
             let _ = done_tx.send(true);
         };
         loop {
@@ -345,7 +383,7 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
                 // without a clean stop — nothing is waiting on `done`, and there may be no engine to ask.
                 r = stop_rx.changed() => {
                     if r.is_err() {
-                        finish(&done_tx);
+                        finish(&done_tx, &state_tx);
                         return;
                     }
                     true
@@ -355,12 +393,12 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
             // stream would hand a clone of it to every subscriber a running node keeps.
             let Some(bytes) = client.snapshot().await else {
                 // The node has shut down, or did not answer inside the request timeout.
-                finish(&done_tx);
+                finish(&done_tx, &state_tx);
                 return;
             };
             if last.as_ref().is_some_and(|prev| *prev == bytes) {
                 if stopping {
-                    finish(&done_tx);
+                    finish(&done_tx, &state_tx);
                     return;
                 }
                 continue;
@@ -401,7 +439,7 @@ pub fn spawn_store_persister(client: Client, state_dir: PathBuf, every: Duration
                 }
             }
             if stopping {
-                finish(&done_tx);
+                finish(&done_tx, &state_tx);
                 return;
             }
         }

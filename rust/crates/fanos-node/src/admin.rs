@@ -238,6 +238,13 @@ pub fn render_health(health: &Health) -> String {
         crate::durable::Durability::Persisting => {
             let _ = writeln!(s, "durable: yes");
         }
+        crate::durable::Durability::Stopped => {
+            let _ = writeln!(
+                s,
+                "durable: STOPPED — the persister task is GONE (panicked or cancelled), so nothing will \
+                 write this node's store again and no retry is coming; restart the node"
+            );
+        }
         crate::durable::Durability::NotConfigured => {
             let _ = writeln!(
                 s,
