@@ -268,6 +268,27 @@ impl ServiceResolver for NodeResolver {
 /// conclude is not a result at all. Collapsing them meant a slow store read under contention silently shrank the cell's
 /// roster, two short scans in a row looked identical, and the role loop then treated a wrong assignment as settled — the
 /// cell froze short of its own membership with nothing to indicate why.
+///
+/// **What a caller may do with an incomplete scan, and the one thing it may not** (#250, #259). Every
+/// directory builder in this crate returns `(value, complete)`, and `complete` is false exactly when some
+/// slot read [`Unknown`](Self::Unknown). The rule the tree follows without exception:
+///
+/// > An incomplete scan may make a caller **decline to act**. It may never make it **act on a substitute**.
+///
+/// Declining asserts nothing — the next refresh supplies a conclusive view, and an epoch with no evidence is
+/// a case every consumer already handles. Substituting is where the failures live, because a substitute is
+/// indistinguishable from a measurement and is therefore acted on with confidence.
+///
+/// All five production consumers were enumerated against this rule (#259). Four decline: `refresh_reputation`
+/// publishes nothing unless `seating_complete && seated_here`, the diagnosis window returns early, the
+/// hidden-service host refuses to register and warns, and the combiner's directory install discards the flag
+/// with its reason written out — a partial view there yields no route rather than a wrong one, which is
+/// declining by another name. The fifth substituted, and it was the defect: the role loop's setpoint fell
+/// back to a held demand that at genesis was `Demand::default()`, the absence of a setpoint spelled as zero.
+///
+/// No type enforces this. A `#[must_use]` newtype catches a flag that is *ignored*, and this flag was not
+/// ignored — it was read, and the `false` arm returned a number nobody had measured. So the rule is stated
+/// where whoever adds the sixth consumer will meet it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Read<T> {
     /// Present and authentic.
@@ -278,6 +299,7 @@ pub enum Read<T> {
     /// The read did not conclude — it timed out. **Not** a negative, and not evidence of anything.
     Unknown,
 }
+
 
 impl<T> Read<T> {
     /// `Found` if `value` is `Some`, else a **definite** `Absent`. For a read that completed and found nothing valid.
