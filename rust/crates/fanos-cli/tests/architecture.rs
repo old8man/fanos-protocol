@@ -1455,6 +1455,71 @@ fn locked_versions() -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
+/// Which `getrandom` each package reaches, read from the lock's dependency lists.
+///
+/// A version set alone cannot answer the question that matters here. `TOLERATED_DUPLICATES` says "0.4 for
+/// fanos' own key paths" — a true sentence today and a *claim about who depends on what*, which the
+/// version-set guard never touches. A new dependency could move the identity path onto ring's copy and every
+/// existing assertion would stay green.
+fn getrandom_reached_by(pkg: &str) -> BTreeSet<String> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
+    let mut out = BTreeSet::new();
+    for block in text.split("[[package]]") {
+        let Some(name) = block.lines().find_map(|l| l.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')))
+        else {
+            continue;
+        };
+        if name != pkg {
+            continue;
+        }
+        // The lock writes a dependency as `"name"` when the name is unambiguous and `"name version"` when it
+        // is not — so a package reaching a DUPLICATED crate always names the version, which is exactly the
+        // case this reads. A bare `"getrandom"` would mean the duplication had collapsed.
+        for dep in block.lines().skip_while(|l| !l.starts_with("dependencies")).skip(1) {
+            let dep = dep.trim().trim_matches(|c| c == '"' || c == ',');
+            if dep == "]" {
+                break;
+            }
+            if let Some(rest) = dep.strip_prefix("getrandom") {
+                out.insert(rest.trim().to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// **The identity path's entropy comes from ONE copy, and the lock says which** (#217).
+///
+/// Three `getrandom` majors are linked into one node — 0.2 under `ring` (rustls' backend), 0.3 under
+/// `rand_core 0.9`, 0.4 for this workspace's own crates. That is tolerated and its cause is stated. What was
+/// only *prose* is the part that matters: that a FANOS crate generating key material reaches the 0.4 copy
+/// rather than the TLS stack's. Each has its own backend selection and its own fallback, so "which one
+/// produced this key" had three possible answers and nothing in the tree checked the answer.
+///
+/// Falsified by expecting `0.2.17` instead: the assertion names the version actually reached.
+#[test]
+fn the_key_generating_crates_reach_exactly_one_getrandom_and_it_is_the_workspace_one() {
+    // The crates that draw OS entropy for something a peer will trust: the node's identity and seat, the
+    // C ABI that embeds it, and the driver that draws PROTEUS datagram nonces.
+    for pkg in ["fanos-node", "fanos-ffi", "fanos-quic"] {
+        let reached = getrandom_reached_by(pkg);
+        assert_eq!(
+            reached.len(),
+            1,
+            "{pkg} reaches {} getrandom copies ({reached:?}); a key path must have ONE source of OS entropy, \
+             because each copy selects its backend and its fallback independently",
+            reached.len()
+        );
+        let got = reached.iter().next().expect("checked non-empty above").clone();
+        assert!(
+            got.starts_with("0.4"),
+            "{pkg} reaches getrandom {got}, not the 0.4 line this workspace names. If that is deliberate, \
+             TOLERATED_DUPLICATES must say so — today it claims 0.4 serves fanos' own key paths."
+        );
+    }
+}
+
 /// **No cryptographic crate is linked at two versions without someone having said why** (#206, #217).
 ///
 /// The supply-chain gap this closes is narrow and real. There is no `deny.toml`, and no `cargo audit`,
