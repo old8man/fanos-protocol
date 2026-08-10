@@ -256,11 +256,13 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
 
     // **Wait for the OBSERVABLE, not the clock.** A `sleep(2s)` is a proxy for "the cell has advanced", and
     // a proxy is what made this flake: one run in four the arrival still completed an exchange, because the
-    // precondition the test needs — the cell's epoch is past the depth-3 window that would still admit a
-    // genesis claim — had not actually been reached when the arrival started.
+    // precondition the test needs — the cell's epoch is past the window that would still admit a genesis
+    // claim — had not actually been reached when the arrival started.
     //
-    // `BeaconWindow::DEPTH` is 3, so epoch 0 leaves the cell's window at epoch 3. Waiting for that exact
-    // event makes the experiment deterministic and says what it means.
+    // `BeaconWindow::DEPTH` is `1 + SHAPE_GRACE = 2` (it was 3 when this comment was written; #261 derived it
+    // from the transport instead of choosing it), so a *rotated* epoch leaves the cell's window two epochs
+    // on. Epoch 10 clears that by any reading, which is why this precondition survived the constant moving —
+    // and why it is stated as a waited-for event rather than a number this file maintains.
     let reached = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Some(Notification::BeaconReady { epoch, .. }) = a.next_notification().await
@@ -272,7 +274,7 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
     })
     .await
     .expect("the anchor must climb past its own beacon window before the arrival starts");
-    println!("PRECONDITION cell epoch = {reached} (well past BeaconWindow::DEPTH = 3)");
+    println!("PRECONDITION cell epoch = {reached} (well past BeaconWindow::DEPTH = 1 + SHAPE_GRACE = 2)");
 
     let mut b = arrival(commitment, Peer { coord: a.address(), addr: a.local_addr() }).await;
 
@@ -280,8 +282,11 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
     // The dialer judges its peer's HELLO first and drops on refusal, so the acceptor never reaches its own
     // verification — the first refusal wins and the second never happens.
     //
-    //   cell → arrival: the cell reads a genesis-epoch claim that has aged out of its depth-3 window (N ≥ 3).
+    //   cell → arrival: the cell reads a genesis-epoch claim. **CLOSED** — the verifier now keeps a pinned
+    //     genesis seed, matching the permanent genesis door PROTEUS already holds open (#235). Before the
+    //     pin the claim aged out of the window and this was the FIRST refusal, which is what hid the other.
     //   arrival → cell: the arrival reads epoch N holding only genesis, so it cannot judge at all (N ≥ 1).
+    //     **OPEN**, and now the only one — closing the cell's arm promoted this to the binding refusal.
     //
     // The second is the realistic join: `bootstrap` exists so the arrival dials the cell.
     // DISCRIMINATOR for step 1 of #235, using only shipped API: a node's coordinate is re-derived and
@@ -316,24 +321,37 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
          {on_arrival}), so this run never reached a HELLO exchange — it measures a dial that did not happen, \
          not the epoch window. Check the bootstrap address before reading anything into the silence."
     );
-    // MEASURED, and it refutes the prediction this test was written from. I expected the ARRIVAL to be the
-    // binding refusal — its window holds only genesis, so a peer proving epoch N ≥ 1 is unjudgeable. The run
-    // says otherwise: cell 1, arrival 0, in both dial directions.
+    // **THE ASYMMETRY HAS FLIPPED, and that is this instrument's clearest result** (#235).
     //
-    // The dialer judges first and drops on refusal, so whichever side refuses ends the exchange before the
-    // other reaches its own verification. And the send path does not re-dial an address that already failed,
-    // so there is exactly ONE refusal in the whole run rather than one per retry.
+    // The first measurement refuted the prediction the test was written from. I expected the ARRIVAL to be
+    // the binding refusal — its window holds only genesis, so a peer proving epoch N ≥ 1 is unjudgeable. The
+    // run said the opposite: **cell 1, arrival 0**, in both dial directions. The dialer judges first and
+    // drops on refusal, so whichever side refuses ends the exchange before the other reaches its own
+    // verification, and the cell was refusing first.
     //
-    // The consequence is worse than the prediction, not better: **the joining node cannot tell that it was
-    // refused.** Every instrument it owns reads clean — no delivery failure it can attribute, no refusal
-    // counter, no dial error. Only the cell knows, and the cell is not the party that needs to act. That is
-    // #236's silence one level up, and it is why the assertion below is on the SUM: pinning which side
-    // records it would pin a race, while pinning that *somebody* did is the property.
+    // With the genesis pin the same run reads **cell 0, arrival 1**. Not a smaller number — a *moved* one:
+    // the cell no longer refuses at all, and the refusal I originally predicted is now the one that fires.
+    // That is a sharper result than a green would have been, because it says which of the two mechanisms the
+    // pin touched, and it could not have been read off either counter alone.
+    //
+    // So the original finding — **the joining node cannot tell that it was refused** — has been repaired as
+    // a side effect, and by the least expected route. Every instrument the arrival owned used to read clean:
+    // no delivery failure it could attribute, no refusal counter, no dial error, because only the cell knew
+    // and the cell is not the party that needs to act. Now the party that must act is the party that counts.
+    // The assertions below therefore pin BOTH sides, where the old one pinned only the sum: the split is now
+    // the property, not a race.
+    assert_eq!(
+        on_cell, 0,
+        "the cell refused a genesis-epoch claim again (cell {on_cell}, arrival {on_arrival}) — the pinned \
+         genesis seed in `BeaconWindow::beacon_for` is the verifier's half of PROTEUS's permanent genesis \
+         door, and if this is non-zero the door leads to a wall again (#235)"
+    );
     assert!(
-        on_arrival == 0,
-        "the arrival now records an unknown-epoch refusal (cell {on_cell}, arrival {on_arrival}) — the \
-         asymmetry this test documents has changed. Re-read the comment above: the finding was that a \
-         joining node learns NOTHING, and if it now learns something, say what changed."
+        on_arrival > 0,
+        "neither side refused for an unknown epoch (cell {on_cell}, arrival {on_arrival}). If the arrival \
+         now joins, that is #235 closing — say by what mechanism it reached a beacon without an \
+         already-verified peer, and turn this file into the property. If it merely stopped counting, the \
+         joining node has gone silent again and THAT is the regression."
     );
     println!(
         "MEASURED delivered: cell->arrival {cell_to_arrival}, arrival->cell {arrival_to_cell}; \

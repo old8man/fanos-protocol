@@ -1610,6 +1610,9 @@ where
 /// a peer attach to the **last good epoch** instead (audit R-C1 safe-stall), while the bound stops a stale
 /// proof from being accepted indefinitely.
 struct BeaconWindow {
+    /// The network's genesis seed, **retained for the life of the node and never evicted** — the verifier's
+    /// half of the transport's permanent genesis door (#235). See [`beacon_for`](Self::beacon_for).
+    genesis: BeaconSeed,
     recent: VecDeque<(Epoch, BeaconSeed)>,
 }
 
@@ -1634,10 +1637,11 @@ impl BeaconWindow {
     /// Widening this constant to "help" such a node is the shape that made `3` look reasonable.
     const DEPTH: usize = 1 + fanos_proteus::SHAPE_GRACE as usize;
 
+    /// A window that has adopted nothing yet. Epoch zero is answered by the **pin**, not by an entry in
+    /// `recent` — one seed in one place, so a rotation can never slide the network's own constant out from
+    /// under the door that is supposed to be permanent.
     fn genesis(seed: BeaconSeed) -> Self {
-        let mut recent = VecDeque::with_capacity(Self::DEPTH);
-        recent.push_back((Epoch::ZERO, seed));
-        Self { recent }
+        Self { genesis: seed, recent: VecDeque::with_capacity(Self::DEPTH) }
     }
 
     /// Record a newly-adopted epoch beacon, evicting the oldest beyond [`DEPTH`].
@@ -1651,9 +1655,36 @@ impl BeaconWindow {
         }
     }
 
-    /// The beacon this window remembers for `epoch`, if it is still within the accepted window.
+    /// The beacon this window remembers for `epoch` — an adopted one still inside the window, **or the
+    /// pinned genesis seed, which never expires** (#235).
+    ///
+    /// **The pin is the verifier's half of a door the transport already holds open.** PROTEUS opens
+    /// `{N−1, N, N+1}` *plus a permanent genesis shape* (#234), so a node that knows only epoch zero can
+    /// always get a frame across to a rotated cell — by design, because that is how it announces itself. Its
+    /// HELLO therefore arrives, is un-shaped, and then met a verifier whose newest two entries could not
+    /// judge an epoch-zero proof: **the door led to a wall.** The cell answered `EpochUnknown`, dropped the
+    /// connection, and the joining node was never seated. That is the measured mechanism behind #260's
+    /// bimodal join — pass while `N ≤ 1`, dark for ever after.
+    ///
+    /// **Why this is not the widening #261 warned against.** That warning was about carrying *more adopted
+    /// epochs*, which buys nothing: a peer at `N−2` cannot get a frame across at all, so no width reaches it.
+    /// Genesis is the one epoch where the opposite holds — the transport singles it out and delivers it — and
+    /// the seed is not a remembered rotation but a permanent network-wide constant derived from the network
+    /// name (#98), which every member holds for the life of the node. Retaining a value that cannot go stale
+    /// costs no staleness. The rule the two cases share: **a door is worth exactly as much as the narrowest
+    /// stage behind it**, and here the verifier was the narrow one.
+    ///
+    /// **What it does not grant.** A coordinate is `MapToPoint(VRF(identity, epoch, beacon))`, so an
+    /// epoch-zero proof still yields the one point that identity has always had at epoch zero — it cannot be
+    /// steered, and the holder gets no *fresh* standing: `verify_book.record` is already gated on
+    /// `epoch == book.epoch()`, so a genesis claim is judged and then deliberately not filed as evidence for
+    /// any placement now. That guard was written for the safe-stall window and covers this unchanged.
     fn beacon_for(&self, epoch: Epoch) -> Option<BeaconSeed> {
-        self.recent.iter().find(|&&(e, _)| e == epoch).map(|&(_, b)| b)
+        self.recent
+            .iter()
+            .find(|&&(e, _)| e == epoch)
+            .map(|&(_, b)| b)
+            .or_else(|| (epoch == Epoch::ZERO).then_some(self.genesis))
     }
 }
 
@@ -3838,26 +3869,60 @@ mod tests {
         let b1 = BeaconSeed::new([1; 32]);
         w.adopt(Epoch::new(1), b1);
         assert_eq!(w.beacon_for(Epoch::new(1)), Some(b1), "the current epoch verifies");
-        assert_eq!(
-            w.beacon_for(Epoch::ZERO),
-            Some(BeaconSeed::GENESIS),
-            "a peer one epoch behind still attaches to its last-good epoch"
-        );
 
-        // Advance past the window depth: the oldest epoch is evicted, so a stale proof cannot live forever.
-        for e in 2..=(BeaconWindow::DEPTH as u64) {
+        // Advance until epoch 1 has fallen out. **Epoch 1, not epoch 0** — this assertion used to be about
+        // zero, and zero is now the one epoch that is deliberately never evicted (#235). A ROTATED epoch is
+        // what the bound is about, so the test asks about one; keeping it on zero would have made the eviction
+        // rule and the genesis pin contradict each other, and the pin would have been the one to go.
+        let last = BeaconWindow::DEPTH as u64 + 1;
+        for e in 2..=last {
             w.adopt(Epoch::new(e), BeaconSeed::new([e as u8; 32]));
         }
-        assert_eq!(w.beacon_for(Epoch::ZERO), None, "an epoch beyond the window is no longer admitted");
-        assert!(
-            w.beacon_for(Epoch::new(BeaconWindow::DEPTH as u64)).is_some(),
-            "the newest epoch is admitted"
-        );
+        assert_eq!(w.beacon_for(Epoch::new(1)), None, "a rotated epoch beyond the window is no longer admitted");
+        assert!(w.beacon_for(Epoch::new(last)).is_some(), "the newest epoch is admitted");
         assert_eq!(w.beacon_for(Epoch::new(999)), None, "an unseen epoch is rejected");
 
         // Re-adopting a known epoch is idempotent — no duplicate, no eviction churn.
-        w.adopt(Epoch::new(BeaconWindow::DEPTH as u64), BeaconSeed::new([0xEE; 32]));
+        w.adopt(Epoch::new(last), BeaconSeed::new([0xEE; 32]));
         assert_eq!(w.recent.len(), BeaconWindow::DEPTH);
+    }
+
+    /// **A door the transport holds open must have a verifier behind it** (#235).
+    ///
+    /// The mirror of [`the_verifier_admits_no_epoch_the_wire_would_refuse`]: that one caught a window wider
+    /// than the wire, this one catches a wire wider than the window. Both gates are driven for real, because
+    /// the relation is the claim — asserting `beacon_for(ZERO).is_some()` alone would pass against a verifier
+    /// nothing could ever reach.
+    ///
+    /// Falsified in both directions. Drop the `or_else` pin from `beacon_for` and the second half reddens:
+    /// the wire delivers a genesis frame that no verifier can judge. Remove the genesis arm from the shaper
+    /// and the first half reddens instead, which is the honest outcome — with no genesis shape there is no
+    /// door, and a pin behind a wall is the unreachable width #261 deleted.
+    #[test]
+    fn the_wire_opens_no_epoch_the_verifier_could_not_judge() {
+        // Far past the window, so a surviving genesis answer cannot be an un-evicted `recent` entry.
+        const N: u64 = 8;
+        let mut here = ProteusShaper::new(b"genesis-door".to_vec(), Epoch::ZERO);
+        here.rotate(Epoch::new(N));
+        let mut window = BeaconWindow::genesis(BeaconSeed::GENESIS);
+        for e in 1..=N {
+            window.adopt(Epoch::new(e), BeaconSeed::new([e as u8; 32]));
+        }
+
+        // A node that knows only epoch zero seals under the genesis shape, and the rotated cell opens it.
+        let joiner = ProteusShaper::new(b"genesis-door".to_vec(), Epoch::ZERO);
+        let mut wire = joiner.seal_datagram(b"hello-ish", &[9u8; fanos_proteus::NONCE_LEN]);
+        assert!(
+            here.open_datagram(&mut wire).is_some(),
+            "the transport keeps a permanent genesis door (#234), so a joining node's frame arrives at N={N}"
+        );
+        assert_eq!(
+            window.beacon_for(Epoch::ZERO),
+            Some(BeaconSeed::GENESIS),
+            "and the verifier can judge what came through it — otherwise the door leads to a wall and the \
+             joining node is refused at N >= {}, which is #260's dark half",
+            BeaconWindow::DEPTH
+        );
     }
 
     /// The per-source inbound cap (audit A6/#69): one host cannot pin more than
