@@ -570,8 +570,15 @@ impl NodeFleet {
     ///
     /// Across members, not per node: one member still scanning while the others are settled is the cell
     /// working, and a per-node reading would let its progress hide behind four still ones.
+    ///
+    /// `#[cfg(test)]`, and the two rejected alternatives are worth naming. As `pub` it entered fanos-sim's
+    /// public census as a capability no production code calls — the shape #227's guard exists to catch, and
+    /// which it caught here on its next full run. As `pub(crate)` it was dead code in the non-test build,
+    /// which is the compiler saying the same thing more precisely: every caller is a predicate in this
+    /// file's own test module, so this is a test instrument and the declaration should say so.
+    #[cfg(test)]
     #[must_use]
-    pub fn widest_withheld_scan(&self) -> u64 {
+    fn widest_withheld_scan(&self) -> u64 {
         self.nodes
             .iter()
             .flat_map(|n| n.client().driver_stations())

@@ -452,6 +452,17 @@ pub enum Station {
     /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
+    /// A child cell's escalation was decided **without a coherence budget**: this node holds no `Φ` for the
+    /// stratum it was asked to absorb the fault into, so it declined and handed the aggregate up.
+    ///
+    /// Declining is the right action — absorbing means installing coarse reroutes, and a reroute plan drawn
+    /// against a budget nobody measured is a repair this node cannot justify. What was missing is that the
+    /// outcome was indistinguishable from a measured refusal. The three ways to have no `Φ` all reached the
+    /// same silent path: before this node's first self-healing diagnosis, for the whole life of a node
+    /// deployed with `self_healing` off, and across a seating change, which invalidates every other
+    /// coherence-derived value the healer holds.
+    EscalationUnbudgeted,
+
     /// The role loop's **demand did not move**, because the cell-wide load scan it rests on did not conclude
     /// — tagged by what was used instead (`fanos_node::SetpointHold`).
     ///
@@ -671,6 +682,7 @@ impl Station {
         Self::RoleUnderProvisioned,
         Self::AssignmentWithheld,
         Self::SetpointHeld,
+        Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
@@ -749,6 +761,7 @@ impl Station {
             Self::RoleUnderProvisioned => "role.under_provisioned",
             Self::AssignmentWithheld => "assignment.withheld",
             Self::SetpointHeld => "setpoint.held",
+            Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
             Self::ExitRefused => "exit.refused",
@@ -797,7 +810,8 @@ impl Station {
             //
             // Not a default: each of these records `None`, and a station that starts carrying a tag must
             // move out of this arm, which is a change to this list rather than a silent widening.
-            Self::GatherExpired
+            Self::EscalationUnbudgeted
+            | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable
             | Self::ShareLateAfterPeel

@@ -158,8 +158,23 @@ pub(crate) struct Healer {
     /// recovery-loss transient never false-fires (resets to 0 on any connected reading).
     partition_streak: u32,
     /// The coherence `Φ` computed on the last diagnosis — exposed so the facade can spend the coarse
-    /// `⌊log₉Φ⌋` reroute budget on a received cell escalation (audit R-C2) without re-diagnosing.
-    pub(crate) last_phi: f64,
+    /// `⌊log₉Φ⌋` reroute budget on a received cell escalation (audit R-C2) without re-diagnosing — or `None`
+    /// where this node holds no `Φ` at all.
+    ///
+    /// **`None` and not a number, because every number here is a claim about a measurement** (#259, the class
+    /// #250 belongs to). It was `1.0`, which is exactly the value `stratum`'s own test uses to mean *the
+    /// parent tier cannot afford this* — so a node that had never diagnosed itself answered a child's
+    /// escalation with a confident refusal it had measured nothing to support. Three ways to reach that, and
+    /// the third is not a labelling problem but a wrong action:
+    ///
+    /// * before the first diagnosis, on every node;
+    /// * for ever on a node deployed with `self_healing` off, since the assignment below sits inside that
+    ///   branch;
+    /// * across a **seating change** — where it kept a `Φ` measured against the old seating while
+    ///   `last_sample`, `measured_correlation`, `band_streak` and `last_band` were all cleared beside it. A
+    ///   *healthy* stale `Φ` makes the parent absorb, and it then installs coarse reroutes computed from a
+    ///   coherence reading of a cell that no longer exists.
+    pub(crate) last_phi: Option<f64>,
     /// The explicit cell members (transport coord by position) when this reflex runs a cell **embedded**
     /// in a larger plane — mirroring the facade's [`OverlayNode::cell_members`], so behavioural sampling,
     /// polar attestation, and the healing actuators (reroute/repair/quarantine) all map cell position `i`
@@ -179,7 +194,7 @@ impl Healer {
     }
 
     /// The `Φ` this reflex computed on its last diagnosis (a healthy 1.0 until the first one).
-    pub(crate) fn last_phi(&self) -> f64 {
+    pub(crate) fn last_phi(&self) -> Option<f64> {
         self.last_phi
     }
 
@@ -218,7 +233,7 @@ impl Healer {
             rebalancing: false,
             endpoint_window: VecDeque::new(),
             partition_streak: 0,
-            last_phi: 1.0,
+            last_phi: None,
             cell_members: None,
         }
     }
@@ -268,6 +283,12 @@ impl Healer {
         self.measured_correlation = None;
         self.band_streak = 0;
         self.last_band = None;
+        // Cleared for the same reason as every value above it, and it was the one omission in this list: `Φ`
+        // is computed from the coherence self-model of a *particular* seating, so across the boundary it is
+        // not a stale reading but a reading of a different cell. Kept, it let the parent-stratum reflex
+        // absorb a child's escalation — and draw a coarse reroute plan — on a budget belonging to the seating
+        // that just went away.
+        self.last_phi = None;
         self.partition_streak = 0;
         self.reroute.clear();
         self.repaired.clear();
@@ -877,7 +898,7 @@ impl Healer {
         let mut effects = alloc::vec![Effect::Notify(Notification::Verdict(verdict.clone()))];
         if config.self_healing {
             let phi = self.counterfactual_phi(config.healthy_correlation, measured.as_ref(), alive_count);
-            self.last_phi = phi; // exposed to the facade's parent-stratum reflex (R-C2)
+            self.last_phi = Some(phi); // exposed to the facade's parent-stratum reflex (R-C2)
             let plan = plan_healing(&verdict, self_index, degraded, phi);
             if !plan.is_empty() {
                 self.observer.note_healing();

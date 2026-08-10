@@ -176,13 +176,22 @@ impl<F: Field> OverlayNode<F> {
         if child_index >= Plane::<F>::N as usize || child_index == self_index {
             return Vec::new(); // a nonsensical child, or ourselves
         }
+        // **No `Φ`, no absorb decision** (#259). Recording the child's escalation is a fact about the child and
+        // happens either way; deciding that *this* tier can heal it is a claim about a budget, and until a
+        // diagnosis produces one there is nothing to spend. Declining is the same action the old `1.0`
+        // default happened to produce, so the behaviour below is unchanged in that case — what changed is
+        // that it is no longer indistinguishable from a measured refusal, and that a *stale* `Φ` from before
+        // a seating change can no longer make this tier absorb on a budget belonging to a cell that is gone.
         let phi = self.healer.last_phi();
+        if phi.is_none() {
+            self.stations.record(fanos_ports::Station::EscalationUnbudgeted, None);
+        }
         let parent = self.parent_cell.get_or_insert_with(|| ParentCell::new(self_index));
         parent.observe(child_index, ChildSummary::escalated(residue));
         let parent = *parent; // Copy out — end the mutable borrow of `self` before escalating further
 
         let mut effects = Vec::new();
-        if parent.contains_escalation(phi) {
+        if let Some(phi) = phi.filter(|phi| parent.contains_escalation(*phi)) {
             // The parent absorbs it: install the coarse reroutes (failed child → via a co-linear sibling) and
             // mark the child repaired at the coarse tier.
             for (around, via) in parent.coarse_reroutes(phi) {

@@ -2517,7 +2517,7 @@ mod tests {
         // and, with a healthy coarse Φ-budget, reroutes around the failed child — the audit's "Escalated was
         // ACTED ON, not merely counted." (⌊log₉81⌋ = 2 affordable coarse hops.)
         let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
-        parent.healer.last_phi = 81.0;
+        parent.healer.last_phi = Some(81.0);
         let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
         let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
         assert!(
@@ -2532,9 +2532,15 @@ mod tests {
 
     #[test]
     fn a_budgetless_top_parent_escalation_is_terminal() {
-        // With no coarse budget (Φ = 1 ⇒ ⌊log₉1⌋ = 0) and no grandparent, a top-cell parent cannot absorb the
-        // child escalation → it emits a terminal `Escalated` (external help), and does NOT reroute.
-        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default()); // last_phi defaults to 1.0
+        // With a MEASURED but exhausted coarse budget (Φ = 1 ⇒ ⌊log₉1⌋ = 0) and no grandparent, a top-cell
+        // parent cannot absorb the child escalation → terminal `Escalated` (external help), and no reroute.
+        //
+        // The `Some(1.0)` is written out, and that is the point of this test after #259. It used to rely on
+        // `last_phi` *defaulting* to 1.0 — so it pinned the fabricated value rather than a measured one, and
+        // the moment the default became `None` it would have gone on passing while silently testing a
+        // different branch. Its twin below covers the unmeasured case, and the pair is what separates them.
+        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        parent.healer.last_phi = Some(1.0);
         let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
         let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
         assert!(
@@ -2544,6 +2550,69 @@ mod tests {
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { .. }))),
             "and does not reroute what it cannot afford"
+        );
+        assert_eq!(
+            parent.stations.total(Station::EscalationUnbudgeted),
+            0,
+            "a MEASURED refusal is not an unbudgeted one — the station must stay silent here"
+        );
+    }
+
+    /// **A refusal with no measurement behind it is a different report** (#259).
+    ///
+    /// `last_phi` was `f64 = 1.0`, and `stratum`'s own test uses 1.0 to mean *the parent tier cannot afford
+    /// this* — so a node that had never diagnosed itself answered a child's escalation with a confident
+    /// refusal it had measured nothing to support. The action is unchanged (declining is right: absorbing
+    /// means drawing a reroute plan against a budget nobody measured), so what this pins is the report.
+    ///
+    /// Falsified by deleting the `record` call in `on_cell_escalate`: the count goes to 0 and this fails,
+    /// while its twin above keeps passing — which is what proves the two branches are actually separated.
+    #[test]
+    fn a_parent_that_never_diagnosed_declines_the_escalation_and_says_it_had_no_budget() {
+        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        assert_eq!(parent.healer.last_phi(), None, "a fresh node has diagnosed nothing, so it holds no Φ");
+        let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
+        let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Escalated(_)))),
+            "it still hands the fault on rather than swallowing it: {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { .. }))),
+            "and installs no reroute, because it has no budget to draw one against"
+        );
+        assert_eq!(
+            parent.stations.total(Station::EscalationUnbudgeted),
+            1,
+            "and the reason reaches an operator instead of looking like a measured refusal"
+        );
+    }
+
+    /// **A seating change invalidates Φ like everything else derived from the coherence model** (#259).
+    ///
+    /// The omission that made this a wrong *action* rather than a wrong label: `on_seating_changed` clears
+    /// `last_sample`, `measured_correlation`, `band_streak` and `last_band` — and used to leave `last_phi`
+    /// alone. A healthy stale Φ therefore let the parent tier absorb a child's escalation and install coarse
+    /// reroutes computed from the coherence reading of a seating that no longer exists.
+    ///
+    /// Falsified by removing `self.last_phi = None;` from `on_seating_changed`: the reroute reappears and
+    /// both assertions below fail.
+    #[test]
+    fn a_seating_change_takes_the_coarse_budget_with_it() {
+        let mut parent = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        parent.healer.last_phi = Some(81.0); // ⌊log₉81⌋ = 2 affordable coarse hops — enough to absorb
+        parent.healer.on_seating_changed();
+        assert_eq!(
+            parent.healer.last_phi(),
+            None,
+            "Φ measured against the old seating is a reading of a different cell, not a stale one"
+        );
+
+        let frame = encode(FrameType::CellEscalate, &[0u8, 3, 0b0010, ESCALATE_TTL]);
+        let effects = parent.step(Instant(0), Input::Message { from: [9, 9, 9], frame });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Notify(Notification::Rerouted { .. }))),
+            "and no reroute is drawn against it: {effects:?}"
         );
     }
 
