@@ -1512,6 +1512,30 @@ fn the_old_curve_branch_is_held_by_vrf_r255_alone_and_nothing_else_has_joined_it
     );
 }
 
+/// **The same tripwire on the RNG half of the split, and it was already tripped** (#210/#217).
+///
+/// `TOLERATED_DUPLICATES` explains `rand_core 0.6` as "pinned by the curve25519-dalek 4 branch". That sentence
+/// is a claim about *who*, and the version-set guard above cannot check it — a crate can sit on the old line
+/// for no reason at all and every existing assertion stays green. One did: `fanos-sim` carried a local
+/// `rand_core = "0.6"` whose comment cited the dalek ecosystem, while its only use was a test generator
+/// feeding `fanos-incentives`. It had followed that crate onto the old line and stayed after it left, and
+/// what surfaced it was not this guard but a **build break** — `--workspace --all-targets` failing once
+/// `fanos-incentives` wanted `Rng` from 0.10. A dependency-set claim that only a compile error can falsify is
+/// the thing this exists to convert into a test.
+#[test]
+fn the_old_rng_line_is_held_by_the_curve_branch_alone() {
+    let old: BTreeSet<String> = dependents_of("rand_core", "0.6.4");
+    let expected: BTreeSet<String> =
+        ["curve25519-dalek", "fanos-vrf", "vrf-r255"].iter().map(|s| (*s).to_owned()).collect();
+    assert_eq!(
+        old, expected,
+        "the dependents of rand_core 0.6.4 changed. If it SHRANK, the curve branch has moved and the \
+         `rand_core` row in TOLERATED_DUPLICATES can go with it. If it GREW, a crate joined the old RNG line \
+         — check whether it has the dalek reason at all, because the last one to do this did not, and the \
+         fix is to move it rather than to widen this expectation."
+    );
+}
+
 /// Which `getrandom` each package reaches, read from the lock's dependency lists.
 ///
 /// A version set alone cannot answer the question that matters here. `TOLERATED_DUPLICATES` says "0.4 for

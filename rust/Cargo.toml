@@ -187,9 +187,12 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 zeroize = { version = "1", default-features = false }
 # `libm` float backend for the no_std DIAKRISIS/NYX math (an optional dep in those crates).
 libm = { version = "0.2", default-features = false }
-# The RustCrypto RNG trait line (0.10), used by the PQ-KEM/onion/driver crates. NB: fanos-vrf,
-# -incentives, and -sim pin rand_core 0.6 locally — the curve25519-dalek v4 / vrf-r255 ecosystem —
-# a genuine two-major-version split that collapses only when those upstreams migrate.
+# The RustCrypto RNG trait line (0.10) — the whole workspace except one crate. NB: fanos-vrf alone pins
+# rand_core 0.6 locally, because vrf-r255 / curve25519-dalek v4 name that trait in their public API; the
+# split collapses when those upstreams migrate. -incentives and -sim were on the old line too and are not
+# any more (#217): -incentives moved with curve25519-dalek v5, and -sim never had the dalek reason at all,
+# it was following -incentives. A crate joining the 0.6 line again must add itself HERE and to the
+# `TOLERATED_DUPLICATES` row that fanos-cli's architecture guard reads.
 rand_core = { version = "0.10", default-features = false }
 # ristretto255 group ops for the verifiable-crypto crates (ECVRF, VOPRF).
 curve25519-dalek = { version = "4", features = ["rand_core", "zeroize"] }

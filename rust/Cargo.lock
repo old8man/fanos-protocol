@@ -1336,7 +1336,7 @@ dependencies = [
  "fanos-wire",
  "proptest",
  "quinn",
- "rand_core 0.6.4",
+ "rand_core 0.10.1",
  "tokio",
 ]
 

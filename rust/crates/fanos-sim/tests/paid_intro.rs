@@ -19,7 +19,7 @@ use fanos_field::F2;
 use fanos_incentives::{CreditIssuer, RedeemProof, Redemption, finalize, request};
 use fanos_runtime::{Command, Config, Duration, Triple};
 use fanos_sim::{Sim, spawn_cell};
-use rand_core::{CryptoRng, RngCore};
+use rand_core::{TryCryptoRng, TryRng};
 
 /// The epoch's public randomness beacon, folded into descriptor keys (audit E5); fixed for this test.
 const BEACON: BeaconSeed = BeaconSeed::new([0xB1; 32]);
@@ -27,7 +27,13 @@ const BEACON: BeaconSeed = BeaconSeed::new([0xB1; 32]);
 /// The PoW difficulty gating an introduction (small, for a fast test).
 const POW_BITS: u32 = 8;
 
-/// A deterministic `rand_core` 0.6 RNG (SplitMix64) — reproducible credit issuance for the test.
+/// A deterministic `rand_core` 0.10 RNG (SplitMix64) — reproducible credit issuance for the test.
+///
+/// On the 0.10 line the implementable trait is `TryRng`; `Rng` and `CryptoRng` — the bounds
+/// `fanos_incentives::request` asks for — arrive by blanket impl once `Error = Infallible`. This crate held a
+/// local `rand_core 0.6` pin whose stated reason was the curve25519-dalek v4 ecosystem, which was never true of
+/// it: the only use is right here, feeding `fanos-incentives`, and it followed that crate onto the old line
+/// rather than needing it (#217).
 struct SplitMix64(u64);
 impl SplitMix64 {
     fn seeded(tag: &str) -> Self {
@@ -46,25 +52,23 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 }
-impl RngCore for SplitMix64 {
-    fn next_u32(&mut self) -> u32 {
-        self.step() as u32
+impl TryRng for SplitMix64 {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.step() as u32)
     }
-    fn next_u64(&mut self) -> u64 {
-        self.step()
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.step())
     }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         for chunk in dest.chunks_mut(8) {
             let bytes = self.step().to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }
-impl CryptoRng for SplitMix64 {}
+impl TryCryptoRng for SplitMix64 {}
 
 fn triple_bytes(t: Triple) -> Vec<u8> {
     let mut v = Vec::with_capacity(12);
