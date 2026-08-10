@@ -269,6 +269,63 @@ mod tests {
             .collect()
     }
 
+    /// **What the ACCEPT branch of `rendezvous_host`'s loop pays — the other half of #248's ratio.**
+    ///
+    /// `open_forwarded` walks a ring of `MAX_REPLY_KEYS = 1 + HOST_GRACE_EPOCHS = 2` keys and calls
+    /// [`ReplyKeys::open`] on each until one succeeds, so a **hit** costs one or two decapsulations and a
+    /// **miss** — a direct request, which is not dead-dropped at all — costs the whole ring and then returns
+    /// the payload unchanged. `fanos-rendezvous`'s `measure_the_cost_of_sealing_one_reply` measured the
+    /// other arm and deliberately said this one was NOT measured; without it, "the accept branch is 5000x
+    /// cheaper" is a claim about `ingest` alone rather than about accepting a request.
+    ///
+    /// A `measure_` name: prints for a person, never gates. Run on a quiet box —
+    /// `cargo test -p fanos-aphantos --release measure_ -- --nocapture`.
+    #[test]
+    fn measure_the_cost_of_opening_a_dead_dropped_request() {
+        use std::time::Instant as Clock;
+
+        const ROUNDS: u32 = 50;
+        /// `fanos_node::rendezvous_host::MAX_REPLY_KEYS`, restated because that crate depends on this one
+        /// and not the other way round. A measurement, not a bound — nothing derives from this copy.
+        const RING: usize = 2;
+
+        let ring: Vec<(ReplyKeys, HybridKemPublic)> =
+            (0..RING).map(|i| ReplyKeys::generate(&[b'e', i as u8])).collect();
+        // Sealed to the key the walk reaches LAST, so the hit costs the whole ring. Sealing to the first —
+        // the obvious fixture — measures the cheapest hit and reads as if the ring were free.
+        let sealed = seal_to_receiver(&ring[RING - 1].1, b"a forwarded request", b"a-fresh-seed-per-reply")
+            .expect("the e2e seal succeeds");
+        // A direct request is not dead-dropped, so every key in the ring refuses it. **It must be long
+        // enough to reach decapsulation**: `ReplyKeys::open` slices `..CIPHERTEXT_LEN` first, so a short
+        // payload is rejected on length before any crypto runs — the first version of this fixture was 44
+        // bytes and measured 0.0 us, which was the length check, not the ring. A production direct request
+        // carrying a real DIAULOS body is comfortably past that boundary.
+        let direct = vec![0xABu8; CIPHERTEXT_LEN + 64];
+
+        let walk = |payload: &[u8]| {
+            for (keys, _) in &ring {
+                if let Some(opened) = keys.open(payload) {
+                    return Some(opened);
+                }
+            }
+            None
+        };
+        assert!(walk(&sealed).is_some(), "the hit case must actually open");
+        assert!(walk(&direct).is_none(), "the miss case must actually walk the whole ring");
+
+        for (name, payload) in [("hit (dead-dropped)", &sealed), ("MISS (direct request)", &direct)] {
+            let start = Clock::now();
+            for _ in 0..ROUNDS {
+                let _ = walk(payload);
+            }
+            let each = start.elapsed() / ROUNDS;
+            println!(
+                "MEASURE open_forwarded {name}: {:>8.1} us each over {ROUNDS} rounds, ring of {RING} (#248)",
+                each.as_secs_f64() * 1e6
+            );
+        }
+    }
+
     /// The receiver's dead-drop line always passes through the receiver, and depends on *both* the
     /// coordinate and the shared secret + beacon (the two independent blinds).
     #[test]
