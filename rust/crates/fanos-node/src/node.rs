@@ -181,7 +181,10 @@ fn os_entropy_32() -> Result<[u8; 32], NodeError> {
 /// pinned at genesis for the node's entire life. Only spawned when beacon params are configured (a bare
 /// overlay has no clock to drive). The task ends when the engine stops (`command` returns `false`).
 fn spawn_epoch_driver(client: Client, period: Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: the sharpest case in the crate. Nothing else advances the epoch, so this actor's death
+    // silently disarms the whole moving-target defence while every surface goes on reporting healthy (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(period);
         // If a tick is missed under load, fire once and carry on — never burst a backlog of epoch advances.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -193,7 +196,8 @@ fn spawn_epoch_driver(client: Client, period: Duration) -> JoinHandle<()> {
                 break; // the engine actor has stopped
             }
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::EpochDriver, &supervised, task)
 }
 
 /// How many consecutive epoch-driver periods with no beacon advance confirm a stall. Set above the safe-stall
@@ -333,17 +337,20 @@ impl RecoveryWatcher {
 
 /// Announce the node to its cell after start: kick off the heartbeat (cover traffic) if configured, and JOIN
 /// with the offered role set so the cell learns what this node serves (spec §7.8 JOIN).
-/// Returns the move announcer, so a coordinate change is announced cell-wide too — see [`spawn_move_announcer`].
-fn announce_node(handle: &NodeHandle, config: &NodeConfig) -> Option<JoinHandle<()>> {
+/// Also starts the move announcer, so a coordinate change is announced cell-wide too — see
+/// [`spawn_move_announcer`]. Its handle is not returned: the announcer reports its own death by name
+/// ([`NodeActor::MoveAnnouncer`](crate::supervise::NodeActor::MoveAnnouncer)), and holding a `JoinHandle`
+/// does nothing at all, since dropping one **detaches** (#251).
+fn announce_node(handle: &NodeHandle, config: &NodeConfig) {
     if config.start_heartbeat {
         handle.command(Command::StartHeartbeat);
     }
     if !config.roles.any() {
-        return None;
+        return;
     }
     let info = vec![config.roles.encode()];
     handle.command(Command::Join { info: info.clone() });
-    Some(spawn_move_announcer(handle.client(), info))
+    spawn_move_announcer(handle.client(), info);
 }
 
 /// Re-announce this node to the whole cell whenever its coordinate **moves**, so membership converges after a
@@ -361,9 +368,11 @@ fn announce_node(handle: &NodeHandle, config: &NodeConfig) -> Option<JoinHandle<
 /// Measured before this: with the draw forced to collide, `known_peers` stalled at 4–6 of 7 and the roster never agreed
 /// (`[1,2,2,2,4,2,4]`), while an injective draw over the same code reached `[7; 7]` in 24 s. The roster is downstream —
 /// a cell that has not finished connecting cannot assemble a directory over coordinates it cannot reach.
-#[must_use]
 fn spawn_move_announcer(client: Client, info: Vec<u8>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: dead, a peer this node is not connected to never learns where it moved, and holding no
+    // address it never dials — the loss is permanent and nothing else reports it (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut events = client.subscribe();
         // **The coordinate is state, so a lost `Reseated` must not be permanent — and here it would have
         // been.** This flood is the *only* path that reaches a peer this node is not connected to (see
@@ -398,7 +407,8 @@ fn spawn_move_announcer(client: Client, info: Vec<u8>) -> JoinHandle<()> {
                 }
             }
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::MoveAnnouncer, &supervised, task)
 }
 
 /// Spawn the recovery auto-trigger for a beacon-carrying node (`None` for a bare node), deriving the cell's
@@ -423,7 +433,10 @@ fn spawn_recovery_trigger(
     anchors: Vec<Triple>,
     threshold: usize,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    // Supervised: this is the cell's only automatic path out of a frozen beacon (#88), so its death leaves
+    // the stall permanent with nobody having decided not to act (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
         let mut events = client.subscribe();
         let beacons = client.beacons();
         let mut ticker = tokio::time::interval(period);
@@ -443,7 +456,8 @@ fn spawn_recovery_trigger(
                 }
             }
         }
-    })
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::RecoveryTrigger, &supervised, task)
 }
 
 /// Lowercase-hex encode `bytes` — for logging the exit's public-key descriptor a proxy configures with.
@@ -489,8 +503,8 @@ fn spawn_exit_role(
     );
     // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
     // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
-    // until the node stops; its handle is not retained (like the mix publisher's).
-    let _publisher = spawn_exit_publisher(handle.client(), public, handle.coordinate_prover());
+    // until the node stops; its handle is not retained, because retaining one does nothing (#251).
+    spawn_exit_publisher(handle.client(), public, handle.coordinate_prover());
     Ok(())
 }
 
@@ -821,20 +835,27 @@ fn spawn_telemetry_export(handle: &NodeHandle, epsilon: Option<f64>) -> Option<J
 /// Only for a relay — a node that does not relay has no onion key to advertise — and only with a self-certifying identity,
 /// which is also the only case where a coordinate can be proven at all. The prover is the handle's own closure over its
 /// credentials, so no signing key reaches this publisher.
-fn spawn_mix_export(handle: &NodeHandle, relay: bool, onion_seed: [u8; 32]) -> Option<JoinHandle<()>> {
+/// **Not supervised, and no longer joined.** Both halves report their own deaths by name
+/// ([`NodeActor::MixPublisher`](crate::supervise::NodeActor::MixPublisher) and `MixFeeder`), which is what a
+/// third task here could never do — it could only say that *one of two* had stopped.
+///
+/// It used to `tokio::join!` the two into a single handle, stored in a `_`-prefixed field. That accomplished
+/// nothing in either direction: a dropped `JoinHandle` **detaches**, so the field neither kept the actors
+/// alive nor learned anything when they ended, and the join's own result was discarded with `let _`. One
+/// spawned task whose entire purpose was to be dropped (#251).
+fn spawn_mix_export(handle: &NodeHandle, relay: bool, onion_seed: [u8; 32]) {
     if !relay {
-        return None;
+        return;
     }
-    let prover = handle.coordinate_prover()?;
+    let Some(prover) = handle.coordinate_prover() else {
+        return;
+    };
     // Two halves of one role, spawned together because a relay is both: it PUBLISHES its own onion key so others
     // can seal to it, and it CONSUMES the cell's directory so it can seal a forward onion as a meeting combiner.
     // The second used to be unnecessary only because a host registration carried the hop keys itself, which does
     // not fit the fixed-width packet past the Fano plane.
-    let feeder = spawn_mix_directory_feeder::<fanos_field::F2>(handle.client(), true);
-    let publisher = spawn_mix_publisher(handle.client(), onion_seed, Some(prover));
-    Some(tokio::spawn(async move {
-        let _ = tokio::join!(publisher, feeder);
-    }))
+    spawn_mix_directory_feeder::<fanos_field::F2>(handle.client(), true);
+    spawn_mix_publisher(handle.client(), onion_seed, Some(prover));
 }
 
 fn spawn_roles<F: Field + 'static>(
@@ -885,18 +906,6 @@ pub struct Node {
     roles: RoleSet,
     /// Whether this node has a reflexive layer — see [`Health::reflexive`].
     reflexive: bool,
-    /// The background task republishing this node's mix onion key each epoch — present only for a relay
-    /// node (which runs the mixnet role). Held so it lives as long as the node; it ends when the node's
-    /// notification stream closes on shutdown.
-    _mix_publisher: Option<JoinHandle<()>>,
-    /// The background task issuing the wall-clock `AdvanceEpoch` tick — present only when a beacon is
-    /// configured (the live epoch clock). Held for the node's lifetime; it ends when the engine stops.
-    _epoch_driver: Option<JoinHandle<()>>,
-    /// The recovery auto-trigger (audit §4 R-C1) — present only with a beacon; fires proactive reshare /
-    /// escalates re-genesis on a beacon freeze. Held for the node's lifetime.
-    _recovery_trigger: Option<JoinHandle<()>>,
-    /// Re-announces this node to the cell on every coordinate move — see [`spawn_move_announcer`].
-    _move_announcer: Option<JoinHandle<()>>,
     /// Keeps this node's durable store on disk (#77) — present only when the config named a state directory.
     ///
     /// Held for the node's lifetime, and now **read on the way out**: [`Node::shutdown`] drains it so a clean
@@ -1212,10 +1221,10 @@ impl Node {
         let address = handle.address();
         let local_addr = handle.local_addr();
         // Keep the relay's onion key live in the mix directory: publish genesis, then republish each epoch (E4∩E5).
-        let mix_publisher = spawn_mix_export(&handle, relay, onion_seed);
+        spawn_mix_export(&handle, relay, onion_seed);
         let _telemetry = spawn_telemetry_export(&handle, config.telemetry_epsilon);
         // The root epoch tick driving the live beacon clock (§L3, §7.6) — only when a beacon is configured.
-        let epoch_driver = has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
+        has_beacon.then(|| spawn_epoch_driver(handle.client(), config.epoch_period));
 
         // The live beacon (audit S1-M2) comes straight off the router's latest-state watch. It used to be a
         // second copy — its own task, subscribed to the *lossy* notification stream, maintaining an
@@ -1223,7 +1232,7 @@ impl Node {
         // second answer to a question that has one.
         let live_beacon = handle.client().beacons();
 
-        let recovery_trigger = spawn_recovery::<F>(handle.client(), &config, address, has_beacon); // audit §4 R-C1
+        spawn_recovery::<F>(handle.client(), &config, address, has_beacon); // audit §4 R-C1
 
         // The measured per-role load, shared by every reporter: the engine's observations arrive on the
         // notification stream, and a driver task that performs work no engine can see opens a gauge on it.
@@ -1250,7 +1259,7 @@ impl Node {
         // fact an operator cannot see any other way, and a silent empty start is the failure this closes.
         let store_persister = spawn_store_role(&handle, state_dir, restored);
 
-        let move_announcer = announce_node(&handle, &config);
+        announce_node(&handle, &config);
 
         Ok(Self {
             handle,
@@ -1259,10 +1268,6 @@ impl Node {
             roles: config.roles,
             // A cell is seven members; only the base plane is its own cell (#145).
             reflexive: config.plane_order == 2,
-            _mix_publisher: mix_publisher,
-            _epoch_driver: epoch_driver,
-            _recovery_trigger: recovery_trigger,
-            _move_announcer: move_announcer,
             store_persister,
             self_org,
             live_beacon,

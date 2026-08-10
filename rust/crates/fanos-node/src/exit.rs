@@ -697,7 +697,6 @@ pub async fn build_cell_exit_directory<F: Field>(
 /// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
-#[must_use]
 pub fn spawn_exit_publisher(
     client: Client,
     public: HybridKemPublic,

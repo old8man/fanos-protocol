@@ -234,7 +234,6 @@ async fn read_mix_key_in_mode<F: Field>(
 /// this node. A publisher that captured it kept writing to the point the node had *left*, so the cell's directory scan found
 /// a descriptor at an unoccupied point and none at the occupied one. Measured as rosters frozen one short of the occupied
 /// count (`[4, 4, 4, 1, 4]` with five points held) after live coordinate resolution started actually moving nodes.
-#[must_use]
 pub fn spawn_mix_publisher(
     client: Client,
     onion_seed: [u8; 32],

@@ -76,6 +76,16 @@ pub enum NodeActor {
     /// Steps the TAXIS consensus engine. Dead: this validator falls out of the chain in silence, and the
     /// cell loses one member of its fault budget without anyone being told.
     TaxisEngine,
+    /// Issues the wall-clock `AdvanceEpoch` tick. Dead: **nothing** advances the epoch, so the VRF
+    /// coordinate, the PROTEUS wire shape and the forward-secure onion keys all stay pinned at genesis for
+    /// the node's entire life — the whole moving-target defence off, with every surface reporting healthy.
+    EpochDriver,
+    /// Re-floods this node's coordinate after a move. Dead: a peer this node is not connected to never
+    /// learns where it went, and since that peer holds no address it never dials — permanently.
+    MoveAnnouncer,
+    /// Watches for a frozen beacon and escalates to the recovery authority. Dead: the cell's only automatic
+    /// path out of a stall is gone, so a frozen cell stays frozen (#88) with no one deciding not to act.
+    RecoveryTrigger,
 }
 
 /// `NodeActor::ALL` is complete, proven by the compiler — same reasoning as `Station::ALL`.
@@ -118,6 +128,9 @@ impl NodeActor {
         Self::RoleController,
         Self::LivenessWatch,
         Self::TaxisEngine,
+        Self::EpochDriver,
+        Self::MoveAnnouncer,
+        Self::RecoveryTrigger,
     ];
 
     /// The discriminant carried in `Observation::tag`, written out so variant order never renumbers an
@@ -138,6 +151,9 @@ impl NodeActor {
                 Self::RoleController => 9,
                 Self::LivenessWatch => 10,
                 Self::TaxisEngine => 11,
+                Self::EpochDriver => 12,
+                Self::MoveAnnouncer => 13,
+                Self::RecoveryTrigger => 14,
             }
     }
 
@@ -157,6 +173,9 @@ impl NodeActor {
             Self::RoleController => "role_controller",
             Self::LivenessWatch => "liveness_watch",
             Self::TaxisEngine => "taxis_engine",
+            Self::EpochDriver => "epoch_driver",
+            Self::MoveAnnouncer => "move_announcer",
+            Self::RecoveryTrigger => "recovery_trigger",
         }
     }
 }
