@@ -91,6 +91,32 @@ fn epoch_unknown(node: &Node) -> u64 {
         .sum()
 }
 
+/// Every station a node has raised, plus how many peers its transport holds.
+///
+/// Printed on BOTH outcomes, not only on failure. A stall reported as a bare `false` says nothing about
+/// which of two very different worlds it is — "no peer was ever reached" and "a peer answered and then the
+/// frame went nowhere" need different repairs, and the peer count is what separates them at a glance.
+fn dump(tag: &str, n: &Node) {
+    let mut v: Vec<String> = n
+        .client()
+        .driver_stations()
+        .iter()
+        .map(|o| format!("{}={}", o.station.name(), o.count))
+        .collect();
+    v.sort();
+    let h = n.health();
+    println!(
+        "STATIONS {tag}: seat={:?} known_peers={} verified={} collisions={} send_drops={} unresolved={} | {}",
+        h.address,
+        h.known_peers,
+        h.verified_claims.map_or(-1i64, |v| v as i64),
+        h.collisions,
+        h.send_drops,
+        h.unresolved_drops,
+        v.join(" ")
+    );
+}
+
 /// Send from `from` to `to` and report whether it was delivered within `budget`.
 async fn delivers(from: &Node, to: &mut Node, budget: Duration) -> bool {
     let target = to.address();
@@ -128,18 +154,38 @@ async fn delivers(from: &Node, to: &mut Node, budget: Duration) -> bool {
 /// NOTHING for 48 s, ~1 run in 4" — and this harness is two nodes and 20 seconds where that one is a
 /// composed hidden service, so if they are the same defect this is much the cheaper reproducer.
 ///
-/// While it stands, the experiment below **cannot be read as evidence**: its silence has two possible
-/// causes and this arm is what was supposed to separate them. So neither ships as a gate. They are
-/// `#[ignore]`d measurements — the class that prints for a person and never blocks — and they become
-/// assertions again the day the control is reliable, which is the point of writing the rate down here.
+/// **SEPARATED, 8 runs, and the discriminator is exact: every failure has `collisions > 0` and every pass
+/// has `collisions == 0`.** Two failures in eight, and in both the arriving node reported `collisions=2`;
+/// the six passes reported zero. In one failure the two nodes ended on the *same* seat (`[0, 1, 1]` twice);
+/// in the other their final seats differ, so the node did detect the clash and move — and delivery still
+/// did not recover inside the 20 s budget. The anchor shows `verified=2` on both failures against 1 on
+/// every pass, which is the same event from the other side: it authenticated the arrival twice, before and
+/// after the move.
+///
+/// So this is not a harness flake. It is the **recovery path after a coordinate collision**, and the rate is
+/// what the geometry predicts: two nodes drawing from the 7 points of `F2` collide with probability 1/7,
+/// and 2-in-8 is that number within the noise of eight samples. Every scenario in this tree brings its whole
+/// cell up at once and has never been read for this, because a collision there is absorbed by the other five
+/// members; with exactly two nodes there is nobody to absorb it.
+///
+/// The experiment below therefore **still cannot be read as evidence** — its silence has two causes and this
+/// arm was meant to separate them — but the reason is now named rather than open. Neither ships as a gate.
+/// They are `#[ignore]`d measurements, the class that prints for a person and never blocks, and they become
+/// assertions the day a collision recovers inside the budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, not an assertion — the control is 1-in-4 intermittent; run with --ignored --nocapture"]
 async fn probe_two_nodes_started_together_on_genesis_exchange_a_frame() {
     let (a, commitment) = anchor(Duration::from_secs(3600)).await;
     let mut b = arrival(commitment, Peer { coord: a.address(), addr: a.local_addr() }).await;
 
+    let delivered = delivers(&a, &mut b, Duration::from_secs(20)).await;
+    // Reported before the assertion, so a failing run leaves the same evidence a passing one does. Without
+    // this the flake is a bare `false` and every explanation for it is equally consistent with the output.
+    println!("CONTROL delivered={delivered}");
+    dump("anchor", &a);
+    dump("second", &b);
     assert!(
-        delivers(&a, &mut b, Duration::from_secs(20)).await,
+        delivered,
         "the control must deliver, or the experiment below measures the harness and not the property"
     );
     assert_eq!(
@@ -213,16 +259,6 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
     // EVERY station on BOTH nodes. One counter answers "did this gate fire"; the whole plane answers "which
     // gate fired", and that is the question left open — how a send can succeed when the exchange that
     // authorizes it was refused.
-    let dump = |tag: &str, n: &Node| {
-        let mut v: Vec<String> = n
-            .client()
-            .driver_stations()
-            .iter()
-            .map(|o| format!("{}={}", o.station.name(), o.count))
-            .collect();
-        v.sort();
-        println!("STATIONS {tag}: {}", v.join(" "));
-    };
     println!(
         "OUTCOME delivered={delivered} cell->arrival={cell_to_arrival} arrival->cell={arrival_to_cell} \
          arrival_seat {arrival_seat_before:?} -> {:?}",
