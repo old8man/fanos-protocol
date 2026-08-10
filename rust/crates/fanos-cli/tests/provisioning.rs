@@ -41,7 +41,10 @@ fn rust_root() -> PathBuf {
 }
 
 fn read(rel: &str) -> String {
-    std::fs::read_to_string(rust_root().join(rel)).unwrap_or_default()
+    // Not `unwrap_or_default`: a named file that has moved would yield an empty text, and every assertion
+    // below would then hold about a file this guard never opened (#253).
+    let path = rust_root().join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("the guard's own input must be readable — {}: {e}", path.display()))
 }
 
 #[test]

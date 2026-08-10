@@ -10,7 +10,7 @@
 //! A closure computed over the manifests cannot make that mistake, and a test cannot go stale quietly.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_testkit::corpus::{RustSource, rust_sources as corpus};
+use fanos_testkit::corpus::{self, RustSource, rust_sources as corpus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -377,6 +377,64 @@ const UNWIRED_SKIP: &[&str] = &[
     "address", "encode", "decode", "to_bytes", "from_bytes", "as_str", "build", "run", "main", "id", "name",
     "verify", "sign", "hash",
 ];
+
+/// **No second walk.** Nothing outside `fanos-testkit` may roll its own recursive scan of the tree (#253).
+///
+/// Fourteen guards did, and each one ended a failed read with `else { continue }` or `unwrap_or_default()`.
+/// That makes two silent holes: a wrong root yields an empty corpus, so "no file does X" holds for the
+/// emptiest of reasons; and a file that exists but cannot be opened is dropped, which is precisely the file a
+/// permissions accident removes from the scan. Neither shows up as anything but green — the reason this rule
+/// has to be about the SHAPE, checked from outside, like its sibling below.
+///
+/// `fanos_testkit::corpus::rust_sources` is the one walk that reports what it reached: unreadable directory,
+/// unreadable file and a crate that contributed nothing are all fatal there.
+///
+/// **The rule is about walks of the SOURCE TREE, not about `read_dir`.** Its first version flagged every
+/// listing and immediately reported `ceremony_secrets.rs`, which lists the temp directory a ceremony just
+/// wrote — a different act, and one that `.expect()`s rather than skipping. Reading the site showed the rule
+/// was wrong, not the code, so the discriminator is now how the walk finds its ROOT: a file that reaches for
+/// `CARGO_MANIFEST_DIR` and then lists directories is scanning the tree; one listing a path it was handed is
+/// not ([[falsify-the-exemption-not-the-rule]], applied to the rule itself).
+///
+/// **Self-exemption by position, and it is the one exemption.** This file has to name the pattern to look for
+/// it, so it is excluded by `file!()` rather than by a list — a list of exempt files is the hole, not the fix
+/// (#227's rule, applied to itself). The corpus module itself is excluded for the same structural reason: it
+/// *is* the walk, and a rule that forbade the only sanctioned implementation would forbid the fix.
+#[test]
+fn no_guard_rolls_its_own_walk_of_the_tree() {
+    let myself = corpus::workspace_root().join(file!()).canonicalize().ok();
+    let home = corpus::workspace_root().join("crates/fanos-testkit/src/corpus.rs");
+    // Assembled rather than written, so this file holds no literal `read_dir` for itself to find.
+    let needle = format!("read{}", "_dir(");
+    let rooted = format!("CARGO_MANIFEST{}", "_DIR");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut examined = 0usize;
+    for file in corpus() {
+        if file.path.canonicalize().ok() == myself || file.path == home {
+            continue;
+        }
+        // Not a tree walk unless it roots itself in the tree — see the paragraph above.
+        if !file.text.contains(&rooted) {
+            continue;
+        }
+        examined += 1;
+        for (n, line) in file.text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains(&needle) {
+                offenders.push(format!("{}:{}", file.rel, n + 1));
+            }
+        }
+    }
+
+    assert!(examined > 0, "the scan examined nothing — which is the failure it exists to catch, in itself");
+    assert!(
+        offenders.is_empty(),
+        "these walk the tree themselves instead of calling `fanos_testkit::corpus::rust_sources`: \
+         {offenders:?}. Every hand-rolled copy so far skipped an unreadable file in silence and passed green \
+         about code it never opened — and an empty corpus passed for the same reason (#253)."
+    );
+}
 
 /// **No second slice.** Nothing outside `fanos-testkit` may split a source file on the test attribute itself.
 ///
@@ -950,43 +1008,28 @@ fn every_section_numbering_pass_is_in_the_audits_citation_register() {
 #[test]
 fn the_loopback_exemption_is_reachable_only_from_a_test() {
     const HATCH: &str = "also_permitting_loopback_for_tests";
-    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
 
     let mut offenders: Vec<String> = Vec::new();
     let mut calls = 0usize;
-    let mut stack = vec![crates];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != "target") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            // This file names the constructor in a `const`, and lives in a `tests/` directory — so without
-            // this line it counts itself, and the "someone still calls it" half below can never fail. That
-            // was not hypothetical: it passed after the only real call site had been renamed away.
-            if path.file_name().is_some_and(|n| n == "architecture.rs") {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            // The definition itself, and this test's own mention of the name, are not calls.
-            let body = src.split("pub fn also_permitting").next().unwrap_or(&src);
-            if !body.contains(HATCH) {
-                continue;
-            }
-            calls += 1;
-            // Membership of a `tests/` directory, and nothing softer. The first cut here also accepted any
-            // file containing `#[cfg(test)]` — which is nearly every `src/` module in this workspace, since
-            // that is where a unit-test module lives — so the guard exempted the whole codebase and passed
-            // when a `src/` call was planted in it. A guard that cannot fail is not a guard.
-            if !path.components().any(|c| c.as_os_str() == "tests") {
-                offenders.push(path.display().to_string());
-            }
+    for file in corpus() {
+        // This file names the constructor in a `const`, and lives in a `tests/` directory — so without
+        // this line it counts itself, and the "someone still calls it" half below can never fail. That
+        // was not hypothetical: it passed after the only real call site had been renamed away.
+        if file.path.file_name().is_some_and(|n| n == "architecture.rs") {
+            continue;
+        }
+        // The definition itself, and this test's own mention of the name, are not calls.
+        let body = file.text.split("pub fn also_permitting").next().unwrap_or(&file.text);
+        if !body.contains(HATCH) {
+            continue;
+        }
+        calls += 1;
+        // Membership of a `tests/` directory, and nothing softer. The first cut here also accepted any
+        // file containing `#[cfg(test)]` — which is nearly every `src/` module in this workspace, since
+        // that is where a unit-test module lives — so the guard exempted the whole codebase and passed
+        // when a `src/` call was planted in it. A guard that cannot fail is not a guard.
+        if !file.path.components().any(|c| c.as_os_str() == "tests") {
+            offenders.push(file.rel);
         }
     }
 
@@ -1018,35 +1061,24 @@ fn the_loopback_exemption_is_reachable_only_from_a_test() {
 /// requiring 0700 there would be ceremony without a threat.
 #[test]
 fn no_production_code_creates_a_directory_at_the_umask() {
-    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut offenders: Vec<String> = Vec::new();
-    let mut stack = vec![crates];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != "target" && n != "tests") {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else { continue };
-            // Test modules are exempt, and excluded by POSITION rather than by "the file mentions
-            // cfg(test)", which would exempt nearly every `src/` module here and make the check vacuous.
-            // The slice is shared: cutting at the FIRST marker dropped shipping code below it (#252).
-            let production = production_part(&src);
-            // `create_private_dir` is the sanctioned wrapper and calls `create_dir_all` itself.
-            if path.file_name().is_some_and(|n| n == "durable.rs") {
-                continue;
-            }
-            for (i, line) in production.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or("");
-                if code.contains("create_dir_all") {
-                    offenders.push(format!("{}:{}", path.display(), i + 1));
-                }
+    // A whole `tests/` directory is exempt here, and that exemption now lives at the guard rather than
+    // inside the walk — the corpus hands over everything, so a reader can see what this test declines to
+    // look at instead of inferring it from a `stack.push` condition (#253).
+    for file in corpus().into_iter().filter(|s| !Path::new(&s.rel).components().any(|c| c.as_os_str() == "tests"))
+    {
+        // Test modules are exempt, and excluded by POSITION rather than by "the file mentions
+        // cfg(test)", which would exempt nearly every `src/` module here and make the check vacuous.
+        // The slice is shared: cutting at the FIRST marker dropped shipping code below it (#252).
+        let production = production_part(&file.text);
+        // `create_private_dir` is the sanctioned wrapper and calls `create_dir_all` itself.
+        if file.path.file_name().is_some_and(|n| n == "durable.rs") {
+            continue;
+        }
+        for (i, line) in production.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("create_dir_all") {
+                offenders.push(format!("{}:{}", file.rel, i + 1));
             }
         }
     }
@@ -1091,50 +1123,40 @@ fn every_production_dial_of_a_peer_named_address_goes_through_the_dial_policy() 
 
     let mut offenders = Vec::new();
     let mut examined = 0usize;
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    for krate in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let root = krate.expect("entry").path().join("src");
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let Ok(src) = std::fs::read_to_string(&path) else { continue };
-                let production = production_part(&src);
-                examined += 1;
-                // Keyed by crate-relative PATH, not basename: `driver.rs` exists in both `fanos-quic` and
-                // `fanos-vpn`, and matching on the name alone applied the quic row's liveness requirement to
-                // the vpn file — a row silently governing a file it was never written about.
-                let named = path.to_string_lossy().replace('\\', "/");
-                if let Some((_, why, required)) = SANCTIONED.iter().find(|(f, ..)| named.ends_with(*f)) {
-                    // The liveness half: a sanctioned file that no longer contains its safe mechanism has
-                    // stopped being sanctioned, and saying so here is the only thing that makes the row
-                    // mean anything ([[falsify-the-exemption-not-the-rule]]).
-                    assert!(
-                        required.is_empty() || src.contains(required),
-                        "`{named}` is exempted because {why}, and no longer contains `{required}` — either \
-                         it stopped dialling (delete the row) or it stopped filtering (that is the bug)."
-                    );
-                    continue;
-                }
-                for (i, line) in production.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    if code.contains("lookup_host(") || code.contains("endpoint.connect(") {
-                        offenders.push(format!("{}:{}", path.display(), i + 1));
-                    }
+    // One pass over the whole corpus. The old shape looped the crates directory and walked each crate, so
+    // "which crates did it reach" was the walk's private business; now it is the corpus's assertion (#253).
+    {
+        // `src/` only, as the per-crate walk this replaced did: a `tests/` file that dials is a test dialling,
+        // which is what the SANCTIONED table is not about.
+        for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+            let production = production_part(&file.text);
+            examined += 1;
+            // Keyed by crate-relative PATH, not basename: `driver.rs` exists in both `fanos-quic` and
+            // `fanos-vpn`, and matching on the name alone applied the quic row's liveness requirement to
+            // the vpn file — a row silently governing a file it was never written about.
+            let named = file.rel.replace('\\', "/");
+            if let Some((_, why, required)) = SANCTIONED.iter().find(|(f, ..)| named.ends_with(*f)) {
+                // The liveness half: a sanctioned file that no longer contains its safe mechanism has
+                // stopped being sanctioned, and saying so here is the only thing that makes the row
+                // mean anything.
+                assert!(
+                    required.is_empty() || file.text.contains(required),
+                    "`{named}` is exempted because {why}, and no longer contains `{required}` — either \
+                     it stopped dialling (delete the row) or it stopped filtering (that is the bug)."
+                );
+                continue;
+            }
+            for (i, line) in production.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("lookup_host(") || code.contains("endpoint.connect(") {
+                    offenders.push(format!("{}:{}", file.rel, i + 1));
                 }
             }
         }
     }
-    // The denominator, so a walk that finds nothing fails rather than passes.
-    assert!(examined > 200, "the scan examined only {examined} production files — it is not reaching them");
+    // The denominator. `> 200` was a number someone picked; the corpus now derives its own floor — every
+    // crate must contribute — so this only has to say the loop ran at all (#253).
+    assert!(examined > 0, "the scan examined no production files — it is not reaching them");
     assert!(
         offenders.is_empty(),
         "these dial a remote address without going through `fanos_quic::dial_policy`: {offenders:?}. A dial \
@@ -1190,28 +1212,16 @@ fn a_test_that_spawns_a_peer_does_not_run_on_a_current_thread_runtime() {
     let mut async_tests = 0usize;
     let mut files = 0usize;
 
-    for krate in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let base = krate.expect("entry").path();
-        let mut stack = vec![base.join("src"), base.join("tests")];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                if path.canonicalize().ok() == myself {
-                    continue;
-                }
-                let Ok(src) = std::fs::read_to_string(&path) else { continue };
-                if !src.contains("#[tokio::test") {
-                    continue;
-                }
-                files += 1;
+    {
+        for file in corpus() {
+            if file.path.canonicalize().ok() == myself {
+                continue;
+            }
+            let src = &file.text;
+            if !src.contains("#[tokio::test") {
+                continue;
+            }
+            files += 1;
                 // Split on the attribute so each test's own body is examined, not the file's. A file-level
                 // grep would clear a file that has one `spawn` in production code, which is most of them.
                 for chunk in src.split("#[tokio::test").skip(1) {
@@ -1238,16 +1248,16 @@ fn a_test_that_spawns_a_peer_does_not_run_on_a_current_thread_runtime() {
                             .nth(1)
                             .and_then(|s| s.split('(').next())
                             .unwrap_or("<unnamed>");
-                        offenders.push(format!("{}::{name}", path.display()));
+                        offenders.push(format!("{}::{name}", file.rel));
                     }
                 }
-            }
         }
     }
 
-    // A scan that examined nothing is a pass by accident. Both counts are floors observed at the time this
-    // guard landed, so a walk that silently stops finding files fails here rather than reporting "clean".
-    assert!(files >= 20, "the walk found only {files} files with async tests; the scan is broken, not the tree");
+    // A scan that examined nothing is a pass by accident. The FILE floor is gone: the corpus derives its own
+    // (every crate must contribute), so a count here would be a second, weaker claim about the same walk. The
+    // test-count floor stays, because it is about the SPLIT rather than the walk (#253).
+    assert!(files > 0, "the walk found no file with an async test; the scan is broken, not the tree");
     assert!(async_tests >= 100, "only {async_tests} async tests examined; the split is broken");
     assert!(
         offenders.is_empty(),
