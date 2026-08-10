@@ -548,6 +548,39 @@ impl NodeFleet {
         out
     }
 
+    /// **The widest directory scan any member has withheld at** — a second term in a settling trajectory,
+    /// carried for what it *tells you when the trajectory freezes* (#159).
+    ///
+    /// [`Station::AssignmentWithheld`](fanos_runtime::ports::stations::Station::AssignmentWithheld) documents
+    /// that `Observation::tag` carries the roster size the scan produced (#199), so the maximum rises while
+    /// members are still appearing and stands still when a cell cannot improve its read. The *count* would
+    /// have been the wrong quantity: it rises for a fleet that is merely spinning, and a permanently broken
+    /// composition would then report `Inconclusive` instead of `Refuted` — which every call site treats as a
+    /// pass. Adding it would have made those assertions unable to fail for the failure they exist to catch.
+    ///
+    /// **It is here as an instrument, not as a repair, and the distinction is the finding.** The hypothesis
+    /// it was written for — that the roster vector freezes in the gap between discovery finishing and the
+    /// first assignment, and `withhold` fills that gap silently — is REFUTED by what it printed:
+    /// `Refuted { frozen_for: 30s, last: ([3, 4, 2, 4, 4], 0) }`. The rosters never completed, and the
+    /// maximum is `0`, so `withhold` was never reached at all. The stall is upstream of the assignment
+    /// decision, in discovery or publication, and the same fleet size and plane converge under
+    /// [`Link::ideal`] — the failing case differs only by 20 ms of latency and 10 ms of jitter, with no loss
+    /// on either. That is a real convergence defect, not a trajectory artefact, and it belongs to the frozen
+    /// roster already tracked separately.
+    ///
+    /// Across members, not per node: one member still scanning while the others are settled is the cell
+    /// working, and a per-node reading would let its progress hide behind four still ones.
+    #[must_use]
+    pub fn widest_withheld_scan(&self) -> u64 {
+        self.nodes
+            .iter()
+            .flat_map(|n| n.client().driver_stations())
+            .filter(|o| o.station == fanos_runtime::ports::stations::Station::AssignmentWithheld)
+            .filter_map(|o| o.tag)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Member `index`, if it exists.
     #[must_use]
     pub fn node(&self, index: usize) -> Option<&fanos_node::Node> {
@@ -863,7 +896,10 @@ mod tests {
         let assigned = fleet
             .until_settled(
                 |f| f.nodes().iter().all(|n| n.assigned_roles().any()),
-                |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
+                // Roster AND withheld count. The roster alone stops moving when discovery finishes, which is
+                // BEFORE the first assignment; the gap is filled by `withhold`, which sends nothing and so
+                // freezes every other observable for exactly `FROZEN_SPAN` (#159).
+                |f| (f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(), f.widest_withheld_scan()),
             )
             .await;
         assert!(
@@ -1313,7 +1349,10 @@ mod tests {
         let settled = fleet
             .until_settled(
                 |f| f.nodes().iter().all(|n| n.assigned_roles().any()),
-                |f| f.nodes().iter().map(|n| n.assignment().roles).collect::<Vec<_>>(),
+                // The sharper case of #159: this observable WAS the predicate — the roles vector changes only
+                // when an assignment lands, so while the predicate is false it can sit perfectly still. The
+                // withheld count moves in exactly that state.
+                |f| (f.nodes().iter().map(|n| n.assignment().roles).collect::<Vec<_>>(), f.widest_withheld_scan()),
             )
             .await;
 
