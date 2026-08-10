@@ -83,6 +83,92 @@ const COST_GATED: &[&str] = &[
     "hedging_holds_the_arrival_rate_when_a_meeting_point_is_silent",
 ];
 
+/// The workflow the two `#[ignore]` runner jobs live in, read as text.
+///
+/// Read rather than listed, and read from the repository rather than from a copy: a guard that compares two
+/// constants in this file would agree with itself while CI ran something else entirely.
+///
+/// # Panics
+///
+/// If the workflow cannot be read. An unreadable file must not silently yield an empty string — that is the
+/// shape that let one file contribute zero findings and kept a guard green about it (#253).
+fn workflow() -> String {
+    let path = fanos_testkit::corpus::workspace_root().join("../.github/workflows/ci.yml");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the CI workflow must be readable at {}: {e}", path.display()))
+}
+
+/// **The two `#[ignore]` jobs must PARTITION the class, not merely divide it** (#255).
+///
+/// `heavy` selects the cost-gated assertions by skipping the measurement prefixes. That is only a partition
+/// if something else runs what it skips — and for most of this tree's life nothing did: fifteen instruments
+/// were compiled by the per-push gate, skipped by the nightly job, and executed by nobody, which is how a
+/// measurement rots without anyone learning that it has (#186).
+///
+/// So the rule is the complement, checked mechanically: **every `--skip` token in the workflow is either run
+/// by some other command in the same workflow, or declared [`RETRACTED`].** `host_a_service_and_serve_a_client`
+/// has satisfied the first arm all along through its own trailing step; the three prefixes did not until the
+/// `measurements` job existed.
+///
+/// The second arm is not a carve-out written to make this green — it is the other way a token can honestly be
+/// unrun, and the first run of this guard is what forced it to be stated. A retracted metric is executed
+/// nowhere **by decision**, and that decision is not a name buried in this assertion: it is a row in
+/// `RETRACTED` carrying its reason, held to the tree by two guards of its own, one of which checks that the
+/// test still says so at its own `#[ignore]`. An exemption that is itself checked elsewhere is the only kind
+/// worth having ([`every_retracted_metric_is_declared_and_still_says_so_at_the_test`]).
+///
+/// Falsified three ways: add a `--skip` for a name that is neither run nor retracted and it is reported;
+/// delete the `measurements` job and all three prefixes are reported at once; drop a row from `RETRACTED`
+/// and its `--skip` immediately becomes an unrun token.
+#[test]
+fn every_prefix_the_cost_gated_job_skips_is_run_by_some_other_step() {
+    let ci = workflow();
+    let skipped: BTreeSet<&str> = ci
+        .split("--skip ")
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    assert!(!skipped.is_empty(), "the workflow must still select by --skip, or this guard checks nothing");
+
+    // The skipping occurrences are removed first, so "is it named anywhere?" cannot be answered by the very
+    // line that skips it — the self-match that makes a scan agree with itself (`falsify-the-exemption`).
+    let without_skips = skipped.iter().fold(ci.clone(), |acc, tok| acc.replace(&format!("--skip {tok}"), ""));
+    let retracted: BTreeSet<&str> = RETRACTED.iter().map(|(name, _)| *name).collect();
+    let unrun: Vec<&&str> = skipped
+        .iter()
+        .filter(|tok| !without_skips.contains(**tok) && !retracted.contains(**tok))
+        .collect();
+    assert!(
+        unrun.is_empty(),
+        "these are skipped by one CI job, run by no other, and not declared RETRACTED — so the class they \
+         name is executed nowhere and nobody decided that: {unrun:?}\n\
+         Add a step that names them, retract them with a reason, or stop skipping them."
+    );
+}
+
+/// **A retracted metric must not be resurrected by a prefix runner** (#255).
+///
+/// [`RETRACTED`]'s own doc predicted this in prose, before the runner existed: an executor keyed on
+/// `measure_` "would run these two and publish their output beside the real readings, which is precisely
+/// republishing a retracted number as a measurement". The `measurements` job is that executor, so the
+/// prediction is now a thing to check rather than a thing to remember.
+///
+/// Falsified by removing either `--skip` from the workflow: the surviving name is reported.
+#[test]
+fn every_retracted_metric_is_excluded_from_the_measurements_job() {
+    let ci = workflow();
+    let resurrected: Vec<&str> = RETRACTED
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !ci.contains(&format!("--skip {name}")))
+        .collect();
+    assert!(
+        resurrected.is_empty(),
+        "the measurements job selects by the `measure_` prefix, so these retracted metrics would run and \
+         their withdrawn numbers would be published as readings: {resurrected:?}"
+    );
+}
+
 /// Every `#[ignore]`d test in a file, by the name of the function that follows the attribute.
 ///
 /// Takes the already-read text rather than a path: a read that fails here used to yield an empty string, so

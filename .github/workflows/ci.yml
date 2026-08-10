@@ -279,3 +279,81 @@ jobs:
       - name: C ABI service host (ordered last — see above)
         timeout-minutes: 5
         run: cargo test -p fanos-ffi --release -- --ignored --test-threads 1 host_a_service_and_serve_a_client
+
+  # **Numbers, not assertions — and until now they had no runner anywhere.**
+  #
+  # `#[ignore]` carries three meanings in this tree, and `fanos-cli/tests/ignored_tests.rs` holds the
+  # workspace to the naming convention that separates them: a cost-gated assertion, which `heavy` above runs;
+  # a live measurement, which prints for a person to read and must never gate a push; and a retracted metric,
+  # which is neither and is declared as such. The middle class was skipped by `heavy` by prefix and named by
+  # nothing else, so its instruments were compiled by the gate, executed by nobody, and free to rot silently
+  # (#186, #255). This is the executor the convention was missing, and
+  # `every_prefix_the_cost_gated_job_skips_is_run_by_some_other_step` now keeps the two jobs a partition.
+  #
+  # A panic here fails the job, deliberately. A measurement cannot fail on its *number* — it asserts none —
+  # so the only way it goes red is an instrument that no longer runs, which is a regression worth a red. The
+  # figures themselves are for a person, read from the uploaded artefact; every wall-clock one prints
+  # `fanos_testkit::measurement_conditions()` first (its own ratchet enforces that), because a duration taken
+  # on a loaded shared runner is a reading of the runner and must not be quoted as a cost of the code.
+  measurements:
+    name: live measurements (numbers for a person)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # One step per prefix rather than one invocation with three filters. libtest would accept them together,
+      # but then all three classes share a process and a stall in any one takes the other two with it — the
+      # same starvation the `heavy` job documents, and the reason its C ABI test is ordered last. Separate
+      # steps also mean a red names which class of instrument broke.
+      #
+      # `set -o pipefail` because the default shell is `bash -e` without it, and a `tee` at the end of the
+      # pipe would otherwise swallow cargo's exit status and report a broken instrument as a pass.
+      # The two `--skip`s are not an exclusion of convenience, they are the third `#[ignore]` class. A
+      # RETRACTED metric is shaped exactly like an instrument and is kept, on purpose, as the counter-example
+      # to a measurement that was found invalid — so a runner keyed on the `measure_` prefix would execute it
+      # and print its number beside the real readings, which is republishing a withdrawn result as a
+      # measurement. `ignored_tests.rs` predicted this exact mistake in prose before this job existed; the
+      # guard `every_retracted_metric_is_excluded_from_the_measurements_job` now checks the two lists agree,
+      # so retracting a third one and forgetting this line is a red test rather than a wrong number.
+      - name: measure_ — instrumented costs
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --features validator --release --no-fail-fast \
+            -- --ignored --nocapture --test-threads 1 measure_ \
+            --skip measure_gpa_timing_on_the_shipping_router \
+            --skip measure_the_timing_channel_at_the_shipping_defaults 2>&1 | tee -a measurements.txt
+      - name: probe_ — separating experiments
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --features validator --release --no-fail-fast \
+            -- --ignored --nocapture --test-threads 1 probe_ 2>&1 | tee -a measurements.txt
+      - name: sweep_ — parameter sweeps
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --features validator --release --no-fail-fast \
+            -- --ignored --nocapture --test-threads 1 sweep_ 2>&1 | tee -a measurements.txt
+      # The per-push gate compiles the benchmarks (`--no-run`) and stops there, which proves they build and
+      # nothing about what they cost. This is the only place they are executed.
+      - name: Benchmarks — hot paths, actually run
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench -p fanos-bench 2>&1 | tee -a measurements.txt
+      # Without this the numbers exist for the length of one log retention and are then gone, which makes a
+      # trend — the thing a measurement is actually for — impossible to read.
+      - name: Keep the numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurements
+          path: rust/measurements.txt
+          if-no-files-found: error
