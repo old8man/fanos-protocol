@@ -482,6 +482,21 @@ pub enum Station {
     /// is the settling window (`docs/design-coordinates.md`) being needed rather than one unlucky draw.
     DirectorySeatOutranked,
 
+    /// This node passed its **first epoch boundary** and may no longer re-seat on a peer claim (#260).
+    ///
+    /// The two states the coordinate-resolution argument turns on are "still joining" and "committed":
+    /// `spawn_self_certifying`'s reshuffle loop moves the first on a recorded peer claim and refuses to move
+    /// the second, because the cell has by then derived committee membership, shard placement and routing from
+    /// where this node sits. Both are load-bearing and neither was observable — so a contested coordinate could
+    /// not be diagnosed without first guessing which side was even permitted to walk on.
+    ///
+    /// Fires **once per node lifetime**, on the transition. A second one is a node that restarted, which is a
+    /// different reading from a node that never committed at all — and telling those apart is the point.
+    /// [`Observation::line`] is deliberately absent: the boundary re-derives the placement a few statements
+    /// later and may leave it unchanged, so any coordinate recorded here would be the one held *entering* the
+    /// boundary, close enough to the settled answer to be misread as it.
+    SeatCommitted,
+
     /// A datagram opened under the **genesis** shape: the sender does not know the cell's live epoch, which
     /// is what a node joining for the first time necessarily looks like (#234).
     ///
@@ -729,6 +744,7 @@ impl Station {
         Self::WireGenesisShaped,
         Self::DirectoryPointTaken,
         Self::DirectorySeatOutranked,
+        Self::SeatCommitted,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
@@ -811,6 +827,7 @@ impl Station {
             Self::WireGenesisShaped => "wire.genesis_shaped",
             Self::DirectoryPointTaken => "directory.point_taken",
             Self::DirectorySeatOutranked => "directory.seat_outranked",
+            Self::SeatCommitted => "seat.committed",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
@@ -864,6 +881,7 @@ impl Station {
             | Self::WireGenesisShaped
             | Self::DirectoryPointTaken
             | Self::DirectorySeatOutranked
+            | Self::SeatCommitted
             | Self::GatherExpired
             | Self::GatherCompleted
             | Self::GatherUnpeelable

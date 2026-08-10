@@ -1825,6 +1825,17 @@ async fn reshuffle_loop<F: Field>(
                 at.output = rank;
                 // The cell commits to placements at a boundary, so from here this node is established and holds its point
                 // for the epoch. Everything below re-derives; nothing may move again until the settling window exists.
+                //
+                // **Reported once, on the transition** (#260). "Free to re-seat" and "committed" are the two states the
+                // whole coordinate-resolution argument turns on — `Wake::Resettle` moves one and refuses the other — and
+                // until now neither was visible from outside this loop. Diagnosing a contested point without it means
+                // guessing which side was even allowed to walk on, which is what cost this investigation three wrong
+                // explanations. No line: the point is settled a few lines below and either `continue` can leave it where
+                // it was, so a coordinate recorded here would be the one held *entering* the boundary — a value close
+                // enough to the real answer to be read as it.
+                if at.joining {
+                    seat.client.record_station(Station::SeatCommitted, None, None);
+                }
                 at.joining = false;
                 // The book's claims belong to the retired epoch; clearing it is what stops a peer's past placement from
                 // justifying a displacement now. Settling immediately afterwards therefore lands at index 0 and moves
