@@ -458,8 +458,14 @@ trait Controllable {
     fn health_line(&self) -> String;
     /// The roles the cell assigned, or why this node cannot say.
     fn roles_line(&self) -> String;
-    /// A client and epoch to take a census with.
-    fn census_source(&self) -> (fanos_quic::Client, Epoch);
+    /// A client, epoch **and the beacon those records are bound against** to take a census with.
+    ///
+    /// The beacon travels with the epoch because a coherence record is bound to `(coord, epoch)` and checked
+    /// against that epoch's seed (#262). Returning the epoch alone is what let this verb read frames it could
+    /// not attribute. `None` means this role cannot prove coordinates at all, and then the records it reads
+    /// are unbound too — the same `vrf.then_some(beacon)` condition the role loop applies to the load
+    /// directory, on both sides at once so the reader and the publisher cannot disagree.
+    fn census_source(&self) -> (fanos_quic::Client, Epoch, Option<BeaconSeed>);
     /// The next overlay notification, so [`serve_control`] can drain it alongside the socket.
     async fn next_note(&mut self) -> Option<Notification>;
 }
@@ -479,8 +485,15 @@ impl Controllable for Node {
             }
         }
     }
-    fn census_source(&self) -> (fanos_quic::Client, Epoch) {
-        (self.client(), self.live_beacon().map_or(Epoch::ZERO, |(e, _)| e))
+    fn census_source(&self) -> (fanos_quic::Client, Epoch, Option<BeaconSeed>) {
+        // A `Node` always proves coordinates (`Node::start` sets `vrf_coordinates`), so the beacon is always
+        // asked for. Before the first round the epoch is 0 and the seed is this NETWORK's genesis — the value
+        // every epoch-0 publisher binds against, not the shared constant.
+        let client = self.client();
+        let (epoch, seed) = self
+            .live_beacon()
+            .map_or_else(|| (Epoch::ZERO, client.genesis()), |(e, s)| (e, BeaconSeed::new(s)));
+        (client, epoch, Some(seed))
     }
     async fn next_note(&mut self) -> Option<Notification> {
         self.next_notification().await
@@ -499,11 +512,15 @@ impl Controllable for fanos_quic::NodeHandle {
     fn roles_line(&self) -> String {
         "roles: not tracked by this role — it runs a fixed function, not a cell-assigned one\n".to_owned()
     }
-    fn census_source(&self) -> (fanos_quic::Client, Epoch) {
+    fn census_source(&self) -> (fanos_quic::Client, Epoch, Option<BeaconSeed>) {
         // No beacon of its own: a validator takes its epoch from the config it was dealt, and the census only
         // needs *an* epoch to address frames with. `ZERO` reads every cell's genesis frame, which is the honest
-        // answer for a node that is not tracking the live beacon rather than a silently wrong one.
-        (self.client(), Epoch::ZERO)
+        // answer for a node that is not tracking the live beacon rather than a silently wrong one — and the
+        // seed epoch-0 records are bound against is this network's genesis. Asked for only when this role can
+        // prove coordinates, because a deployment that cannot also publishes unbound (#262).
+        let client = self.client();
+        let genesis = self.coordinate_prover().map(|_| client.genesis());
+        (client, Epoch::ZERO, genesis)
     }
     async fn next_note(&mut self) -> Option<Notification> {
         self.next_notification().await
@@ -638,7 +655,7 @@ fn answer_control<N: Controllable>(
         Request::Coherence => {
             // Answered off the loop and bounded, for the same reasons as `stations` — it is the same
             // `Observe` round trip, and the node an operator asks this of may be the one that is stuck.
-            let (client, _) = node.census_source();
+            let (client, _, _) = node.census_source();
             tokio::spawn(async move {
                 let mut notes = client.subscribe();
                 let asked = client.command(fanos_node::Command::Observe);
@@ -663,7 +680,10 @@ fn answer_control<N: Controllable>(
             // The node's own epoch, so the schedule is reported against the clock the heights are measured
             // in. Reading it from the live beacon rather than a wall clock is the whole point of an
             // epoch-aligned activation: an operator comparing two nodes must see the same ordinal.
-            let (client, epoch) = node.census_source();
+            // Only the epoch here: this verb reports a schedule, and reads no bound record whose binding
+            // would need checking. Named `_beacon` rather than dropped so the next reader sees the source
+            // does carry one (#262).
+            let (client, epoch, _beacon) = node.census_source();
             tokio::spawn(async move {
                 let mut notes = client.subscribe();
                 // Subscribe *before* issuing, or the answer can land in the gap between the two.
@@ -681,10 +701,11 @@ fn answer_control<N: Controllable>(
             // Answered off the loop. A census reads every cell coordinate out of the overlay store, so serving it
             // inline would stop this node driving its own engine for the duration — an operator's question is not
             // worth pausing the node it is about.
-            let (client, epoch) = node.census_source();
+            let (client, epoch, beacon) = node.census_source();
             tokio::spawn(async move {
                 let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
-                let census = fanos_node::telemetry_dir::take_census(&client, &coords, epoch).await;
+                let census =
+                    fanos_node::telemetry_dir::take_census::<F2>(&client, &coords, epoch, beacon).await;
                 let _ = reply.send(census.to_string());
             });
             return Control::Go;

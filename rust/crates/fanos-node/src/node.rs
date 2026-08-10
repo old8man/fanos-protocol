@@ -826,7 +826,13 @@ fn spawn_store_role(
 /// coherence readings describe the cell it sits in, so emitting them is an operator's decision.
 fn spawn_telemetry_export(handle: &NodeHandle, epsilon: Option<f64>) -> Option<JoinHandle<()>> {
     epsilon.map(|e| {
-        crate::telemetry_dir::spawn_coherence_publisher(handle.client(), fanos_telemetry::dp::PrivacyBudget::new(e))
+        // The prover binds each published frame to this node's coordinate (#262), so a census cannot be
+        // told a Φ for a node that never said it. `None` where coordinates cannot be proven at all.
+        crate::telemetry_dir::spawn_coherence_publisher(
+            handle.client(),
+            fanos_telemetry::dp::PrivacyBudget::new(e),
+            handle.coordinate_prover(),
+        )
     })
 }
 

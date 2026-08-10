@@ -21,15 +21,17 @@
 use fanos_diaulos::Coord;
 use fanos_field::Field;
 use fanos_geometry::Plane;
-use fanos_primitives::Epoch;
-use fanos_quic::Client;
+use fanos_primitives::{BeaconSeed, Epoch};
+use fanos_quic::{Client, CoordinateProver};
 use fanos_runtime::Notification;
 use fanos_telemetry::CoherenceFrame;
 use fanos_telemetry::dp::PrivacyBudget;
+use fanos_vrf::{VrfProof, VrfPublic};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::DIAGNOSIS_SLOT_EPOCHS;
+use crate::bound::Entitlement;
 use crate::resolve::{STORE_TIMEOUT, Read};
 
 /// The store slot a node's privatized coherence frame is published at, keyed by its coordinate **and** the epoch.
@@ -131,7 +133,13 @@ impl rand_core::TryRng for FreshEntropy {
 /// Goes through `CoherenceFrame::export` — privatize, then encode — never `encode` alone. That distinction is the whole of
 /// audit C7: the exact frame is already in hand and shipping it is one line shorter, which is exactly how a DP guarantee
 /// gets lost. `false` if the store rejected the write.
-pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceFrame, budget: PrivacyBudget) -> bool {
+pub async fn publish_coherence(
+    client: &Client,
+    epoch: Epoch,
+    frame: &CoherenceFrame,
+    budget: PrivacyBudget,
+    credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
+) -> bool {
     // No entropy, no export. Publishing an under-noised frame would be worse than publishing nothing, because a consumer
     // cannot tell the difference and the ε would be a claim about something that did not happen.
     let Some(mut rng) = FreshEntropy::new() else {
@@ -139,19 +147,71 @@ pub async fn publish_coherence(client: &Client, epoch: Epoch, frame: &CoherenceF
     };
     let bytes = frame.export(budget, &mut rng);
     let landed = client
-        .put_ephemeral(coherence_slot(client.address(), epoch), bytes.to_vec(), DIAGNOSIS_SLOT_EPOCHS)
+        .put_ephemeral(
+            coherence_slot(client.address(), epoch),
+            coherence_record(&bytes, credential),
+            DIAGNOSIS_SLOT_EPOCHS,
+        )
         .await;
     crate::note_publish(client, crate::Directory::Coherence, epoch, landed)
+}
+
+/// The bytes a coherence frame is stored as: the privatized frame, or that inside the coordinate-bound
+/// [`Entitlement`] envelope when this deployment can prove coordinates (#262).
+///
+/// **The slot key names a coordinate; nothing used to make that name true.** `put_ephemeral` hands the store
+/// `storage_digest(&key)`, so the store never sees the key and cannot check that the writer is the node the
+/// slot names — it is content-addressed by construction, and no store-side rule will ever close this. So any
+/// node could publish a coherence frame at any other node's slot, and `take_census` would attribute it.
+///
+/// **What that costs is a lie about a neighbour, not a broken control loop** — worth stating plainly, because
+/// the sibling this pattern came from (`ingressdir`, bound in the same task) sits on the rotation path and
+/// this one does not. The only consumer is `take_census`, reached from the CLI: a forged frame makes
+/// `fanos census` report a Φ, a stability radius and an alarm level for a node that never said them. An
+/// operator acts on those; nothing automatic does.
+#[must_use]
+fn coherence_record(exported: &[u8], credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>) -> Vec<u8> {
+    match credential {
+        Some((id, public, proof)) => Entitlement::encode(id, public, proof, exported),
+        None => exported.to_vec(),
+    }
+}
+
+/// The inverse of [`coherence_record`]: the published frame, or `None` if malformed or — when `beacon` is
+/// `Some` — not bound to `coord` for `epoch`.
+#[must_use]
+fn open_coherence_record<F: Field>(
+    bytes: &[u8],
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Option<CoherenceFrame> {
+    match beacon {
+        Some(seed) => {
+            let (_, payload) = Entitlement::open::<F>(bytes, coord, epoch, &seed)?;
+            CoherenceFrame::decode(payload)
+        }
+        None => CoherenceFrame::decode(bytes),
+    }
 }
 
 /// Resolve the coherence frame the node at `coord` published for `epoch`.
 ///
 /// Three-valued: a read that **timed out** is not the same as a node that published nothing, and collapsing them is how a
 /// monitor comes to believe a quiet cell is a healthy one. Same discipline as `capdir`'s `read_capability`.
-pub async fn read_coherence(client: &Client, coord: Coord, epoch: Epoch) -> Read<CoherenceFrame> {
+///
+/// A record that fails its coordinate binding lands in the same arm as a malformed one — `Absent` — and that
+/// is the honest place for it: the node at `coord` did not publish this, so as far as this coordinate is
+/// concerned nothing was published. It is not `Unknown`, which means "the store did not answer".
+pub async fn read_coherence<F: Field>(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Read<CoherenceFrame> {
     Read::of(
         tokio::time::timeout(STORE_TIMEOUT, client.read(coherence_slot(coord, epoch))).await.ok(),
-        CoherenceFrame::decode,
+        |bytes| open_coherence_record::<F>(bytes, coord, epoch, beacon),
     )
 }
 
@@ -167,7 +227,11 @@ pub fn cell_telemetry_coords<F: Field>() -> Vec<Coord> {
 /// cadence is the diagnosis cadence, with no separate timer to drift from it and no polling. Ends when the notification
 /// stream closes; must run inside a tokio runtime.
 #[must_use]
-pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinHandle<()> {
+pub fn spawn_coherence_publisher(
+    client: Client,
+    budget: PrivacyBudget,
+    prover: Option<CoordinateProver>,
+) -> JoinHandle<()> {
     // Supervised: this actor's death is a capability the node loses, and the counters that would
     // have shown it are written by the actor itself (#251).
     let supervised = client.clone();
@@ -183,11 +247,19 @@ pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinH
                     // Read the epoch at publish time from latest-state rather than tracking it off the
                     // stream: a reading published at a stale epoch lands at the address of a period that has
                     // passed, and the stream can drop the round that would have advanced the counter (#86).
-                    if let Some((e, _)) = *beacons.borrow_and_update() {
+                    let mut seed = client.genesis();
+                    if let Some((e, s)) = *beacons.borrow_and_update() {
                         epoch = e;
+                        seed = BeaconSeed::new(s);
                     }
                     if let Some(frame) = CoherenceFrame::decode(&bytes) {
-                        publish_coherence(&client, epoch, &frame, budget).await;
+                        // Proven per write, never once at spawn: the credential names an epoch, so one
+                        // captured at startup would verify only in the epoch it was made — the rule every
+                        // bound publisher here follows. Before the first beacon the seed is this NETWORK's
+                        // genesis, not the shared constant, or the record would prove a coordinate this node
+                        // does not occupy and no reader could verify it.
+                        let credential = prover.as_ref().map(|prove| prove(epoch, &seed));
+                        publish_coherence(&client, epoch, &frame, budget, credential.as_ref()).await;
                     }
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -203,6 +275,102 @@ pub fn spawn_coherence_publisher(client: Client, budget: PrivacyBudget) -> JoinH
 mod tests {
     use super::*;
     use fanos_field::F2;
+
+    /// A frame for the binding tests — the values do not matter, only that it round-trips.
+    fn sample_frame() -> CoherenceFrame {
+        CoherenceFrame {
+            cell_id: fanos_telemetry::CellId([9; 16]),
+            epoch: 3,
+            syndrome: 0,
+            verdict: 0,
+            phi: 1.5,
+            purity: 0.37,
+            reflection: 0.4,
+            mean_r: 0.6,
+            gap: 0.2,
+            forecast: -3,
+            heal_seq: 7,
+        }
+    }
+
+    /// **A published coherence frame verifies only at a coordinate its publisher can prove** (#262).
+    ///
+    /// Driven through `coherence_record`/`open_coherence_record` — the pair the publisher and the census
+    /// actually call — for the reason #80 recorded: its first version of this binding tested `Entitlement`
+    /// in isolation and stayed green when the envelope was deleted from the publisher.
+    #[test]
+    fn a_coherence_frame_verifies_only_where_its_publisher_can_prove_a_coordinate() {
+        use fanos_field::F7;
+        use fanos_geometry::{Plane, Point};
+        use fanos_vrf::VrfSecret;
+
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([21u8; 32]);
+        let id = b"telemetry-member-21".to_vec();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, &beacon);
+        let frame = sample_frame();
+        let record = coherence_record(&frame.encode(), Some(&(id.clone(), sk.public(), proof)));
+        let output = fanos_vrf::coordinate_output(&sk.public(), &id, epoch, &beacon, &proof)
+            .expect("the publisher's own credential yields its walk");
+
+        let mut refused = 0;
+        for i in 0..Plane::<F7>::N as usize {
+            let p = Point::<F7>::at(i);
+            let got = open_coherence_record::<F7>(&record, p.coords(), epoch, Some(beacon));
+            if fanos_vrf::probe_index_of::<F7>(&output, &p).is_some() {
+                assert_eq!(got, Some(frame), "a point on the publisher's own walk verifies");
+            } else {
+                assert!(got.is_none(), "a coordinate the publisher cannot prove is refused");
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, 49, "the forgery is refused at 49 of the plane's 57 points");
+    }
+
+    /// The binding is **epoch-scoped**, so a healthy-looking frame cannot be replayed forward to keep a node
+    /// looking well after its real readings have turned.
+    #[test]
+    fn a_coherence_frame_does_not_verify_in_another_epoch() {
+        use fanos_field::F7;
+        use fanos_geometry::{Plane, Point};
+        use fanos_vrf::VrfSecret;
+
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([22u8; 32]);
+        let id = b"telemetry-member-22".to_vec();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, &beacon);
+        let record = coherence_record(&sample_frame().encode(), Some(&(id.clone(), sk.public(), proof)));
+        let output = fanos_vrf::coordinate_output(&sk.public(), &id, epoch, &beacon, &proof)
+            .expect("the publisher's own credential yields its walk");
+        let mine = (0..Plane::<F7>::N as usize)
+            .map(Point::<F7>::at)
+            .find(|p| fanos_vrf::probe_index_of::<F7>(&output, p).is_some())
+            .expect("a walk reaches at least one point");
+
+        assert!(
+            open_coherence_record::<F7>(&record, mine.coords(), epoch, Some(beacon)).is_some(),
+            "it verifies in the epoch it was made for"
+        );
+        assert!(
+            open_coherence_record::<F7>(&record, mine.coords(), Epoch::new(4), Some(beacon)).is_none(),
+            "and not in the next one — the credential names its epoch"
+        );
+    }
+
+    /// A deployment that cannot prove coordinates still round-trips; the census asks with `None` there, so it
+    /// stays as readable as it was rather than reporting an empty cell.
+    #[test]
+    fn an_unbound_deployment_still_round_trips_its_coherence_frame() {
+        use fanos_field::F7;
+        let frame = sample_frame();
+        let record = coherence_record(&frame.encode(), None);
+        assert_eq!(
+            open_coherence_record::<F7>(&record, [1, 0, 1], Epoch::new(2), None),
+            Some(frame),
+            "no credential to check, so the bare frame is the whole record"
+        );
+    }
+
 
     /// The retention and the law that reads it must be the SAME number (#44).
     ///
@@ -391,10 +559,15 @@ impl Census {
 /// Reads are issued one at a time rather than concurrently: this is an operator's occasional question, not a
 /// data path, and a monitor that fans out over a whole federation at once is itself a load spike on a network
 /// it may be asking about *because* it is under load.
-pub async fn take_census(client: &Client, coords: &[Coord], epoch: Epoch) -> Census {
+pub async fn take_census<F: Field>(
+    client: &Client,
+    coords: &[Coord],
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Census {
     let mut census = Census::default();
     for &coord in coords {
-        census.observe(&read_coherence(client, coord, epoch).await);
+        census.observe(&read_coherence::<F>(client, coord, epoch, beacon).await);
     }
     census
 }
