@@ -365,6 +365,22 @@ pub enum Station {
     /// The writer learns only from a `put` timing out, which is indistinguishable from an unreachable peer —
     /// the two failures an operator most needs to separate — and the node itself reported nothing at all.
     StoreAtCapacity,
+    /// A **long-lived driver actor stopped** — the node lost a piece of itself and kept running (#251).
+    ///
+    /// The transport driver spawns six loops that are meant to outlive every request: the accept loop, the
+    /// transport loop, the engine loop, the router, the announce watcher and the epoch reshuffle. Nothing
+    /// joined them, and a task nobody joins cannot report its own death — so a panic inside one removed a
+    /// whole capability (no new connections; or no frames sent; or no epoch reseat) while every other
+    /// surface, `health` included, went on saying the node was fine. That is the worst shape an outage can
+    /// take: degraded and confident.
+    ///
+    /// [`Observation::tag`] carries `fanos_quic::DriverActor`, because which one died decides what stopped
+    /// working, and one aggregate count would say only "something".
+    ///
+    /// **Panic and cancellation are the same station and must NOT be**: they are separated by the log line
+    /// beside the counter, since a cancelled actor is an orderly shutdown and a panicked one is a defect.
+    /// The counter is the alarm; the line says which of the two rang it.
+    ActorDied,
     /// A snapshot write to the state directory **failed**, so this node is running without durable state.
     ///
     /// The counterpart of [`StoreAtCapacity`](Self::StoreAtCapacity) one layer down: that one is a node
@@ -656,6 +672,7 @@ impl Station {
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
         Self::StoreAtCapacity,
+        Self::ActorDied,
         Self::SnapshotWriteFailed,
         Self::ReadShardRefused,
         Self::ReadInconclusive,
@@ -704,6 +721,7 @@ impl Station {
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
             Self::StoreAtCapacity => "store.at_capacity",
+            Self::ActorDied => "driver.actor_died",
             Self::SnapshotWriteFailed => "store.snapshot_write_failed",
             Self::ReadShardRefused => "read.shard_refused",
             Self::ReadInconclusive => "read.inconclusive",
@@ -749,6 +767,7 @@ impl Station {
             | Self::ReadShardRefused          // fanos_runtime::ReadRefusal
             | Self::RoleUnderProvisioned      // fanos_core::roles::Role
             | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
+            | Self::ActorDied                 // fanos_quic::DriverActor
             => TagKind::Vocabulary,
 
             // --- The tag is a number that means itself. ---

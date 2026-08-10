@@ -26,6 +26,11 @@
 //! (the DHT's job in production). TLS gives every link confidentiality and integrity; it does not
 //! authenticate a hostname — the self-signed per-node certificate exists only to key the channel.
 
+// `variant_count` turns "every driver actor is listed in `DriverActor::ALL`" from a hand-maintained
+// invariant into a compile-time one — the same reasoning `fanos-ports` gives for `Station::ALL`, and for
+// the same reason: the list is what a reader enumerates, so a variant missing from it is invisible exactly
+// where a new supervised actor was just added. The project pins nightly deliberately.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 mod claims;
@@ -41,7 +46,7 @@ mod tls;
 
 pub use directory::{Directory, WriteOutcome};
 pub use reflexive::ReflexiveAddr;
-pub use driver::{Beacons, CoordinateProver, REQUEST_TIMEOUT, reflexive_quorum,
+pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, reflexive_quorum,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,
     Fabric, spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_persistent_over,

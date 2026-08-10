@@ -617,6 +617,14 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
+    /// The shared data-path plane, for the driver's own supervisors (#251).
+    ///
+    /// `pub(crate)` and returning the `Arc` rather than a reading: a supervisor must record into the SAME
+    /// plane `Observe` merges, long after this handle was built, so it needs the handle and not a snapshot.
+    pub(crate) const fn stations_handle(&self) -> &Arc<Mutex<Stations>> {
+        &self.stations
+    }
+
     /// This node's overlay coordinate, as of now.
     #[must_use]
     pub fn address(&self) -> Triple {
@@ -1488,7 +1496,7 @@ where
     // directory coordinate, and publishes the fresh HELLO + beacon so subsequent connections prove/verify
     // the current placement.
     let local_addr = handle.local_addr();
-    tokio::spawn(reshuffle_loop::<F>(
+    supervise(DriverActor::Reshuffle, handle.stations_handle(), tokio::spawn(reshuffle_loop::<F>(
         creds.clone(),
         Placement {
             coord: coord.coords(),
@@ -1512,7 +1520,7 @@ where
         shaper,
         handle.subscribe(),
         contender_at_our_point,
-    ));
+    )));
     Ok(handle)
 }
 
@@ -1878,6 +1886,101 @@ fn bind_own_seat(
     }
 }
 
+/// Which long-lived driver actor a [`Station::ActorDied`] observation is about (#251).
+///
+/// **Only the loops meant to outlive every request.** Per-connection, per-peer and per-timer tasks are
+/// deliberately absent: their death is how they end, and counting it would bury the six whose death is a
+/// node fault under thousands of ordinary completions. The discriminator is #244's — whether anyone has
+/// another move — and it is what makes supervision affordable here and absurd per connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DriverActor {
+    /// Re-derives this node's VRF coordinate each epoch. Dead: the node never reseats again.
+    Reshuffle,
+    /// Re-announces this node's moves. Dead: peers stop learning where it went.
+    AnnounceMoves,
+    /// Accepts inbound QUIC connections. Dead: the node answers nobody while still dialling out.
+    Accept,
+    /// Drains the send queue onto the wire. Dead: nothing this node produces ever leaves.
+    Transport,
+    /// Steps the engine over its inputs. Dead: the node stops thinking and keeps its sockets open.
+    Engine,
+    /// Correlates replies and fans events out. Dead: every `get`/`put` times out with no reason given.
+    Router,
+}
+
+/// `DriverActor::ALL` is complete, proven by the compiler — same reasoning as `Station::ALL`.
+const _: () = assert!(
+    DriverActor::ALL.len() == core::mem::variant_count::<DriverActor>(),
+    "a DriverActor variant is missing from ALL, so it is invisible to every reader that enumerates"
+);
+
+impl DriverActor {
+    /// Every supervised actor, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] =
+        &[Self::Reshuffle, Self::AnnounceMoves, Self::Accept, Self::Transport, Self::Engine, Self::Router];
+
+    /// The discriminant carried in `Observation::tag`, written out so variant order never renumbers an
+    /// operator's counters.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::Reshuffle => 0,
+            Self::AnnounceMoves => 1,
+            Self::Accept => 2,
+            Self::Transport => 3,
+            Self::Engine => 4,
+            Self::Router => 5,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Reshuffle => "reshuffle",
+            Self::AnnounceMoves => "announce_moves",
+            Self::Accept => "accept",
+            Self::Transport => "transport",
+            Self::Engine => "engine",
+            Self::Router => "router",
+        }
+    }
+}
+
+/// Watch one long-lived actor and record its death where an operator can see it (#251).
+///
+/// A task nobody joins **cannot report its own death**: the handle is dropped, the runtime reaps it, and a
+/// panic leaves only a line on stderr that no aggregate surface reads. Sixty-three actors shipped that way,
+/// and `panic = "abort"` — which would at least have taken the process down loudly — is set on the
+/// `maxperf` profile alone, which CI does not build. So a panic inside `accept_loop` removed this node's
+/// ability to answer anyone while `health` went on saying it was fine: degraded and confident, the worst
+/// shape an outage can take.
+///
+/// The cost is one task parked on a `JoinHandle` that wakes exactly once, ever.
+///
+/// Three endings, kept apart in the line because the operator's next move differs — a panic is a defect, a
+/// cancellation is an orderly stop, and a plain return from a `loop {}` is neither and should never happen.
+/// One station for all three: the counter is the alarm, the line says which of them rang it.
+fn supervise(actor: DriverActor, stations: &Arc<Mutex<Stations>>, handle: tokio::task::JoinHandle<()>) {
+    let stations = Arc::clone(stations);
+    tokio::spawn(async move {
+        let how = match handle.await {
+            Ok(()) => "returned, which these loops are not meant to do",
+            Err(e) if e.is_panic() => "PANICKED",
+            Err(_) => "was cancelled",
+        };
+        tracing::error!(
+            actor = actor.name(),
+            how,
+            "a long-lived driver actor stopped; this node has lost that capability and is still running"
+        );
+        stations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record_tagged(Station::ActorDied, None, Some(actor.tag()), 1);
+    });
+}
+
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
 /// `tokio::spawn`s tasks); the public wrappers stay `async` for API stability.
 #[allow(clippy::too_many_arguments)]
@@ -1985,19 +2088,23 @@ fn spawn_inner(
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
     };
-    tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe()));
-    tokio::spawn(accept_loop(transport.clone()));
-    tokio::spawn(transport_loop(transport, send_rx));
-    tokio::spawn(engine_loop(
+    supervise(DriverActor::AnnounceMoves, &stations, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
+    supervise(DriverActor::Accept, &stations, tokio::spawn(accept_loop(transport.clone())));
+    supervise(DriverActor::Transport, &stations, tokio::spawn(transport_loop(transport, send_rx)));
+    supervise(DriverActor::Engine, &stations, tokio::spawn(engine_loop(
         engine,
         input_rx,
         input_tx.clone(),
         send_tx,
         notify_tx,
         distrust,
-    ));
+    )));
     // The router owns the notification stream: it correlates get/put replies and fans events out.
-    tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), beacon_tx, seat.clone()));
+    supervise(
+        DriverActor::Router,
+        &stations,
+        tokio::spawn(router_loop(notify_rx, ctrl_rx, events_tx.clone(), beacon_tx, seat.clone())),
+    );
 
     Ok(NodeHandle {
         addr: seat,
@@ -3188,6 +3295,50 @@ impl quinn::UdpPoller for WritablePoller {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
+    /// **A panicking actor is named on the data-path plane, and a clean one is silent (#251).**
+    ///
+    /// The defect this closes is not "the actor died" — it is that nobody could tell. Sixty-three actors
+    /// shipped unjoined, and a task nobody joins cannot report its own death; `panic = "abort"` sits only on
+    /// the `maxperf` profile, which CI does not build. So a panic inside `accept_loop` removed this node's
+    /// ability to answer anyone while every other surface said it was fine.
+    ///
+    /// Both directions, because a supervisor that recorded unconditionally would pass the first half alone
+    /// and turn every orderly shutdown into an alarm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_actor_is_named_and_a_finished_one_is_not() {
+        let stations = Arc::new(Mutex::new(Stations::new()));
+        let count = |tag: u64| {
+            stations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observations()
+                .iter()
+                .filter(|o| o.station == Station::ActorDied && o.tag == Some(tag))
+                .map(|o| o.count)
+                .sum::<u64>()
+        };
+
+        // A task that finishes normally is NOT an outage — but these loops never return, so `supervise`
+        // records that too. What must differ is which actor is named, so the two are given different tags.
+        supervise(DriverActor::Accept, &stations, tokio::spawn(async { panic!("the accept loop fell over") }));
+        for _ in 0..200 {
+            if count(DriverActor::Accept.tag()) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            count(DriverActor::Accept.tag()),
+            1,
+            "a panicked actor must be named on the plane; without it the node is degraded and confident"
+        );
+        assert_eq!(
+            count(DriverActor::Engine.tag()),
+            0,
+            "and only the one that died — a supervisor that tagged them all would say nothing useful"
+        );
+    }
     use super::*;
     use crate::identity::verifiable_coordinate;
     use fanos_field::F2;

@@ -387,6 +387,11 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::ReadInconclusive => {
             fanos_runtime::ReadStall::ALL.iter().find(|s| s.tag() == tag).map(|s| s.name())
         }
+        // #251: which of the six long-lived driver loops died decides what stopped working, and the
+        // whole point of supervising them was that "something is wrong" was already available — silence.
+        Station::ActorDied => {
+            fanos_quic::DriverActor::ALL.iter().find(|a| a.tag() == tag).map(|a| a.name())
+        }
         Station::SnapshotWriteFailed => {
             crate::durable::PersistFailure::ALL.iter().find(|f| f.tag() == tag).map(|f| f.name())
         }
@@ -1111,6 +1116,15 @@ mod tests {
             // the fifteen codes into the untagged bucket, so a mapping keyed by `code()` would resolve the
             // 1xx/2xx classes and silently lose the rest. Asserted, because that failure is invisible.
             assert!(e.index() <= fanos_runtime::ports::stations::MAX_SKEW_TAG, "{} tag is clampable", e.name());
+        }
+        for a in fanos_quic::DriverActor::ALL {
+            assert_eq!(
+                tag_name(Station::ActorDied, a.tag()),
+                Some(a.name()),
+                "driver actor {} renders as a bare number — an operator seeing `driver.actor_died tag 2` \
+                 cannot tell that this node stopped accepting connections (#251)",
+                a.name()
+            );
         }
         for s in fanos_runtime::ReadStall::ALL {
             assert_eq!(
