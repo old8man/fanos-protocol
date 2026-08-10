@@ -390,6 +390,7 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::DirectoryPublishFailed => {
             crate::Directory::ALL.iter().find(|d| d.tag() == tag).map(|d| d.name())
         }
+        Station::SetpointHeld => crate::SetpointHold::ALL.iter().find(|h| h.tag() == tag).map(|h| h.name()),
         Station::AuthenticationRejected => crate::Gate::ALL.iter().find(|g| g.tag() == tag).map(|g| g.name()),
         Station::ExitRefused => {
             crate::ExitRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())

@@ -140,6 +140,57 @@ impl Directory {
     }
 }
 
+/// What the role loop did when the load scan its demand rests on **did not conclude** — the sub-kind
+/// [`Station::SetpointHeld`](fanos_runtime::ports::stations::Station::SetpointHeld) is counted under.
+///
+/// The two arms are the same non-conclusion with opposite consequences, which is why one counter cannot carry
+/// both. `Held` keeps a value the cell agreed on, so the assignment merely fails to *improve*; `Floored` says
+/// the cell has agreed on nothing yet, and the demand it uses instead is the geometry's own minimum rather
+/// than an inherited one. An operator seeing a run of `Floored` is watching a cell that has never completed a
+/// cell-wide load read — a bootstrap that is not finishing — and that is a different call-out from a settled
+/// cell riding out a slow epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetpointHold {
+    /// A previously **agreed** setpoint was kept, exactly as [`setpoint_to_track`](crate::role_loop) intends.
+    Held,
+    /// Nothing had ever been agreed, so the viability floor was applied to the understated read instead.
+    ///
+    /// There is no held value at this point — only [`Demand::default`](fanos_core::roles::Demand::default),
+    /// which is the *absence* of a setpoint spelled as a number. Holding it froze the cell at zero for as long
+    /// as the reads kept timing out (#250).
+    Floored,
+}
+
+/// `SetpointHold::ALL` is complete, proven by the compiler, for the same reason [`Directory::ALL`] is.
+const _: () = assert!(
+    SetpointHold::ALL.len() == core::mem::variant_count::<SetpointHold>(),
+    "a SetpointHold variant is missing from ALL, so it is invisible to every reader that enumerates"
+);
+
+impl SetpointHold {
+    /// Both arms, for a reader that enumerates rather than guesses.
+    pub const ALL: &'static [Self] = &[Self::Held, Self::Floored];
+
+    /// The discriminant carried in [`Observation::tag`](fanos_runtime::ports::stations::Observation::tag),
+    /// written out for the reason [`Directory::tag`] is.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        match self {
+            Self::Held => 0,
+            Self::Floored => 1,
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::Floored => "floored",
+        }
+    }
+}
+
 /// Which authentication gate refused a message — the sub-kind
 /// [`Station::AuthenticationRejected`](fanos_runtime::ports::stations::Station::AuthenticationRejected) is
 /// counted under.

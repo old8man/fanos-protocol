@@ -452,6 +452,19 @@ pub enum Station {
     /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
+    /// The role loop's **demand did not move**, because the cell-wide load scan it rests on did not conclude
+    /// — tagged by what was used instead (`fanos_node::SetpointHold`).
+    ///
+    /// The silent half of a pair whose loud half is [`Self::AssignmentWithheld`]. Withholding is a decision not
+    /// to *publish*; this is a decision not to *advance*, and it is the one an operator cannot infer from
+    /// anything else: the node keeps publishing, the roster keeps moving, and the assignment it produces is
+    /// simply computed from a demand that is one epoch — or, at genesis, infinitely — stale.
+    ///
+    /// Measured before it existed: five nodes on a 20 ms link, every load scan timing out, every node holding
+    /// a demand of zero, and every node therefore assigning `RoleSet::EMPTY` for a full minute with the whole
+    /// stations plane empty (#250). A cell serving nothing looked exactly like a cell serving everything.
+    SetpointHeld,
+
     /// The role loop **declined to publish an assignment** because the view it derived one from was behind
     /// what this node can already see — its own capability record missing from the roster, or the roster
     /// smaller than the transport's own peer table.
@@ -657,6 +670,7 @@ impl Station {
         Self::DirectoryPublishFailed,
         Self::RoleUnderProvisioned,
         Self::AssignmentWithheld,
+        Self::SetpointHeld,
         Self::ReseatOutOfCell,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
@@ -734,6 +748,7 @@ impl Station {
             Self::DirectoryPublishFailed => "directory.publish_failed",
             Self::RoleUnderProvisioned => "role.under_provisioned",
             Self::AssignmentWithheld => "assignment.withheld",
+            Self::SetpointHeld => "setpoint.held",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
             Self::AuthenticationRejected => "auth.rejected",
             Self::ExitRefused => "exit.refused",
@@ -766,6 +781,7 @@ impl Station {
             | Self::ReadInconclusive          // fanos_runtime::ReadStall
             | Self::ReadShardRefused          // fanos_runtime::ReadRefusal
             | Self::RoleUnderProvisioned      // fanos_core::roles::Role
+            | Self::SetpointHeld              // fanos_node::SetpointHold
             | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
             | Self::ActorDied                 // fanos_quic::DriverActor
             => TagKind::Vocabulary,

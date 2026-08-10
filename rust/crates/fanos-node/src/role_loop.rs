@@ -478,7 +478,14 @@ pub struct LiveRoleController {
     /// The last setpoint this node read **completely**, which is what a scan that did not conclude falls back
     /// to. A published value, not an accumulator: see [`Self::step`] for why that distinction is the whole
     /// point.
-    last_agreed: Demand,
+    ///
+    /// `None` until the first complete read, and that is the whole of #250. The fallback's safety argument is
+    /// "hold what the cell agreed", which requires there to *be* something the cell agreed; a `Demand::default()`
+    /// in this field is not a quiet setpoint but the absence of one, and holding it is a claim the cell never
+    /// made. On a 20 ms link every genesis load scan times out, so a two-valued field held zero for as long as
+    /// that lasted and the whole cell assigned `RoleSet::EMPTY` — the freeze [`setpoint_to_track`]'s own doc
+    /// calls "what makes the two-valued version of this rule a bug", reached by a different road.
+    last_agreed: Option<Demand>,
     /// Per-role shortfall from the last [`step`](LiveRoleController::step) — see
     /// [`deficit`](LiveRoleController::deficit).
     last_deficit: Demand,
@@ -493,7 +500,7 @@ impl LiveRoleController {
         Self {
             node_id,
             controller,
-            last_agreed: Demand::default(),
+            last_agreed: None,
             last_deficit: Demand::default(),
             reputation: Reputation::new(),
         }
@@ -503,13 +510,13 @@ impl LiveRoleController {
     /// not of anything carried.
     #[must_use]
     pub fn demand(&self) -> Demand {
-        self.demand_for(self.last_agreed)
+        self.demand_for(self.last_agreed.unwrap_or_default())
     }
 
     /// The last **complete** setpoint read, which a partial scan holds rather than acting on its own
-    /// understated view.
+    /// understated view — or `None` if no scan has ever concluded, in which case there is nothing to hold.
     #[must_use]
-    pub fn last_agreed(&self) -> Demand {
+    pub fn last_agreed(&self) -> Option<Demand> {
         self.last_agreed
     }
 
@@ -569,7 +576,7 @@ impl LiveRoleController {
         beacon: &BeaconSeed,
         setpoint: Demand,
     ) -> Assignment {
-        self.last_agreed = setpoint;
+        self.last_agreed = Some(setpoint);
         let weighted = self.reputation.adjust(members);
         let report = fanos_core::roles::assign_report(&weighted, epoch, beacon, self.demand_for(setpoint));
         self.last_deficit = report.deficit;
@@ -1010,13 +1017,45 @@ const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> 
 /// The viability floor rides with the fresh branch, where the supply it must be conditioned on was just read;
 /// a held setpoint already carries the floor applied when it was last set.
 ///
+/// **There is a third case, and it is the one that shipped broken (#250): nothing has ever been agreed.**
+/// The safety argument above is "hold what the cell agreed", and it silently assumes such a value exists. It
+/// does not at genesis, where `held` is `Demand::default()` — the *absence* of a setpoint written as a number.
+/// Holding that is not conservative, it is a claim the cell never made, and it is self-sustaining: a demand of
+/// zero assigns no roles, and a cell with no roles publishes no load, so the next scan has nothing to conclude
+/// with either. Measured: five nodes, a 20 ms link, every genesis load scan timing out, and all five holding
+/// zero for a full minute — the freeze this doc calls "what makes the two-valued version of this rule a bug",
+/// arrived at from the other side. The paragraph above rules it out for *empty* slots, which read as a definite
+/// `Absent`; it does not rule it out for slots whose read never returned.
+///
+/// So when there is nothing to hold, the understated read is floored instead. That is not a fallback invented
+/// here — the viability floor is exactly the mechanism for "this cell must be able to function", it is
+/// conditioned on the supply just read, and applying it to a zero read yields the geometry's own minimum
+/// (`line_threshold` for a threshold-line role, one for a self-gated one) rather than nothing at all. The
+/// churn argument does not apply either: there is no prior value to churn away from.
+///
+/// Returns the arm taken alongside the demand, because a non-conclusion that nothing reports is how this cost
+/// a minute of silence across five nodes.
+///
 /// **`held` is a published setpoint, not an accumulator, and that is what makes holding safe.** Two nodes
 /// holding different ones — one read epoch `e − 1`, the other's scan timed out and it still holds `e − 2` —
 /// disagree only until both complete a scan of the same closed epoch. Nothing compounds, because the demand
 /// is recomputed from the floor every epoch rather than stepped from where it was. Under the carried demand
 /// this same fallback was the one path by which a momentary read failure became permanent.
-fn setpoint_to_track(read: Demand, complete: bool, held: Demand, supply: Demand, line_size: usize) -> Demand {
-    if complete { read.with_viability_floor(supply, line_size) } else { held }
+fn setpoint_to_track(
+    read: Demand,
+    complete: bool,
+    held: Option<Demand>,
+    supply: Demand,
+    line_size: usize,
+) -> (Demand, Option<crate::SetpointHold>) {
+    match (complete, held) {
+        (true, _) => (read.with_viability_floor(supply, line_size), None),
+        (false, Some(agreed)) => (agreed, Some(crate::SetpointHold::Held)),
+        (false, None) => (
+            read.with_viability_floor(supply, line_size),
+            Some(crate::SetpointHold::Floored),
+        ),
+    }
 }
 
 /// The node's **latest** cell reading, on a `watch` — `(degraded, responsive)` from the heartbeat's
@@ -1182,13 +1221,23 @@ async fn assign_epoch<F: Field>(
     refresh_reputation::<F>(client, live, at, &seating, caps_complete).await;
     // The plane's own line size, so the threshold-line roles are floored at `t`-of-`(q+1)` for THIS plane
     // rather than at the base cell's three — the ceiling-computed-on-Fano defect (#122), one subsystem over.
-    let setpoint = setpoint_to_track(
+    let (setpoint, hold) = setpoint_to_track(
         setpoint,
         load_complete,
         live.last_agreed(),
         Demand::supply(&members),
         Plane::<F>::LINE_SIZE as usize,
     );
+    // A demand that did not advance is a decision, and an unreported decision is how #250 stayed invisible for
+    // a minute across five nodes: the roster kept moving, the assignments kept being published, and every one
+    // of them was computed from a setpoint nobody had agreed to.
+    if let Some(hold) = hold {
+        client.record_station(
+            fanos_runtime::ports::stations::Station::SetpointHeld,
+            Some(client.address()),
+            Some(hold.tag()),
+        );
+    }
     // **A node that is not in the roster it just read may not speak for the cell** (#146).
     //
     // A capability record lives at `cap_slot(coord, epoch)`, so at the instant an epoch opens every slot is
@@ -1682,17 +1731,18 @@ mod tests {
         let understated = Demand::default();
 
         assert_eq!(
-            setpoint_to_track(understated, false, held, supply, fano::LINE_SIZE),
-            held,
-            "a read that did not conclude is not evidence that demand fell — hold"
+            setpoint_to_track(understated, false, Some(held), supply, fano::LINE_SIZE),
+            (held, Some(crate::SetpointHold::Held)),
+            "a read that did not conclude is not evidence that demand fell — hold, and say so"
         );
 
         // A read that DID conclude moves the demand, including downward. That direction has to keep working:
         // believing a measured zero is the whole point of the sensor work, and a rule that never shrank a role
         // would trade one defect for its mirror image.
         let measured_zero = Demand::default();
-        let moved = setpoint_to_track(measured_zero, true, held, supply, fano::LINE_SIZE);
+        let (moved, reported) = setpoint_to_track(measured_zero, true, Some(held), supply, fano::LINE_SIZE);
         assert_eq!(moved.of(Role::Relay), 0, "a COMPLETE read of zero relay demand must shrink the role");
+        assert_eq!(reported, None, "a scan that concluded is the normal case and must not raise a station");
 
         // …and the floor rides with the fresh branch. Rendezvous is floored at the LINE THRESHOLD, not at one:
         // its guarantee is `t`-of-`(q+1)` occupancy, so a single point is not a thin anonymity set but none.
@@ -1707,9 +1757,51 @@ mod tests {
         // reads complete and the demand is free to move from zero — which is what makes holding safe at all.
         let fresh = Demand::per_role(|r| if r == Role::Storage { 4 } else { 0 });
         assert_eq!(
-            setpoint_to_track(fresh, true, Demand::default(), supply, fano::LINE_SIZE).of(Role::Storage),
+            setpoint_to_track(fresh, true, None, supply, fano::LINE_SIZE).0.of(Role::Storage),
             4,
             "a bootstrapping cell whose reads conclude tracks its first real setpoint"
+        );
+    }
+
+    /// **Nothing to hold is not a demand of zero** (#250).
+    ///
+    /// The third case, and the one that shipped broken. `held` was a `Demand`, so "the cell agreed on nothing
+    /// yet" and "the cell agreed on nothing" were the same value — and the fallback held the second reading of
+    /// it. On a 20 ms link every genesis load scan times out, so five nodes held a demand of zero for a full
+    /// minute, assigned `RoleSet::EMPTY`, published no load, and thereby guaranteed the next scan had nothing
+    /// to conclude with either. Self-sustaining, and silent.
+    ///
+    /// Falsified by reverting the arm to `held.unwrap_or_default()`: this test then reports a relay demand of
+    /// 0 against the floor's 1, and a rendezvous demand of 0 against `t`.
+    #[test]
+    fn a_cell_that_has_agreed_nothing_yet_is_floored_rather_than_frozen_at_zero() {
+        let supply = Demand::per_role(|_| 3);
+        // What the timed-out scan produces: every member's slot unresolved, so the aggregate is a zero that is
+        // not evidence of anything — exactly the value the two-valued fallback then held forever.
+        let (tracked, reported) =
+            setpoint_to_track(Demand::default(), false, None, supply, fano::LINE_SIZE);
+
+        assert_eq!(
+            reported,
+            Some(crate::SetpointHold::Floored),
+            "the arm an operator needs distinguished: this cell has never completed a cell-wide load read"
+        );
+        assert_eq!(
+            tracked.of(Role::Rendezvous),
+            line_floor(fano::LINE_SIZE),
+            "a threshold-line role is floored at t-of-(q+1) — the geometry's own minimum, not zero"
+        );
+        assert_eq!(tracked.of(Role::Exit), 1, "a self-gated role keeps the floor of 1");
+
+        // The floor is conditioned on supply, and that condition survives: a role nobody offers stays at zero
+        // rather than being provisioned into existence by a scan that failed.
+        let unoffered = Demand::per_role(|r| u16::from(r != Role::Rendezvous) * 3);
+        assert_eq!(
+            setpoint_to_track(Demand::default(), false, None, unoffered, fano::LINE_SIZE)
+                .0
+                .of(Role::Rendezvous),
+            0,
+            "flooring must not invent demand for a role the cell has no supply for"
         );
     }
 
