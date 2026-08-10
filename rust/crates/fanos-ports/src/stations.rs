@@ -282,6 +282,26 @@ pub enum Station {
     /// peer's claim lands here and nothing else moves at all.
     HelloEpochUnknown,
 
+    /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
+    /// (#235) — the count of joins currently in progress.
+    ///
+    /// The companion to [`HelloEpochUnknown`](Self::HelloEpochUnknown), and the two answer different
+    /// questions: that one says a claim was refused, this one says the connection carrying it survived.
+    /// Before this the two were the same event, so an operator could not tell "we turned a joining node
+    /// away" from "we are waiting for the beacon that will let it in". On a healthy node it is small and
+    /// transient; a value that stays high means beacons are not reaching new arrivals.
+    ///
+    /// Not keyed by line, for the same reason as its companion: the coordinate is a stranger's claim.
+    PeerUnjudged,
+
+    /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
+    ///
+    /// The restricted set admits exactly the frames whose handler does **not** read `from`, because an
+    /// unjudged peer's coordinate is a claim rather than a fact. Anything else is either a version skew or
+    /// a peer probing what an unauthenticated connection will carry — and neither leaves a trace anywhere
+    /// else, since a connection in this state is in no table and so has no per-peer counter.
+    RestrictedFrameDropped,
+
     /// A dialed coordinate was **vacant at the address the directory named**, and the peer that answered
     /// proved a *different* one — the peer moved and our entry is stale (#240).
     ///
@@ -770,6 +790,8 @@ impl Station {
         Self::TransportRoundTripLost,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
+        Self::PeerUnjudged,
+        Self::RestrictedFrameDropped,
         Self::DirectoryStaleCoordinate,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
@@ -819,6 +841,8 @@ impl Station {
             Self::TransportRoundTripLost => "transport.round_trip_lost",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
+            Self::PeerUnjudged => "hello.peer_unjudged",
+            Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
@@ -923,6 +947,8 @@ impl Station {
             | Self::TransportRoundTripLost
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
+            | Self::PeerUnjudged
+            | Self::RestrictedFrameDropped
             | Self::DirectoryStaleCoordinate
             | Self::PorosRotationUnarmed
             | Self::DirectorySeatSuperseded

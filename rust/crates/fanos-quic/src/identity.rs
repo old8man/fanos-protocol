@@ -8,7 +8,7 @@
 //! only address resolution (a hint for dialing), never identity.
 
 use fanos_field::Field;
-use fanos_geometry::{HierAddr, Point, Triple, decode_triple, derive_address, encode_triple};
+use fanos_geometry::{HierAddr, Point, TRIPLE_WIRE_LEN, Triple, decode_triple, derive_address, encode_triple};
 use fanos_primitives::hash::label;
 use fanos_primitives::{BeaconSeed, Epoch, map_to_point};
 use fanos_vrf::{CoordinateClaim, PROOF_LEN, VrfProof, VrfPublic, prove_coordinate, verify_coordinate};
@@ -301,6 +301,27 @@ pub(crate) fn hello_epoch(hello: &[u8]) -> Option<Epoch> {
         return None;
     }
     Some(Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?)))
+}
+
+/// Peek the coordinate a HELLO *claims*, without verifying it. Paired with [`hello_epoch`], and read from
+/// the same fixed head — the claim sits at `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN`, right after the epoch.
+///
+/// **This is an unproven assertion by a stranger, and only one caller may treat it as anything at all**
+/// (#235): the restricted state a connection sits in when this node cannot judge the peer's epoch, where it
+/// serves as a *label* for a connection that is not in any routing table. It must never reach the directory,
+/// the connection map, a station tag, or a reply target — attaching it to any of those is how a stranger
+/// picks which line this node's instruments accuse or which member its replies are aimed at.
+#[must_use]
+pub(crate) fn hello_coord(hello: &[u8]) -> Option<Triple> {
+    let (frame, _) = decode_frame(hello).ok()?;
+    if frame.frame_type() != Some(FrameType::Hello) {
+        return None;
+    }
+    let body = frame.body;
+    if body.len() < HELLO_MIN_BODY_LEN {
+        return None;
+    }
+    decode_triple(body.get(HELLO_HEAD_LEN - TRIPLE_WIRE_LEN..HELLO_HEAD_LEN)?)
 }
 
 /// The peer's end-entity certificate DER from an established connection (its authenticated

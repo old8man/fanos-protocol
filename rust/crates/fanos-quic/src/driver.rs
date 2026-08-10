@@ -43,7 +43,8 @@ use fanos_vrf::{CoordinateClaim, VrfProof, VrfPublic};
 
 use crate::claims::{self, ClaimBook};
 use crate::identity::{
-    HelloResult, hello_bytes, hello_epoch, peer_cert_der, verifiable_coordinate_ranked, verify_hello,
+    HelloResult, hello_bytes, hello_coord, hello_epoch, peer_cert_der, verifiable_coordinate_ranked,
+    verify_hello,
 };
 use crate::tls::{NodeCredentials, TlsError, node_configs, node_configs_mutual_from};
 
@@ -566,6 +567,9 @@ struct Transport {
     /// can cost (see [`accept_holepunch`]). A *set of coordinates*, so the ceiling is the plane's own point
     /// count and no constant has to assert one.
     punching: Arc<Mutex<BTreeSet<Triple>>>,
+    /// Coordinates a dialed-but-unjudgeable connection is already being held open for (#235) — the dial
+    /// side's ceiling, deliberately the same shape as `punching` above. See [`spawn_restricted`].
+    unjudged: Arc<Mutex<BTreeSet<Triple>>>,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -2289,6 +2293,7 @@ fn spawn_inner(
         distrust: distrust.clone(),
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
+        unjudged: Arc::new(Mutex::new(BTreeSet::new())),
     };
     supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
     supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(accept_loop(transport.clone())));
@@ -2666,7 +2671,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             // dialer now does too, rather than inventing a second constant for one quantity.
             let handshake = tokio::time::timeout(HELLO_DEADLINE, hello_exchange(&conn, t, id))
                 .await
-                .unwrap_or(Handshake { peer: None, round_trip: false });
+                .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false });
             // **The breaker reads the shaped round trip, not the QUIC handshake** (#231). Shaping starts at
             // the stream, so the handshake completing says nothing about the morph — a censor that admits
             // the handshake and kills the data phase used to be recorded as a success, resetting the breaker
@@ -2693,8 +2698,8 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             // The payload is NOT redirected to `actual`. A coordinate is the overlay identity, so delivering
             // it there would be a misdelivery, not a repair — this fixes the map and fails the send.
             match handshake.peer {
-                Some(actual) if actual == to => {}
-                Some(actual) => {
+                PeerIdentity::Proven(actual) if actual == to => {}
+                PeerIdentity::Proven(actual) => {
                     t.record_station(Station::DirectoryStaleCoordinate, Some(to), None);
                     // Sound by the same rule `spawn_punch` already follows: an address binding is recorded
                     // only for a coordinate that was *proved* at it, and this one was, over mutual TLS to an
@@ -2739,8 +2744,19 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     tracing::debug!(?to, ?actual, "dialed coordinate has moved; directory corrected");
                     return None;
                 }
-                None => {
-                    tracing::warn!(?to, "peer proved no coordinate (impostor or unjudgeable epoch); rejecting");
+                // **We could not judge it, so we keep the connection and fail only the send** (#235). This
+                // dial was to `to`, and nothing here proved the peer is `to` — so no directory write, no
+                // connection-map entry, and the caller's frame is not delivered. What the connection *is*
+                // good for is the one thing this node is missing: a beacon round, which authenticates
+                // itself against the group commitment and needs no trusted sender. Dropping it instead is
+                // what made §7.8's bootstrap unreachable — the pull-sync it defines has to run over a
+                // connection, and this was the connection.
+                PeerIdentity::Unjudged(u) => {
+                    spawn_restricted(conn, u, t.clone());
+                    return None;
+                }
+                PeerIdentity::Rejected => {
+                    tracing::warn!(?to, "peer proved no coordinate (impostor or malformed claim); rejecting");
                     return None;
                 }
             }
@@ -2807,14 +2823,14 @@ impl Drop for SourceGuard {
 /// Resolve a peer's coordinate from a freshly-established connection: a proof-of-coordinate HELLO exchange
 /// (self-certifying mode) or an unauthenticated HELLO read (directory-trust mode). `None` if the HELLO is
 /// rejected (bad proof / incompatible negotiation) or unreadable.
-async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
+async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> PeerIdentity {
     match &t.identity {
         // The accept side wants the coordinate and nothing else. It deliberately does **not** feed the morph
         // breaker: an inbound exchange reports whether a *peer's* transport reached us, and the breaker
         // regulates whether ours reaches out. Rotating on someone else's reachability would let one peer
         // walk this node's morph chain.
         Some(id) => hello_exchange(conn, t, id).await.peer,
-        None => read_hello(conn, t).await,
+        None => read_hello(conn, t).await.map_or(PeerIdentity::Rejected, PeerIdentity::Proven),
     }
 }
 
@@ -2848,7 +2864,18 @@ async fn accept_loop(t: Transport) {
             // link is never reclaimed for silence, since it may back the #119 reverse-reachability path.
             let established = tokio::time::timeout(HELLO_DEADLINE, async {
                 let conn = incoming.await.ok()?;
-                let from = resolve_peer_hello(&conn, &t).await?;
+                let from = match resolve_peer_hello(&conn, &t).await {
+                    PeerIdentity::Proven(from) => from,
+                    // **Kept, not dropped, and kept out of every table** (#235). Symmetric with the dial
+                    // side: this peer proved an epoch we hold no beacon for, and the connection it arrived
+                    // on is the one place that beacon can come from. Nothing below runs — no seat, no
+                    // connection map, no hole-punch address — because all three are statements about a
+                    // coordinate, and none was proved. Handed OUT of the deadline rather than served here:
+                    // `HELLO_DEADLINE` bounds a handshake, and this connection's whole purpose is to
+                    // outlive one.
+                    PeerIdentity::Unjudged(u) => return Some((conn, PeerIdentity::Unjudged(u))),
+                    PeerIdentity::Rejected => return None,
+                };
                 // Audit R-M1: the HELLO exchange just proved this peer's coordinate against its certificate, so this is
                 // the one moment the identity↔coordinate binding is known. Seat it, and issue whatever the engine needs
                 // to stay consistent — clear a stale tag if the occupant changed, re-apply one if this identity is
@@ -2858,12 +2885,23 @@ async fn accept_loop(t: Transport) {
                         let _ = t.input_tx.send(Input::Command(cmd)).await;
                     }
                 }
-                Some((conn, from))
+                Some((conn, PeerIdentity::Proven(from)))
             })
             .await;
             let (conn, from) = match established {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
+                Ok(Some((conn, PeerIdentity::Proven(from)))) => (conn, from),
+                // The restricted state runs **here**, inside the handler, so the inbound permit and the
+                // per-source guard are held for its whole life — exactly as they are for `read_frames`.
+                // Spawning it instead would free both the moment the handshake ended, and an unjudgeable
+                // peer would then cost nothing to hold, which is the one thing every bound on this path
+                // exists to prevent (audit A6/C3).
+                Ok(Some((conn, PeerIdentity::Unjudged(u)))) => {
+                    read_restricted(conn, u, t).await;
+                    return;
+                }
+                // Unreachable by construction: the block above returns `None` rather than a `Rejected`.
+                // Matched rather than `_`-ed so that adding a fourth identity state is a compile error here.
+                Ok(Some((_, PeerIdentity::Rejected)) | None) => {
                     tracing::debug!(
                         "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
                     );
@@ -2979,6 +3017,13 @@ enum PeerHello {
     /// only "not a transport failure"; an operator needs the reason, and the operator's channel is the
     /// station plane.
     Refused,
+    /// A HELLO arrived and decoded, and this node **cannot judge it**: it holds no beacon for the epoch the
+    /// peer proves (#235). Split off from [`Refused`](Self::Refused) because the two call for opposite
+    /// responses — a forged proof is a peer to be rid of, an unjudgeable epoch is *our* gap, and the
+    /// connection carrying it is the only place the beacon that closes the gap can arrive from.
+    /// Carries what the peer **claims**, unproven — a label for a connection that is in no routing table,
+    /// never a routing or reply target. See [`hello_coord`](crate::identity::hello_coord).
+    Unjudgeable(Triple),
 }
 
 /// Read the peer's first uni-stream as its HELLO, verify its coordinate proof against the peer's
@@ -3019,9 +3064,15 @@ async fn read_verified_hello(
         }
         HelloVerdict::EpochUnknown => {
             // Not keyed by line: the claim is unverified, so the coordinate it names is not yet a fact about
-            // anyone — attaching it would let a stranger choose which line this node's counters accuse.
+            // anyone — attaching it would let a stranger choose which line this node's counters accuse. The
+            // claim IS carried in the arm below, for routing-free labelling only; the station stays blind.
             t.record_station(Station::HelloEpochUnknown, None, None);
-            PeerHello::Refused
+            match hello_coord(&hello) {
+                Some(claimed) => PeerHello::Unjudgeable(claimed),
+                // A HELLO that passed `verify`'s own length checks but whose coordinate will not decode is
+                // malformed, not unjudgeable — there is nothing to hold a connection open for.
+                None => PeerHello::Refused,
+            }
         }
     }
 }
@@ -3042,7 +3093,7 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
     // handshake, matching the connection-map convention elsewhere in this driver — and it is a *local*
     // fault, so it says nothing about the transport.
     let Ok(hello) = id.hello.read().map(|h| h.clone()) else {
-        return Handshake { peer: None, round_trip: false };
+        return Handshake { peer: PeerIdentity::Rejected, round_trip: false };
     };
     // Asked BEFORE the first byte goes out, which is the whole point: by the time an inbound frame could
     // tell us, ours has already left in the wrong shape (#234).
@@ -3060,17 +3111,21 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
                 peer: _,
             } => {
                 send_hello_ack(conn, &t.shaper, joining, version, capabilities).await;
-                Handshake { peer: Some(coord), round_trip: true }
+                Handshake { peer: PeerIdentity::Proven(coord), round_trip: true }
             }
             HelloResult::Incompatible(err) => {
                 tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
                 send_error(conn, &t.shaper, joining, err).await;
                 // A version disagreement is proof the shaped bytes crossed intact — we read and parsed them.
-                Handshake { peer: None, round_trip: true }
+                Handshake { peer: PeerIdentity::Rejected, round_trip: true }
             }
         },
-        PeerHello::Refused => Handshake { peer: None, round_trip: true },
-        PeerHello::Silent => Handshake { peer: None, round_trip: false },
+        // No `HELLO_ACK` and no `ERROR`: an ACK echoes *agreed* parameters, and nothing was agreed — we
+        // could not read the peer's claim. An ERROR would be worse: it tells a stranger which of our gates
+        // it hit (§L0), and this peer is very likely honest and simply ahead of us.
+        PeerHello::Unjudgeable(u) => Handshake { peer: PeerIdentity::Unjudged(u), round_trip: true },
+        PeerHello::Refused => Handshake { peer: PeerIdentity::Rejected, round_trip: true },
+        PeerHello::Silent => Handshake { peer: PeerIdentity::Rejected, round_trip: false },
     }
 }
 
@@ -3081,11 +3136,24 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
 /// it. Before this they were one `Option<Triple>`, so the breaker had nothing to read at this layer and was
 /// fed the QUIC handshake instead — an event the morph cannot influence, since shaping starts above it.
 struct Handshake {
-    /// The peer's certified coordinate, if the exchange established one.
-    peer: Option<Triple>,
+    /// What the exchange settled about **who** the peer is.
+    peer: PeerIdentity,
     /// Whether a shaped frame completed the round trip. **A refusal counts as `true`**: we decoded what the
     /// peer sent and rejected its contents, so the transport is not what failed.
     round_trip: bool,
+}
+
+/// What a completed exchange settled about **who** the peer is — three states, because "we do not know"
+/// and "we know it is nobody" lead to opposite handling of the same live connection (#235).
+enum PeerIdentity {
+    /// A coordinate proved against the peer's authenticated certificate. The connection is routable.
+    Proven(Triple),
+    /// The peer named an epoch this node holds no beacon for, so nothing is proved *and nothing is
+    /// disproved*. The connection is kept but stays out of every routing table — see [`read_restricted`].
+    /// The `Triple` is the peer's unproven claim, carried only as a label.
+    Unjudged(Triple),
+    /// Nothing was established: a forged proof, an incompatible negotiation, a local fault, or silence.
+    Rejected,
 }
 
 /// Tell every live peer when this node moves, by re-sending its (already updated) `HELLO` on each open connection.
@@ -3143,6 +3211,99 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
             None
         }
     }
+}
+
+/// Whether a frame may cross from a peer whose coordinate is **unproven** (#235).
+///
+/// **The rule is read off the consumer, not chosen:** a frame whose handler uses `from` cannot be admitted
+/// from a peer whose coordinate is a claim. Applying it to `BeaconNode::step`'s dispatch leaves exactly one
+/// frame:
+///
+/// * `Beacon` → `on_round(f.body)`. `from` is **not read**. The round carries its own proof against the
+///   group commitment, so a forged one is rejected by the same check that rejects a forged flood from a
+///   proven peer. Admitted.
+/// * `BeaconReq` → `on_beacon_req(from)`, where `from` is the **reply target**. From an unproven peer this
+///   is both useless (it is not reachable at the coordinate it names, precisely because we filed nothing)
+///   and a small reflection primitive — we would send to whoever really holds that point. Refused.
+/// * `BeaconPartial` and the three reshare frames: a joining node has no share to contribute and no reshare
+///   to trigger, so admitting them would widen the surface for nothing.
+///
+/// So this is **narrower than `is_beacon_frame`** on purpose, and the difference is not a copy that drifted:
+/// that predicate answers "which engine owns this frame", this one answers "may a stranger send it".
+fn admitted_unjudged(frame: &[u8]) -> bool {
+    matches!(
+        decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
+        Some(FrameType::Beacon)
+    )
+}
+
+/// Hold a connection whose peer this node **could not judge**, and read the one thing it can safely accept
+/// from it: a beacon round (#235).
+///
+/// This is what makes §7.8's bootstrap reachable. The pull-sync it defines (`request_sync` → `on_beacon_req`
+/// → a round) has to run over a connection, and until now the handshake dropped the only connection there
+/// was — the joining node refused a cell it could not judge, and so never received the beacon that would
+/// let it judge. A node needed to be a member to become one.
+///
+/// **There is deliberately no promotion path, and that is a simplification the design gained by reading.**
+/// Once a round is adopted, `reshuffle_loop` re-derives this node's seat and rewrites its HELLO, and the
+/// very next send dials a fresh connection that both sides *can* judge, gets cached, and proceeds as
+/// normal. Promoting this connection in place would buy one connection setup and cost a re-verification
+/// hook, a stored copy of the peer's HELLO, and a `select!` over `Connection::accept_uni` — which quinn
+/// does not document as cancel-safe, and this is the authentication path.
+///
+/// The peer is told nothing and this node claims nothing: no directory write, no connection-map entry, no
+/// hole-punch address, no seat, no distrust binding. `claimed` labels the frame for the engine and is
+/// otherwise inert — the one frame admitted does not read it.
+async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
+    t.record_station(Station::PeerUnjudged, None, None);
+    while let Ok(mut stream) = conn.accept_uni().await {
+        let Ok(raw) = stream.read_to_end(max_wire()).await else {
+            t.record_station(Station::WireOverBound, None, None);
+            continue;
+        };
+        let Some((frame, _under)) = shape_in(&t.shaper, raw) else {
+            t.record_station(Station::WireUnshaped, None, None);
+            continue;
+        };
+        if !admitted_unjudged(&frame) {
+            // Counted, because "a peer we cannot judge is talking to us about something else" is the shape
+            // an operator would want to see rising, and it is invisible everywhere else: this connection is
+            // in no table, so no per-peer counter exists for it.
+            t.record_station(Station::RestrictedFrameDropped, None, None);
+            continue;
+        }
+        if t.input_tx.send(Input::Message { from: claimed, frame }).await.is_err() {
+            break; // engine actor gone
+        }
+    }
+}
+
+/// Hold an unjudgeable connection open on the **dial** side, at most one per claimed coordinate.
+///
+/// The accept side awaits [`read_restricted`] under its own inbound permit, so it is already bounded by
+/// `MAX_INBOUND_CONNECTIONS`. A dial has no permit, so it needs its own ceiling — and the shape is the one
+/// `spawn_punch` already uses (#78): a **set of coordinates**, whose size is the plane's own point count
+/// `q² + q + 1`. No constant has to be invented, and the fact that `claimed` is attacker-chosen cannot
+/// widen it, because a `Triple` is a point and there are only that many.
+///
+/// It also closes a re-dial storm before it opens: nothing caches an unjudged connection, so without this
+/// every send to the same coordinate would open another one — the #72 shape.
+fn spawn_restricted(conn: Connection, claimed: Triple, t: Transport) {
+    let admitted = match t.unjudged.lock() {
+        Ok(mut held) => held.insert(claimed),
+        // A poisoned set is a local fault; refusing is what every path here did before this existed.
+        Err(_) => false,
+    };
+    if !admitted {
+        return;
+    }
+    tokio::spawn(async move {
+        read_restricted(conn, claimed, t.clone()).await;
+        if let Ok(mut held) = t.unjudged.lock() {
+            held.remove(&claimed);
+        }
+    });
 }
 
 /// Read a connection's first uni-stream as the peer's HELLO (its coordinate), un-shaping first.
@@ -3857,6 +4018,41 @@ mod tests {
             "epoch {outside} is outside the verification window, and the wire agrees — if the wire carried \
              it, the window would be the gate turning a reachable peer away"
         );
+    }
+
+    /// **The restricted set admits exactly the frames whose handler ignores `from`** (#235).
+    ///
+    /// Stated as the rule rather than as a list, because the list is a consequence: an unjudged peer's
+    /// coordinate is a claim, so any handler that *uses* `from` would be acting on a stranger's choice.
+    /// `Beacon` → `on_round(f.body)` does not read it; `BeaconReq` → `on_beacon_req(from)` uses it as the
+    /// reply target. Those two are the whole discrimination, and they are checked here as a pair — checking
+    /// only that `Beacon` passes would be satisfied by a function that admits everything.
+    ///
+    /// Falsified by widening `admitted_unjudged` to `is_beacon_frame`'s six types: the `BeaconReq` and
+    /// `BeaconPartial` assertions redden. Narrowed to nothing, the first assertion reddens.
+    #[test]
+    fn an_unjudged_peer_may_send_only_what_no_handler_attributes_to_it() {
+        let framed = |ty: FrameType, body: &[u8]| {
+            let mut out = Vec::new();
+            encode_frame(ty.code(), body, &mut out);
+            out
+        };
+        assert!(
+            admitted_unjudged(&framed(FrameType::Beacon, b"round-ish")),
+            "a beacon round proves itself against the group commitment, so an unproven sender costs nothing"
+        );
+        assert!(
+            !admitted_unjudged(&framed(FrameType::BeaconReq, b"")),
+            "`on_beacon_req` sends the round TO `from`, so admitting this would let a stranger aim our \
+             reply at a coordinate it merely named"
+        );
+        for other in [FrameType::BeaconPartial, FrameType::Hello, FrameType::Relay, FrameType::ObservedAddr] {
+            assert!(
+                !admitted_unjudged(&framed(other, b"x")),
+                "{other:?} is not part of the §7.8 bootstrap and must not cross an unauthenticated connection"
+            );
+        }
+        assert!(!admitted_unjudged(b"not-a-frame"), "an undecodable frame is not admitted by default");
     }
 
     #[test]
