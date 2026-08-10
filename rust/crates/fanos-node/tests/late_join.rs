@@ -119,12 +119,18 @@ fn dump(tag: &str, n: &Node) {
 
 /// Send from `from` to `to` and report whether it was delivered within `budget`.
 async fn delivers(from: &Node, to: &mut Node, budget: Duration) -> bool {
-    let target = to.address();
-    let source = from.address();
-    // Retry the send: the first dial may lose the race with the peer's own startup, and a single shot would
-    // make this measure a race rather than the property.
+    // **Both addresses are re-read every iteration, and that is not tidiness** (#260). A node that finds its
+    // coordinate taken *moves*, and this harness is the one place where that happens often enough to matter:
+    // two nodes drawing from 7 points collide about one time in seven. Bound once before the loop, `target`
+    // is the seat the peer has just left and `source` is the name it no longer answers to — so the send goes
+    // nowhere and the `f == source` comparison rejects the delivery that did arrive. The instrument would
+    // then report a transport failure for an address it was holding wrong itself.
+    //
+    // Retry the send too: the first dial may lose the race with the peer's own startup, and a single shot
+    // would make this measure a race rather than the property.
     let deadline = tokio::time::Instant::now() + budget;
     loop {
+        let (target, source) = (to.address(), from.address());
         from.command(Command::Send { to: target, payload: b"late-join probe".to_vec() });
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
@@ -167,6 +173,18 @@ async fn delivers(from: &Node, to: &mut Node, budget: Duration) -> bool {
 /// and 2-in-8 is that number within the noise of eight samples. Every scenario in this tree brings its whole
 /// cell up at once and has never been read for this, because a collision there is absorbed by the other five
 /// members; with exactly two nodes there is nobody to absorb it.
+///
+/// **The obvious explanation was mine, and this instrument refuted it.** `delivers` used to bind the peer's
+/// address once, before its retry loop — so a node that re-seats leaves the sender addressing a seat it has
+/// left, and the harness would report a transport failure for an address it was holding wrong itself. That
+/// is a real defect in the instrument and it is fixed. It is **not** the cause: with both addresses re-read
+/// every iteration the rate is unchanged at 2 in 10, and the discriminator still separates every run. Across
+/// both batches `collisions` separates 18 of 18.
+///
+/// What the second batch adds: on both failures the arrival ends with `known_peers = 1` — its directory
+/// holds only itself — against 2 on every pass. So after the clash it does not re-learn the anchor, while
+/// the anchor has authenticated it twice. That is the next thing to chase, and it is a claim about the
+/// directory rather than about the transport.
 ///
 /// The experiment below therefore **still cannot be read as evidence** — its silence has two causes and this
 /// arm was meant to separate them — but the reason is now named rather than open. Neither ships as a gate.
