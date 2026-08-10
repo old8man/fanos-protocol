@@ -101,7 +101,12 @@ fn dump(tag: &str, n: &Node) {
         .client()
         .driver_stations()
         .iter()
-        .map(|o| format!("{}={}", o.station.name(), o.count))
+        // The line matters for the directory stations: `directory.point_taken` carries the CONTESTED
+        // coordinate, and "which point was taken" is the question the count alone cannot answer (#260).
+        .map(|o| match o.line {
+            Some(line) => format!("{}@{:?}={}", o.station.name(), line, o.count),
+            None => format!("{}={}", o.station.name(), o.count),
+        })
         .collect();
     v.sort();
     let h = n.health();
@@ -181,10 +186,25 @@ async fn delivers(from: &Node, to: &mut Node, budget: Duration) -> bool {
 /// every iteration the rate is unchanged at 2 in 10, and the discriminator still separates every run. Across
 /// both batches `collisions` separates 18 of 18.
 ///
-/// What the second batch adds: on both failures the arrival ends with `known_peers = 1` — its directory
-/// holds only itself — against 2 on every pass. So after the clash it does not re-learn the anchor, while
-/// the anchor has authenticated it twice. That is the next thing to chase, and it is a claim about the
-/// directory rather than about the transport.
+/// **Traced to the end, and the last reading is the one that names it.** Printing the station's *line* —
+/// which coordinate was contested — gave the whole sequence on a failing run:
+///
+/// ```text
+/// anchor   seat=[0,1,0]  known_peers=1  verified=2  collisions=0
+/// second   seat=[0,1,0]  known_peers=1  verified=1  collisions=2  directory.point_taken@[0,1,0]=1
+/// ```
+///
+/// Both nodes are on the SAME seat, and the anchor's `collisions=0` says it never saw the clash. The
+/// arbitration happened only in the arrival's own directory: it decided locally that its claim beats the
+/// incumbent, rebound `[0,1,0]` to itself — and in doing so **deleted the only address it had for the
+/// anchor**, which is exactly `known_peers = 1`. The anchor was never told its point was taken, so it does
+/// not walk on. Two nodes, one coordinate, and neither can address the other.
+///
+/// The resolution that does exist is the next epoch: each node re-derives its seat from a fresh rank on
+/// `BeaconReady`. This fixture's period is an hour, so nothing re-derives inside the 20 s budget — which is
+/// not the harness being unfair, it is the harness making visible how long the pair stays mutually
+/// unreachable when the beacon is slow. The arbitration is one-sided and the loser has no notification path;
+/// the epoch turn is the only thing that ends it.
 ///
 /// The experiment below therefore **still cannot be read as evidence** — its silence has two causes and this
 /// arm was meant to separate them — but the reason is now named rather than open. Neither ships as a gate.
