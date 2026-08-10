@@ -1264,7 +1264,15 @@ impl Node {
         // and an ingress line that does not rotate forfeits the moving-target property §6 rests on — its
         // blocklist stops going stale. `None` for a node not hosting ingress, which is most of them.
         let _ingress_rotation = rotation_params.map(|(community, kem_seed)| {
-            crate::ingressdir::spawn_ingress_rotation::<F>(handle.client(), community, kem_seed)
+            // The prover is what binds each published key to this node's coordinate (#262). `None` on a
+            // deployment that cannot prove coordinates, which is the same condition every other bound
+            // directory keys its envelope on.
+            crate::ingressdir::spawn_ingress_rotation::<F>(
+                handle.client(),
+                community,
+                kem_seed,
+                handle.coordinate_prover(),
+            )
         });
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
@@ -2145,7 +2153,16 @@ mod tests {
         let mut resolved = None;
         for _ in 0..200 {
             resolved =
-                crate::ingressdir::resolve_ingress_key(&node.client(), node.address(), Epoch::new(0)).await;
+                crate::ingressdir::resolve_ingress_key::<F2>(
+                    &node.client(),
+                    node.address(),
+                    Epoch::new(0),
+                    // Verified, not merely decoded: this test asserts the SHIPPED publisher binds its key
+                    // (#262). Passing `None` here would let the envelope be deleted from
+                    // `spawn_ingress_rotation` and leave this test green — the exact trap #80 recorded.
+                    Some(node.client().genesis()),
+                )
+                .await;
             if resolved.is_some() {
                 break;
             }

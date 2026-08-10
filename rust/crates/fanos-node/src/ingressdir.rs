@@ -27,12 +27,16 @@
 
 use fanos_geometry::Triple;
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, SeedRng};
-use fanos_quic::Client;
+use fanos_quic::{Client, CoordinateProver};
+use fanos_vrf::{VrfProof, VrfPublic};
+use fanos_field::Field;
+use fanos_primitives::BeaconSeed;
 use fanos_rendezvous::Epoch;
 
 use fanos_primitives::codec::{Reader, put_seq, put_var_bytes};
 
 use crate::DIRECTORY_SLOT_EPOCHS;
+use crate::bound::Entitlement;
 use crate::resolve::STORE_TIMEOUT;
 
 /// **The control tag that hands a `PorosHost` what it cannot look up.**
@@ -133,23 +137,73 @@ pub async fn publish_ingress_key(
     coord: Triple,
     epoch: Epoch,
     public: &HybridKemPublic,
+    credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
 ) -> bool {
     let landed = client
-        .put_ephemeral(ingress_key_slot(coord, epoch), public.encode(), DIRECTORY_SLOT_EPOCHS)
+        .put_ephemeral(ingress_key_slot(coord, epoch), ingress_key_record(public, credential), DIRECTORY_SLOT_EPOCHS)
         .await;
     crate::note_publish(client, crate::Directory::IngressKey, epoch, landed)
 }
 
+/// The bytes an ingress key is stored as: the bare encoded public, or that inside the coordinate-bound
+/// [`Entitlement`] envelope when this deployment can prove coordinates (#262).
+///
+/// **Why this directory needed the envelope and could not lean on the store.** `put_ephemeral` hands the
+/// store `storage_digest(&key)` — the store never sees the key, so it cannot check that the writer is the
+/// node the slot names, and no store-side rule ever will: it is content-addressed by construction. Publisher
+/// authenticity therefore lives in the payload or nowhere, which is the same conclusion `loaddir` reached in
+/// #80 and `capdir` before it.
+///
+/// **What an unbound slot cost here specifically.** This is not a reporting directory. `resolve_ingress_line`
+/// reads it inside the rotation and the emitter seals each new member's reshare sub-share to the key it
+/// finds; a key nobody holds the secret for makes the rotated line one sub-share short of its threshold, and
+/// the symptom is the one this module's own doc calls out — an ingress that looks provisioned and admits
+/// nobody. One forged slot is enough, because the resolve is fail-closed on ALL members.
+#[must_use]
+fn ingress_key_record(
+    public: &HybridKemPublic,
+    credential: Option<&(Vec<u8>, VrfPublic, VrfProof)>,
+) -> Vec<u8> {
+    let payload = public.encode();
+    match credential {
+        Some((id, vrf_public, proof)) => Entitlement::encode(id, vrf_public, proof, &payload),
+        None => payload,
+    }
+}
+
+/// The inverse of [`ingress_key_record`]: the published KEM public, or `None` if malformed or — when
+/// `beacon` is `Some` — not bound to `coord` for `epoch`.
+#[must_use]
+fn open_ingress_key_record<F: Field>(
+    bytes: &[u8],
+    coord: Triple,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Option<HybridKemPublic> {
+    match beacon {
+        Some(seed) => {
+            let (_, payload) = Entitlement::open::<F>(bytes, coord, epoch, &seed)?;
+            HybridKemPublic::decode(payload)
+        }
+        None => HybridKemPublic::decode(bytes),
+    }
+}
+
 /// Resolve one incoming line member's ingress KEM public for `epoch`.
-pub async fn resolve_ingress_key(
+///
+/// `beacon` is `Some` wherever the deployment proves coordinates, and then a record not bound to `coord` for
+/// `epoch` is refused rather than returned — the same three-way shape `loaddir::resolve_load` uses, and for
+/// the same reason: a reader that cannot check the binding must not pretend it did.
+pub async fn resolve_ingress_key<F: Field>(
     client: &Client,
     coord: Triple,
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> Option<HybridKemPublic> {
     let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(ingress_key_slot(coord, epoch)))
         .await
         .ok()??;
-    HybridKemPublic::decode(&bytes)
+    open_ingress_key_record::<F>(&bytes, coord, epoch, beacon)
 }
 
 /// Resolve **every** member of the incoming line, in roster order — what `emit_reshare` needs.
@@ -159,14 +213,15 @@ pub async fn resolve_ingress_key(
 /// the threshold and the rotation would silently produce a line that cannot serve. Better to emit nothing
 /// this epoch — the old line keeps serving, and the next epoch tries again — than to hand the community an
 /// ingress that looks provisioned and admits nobody.
-pub async fn resolve_ingress_line(
+pub async fn resolve_ingress_line<F: Field>(
     client: &Client,
     line: &[Triple],
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> Option<Vec<HybridKemPublic>> {
     let mut keys = Vec::with_capacity(line.len());
     for &coord in line {
-        keys.push(resolve_ingress_key(client, coord, epoch).await?);
+        keys.push(resolve_ingress_key::<F>(client, coord, epoch, beacon).await?);
     }
     Some(keys)
 }
@@ -201,10 +256,11 @@ const RESHARE_RANDOMNESS_LEN: usize = 8192;
 /// skipped whole (see [`resolve_ingress_line`]): the outgoing line keeps serving its own epoch, and the next
 /// advance tries again. A partial emission would leave the new line below threshold — provisioned-looking
 /// and unable to admit anyone.
-pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
+pub fn spawn_ingress_rotation<F: Field + 'static>(
     client: Client,
     community: Vec<u8>,
     kem_seed: [u8; 32],
+    prover: Option<CoordinateProver>,
 ) -> tokio::task::JoinHandle<()> {
     // Supervised: this actor's death is a capability the node loses, and the counters that would
     // have shown it are written by the actor itself (#251).
@@ -212,8 +268,12 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
     let task = tokio::spawn(async move {
         let (_secret, public) = ingress_keypair(&kem_seed);
         let mut beacons = client.beacons();
-        // Genesis first, so a line rotating out of epoch 0 can already resolve this member.
-        publish_ingress_key(&client, client.address(), Epoch::new(0), &public).await;
+        // Genesis first, so a line rotating out of epoch 0 can already resolve this member. Bound against
+        // THIS NETWORK's epoch-0 seed, not the shared constant: a record bound against the wrong seed proves
+        // a coordinate this node does not occupy, so no reader could verify it (`docs/design-genesis.md`).
+        let genesis_credential = prover.as_ref().map(|prove| prove(Epoch::new(0), &client.genesis()));
+        publish_ingress_key(&client, client.address(), Epoch::new(0), &public, genesis_credential.as_ref())
+            .await;
         let mut current = Epoch::new(0);
         // Latest-state, not the lossy stream: a missed round is a rotation that never happens, and an ingress
         // line that stops rotating forfeits the moving-target property §6 rests on — its blocklist stops
@@ -222,7 +282,11 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
             let next = epoch.next();
             // Publish for the epoch AFTER this one: the rotation into it happens at that boundary,
             // and a key published at the boundary is a key the outgoing line could not have read.
-            publish_ingress_key(&client, client.address(), next, &public).await;
+            // Proven per write, never once at spawn: the credential names an epoch, so one captured at
+            // startup would verify only in the epoch it was made — the same rule `loaddir` and `capdir`
+            // follow. Bound to `next`, the epoch the record is FOR, because that is what a reader checks.
+            let credential = prover.as_ref().map(|prove| prove(next, &beacon));
+            publish_ingress_key(&client, client.address(), next, &public, credential.as_ref()).await;
 
             let old_line = crate::poros::ingress_line::<F>(&community, current, &beacon);
             let new_line = crate::poros::ingress_line::<F>(&community, epoch, &beacon);
@@ -235,7 +299,11 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
             if !old_members.contains(&client.address()) {
                 continue;
             }
-            let Some(keys) = resolve_ingress_line(&client, &new_members, epoch).await else {
+            // The beacon this epoch's records are bound against — present exactly when this node can prove
+            // coordinates, so the check is on wherever the binding is.
+            let verify_against = prover.as_ref().map(|_| beacon);
+            let Some(keys) = resolve_ingress_line::<F>(&client, &new_members, epoch, verify_against).await
+            else {
                 // Fail-closed and quiet on the wire, which is why it must not be quiet to an
                 // operator: a line that stops rotating is a line whose blocklist stops going stale.
                 tracing::warn!(
@@ -264,9 +332,97 @@ pub fn spawn_ingress_rotation<F: fanos_field::Field + 'static>(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// **A published ingress key verifies only at a coordinate its publisher can prove** (#262).
+    ///
+    /// Driven through `ingress_key_record`/`open_ingress_key_record` — the functions the publisher and the
+    /// resolver actually call — and not through `Entitlement` directly. #80 recorded why: its first version
+    /// of this binding tested the envelope in isolation and stayed green when the envelope was deleted from
+    /// `publish_load`, proving something the capability directory had already proven and nothing about this
+    /// directory. A test that survives the removal of what it tests is not a test.
+    #[test]
+    fn an_ingress_key_verifies_only_where_its_publisher_can_prove_a_coordinate() {
+        use fanos_field::F7;
+        use fanos_geometry::{Plane, Point};
+        use fanos_vrf::VrfSecret;
+
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([11u8; 32]);
+        let id = b"ingress-member-11".to_vec();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, &beacon);
+        let (_secret, public) = ingress_keypair(&[3u8; 32]);
+        let record = ingress_key_record(&public, Some(&(id.clone(), sk.public(), proof)));
+        let output = fanos_vrf::coordinate_output(&sk.public(), &id, epoch, &beacon, &proof)
+            .expect("the publisher's own credential yields its walk");
+
+        let mut refused = 0;
+        for i in 0..Plane::<F7>::N as usize {
+            let p = Point::<F7>::at(i);
+            let got = open_ingress_key_record::<F7>(&record, p.coords(), epoch, Some(beacon));
+            if fanos_vrf::probe_index_of::<F7>(&output, &p).is_some() {
+                assert_eq!(
+                    got.map(|k| k.encode()),
+                    Some(public.encode()),
+                    "a point on the publisher's own walk verifies"
+                );
+            } else {
+                assert!(got.is_none(), "a coordinate the publisher cannot prove is refused");
+                refused += 1;
+            }
+        }
+        // Same arithmetic the load directory's binding test states: PG(2,7) holds 57 points, a line holds
+        // q + 1 = 8, so 49 are unreachable for this publisher.
+        assert_eq!(refused, 49, "the forgery is refused at 49 of the plane's 57 points");
+    }
+
+    /// The binding is **epoch-scoped**, so a key cannot be replayed into the next epoch to hold a retired
+    /// member in the rotation after the line has moved on.
+    #[test]
+    fn an_ingress_key_does_not_verify_in_another_epoch() {
+        use fanos_field::F7;
+        use fanos_geometry::{Plane, Point};
+        use fanos_vrf::VrfSecret;
+
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([12u8; 32]);
+        let id = b"ingress-member-12".to_vec();
+        let (_, proof) = fanos_vrf::prove_coordinate::<F7>(&sk, &id, epoch, &beacon);
+        let (_secret, public) = ingress_keypair(&[4u8; 32]);
+        let record = ingress_key_record(&public, Some(&(id.clone(), sk.public(), proof)));
+        let output = fanos_vrf::coordinate_output(&sk.public(), &id, epoch, &beacon, &proof)
+            .expect("the publisher's own credential yields its walk");
+        let mine = (0..Plane::<F7>::N as usize)
+            .map(Point::<F7>::at)
+            .find(|p| fanos_vrf::probe_index_of::<F7>(&output, p).is_some())
+            .expect("a walk reaches at least one point");
+
+        assert!(
+            open_ingress_key_record::<F7>(&record, mine.coords(), epoch, Some(beacon)).is_some(),
+            "it verifies in the epoch it was made for"
+        );
+        assert!(
+            open_ingress_key_record::<F7>(&record, mine.coords(), Epoch::new(4), Some(beacon)).is_none(),
+            "and not in the next one — the credential names its epoch"
+        );
+    }
+
+    /// A deployment that cannot prove coordinates still round-trips, and the reader says so by asking with
+    /// `None`. Asserted because the alternative — a bound-only reader — would take every such deployment's
+    /// ingress line offline rather than leave it as unprotected as it was.
+    #[test]
+    fn an_unbound_deployment_still_round_trips_its_ingress_key() {
+        use fanos_field::F7;
+        let (_secret, public) = ingress_keypair(&[5u8; 32]);
+        let record = ingress_key_record(&public, None);
+        assert_eq!(
+            open_ingress_key_record::<F7>(&record, [1, 0, 1], Epoch::new(2), None).map(|k| k.encode()),
+            Some(public.encode()),
+            "no credential to check, so the bare public is the whole record"
+        );
+    }
 
     #[test]
     fn ingress_key_slots_are_deterministic_distinct_and_domain_separated() {
