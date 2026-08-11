@@ -327,3 +327,61 @@ async fn persistent_credentials_keep_the_same_coordinate_across_restarts() {
         .expect("spawn from reloaded credentials");
     assert_eq!(b.address(), coord, "coordinate is stable across restarts");
 }
+
+/// **The send ladder's last rung reaches a configured entry address** (#263).
+///
+/// A coordinate with no directory address, no cached connection and no relay hub used to be a bare drop.
+/// That is exactly the state a node lands in when its own lawful reseat overwrote the one address it was
+/// given (#263), and the address it needs is the one the operator configured — held outside the coordinate
+/// map so nothing can arbitrate it away.
+///
+/// **Asserted on the attempt, not a delivery.** The rung is recovery: the frame that triggered it is dropped
+/// and the dial runs detached, because awaiting it would put a `DIAL_TIMEOUT` on the drop path (#129). What
+/// the dial buys is the next frame.
+///
+/// Falsified by not arming the entry list — the station never fires, because the ladder has nothing below
+/// the hub. That is also the pre-#263 behaviour, so the same edit reproduces the defect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unroutable_coordinate_falls_back_to_a_configured_entry_address() {
+    let dir = Directory::new();
+    let a = spawn_distinct(&dir, &[]).await;
+    let b = spawn_distinct(&dir, &[a.address()]).await;
+
+    // The operator's bootstrap line, recorded the way `seed_directory` does: the ADDRESS on its own, with
+    // no coordinate attached, because the coordinate is the perishable half.
+    dir.note_entry(b.local_addr());
+
+    // A point nobody holds and the directory does not name, so the ladder falls through every rung above.
+    let orphan = [1u32, 1, 1];
+    assert_ne!(orphan, a.address());
+    assert_ne!(orphan, b.address());
+    assert_eq!(dir.resolve(orphan), None, "the precondition is an UNROUTABLE coordinate, not a slow one");
+
+    a.command(Command::Send { to: orphan, payload: b"nobody holds this point".to_vec() });
+
+    let fell_back = tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            let n = entry_fallbacks(&a);
+            if n > 0 {
+                return n;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "with no address, no cached connection and no hub, the configured entry address is the only thing \
+         left — and before #263 the ladder simply dropped the frame there",
+    );
+    assert!(fell_back > 0);
+}
+
+/// Count of `directory.entry_fallback` on a node's transport driver.
+fn entry_fallbacks(node: &NodeHandle) -> u64 {
+    node.client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "directory.entry_fallback")
+        .map(|o| o.count)
+        .sum()
+}

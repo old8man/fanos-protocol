@@ -2531,6 +2531,9 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
     // Hubs already asked to broker a punch to `to` — see the relay branch below. Local to this worker, so
     // it needs no lock, and bounded by the plane's point count because a hub is a peer coordinate.
     let mut asked: BTreeSet<Triple> = BTreeSet::new();
+    // Configured entry addresses already dialed for this peer — the last rung's bound (#263). Local for the
+    // same reason `asked` is, and bounded by the operator's own bootstrap list.
+    let mut entries_tried: BTreeSet<SocketAddr> = BTreeSet::new();
     // The address whose dial already failed — see the reachability decision below. Per-peer, because this
     // worker is.
     let mut dead_addr: Option<SocketAddr> = None;
@@ -2598,8 +2601,33 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // ends — exactly the topology the overlay's cell membership creates. This frame relays either
             // way: a punch is asynchronous, and the traffic must not wait on it.
             send_uni(&hub, &t.shaper, t.joining(&hub), &encode_relay(to, t.me, &frame)).await;
+        } else if let Some(entry) = t.directory.entries().into_iter().find(|a| entries_tried.insert(*a)) {
+            // **The last rung: a configured entry address** (#263). No direct path, no hub — which on a
+            // small or freshly-partitioned cell is exactly where a node lands when its own lawful reseat
+            // overwrote the one address it was given. The entry list is held outside the coordinate map
+            // precisely so nothing can arbitrate it away; see `Directory::entries`.
+            //
+            // **Dialed with `to` even though the entry is probably not `to`.** The handshake settles who is
+            // there: if the entry IS `to`'s current address the connection is filed under `to` and the next
+            // frame goes direct, and if it is not, the peer is filed at the coordinate it PROVED and becomes
+            // the hub this ladder's rung above can use. Both outcomes are the dialer's existing behaviour;
+            // what had to change first was that neither of them threw the connection away (#264) and that a
+            // surplus one no longer costs the answering peer its route (#265). This rung was red for three
+            // passes on exactly those two defects.
+            //
+            // **Spawned, never awaited.** Awaiting put a full `DIAL_TIMEOUT` on the *drop* path — the one
+            // path that must be fast, because it is reached when there is nothing to wait for. That is
+            // #129's stall, and the comment on the direct dial above already says so. Recovery is also what
+            // this rung *is*: this frame is dropped either way, and the dial buys the next one.
+            t.record_station(Station::DirectoryEntryFallback, Some(to), None);
+            let recover = t.clone();
+            tokio::spawn(async move {
+                let _ = get_or_connect(&recover, to, entry).await;
+            });
+            t.directory.note_unresolved_drop(to);
         } else {
-            // Genuinely unroutable (no direct path and no hub): drop, counted + logged so it is observable.
+            // Genuinely unroutable (no direct path, no hub, no untried entry): drop, counted + logged so it
+            // is observable.
             t.directory.note_unresolved_drop(to);
         }
     }
@@ -2738,7 +2766,6 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             match handshake.peer {
                 PeerIdentity::Proven(actual) if actual == to => {}
                 PeerIdentity::Proven(actual) => {
-                    t.record_station(Station::DirectoryStaleCoordinate, Some(to), None);
                     // Sound by the same rule `spawn_punch` already follows: an address binding is recorded
                     // only for a coordinate that was *proved* at it, and this one was, over mutual TLS to an
                     // address we chose ourselves.
@@ -2775,7 +2802,14 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // another. Read-then-write was the first form of this and had a window: a rebinding
                     // landing between the `resolve` and the `remove` was deleted by a decision taken before
                     // it existed. `remove_if` closes the pair inside one write lock (#241).
-                    let _ = t.directory.remove_if(to, addr);
+                    // **Recorded on the retraction, not before it** (#263). The station means "our entry
+                    // sent this dial to the wrong node", and `remove_if` answers exactly that: it returns
+                    // whether the directory really did name `addr` for `to`. The entry-address rung dials an
+                    // address the directory never named, so the old unconditional record would have reported
+                    // a stale entry that did not exist — a counter lying about the one thing it is for.
+                    if t.directory.remove_if(to, addr) {
+                        t.record_station(Station::DirectoryStaleCoordinate, Some(to), None);
+                    }
                     // **The connection is KEPT, filed under the coordinate it proved** (#264). It used to be
                     // dropped here, with the reason "caching a connection that arrived through a *failed*
                     // dial is a new state for the connection map, and this change is about the directory".

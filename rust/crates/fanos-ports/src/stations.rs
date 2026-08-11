@@ -361,6 +361,21 @@ pub enum Station {
     /// this one, which is zero on every ordinary accept.
     ConnSurplusHeld,
 
+    /// An unroutable coordinate made this node dial a **configured entry address** (#263) — the send
+    /// ladder's last rung, below the relay hub.
+    ///
+    /// **Counts the attempt, not a delivery.** The rung is recovery rather than routing: the frame that
+    /// triggered it is dropped (`unresolved_drops` rises with it) and the dial runs detached, so the drop
+    /// path stays fast — awaiting it put a full `DIAL_TIMEOUT` on the one path that must not wait, which is
+    /// #129's stall. What it buys is the *next* frame, once the handshake has filed whoever answered at the
+    /// coordinate it proved.
+    ///
+    /// Zero on a healthy node: reached only when a coordinate has no address, no cached connection and no
+    /// hub. A non-zero value says the address book lost a peer and the operator's bootstrap list is what the
+    /// node fell back to — useful precisely because that loss is silent in the map, which simply no longer
+    /// holds the entry.
+    DirectoryEntryFallback,
+
     /// A POROS line rotation **did not arm**: the outgoing roster admits no valid contributor subset at the
     /// line's threshold, so this node prepared nothing and will keep serving on the share it already holds
     /// until that share's epoch expires (#243).
@@ -841,6 +856,7 @@ impl Station {
         Self::DirectoryStaleCoordinate,
         Self::DirectoryMovedPeerRetained,
         Self::ConnSurplusHeld,
+        Self::DirectoryEntryFallback,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
@@ -895,6 +911,7 @@ impl Station {
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
             Self::ConnSurplusHeld => "conns.surplus_held",
+            Self::DirectoryEntryFallback => "directory.entry_fallback",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
@@ -1004,6 +1021,7 @@ impl Station {
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld
+            | Self::DirectoryEntryFallback
             | Self::PorosRotationUnarmed
             | Self::DirectorySeatSuperseded
             | Self::DirectoryRouteSuperseded
