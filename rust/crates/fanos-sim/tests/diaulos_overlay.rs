@@ -32,9 +32,9 @@ fn dispatch(
     for obs in &notes[*seen..] {
         if let Notification::Delivered { from, payload } = &obs.note {
             if obs.node == service_node {
-                server.handle_delivery(keypair, *from, payload, srng);
+                let _ = server.handle_delivery(keypair, *from, payload, srng);
             } else if obs.node == client_node {
-                client.handle_delivery(*from, payload);
+                let _ = client.handle_delivery(*from, payload);
             }
         }
     }

@@ -342,13 +342,13 @@ fn drain(
             // A client request arriving at the service's meeting line: the transport ingests it (binding
             // the cookie to its reply circuit) and surfaces the inner DIAULOS bytes for the server.
             if let Some((_cookie, payload)) = rservice.ingest(&bytes) {
-                server.handle_payload(keypair, &payload, srng);
+                let _ = server.handle_payload(keypair, &payload, srng);
             }
         } else if reply_members.contains(&recv) && let Some(cell) = bytes.get(16..) {
             // A service reply arriving at the client's rendezvous: strip the 16-byte session-cookie prefix
             // the service tags every reply with (a shared relay uses it to demultiplex clients), then feed
             // the client's DIAULOS session the cell.
-            client.handle_payload(cell);
+            let _ = client.handle_payload(cell);
         }
     }
 }
@@ -462,7 +462,7 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
             for (recv, bytes) in new {
                 if meeting_members.contains(&recv) {
                     if let Some((cookie, payload)) = rsvc.ingest(&bytes) {
-                        servers
+                        let _ = servers
                             .entry(cookie)
                             .or_default()
                             .handle_payload(&service, &payload, &mut srng);
@@ -473,9 +473,9 @@ fn one_service_demultiplexes_two_anonymous_clients_by_cookie() {
                     // claims. Coordinate-based routing would be ambiguous at the single point the two
                     // reply lines share.
                     if tag == cookie_a {
-                        client_a.handle_payload(cell);
+                        let _ = client_a.handle_payload(cell);
                     } else if tag == cookie_b {
-                        client_b.handle_payload(cell);
+                        let _ = client_b.handle_payload(cell);
                     }
                 }
             }

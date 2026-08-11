@@ -31,6 +31,96 @@ use crate::session::{self, Dialed, PendingDial};
 /// literally one type, so they cannot silently diverge.
 pub use fanos_ports::Triple as Coord;
 
+/// What one inbound payload did to a session — folded, or discarded for a **named** reason (#244).
+///
+/// # Why a value and not a bare `return`
+///
+/// Both sides of this module used to answer an inbound payload with four anonymous `return`s: an
+/// unparseable frame, a well-formed frame in the wrong state, a refused handshake, and a delivery from the
+/// wrong coordinate all left the session unchanged and said nothing. The path is fed by a **peer** — on the
+/// service side by *any* peer — so "nothing happened" was the answer a session gave equally to a version
+/// mismatch and to someone probing it, which is the shape audit #109 closed for POROS one layer down.
+///
+/// `#[must_use]` is what keeps the reasons named: a caller has to decide, and a future one cannot re-create
+/// the silence by ignoring the value.
+///
+/// # What a caller does with it
+///
+/// This crate is sans-I/O and holds no telemetry sink, so it **counts** rather than reports: each session
+/// carries a per-class tally a driver reads the same way it already reads `stalled_attempts` — the other
+/// "is this peer gone or merely slow" input. Deciding that a session whose every payload is discarded
+/// should be abandoned is a **give-up rule**, and this platform does not invent those without a
+/// derivation, so the tally is exposed and no threshold is chosen here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use]
+pub enum Ingest {
+    /// Folded into the session: a handshake completed, or a cell reached the connection.
+    Folded,
+    /// The bytes did not parse as an overlay frame at all.
+    Unframed,
+    /// A well-formed frame whose tag does not belong in the session's current state — a cell before the
+    /// handshake, a hello after it, or a tag this version does not know.
+    OutOfState,
+    /// The handshake reply parsed but was non-contributory (audit B5); the session is now failed.
+    HandshakeRefused,
+    /// A delivery from a coordinate that is not the bound peer.
+    WrongSender,
+}
+
+impl Ingest {
+    /// Every variant — the tally's width, and a tag vocabulary.
+    pub const ALL: [Ingest; 5] = [
+        Ingest::Folded,
+        Ingest::Unframed,
+        Ingest::OutOfState,
+        Ingest::HandshakeRefused,
+        Ingest::WrongSender,
+    ];
+
+    /// This outcome's stable snake_case name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Ingest::Folded => "folded",
+            Ingest::Unframed => "unframed",
+            Ingest::OutOfState => "out_of_state",
+            Ingest::HandshakeRefused => "handshake_refused",
+            Ingest::WrongSender => "wrong_sender",
+        }
+    }
+
+    /// Whether the payload changed nothing — every variant but [`Folded`](Self::Folded).
+    #[must_use]
+    pub const fn is_drop(self) -> bool {
+        !matches!(self, Ingest::Folded)
+    }
+
+    /// Dense index into [`ALL`](Self::ALL) — the tally slot, and the tag a station would carry.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Ingest::Folded => 0,
+            Ingest::Unframed => 1,
+            Ingest::OutOfState => 2,
+            Ingest::HandshakeRefused => 3,
+            Ingest::WrongSender => 4,
+        }
+    }
+}
+
+// `index` must be `ALL`'s position, checked by the compiler: a new variant then cannot overflow the tally
+// or collide on a slot, and the `match`es above cannot be left short (#268).
+const _: () = {
+    // Destructured rather than indexed: the pattern's arity is the count, so a new variant breaks this
+    // line, and no bounds check is involved.
+    let [folded, unframed, out_of_state, refused, wrong_sender] = Ingest::ALL;
+    assert!(folded.index() == 0, "Ingest::index disagrees with its position in ALL");
+    assert!(unframed.index() == 1, "Ingest::index disagrees with its position in ALL");
+    assert!(out_of_state.index() == 2, "Ingest::index disagrees with its position in ALL");
+    assert!(refused.index() == 3, "Ingest::index disagrees with its position in ALL");
+    assert!(wrong_sender.index() == 4, "Ingest::index disagrees with its position in ALL");
+};
+
 // The two frame tags this overlay binding speaks, distinguishing a session HELLO from a data cell. Wire
 // values: fixed by the format and read by the peer, so they may never change without a version bump.
 const TAG_HELLO: u8 = 0x01;
@@ -67,6 +157,8 @@ const MAX_HELLO_RESEND_GAP: u32 = 32;
 pub struct ClientSession {
     service: Coord,
     state: ClientState,
+    /// Per-class tally of what inbound payloads did (#244) — see [`Ingest`].
+    drops: [u32; Ingest::ALL.len()],
 }
 
 enum ClientState {
@@ -112,6 +204,7 @@ impl ClientSession {
         Self {
             service,
             state: ClientState::Handshaking { pending, hello, polls_until_resend: 0, resend_gap: 1 },
+            drops: [0; Ingest::ALL.len()],
         }
     }
 
@@ -123,6 +216,7 @@ impl ClientSession {
         Some(Self {
             service,
             state: ClientState::Handshaking { pending, hello, polls_until_resend: 0, resend_gap: 1 },
+            drops: [0; Ingest::ALL.len()],
         })
     }
 
@@ -187,9 +281,15 @@ impl ClientSession {
 
     /// Ingest a payload from the peer (the transport has already resolved addressing). A `ServerHello`
     /// completes the handshake; a cell feeds the live connection.
-    pub fn handle_payload(&mut self, payload: &[u8]) {
+    pub fn handle_payload(&mut self, payload: &[u8]) -> Ingest {
+        let outcome = self.ingest(payload);
+        self.tally(outcome)
+    }
+
+    /// The ingest decision itself, separated from the tally so the tally has exactly one site.
+    fn ingest(&mut self, payload: &[u8]) -> Ingest {
         let Some((tag, body)) = unframe(payload) else {
-            return;
+            return Ingest::Unframed;
         };
         match (&self.state, tag) {
             (ClientState::Handshaking { .. }, TAG_HELLO) => {
@@ -198,23 +298,48 @@ impl ClientSession {
                     && let Some(dialed) = pending.establish(body)
                 {
                     self.state = ClientState::Live { dialed };
+                    return Ingest::Folded;
                 }
+                // The state is already `Failed` — deliberately, so a refused hello is observable in the
+                // session and not only in this return value.
+                Ingest::HandshakeRefused
             }
             (ClientState::Live { .. }, TAG_CELL) => {
                 if let ClientState::Live { dialed } = &mut self.state {
                     dialed.conn.on_cell(body);
+                    return Ingest::Folded;
                 }
+                Ingest::OutOfState
             }
-            _ => {}
+            _ => Ingest::OutOfState,
         }
+    }
+
+    /// Count `outcome` and hand it back — the one place the tally moves.
+    fn tally(&mut self, outcome: Ingest) -> Ingest {
+        if let Some(slot) = self.drops.get_mut(outcome.index()) {
+            *slot = slot.saturating_add(1);
+        }
+        outcome
+    }
+
+    /// How many inbound payloads landed in each [`Ingest`] class, indexed by [`Ingest::index`].
+    ///
+    /// The counterpart to `stalled_attempts` on the *inbound* side: that one says the peer is not
+    /// acknowledging, this one says the peer is talking and being discarded. A driver that reads only the
+    /// first cannot tell a silent peer from an incompatible one.
+    #[must_use]
+    pub fn ingest_drops(&self) -> [u32; Ingest::ALL.len()] {
+        self.drops
     }
 
     /// Ingest an overlay delivery — [`handle_payload`](Self::handle_payload) gated on the sender being
     /// the dialed service coordinate (deliveries from elsewhere are ignored).
-    pub fn handle_delivery(&mut self, from: Coord, payload: &[u8]) {
+    pub fn handle_delivery(&mut self, from: Coord, payload: &[u8]) -> Ingest {
         if from == self.service {
-            self.handle_payload(payload);
+            return self.handle_payload(payload);
         }
+        self.tally(Ingest::WrongSender)
     }
 
     /// Append request bytes to the primary stream (no-op until live).
@@ -311,6 +436,9 @@ pub struct ServerSession {
     /// Set when a `ClientHello` arrives, cleared when the `ServerHello` is (re)sent this poll.
     resend_hello: bool,
     primary: Option<u32>,
+    /// Per-class tally of what inbound payloads did (#244) — see [`Ingest`]. On this side the path is fed
+    /// by *any* peer, so the tally is the only thing separating a version mismatch from a probe.
+    drops: [u32; Ingest::ALL.len()],
 }
 
 impl ServerSession {
@@ -388,9 +516,20 @@ impl ServerSession {
         keypair: &StaticKeypair,
         payload: &[u8],
         rng: &mut R,
-    ) {
+    ) -> Ingest {
+        let outcome = self.ingest(keypair, payload, rng);
+        self.tally(outcome)
+    }
+
+    /// The ingest decision itself, separated from the tally so the tally has exactly one site.
+    fn ingest<R: CryptoRng>(
+        &mut self,
+        keypair: &StaticKeypair,
+        payload: &[u8],
+        rng: &mut R,
+    ) -> Ingest {
         let Some((tag, body)) = unframe(payload) else {
-            return;
+            return Ingest::Unframed;
         };
         match tag {
             TAG_HELLO => {
@@ -401,8 +540,13 @@ impl ServerSession {
                     self.server_hello = Some(hello);
                 }
                 if self.server_hello.is_some() {
+                    // Either this hello was accepted just now, or an earlier one was and this is a
+                    // resend — both are progress, and re-arming the `ServerHello` is the answer.
                     self.resend_hello = true;
+                    return Ingest::Folded;
                 }
+                // No cached hello: `accept` refused this one and there was no session to resend for.
+                Ingest::HandshakeRefused
             }
             TAG_CELL => {
                 if let Some(conn) = &mut self.conn {
@@ -410,10 +554,31 @@ impl ServerSession {
                     if self.primary.is_none() {
                         self.primary = conn.accept();
                     }
+                    return Ingest::Folded;
                 }
+                // A cell before any handshake — nothing to decrypt it with.
+                Ingest::OutOfState
             }
-            _ => {}
+            _ => Ingest::OutOfState,
         }
+    }
+
+    /// Count `outcome` and hand it back — the one place the tally moves.
+    fn tally(&mut self, outcome: Ingest) -> Ingest {
+        if let Some(slot) = self.drops.get_mut(outcome.index()) {
+            *slot = slot.saturating_add(1);
+        }
+        outcome
+    }
+
+    /// How many inbound payloads landed in each [`Ingest`] class, indexed by [`Ingest::index`].
+    ///
+    /// On the service side this is the closest thing the session has to an attack sensor: a client that
+    /// cannot speak the protocol and one that is probing it produce the same *absence* of progress, and
+    /// differ only in which of these classes they fill.
+    #[must_use]
+    pub fn ingest_drops(&self) -> [u32; Ingest::ALL.len()] {
+        self.drops
     }
 
     /// Ingest an overlay delivery. Binds the client coordinate on the first accepted `ClientHello`;
@@ -424,16 +589,17 @@ impl ServerSession {
         from: Coord,
         payload: &[u8],
         rng: &mut R,
-    ) {
+    ) -> Ingest {
         if let Some(client) = self.client
             && from != client
         {
-            return;
+            return self.tally(Ingest::WrongSender);
         }
-        self.handle_payload(keypair, payload, rng);
+        let outcome = self.handle_payload(keypair, payload, rng);
         if self.client.is_none() && self.conn.is_some() {
             self.client = Some(from);
         }
+        outcome
     }
 
     /// The client's primary stream, once its first cell has arrived.
@@ -573,7 +739,8 @@ mod tests {
             // client → service
             for (to, payload) in datagrams(client.poll_transmit()) {
                 assert_eq!(to, SERVICE);
-                server.handle_delivery(&service_kp, CLIENT, &payload, &mut srng);
+                let got = server.handle_delivery(&service_kp, CLIENT, &payload, &mut srng);
+                assert_eq!(got, Ingest::Folded, "the honest exchange must fold every payload");
             }
             // Once live, the client writes its request exactly once.
             if client.is_live() && !wrote_request {
@@ -595,7 +762,8 @@ mod tests {
             // service → client
             for (to, payload) in datagrams(server.poll_transmit()) {
                 assert_eq!(to, CLIENT);
-                client.handle_delivery(SERVICE, &payload);
+                let got = client.handle_delivery(SERVICE, &payload);
+                assert_eq!(got, Ingest::Folded, "the honest exchange must fold every payload");
             }
             if client.is_done() {
                 break;
@@ -615,8 +783,13 @@ mod tests {
         let mut rng = SeedRng::from_seed(b"diaulos-overlay-2");
         let kp = StaticKeypair::generate(&mut rng);
         let mut client = ClientSession::dial(SERVICE, kp.public(), &mut rng);
-        // A hello "from" the wrong coordinate must not complete the handshake.
-        client.handle_delivery([9, 9, 9], &framed(TAG_HELLO, b"junk"));
+        // A hello "from" the wrong coordinate must not complete the handshake — and must SAY so, not
+        // merely fail to help: before #244 this was indistinguishable from the service never answering.
+        let got = client.handle_delivery([9, 9, 9], &framed(TAG_HELLO, b"junk"));
+        assert_eq!(got, Ingest::WrongSender);
         assert!(!client.is_live());
+        let drops = client.ingest_drops();
+        assert_eq!(drops.get(Ingest::WrongSender.index()), Some(&1), "the tally must carry the refusal");
+        assert_eq!(drops.get(Ingest::Folded.index()), Some(&0), "nothing was folded");
     }
 }

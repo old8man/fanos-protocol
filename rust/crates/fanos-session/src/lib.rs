@@ -19,7 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fanos_diaulos::{ClientSession, Coord, ServerSession, StaticKeypair};
+use fanos_diaulos::{ClientSession, Coord, Ingest, ServerSession, StaticKeypair};
 use rand_core::CryptoRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc::error::TrySendError;
@@ -277,8 +277,13 @@ trait SessionStream: Send + 'static {
     /// (a caller that also ticks the clock reactively can race it ahead of real time under load — the
     /// mechanism behind the anonymous-session retransmit-storm livelock this split exists to prevent).
     fn poll_new(&mut self) -> Vec<Vec<u8>>;
-    /// Fold a received datagram cell into the session.
-    fn handle_payload(&mut self, payload: &[u8]);
+    /// Fold a received datagram cell into the session, and say what it did (#244).
+    ///
+    /// The return value is the inbound counterpart of [`stalled_attempts`](Self::stalled_attempts): that
+    /// one reports a peer that is not acknowledging, this one a peer that is talking and being discarded.
+    /// A driver reading only the first cannot tell a silent peer from an incompatible one — which was the
+    /// state of things while every discard here was a bare `return`.
+    fn handle_payload(&mut self, payload: &[u8]) -> Ingest;
     /// How many times the most-retransmitted unacknowledged segment has been resent — TCP's `R2`
     /// statistic (RFC 1122 §4.2.3.5), which is how `drive` tells a peer that is **gone** from one
     /// that is merely slow. Zero while handshaking and for a stream whose window is fully acked.
@@ -313,8 +318,8 @@ impl SessionStream for ClientSession {
     fn poll_new(&mut self) -> Vec<Vec<u8>> {
         ClientSession::poll_new(self)
     }
-    fn handle_payload(&mut self, payload: &[u8]) {
-        ClientSession::handle_payload(self, payload);
+    fn handle_payload(&mut self, payload: &[u8]) -> Ingest {
+        ClientSession::handle_payload(self, payload)
     }
     fn stalled_attempts(&self) -> u32 {
         ClientSession::stalled_attempts(self)
@@ -371,13 +376,15 @@ impl<R: CryptoRng + Send + 'static> SessionStream for ServerStream<R> {
     fn poll_new(&mut self) -> Vec<Vec<u8>> {
         self.server.poll_new()
     }
-    fn handle_payload(&mut self, payload: &[u8]) {
-        self.server
+    fn handle_payload(&mut self, payload: &[u8]) -> Ingest {
+        let outcome = self
+            .server
             .handle_payload(&self.keypair, payload, &mut self.rng);
         // Latch the primary stream id once the handshake opens it.
         if self.stream_id.is_none() {
             self.stream_id = self.server.primary();
         }
+        outcome
     }
     fn stalled_attempts(&self) -> u32 {
         self.server.stalled_attempts()
@@ -565,9 +572,14 @@ async fn drive<S: SessionStream>(
                     // Coalesce: absorb this delivery and every other one already queued, then emit once
                     // (the ack for the whole batch plus any newly-unblocked segments). A burst of N
                     // deliveries costs one emit, not N.
-                    session.handle_payload(&payload);
+                    // The outcome is acknowledged rather than re-counted: the session tallies every
+                    // class itself (`ingest_drops`), so folding a second copy here would be two
+                    // accountings of one event. Acting on it — abandoning a session whose every payload
+                    // is discarded — is a give-up rule, and this platform derives those before it ships
+                    // them (#244, and see the residual on `ready` in that task).
+                    let _: Ingest = session.handle_payload(&payload);
                     while let Ok(more) = inbound.try_recv() {
-                        session.handle_payload(&more);
+                        let _: Ingest = session.handle_payload(&more);
                     }
                     emit = Emit::Reactive;
                 }
@@ -681,9 +693,10 @@ mod tests {
             tokio::select! {
                 maybe = inbound.recv() => match maybe {
                     Some(payload) => {
-                        server.handle_payload(&keypair, &payload, &mut rng);
+                        // Acknowledged, not re-counted — see the client-side loop above (#244).
+                        let _: Ingest = server.handle_payload(&keypair, &payload, &mut rng);
                         while let Ok(more) = inbound.try_recv() {
-                            server.handle_payload(&keypair, &more, &mut rng);
+                            let _: Ingest = server.handle_payload(&keypair, &more, &mut rng);
                         }
                     }
                     None => return,
@@ -847,9 +860,9 @@ mod tests {
             tokio::select! {
                 msg = inbound.recv() => match msg {
                     Some((_from, payload)) => {
-                        server.handle_payload(&keypair, &payload, &mut rng);
+                        let _: Ingest = server.handle_payload(&keypair, &payload, &mut rng);
                         while let Ok((_from, more)) = inbound.try_recv() {
-                            server.handle_payload(&keypair, &more, &mut rng);
+                            let _: Ingest = server.handle_payload(&keypair, &more, &mut rng);
                         }
                     }
                     None => return,
@@ -1020,7 +1033,7 @@ mod tests {
         while server.primary().is_none() {
             match inbound.recv().await {
                 Some(payload) => {
-                    server.handle_payload(&keypair, &payload, &mut rng);
+                    let _: Ingest = server.handle_payload(&keypair, &payload, &mut rng);
                     for out in server.poll_payloads() {
                         if !offer(&outbound, out) {
                             return;

@@ -44,5 +44,5 @@ pub use handshake::{
     ClientHandshake, ServerHandshake, SessionKeys, StaticKeypair, bundle_from_identity, bundle_from_kem_public,
     service_public_from_bundle,
 };
-pub use overlay::{ClientSession, Coord, ServerSession};
+pub use overlay::{ClientSession, Coord, Ingest, ServerSession};
 pub use session::{Dialed, PendingDial, accept, dial, dial_bundle};
