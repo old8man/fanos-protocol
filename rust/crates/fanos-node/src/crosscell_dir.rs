@@ -5,7 +5,7 @@
 //! - **Checkpoint directory** ([`publish_checkpoint`] / [`attest_children`]) — each cell publishes its latest
 //!   [`ExecCertificate`] for the epoch at a cell-and-epoch slot; a parent cell reads its children's
 //!   certificates and anchors their finality through a [`ChildRegistry`], giving *live* shared security.
-//! - **Cross-cell receipt inbox** ([`publish_receipt`] / `drain_inbox`) — a source cell publishes a
+//! - **Cross-cell receipt inbox** ([`publish_receipt`] / [`drain_inbox`]) — a source cell publishes a
 //!   [`CrossCellReceipt`] to the destination cell's inbox slot; the destination reads and (its state machine)
 //!   verifies + applies it, trusting no bridge.
 //!
@@ -49,7 +49,7 @@ use fanos_taxis::hierarchy::ChildRegistry;
 use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
-use crate::resolve::STORE_TIMEOUT;
+use crate::resolve::{Read, STORE_TIMEOUT};
 
 /// A cell's checkpoint slot: the store address its latest execution certificate for `epoch` lives at.
 fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
@@ -202,18 +202,122 @@ pub async fn publish_receipt(client: &Client, source_cell: u32, receipt: &CrossC
     client.put(slot, receipt.to_bytes()).await
 }
 
-/// Read the cross-cell receipt for `(dest_cell, source_cell, nonce)` from the inbox, or `None`. The caller
+/// Read the cross-cell receipt for `(dest_cell, source_cell, nonce)` from the inbox, three-valued. The caller
 /// verifies it against the source cell's committee ([`CrossCellReceipt::verify`]) before applying — no trust in
 /// the relaying bridge or the store.
+///
+/// [`Read::Absent`] and [`Read::Unknown`] are kept apart because [`drain_inbox`] has to tell them apart: an
+/// empty slot ends a walk, a timeout must not.
 pub async fn read_receipt(
     client: &Client,
     dest_cell: u32,
     source_cell: u32,
     nonce: u64,
-) -> Option<CrossCellReceipt> {
-    let bytes =
-        tokio::time::timeout(STORE_TIMEOUT, client.get(receipt_slot(dest_cell, source_cell, nonce))).await.ok()??;
-    CrossCellReceipt::from_bytes(&bytes)
+) -> Read<CrossCellReceipt> {
+    // `read`, not `get`: `get` collapses "the slot is empty" and "the read did not conclude" into one
+    // `None`, and telling those apart is the whole of the walk below.
+    Read::of(
+        tokio::time::timeout(STORE_TIMEOUT, client.read(receipt_slot(dest_cell, source_cell, nonce)))
+            .await
+            .ok(),
+        CrossCellReceipt::from_bytes,
+    )
+}
+
+/// What a drain does with one slot's read — the whole content of [`drain_inbox`], named.
+///
+/// Carries the receipt rather than reporting on it, so the walk applies the rule to the value it actually
+/// read. A verdict computed from one read and then acted on by re-reading is two readings of two moments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Step<T> {
+    /// A receipt is here: apply it and advance the cursor.
+    Take(T),
+    /// A **definite** gap — the source has published nothing at this nonce. Nonces are per-source monotonic
+    /// (`fanos_taxis::crosscell`), so nothing beyond it can exist yet: the inbox is drained to here, and the
+    /// cursor stops at this nonce because it is where the next message will land.
+    Exhausted,
+    /// The read did not conclude. The walk ends and **concludes nothing**: the cursor does not advance, and
+    /// the result is not evidence of an empty inbox.
+    ///
+    /// This is the one distinction that makes a drain safe to run repeatedly. Folding it into `Exhausted`
+    /// would let one timeout mark the inbox drained and skip every message behind the gap, permanently — the
+    /// `Read` rule this crate states without exception: an incomplete scan may make a caller decline to act,
+    /// never act on a substitute.
+    Inconclusive,
+}
+
+/// The drain's rule, as a function of one read.
+pub fn step<T>(read: Read<T>) -> Step<T> {
+    match read {
+        Read::Found(receipt) => Step::Take(receipt),
+        Read::Absent => Step::Exhausted,
+        Read::Unknown => Step::Inconclusive,
+    }
+}
+
+/// What one drain pass recovered, and whether it saw the bottom of the inbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Drained<T> {
+    /// The receipts, in nonce order from the requested start. **Unverified** — the caller checks each
+    /// against the source cell's committee before applying.
+    pub receipts: Vec<T>,
+    /// The nonce to resume from next time.
+    pub next: u64,
+    /// Whether the walk ended at a definite gap. `false` means a read did not conclude or the cap was hit,
+    /// so the inbox may hold more at [`next`](Self::next) and this pass is **not** evidence of an empty one.
+    pub complete: bool,
+}
+
+/// Walk `(dest_cell ← source_cell)` from nonce `from`, taking at most `max` receipts.
+///
+/// The inbox had a writer and no reader: [`publish_receipt`] addresses a slot by the nonce carried *inside*
+/// the message, and [`read_receipt`] asks for a nonce, so a destination could only fetch a letter whose
+/// serial number it already knew. Nothing enumerated the slots, and nothing could — which is why the module
+/// header named a `drain_inbox` that was never written.
+///
+/// The walk is derived rather than chosen: nonces are **per-source monotonic** and the destination applies
+/// each `(source, nonce)` at most once, so successive nonces from a remembered cursor *are* the enumeration.
+/// The rule at each step is [`step`], and the whole reason it is three-valued is stated there.
+///
+/// `max` is the caller's, never a constant here: this is an unbounded read of a remote-controlled sequence,
+/// and the ceiling belongs to whoever has to hold the result (#194).
+pub async fn drain_inbox(
+    client: &Client,
+    dest_cell: u32,
+    source_cell: u32,
+    from: u64,
+    max: usize,
+) -> Drained<CrossCellReceipt> {
+    drain_with(from, max, |nonce| read_receipt(client, dest_cell, source_cell, nonce)).await
+}
+
+/// [`drain_inbox`]'s walk with the store lifted out, so the loop can be tested without one.
+///
+/// The split is not for convenience. What can be wrong here is the *stopping rule* and the cursor, and a
+/// test that needs a live overlay to reach them is a test that will not be written for a mechanism no
+/// deployment can run yet (#167: there is never a second cell).
+async fn drain_with<T, F, Fut>(from: u64, max: usize, read: F) -> Drained<T>
+where
+    F: Fn(u64) -> Fut,
+    Fut: Future<Output = Read<T>>,
+{
+    let mut receipts = Vec::new();
+    let mut nonce = from;
+    loop {
+        if receipts.len() >= max {
+            // The cap is not a gap. Stopping here says nothing about what is at `nonce`.
+            return Drained { receipts, next: nonce, complete: false };
+        }
+        match step(read(nonce).await) {
+            Step::Take(receipt) => {
+                receipts.push(receipt);
+                nonce += 1;
+            }
+            Step::Exhausted => return Drained { receipts, next: nonce, complete: true },
+            Step::Inconclusive => return Drained { receipts, next: nonce, complete: false },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,5 +400,56 @@ mod tests {
         // The two directories are domain-separated from each other and from the capability directory.
         assert!(!c.starts_with(b"FANOS-v1/xcell-inbox/") && !r.starts_with(b"FANOS-v1/cell-checkpoint/"));
         assert!(!c.starts_with(b"FANOS-v1/cap-desc/") && !r.starts_with(b"FANOS-v1/cap-desc/"));
+    }
+
+    // The walk is tested over `u64` rather than a receipt, because the walk does not depend on what it
+    // carries — and a hand-built receipt fixture would be a second thing that can be wrong about a
+    // mechanism nothing runs yet. Decoding is `CrossCellReceipt::from_bytes`, tested where it lives.
+
+    /// One pass drains what is there, in order, and says it saw the bottom.
+    #[tokio::test]
+    async fn a_drain_walks_the_monotonic_nonces_and_stops_at_a_definite_gap() {
+        let drained = drain_with(4, 100, |n| async move {
+            if (4..7).contains(&n) { Read::Found(n) } else { Read::Absent }
+        })
+        .await;
+        assert_eq!(drained.receipts, vec![4, 5, 6], "the walk takes successive nonces from the cursor");
+        assert_eq!(drained.next, 7, "and resumes where the next message will land");
+        assert!(drained.complete, "an empty slot is a definite bottom");
+    }
+
+    /// **The distinction the type exists for.** A timeout must not be read as an empty inbox.
+    ///
+    /// Falsify by mapping `Read::Unknown` to `Step::Exhausted`: this goes green on the receipts and red on
+    /// `complete`, and the failure it stands for is permanent — a drain that concluded "empty" advances
+    /// nothing, so every message behind the gap is skipped for good.
+    #[tokio::test]
+    async fn a_read_that_did_not_conclude_is_not_an_empty_inbox() {
+        let drained = drain_with(0, 100, |n| async move {
+            if n < 2 { Read::Found(n) } else { Read::Unknown }
+        })
+        .await;
+        assert_eq!(drained.receipts.len(), 2, "what was read is still returned");
+        assert_eq!(drained.next, 2, "the cursor stops at the slot that did not answer");
+        assert!(!drained.complete, "and the pass must not claim the inbox is empty");
+    }
+
+    /// The cap is the caller's, and hitting it is not a gap either.
+    #[tokio::test]
+    async fn the_callers_cap_stops_the_walk_without_concluding_anything() {
+        let drained = drain_with(0, 3, |n| async move { Read::Found(n) }).await;
+        assert_eq!(drained.receipts.len(), 3);
+        assert_eq!(drained.next, 3);
+        assert!(!drained.complete, "an inbox longer than the cap is not an inbox that ended");
+    }
+
+    /// An empty inbox and an unreachable one are different answers to the same question.
+    #[tokio::test]
+    async fn an_empty_inbox_and_an_unreachable_one_are_told_apart() {
+        let empty = drain_with::<u64, _, _>(0, 10, |_| async { Read::Absent }).await;
+        let unreachable = drain_with::<u64, _, _>(0, 10, |_| async { Read::Unknown }).await;
+        assert_eq!(empty.receipts, unreachable.receipts, "neither returns anything");
+        assert_eq!(empty.next, unreachable.next, "neither moves the cursor");
+        assert!(empty.complete && !unreachable.complete, "and only one of them is a reading");
     }
 }
