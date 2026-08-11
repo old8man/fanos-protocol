@@ -8,6 +8,30 @@
 //! one bound subject *and* still self-observing — which is the honest liveness gate a Kubernetes probe
 //! or an SLO should read, in place of a hand-picked latency.
 //!
+//! ## This is the canonical summary, and why it has to live here (#277)
+//!
+//! There were four summaries of one thing. Three are legitimate and one was a fossil:
+//!
+//! - **[`CoherenceSnapshot`] — canonical.** Everything an operator or an agent reads about a cell's
+//!   coherence goes through it: `fanos status coherence` off a deployed node's socket, the
+//!   `fanos-monitor` panel, the OpenMetrics exposition, `--json`.
+//! - `fanos_observatory::HealthSummary` — a five-field projection of this one for `/healthz`. A
+//!   projection, not a rival: its own doc is that the two can never disagree.
+//! - `fanos_sim::observatory::CoherenceReading` — the simulator's *forecasting* instrument, which sweeps a
+//!   cascade and measures lead time. It reads a matrix because it has no node and no wire; the simulator's
+//!   view of a node's telemetry goes through this snapshot, like production's.
+//! - `fanos_diakrisis::VitalSigns` — **deleted.** It called itself "the one canonical, stable summary of a
+//!   cell's health" and was constructed nowhere outside its own tests.
+//!
+//! The fossil is worth recording, because it says where the canonical summary *must* live. `VitalSigns`
+//! read a [`CoherenceMatrix`](fanos_diakrisis::CoherenceMatrix) — and a matrix does not know where it came
+//! from. So its readiness gate was `Φ ≥ 1 ∧ R ≥ 1/3`, the pre-#154 form: at the shipped
+//! `healthy_correlation = 0.45` a node that had observed **nothing** produces exactly those numbers and
+//! would have read ready. It could not have carried the third conjunct even if someone had thought to,
+//! because **readiness is a question about provenance as much as about magnitudes**, and provenance is a
+//! property of the frame. A summary one layer down cannot answer it. (Two smaller fossils rode along: band
+//! edges from the flat `1/√(N−1)`, and the *steering* stability radius on a *reporting* surface.)
+//!
 //! ## What must NOT be added here
 //!
 //! This is an **export** surface — its JSON leaves the node. The data-path plane's counters
@@ -341,6 +365,45 @@ mod tests {
     fn frame(r: f64) -> CoherenceFrame {
         let matrix = CoherenceMatrix::equicorrelated(7, r);
         CoherenceFrame::observe(CellId([0xAB; 16]), 9, &matrix, 0, 0.5, -1, 3, true)
+    }
+
+    /// The property that decides where the canonical summary can live (#277): readiness is a question
+    /// about **provenance**, not only about magnitudes, and a fold that cannot see provenance must not be
+    /// allowed to answer it.
+    ///
+    /// The two frames here carry *bit-identical* scalars — same matrix, same `Φ`, `P`, `R`, `r`. The only
+    /// difference is the measured bit, and it must decide the verdict on its own. `0.45` is not an
+    /// arbitrary correlation: it is the shipped `healthy_correlation`, the value the fallback evaluates its
+    /// model at when a node has no observation window, and it lands inside the band on purpose. That is
+    /// exactly why the deleted `VitalSigns` — which read a matrix, where the bit does not exist — reported
+    /// a node that had observed *nothing* as ready.
+    #[test]
+    fn two_frames_with_identical_scalars_disagree_on_readiness_when_one_measured_nothing() {
+        let matrix = CoherenceMatrix::equicorrelated(7, 0.45); // the shipped `healthy_correlation`
+        let measured = CoherenceFrame::observe(CellId([1; 16]), 1, &matrix, 0, 0.0, -1, 0, true);
+        let assumed = CoherenceFrame::observe(CellId([1; 16]), 1, &matrix, 0, 0.0, -1, 0, false);
+
+        let (m, a) = (
+            CoherenceSnapshot::from_frame(&measured),
+            CoherenceSnapshot::from_frame(&assumed),
+        );
+        assert_eq!(
+            (m.phi, m.purity, m.reflection, m.mean_correlation),
+            (a.phi, a.purity, a.reflection, a.mean_correlation),
+            "the two frames must differ ONLY in provenance, or this proves nothing about provenance"
+        );
+        assert!(
+            m.phi >= PHI_THRESHOLD && m.reflection >= REFLECTION_FLOOR,
+            "both numeric conjuncts hold at the shipped baseline (Φ={}, R={}) — which is what makes the \
+             assumed frame dangerous rather than obviously wrong",
+            m.phi,
+            m.reflection
+        );
+        assert!(m.is_ready(), "a measured cell in the band is ready");
+        assert!(
+            !a.is_ready(),
+            "a node that has observed nothing must not report ready on numbers it assumed (#154)"
+        );
     }
 
     #[test]

@@ -535,9 +535,18 @@ impl CoherenceMatrix {
         self.n >= 2 && self.mean_correlation() > systemic_correlation_at(self.diagonal_purity()) + 1e-12
     }
 
-    /// Whether the cell is **over-coupled** (`r > √(2/(N−1))`, equivalently `R < 1/3`):
+    /// Whether the cell is **over-coupled** — past its own band's upper edge with `R < 1/3`:
     /// integration has climbed past the collective-subject band and the cell is losing its
-    /// self-model (spec §18.2, §6.8). This — not the mere early-warning [`is_systemic`](Self::is_systemic)
+    /// self-model (spec §18.2, §6.8).
+    ///
+    /// This doc used to read *"`r > √(2/(N−1))`, **equivalently** `R < 1/3`"*. Those two are one line on
+    /// the equicorrelated stratum and two different lines off it, and #275 moved the code to the second
+    /// while leaving the sentence claiming they are the same. Measured on a Fano cell whose one line
+    /// exchanged more than the rest: `r = 0.5746` against a flat edge of `0.5774`, with `R = 0.3209` — over
+    /// -coupled, and below the edge the old sentence names. The word *equivalently* on a threshold is a
+    /// theorem with scope conditions, and this one's scope is a flat diagonal.
+    ///
+    /// This — not the mere early-warning [`is_systemic`](Self::is_systemic)
     /// — is the actionable *decouple* trigger: shedding correlation is warranted only once the
     /// cell leaves the healthy band, never while it is a legitimately integrated subject.
     #[must_use]

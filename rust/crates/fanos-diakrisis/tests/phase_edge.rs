@@ -9,7 +9,7 @@
 //! Its own honesty frame is "engineering results on a seven-dimensional reference implementation", which
 //! is the Fano cell's dimension, so T-316's stratum rule does not discount the transfer.
 //!
-//! FANOS measures **one**. [`classify_collective_at`] decides all three collective states by comparing the
+//! FANOS measures **one**. `classify_collective` decided all three collective states by comparing the
 //! smooth scalar `r` against a band. If aliveness steps somewhere the band does not mark, the classifier
 //! reports a healthy collective subject that is already dead — the shape of #184 and #99.
 //!
@@ -26,8 +26,7 @@
 
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
-use fanos_diakrisis::coherence::{CoherenceMatrix, R_TH};
-use fanos_diakrisis::vitals::VitalSigns;
+use fanos_diakrisis::coherence::{CoherenceMatrix, PHI_TH, R_TH};
 use fanos_diakrisis::window::CollectiveState;
 
 /// Cell size: the Fano plane's node count, and the size UHM's colony was measured at.
@@ -75,12 +74,19 @@ fn cell_at(lambda: f64) -> CoherenceMatrix {
 }
 
 /// One sweep point: what the classifier says, and whether the cell is actually alive.
+///
+/// Read straight off the matrix. This used to fold through `VitalSigns`, a summary at this layer that
+/// claimed to be the canonical one and was constructed by nobody in production; it was deleted with #277,
+/// and the reason is visible right here — its `ready` was `Φ ≥ 1 ∧ R ≥ 1/3` with no third conjunct,
+/// because *provenance is not a property of a matrix*. `integrated` and `self_modelling` below are those
+/// two numeric conjuncts, kept apart and named, which is all this sweep ever needed from it.
 struct Point {
     lambda: f64,
     r: f64,
     phi: f64,
     reflection: f64,
-    ready: bool,
+    integrated: bool,
+    self_modelling: bool,
     collective: CollectiveState,
 }
 
@@ -88,14 +94,16 @@ fn sweep() -> Vec<Point> {
     (0..=60)
         .map(|k| {
             let lambda = f64::from(k) / 60.0;
-            let v = VitalSigns::of(&cell_at(lambda));
+            let g = cell_at(lambda);
+            let m = g.measures();
             Point {
                 lambda,
-                r: v.mean_correlation,
-                phi: v.phi,
-                reflection: v.reflection,
-                ready: v.ready,
-                collective: v.collective,
+                r: g.mean_correlation(),
+                phi: m.phi,
+                reflection: m.reflection,
+                integrated: m.phi >= PHI_TH - 1e-9,
+                self_modelling: m.reflection >= R_TH - 1e-9,
+                collective: g.collective_state(),
             }
         })
         .collect()
@@ -117,12 +125,12 @@ fn the_band_must_mark_the_place_where_the_cell_stops_being_alive() {
 
     for p in &points {
         println!(
-            "λ={:.3}  r={:.4}  Φ={:.4}  R={:.4}  ready={}  {:?}",
-            p.lambda, p.r, p.phi, p.reflection, p.ready, p.collective
+            "λ={:.3}  r={:.4}  Φ={:.4}  R={:.4}  integrated={}  self_modelling={}  {:?}",
+            p.lambda, p.r, p.phi, p.reflection, p.integrated, p.self_modelling, p.collective
         );
     }
 
-    // The LOWER disagreement is not asserted here, and deliberately so: `classify_collective_at`'s own doc
+    // The LOWER disagreement is not asserted here, and deliberately so: `classify_collective`'s own doc
     // names `Φ > 1` with the mean below the floor as the *under-coupled band*, a used feature. Reading
     // that as a defect would be indicting a function without reading it.
     //
