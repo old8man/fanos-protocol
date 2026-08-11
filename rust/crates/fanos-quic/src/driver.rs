@@ -5005,7 +5005,7 @@ mod tests {
     ///
     /// Deliberately minimal: two endpoints, one dial, drop the dialer's only handle, watch the accepted
     /// side. No FANOS layers, because the question is about quinn's contract and nothing above it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropping_a_dialers_last_handle_is_visible_to_the_acceptor() {
         let creds = NodeCredentials::generate().expect("credentials");
         let (server, client, _cert) = node_configs_mutual_from(&creds).expect("tls");
@@ -5072,7 +5072,7 @@ mod tests {
     ///
     /// Falsified twice: `live.first()` (the shipped behaviour this task corrects) fails the newest
     /// assertion, and dropping the `retain` fails the survivor assertion.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_connection_map_hands_back_the_newest_and_drops_the_closed() {
         let creds = NodeCredentials::generate().expect("credentials");
         let (server, client, _cert) = node_configs_mutual_from(&creds).expect("tls");
