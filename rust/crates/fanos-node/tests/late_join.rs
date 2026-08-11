@@ -127,9 +127,18 @@ fn dump(tag: &str, n: &Node) {
         .iter()
         // The line matters for the directory stations: `directory.point_taken` carries the CONTESTED
         // coordinate, and "which point was taken" is the question the count alone cannot answer (#260).
-        .map(|o| match o.line {
-            Some(line) => format!("{}@{:?}={}", o.station.name(), line, o.count),
-            None => format!("{}={}", o.station.name(), o.count),
+        //
+        // The TAG matters for the frame stations, and leaving it out is why 20 runs could name a
+        // discriminator without saying what it was made of: `hello.restricted_frame_dropped = 2` on every
+        // failing run is a different fact depending on whether the two frames share a type (#267). Printed
+        // as `#code` because `FrameType` has no name table yet — a raw code the reader can look up beats a
+        // fabricated name, and beats the nothing that was here before.
+        .map(|o| {
+            let tag = o.tag.map(|t| format!("#{t}")).unwrap_or_default();
+            match o.line {
+                Some(line) => format!("{}@{:?}{tag}={}", o.station.name(), line, o.count),
+                None => format!("{}{tag}={}", o.station.name(), o.count),
+            }
         })
         .collect();
     v.sort();

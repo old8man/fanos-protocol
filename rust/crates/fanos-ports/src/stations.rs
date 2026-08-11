@@ -978,7 +978,16 @@ impl Station {
             // `AssignmentWithheld` carries the roster size it withheld against; `FrameTypeUnknown` carries a
             // wire code that by definition is not in the registry — an enumeration cannot contain it, and
             // that is the whole reason the station exists.
-            Self::AssignmentWithheld | Self::FrameTypeUnknown => TagKind::Quantity,
+            //
+            // `RestrictedFrameDropped` carries the wire type code of the frame an unjudged peer sent, and it
+            // is a **quantity by omission, not by nature** (#267). Unlike the two above, most of these codes
+            // ARE in the registry — but `FrameType` has no `ALL`/`name()`, so there is no vocabulary to
+            // resolve against, and inventing one here would be the fabrication this split exists to prevent.
+            // Give `FrameType` the two members every other resolved enum has and this moves to `Vocabulary`
+            // with a one-line arm in `tag_name`.
+            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::RestrictedFrameDropped => {
+                TagKind::Quantity
+            }
 
             // --- No tag. ---
             //
@@ -1017,7 +1026,6 @@ impl Station {
             | Self::HelloEpochUnknown
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
-            | Self::RestrictedFrameDropped
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

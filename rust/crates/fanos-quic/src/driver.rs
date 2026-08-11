@@ -3397,7 +3397,20 @@ async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
             // Counted, because "a peer we cannot judge is talking to us about something else" is the shape
             // an operator would want to see rising, and it is invisible everywhere else: this connection is
             // in no table, so no per-peer counter exists for it.
-            t.record_station(Station::RestrictedFrameDropped, None, None);
+            //
+            // **Tagged with the wire type code, which is what the tag field is for** (`Observation::tag`
+            // says frame stations put it there) and which this site was throwing away. The bare count
+            // cannot tell two very different worlds apart, and a measurement needed exactly that
+            // distinction: a late-joining node's restricted channel carries **exactly 2** dropped frames on
+            // every run where the join fails and 38–324 on every run where it succeeds (#267, 20 runs). Two
+            // frames of one type is a peer that said its piece and stopped; two of different types is a
+            // conversation that died. The count alone cannot say which, and until it can, every explanation
+            // for the silence is unfalsifiable.
+            // `None` when the bytes do not decode as a frame at all, which is a THIRD thing and must not
+            // be folded into a type code: `admitted_unjudged` returns false for both "a well-formed frame
+            // of the wrong type" and "not a frame", and only the tag can now tell them apart.
+            let code = decode_frame(&frame).ok().map(|(f, _)| f.type_code);
+            t.record_station(Station::RestrictedFrameDropped, None, code);
             continue;
         }
         // Counted BEFORE the send, and counted at all because the drop counter alone is one-sided: it says
