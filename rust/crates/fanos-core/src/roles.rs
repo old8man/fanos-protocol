@@ -773,6 +773,46 @@ pub const REP_RECOVER: u16 = REP_SCALE / (REP_WINDOW as u16 + 1);
 /// twice, with no statement that they must be the same number. They must.
 pub const REP_FLOOR: u16 = REP_RECOVER;
 
+/// The smallest gap between false alarms at which an honest node still climbs back to **full** weight —
+/// `REP_SCALE/(2·REP_RECOVER) + 1 = 5` windows (#270).
+///
+/// # Why this number has to exist
+///
+/// UHM `f4f901f` names the trap: *"without truth, the clock measures the eye."* A counter fed by the
+/// chain's own verdicts measures that eye's hit and false-alarm rates, not the thing judged, and the
+/// honest endings are only two — an external witness of truth, or abstention. This reputation has
+/// neither: [`observe`](Reputation::observe) moves the score on a **node-local** reading of the coherence
+/// self-diagnosis, and that function's own doc admits every node does not read it identically.
+///
+/// So the trap forces a quantitative question: **how often may the eye be wrong before an honest node is
+/// punished for the eye's bias rather than its own conduct?** One halving costs `REP_SCALE/2` and each
+/// good window returns `REP_RECOVER`, so the climb back takes `REP_SCALE/(2·REP_RECOVER) = 4` windows and
+/// the alarms must be at least one further window apart.
+///
+/// # The measurement corrected the derivation, and the correction is the point
+///
+/// The first version of this constant claimed a *rate* — `p ≤ REP_RECOVER/(REP_SCALE/2 + REP_RECOVER) =
+/// 1/5` — below which an honest node loses **nothing**, taken from where the mean drift
+/// `p·(−s/2) + (1−p)·REP_RECOVER` vanishes. Driving the real `observe` refuted it: at exactly that rate
+/// the score reads `128`, not `256`.
+///
+/// The drift analysis was of an *unclamped* walk. Recovery is capped at [`REP_SCALE`], so **surplus
+/// cannot be banked**: every halving is paid in full and only the four windows before the next alarm are
+/// available to repay it. At this gap the score therefore *oscillates* `128 → 160 → 192 → 224 → 256` and
+/// is halved again — mean `192`, a standing **25 % weight loss**, not zero. The cap makes the mechanism
+/// strictly worse than the drift predicts, and no cost-free rate exists at all.
+///
+/// Below this gap the score never reaches the cap again; the loss is still graceful rather than a cliff,
+/// and [`adjust`](Reputation::adjust) floors the weight at 1, so the eye may down-weight and never exclude.
+///
+/// # What is NOT established, and it is the load-bearing half
+///
+/// **Nothing measures the diagnosis's actual false-alarm rate.** This states what the mechanism survives;
+/// it does not show the eye is inside it. The boundary is an *emergent* property of `REP_RECOVER` against
+/// the halving and the cap — nobody chose it — which is why it is written here with a test, so changing
+/// either constant moves a stated number rather than a silent one.
+pub const REP_ALARM_GAP_FOR_FULL_RECOVERY: u16 = REP_SCALE / (2 * REP_RECOVER) + 1;
+
 /// A per-node **performance reputation** — the third bound on the "controlled freedom" of the self-organizing
 /// loop (`docs/design-self-organization.md` §5): a node declares capability freely, but an assignee that does
 /// not actually *serve* its role has its effective capacity weight decayed, so the assignment prefers nodes
@@ -1279,20 +1319,72 @@ mod tests {
             "a node serving every other window settles exactly at the floor"
         );
         assert_eq!(REP_FLOOR, REP_RECOVER, "and the floor IS the recovery step, which is why it settles there");
+    }
 
-        // Serving MORE than half is worth strictly more than the floor — otherwise the floor would be a
-        // ceiling on everyone who ever failed, and the law would not price behaviour at all.
-        let better = NodeId([8u8; 32]);
+    /// The eye's bias costs an honest node a **standing 25 %** at the widest gap it fully recovers from —
+    /// and my first derivation said zero (#270, UHM `f4f901f`).
+    ///
+    /// Driven through the real `observe`, not solved, so the number moves if the update rule does. The
+    /// false alarms are a fixed stride rather than a sample: that is the worst case for an *additive*
+    /// recovery against a *multiplicative* punishment, because the score can never bank surplus past the
+    /// cap to spend on the next alarm — which is exactly what the unclamped drift analysis missed.
+    #[test]
+    fn the_eye_costs_an_honest_node_a_quarter_of_its_weight_even_at_the_full_recovery_gap() {
+        assert_eq!(
+            REP_ALARM_GAP_FOR_FULL_RECOVERY, 5,
+            "REP_SCALE/(2*REP_RECOVER) + 1 — restate the doc's worked numbers if this moves"
+        );
+        let gap = u64::from(REP_ALARM_GAP_FOR_FULL_RECOVERY);
+
+        // Walk 400 windows, then read the whole final cycle rather than one instant: sampling at a
+        // multiple of the stride reads the trough and would have called the oscillation a settled value.
+        let node = NodeId([7u8; 32]);
         let mut rep = Reputation::new();
-        for _ in 0..64 {
-            rep.observe(better, true);
-            rep.observe(better, true);
-            rep.observe(better, false);
+        for w in 1..=400u64 {
+            rep.observe(node, !w.is_multiple_of(gap));
+        }
+        let mut cycle = Vec::new();
+        for w in 401..=(400 + gap) {
+            rep.observe(node, !w.is_multiple_of(gap));
+            cycle.push(u32::from(rep.score(&node)));
+        }
+
+        assert!(
+            cycle.contains(&u32::from(REP_SCALE)),
+            "at the full-recovery gap the score must touch the cap once per cycle, got {cycle:?}"
+        );
+        let mean = cycle.iter().sum::<u32>() / cycle.len() as u32;
+        assert_eq!(
+            mean, 192,
+            "the standing cost of an eye wrong once every {gap} windows is 25% of the cap, not zero — \
+             the cap forbids banking surplus, which is what the drift analysis missed. Cycle: {cycle:?}"
+        );
+
+        // One window tighter and the cap is never reached again: the boundary is real, not a rounding.
+        let mut tight = Reputation::new();
+        for w in 1..=400u64 {
+            tight.observe(node, !w.is_multiple_of(gap - 1));
+        }
+        let mut reached_cap = false;
+        for w in 401..=(400 + gap) {
+            tight.observe(node, !w.is_multiple_of(gap - 1));
+            reached_cap |= tight.score(&node) == REP_SCALE;
         }
         assert!(
-            rep.score(&better) > REP_FLOOR,
-            "two-in-three is worth more than the floor ({} vs {REP_FLOOR})",
-            rep.score(&better)
+            !reached_cap,
+            "one window tighter than the stated gap must never return to full weight"
+        );
+
+        // And the eye may down-weight, never exclude: `adjust` floors the share at 1.
+        let mut floored = Reputation::new();
+        for _ in 0..20 {
+            floored.observe(node, false);
+        }
+        assert_eq!(floored.score(&node), REP_FLOOR);
+        let weighted = floored.adjust(&[(node, Capability::new(RoleSet::EMPTY, 1))]);
+        assert!(
+            weighted.first().is_some_and(|(_, cap)| cap.weight >= 1),
+            "a floored node keeps a non-zero share"
         );
     }
 
