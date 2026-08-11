@@ -36,7 +36,7 @@ fn real_frame(relay: &HybridKemPublic, dest: &HybridKemPublic, ctr: u64) -> Vec<
         fanos_nyx::build_circuit(Point::<F31>::at(1), Point::<F31>::at(9), 2, b"flow").unwrap();
     let mut seed = b"cell-".to_vec();
     seed.extend_from_slice(&ctr.to_be_bytes());
-    let onion = sealed::build(&circuit, &[relay, dest], b"payload", &seed).unwrap();
+    let onion = sealed::build(&circuit, &[relay, dest], b"payload", &sealed::FreshSeed::replayable_for_test(&seed)).unwrap();
     assert_eq!(onion.len(), ONION_LEN);
     let mut frame = Vec::new();
     fanos_wire::encode_frame(fanos_wire::FrameType::Tessera.code(), &onion, &mut frame);

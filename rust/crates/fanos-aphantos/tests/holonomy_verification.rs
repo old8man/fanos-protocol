@@ -46,7 +46,7 @@ fn seal_and_route_to_client(
     relay_keys.push(client_public);
     assert_eq!(relay_keys.len(), circuit.hop_count());
 
-    let mut onion = sealed::build(circuit, &relay_keys, payload, seed).expect("onion seals");
+    let mut onion = sealed::build(circuit, &relay_keys, payload, &sealed::FreshSeed::replayable_for_test(seed)).expect("onion seals");
     for (secret, _) in interior {
         match sealed::peel(&onion, secret).expect("interior hop peels") {
             PeelOutcome::Forward { onion: inner, .. } => onion = inner,
@@ -61,7 +61,7 @@ fn seal_and_route_to_client(
 struct ReplySetup {
     client: NyxNode<F31>,
     circuit: fanos_nyx::Circuit<F31>,
-    seed: Vec<u8>,
+    seed: sealed::FreshSeed,
     interior: Vec<(HybridKemSecret, HybridKemPublic)>,
     client_public: HybridKemPublic,
 }
@@ -109,10 +109,10 @@ fn an_honest_reply_verifies_through_the_live_nyxnode_path() {
         client_public,
     } = client_with_reply_circuit(1);
     let payload = b"the response";
-    let frame = seal_and_route_to_client(&circuit, &interior, &client_public, payload, &seed);
+    let frame = seal_and_route_to_client(&circuit, &interior, &client_public, payload, seed.as_bytes());
 
     let delivered = client
-        .verified_deliver(&frame, &circuit, &seed)
+        .verified_deliver(&frame, &circuit, seed.as_bytes())
         .expect("an honest, untampered reply verifies");
     assert_eq!(delivered, payload, "the payload arrives unchanged");
 }
@@ -148,13 +148,13 @@ fn a_substituted_hop_fails_verification_and_is_rejected() {
         &actual_interior,
         &client_public,
         b"the response",
-        &actual_seed,
+        actual_seed.as_bytes(),
     );
 
     // Verifying the REAL delivery against the client's OWN (but mismatched) expectation must fail —
     // never silently accept a payload that did not travel the intended path.
     assert_eq!(
-        client.verified_deliver(&frame, &expected, &expected_seed),
+        client.verified_deliver(&frame, &expected, expected_seed.as_bytes()),
         Err(ProtocolError::HolonomyFail),
         "a substituted hop must be caught, not silently delivered"
     );

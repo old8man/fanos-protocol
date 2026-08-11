@@ -40,7 +40,7 @@ fn victim_onion() -> (Vec<u8>, HybridKemSecret) {
             .expect("circuit");
     let keypairs = relays(circuit.hop_count(), 7);
     let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
-    let onion = build(&circuit, &pubkeys, b"anonymous payload", b"seed").expect("seal");
+    let onion = build(&circuit, &pubkeys, b"anonymous payload", &fanos_aphantos::sealed::FreshSeed::replayable_for_test(b"seed")).expect("seal");
     assert_eq!(
         onion.len(),
         ONION_LEN,

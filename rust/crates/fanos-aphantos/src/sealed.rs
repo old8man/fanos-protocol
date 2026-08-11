@@ -124,6 +124,44 @@ pub enum PeelOutcome {
     },
 }
 
+/// A seed that its producer has undertaken to never repeat — the input [`build`] cannot check.
+///
+/// A newtype rather than a doc line, because the failure it prevents is catastrophic and invisible: see
+/// [`build`]'s "A repeated seed is a two-time pad". Every constructor below names how freshness is obtained,
+/// so a call site that has none has to say so out loud.
+#[derive(Clone, Debug)]
+pub struct FreshSeed(Vec<u8>);
+
+impl FreshSeed {
+    /// A seed from a **per-boot-freshened** node seed and a counter that advances once per circuit.
+    ///
+    /// Both halves are load-bearing. The counter alone repeats across restarts (it resets to zero); the node
+    /// seed alone repeats across circuits. `NyxNode` folds a fresh `boot_nonce` into its seed for exactly
+    /// this reason and advances `circuit_counter` exactly once per circuit however the circuit is built.
+    #[must_use]
+    pub fn per_circuit(boot_freshened_node_seed: &[u8], circuit_counter: u64) -> Self {
+        let mut seed = boot_freshened_node_seed.to_vec();
+        seed.extend_from_slice(&circuit_counter.to_be_bytes());
+        Self(seed)
+    }
+
+    /// A seed a **test** chose, with no freshness argument behind it.
+    ///
+    /// Deliberately named for what it is. A test wants a replayable packet, which is the exact property
+    /// production must never have, so the two are different constructors rather than one `From<&[u8]>` that
+    /// makes them indistinguishable at the call site.
+    #[must_use]
+    pub fn replayable_for_test(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    /// The bytes, for the derivations that consume them.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 fn hop_key(session: &[u8; 32]) -> [u8; 32] {
     hash_labeled("FANOS-v1/aphantos-hopkey", session)
 }
@@ -165,18 +203,30 @@ fn slice_at(buf: &[u8], off: usize, len: usize) -> Result<&[u8], SealedError> {
 /// Build a KEM-sealed onion for `circuit` carrying `payload`, sealing hop `k` to
 /// `relay_keys[k-1]` (the public key of relay `r_k`). All randomness derives from `seed`.
 ///
+/// # A repeated seed is a two-time pad
+///
+/// Every per-hop KEM ephemeral **and** every AEAD nonce here is derived from `seed ‖ k`. Two packets built
+/// from the same seed therefore reuse the same `(key, nonce)` on every hop: keystream reuse and tag forgery,
+/// on the layer whose entire job is unlinkability. Nothing inside this function can detect that — it is pure,
+/// and a `&[u8]` looks the same the second time.
+///
+/// So the obligation is carried by the type: [`FreshSeed`] can only be minted by something that has said how
+/// it stays fresh. That requirement used to live two files away, in `NyxNode::new`'s comment about
+/// `boot_nonce`, where a second caller — sealed transport for another subsystem, say — would never read it.
+///
 /// `relay_keys.len()` must equal `circuit.hop_count()` (one key per peeling relay `r_1…r_L`).
 pub fn build<F: Field>(
     circuit: &Circuit<F>,
     relay_keys: &[&HybridKemPublic],
     payload: &[u8],
-    seed: &[u8],
+    seed: &FreshSeed,
 ) -> Result<Vec<u8>, SealedError> {
     let hops = circuit.hop_count();
     if relay_keys.len() != hops {
         return Err(SealedError::KeyMismatch);
     }
     let relays = circuit.relays();
+    let seed = seed.as_bytes();
     let holonomy = circuit_holonomy(circuit, &hash_labeled(HOLOSEED_LABEL, seed));
 
     // `inner` is the *unpadded* nested onion built so far (innermost first); `outer_session` is the
@@ -362,7 +412,7 @@ mod tests {
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
 
         let payload = b"anonymous hello";
-        let mut onion = build(&circuit, &pubkeys, payload, b"onion-seed").unwrap();
+        let mut onion = build(&circuit, &pubkeys, payload, &FreshSeed::replayable_for_test(b"onion-seed")).unwrap();
 
         // Each hop is peeled only by the correct relay's secret key, and every packet on the wire is
         // exactly the constant bucket — a passive observer sees no size difference across hops.
@@ -398,7 +448,7 @@ mod tests {
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
         let huge = alloc::vec![0xABu8; ONION_LEN];
         assert_eq!(
-            build(&circuit, &pubkeys, &huge, b"s"),
+            build(&circuit, &pubkeys, &huge, &FreshSeed::replayable_for_test(b"s")),
             Err(SealedError::TooLong)
         );
     }
@@ -412,7 +462,7 @@ mod tests {
             build_circuit(Point::<F31>::at(3), Point::<F31>::at(700), 3, b"corr").unwrap();
         let keypairs = relays(circuit.hop_count(), 7);
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
-        let mut onion = build(&circuit, &pubkeys, b"secret payload", b"corr-seed").unwrap();
+        let mut onion = build(&circuit, &pubkeys, b"secret payload", &FreshSeed::replayable_for_test(b"corr-seed")).unwrap();
 
         let mut snapshots = alloc::vec![onion.clone()];
         let mut delivered = None;
@@ -442,7 +492,7 @@ mod tests {
         let circuit = build_circuit(Point::<F31>::at(1), Point::<F31>::at(2), 2, b"c").unwrap();
         let keypairs = relays(circuit.hop_count(), 2);
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
-        let onion = build(&circuit, &pubkeys, b"x", b"s").unwrap();
+        let onion = build(&circuit, &pubkeys, b"x", &FreshSeed::replayable_for_test(b"s")).unwrap();
         // The second relay's key cannot peel the first hop.
         assert_eq!(peel(&onion, &keypairs[1].0), Err(SealedError::Aead));
     }
@@ -475,7 +525,7 @@ mod tests {
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
         let seed = b"honest-reply-seed";
         let payload = b"the response";
-        let onion = build(&circuit, &pubkeys, payload, seed).unwrap();
+        let onion = build(&circuit, &pubkeys, payload, &FreshSeed::replayable_for_test(seed)).unwrap();
 
         let (delivered_payload, holonomy) = route_to_delivery(&circuit, &onion, &keypairs);
         assert_eq!(delivered_payload, payload, "the payload arrives unchanged");
@@ -506,7 +556,7 @@ mod tests {
         let keypairs = relays(actual.hop_count(), 9);
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
         let seed = b"honest-reply-seed";
-        let onion = build(&actual, &pubkeys, b"the response", seed).unwrap();
+        let onion = build(&actual, &pubkeys, b"the response", &FreshSeed::replayable_for_test(seed)).unwrap();
 
         // The onion still genuinely routes and delivers — per-hop AEAD alone has no opinion on
         // *which* circuit was intended, only that each layer opened under the right relay key.

@@ -39,7 +39,7 @@ fn tessera_frame(onion: &[u8]) -> Vec<u8> {
 fn onion(relay: &HybridKemPublic, dest: &HybridKemPublic, build_seed: &[u8]) -> Vec<u8> {
     let circuit =
         fanos_nyx::build_circuit(Point::<F31>::at(1), Point::<F31>::at(9), 2, b"replay").unwrap();
-    let onion = sealed::build(&circuit, &[relay, dest], b"anonymous payload", build_seed).unwrap();
+    let onion = sealed::build(&circuit, &[relay, dest], b"anonymous payload", &sealed::FreshSeed::replayable_for_test(build_seed)).unwrap();
     assert_eq!(
         onion.len(),
         ONION_LEN,

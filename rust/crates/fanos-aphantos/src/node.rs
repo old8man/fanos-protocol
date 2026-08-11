@@ -284,11 +284,13 @@ impl<F: Field> NyxNode<F> {
     /// Shared by every circuit-building path ([`next_circuit`](Self::next_circuit) and
     /// [`build_verifiable_circuit`](Self::build_verifiable_circuit)), so `circuit_counter` is
     /// consumed exactly once per circuit however it is built.
-    fn next_seed(&mut self) -> Vec<u8> {
+    fn next_seed(&mut self) -> sealed::FreshSeed {
         self.circuit_counter += 1;
-        let mut circuit_seed = self.seed.to_vec();
-        circuit_seed.extend_from_slice(&self.circuit_counter.to_be_bytes());
-        circuit_seed
+        // Constructed once, here, through the constructor that names both halves of the freshness argument:
+        // the boot-freshened node seed (a bare persistent one repeats across restarts, since the counter
+        // resets) and the counter (a bare seed repeats across circuits). Circuit building reads the same
+        // bytes back out, so there is one seed and one guarantee rather than two spellings of it.
+        sealed::FreshSeed::per_circuit(&self.seed, self.circuit_counter)
     }
 
     /// Build a fresh **outbound** circuit `self.coord → … → dest`, entering through this client's stable
@@ -299,17 +301,17 @@ impl<F: Field> NyxNode<F> {
     /// counter), so the entry is fixed across circuits while the interior still rotates. Falls back to a
     /// fully derived (guardless) circuit only when NO guard is sealable, or for a 1-hop / degenerate
     /// request. Used by [`originate`](Self::originate); `None` on a degenerate request.
-    fn next_circuit(&mut self, dest: Point<F>) -> Option<(Circuit<F>, Vec<u8>)> {
+    fn next_circuit(&mut self, dest: Point<F>) -> Option<(Circuit<F>, sealed::FreshSeed)> {
         let circuit_seed = self.next_seed();
         // A fixed-window guard set: the standalone engine has no epoch source, so slow rotation is inert
         // here — the ordered SET plus the sealable-guard failover is the live improvement over a single
         // guard. A guard is usable iff we can seal an onion layer to it (its key is in the mix directory).
         let guards = GuardSet::derive(&self.seed, 0, u64::MAX, GUARD_SET_SIZE, self.coord);
         let circuit = guards
-            .build_circuit(self.coord, dest, self.path_len, &circuit_seed, |g| {
+            .build_circuit(self.coord, dest, self.path_len, circuit_seed.as_bytes(), |g| {
                 self.directory.get(&g.coords()).is_some()
             })
-            .or_else(|| build_circuit(self.coord, dest, self.path_len, &circuit_seed))?;
+            .or_else(|| build_circuit(self.coord, dest, self.path_len, circuit_seed.as_bytes()))?;
         Some((circuit, circuit_seed))
     }
 
@@ -365,10 +367,10 @@ impl<F: Field> NyxNode<F> {
     /// application-layer concern above this engine) so the peer can address a reply through it, and
     /// checks the reply it eventually receives with [`verified_deliver`](Self::verified_deliver).
     #[must_use]
-    pub fn build_verifiable_circuit(&mut self, launch: Triple) -> Option<(Circuit<F>, Vec<u8>)> {
+    pub fn build_verifiable_circuit(&mut self, launch: Triple) -> Option<(Circuit<F>, sealed::FreshSeed)> {
         let launch_point = Point::<F>::new(launch)?;
         let circuit_seed = self.next_seed();
-        let circuit = build_circuit(launch_point, self.coord, self.path_len, &circuit_seed)?;
+        let circuit = build_circuit(launch_point, self.coord, self.path_len, circuit_seed.as_bytes())?;
         Some((circuit, circuit_seed))
     }
 

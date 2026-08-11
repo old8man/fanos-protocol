@@ -41,7 +41,7 @@ proptest! {
             .collect();
         let pubkeys: Vec<&HybridKemPublic> = keypairs.iter().map(|(_, p)| p).collect();
 
-        let mut onion = sealed::build(&circuit, &pubkeys, &payload, &seed).unwrap();
+        let mut onion = sealed::build(&circuit, &pubkeys, &payload, &sealed::FreshSeed::replayable_for_test(&seed)).unwrap();
         for (secret, _) in &keypairs {
             match sealed::peel(&onion, secret).unwrap() {
                 PeelOutcome::Forward { onion: inner, .. } => onion = inner,
