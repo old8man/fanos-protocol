@@ -55,6 +55,8 @@ use alloc::vec::Vec;
 use core::simd::f64x8;
 use core::simd::num::SimdFloat;
 
+use fanos_geometry::fano;
+
 use crate::eig::eigenvalues_symmetric;
 use crate::mathfns::sqrt;
 
@@ -586,6 +588,88 @@ impl CoherenceMatrix {
     #[must_use]
     pub fn diagonal_purity(&self) -> f64 {
         self.d.iter().map(|x| x * x).sum()
+    }
+
+    /// The **pairwise coupling** `c_ij` between two nodes, or `None` if either index is off the cell.
+    ///
+    /// The third instrument family (UHM T-317): `C(7,2) = 21` numbers on a Fano cell, of which the verdict
+    /// keeps two summaries — [`mean_correlation`](Self::mean_correlation) and
+    /// [`dispersion`](Self::dispersion). Both are symmetric functions, so neither can say *which* pair is
+    /// coupled, and a summary is what the verdict is *for*. This is the reading underneath them.
+    ///
+    /// `c_ii = 1` exactly, by [`from_correlation`](Self::from_correlation)'s construction.
+    #[must_use]
+    pub fn pairwise(&self, i: usize, j: usize) -> Option<f64> {
+        (i < self.n && j < self.n).then(|| self.c.get(i * self.n + j).copied())?
+    }
+
+    /// The **holonomy of a closed triple**, `c_ij · c_jk · c_ki` — the fourth instrument family (T-306).
+    ///
+    /// # What this is, and what it deliberately is not
+    ///
+    /// UHM's holonomy is `arg(γ_ij γ_jk γ_ki)` on a **complex** state, where the argument is a genuine
+    /// phase taking a continuum of values. FANOS's substrate is a *real* correlation matrix, so that
+    /// argument can only be `0` or `π` and the whole of the phase information UHM's `γ` carries is **not
+    /// present here at all**. Borrowing the name without saying so would be claiming an instrument this
+    /// platform does not have.
+    ///
+    /// What survives the restriction is exactly the part that matters for T-311: the **sign**. A negative
+    /// product means the triple is **frustrated** — no assignment of "these two move together" is
+    /// consistent around the loop — and `Φ` cannot see it, because `Φ` sums `c_ij²` and squares the sign
+    /// away (#221). The magnitude `|c_ij c_jk c_ki|` says how strongly the loop is closed, so the reading
+    /// is a signed strength rather than a bit.
+    ///
+    /// `None` if any index is off the cell, or if the three are not distinct — a "triple" with a repeated
+    /// point is not a loop, and returning `c_ij²·1` for it would be a number with no meaning.
+    #[must_use]
+    pub fn triple_holonomy(&self, i: usize, j: usize, k: usize) -> Option<f64> {
+        if i == j || j == k || i == k {
+            return None;
+        }
+        Some(self.pairwise(i, j)? * self.pairwise(j, k)? * self.pairwise(k, i)?)
+    }
+
+    /// The seven Fano line holonomies, indexed by line — or `None` on any cell that is not `PG(2,2)`.
+    ///
+    /// A Fano line is three points, so it is exactly a closed triple, and the plane's seven lines are the
+    /// seven loops the geometry itself names. See [`triple_holonomy`](Self::triple_holonomy) for what the
+    /// number is and, more importantly, what it is not.
+    ///
+    /// **These seven do not span the cell's loops.** The cycle space of `K₇` has dimension
+    /// `E − V + 1 = 21 − 7 + 1 = 15`; the seven lines span a proper subspace of it, and the remainder is
+    /// dark to this reading — triangles the plane does not draw. `the_fano_lines_leave_exactly_eight_loop_dimensions_dark`
+    /// computes both ranks rather than quoting them.
+    #[must_use]
+    pub fn line_holonomies(&self) -> Option<[f64; fano::N]> {
+        if self.n != fano::N {
+            return None;
+        }
+        let mut out = [0.0; fano::N];
+        for (slot, points) in out.iter_mut().zip(fano::LINE_POINTS.iter()) {
+            *slot = self.triple_holonomy(
+                usize::from(points[0]),
+                usize::from(points[1]),
+                usize::from(points[2]),
+            )?;
+        }
+        Some(out)
+    }
+
+    /// Bitmask of the Fano lines whose holonomy is **negative** — the frustrated loops (`0` on any cell
+    /// that is not `PG(2,2)`, which is also the honest answer: no line is known to be frustrated).
+    ///
+    /// A tolerance is deliberately absent. The sign of a product of three measured correlations is a
+    /// discrete fact about the estimate, and a "nearly zero" holonomy is a loop that is barely closed
+    /// either way — the magnitude in [`line_holonomies`](Self::line_holonomies) is where that lives, and
+    /// folding it into the mask would hide it.
+    #[must_use]
+    pub fn frustrated_lines(&self) -> u8 {
+        self.line_holonomies().map_or(0, |h| {
+            h.iter()
+                .enumerate()
+                .filter(|&(_, &v)| v < 0.0)
+                .fold(0u8, |mask, (l, _)| mask | (1u8 << l))
+        })
     }
 
     /// The per-node **activity shares** `d` — each node's share of the cell's behavioural variance,
