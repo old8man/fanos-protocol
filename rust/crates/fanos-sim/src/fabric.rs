@@ -768,6 +768,10 @@ mod tests {
             &credentials,
             |point| Box::new(OverlayNode::<F2>::new(point, Config::default())),
             directory.clone(),
+            // The same derivation the deployed node runs, over the same default roles — the simulator differs
+            // from production in the transport and only the transport, and an announced capability set is not
+            // transport (#284).
+            fanos_node::config::RoleSet::default().advertised_capabilities(2),
             None,
         )
         .expect("a node spawns over the modelled fabric");

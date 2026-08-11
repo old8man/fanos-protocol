@@ -379,6 +379,8 @@ fn node_over(fabric: Fabric, dir: &Directory, point: usize) -> NodeHandle {
         &credentials,
         |point| Box::new(OverlayNode::<F2>::new(point, Config::default())),
         dir.clone(),
+        // A NAT-traversal harness node is a baseline node (#284).
+        fanos_wire::capability::Capabilities::CORE,
         None,
     )
     .expect("spawn node over the modelled NAT fabric")

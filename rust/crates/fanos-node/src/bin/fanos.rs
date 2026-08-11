@@ -2516,6 +2516,10 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
             Box::new(DkgCeremony::new(node, slot))
         },
         directory,
+        // A keygen ceremony node runs the DKG engine and nothing else — no overlay, no mixnet router, no
+        // hidden-service path — so `CORE` is not a conservative placeholder here, it is the whole truth
+        // (#284). Written out rather than derived from a `RoleSet` this node does not have.
+        fanos_wire::capability::Capabilities::CORE | fanos_wire::capability::Capabilities::PQ_ONLY,
         None,
     )
     .map_err(|_| NodeError::Identity)?;

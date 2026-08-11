@@ -1253,6 +1253,9 @@ impl Node {
                 crate::composition::compose_engine::<F>(coord, &what)
             },
             directory.clone(),
+            // What this node ANNOUNCES is derived from what it wires, never written beside it (#284): these
+            // are the same roles that decide whether the mixnet router and hidden-service path come up.
+            config.roles.advertised_capabilities(config.plane_order),
             // PROTEUS (§13.4): when a community secret is configured, every frame is shaped and the shape
             // rotates each epoch (driven by the same beacon that reshuffles the coordinate). An environment
             // policy enables morph auto-fallback (§13.7); otherwise the fixed morph is used. No secret ⇒

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fanos_calypso::hosting::Share;
+use fanos_wire::capability::Capabilities;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
 use fanos_keygen::recovery::RecoveryAuthoritySet;
@@ -914,6 +915,55 @@ pub struct RoleSet {
     pub ingress: bool,
 }
 
+impl RoleSet {
+    /// The capability set this node may honestly advertise in its HELLO (spec §7.4), **derived from the
+    /// modules it actually wires** and never configured beside them (#284).
+    ///
+    /// Every production entry point hard-coded [`Capabilities::CORE`], with an honest reason —
+    /// `spawn_self_certifying`'s doc says the generic seam "has no visibility into which optional modules the
+    /// caller wires up… so it never overclaims a feature it might not actually serve", and points at a
+    /// with-capabilities variant "for a deployment that knows". That variant had no production caller. The
+    /// deployment that knows is this one: the roles below *are* what gets wired.
+    ///
+    /// The consequence of the constant was not a lie to a peer — under-claiming is the safe direction — but an
+    /// **inert negotiation**: the intersection machinery is complete and tested, and its input never varied, so
+    /// §7.4 feature selection always degraded to the baseline and a client could not find an APHANTOS-Full
+    /// relay or a CALYPSO host by the mechanism built for it.
+    ///
+    /// Derived, bit by bit, from the thing that provides it:
+    ///
+    /// * [`CORE`](Capabilities::CORE) — unconditional, and it must stay that way: an empty intersection is the
+    ///   handshake's incompatibility condition, so dropping it would refuse every peer.
+    /// * [`PQ_ONLY`](Capabilities::PQ_ONLY) — unconditional, and true structurally rather than by
+    ///   configuration. The bit means "refuses a classical-only fallback"; this tree has no classical-only
+    ///   path to fall back to, so the guarantee holds by construction. It is set because it is true, not
+    ///   because it is desirable — the distinction #282 was about.
+    /// * [`GF_2M`](Capabilities::GF_2M) — a pure function of the plane order, not a choice.
+    /// * [`APHANTOS_FULL`](Capabilities::APHANTOS_FULL) — the `relay` role, which is exactly what stands up the
+    ///   threshold-onion router: "a relay node also runs the anonymity mixnet" (`Node::start_on_plane`), and
+    ///   the role is refused without beacon parameters for that reason.
+    /// * [`CALYPSO`](Capabilities::CALYPSO) — `service` (hosts hidden services) or `rendezvous` (a member of an
+    ///   anonymous rendezvous line). Either is a real contribution to the hidden-service path.
+    ///
+    /// **`APHANTOS_LITE` is deliberately never set.** Its named mechanism, `fanos_aphantos::NyxNode`, is
+    /// constructed only in tests; production runs the Full router. A bit whose engine no binary instantiates
+    /// is the defect this function exists to prevent, and setting it would be committing it (#119).
+    #[must_use]
+    pub fn advertised_capabilities(&self, plane_order: u32) -> Capabilities {
+        let mut caps = Capabilities::CORE | Capabilities::PQ_ONLY;
+        if plane_order.is_power_of_two() {
+            caps = caps | Capabilities::GF_2M;
+        }
+        if self.relay {
+            caps = caps | Capabilities::APHANTOS_FULL;
+        }
+        if self.service || self.rendezvous {
+            caps = caps | Capabilities::CALYPSO;
+        }
+        caps
+    }
+}
+
 /// The inverse of [`RoleSet::parse`] — the comma list a config file carries.
 ///
 /// Written as a `Display` rather than an `encode`-style method because the round trip is the point: a generated
@@ -1373,6 +1423,61 @@ impl NodeConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **The announced set follows the wired modules, bit by bit** (#284).
+    ///
+    /// Each arm flips exactly one role and reads exactly one bit, so a derivation that stopped consulting a
+    /// role — or started announcing a capability unconditionally — fails on the pair it broke rather than on
+    /// a lump comparison that says only "different".
+    #[test]
+    fn every_advertised_bit_follows_the_role_that_provides_it() {
+        use fanos_wire::capability::Capabilities;
+        let bare = RoleSet::default();
+        let base = bare.advertised_capabilities(2);
+
+        // Unconditional, and each for its own reason.
+        assert!(base.contains(Capabilities::CORE), "CORE is mandatory — an empty intersection refuses peers");
+        assert!(
+            base.contains(Capabilities::PQ_ONLY),
+            "the transport is hybrid PQ by construction, with no classical path to fall back to"
+        );
+
+        // A pure function of the plane, not a choice: q = 2 is GF(2), q = 7 is a prime field.
+        assert!(bare.advertised_capabilities(2).contains(Capabilities::GF_2M), "q=2 is a binary extension");
+        assert!(!bare.advertised_capabilities(7).contains(Capabilities::GF_2M), "q=7 is a prime field");
+
+        // Off with the role, on with it — and off again for the roles that do NOT provide the bit.
+        assert!(!base.contains(Capabilities::APHANTOS_FULL), "a node with no relay role runs no mixnet");
+        let relay = RoleSet { relay: true, ..RoleSet::default() };
+        assert!(
+            relay.advertised_capabilities(2).contains(Capabilities::APHANTOS_FULL),
+            "the relay role is what stands up the threshold-onion router"
+        );
+        assert!(
+            !relay.advertised_capabilities(2).contains(Capabilities::CALYPSO),
+            "relaying is not hosting — the bits must not move together"
+        );
+
+        assert!(!base.contains(Capabilities::CALYPSO));
+        for hosting in [
+            RoleSet { service: true, ..RoleSet::default() },
+            RoleSet { rendezvous: true, ..RoleSet::default() },
+        ] {
+            assert!(
+                hosting.advertised_capabilities(2).contains(Capabilities::CALYPSO),
+                "either half of the hidden-service path earns the bit"
+            );
+        }
+
+        // Never announced, because its engine is constructed only in tests (#119).
+        for roles in [bare, relay, RoleSet { service: true, rendezvous: true, relay: true, ..RoleSet::default() }] {
+            assert!(
+                !roles.advertised_capabilities(2).contains(Capabilities::APHANTOS_LITE),
+                "APHANTOS_LITE names `NyxNode`, which no binary instantiates — announcing it would be the \
+                 defect this derivation exists to prevent"
+            );
+        }
+    }
+
     /// The **revision clock** on the two mixnet defaults: it rings when their sweep becomes buildable
     /// again (#187, UHM `316edd9`).
     ///

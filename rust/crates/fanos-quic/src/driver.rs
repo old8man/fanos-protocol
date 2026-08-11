@@ -1535,11 +1535,20 @@ pub async fn spawn_self_certifying_persistent_on<F: Field + 'static>(
 ///
 /// # Errors
 /// [`QuicError`] if the credentials cannot be turned into a TLS configuration or the endpoint cannot be created.
+/// `capabilities` is an **argument, not a default** (#284). This entry point spawns the node a deployment
+/// actually runs, so it is the one place where what the caller wired and what the HELLO announces are both in
+/// scope; a `Capabilities::CORE` constant here made the whole §7.4 negotiation inert — the intersection
+/// machinery complete and tested, its input never varying, so feature selection always degraded to baseline.
+/// Derive the set from the modules composed (`RoleSet::advertised_capabilities`), never write it beside them.
+///
+/// [`Capabilities::CORE`] must be in the set: an empty intersection is the handshake's incompatibility
+/// condition, so a caller that omits it refuses every peer.
 pub fn spawn_self_certifying_persistent_over<F: Field + 'static>(
     fabric: Fabric,
     credentials: &NodeCredentials,
     make_engine: impl FnOnce(Point<F>) -> Box<dyn Engine + Send>,
     directory: Directory,
+    capabilities: Capabilities,
     proteus: Option<ProteusConfig>,
 ) -> Result<NodeHandle, QuicError> {
     let (server, client, _cert) = node_configs_mutual_from(credentials)?;
@@ -1550,7 +1559,7 @@ pub fn spawn_self_certifying_persistent_over<F: Field + 'static>(
         make_engine,
         directory,
         fabric,
-        Capabilities::CORE,
+        capabilities,
         proteus,
     )
 }
@@ -4183,6 +4192,8 @@ mod tests {
                 &credentials,
                 |point| Box::new(OverlayNode::<F2>::new(point, Config::default())),
                 directory.clone(),
+                // A transport test's node is a baseline node: CORE is what it means, said out loud (#284).
+                Capabilities::CORE,
                 None,
             )
             .expect("a node spawns over the injected fabric");
@@ -4885,6 +4896,7 @@ mod tests {
                 ))
             },
             dir.clone(),
+            Capabilities::CORE,
             Some(ProteusConfig::polymorph(secret.to_vec())),
         )
         .expect("spawn the dialer");
