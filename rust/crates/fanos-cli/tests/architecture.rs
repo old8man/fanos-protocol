@@ -304,8 +304,18 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // Raised rather than satisfied: inventing a caller is the one thing this ratchet must never reward, and
     // that applies to me as much as to anyone.
     ("fanos-core", 17),
-    ("fanos-diakrisis", 43),
-    ("fanos-diaulos", 6),
+    // 43 → 45 (#285), and the reason is the one the definitions themselves state. `activity_shares`,
+    // `dominant_axis` and `frustrated_lines` are the discriminators for the two illnesses a scalar folds
+    // together: `tests/starved_or_dominant.rs` holds a matched pair where `r` and `p` agree to six decimals
+    // and `Φ`, `P`, `R` to 3e-3, so every published scalar calls a starving cell and a swallowing one the
+    // same cell — while the correct responses are opposite. Their consumer is the cure #139 specifies
+    // (small-λ injection ADDRESSED to the hungry axis, UHM 1ea2b27) and that cure does not exist, so wiring
+    // them would mean inventing a caller. Escalated, not parked: #139 is open with its mechanism named.
+    ("fanos-diakrisis", 45),
+    // 6 → 7 (#285). `handle_delivery` and `ingest_drops` arrived with the overlay work; every call site is
+    // inside `overlay.rs`'s own test module (it opens at 665, they are called at 742–791), so the overlay
+    // delivery path has no production driver. Verified by reading each site, not inferred from the count.
+    ("fanos-diaulos", 7),
     // **20 → 17 (2026-08-04), LOWERED — the debt was paid, not re-justified.** `fanos term` now builds a
     // term, type-checks it, encodes it canonically and submits it, so `name_register_term` and
     // `term_payload` left this set by acquiring the caller they were budgeted for. The count is the true
@@ -347,10 +357,23 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-pqcrypto", 6),
     ("fanos-primitives", 3),
     ("fanos-proteus", 7),
-    ("fanos-quic", 11),
+    // 11 → 12 (#285). `Client::sample_availability` was cut in #173 as the ONE door onto a DA sample that
+    // subscribes before it issues the command — the guarded shape, replacing a guarded door nobody called.
+    // Which subsystem should ask it is a separate decision (#173's residual), and answering it by inventing
+    // a caller here is the trade this ratchet forbids.
+    ("fanos-quic", 12),
     ("fanos-rendezvous", 2),
     ("fanos-runtime", 9),
-    ("fanos-session", 1),
+    // 1 → 2 (#285), two names read individually rather than covered by one argument.
+    // `serve_over_channels` is the BASE of a family: production drives `serve_over_channels_observed`
+    // (fanos-node/src/diaulos.rs) and `serve_over_channels_paced_observed` (rendezvous_host.rs:784), and the
+    // bare name survives only in doc prose, which `code_only` strips — an orphan created by decorating, not
+    // by adding.
+    // `dropped_payloads` has a `pub use` in fanos-node:387 and a call at fanos-ffi:759, but 759 sits INSIDE
+    // the test module opening at 728, so the scan is right to refuse it. The number itself reaches an
+    // operator through the station wired in #276; this accessor is the embedder's direct read, and no
+    // embedder in this tree takes it.
+    ("fanos-session", 2),
     // 31: `Timeline::revisits` — the oscillation detector added for the role-setpoint measurement. It is a
     // scenario instrument, like most of this crate's entry: `until`, `until_settled`, `frozen`,
     // `changes_after` and `is_reached` are all called only from scenarios, which is what fanos-sim is for.
