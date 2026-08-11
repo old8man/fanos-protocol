@@ -43,7 +43,7 @@
 //! reachable from `from_signals`, and only from a genuinely concentrated cell.
 //!
 //! What remains genuinely two-dimensional is the gap between the off-diagonals' **RMS** `q` (which `Φ`
-//! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective_at`] reads). By
+//! reads, `Φ = (N−1)q²`) and their **mean** `m` (which [`crate::window::classify_collective`] reads). By
 //! Cauchy–Schwarz `m² ≤ q²`, with equality exactly on the equicorrelated stratum, so
 //! [`Measures::dispersion`] `v = q² − m²` is the second coordinate. It is not a curiosity: the
 //! under-coupled `Bind` band is `q > lo ≥ m`, which is *unreachable at `v = 0`* — the band exists only for
@@ -133,7 +133,7 @@ pub struct Measures {
     /// Reflection `R = 1/(N·P)` (threshold `1/3`). Also a bijection of `phi`: `R = 1/(1 + Φ)`.
     pub reflection: f64,
     /// **Pairwise dispersion** `v = q² − m²` — the variance of the off-diagonal correlations, where `q` is
-    /// their RMS (`Φ = (N−1)q²`) and `m` their mean (what `classify_collective_at` reads).
+    /// their RMS (`Φ = (N−1)q²`) and `m` their mean (what `classify_collective` reads).
     ///
     /// The genuinely independent second dimension. Zero exactly on the equicorrelated stratum, and strictly
     /// positive whenever the cell couples unevenly — which is the load-hotspot signature the §6.7 response
@@ -582,12 +582,39 @@ impl CoherenceMatrix {
     /// The collective-subject classification from the mean correlation (spec §18.2, V19):
     /// `Aggregate` (too weak to bind), `CollectiveSubject` (in the band), or `OverCoupled`.
     ///
-    /// Classified against **this cell's own** window, which is what [`diagonal_purity`](Self::diagonal_purity)
-    /// exists to supply. On the flat stratum this is exactly the old reading; off it the old one was
-    /// optimistic, and the direction matters — it called an aggregate a subject, never the reverse.
+    /// Classified against **this cell's own** window for the lower edge, and against its **measured**
+    /// self-model for the upper one.
+    ///
+    /// The lower edge is [`diagonal_purity`](Self::diagonal_purity)'s window (#219): on the flat stratum it
+    /// is exactly the old reading, off it the old one was optimistic, and the direction matters — it called
+    /// an aggregate a subject, never the reverse.
+    ///
+    /// **The upper edge cannot be a prediction, because the equivalence it rested on is a stratum result**
+    /// (#275, UHM `1ea2b27`). [`is_overcoupled`](Self::is_overcoupled) defines over-coupling as
+    /// "`r > √(2/(N−1))`, *equivalently* `R < 1/3`" — the two agree exactly where `Φ = r²(1−p)/p` is the
+    /// whole story, which is the equicorrelated stratum. Off it a third parameter enters: the *dispersion*
+    /// of the off-diagonals raises the real `Φ` above what that two-parameter law predicts from `r`, so the
+    /// cell loses its self-model while `r` is still inside the band. Measured on a Fano cell whose one line
+    /// exchanges more than the rest: at `r = 0.5746` — below the `0.5774` edge — the cell reads `R = 0.3209`
+    /// and `Φ = 2.1065`, already past the `Φ = 2` the edge was solved at, and the old test called it a
+    /// healthy collective subject. The error is one-directional: dispersion only ever raises `Φ`, so the
+    /// prediction is only ever **late**, and late is the side where `Decouple` does not fire.
+    ///
+    /// So the upper edge reads `R` — the quantity the definition was always about — and the `hi` edge stays
+    /// what it honestly is: a landmark an operator can compare `r` against, not the trigger.
+    ///
+    /// Ordering matters: a cell below the lower edge is an [`Aggregate`] even if its `R` is low, because
+    /// there the self-model was lost to *concentration*, not to coupling, and shedding correlation is the
+    /// wrong answer — that case is [`Alarm::Structure`](crate::window::Alarm)'s.
+    ///
+    /// [`Aggregate`]: crate::window::CollectiveState::Aggregate
     #[must_use]
     pub fn collective_state(&self) -> crate::window::CollectiveState {
-        crate::window::classify_collective_at(self.mean_correlation(), self.diagonal_purity())
+        crate::window::classify_collective(
+            self.mean_correlation(),
+            self.diagonal_purity(),
+            self.measures().reflection,
+        )
     }
 }
 
@@ -759,7 +786,7 @@ mod tests {
     /// it the test would pass on a cell where both readings say `Aggregate` and would be pinning nothing.
     #[test]
     fn a_cell_that_concentrates_its_weight_is_not_called_a_subject_by_the_flat_threshold() {
-        use crate::window::{CollectiveState, classify_collective_at};
+        use crate::window::CollectiveState;
 
         // Sylvester–Hadamard: `H[i][j] = (−1)^popcount(i & j)`. Row 0 is constant (no variance after
         // centring, so unusable); rows 1.. are zero-mean and mutually orthogonal.
@@ -795,7 +822,7 @@ mod tests {
         // The disagreement this fixes, asserted so the test cannot go vacuous: the flat threshold, read off
         // the same cell, calls it a subject.
         assert_eq!(
-            classify_collective_at(g.mean_correlation(), 1.0 / 7.0),
+            crate::window::classify_collective(g.mean_correlation(), 1.0 / 7.0, g.measures().reflection),
             CollectiveState::CollectiveSubject,
             "the flat threshold must still disagree, or this test is pinning nothing"
         );
@@ -803,7 +830,7 @@ mod tests {
 
     #[test]
     fn dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs() {
-        use crate::window::{CollectiveState, classify_collective_at, collective_subject_window};
+        use crate::window::{CollectiveState, collective_subject_window};
 
         // Zero exactly on the equicorrelated stratum — where the three measures really do say everything.
         for &r in &[0.0, 0.3, 0.45, 0.8] {
@@ -833,7 +860,7 @@ mod tests {
             let g = block(k);
             let m = g.measures();
             let binds = m.phi > 1.0
-                && classify_collective_at(g.mean_correlation(), 1.0 / 7.0) == CollectiveState::Aggregate;
+                && g.collective_state() == CollectiveState::Aggregate;
             assert_eq!(
                 binds,
                 k == 4,

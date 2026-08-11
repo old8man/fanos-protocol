@@ -28,10 +28,10 @@
 //! clamp* to reshape the approach to the attractor, but can never move the attractor, leave the band, or
 //! break the T-104 contraction. Learning lives strictly inside the proven envelope.
 
-use crate::coherence::p_crit;
+use crate::coherence::{R_TH, p_crit};
 use crate::healing::KAPPA_BOOTSTRAP;
 use crate::stability::v_preservation_gate;
-use crate::window::{CollectiveState, classify_collective_at, collective_subject_window_at};
+use crate::window::{CollectiveState, classify_collective};
 
 /// One corrective decision of the coherence homeostat — the `act` phase for the continuous self-model.
 /// Every non-[`Hold`](BandControl::Hold) action moves `Γ` toward `ρ*`, i.e. lowers the Lyapunov `V`. The
@@ -127,13 +127,25 @@ impl Homeostat {
         if purity <= p_crit(n) {
             return BandControl::Escalate;
         }
-        let (_, hi) = collective_subject_window_at(diagonal_purity);
-        match classify_collective_at(mean_r, diagonal_purity) {
+        // `R = 1/(N·P)` — the caller already carries `P`, so the self-model the upper edge is defined by
+        // needs no new input, only naming (#275).
+        let reflection = if purity > 0.0 { 1.0 / (n as f64 * purity) } else { 0.0 };
+        match classify_collective(mean_r, diagonal_purity, reflection) {
             CollectiveState::CollectiveSubject => BandControl::Hold,
             CollectiveState::OverCoupled => {
-                // Proportional shed: effort ∝ over-excursion, scaled by gain, capped at 1 (cannot shed more
-                // correlation than exists). Never negative, so it cannot push `r` below the band.
-                let effort = (self.kappa * (mean_r - hi) / hi).clamp(0.0, 1.0);
+                // **Proportional shed, on the same quantity the trigger reads** (#275). It used to be
+                // `(mean_r − hi)/hi`, which was right only while the trigger was also `r > hi`: once the
+                // trigger became the measured `R`, a cell can be over-coupled at `r < hi`, and that
+                // expression goes negative and `clamp`s to a `Decouple { effort: 0 }` — a shed that sheds
+                // nothing, fired on exactly the cells the change exists to catch. Trigger and effort have
+                // to measure one thing.
+                //
+                // The excursion is how far the self-model has fallen below its floor, as a fraction of the
+                // floor: zero at the edge, 1 when the self-model is gone entirely, monotone between. Scaled
+                // by the gain and capped at 1 for the same reason as before — a shed cannot exceed what
+                // exists.
+                let excursion = (R_TH - reflection) / R_TH;
+                let effort = (self.kappa * excursion).clamp(0.0, 1.0);
                 BandControl::Decouple { effort }
             }
             CollectiveState::Aggregate => {
@@ -158,6 +170,34 @@ impl Default for Homeostat {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    /// A cell that is over-coupled **below** the `hi` edge must still be shed with real effort (#275).
+    ///
+    /// This is the coupling the #275 change could have broken instead of fixed. The trigger moved to the
+    /// measured `R`, which admits cells at `r < hi`; the old shed law `κ(r − hi)/hi` goes negative there and
+    /// `clamp`s to zero, so the homeostat would have answered `Decouple { effort: 0.0 }` — a shed that sheds
+    /// nothing, on exactly the cells the change exists to catch. Two errors cancelling into a confident
+    /// no-op is worse than the defect it replaced.
+    ///
+    /// The numbers are the measured ones from `tests/phase_edge.rs`, not invented: a Fano cell whose one
+    /// line exchanges more than the rest reads `r = 0.5746` (edge `0.5774`), `P = 0.4452`, hence
+    /// `R = 1/(7P) = 0.3209` and `Φ = P/p − 1 = 2.116`.
+    #[test]
+    fn a_cell_over_coupled_below_the_edge_is_shed_with_real_effort() {
+        let (purity, mean_r, p, n) = (0.4452, 0.5746, 1.0 / 7.0, 7);
+        let (_, hi) = crate::window::collective_subject_window_at(p);
+        assert!(mean_r < hi, "the case is only interesting below the edge: r={mean_r}, hi={hi}");
+
+        let out = Homeostat::default().control(purity, mean_r, p, n);
+        let BandControl::Decouple { effort } = out else {
+            panic!("a cell at R = {:.4} has lost its self-model and must be shed, got {out:?}", 1.0 / (7.0 * purity));
+        };
+        assert!(
+            effort > 0.0,
+            "the shed fired with zero effort — the trigger reads R and the law still reads r, so they \
+             disagree on every cell between the crossing and the edge (#275)"
+        );
+    }
 
     /// **These cases live on the equicorrelated stratum, and that is now said rather than assumed.**
     ///
@@ -246,7 +286,7 @@ mod tests {
 
     /// **A degenerate behavioural diagonal escalates — and the reason is algebra, not the band** (#272).
     ///
-    /// `collective_subject_window_at` returns `(∞, ∞)` for `p ≤ 0`, which `classify_collective_at` reads as
+    /// `collective_subject_window_at` returns `(∞, ∞)` for `p ≤ 0`, which `classify_collective` reads as
     /// [`Aggregate`](crate::CollectiveState::Aggregate) — under-coupled — whose prescription is `Bind`, more
     /// coupling. That would be exactly the wrong direction for a cell with no carriers, so the question is
     /// whether anything reaches it.

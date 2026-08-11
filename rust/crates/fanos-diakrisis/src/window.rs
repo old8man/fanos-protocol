@@ -105,24 +105,47 @@ pub fn collective_subject_window_at(p: f64) -> (f64, f64) {
     (lo, lo * sqrt(2.0))
 }
 
-/// Classify against the window this cell's own diagonal puts it in, rather than the flat-stratum one.
+/// Classify a cell: its own diagonal's window for the lower edge, its **measured** self-model for the
+/// upper one.
 ///
-/// **The direction of the old error is the reason this exists.** `r*` *rises* as behavioural weight
-/// concentrates, so the flat `1/√(N−1)` sits below a lopsided cell's true phase line: the old reading
-/// called an [`Aggregate`](CollectiveState::Aggregate) a [`CollectiveSubject`](CollectiveState::CollectiveSubject),
+/// **The lower edge — why `p` and not `n`.** `r*` *rises* as behavioural weight concentrates, so the flat
+/// `1/√(N−1)` sits below a lopsided cell's true phase line: the old reading called an
+/// [`Aggregate`](CollectiveState::Aggregate) a [`CollectiveSubject`](CollectiveState::CollectiveSubject),
 /// never the reverse. Measured at a node carrying 30 % of the variance: true line `0.455`, flat line
 /// `0.408`, and a cell at `r = 0.45` has `Φ = 0.977`.
 ///
-/// The *opposite* disagreement — `Φ > 1` with the mean below the floor — is a different animal and stays:
-/// it is the deliberately-used **under-coupled band**, reachable at exactly one block size and asserted in
-/// `dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs`. One direction was a named
-/// feature and the other was unnamed; they are not the same fact seen twice.
+/// The *opposite* disagreement at this edge — `Φ > 1` with the mean below the floor — is a different animal
+/// and stays: it is the deliberately-used **under-coupled band**, reachable at exactly one block size and
+/// asserted in `dispersion_is_the_second_dimension_and_is_what_the_under_coupled_band_needs`. One direction
+/// was a named feature and the other was unnamed; they are not the same fact seen twice.
+///
+/// **The upper edge — why `reflection` and not `r`** (#275, UHM `1ea2b27`). Over-coupling has always been
+/// defined two ways at once: "`r > √(2/(N−1))`, *equivalently* `R < 1/3`". The equivalence is a **stratum
+/// result** — it holds exactly where `Φ = r²(1−p)/p` is the whole story. Off the stratum a third parameter
+/// enters that neither `r` nor `p` carries: the *dispersion* of the off-diagonals raises the real `Φ` above
+/// what that law predicts, so the cell crosses `R = 1/3` while `r` is still inside the band. Measured on a
+/// Fano cell whose one line exchanges more than the rest: `r = 0.5746` sits below the `0.5774` edge while
+/// `R = 0.3209` and `Φ = 2.1065`, past the `Φ = 2` the edge was solved at.
+///
+/// The error is **one-directional**: dispersion only ever raises `Φ`, so a prediction from `r` is only ever
+/// late — and late is the side on which `Decouple` fails to fire on a cell that has already lost its
+/// self-model. So this reads `R`, the quantity the definition was always about, and the `hi` edge keeps the
+/// honest job it can do: a landmark an operator compares `r` against.
+///
+/// **`reflection` is an argument, not a derivation from the other two, and that is the point.** A caller
+/// that has only `(r, p)` genuinely cannot answer this question; making it pass the measured self-model is
+/// what stops the stratum being assumed by omission — the same discipline that deleted the flat closed
+/// forms in #219.
+///
+/// Ordering matters: a cell below the lower edge is an `Aggregate` even with a low `R`, because there the
+/// self-model was lost to *concentration*, not to coupling, and shedding correlation is the wrong answer —
+/// that case belongs to [`Alarm::Structure`](Alarm).
 #[must_use]
-pub fn classify_collective_at(r: f64, p: f64) -> CollectiveState {
-    let (lo, hi) = collective_subject_window_at(p);
+pub fn classify_collective(r: f64, p: f64, reflection: f64) -> CollectiveState {
+    let (lo, _) = collective_subject_window_at(p);
     if r <= lo + 1e-12 {
         CollectiveState::Aggregate
-    } else if r <= hi + 1e-12 {
+    } else if reflection >= crate::coherence::R_TH - 1e-9 {
         CollectiveState::CollectiveSubject
     } else {
         CollectiveState::OverCoupled
@@ -278,9 +301,9 @@ pub enum CollectiveState {
 }
 
 // `classify_collective(r, n)` was here — the flat-stratum classifier. Removed for the same reason as
-// `phi_equicorrelated`: it is [`classify_collective_at`] at `p = 1/n`, and keeping it as a separate name
+// `phi_equicorrelated`: it is [`classify_collective`] at `p = 1/n`, and keeping it as a separate name
 // let a caller read `0.408` off a cell without stating that it had assumed the diagonal flat. Every former
-// use is now `classify_collective_at(r, 1.0 / n as f64)`.
+// use is now `classify_collective(r, 1.0 / n as f64, reflection)`.
 
 
 /// **The convergence, written down rather than remarked on** (UHM T-312/T-314).
@@ -499,11 +522,51 @@ mod tests {
         let (lo, hi) = collective_subject_window(7);
         assert!((lo - 1.0 / sqrt(6.0)).abs() < 1e-12);
         assert!((hi - 1.0 / sqrt(3.0)).abs() < 1e-12);
-        assert_eq!(classify_collective_at(0.35, 1.0 / 7.0), CollectiveState::Aggregate);
+        // On the flat stratum the self-model is a function of `r`: `P = p(1 + Φ) = (1 + 6r²)/7`, so
+        // `R = 1/(7P) = 1/(1 + 6r²)`. Passing that rather than a literal is what keeps this a test of the
+        // classifier and not of a number I chose to make it pass.
+        let r_flat = |r: f64| 1.0 / (1.0 + 6.0 * r * r);
         assert_eq!(
-            classify_collective_at(0.5, 1.0 / 7.0),
+            classify_collective(0.35, 1.0 / 7.0, r_flat(0.35)),
+            CollectiveState::Aggregate
+        );
+        assert_eq!(
+            classify_collective(0.5, 1.0 / 7.0, r_flat(0.5)),
             CollectiveState::CollectiveSubject
         );
-        assert_eq!(classify_collective_at(0.7, 1.0 / 7.0), CollectiveState::OverCoupled);
+        assert_eq!(
+            classify_collective(0.7, 1.0 / 7.0, r_flat(0.7)),
+            CollectiveState::OverCoupled
+        );
+    }
+
+    /// On the stratum the new upper edge and the old one are the **same** boundary, and that is the check
+    /// that the #275 change did not move a line it was not supposed to move.
+    ///
+    /// `hi` was solved from `Φ = 2`, and on a flat diagonal `R = 1/(1 + Φ)`, so `R = 1/3` is `Φ = 2` is
+    /// `r = hi` — three spellings of one crossing. The classifier now reads the third; sweeping `r` across
+    /// `hi` in fine steps and demanding the verdict flip exactly there proves the reading is the same
+    /// boundary where the old equivalence holds, and leaves the off-stratum case — where it does not — as
+    /// the only place the behaviour changed.
+    #[test]
+    fn on_the_flat_stratum_the_measured_upper_edge_is_the_predicted_one() {
+        let p = 1.0 / 7.0;
+        let (_, hi) = collective_subject_window_at(p);
+        let r_flat = |r: f64| 1.0 / (1.0 + 6.0 * r * r);
+        for k in -50..=50 {
+            // Step well inside f64 resolution of the edge, but fine enough that a shifted boundary shows.
+            let r = hi + f64::from(k) * 1e-4;
+            let want = if k <= 0 {
+                CollectiveState::CollectiveSubject
+            } else {
+                CollectiveState::OverCoupled
+            };
+            assert_eq!(
+                classify_collective(r, p, r_flat(r)),
+                want,
+                "at r = {r} (edge {hi}) the measured reading disagrees with the predicted edge on the \
+                 stratum where the two are provably one boundary (#275)"
+            );
+        }
     }
 }
