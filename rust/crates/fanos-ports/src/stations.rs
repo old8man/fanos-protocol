@@ -361,6 +361,21 @@ pub enum Station {
     /// this one, which is zero on every ordinary accept.
     ConnSurplusHeld,
 
+    /// A second **unjudged** connection from a coordinate this node already holds one for was refused a
+    /// reader and dropped, which closes it (#267).
+    ///
+    /// **The deliberate asymmetry with [`ConnSurplusHeld`](Self::ConnSurplusHeld), and the reason both are
+    /// counted.** That station says a surplus was *kept*; this one says a surplus was *closed*. The two sit
+    /// one layer apart on purpose: a judged peer's second connection costs a list entry, while an unjudged
+    /// peer's would cost a spawned reader on a connection nothing has authenticated, and the bound there is
+    /// one per coordinate. But the consequence lands on the peer, not here — it dialed, got answered, and
+    /// had the answer closed under it.
+    ///
+    /// It was silent, and silence is what made a measurement unreadable: a late-joining node's restricted
+    /// channel carried exactly two frames on every failing run, and nothing said that the same node had
+    /// closed six other connections to the same peer in the same second. Keyed by the coordinate refused.
+    RestrictedSurplusDropped,
+
     /// An unroutable coordinate made this node dial a **configured entry address** (#263) — the send
     /// ladder's last rung, below the relay hub.
     ///
@@ -856,6 +871,7 @@ impl Station {
         Self::DirectoryStaleCoordinate,
         Self::DirectoryMovedPeerRetained,
         Self::ConnSurplusHeld,
+        Self::RestrictedSurplusDropped,
         Self::DirectoryEntryFallback,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
@@ -911,6 +927,7 @@ impl Station {
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
             Self::ConnSurplusHeld => "conns.surplus_held",
+            Self::RestrictedSurplusDropped => "hello.restricted_surplus_dropped",
             Self::DirectoryEntryFallback => "directory.entry_fallback",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
@@ -1026,6 +1043,7 @@ impl Station {
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld
+            | Self::RestrictedSurplusDropped
             | Self::DirectoryEntryFallback
             | Self::PorosRotationUnarmed
             | Self::DirectorySeatSuperseded

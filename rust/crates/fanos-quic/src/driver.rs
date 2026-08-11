@@ -3442,6 +3442,12 @@ fn spawn_restricted(conn: Connection, claimed: Triple, t: Transport) {
         Err(_) => false,
     };
     if !admitted {
+        // **Counted, because the peer pays for it and nothing else here says so** (#267). Dropping `conn`
+        // closes it, so a peer that dialed and was answered has the answer shut under it — and the bound
+        // that decides this is on THIS node's coordinate set, invisible from the other end. Its judged twin
+        // `ConnSurplusHeld` records the opposite choice one layer up, and having both is what makes the
+        // asymmetry a decision rather than an accident.
+        t.record_station(Station::RestrictedSurplusDropped, Some(claimed), None);
         return;
     }
     tokio::spawn(async move {
