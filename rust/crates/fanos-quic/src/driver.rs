@@ -496,15 +496,28 @@ const MAX_PEER_SEND_QUEUE: usize = INPUT_CAP;
 /// them; [`file_conn`] additionally drops closed entries on every write, so the steady state is the number
 /// of connections the peer is actually keeping open.
 ///
-/// **Why a list rather than "keep the older" or "keep the newer".** Neither is right by construction: the
-/// newest is the good one when a peer migrates and the doomed one when it is surplus, and the acceptor
-/// cannot tell which at accept time — that is the whole difficulty. Holding both and letting closure decide
-/// is self-healing: a send that picks a just-closed connection fails once, the entry is pruned, and the next
-/// send picks the survivor. Neither the old behaviour nor refusing the write recovers at all.
+/// **Why a list rather than "keep the older" or "keep the newer".** The acceptor cannot tell at accept time
+/// whether a second connection is a doomed surplus or a migrated peer's only working path, so it keeps both
+/// and defers the question to the reader below. What it must *not* do is discard one, which is what the old
+/// single-slot map did — and discarding closed the route the answering peer had just filed (#264).
 type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
 
-/// The one place the liveness rule is applied: drop closed connections to `peer` and hand back the first
-/// survivor. Every reader goes through this so "live" cannot come to mean two things in two callers.
+/// The one place the liveness rule is applied: drop closed connections to `peer` and hand back the
+/// **newest** survivor. Every reader goes through this so "live" cannot come to mean two things in two
+/// callers.
+///
+/// **Why the newest, derived — this is not a preference (#266).** Two causes put a second connection under
+/// one coordinate, and they are the only two. *Surplus*: both sides dialed at once, both are live, and either
+/// choice carries the frame. *Redial*: the peer lost its side (restart, NAT rebind, migration) and dialed
+/// again, so the older entry is dead and the newer one is the only path. The newest is therefore never worse
+/// and is sometimes the only correct answer, so it dominates — no measurement is needed to choose.
+///
+/// **Why the reader must choose at all, rather than trying each in turn.** Trying in turn needs a send whose
+/// failure is observable, and QUIC does not give one here: a peer that vanished sends no `CONNECTION_CLOSE`,
+/// so `close_reason()` stays `None` for the whole `max_idle_timeout`, `retain` keeps the corpse, `open_uni`
+/// succeeds locally, and the write is buffered into silence. Nothing reports a failure to fall back *from*.
+/// That lagging predicate is also why picking the oldest was actively harmful and not merely arbitrary: it
+/// pinned every redial onto the dead entry for a full idle timeout, which is longer than most exchanges live.
 fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> Option<Connection> {
     let live = map.get_mut(&peer)?;
     live.retain(|c| c.close_reason().is_none());
@@ -512,7 +525,7 @@ fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> Option
         map.remove(&peer);
         return None;
     }
-    live.first().cloned()
+    live.last().cloned()
 }
 
 /// File a connection under `peer`, pruning closed ones first. Returns how many live connections were
@@ -4822,6 +4835,75 @@ mod tests {
             ceiling,
         );
     }
+    /// Two connections proving one coordinate, and the reader must hand back the **newest** (#266).
+    ///
+    /// The property is not a preference: a second connection exists either because both sides dialed at
+    /// once — in which case either carries the frame — or because the peer lost its side and dialed again,
+    /// in which case the older one is a corpse and the newer is the only path. So the newest is never worse
+    /// and is sometimes the only right answer. The second half pins the pruning that makes the first half
+    /// safe: once a connection *is* known closed it must leave, or "newest" would mean "newest corpse".
+    ///
+    /// Falsified twice: `live.first()` (the shipped behaviour this task corrects) fails the newest
+    /// assertion, and dropping the `retain` fails the survivor assertion.
+    #[tokio::test]
+    async fn the_connection_map_hands_back_the_newest_and_drops_the_closed() {
+        let creds = NodeCredentials::generate().expect("credentials");
+        let (server, client, _cert) = node_configs_mutual_from(&creds).expect("tls");
+
+        let listener =
+            Endpoint::server(server, "127.0.0.1:0".parse().expect("listen addr")).expect("listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = listener.accept().await {
+                if let Ok(conn) = incoming.await {
+                    held.push(conn);
+                }
+            }
+        });
+
+        let mut dialer =
+            Endpoint::client("127.0.0.1:0".parse().expect("client addr")).expect("dialer");
+        dialer.set_default_client_config(client);
+        let older = dialer
+            .connect(addr, "fanos.node")
+            .expect("dial the older")
+            .await
+            .expect("older connection");
+        let newer = dialer
+            .connect(addr, "fanos.node")
+            .expect("dial the newer")
+            .await
+            .expect("newer connection");
+        assert_ne!(
+            older.stable_id(),
+            newer.stable_id(),
+            "the two dials collapsed onto one connection, so this test cannot tell the orders apart"
+        );
+
+        let peer: Triple = [1, 0, 1];
+        let mut map: HashMap<Triple, Vec<Connection>> = HashMap::new();
+        assert_eq!(file_conn(&mut map, peer, older.clone()), 0, "the first is not surplus");
+        assert_eq!(file_conn(&mut map, peer, newer.clone()), 1, "the second arrives over one held");
+
+        let picked = live_conn(&mut map, peer).expect("both are live, so one must come back");
+        assert_eq!(
+            picked.stable_id(),
+            newer.stable_id(),
+            "the reader handed back the OLDER connection. A peer that redialed because it lost its side is \
+             then pinned to a corpse for a full idle timeout, because QUIC reports no failure to fall back \
+             from — the send succeeds locally and the frame is buffered into silence (#266)."
+        );
+
+        newer.close(0u32.into(), b"gone");
+        let survivor = live_conn(&mut map, peer).expect("the older one is still live");
+        assert_eq!(
+            survivor.stable_id(),
+            older.stable_id(),
+            "a closed connection was handed back: `newest` must mean the newest SURVIVOR, or the map \
+             degrades into always returning the most recent corpse."
+        );
+    }
 }
 
 /// **#245: what one inbound connection may pin, as a number rather than a library default.**
@@ -4857,4 +4939,5 @@ mod transport_bounds {
              budget was not redone (#245, #213)."
         );
     }
+
 }
