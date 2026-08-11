@@ -30,9 +30,6 @@ set -u
 
 cd "$(dirname "$0")/rust" || exit 2
 
-LOGS="${GATE_LOGS:-${TMPDIR:-/tmp}/fanos-gate-$$}"
-mkdir -p "$LOGS" || exit 2
-
 FAILED=0
 SUMMARY=()
 
@@ -71,6 +68,33 @@ want() {
 }
 
 SELECT=("$@")
+
+# The log directory is named for WHAT WAS ASKED, not for the PID.
+#
+# It used to be `fanos-gate-$$`, and that address is computable only from inside the running gate. When a run
+# returned `GATE_TESTS_EXIT=1` alongside `no space left on device` in the same output, there was no way to tell
+# a real test failure from a disk artefact: the per-step logs existed and were unfindable. A gate whose
+# evidence outlives it only in principle reports nothing at the one moment it is needed — after it died.
+#
+# Naming it for the selection keeps it findable AND keeps #217's rule that overlapping gates must not share
+# paths: `./gate.sh clippy` and `./gate.sh tests` land in different directories, and the only collision left
+# is two runs of the SAME groups, which the lock below refuses outright rather than letting them interleave
+# their statuses.
+TAG=all
+if [ "${#SELECT[@]}" -gt 0 ]; then
+  TAG=$(printf '%s-' ${SELECT[@]+"${SELECT[@]}"})
+  TAG="${TAG%-}"
+fi
+LOGS="${GATE_LOGS:-${TMPDIR:-/tmp}/fanos-gate-$TAG}"
+
+if [ -f "$LOGS/pid" ] && kill -0 "$(cat "$LOGS/pid" 2>/dev/null)" 2>/dev/null; then
+  echo "gate '$TAG' is already running (pid $(cat "$LOGS/pid")) — its logs are in $LOGS" >&2
+  echo "refusing to start a second one: they would overwrite each other's statuses" >&2
+  exit 3
+fi
+mkdir -p "$LOGS" || exit 2
+echo $$ >"$LOGS/pid"
+trap 'rm -f "$LOGS/pid"' EXIT
 
 echo "gate — logs in $LOGS"
 
@@ -131,9 +155,11 @@ echo
 echo "summary"
 printf '  %s\n' ${SUMMARY[@]+"${SUMMARY[@]}"}
 echo
+# The path is printed again HERE, not only at the top. A caller that keeps the tail of a long run — which is
+# every caller — otherwise ends up holding the verdict without the evidence.
 if [ "$FAILED" -eq 0 ]; then
-  echo "GATE GREEN — ${#SUMMARY[@]} steps, every status read from cargo"
+  echo "GATE GREEN — ${#SUMMARY[@]} steps, every status read from cargo — logs in $LOGS"
 else
-  echo "GATE RED — see the logs named above"
+  echo "GATE RED — logs in $LOGS"
 fi
 exit "$FAILED"
