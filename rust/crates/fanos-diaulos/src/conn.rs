@@ -691,6 +691,58 @@ mod tests {
         assert!(service.accept().is_none());
     }
 
+    /// **A write to a stream the peer has reset produces nothing, and says nothing** (#244).
+    ///
+    /// `write` is a no-op for an unknown stream and returns `()`, so a caller cannot tell a queued write
+    /// from a discarded one. Harmless if nothing removes a stream behind the caller's back — but
+    /// `Frame::Reset` does exactly that, asynchronously, at any moment.
+    ///
+    /// **The observable had to be built carefully, and the first attempt was not.** Asserting on
+    /// `outbound()` without draining first proves nothing: the queue also carries acks and the reset's own
+    /// traffic, so "not empty" does not mean "the write was queued". Draining immediately before the write
+    /// makes whatever appears afterwards attributable to it alone.
+    #[test]
+    fn a_write_to_a_peer_reset_stream_queues_nothing_and_reports_nothing() {
+        let (c2s, s2c) = ([1u8; 32], [2u8; 32]);
+        let mut client = Connection::new(c2s, s2c, true);
+        let mut service = Connection::new(s2c, c2s, false);
+
+        let id = client.open_stream();
+        client.write(id, b"first");
+        client.flush(id); // `write` only buffers — nothing leaves until a segment is sealed.
+        for cell in client.outbound() {
+            service.on_cell(&cell);
+        }
+        assert_eq!(service.accept(), Some(id), "the service holds the stream before it aborts it");
+
+        let reset = service.reset_stream(id).expect("a known stream resets");
+        client.on_cell(&reset);
+        assert_eq!(client.stream_count(), 0, "the peer's reset removed our side");
+
+        // Drain everything the reset itself produced, so the next queue read is attributable to the write.
+        let _ = client.outbound();
+
+        // The application writes. It cannot know the stream is gone, and `write` will not tell it.
+        client.write(id, b"this payload belongs to the application");
+        client.flush(id); // the same seal a live stream would get — without it the check is vacuous
+        assert!(
+            client.outbound().is_empty(),
+            "the write produced cells after all — the stream survived the reset and this door is safe"
+        );
+
+        // **The control, without which the assertion above is vacuous.** A bare `write` seals nothing, so
+        // an empty queue would prove nothing on its own: the same write-then-flush on a LIVE stream must
+        // produce a cell. Three earlier versions of this probe were unfalsifiable for want of this.
+        let live = client.open_stream();
+        client.write(live, b"same sequence, live stream");
+        client.flush(live);
+        assert!(
+            !client.outbound().is_empty(),
+            "write+flush produced nothing even on a live stream, so the check above measures the sealing \
+             rule and not the reset (#244)"
+        );
+    }
+
     #[test]
     fn the_connection_hard_kills_at_nonce_exhaustion_rather_than_reusing_a_nonce() {
         // Nonce reuse would be catastrophic for the AEAD, so at the top of the 2⁶⁴ nonce space the
