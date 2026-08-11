@@ -36,6 +36,7 @@ pub mod healing;
 /// Parent-observes-child recursion — DIAKRISIS up the cell hierarchy (§L1, §6.5; #95).
 pub mod hierarchy;
 pub mod homeostat;
+pub mod lift;
 pub mod loadbalance;
 pub mod minima;
 pub mod monitor;
