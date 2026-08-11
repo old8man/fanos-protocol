@@ -47,6 +47,27 @@ pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 ///
 /// Measured, not argued: delivery through a composed relay cell takes 200 ms at means of 0, 1 s, 5 s, 60 s **and
 /// 600 s** with cover on (`fanos-sim/tests/composed_relay.rs`). A 600 s mean cannot produce 200 ms.
+///
+/// # Provenance, and why this constant cannot be re-derived today (#187, UHM `316edd9`)
+///
+/// **The `120 ms` came from a knee sweep on `PG(2,7)`** (`252815b`, 2026-07-26). The very next commit
+/// (`4ba78c3`, 2026-07-27) landed the fixed-slot onion layout, which made `depth_for(8) == 1` — so the
+/// sweep's own 2-hop circuit stopped building, and the commit after that formalised the `#[ignore]` class
+/// that keeps the breakage from ever being run into. **One day** between the number shipping and its
+/// derivation becoming unbuildable, and it has stayed unbuildable since.
+///
+/// There is nowhere to port it. `Node::start` dispatches only `q ∈ {2, 4, 7, 31}`, and Fano — the sole
+/// dispatchable plane whose `depth_for` still reaches 2 — has `K = 2` distinct-combiner circuits, so its
+/// linkability floor is `1/2`: a knee sweep there *starts at chance* and cannot discriminate a schedule.
+///
+/// So by UHM's own name for it this is a **fossil**: a constant with no incoming observations is a fixed
+/// point of any transmission chain, because its only source is itself. The discipline that rule prescribes
+/// is a *revision clock*, and this one has it —
+/// [`the_mixnet_defaults_revision_clock_has_not_rung`](self::tests) fails the moment the sweep becomes
+/// buildable again, so the obligation cannot become satisfiable unnoticed.
+///
+/// **What unblocks it:** `THRESHOLD_ONION_LEN` large enough that `depth_for(slot_len(8)) ≥ 2`. The clock
+/// computes that from the two functions rather than restating a number, so it moves when they do.
 pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 
 /// Default mean interval between a **relay**'s constant-size **cover cells** (spec §L5/V8): the router's send
@@ -121,6 +142,17 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 /// Closing this needs emission **decoupled from arrival** — a continuous-time (Poisson) mix, where each cell's delay is
 /// independently exponential and cover is itself Poisson, so the output process is independent of the input rate.
 /// Recorded as an open design gap, not a dial.
+///
+/// # Provenance: the same fossil, same day, same sweep (#187, UHM `316edd9`)
+///
+/// The `500 ms` was set by the identical `PG(2,7)` knee sweep as [`DEFAULT_MIX_DELAY`], in the same commit,
+/// and became unreproducible on the same day and for the same reason. See that constant's provenance
+/// section for the mechanism and the unblocking condition; the revision clock covers both, because one
+/// sweep produced both and one measurement will have to re-derive both.
+///
+/// Re-measured since at the live mix delay (`e26dbc5`): exposure `0.546` at this default, and the curve is
+/// **non-monotone** — `300 ms` reads `0.475`, better than the shipping value. That is a live reason to
+/// re-derive, not merely a stale provenance.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With
@@ -1285,6 +1317,48 @@ impl NodeConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// The **revision clock** on the two mixnet defaults: it rings when their sweep becomes buildable
+    /// again (#187, UHM `316edd9`).
+    ///
+    /// UHM's rule: *"a constant with no incoming observations is a fixed point of any transmission chain
+    /// — it has no revision mechanism, since its only source is itself. Give every blind constant a
+    /// revision clock against observations, or the chain will carry it forever."*
+    ///
+    /// Both defaults came from one `PG(2,7)` knee sweep that stopped building the day after it ran, and
+    /// nothing since has been able to feed them an observation. The failure mode this guards is not the
+    /// breakage — that is known — it is the **repair going unnoticed**: someone raises the onion budget for
+    /// an unrelated reason, the sweep becomes runnable, and two shipped anonymity defaults quietly stay at
+    /// numbers nobody can reproduce. That is a conditional obligation with no tripwire, and this is the
+    /// tripwire.
+    ///
+    /// It computes the condition from `depth_for` and `slot_len` rather than restating `37 804`: a guard
+    /// that copies the value it guards stops guarding the moment the original moves.
+    #[test]
+    fn the_mixnet_defaults_revision_clock_has_not_rung() {
+        // `PG(2,7)` — the plane the sweep ran on — has 8 points per line.
+        const SWEEP_LINE_SIZE: usize = 8;
+        let depth = fanos_aphantos::slots::depth_for(SWEEP_LINE_SIZE);
+
+        assert!(
+            depth < 2,
+            "the knee sweep that set DEFAULT_MIX_DELAY ({DEFAULT_MIX_DELAY:?}) and DEFAULT_COVER_INTERVAL \
+             ({DEFAULT_COVER_INTERVAL:?}) needs a \
+             2-hop circuit on PG(2,7), and depth_for(8) has risen to {depth} — it BUILDS again. Re-run \
+             `cargo test -p fanos-sim --test threshold_routing -- --ignored` and re-derive both defaults \
+             from it, then retire this clock. Leaving them is exactly the fossil UHM 316edd9 names: a \
+             constant whose only source is itself (#187)",
+        );
+
+        // And the clock must be watching the right thing: Fano, the one dispatchable plane that *does*
+        // reach depth 2, is not a substitute — its own line is smaller, and #187 records why its floor of
+        // 1/2 cannot discriminate a schedule. Asserting both keeps the clock from reading as "no plane
+        // works", which would make it ring for the wrong reason.
+        assert!(
+            fanos_aphantos::slots::depth_for(3) >= 2,
+            "Fano must still build a circuit — if it does not, the finding is larger than this clock"
+        );
+    }
+
     /// **A provisioning file that names one seat twice is refused, and an idempotent repeat is not.**
     ///
     /// The PROPERTY, and the discriminator is the pair: the guard must reject exactly the input that would silently
