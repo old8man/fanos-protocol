@@ -20,6 +20,7 @@ std = ["alloc", "fanos-geometry/std"]
 alloc = ["fanos-geometry/alloc"]
 
 [dev-dependencies]
+fanos-testkit = { path = "../fanos-testkit" }
 proptest.workspace = true
 # Exercise `#[derive(Wire)]` end-to-end (a dev-only cycle, permitted by Cargo).
 fanos-wire-derive.workspace = true

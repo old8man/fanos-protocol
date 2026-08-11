@@ -1437,6 +1437,7 @@ version = "0.1.0"
 dependencies = [
  "fanos-field",
  "fanos-geometry",
+ "fanos-testkit",
  "fanos-wire-derive",
  "proptest",
  "serde_json",

@@ -170,44 +170,43 @@ fn no_production_code_waives_a_panic_lint() {
         "clippy::panic",
     ];
 
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&src)
-        .expect("the crate's own src/ must be readable")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+    // The corpus and the test-block slice are the SHARED ones (#252/#253). Both were hand-rolled here, and
+    // both hand-rolled forms have the same failure: a walk that cannot open a file skips it in silence and
+    // then reports green about code it never read, and a slice cut at the FIRST `#[cfg(test)]` drops the
+    // shipping code below it. `shipping_lines` also keeps the 1-indexed numbers this test reports, which a
+    // naive "slice then enumerate" would have quietly shifted.
+    let files: Vec<(String, String)> = fanos_testkit::corpus::rust_sources()
+        .into_iter()
+        .filter(|s| s.krate == "fanos-wire" && s.is_crate_src())
+        .map(|s| (s.rel.clone(), s.text.clone()))
         .collect();
-    files.sort();
 
     // FLOOR 1 — the walk reached the files this crate is made of. Named individually, because
     // asserting the count against itself would pass on an empty directory listing.
     for expected in ["lib.rs", "frame.rs", "varint.rs", "element.rs", "wire.rs"] {
         assert!(
-            files.iter().any(|p| p.file_name().is_some_and(|n| n == expected)),
+            files.iter().any(|(rel, _)| rel.ends_with(expected)),
             "the scan did not reach src/{expected}, so its verdict covers an unknown subset of the crate"
         );
     }
 
+    let is_waiver = |line: &str| {
+        let trimmed = line.trim_start();
+        (trimmed.starts_with("#[allow(") || trimmed.starts_with("#![allow("))
+            && PANIC_LINTS.iter().any(|lint| line.contains(lint))
+    };
+
     let mut waivers = 0usize;
     let mut production = Vec::new();
-    for path in &files {
-        let text = std::fs::read_to_string(path).expect("a listed source file must be readable");
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            let is_waiver = (trimmed.starts_with("#[allow(") || trimmed.starts_with("#![allow("))
-                && PANIC_LINTS.iter().any(|lint| line.contains(lint));
-            if !is_waiver {
-                continue;
-            }
-            waivers += 1;
-            // The waiver is test-scoped iff the attribute above it gates the item out of the build.
-            let gated = i
-                .checked_sub(1)
-                .and_then(|p| lines.get(p))
-                .is_some_and(|prev| prev.trim() == "#[cfg(test)]");
-            if !gated {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                production.push(format!("{name}:{}: {}", i + 1, trimmed));
+    for (rel, text) in &files {
+        // Counted over the WHOLE file, because FLOOR 2 below is about the matcher being alive, and every
+        // waiver in this crate lives inside a test module — the very lines the shipping slice removes.
+        waivers += text.lines().filter(|l| is_waiver(l)).count();
+        // Reported over the SHIPPING lines only: a waiver that survives the cut is a production waiver, and
+        // the `#[cfg(test)]` lookback this used to do by hand is what the shared slice already knows.
+        for (n, line) in fanos_testkit::source::shipping_lines(text) {
+            if is_waiver(line) {
+                production.push(format!("{rel}:{n}: {}", line.trim_start()));
             }
         }
     }
