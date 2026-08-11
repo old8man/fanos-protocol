@@ -1261,8 +1261,10 @@ impl Node {
             // policy enables morph auto-fallback (§13.7); otherwise the fixed morph is used. No secret ⇒
             // plaintext QUIC.
             config.proteus_secret.clone().map(|secret| match config.proteus_environment {
-                Some(env) => ProteusConfig::auto(secret, env),
-                None => ProteusConfig::with_morph(secret, config.proteus_morph),
+                // `to_vec` and not a move: the config's copy is `Zeroizing` and stays that way, so it is
+                // wiped when the config drops even though PROTEUS needs a plain buffer to shape with (#13).
+                Some(env) => ProteusConfig::auto(secret.to_vec(), env),
+                None => ProteusConfig::with_morph(secret.to_vec(), config.proteus_morph),
             }),
         )?;
 

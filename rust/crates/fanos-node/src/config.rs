@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use fanos_calypso::hosting::Share;
 use fanos_wire::capability::Capabilities;
+use zeroize::Zeroizing;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
 use fanos_geometry::Triple;
 use fanos_keygen::recovery::RecoveryAuthoritySet;
@@ -1183,7 +1184,19 @@ pub struct NodeConfig {
     /// community secret so the transport carries no static FANOS signature, and the shape **rotates each
     /// epoch** (the moving-target defence); `None` (the default) is plaintext QUIC. All peers that must
     /// interoperate share the same secret — it is a bridge/community password, not a per-node key.
-    pub proteus_secret: Option<Vec<u8>>,
+    /// **Wiped on drop** ([`Zeroizing`], #13) — a long-lived shared community secret that used to sit in
+    /// freed heap for the life of the process.
+    ///
+    /// What that closes and what it does not. The residue is gone; the secret still has **no generation**, so
+    /// it can be neither rotated nor revoked without a flag day: every epoch's shaping material is
+    /// `H(root ‖ epoch)`, which gives unlinkability across epochs and *no* forward secrecy against a
+    /// compromised root — an attacker holding it recomputes every epoch, past and future. That is the open
+    /// half of the class, shared with the keyper decryption key (#143), and it needs a generation on the wire
+    /// so two can be accepted during a changeover.
+    ///
+    /// The buffer this is parsed out of — the whole provisioning file, read into a `String` — is not wiped
+    /// either. Naming it here rather than leaving a partial wipe to read as a complete one.
+    pub proteus_secret: Option<Zeroizing<Vec<u8>>>,
     /// The PROTEUS morph selecting the wire codec and traffic-shaping profile (§13.3): the flagship
     /// [`Morph::Polymorph`] ("look like nothing", the default) or an explicit shaping morph. Only takes
     /// effect when [`proteus_secret`](Self::proteus_secret) is set, and is ignored when
@@ -1340,7 +1353,7 @@ impl NodeConfig {
                             "proteus_secret must be non-empty (a shared community secret)".to_owned(),
                         ));
                     }
-                    config.proteus_secret = Some(value.as_bytes().to_vec());
+                    config.proteus_secret = Some(Zeroizing::new(value.as_bytes().to_vec()));
                 }
                 "proteus_morph" => {
                     config.proteus_morph = Morph::from_name(value).ok_or_else(|| {
@@ -1812,7 +1825,7 @@ mod tests {
         // PROTEUS (§13.4) is opt-in: default off (plaintext QUIC), enabled by a non-empty shared secret.
         assert!(NodeConfig::default().proteus_secret.is_none(), "off by default");
         let cfg = NodeConfig::from_config_str("proteus_secret = a-shared-bridge-secret").unwrap();
-        assert_eq!(cfg.proteus_secret.as_deref(), Some(&b"a-shared-bridge-secret"[..]));
+        assert_eq!(cfg.proteus_secret.as_deref().map(Vec::as_slice), Some(&b"a-shared-bridge-secret"[..]));
         // An empty secret is a configuration error, not a silent no-op.
         assert!(NodeConfig::from_config_str("proteus_secret =").is_err());
     }

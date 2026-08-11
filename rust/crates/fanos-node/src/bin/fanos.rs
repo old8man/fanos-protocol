@@ -245,7 +245,16 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     }
     if let Some(s) = flag(args, "--proteus-secret") {
         // Enable PROTEUS: shape every frame with this shared community secret, rotating per epoch (§13.4).
-        config.proteus_secret = Some(s.as_bytes().to_vec());
+        //
+        // The config held it as a bare `Vec<u8>` and left it in freed heap for the process's life; it is
+        // `Zeroizing` now (#13). That closes the residue and NOT the bigger exposure on this path: a secret
+        // passed as an argv flag is readable in `ps` by every local user for as long as the node runs, and no
+        // wipe inside the process can reach the kernel's copy of the command line. The provisioning-file key
+        // (`proteus_secret = …`) is the surface that does not have that hole; this flag stays for a one-shot
+        // and says what it costs.
+        warn!("--proteus-secret puts a shared community secret in this process's command line, where any \
+               local user can read it from `ps`; prefer the `proteus_secret` provisioning-file key");
+        config.proteus_secret = Some(zeroize::Zeroizing::new(s.as_bytes().to_vec()));
     }
     if let Some(m) = flag(args, "--proteus-morph") {
         // The morph selecting the codec + traffic-shaper (§13.3): plain, polymorph (default), tls-tunnel,
