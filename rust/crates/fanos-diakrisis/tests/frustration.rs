@@ -196,3 +196,38 @@ fn the_fano_lines_leave_exactly_eight_loop_dimensions_dark() {
          more of the cell's loop structure is nameable by the geometry than the doc says"
     );
 }
+
+/// **A rank-one shared structure is never frustrated** — which is why the stratum's exculpation is true
+/// there, and why a census built on one shared mode can only ever read zero (#221).
+///
+/// With a single common factor every coupling is `c_ij = s_i·s_j·|c|`, so a triple's product is
+/// `(s_i s_j s_k)²·|c|³` — non-negative for **every** sign assignment. This is T-318's "balanced ⟺ pure
+/// gauge" in the one case FANOS can check without leaving arithmetic, and it is worth pinning because it
+/// cost three attempts at a census: a generator with one signed shared mode cannot produce a frustrated
+/// cell at all, so its `0 %` was a statement about the fixture.
+#[test]
+fn one_shared_mode_can_never_frustrate_a_loop_whatever_the_signs() {
+    for pattern in 0u8..128 {
+        let signs: Vec<f64> = (0..N)
+            .map(|i| if pattern & (1 << i) == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut c = vec![0.0; N * N];
+        for i in 0..N {
+            c[i * N + i] = 1.0;
+            for j in (i + 1)..N {
+                let v = signs[i] * signs[j] * 0.4;
+                c[i * N + j] = v;
+                c[j * N + i] = v;
+            }
+        }
+        let Some(g) = CoherenceMatrix::from_correlation(c, N) else {
+            continue; // not every sign pattern at this magnitude is a reachable state
+        };
+        assert_eq!(
+            g.frustrated_lines(),
+            0,
+            "sign pattern {pattern:07b} frustrated a line, which a rank-one structure cannot do — the \
+             product around any triple is a perfect square times |c|³"
+        );
+    }
+}
