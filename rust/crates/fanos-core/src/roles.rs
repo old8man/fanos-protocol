@@ -1298,6 +1298,75 @@ pub fn assign_report(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    /// A weight every node shares does **not** cancel — it permutes. `ROLE_CAPACITY_WEIGHT` is therefore a
+    /// consensus-critical constant nobody derived (#270, UHM `a82aa1c`).
+    ///
+    /// UHM separates two currencies: *knowledge* (how often a place's outcome is good) from *want* (how
+    /// large that good is), and notes the neutral case — *"wherever a world never distinguishes magnitudes
+    /// the weight is identically 1, so every previous result reproduces bit for bit."* FANOS looks like
+    /// that case: `node.rs` builds every descriptor with one private `ROLE_CAPACITY_WEIGHT`, and among
+    /// healthy nodes `score` sits at `REP_SCALE`, so both terms are constant across the cell.
+    ///
+    /// **I expected the value to be inert, and the run refuted it.** A uniform weight is not a no-op: the
+    /// ticket count is an *input to the draw*, so seven nodes at four tickets each select a different
+    /// winner set than seven at one — same fairness, different permutation. The measurement below states
+    /// both halves, because only together do they say what the constant is: it does not bias the lottery,
+    /// and it does decide its outcome.
+    ///
+    /// That makes it worse than decorative. A value that changes who serves, is private, has no derivation,
+    /// and must be identical on every node or two nodes assign differently — is a cell-wide agreement
+    /// resting on a number chosen once. The tripwire is the fairness half: the day the weights stop being
+    /// uniform, the assignment starts trusting a magnitude, and UHM's rule says that magnitude must be
+    /// earned from the world's feedback rather than installed — which today it is not.
+    #[test]
+    fn a_uniform_capacity_weight_permutes_the_assignment_without_biasing_it() {
+        let members = |w: u16| -> Vec<(NodeId, Capability)> {
+            (0u8..7)
+                .map(|i| {
+                    (NodeId([i; 32]), Capability::new(RoleSet::of(&[Role::Relay, Role::Exit]), w))
+                })
+                .collect()
+        };
+        // A contest is required, or nothing is assigned and every comparison is vacuous: seven nodes offer
+        // two roles, and the cell asks for two of each. The first version used `Demand::default()` and the
+        // equality passed on two empty maps.
+        let demand = Demand::per_role(|role| u16::from(matches!(role, Role::Relay | Role::Exit)) * 2);
+        let beacon = BeaconSeed::new([0x5A; 32]);
+
+        // (1) The value DECIDES the outcome — it is not a no-op the way a cancelling factor would be.
+        assert_ne!(
+            assign(&members(1), Epoch(9), &beacon, demand),
+            assign(&members(4), Epoch(9), &beacon, demand),
+            "a uniform ROLE_CAPACITY_WEIGHT still selects a different winner set at 1 than at 4: the \
+             ticket count is an input to the draw, so this constant is consensus-critical (#270)"
+        );
+
+        // (2) And it does NOT bias it: across many epochs each node wins its fair share at either value.
+        // Without this the first assertion would read as "the weight matters", which is the wrong lesson —
+        // what it changes is *which* node, never *how often*.
+        let share = |w: u16| -> Vec<usize> {
+            let mut wins = vec![0usize; 7];
+            for e in 0..700u64 {
+                for (id, _) in assign(&members(w), Epoch(e), &beacon, demand) {
+                    if let Some(slot) = id.0.first().map(|&i| i as usize).and_then(|i| wins.get_mut(i)) {
+                        *slot += 1;
+                    }
+                }
+            }
+            wins
+        };
+        for (w, wins) in [(1u16, share(1)), (4, share(4))] {
+            let total: usize = wins.iter().sum();
+            let fair = total / 7;
+            let spread = wins.iter().max().copied().unwrap_or(0) - wins.iter().min().copied().unwrap_or(0);
+            assert!(
+                spread * 4 < fair,
+                "at weight {w} the lottery must stay fair across nodes — fair share {fair}, observed \
+                 spread {spread}: {wins:?}"
+            );
+        }
+    }
+
 
     /// The floor is not a second constant: it is where an alternating shirker lands.
     ///
