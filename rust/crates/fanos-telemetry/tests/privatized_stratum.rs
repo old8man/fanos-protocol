@@ -186,3 +186,80 @@ fn the_export_substitutes_a_flat_cell_and_that_costs_a_whole_regime() {
         exported.reflection
     );
 }
+
+/// **Would releasing the diagonal purity close it?** (#278, step 3 before step 1.)
+///
+/// The obvious fix for the cost above is to release `p` alongside `r` with its own derived sensitivity, so
+/// the re-derivation has the second parameter. Deriving `Δp` is real work, and the task that proposes it
+/// carries an explicit warning: *measure whether the second parameter helps before deriving its Δ.* This
+/// is that measurement, and it is cheap — no sensitivity, no privacy, no noise. It asks one question:
+/// **given `(r, p)` exactly, how often does the re-derived regime still differ from the cell's own?**
+///
+/// Three verdicts per sweep point:
+/// 1. the cell's own, from the full matrix;
+/// 2. the **flat** re-derivation, `equicorrelated(7, r)` — what `privatize` does today;
+/// 3. the **two-parameter** re-derivation, `Φ = r²(1−p)/p`, `P = p(1+Φ)`, `R = 1/(NP)` — what releasing
+///    `p` would buy, evaluated at the *exact* `p`, which is the most generous version of the proposal.
+///
+/// If (3) is no better than (2), the proposal is answering the wrong question and the honest fix is
+/// different: stop shipping verdict bits a consumer will read as the cell's own.
+#[test]
+fn releasing_the_diagonal_purity_is_measured_before_its_sensitivity_is_derived() {
+    let n = N as f64;
+    let (mut flat_wrong, mut two_wrong, mut both_wrong, mut points) = (0usize, 0usize, 0usize, 0usize);
+    let mut first_two_param_miss = None;
+
+    for k in 0..=400 {
+        let g = cell_at(f64::from(k) / 400.0);
+        let (r, p) = (g.mean_correlation(), g.diagonal_purity());
+        let truth = g.collective_state();
+
+        // (2) the flat model, exactly as `privatize` builds it.
+        let flat = CoherenceMatrix::equicorrelated(N, r).collective_state();
+
+        // (3) the two-parameter model at the exact p — the proposal's best case.
+        let phi2 = fanos_diakrisis::coherence::phi_at(r, p);
+        let purity2 = p * (1.0 + phi2);
+        let reflection2 = if purity2 > 0.0 { 1.0 / (n * purity2) } else { 0.0 };
+        let two = fanos_diakrisis::window::classify_collective(r, p, reflection2);
+
+        points += 1;
+        let (f_bad, t_bad) = (flat != truth, two != truth);
+        flat_wrong += usize::from(f_bad);
+        two_wrong += usize::from(t_bad);
+        both_wrong += usize::from(f_bad && t_bad);
+        if t_bad && first_two_param_miss.is_none() {
+            first_two_param_miss = Some((r, p, g.measures().phi, phi2, truth, two));
+        }
+    }
+
+    println!(
+        "over {points} sweep points: the FLAT re-derivation misses the regime {flat_wrong} times; the \
+         TWO-PARAMETER one at the exact p misses it {two_wrong} times ({both_wrong} of those are the same \
+         points)"
+    );
+    if let Some((r, p, phi_true, phi_two, truth, two)) = first_two_param_miss {
+        println!(
+            "first two-parameter miss: r={r:.4} p={p:.4} — the cell measures Φ={phi_true:.4}, the law \
+             gives Φ={phi_two:.4} ({:+.1}%), so {truth:?} reads as {two:?}",
+            (phi_two - phi_true) / phi_true * 100.0
+        );
+    }
+
+    // The sweep must exercise the flat failure, or the comparison has no baseline.
+    assert!(
+        flat_wrong > 0,
+        "the flat model got every point right on this sweep, so there is nothing for the second parameter \
+         to improve and this measurement is vacuous"
+    );
+
+    // THE FINDING. If the second parameter closed it, this would be zero and #278 would be worth its
+    // derivation. It is not: `Φ = r²(1−p)/p` is still a two-parameter law read on a cell whose off-diagonal
+    // DISPERSION is a third, and dispersion is what raises the true Φ above what any function of (r, p)
+    // predicts.
+    assert!(
+        two_wrong > 0,
+        "the two-parameter re-derivation got every point right — releasing `p` WOULD close the export's \
+         model cost, so #278's derivation of Δp is worth doing and this assertion must be inverted"
+    );
+}

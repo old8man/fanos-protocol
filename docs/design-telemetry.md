@@ -231,8 +231,14 @@ minimal one:
     regime, lost to the model alone. The cell is barely off the stratum (`p = 0.1432` against a flat
     `0.1429`); the work is done by off-diagonal **dispersion**, which no function of `(r, p)` carries.
     So a consumer — `Census` above all — must read a privatized verdict as *a model's verdict about a cell
-    with that mean correlation*, not as the cell's own. Closing it means releasing the diagonal purity too,
-    with its own derived sensitivity; that is a new DP derivation, tracked, not attempted.
+    with that mean correlation*, not as the cell's own.
+  - **How many statistics closing it would take — measured, not guessed.** The obvious proposal, releasing
+    the diagonal purity `p` as a second statistic, buys **nothing**: over a 401-point sweep the flat model
+    misses the regime 5 times and a two-parameter model at the *exact* `p` misses it on the same 5 points.
+    The verdict is `classify_collective(r, p, R)` with `R = 1/(N·P)`, `P = p(1+Φ)` and
+    `Φ = (N−1)(r² + v)`, so it is a function of `(N, r, p, v)` with `v` the off-diagonal dispersion:
+    **three** releases where there is one, each needing its own derived sensitivity and a third of the ε.
+    The honest alternative is to stop shipping verdict bits at all. Open, tracked as #278.
   **Only `privatize`
   crosses the export boundary** — the full-resolution frame stays internal for self-healing, and an
   emitted raw `CoherenceFrame` must still never be treated as anonymized.

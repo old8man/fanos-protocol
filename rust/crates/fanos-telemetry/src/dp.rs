@@ -163,9 +163,20 @@ impl CoherenceFrame {
     /// (`fanos status coherence`, which is unprivatized and local, and which §3's R4 says costs no
     /// anonymity).
     ///
-    /// Closing it properly means releasing the diagonal purity too, with its own derived sensitivity, so
-    /// the re-derivation has the second parameter. That is a new DP derivation, not a wiring change, and it
-    /// is deliberately not attempted here.
+    /// **How many statistics closing it would take, measured rather than guessed.** The obvious proposal is
+    /// to release the diagonal purity `p` as well, so the re-derivation has the second parameter. It buys
+    /// **nothing**: over a 401-point sweep the flat model misses the regime 5 times and a two-parameter
+    /// model evaluated at the *exact* `p` misses it on the same 5 points
+    /// (`tests/privatized_stratum.rs`). `Φ = r²(1−p)/p` is still a two-parameter law, and the parameter
+    /// doing the work is a third one.
+    ///
+    /// The verdict is `classify_collective(r, p, R)` with `R = 1/(N·P)`, `P = p(1 + Φ)` and
+    /// `Φ = (N−1)(r² + v)` where `v` is the off-diagonal **dispersion**. So it is a function of exactly
+    /// `(N, r, p, v)`: closing this needs **three** releases where there is one, each with its own derived
+    /// sensitivity, and the ε budget split three ways. Whether that is worth its accuracy — a third of the
+    /// ε per statistic is a third of the noise budget — is the open question, and the honest alternative is
+    /// to stop shipping verdict bits a consumer will read as the cell's own. Tracked as #278; not attempted
+    /// here, and deliberately not attempted as "just release `p`", which the measurement rules out.
     #[must_use]
     pub fn privatize(&self, budget: PrivacyBudget, rng: &mut impl Rng) -> Self {
         // ε ≤ 0 is meaningless; fall back to the strongest representable floor rather than divide by ≤ 0.
