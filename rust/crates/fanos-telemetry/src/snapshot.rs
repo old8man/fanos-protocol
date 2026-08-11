@@ -197,6 +197,51 @@ impl CoherenceSnapshot {
         self.cascade_lead >= 0
     }
 
+    /// The cell's **diagonal purity** `p = Σᵢ dᵢ²` — how concentrated its behavioural weight is.
+    ///
+    /// Recovered from two measures already on the wire rather than widened into the frame: `P = p·(1 + Φ)`
+    /// is the general law's own identity, so `p = P/(1 + Φ)` exactly. `p = 1/N` is the flat (equicorrelated)
+    /// stratum; `p → 1` is a cell where one node carries all the variance.
+    ///
+    /// Carried to f32 precision, because that is what the frame carries. That is ample for a band edge an
+    /// operator reads and **not** enough to re-derive a verdict from — which is why nothing here does; see
+    /// [`Self::collective_band`].
+    #[must_use]
+    pub fn diagonal_purity(&self) -> f64 {
+        let denom = 1.0 + self.phi;
+        if denom > 0.0 { self.purity / denom } else { f64::NAN }
+    }
+
+    /// The collective-subject band `(r*, r_over]` **of this cell** — the two edges of `Φ ∈ [1, 2]` solved
+    /// at the cell's own diagonal, not at a flat seven-node one.
+    ///
+    /// [`R_STAR`] and [`OVER_COUPLING`] are these same two edges frozen at `p = 1/7`, and they are correct
+    /// there and nowhere else: `r*` *rises* as behavioural weight concentrates, so on a lopsided cell the
+    /// frozen pair sits below the real band. This is what a renderer should draw and what a reader should
+    /// compare a `mean_correlation` against.
+    ///
+    /// **It is not a verdict, and must not be used as one.** The cell's regime is decided at the source, on
+    /// the full matrix, and travels in [`Self::regime`] — the upper edge in particular is settled by the
+    /// *measured* reflection rather than by `r` (#275), which no consumer of this snapshot can recompute.
+    /// A consumer that re-derives the regime from `(r, p)` here is running a weaker law beside the
+    /// answer it was handed (#277).
+    #[must_use]
+    pub fn collective_band(&self) -> (f64, f64) {
+        fanos_diakrisis::window::collective_subject_window_at(self.diagonal_purity())
+    }
+
+    /// The viability floor `P_crit = 2/N` for **this** cell, using the node count recovered exactly from
+    /// its own measures.
+    ///
+    /// [`PURITY_FLOOR`] is this at `N = 7`. The same substitution was already made for
+    /// [`Self::stability_radius`] — whose old form "was previously computed against a hard-coded seven,
+    /// which made the operator's headroom reading wrong on every cell that is not `PG(2,2)`" — and the
+    /// floor that radius is measured *from* was left behind on the constant.
+    #[must_use]
+    pub fn purity_floor(&self) -> f64 {
+        2.0 / f64::from(self.alive_nodes.max(1))
+    }
+
     /// Canonical JSON — a flat, stable object for `fanos monitor --json` / OTLP / agent consumption.
     /// Field order and shape are fixed (KAT-pinned); non-finite scalars render as `null`.
     #[must_use]

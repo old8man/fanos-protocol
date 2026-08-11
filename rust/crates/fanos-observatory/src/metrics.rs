@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use fanos_telemetry::snapshot::{OVER_COUPLING, PHI_THRESHOLD, R_STAR};
+use fanos_telemetry::snapshot::PHI_THRESHOLD;
 use fanos_telemetry::{AlarmLevel, CoherenceSnapshot, Regime};
 
 /// The cell-identifying label every metric line carries, so a multi-node/multi-cell scrape can tell
@@ -95,7 +95,9 @@ fn push_coherence_gauges(out: &mut String, cell_id: &str, s: &CoherenceSnapshot)
     push_gauge(
         out,
         "fanos_coherence_phi",
-        "Integration Φ = 6r² (spec §2.7); a cell is one bound subject iff Φ ≥ 1.",
+        "Integration Φ = r²·(1−p)/p with p the cell's diagonal purity (spec §2.7, UHM T-312); a cell is \
+         one bound subject iff Φ ≥ 1. NOT 6r² — that is the flat/equicorrelated special case at N = 7, \
+         deleted from the code by #219 so the stratum could not be assumed.",
         cell_id,
         s.phi,
     );
@@ -130,15 +132,18 @@ fn push_coherence_gauges(out: &mut String, cell_id: &str, s: &CoherenceSnapshot)
     push_gauge(
         out,
         "fanos_coherence_stability_radius",
-        "Stability radius r_stab = √(max(0, P − 2/N)) (T-104); the viability speedometer.",
+        "Stability radius (T-104): the Bures distance to the viability shell {P = 2/N} — the viability \
+         speedometer. NOT √(P − 2/N): that form was refuted in 2026-08, overstating the margin by up to \
+         81.7× precisely as the wall is approached.",
         cell_id,
         s.stability_radius,
     );
     push_gauge(
         out,
         "fanos_cell_alive_nodes",
-        "Estimated alive nodes in the cell, recovered from Φ = (N−1)r² (spec §2.7); exact for the \
-         mandatory liveness self-observation, approximate for the measured-behavioural fold.",
+        "Alive nodes in the cell, recovered EXACTLY as N = 1/(R·P) — an identity on any coherence matrix, \
+         so it assumes no stratum. It replaced an inversion of the equicorrelated Φ = (N−1)r², which was \
+         exact only on a flat cell.",
         cell_id,
         f64::from(s.alive_nodes),
     );
@@ -188,18 +193,20 @@ fn push_alarm_gauges(out: &mut String, cell_id: &str, s: &CoherenceSnapshot) {
     push_gauge(
         out,
         "fanos_coherence_cascade_alarm",
-        "Cascade early-warning (spec §2.7): mean correlation r has crossed r* = 1/√6, the onset of the \
-         collective-subject/cascade-risk band.",
+        "Cascade early-warning (spec §2.7): the cell has crossed its lower band edge r* — the onset of \
+         the collective-subject/cascade-risk band. Read from the regime the frame carries, so it cannot \
+         disagree with fanos_coherence_regime.",
         cell_id,
-        f64::from(i32::from(s.mean_correlation >= R_STAR)),
+        f64::from(i32::from(!matches!(s.regime, Regime::Aggregate))),
     );
     push_gauge(
         out,
         "fanos_coherence_over_coupling_alarm",
-        "Over-coupling alarm (spec §18.2): r has crossed 1/√3 — the cell is losing its self-model \
-         (R < 1/3); the response is to shed correlation (Decouple).",
+        "Over-coupling alarm (spec §18.2): the cell has lost its self-model (R < 1/3) while coupled; the \
+         response is to shed correlation (Decouple). Read from the regime the frame carries, so it cannot \
+         disagree with fanos_coherence_regime.",
         cell_id,
-        f64::from(i32::from(s.mean_correlation >= OVER_COUPLING)),
+        f64::from(i32::from(matches!(s.regime, Regime::OverCoupled))),
     );
     push_gauge(
         out,
@@ -298,7 +305,10 @@ impl HealthSummary {
             verdict: derived_verdict(snapshot),
             alive_nodes: snapshot.alive_nodes,
             integration_alarm: snapshot.phi < PHI_THRESHOLD,
-            cascade_alarm: snapshot.mean_correlation >= R_STAR,
+            // The regime, not `r >= R_STAR`. `R_STAR` is the lower band edge frozen at a flat seven-node
+            // cell, and this summary is what an alerting rule reads — it must not answer a question the
+            // same snapshot already answers, by a weaker law (#277).
+            cascade_alarm: !matches!(snapshot.regime, Regime::Aggregate),
         }
     }
 }
@@ -306,6 +316,8 @@ impl HealthSummary {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
+    use fanos_telemetry::snapshot::{OVER_COUPLING, R_STAR};
+
     use super::*;
     use fanos_diakrisis::coherence::CoherenceMatrix;
     use fanos_telemetry::{CellId, CoherenceFrame};

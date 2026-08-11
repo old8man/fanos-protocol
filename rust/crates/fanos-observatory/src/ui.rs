@@ -12,7 +12,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use fanos_telemetry::{
-    AlarmLevel, CoherenceSnapshot, OVER_COUPLING, PURITY_FLOOR, R_STAR, REFLECTION_FLOOR, Regime,
+    AlarmLevel, CoherenceSnapshot, REFLECTION_FLOOR, Regime,
 };
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -117,18 +117,21 @@ fn render_left(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnapsho
         format!("{:.3}   bound if ≥ 1", snap.phi),
         if snap.phi >= 1.0 { READY } else { WARN },
     );
-    // P > 2/N ⇒ structured/viable.
+    // P > 2/N ⇒ structured/viable. The floor is **this cell's**, from the node count recovered exactly
+    // from its own measures — the same substitution `stability_radius` already made, on the floor that
+    // radius is measured from. A five-node survivor's wall is 2/5, and printing 2/7 would show it margin
+    // it does not have.
+    let floor = snap.purity_floor();
     gauge(
         f,
         rows[1],
         "P  structure",
         snap.purity.clamp(0.0, 1.0),
-        format!("{:.3}   viable if > 2/7 ({PURITY_FLOOR:.3})", snap.purity),
-        if snap.purity > PURITY_FLOOR {
-            READY
-        } else {
-            CRIT
-        },
+        format!(
+            "{:.3}   viable if > 2/{} ({floor:.3})",
+            snap.purity, snap.alive_nodes
+        ),
+        if snap.purity > floor { READY } else { CRIT },
     );
     // R ≥ 1/3 ⇒ still self-observing (not over-coupled).
     gauge(
@@ -190,14 +193,20 @@ fn render_spectrum(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
     let marker =
         ((snap.mean_correlation.clamp(0.0, 1.0)) * (w.saturating_sub(1)) as f64).round() as usize;
 
+    // **This cell's** band, not a flat seven-node one. `R_STAR`/`OVER_COUPLING` are these edges frozen at
+    // `p = 1/7`; `r*` rises as behavioural weight concentrates, so on a lopsided cell the frozen pair
+    // draws the marker inside a band it has already left. A degenerate `p` yields an infinite window,
+    // which paints the whole axis "below the band" — the same fail-safe the classifier takes.
+    let (lo, hi) = snap.collective_band();
+
     let mut band = Vec::with_capacity(w);
     for i in 0..w {
         let r = i as f64 / (w.max(2) - 1) as f64;
         let (ch, col) = if i == marker {
             ('▐', Color::White)
-        } else if r <= R_STAR {
+        } else if r <= lo {
             ('▄', WARN)
-        } else if r <= OVER_COUPLING {
+        } else if r <= hi {
             ('▄', ACCENT)
         } else {
             ('▄', CRIT)
@@ -206,11 +215,8 @@ fn render_spectrum(f: &mut Frame<'_>, area: Rect, snap: &CoherenceSnapshot) {
     }
     let axis = Line::from(vec![
         Span::styled("0", Style::default().fg(MUTED)),
-        Span::styled(format!("  r*={R_STAR:.2}  "), Style::default().fg(WARN)),
-        Span::styled(
-            format!("band  1/√3={OVER_COUPLING:.2}"),
-            Style::default().fg(ACCENT),
-        ),
+        Span::styled(format!("  r*={lo:.2}  "), Style::default().fg(WARN)),
+        Span::styled(format!("band  {hi:.2}"), Style::default().fg(ACCENT)),
         Span::styled("  1", Style::default().fg(MUTED)),
     ]);
     let para = Paragraph::new(vec![Line::from(band), axis]);
@@ -248,12 +254,18 @@ fn render_right(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnapsh
 fn render_vitals(f: &mut Frame<'_>, area: Rect, app: &App, snap: &CoherenceSnapshot) {
     let (reg_col, reg_txt) = regime_label(snap.regime);
     let (al_col, al_txt) = alarm_label(snap.alarm);
-    let band_note = if snap.mean_correlation <= R_STAR {
-        Span::styled("below r* — not yet bound", Style::default().fg(WARN))
-    } else if snap.mean_correlation <= OVER_COUPLING {
-        Span::styled("in the collective-subject band", Style::default().fg(READY))
-    } else {
-        Span::styled("over-coupled — shed correlation", Style::default().fg(CRIT))
+    // The sentence and `reg_txt` one line above it answer the same question, so they read the same field.
+    // This used to compare `mean_correlation` against the frozen `R_STAR`/`OVER_COUPLING`, which is that
+    // comparison on the equicorrelated stratum only — so the panel could print "over_coupled" beside
+    // "in the collective-subject band", two lines apart, on a cell whose weight is concentrated (#277).
+    let band_note = match snap.regime {
+        Regime::Aggregate => Span::styled("below r* — not yet bound", Style::default().fg(WARN)),
+        Regime::CollectiveSubject => {
+            Span::styled("in the collective-subject band", Style::default().fg(READY))
+        }
+        Regime::OverCoupled => {
+            Span::styled("over-coupled — shed correlation", Style::default().fg(CRIT))
+        }
     };
     // The radius alone cannot say whether it is small because the cell is small or because the cell is badly
     // placed inside its band — `r_stab` varies **8.58×** across `Φ ∈ (1, 2]` (`0.0171` at `Φ = 1.1` against
