@@ -344,6 +344,24 @@ pub enum Station {
     /// the one fact the handshake established.
     DirectoryMovedPeerRetained,
 
+    /// An inbound connection **replaced a live one** under the same coordinate (#265) — the connection map's
+    /// first and only observable.
+    ///
+    /// **The map had none, and that is why five explanations died.** Stations cover the directory, the wire,
+    /// HELLO and the roles; `conns` — the table reverse reachability (#119) actually depends on — was
+    /// unobservable, so "the route was lost" and "the route was never there" read identically and every
+    /// hypothesis stayed equally consistent with the silence.
+    ///
+    /// **Counts an eviction, not an error.** A peer whose previous connection genuinely died and dialed
+    /// again is the normal cause, and there the old entry is dead, so this stays flat. It rises only when
+    /// the displaced connection was still *open* — which is the peer opening a second connection while the
+    /// first works, and that surplus is the dialer's to discard and the acceptor's only route.
+    ///
+    /// Keyed by the coordinate whose route was replaced. No denominator yet, deliberately: the question this
+    /// was built for is binary — does the accept path ever evict a live connection on the path under
+    /// investigation — and a zero answers it only because the counter is made to fire on purpose first.
+    ConnRouteReplaced,
+
     /// A POROS line rotation **did not arm**: the outgoing roster admits no valid contributor subset at the
     /// line's threshold, so this node prepared nothing and will keep serving on the share it already holds
     /// until that share's epoch expires (#243).
@@ -823,6 +841,7 @@ impl Station {
         Self::RestrictedFrameDropped,
         Self::DirectoryStaleCoordinate,
         Self::DirectoryMovedPeerRetained,
+        Self::ConnRouteReplaced,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
         Self::DirectoryRouteSuperseded,
@@ -876,6 +895,7 @@ impl Station {
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
+            Self::ConnRouteReplaced => "conns.route_replaced",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
             Self::DirectoryRouteSuperseded => "directory.route_superseded",
@@ -984,6 +1004,7 @@ impl Station {
             | Self::RestrictedFrameDropped
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
+            | Self::ConnRouteReplaced
             | Self::PorosRotationUnarmed
             | Self::DirectorySeatSuperseded
             | Self::DirectoryRouteSuperseded

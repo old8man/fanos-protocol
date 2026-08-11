@@ -2954,8 +2954,20 @@ async fn accept_loop(t: Transport) {
             // an ephemeral client port, not where it accepts). No directory entry is written — a live
             // connection *is* the reachability, and inventing a directory address from the source port
             // would be wrong (and, in a shared directory, would clobber the peer's real listen address).
+            // **Observed, not changed** (#265). The write stays unconditional — five explanations for the
+            // route loss have already been refuted, and changing behaviour on a sixth guess is how the last
+            // three passes went. What was missing is that this eviction left no trace at all: `conns` is the
+            // table reverse reachability depends on and it had no instrument, so "the route was replaced by
+            // a connection about to close" and "there was never a route" were the same silence.
+            //
+            // Under one lock, so the observation cannot disagree with the write it describes.
             if let Ok(mut map) = t.conns.lock() {
+                let displaced_live = map.get(&from).is_some_and(|old| old.close_reason().is_none());
                 map.insert(from, conn.clone());
+                drop(map);
+                if displaced_live {
+                    t.record_station(Station::ConnRouteReplaced, Some(from), None);
+                }
             }
             // Remember the public source address this peer dialed in from, keyed by its proven coordinate:
             // the hub's hole-punch table (#119). When a third party later asks us to broker a connection to
