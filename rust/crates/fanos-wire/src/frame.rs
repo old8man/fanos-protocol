@@ -252,7 +252,124 @@ impl FrameType {
     pub fn code(self) -> u64 {
         self as u64
     }
+
+    /// Every frame type, for a reader that **enumerates rather than guesses** — the resolver that turns a
+    /// station's tag into a name, a dashboard, a conformance sweep over the registry.
+    ///
+    /// Completeness is a compile-time fact, not a test: the assertion below compares this list's length to
+    /// the variant count, so adding a type without listing it here fails the build. A test could only visit
+    /// the variants the list already holds, which is exactly the one it would need to notice.
+    pub const ALL: [Self; 43] = [
+        Self::Hello,
+        Self::HelloAck,
+        Self::Ping,
+        Self::Pong,
+        Self::Error,
+        Self::ObservedAddr,
+        Self::ConnectReq,
+        Self::PunchTo,
+        Self::Relay,
+        Self::Announce,
+        Self::BeaconReq,
+        Self::Beacon,
+        Self::DkgDeal,
+        Self::DkgJustify,
+        Self::DkgCommit,
+        Self::DkgComplaint,
+        Self::BeaconPartial,
+        Self::EpochAgree,
+        Self::BeaconReshareTrigger,
+        Self::BeaconReshareCommit,
+        Self::BeaconReshareShare,
+        Self::Lookup,
+        Self::Value,
+        Self::Publish,
+        Self::Ack,
+        Self::Route,
+        Self::RouteHier,
+        Self::Tessera,
+        Self::RdvIntro,
+        Self::RdvReply,
+        Self::RdvRegister,
+        Self::SvcShareReq,
+        Self::SvcPartial,
+        Self::PorosRequest,
+        Self::PorosShareReq,
+        Self::PorosShare,
+        Self::PorosResponse,
+        Self::PorosReshare,
+        Self::DiagGossip,
+        Self::DiagAttest,
+        Self::DiagLoss,
+        Self::CellEscalate,
+        Self::App,
+    ];
+
+    /// The registry name, in the snake_case every other resolved vocabulary in this tree uses.
+    ///
+    /// **Why the wire registry needed one (#268).** `Observation::tag` reserves its field for frame stations
+    /// to carry a wire type code, and `Station::tag_kind` will only call a tag a *vocabulary* if something
+    /// can resolve it. Without `ALL` + `name()` there was nothing to resolve against, so every frame station
+    /// had to declare its tag a bare `Quantity` and print `#17` at an operator — or, as
+    /// `RestrictedFrameDropped` did until #267 needed it, throw the code away entirely.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::HelloAck => "hello_ack",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::Error => "error",
+            Self::ObservedAddr => "observed_addr",
+            Self::ConnectReq => "connect_req",
+            Self::PunchTo => "punch_to",
+            Self::Relay => "relay",
+            Self::Announce => "announce",
+            Self::BeaconReq => "beacon_req",
+            Self::Beacon => "beacon",
+            Self::DkgDeal => "dkg_deal",
+            Self::DkgJustify => "dkg_justify",
+            Self::DkgCommit => "dkg_commit",
+            Self::DkgComplaint => "dkg_complaint",
+            Self::BeaconPartial => "beacon_partial",
+            Self::EpochAgree => "epoch_agree",
+            Self::BeaconReshareTrigger => "beacon_reshare_trigger",
+            Self::BeaconReshareCommit => "beacon_reshare_commit",
+            Self::BeaconReshareShare => "beacon_reshare_share",
+            Self::Lookup => "lookup",
+            Self::Value => "value",
+            Self::Publish => "publish",
+            Self::Ack => "ack",
+            Self::Route => "route",
+            Self::RouteHier => "route_hier",
+            Self::Tessera => "tessera",
+            Self::RdvIntro => "rdv_intro",
+            Self::RdvReply => "rdv_reply",
+            Self::RdvRegister => "rdv_register",
+            Self::SvcShareReq => "svc_share_req",
+            Self::SvcPartial => "svc_partial",
+            Self::PorosRequest => "poros_request",
+            Self::PorosShareReq => "poros_share_req",
+            Self::PorosShare => "poros_share",
+            Self::PorosResponse => "poros_response",
+            Self::PorosReshare => "poros_reshare",
+            Self::DiagGossip => "diag_gossip",
+            Self::DiagAttest => "diag_attest",
+            Self::DiagLoss => "diag_loss",
+            Self::CellEscalate => "cell_escalate",
+            Self::App => "app",
+        }
+    }
 }
+
+/// **`ALL` is complete, proven by the compiler.** A registry entry missing from the list is invisible to
+/// every reader that enumerates — the tag resolver, a dashboard, a conformance sweep — and invisible
+/// *exactly* where a new frame type was just added. `variant_count` answers that at compile time; a test
+/// could not, because it can only visit what the list already contains.
+const _: () = assert!(
+    FrameType::ALL.len() == core::mem::variant_count::<FrameType>(),
+    "a FrameType variant is missing from FrameType::ALL, so every reader that enumerates is blind to it"
+);
 
 /// The **inner-session** frame registry — the frame types carried *inside* one AEAD-encrypted DIAULOS
 /// cell (spec §L2), a deliberately distinct layer from the outer overlay-transport [`FrameType`]. Like

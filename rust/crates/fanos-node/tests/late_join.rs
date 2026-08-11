@@ -131,8 +131,8 @@ fn dump(tag: &str, n: &Node) {
         // The TAG matters for the frame stations, and leaving it out is why 20 runs could name a
         // discriminator without saying what it was made of: `hello.restricted_frame_dropped = 2` on every
         // failing run is a different fact depending on whether the two frames share a type (#267). Printed
-        // as `#code` because `FrameType` has no name table yet — a raw code the reader can look up beats a
-        // fabricated name, and beats the nothing that was here before.
+        // as the raw `#code` here on purpose — this dump is a research instrument reading `Observation`
+        // directly, where an operator gets the resolved name through `admin::tag_name` (#268).
         .map(|o| {
             let tag = o.tag.map(|t| format!("#{t}")).unwrap_or_default();
             match o.line {

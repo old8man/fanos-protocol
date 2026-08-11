@@ -401,6 +401,13 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::PeerRefused => {
             fanos_wire::ProtocolError::ALL.iter().find(|e| e.index() == tag).map(|e| e.name())
         }
+        // The wire registry itself (#268). `None` here is not a hole: the tag is a code that arrived from a
+        // peer we could not judge, so a code outside §7.2 is exactly what a stranger sends, and printing the
+        // raw number is the honest answer. Its sibling `FrameTypeUnknown` stays a `Quantity` for the same
+        // reason from the other side — that station exists *because* the code is not in the registry.
+        Station::RestrictedFrameDropped => {
+            fanos_wire::FrameType::ALL.iter().find(|f| f.code() == tag).map(|f| f.name())
+        }
         Station::ReadShardRefused => {
             fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
         }

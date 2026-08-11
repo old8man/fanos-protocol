@@ -971,23 +971,20 @@ impl Station {
             | Self::SetpointHeld              // fanos_node::SetpointHold
             | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
             | Self::ActorDied                 // fanos_quic::DriverActor
+            | Self::RestrictedFrameDropped    // fanos_wire::FrameType
             => TagKind::Vocabulary,
 
             // --- The tag is a number that means itself. ---
             //
             // `AssignmentWithheld` carries the roster size it withheld against; `FrameTypeUnknown` carries a
-            // wire code that by definition is not in the registry — an enumeration cannot contain it, and
+            // wire code that by definition is **not** in the registry — an enumeration cannot contain it, and
             // that is the whole reason the station exists.
             //
-            // `RestrictedFrameDropped` carries the wire type code of the frame an unjudged peer sent, and it
-            // is a **quantity by omission, not by nature** (#267). Unlike the two above, most of these codes
-            // ARE in the registry — but `FrameType` has no `ALL`/`name()`, so there is no vocabulary to
-            // resolve against, and inventing one here would be the fabrication this split exists to prevent.
-            // Give `FrameType` the two members every other resolved enum has and this moves to `Vocabulary`
-            // with a one-line arm in `tag_name`.
-            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::RestrictedFrameDropped => {
-                TagKind::Quantity
-            }
+            // Note the pair with `RestrictedFrameDropped` above, which tags with a wire code too and IS a
+            // vocabulary. The two are not a contradiction and must not be merged: one carries a code the
+            // registry has a name for, the other carries the codes it does not. Folding them would hand the
+            // resolver an unresolvable tag and force it to invent a name or return a hole (#268).
+            Self::AssignmentWithheld | Self::FrameTypeUnknown => TagKind::Quantity,
 
             // --- No tag. ---
             //
