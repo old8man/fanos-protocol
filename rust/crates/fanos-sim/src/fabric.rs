@@ -498,6 +498,12 @@ impl NodeFleet {
                     }),
                     roles,
                     bootstrap,
+                    // OBSERVED, not provisioned: this list is the coordinates the running nodes are
+                    // actually at, read from their own `health()`. When the draw collides — which is the
+                    // whole subject of `spawn_as_drawn` and of the two measurements that use it — the list
+                    // repeats a coordinate, and treating that as an operator's typo made both of them
+                    // impossible to run at all (#186).
+                    bootstrap_source: fanos_node::config::SeatSource::Observed,
                     ..fanos_node::NodeConfig::default()
                 },
                 fanos_quic::Fabric::Abstract(socket),

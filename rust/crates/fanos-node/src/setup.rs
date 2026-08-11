@@ -506,6 +506,7 @@ pub fn default_roles() -> RoleSet {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use crate::config::SeatSource;
     use super::*;
 
     #[test]
@@ -563,6 +564,9 @@ mod tests {
     #[test]
     fn the_round_trip_covers_every_field_the_compiler_knows_about() {
         let c = NodeConfig {
+            // Deliberately the PERMISSIVE value, so the assertion below is about the render/parse
+            // path resetting it rather than about the fixture already holding the default.
+            bootstrap_source: SeatSource::Observed,
             listen: "127.0.0.1:9977".parse().expect("a valid listen address"),
             plane_order: 4,
             telemetry_epsilon: Some(0.5),
@@ -592,6 +596,7 @@ mod tests {
             ingress_path,
             state_path,
             bootstrap,
+            bootstrap_source,
             roles,
             mix_mean_delay,
             cover_interval,
@@ -630,6 +635,19 @@ mod tests {
         assert_eq!(identity_path, &None, "and the fixture deliberately leaves the field unset");
 
         // --- deliberately not round-tripped, each for its own reason ---
+
+        // `bootstrap_source` is a CONSTRUCTOR ARGUMENT, not a setting, and the round trip must not create
+        // one: it says whether a repeated coordinate in `bootstrap` is an operator's typo (refuse) or a
+        // live collision among running peers (admit). Rendering it would let a provisioning file declare
+        // its own duplicate acceptable, which is the exact hole `seed_directory` exists to close. So the
+        // property asserted here is the OPPOSITE of a round trip — the parse must come back at the
+        // fail-closed default whatever the fixture was built with (#186).
+        assert_eq!(bootstrap_source, &SeatSource::Observed, "the fixture sets the permissive value");
+        assert_eq!(
+            back.bootstrap_source,
+            SeatSource::Provisioned,
+            "a rendered-and-reparsed config must come back refusing duplicates, or a file could relax it"
+        );
 
         // A shared community secret does not belong in a file an operator copies between hosts, so the
         // renderer writes a comment naming it instead of the value. The property worth asserting is

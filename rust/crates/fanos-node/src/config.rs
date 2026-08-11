@@ -770,16 +770,67 @@ pub struct Peer {
 /// # Errors
 /// [`NodeError::Config`] naming the repeated coordinate and both addresses claiming it.
 pub fn seed_directory(peers: &[Peer], directory: &fanos_quic::Directory) -> Result<(), NodeError> {
+    seed_directory_from(peers, directory, SeatSource::Provisioned).map(|_| ())
+}
+
+/// Where a bootstrap list came from — which is what decides **what a repeated coordinate means**.
+///
+/// One predicate, two provenances, opposite correct answers. The refusal below was written for a
+/// provisioning file and is right there; applied to a list of coordinates a *draw* produced, it refuses a
+/// state the platform's own settle walk exists to resolve.
+///
+/// This is a **constructor argument, never a config key**: [`NodeConfig`] deliberately derives no
+/// `Deserialize`, so nothing a file can say reaches it, and a deployment cannot declare its own typo
+/// acceptable. [`SeatSource::Provisioned`] is the `Default` for the same reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SeatSource {
+    /// **Someone wrote this list.** A repeated coordinate is an operator error and is fatal — see
+    /// [`seed_directory`] for why a warning is not enough and why `fanos keygen` makes it sharper.
+    #[default]
+    Provisioned,
+    /// **These coordinates were observed from peers that are running.** A repeat is then not an error in
+    /// the list; it is a live **collision** — two nodes currently contesting one point, which
+    /// `fanos_vrf::settle_index` moves one of them off. Refusing over it would punish *this* node for two
+    /// others' draw, and the cost is total: it cannot start at all, while the collision it refuses over is
+    /// transient and not its to fix. Admitted, and counted, because the joining node can still reach one of
+    /// the pair and one reachable peer is all a bootstrap needs.
+    Observed,
+}
+
+/// [`seed_directory`], with the provenance of the list stated. Returns how many collisions were admitted.
+///
+/// Under [`SeatSource::Provisioned`] the count is always `0` — the first repeat is an error. Under
+/// [`SeatSource::Observed`] a repeat writes nothing (the incumbent's binding stands, and the second peer's
+/// address is still kept by `note_entry` where no arbitration can reach it) and increments the count, so
+/// the caller can say out loud that its bootstrap set was smaller than the list it was handed.
+///
+/// # Errors
+/// [`NodeError::Config`] naming the repeated coordinate and both addresses, under `Provisioned` only.
+pub fn seed_directory_from(
+    peers: &[Peer],
+    directory: &fanos_quic::Directory,
+    source: SeatSource,
+) -> Result<usize, NodeError> {
+    let mut contested = 0usize;
     for peer in peers {
         // `resolve` rather than the write's outcome, because the outcome cannot carry this: the second unranked
         // write is `Bound`, which is the arbitration rule behaving exactly as designed. Only the *input* is wrong.
         if let Some(held) = directory.resolve(peer.coord)
             && held != peer.addr
         {
-            return Err(NodeError::Config(format!(
-                "coordinate {}:{}:{} is listed twice, at {held} and at {} — one seat cannot hold two addresses",
-                peer.coord[0], peer.coord[1], peer.coord[2], peer.addr
-            )));
+            if source == SeatSource::Provisioned {
+                return Err(NodeError::Config(format!(
+                    "coordinate {}:{}:{} is listed twice, at {held} and at {} — one seat cannot hold two addresses",
+                    peer.coord[0], peer.coord[1], peer.coord[2], peer.addr
+                )));
+            }
+            // Observed: a live collision. The incumbent's binding stands — an unranked write over an
+            // unranked incumbent would land and silently swap which of the pair is reachable, for no gain —
+            // but the address is still kept below, so the send ladder can reach this peer even though the
+            // point resolves to the other one.
+            contested += 1;
+            directory.note_entry(peer.addr);
+            continue;
         }
         // Discarded deliberately: into a directory this function is seeding, an unranked write over an unranked
         // incumbent always lands, and the one input that could make it not land is refused above.
@@ -792,7 +843,7 @@ pub fn seed_directory(peers: &[Peer], directory: &fanos_quic::Directory) -> Resu
         // no arbitration can reach it and the send ladder can fall back to it.
         directory.note_entry(peer.addr);
     }
-    Ok(())
+    Ok(contested)
 }
 
 /// The inverse of [`Peer::parse`] — the `x:y:z@host:port` seed form.
@@ -1036,6 +1087,10 @@ pub struct NodeConfig {
     pub state_path: Option<PathBuf>,
     /// Bootstrap peers seeded into the address book.
     pub bootstrap: Vec<Peer>,
+    /// Where [`bootstrap`](Self::bootstrap) came from, which decides what a repeated coordinate in it
+    /// means — see [`SeatSource`]. `Provisioned` by default: a list nobody vouched for is treated as a
+    /// file an operator wrote, which is the answer that refuses rather than the one that admits.
+    pub bootstrap_source: SeatSource,
     /// The advertised role set.
     pub roles: RoleSet,
     /// Mean Poisson mixing delay a **relay** holds each forwarded onion for (spec §L5/V7, audit S1-H1). Zero
@@ -1103,6 +1158,7 @@ impl Default for NodeConfig {
             exit_path: None,
             ingress_path: None,
             bootstrap: Vec::new(),
+            bootstrap_source: SeatSource::Provisioned,
             roles: RoleSet::default(),
             mix_mean_delay: DEFAULT_MIX_DELAY,
             cover_interval: DEFAULT_COVER_INTERVAL,

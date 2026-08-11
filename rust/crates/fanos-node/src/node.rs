@@ -1005,6 +1005,28 @@ pub struct Health {
     pub organizing: crate::role_loop::RoleStanding,
 }
 
+/// Seed the address book from `config.bootstrap`, and say so when a coordinate is contested.
+///
+/// The **provenance** of that list decides what a repeated coordinate in it means (#186): an operator's
+/// file must be refused, because a duplicate there silently shrinks the bootstrap set and `fanos keygen`
+/// derives the network's name from the roster it was handed. A snapshot of *running* peers must not be —
+/// two peers contesting one point is a live state `fanos_vrf::settle_index` resolves, and refusing over it
+/// would stop THIS node for a collision that is neither its fault nor its to fix, at a total cost against
+/// a transient one.
+fn seed_bootstrap(config: &NodeConfig, directory: &Directory) -> Result<(), NodeError> {
+    let contested =
+        crate::config::seed_directory_from(&config.bootstrap, directory, config.bootstrap_source)?;
+    if contested > 0 {
+        tracing::warn!(
+            contested,
+            listed = config.bootstrap.len(),
+            "bootstrap peers contest a coordinate: the point resolves to one of each pair, so this node \
+             starts with fewer dialable seats than it was given — transient while the cell settles"
+        );
+    }
+    Ok(())
+}
+
 impl Node {
     /// Start a node over the deployment field `F`, using `config` (identity, bootstrap, roles).
     ///
@@ -1134,7 +1156,7 @@ impl Node {
             Some(bp) => Directory::new().for_network(genesis_seed(&bp.network_id)),
             None => Directory::new(),
         };
-        crate::config::seed_directory(&config.bootstrap, &directory)?;
+        seed_bootstrap(&config, &directory)?;
 
         // Compose the engine per coordinate: a bare overlay by default, or — when beacon params are
         // configured — an `OverlayBeaconNode` that runs the live threshold-DVRF epoch clock (§7.6). A
