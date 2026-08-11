@@ -138,6 +138,34 @@ impl CoherenceFrame {
     /// `rng` is the caller's entropy source — a node's CSPRNG in production, a seeded RNG in tests. The
     /// noise MUST be fresh per release: never reuse a deterministic draw across exports, or the guarantee
     /// is void.
+    ///
+    /// # The export costs accuracy twice, and only one cost is bounded by ε (#222)
+    ///
+    /// Re-deriving every other field from the single release is what makes the whole frame ε-DP for the
+    /// price of one Laplace draw. It also **substitutes an equicorrelated cell for the measured one**, and
+    /// that error is not a function of ε: it does not shrink as ε grows, and at `ε = ∞` it is all that is
+    /// left.
+    ///
+    /// Measured, with the noise set to exactly zero so nothing is attributable to the draw
+    /// (`tests/privatized_stratum.rs`): a Fano cell at `r = 0.5613` whose own reflex reads
+    /// `Φ = 2.0092, P = 0.4309, R = 0.3315` — **over-coupled**, the state `Decouple` exists for — exports
+    /// as `Φ = 1.8905, P = 0.4129, R = 0.3460`: a healthy **collective subject**, `alarm = Healthy`. Same
+    /// `r` to four decimals. One regime, lost to the model alone.
+    ///
+    /// The cell is barely off the stratum — `p = 0.1432` against a flat `1/7 = 0.1429` — so this is not
+    /// about lopsided cells. The work is done by off-diagonal **dispersion**, a third parameter that
+    /// neither `6r²` nor `r²(1−p)/p` carries, and every real cell has some.
+    ///
+    /// **What a consumer must not do:** treat a privatized frame's `regime`/`alarm`/`integrated` as the
+    /// cell's own verdict. They are a model's verdict about a cell with that mean correlation. The bits are
+    /// still worth carrying — a roll-up over many cells wants *an* answer, and this one is right on the
+    /// stratum and close to it — but a reader deciding about one cell should ask that cell
+    /// (`fanos status coherence`, which is unprivatized and local, and which §3's R4 says costs no
+    /// anonymity).
+    ///
+    /// Closing it properly means releasing the diagonal purity too, with its own derived sensitivity, so
+    /// the re-derivation has the second parameter. That is a new DP derivation, not a wiring change, and it
+    /// is deliberately not attempted here.
     #[must_use]
     pub fn privatize(&self, budget: PrivacyBudget, rng: &mut impl Rng) -> Self {
         // ε ≤ 0 is meaningless; fall back to the strongest representable floor rather than divide by ≤ 0.

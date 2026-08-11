@@ -215,12 +215,25 @@ minimal one:
   ε-differential privacy: `CoherenceFrame::privatize` Laplace-noises the cell's sufficient statistic `r`
   at the *derived* sensitivity `Δr = 1/21` (one flow is one of the `C(7,2) = 21` cell pairs, so a mean
   over them has marginal sensitivity `1/21` — the favorable sensitivity that lets a small ε hide any
-  single flow), re-derives `Φ = 6r̃²`, `P`, `R`, and the regime/alarm verdict from the noised `r` by
-  post-processing (no extra ε budget, by the post-processing theorem), and **withholds** the exact
-  syndrome, spectral gap, heal-event counter, and forecast (the cell-granular floor). Verified in
+  single flow), re-derives `Φ`, `P`, `R`, and the regime/alarm verdict from the noised `r` **on an
+  equicorrelated model** by post-processing (no extra ε budget, by the post-processing theorem), and
+  **withholds** the exact syndrome, spectral gap, heal-event counter, and forecast (the cell-granular
+  floor). Verified in
   `telemetry/tests/differential_privacy.rs`: a raw frame is a deanonymization oracle (advantage ≈ 1),
   while the private frame's optimal distinguishing advantage collapses to the analytic Laplace bound
-  `1 − e^{−ε/2}`, and the noised statistic is unbiased so the cell signal survives. **Only `privatize`
+  `1 − e^{−ε/2}`, and the noised statistic is unbiased so the cell signal survives.
+  - **The export costs accuracy twice, and only the noise is bounded by ε (#222).** Substituting an
+    equicorrelated cell is a *model* error: it is not a function of ε, does not shrink as ε grows, and at
+    `ε = ∞` it is all that is left. Measured with the noise set to exactly zero
+    (`telemetry/tests/privatized_stratum.rs`): a cell at `r = 0.5613` reading
+    `Φ = 2.0092, P = 0.4309, R = 0.3315` — **over-coupled**, the state `Decouple` exists for — exports as
+    `Φ = 1.8905, P = 0.4129, R = 0.3460`, a healthy **collective subject** with `alarm = Healthy`. One
+    regime, lost to the model alone. The cell is barely off the stratum (`p = 0.1432` against a flat
+    `0.1429`); the work is done by off-diagonal **dispersion**, which no function of `(r, p)` carries.
+    So a consumer — `Census` above all — must read a privatized verdict as *a model's verdict about a cell
+    with that mean correlation*, not as the cell's own. Closing it means releasing the diagonal purity too,
+    with its own derived sensitivity; that is a new DP derivation, tracked, not attempted.
+  **Only `privatize`
   crosses the export boundary** — the full-resolution frame stays internal for self-healing, and an
   emitted raw `CoherenceFrame` must still never be treated as anonymized.
 - **Full-domain frames carry no timing.** For a `Full`-privacy cell, the frame excludes schedule-derived

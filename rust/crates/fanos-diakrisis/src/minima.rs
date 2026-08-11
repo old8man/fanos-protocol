@@ -354,6 +354,11 @@ pub fn purity_after_failures(n: usize, k: usize) -> f64 {
 /// integration directly. Shows the dilution law plainly — holding `Φ` fixed while `N` grows requires
 /// `r ∝ 1/√(N−1)`.
 ///
+/// **Flat-stratum only, and there is no general inverse taking `(N, Φ)`.** The general law is
+/// `Φ = r²(1−p)/p`, whose inverse `r = √(Φ·p/(1−p))` needs the cell's *diagonal purity* — a third
+/// parameter this signature does not carry. A caller holding a real cell must pass `p`; a caller holding
+/// only `N` is asking a question about the stratum, which is what this module is for (#222).
+///
 /// Returns `0` for `n < 2`, where no inter-node correlation exists to speak of.
 #[must_use]
 pub fn correlation_for_integration(n: usize, phi: f64) -> f64 {

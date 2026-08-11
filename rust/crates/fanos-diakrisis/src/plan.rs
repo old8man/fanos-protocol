@@ -63,9 +63,15 @@ pub enum HealingAction {
         node: usize,
     },
     /// Shed excess inter-node correlation while every node is still live: the cell is
-    /// **over-coupled** (`r > 1/√3`, `R < 1/3`, spec §18.2). Band-keeping back toward `(1/√6, 1/√3]`
-    /// — this *lowers* `Φ = 6r²` (V15) out of the over-coupled regime and restores `R ≥ 1/3`, not
-    /// raises it. (A cell merely inside the band is a healthy subject and is left untouched.)
+    /// **over-coupled** — past its own band's upper edge with a measured `R < 1/3` (spec §18.2).
+    /// Band-keeping back toward that band lowers `Φ = r²(1−p)/p` out of the over-coupled regime and
+    /// restores `R ≥ 1/3`, not raises it. (A cell merely inside the band is a healthy subject and is left
+    /// untouched.)
+    ///
+    /// The numbers `r > 1/√3` and `Φ = 6r²` this used to name are the *flat* spellings at `N = 7`, and the
+    /// module header above is careful to say so where it uses them. Here they read as the definition, which
+    /// is the shape #219 deleted from the code: an over-coupled cell measured at `r = 0.5613` sits **below**
+    /// `1/√3 = 0.5774` (#222).
     Decouple,
     /// Hand the residue to the parent cell: the listed nodes are an irrecoverable stopping set
     /// (a hyperoval, V20) or lie beyond the `Φ`-budget (spec §6.3 stratification, §6.7).

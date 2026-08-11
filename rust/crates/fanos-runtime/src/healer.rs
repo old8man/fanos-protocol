@@ -409,7 +409,15 @@ impl Healer {
     /// The shed answers a *measured* over-coupling; scaling a configured constant instead meant the
     /// controller's model of what it had done bore no relation to what it was responding to. It also made
     /// every cap look arbitrary: at `healthy = 0.45` the whole budget down to the floor is 0.042, while an
-    /// over-coupled cell is by definition above `hi = 0.577` and has four times that to give back.
+    /// over-coupled cell typically sits near `hi ≈ 0.577` with several times that to give back.
+    ///
+    /// *Typically*, not *by definition* — the earlier wording said the latter and it is false off the flat
+    /// stratum, which is where this function's whole reason for existing lives. Over-coupling is settled by
+    /// the measured `R`, not by `r` against a frozen edge (#275): a cell measured at `r = 0.5613` with
+    /// `R = 0.3315` is over-coupled *below* `0.577`. The argument survives — the measured baseline is still
+    /// the right input, and a cell that is genuinely over-coupled still has far more to give back than the
+    /// configured constant would suggest — but the budget is whatever `r` actually reads, and reasoning
+    /// from a floor of `0.577` would over-state it (#222).
     pub(crate) fn baseline_correlation(&self, healthy: f64) -> f64 {
         self.measured_correlation.unwrap_or(healthy)
     }

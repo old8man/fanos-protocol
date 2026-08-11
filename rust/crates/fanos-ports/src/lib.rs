@@ -385,8 +385,17 @@ pub enum Escalation {
     /// `Φ`-budget): the Fano mask of the nodes it could not recover (spec §6.3, §6.7). Always non-empty —
     /// the localizer escalates only at three or more faults.
     Faults(u8),
-    /// The cell's **behavioural coherence collapsed** (`Φ ≤ 1`, equivalently `P ≤ 2/N`): it is no longer an
-    /// integrated whole, and T-104 §5 puts that past the point of no return without external support.
+    /// The cell's **behavioural coherence collapsed** (`P ≤ 2/N`, which implies `Φ ≤ 1`): it is no longer
+    /// an integrated whole, and T-104 §5 puts that past the point of no return without external support.
+    ///
+    /// The implication runs **one way only**, and the trigger deliberately takes the strong side. Writing
+    /// `d` for the cell's activity shares, `P = p·(1 + Φ)` with `p = Σᵢdᵢ² ≥ 1/N` (Cauchy–Schwarz, equality
+    /// exactly on the flat stratum). So `P ≤ 2/N` forces `1 + Φ = P/p ≤ 2` — always, on any cell. The
+    /// converse needs `p = 1/N`: a cell whose behavioural weight is concentrated can lose integration
+    /// (`Φ ≤ 1`) while `P` is still above the wall, and this escalation stays silent. That is not a hole —
+    /// [`Alarm`](crate::stations) reports the integration crossing on its own channel, and the two are
+    /// separate on purpose — but the old wording said *equivalently*, which promised a reader that this
+    /// escalation covers both (#222).
     ///
     /// **No node is implicated**, which is exactly why it cannot travel as a fault mask: the answer is not
     /// "reroute around these" but re-provisioning the cell, and there is no parent-side channel for that
