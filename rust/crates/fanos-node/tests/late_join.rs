@@ -83,10 +83,20 @@ async fn arrival(commitment: VssCommitment, peer: Peer) -> Node {
 /// symmetric: each side announces its own epoch and judges the other's, so an advanced cell and a cold
 /// arrival refuse each other for two different reasons at two different counters.
 fn epoch_unknown(node: &Node) -> u64 {
+    station_total(node, "hello.epoch_unknown")
+}
+
+/// How many times this node put a peer it could not judge into the restricted state instead of dropping
+/// it — the entry condition of the only path a beacon has to an unverified node (#235).
+fn peer_unjudged(node: &Node) -> u64 {
+    station_total(node, "hello.peer_unjudged")
+}
+
+fn station_total(node: &Node, name: &str) -> u64 {
     node.client()
         .driver_stations()
         .iter()
-        .filter(|o| o.station.name() == "hello.epoch_unknown")
+        .filter(|o| o.station.name() == name)
         .map(|o| o.count)
         .sum()
 }
@@ -241,11 +251,13 @@ async fn probe_two_nodes_started_together_on_genesis_exchange_a_frame() {
 /// The anchor ticks every 120 ms, so by the time the arrival starts the cell is several epochs past genesis
 /// and the arrival holds only `(0, genesis_seed)`.
 ///
-/// This test asserts what is TRUE TODAY, and it is written to fail the day it stops being true — the panic
-/// message says so, because a joining node succeeding is the fix landing, not a regression.
+/// **It used to assert that the join FAILS, and that tripwire has now fired.** The arrival now completes
+/// the exchange, so the expectation is gone and the ROUTE is asserted in its place — see the long note at
+/// the assertion, which names the mechanism the tripwire demanded. The join is intermittent, which is why
+/// this is still a measurement and not yet a gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "measurement, not an assertion — its control above is intermittent, so a green here proves nothing yet"]
-async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified() {
+#[ignore = "measurement: the join is intermittent (4 of 10), so the outcome is a rate — only the route is asserted"]
+async fn probe_a_node_arriving_after_the_cell_leaves_genesis_joins_by_the_restricted_channel() {
     // A subscriber, because `RUST_LOG` alone does nothing in a test binary — measured, and it is why the
     // first three attempts at this investigation produced no trace at all.
     let _ = tracing_subscriber::fmt()
@@ -309,14 +321,41 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
     );
     dump("cell", &a);
     dump("arrival", &b);
+    // **THE TRIPWIRE FIRED, AND THIS IS WHAT REPLACED IT (#235, #266).** The old assertion here was
+    // `!delivered`, with a message demanding that whoever saw it green replace the expectation with the
+    // property and name the mechanism. A late-arriving node now completes the exchange, so:
+    //
+    // **The rate, and why it is not quoted as one.** 4 successes in 10 runs on a quiet box, up from 0 in
+    // 5 before `live_conn` was corrected to hand back the newest survivor. The two batches were 3-of-5 and
+    // 1-of-5 on identical production code, so the frequency itself is unstable and a single batch would
+    // have been quoted as a rate it does not have. Printed, never asserted. What IS asserted is the ROUTE,
+    // which holds on every run, delivering or not.
+    //
+    // **The mechanism, read off the station dump of a delivering run.** The arrival refuses the cell's
+    // HELLO seven times (`hello.epoch_unknown = 7`): holding only `(0, genesis)` it genuinely cannot judge
+    // a peer proving epoch 10. It does not drop the connection — `hello.peer_unjudged = 1` puts it in the
+    // restricted state, which admits `FrameType::Beacon` and nothing else, and `restricted_frame_dropped =
+    // 49` beside `restricted_frame_admitted = 2` shows the filter doing exactly that. Two beacon rounds
+    // crossed a connection to a peer the arrival had not verified, and that is the whole answer to "how
+    // does a beacon reach a node with no verified peer".
+    //
+    // Three shipped pieces had to hold for those two frames to arrive, and all three are visible in the
+    // same dump. `directory.entry_fallback` on all seven coordinates (#263): the arrival could not route
+    // by coordinate at all, so every send fell back to the configured entry address. `moved_peer_retained`
+    // twice (#264): the dial was answered by a peer proving a different coordinate and the connection was
+    // kept rather than discarded. `conns.surplus_held@[1,1,0] = 7` on the cell (#265 + #266): the cell
+    // holds seven connections to the arrival's coordinate and answers on the NEWEST — which is the one the
+    // arrival most recently dialed and is still reading. With `first()` it answered into the oldest, and
+    // that is the run where nothing crossed.
     assert!(
-        !delivered,
-        "a late-arriving node COMPLETED an exchange with an advanced cell (hello.epoch_unknown: cell \
-         {on_cell}, arrival {on_arrival}). #235 is closed — replace this expectation with the property, \
-         and record which mechanism made the beacon reachable without an already-verified peer."
+        !delivered || peer_unjudged(&b) > 0,
+        "a late-arriving node completed an exchange without ever holding an unproven peer's connection \
+         (peer_unjudged = 0), so the beacon reached it by a path this file does not know about and the \
+         restricted channel is NOT the mechanism after all. Find the real one before trusting the join \
+         (#235)."
     );
     assert!(
-        on_cell + on_arrival > 0,
+        delivered || on_cell + on_arrival > 0,
         "nothing was delivered AND neither side refused for an unknown epoch (cell {on_cell}, arrival \
          {on_arrival}), so this run never reached a HELLO exchange — it measures a dial that did not happen, \
          not the epoch window. Check the bootstrap address before reading anything into the silence."
@@ -348,10 +387,11 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_cannot_be_verified(
     );
     assert!(
         on_arrival > 0,
-        "neither side refused for an unknown epoch (cell {on_cell}, arrival {on_arrival}). If the arrival \
-         now joins, that is #235 closing — say by what mechanism it reached a beacon without an \
-         already-verified peer, and turn this file into the property. If it merely stopped counting, the \
-         joining node has gone silent again and THAT is the regression."
+        "the arrival never refused for an unknown epoch (cell {on_cell}, arrival {on_arrival}). It holds \
+         only genesis against a cell at epoch 10, so it CANNOT judge and must say so — a zero here is the \
+         joining node going silent again, which is the original #235 finding returning, not the fix. Note \
+         this stays non-zero on the runs that now succeed: the arrival refuses AND joins, because the \
+         restricted channel carries the beacon past the refusal rather than around it."
     );
     println!(
         "MEASURED delivered: cell->arrival {cell_to_arrival}, arrival->cell {arrival_to_cell}; \
