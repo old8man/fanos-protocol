@@ -143,7 +143,7 @@ fn closure(deps: &BTreeMap<String, BTreeSet<String>>, roots: &BTreeSet<String>) 
 /// finally wired (delete its row — the list is the record of what remains unwired).
 /// The shipping-code slice, shared (#252). Seven copies of it existed; each cut at the FIRST
 /// `#[cfg(test)]` and so examined only the head of any file with a test module in the middle.
-use fanos_testkit::source::{code_only, production_part};
+use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, production_part};
 
 #[test]
 fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
@@ -512,11 +512,40 @@ fn the_slice_reaches_the_shipping_code_that_sits_below_a_test_module() {
 }
 
 /// `pub fn` / `pub const fn` / `pub async fn` / `pub unsafe fn` names declared in `src`.
+/// The collector's end of the shipping exemption, on the shapes this tree actually contains.
+///
+/// The predicate itself is falsified in `fanos-testkit`, where it lives beside [`production_part`] — the two
+/// carry one piece of knowledge at two granularities and must not drift. What is checked here is the wiring:
+/// that `public_fn_names` consults it at all, and that an attribute for a **shipped** feature still counts.
+#[test]
+fn the_collector_skips_a_capability_no_build_contains() {
+    let gated = format!("#[cfg{}]\npub fn only_for_tests() {{}}\n", "(test)");
+    let src = format!("{gated}#[cfg(feature = \"vpn\")]\npub fn ships_with_vpn() {{}}\npub fn plain() {{}}\n");
+    assert_eq!(public_fn_names(&src), vec!["ships_with_vpn".to_string(), "plain".to_string()]);
+}
+
 fn public_fn_names(src: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut gated = false;
     for line in src.lines() {
         let mut rest = line.trim_start();
+        if rest.is_empty() {
+            continue;
+        }
+        if rest.starts_with('#') {
+            gated |= excluded_from_every_shipping_build(rest);
+            continue;
+        }
         if !rest.starts_with("pub ") {
+            gated = false;
+            continue;
+        }
+        // An item that is not in any shipped build is not a shipped capability, and counting it here is
+        // not merely noise — it is **unclosable**. Its only legitimate callers live under `crates/*/tests/`,
+        // which this scan excludes by construction, so the single action that clears it is raising the very
+        // number the guard exists to hold down (#285, found on `FreshSeed::replayable_for_test`).
+        if gated {
+            gated = false;
             continue;
         }
         rest = &rest[4..];

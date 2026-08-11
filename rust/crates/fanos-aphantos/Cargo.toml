@@ -31,7 +31,15 @@ fanos-pqcrypto.workspace = true
 fanos-threshold = { workspace = true, features = [] }
 rand_core.workspace = true
 
+[features]
+# `sealed::FreshSeed::replayable_for_test` — off in every shipped build (#285, on #194's precedent). A seed
+# that repeats is a two-time pad across the whole onion, and the constructor's only warning was its name.
+testing = []
+
 [dev-dependencies]
+# This crate's own integration tests link the library as an external crate, so `cfg(test)` inside it is
+# FALSE for them — the feature is how `tests/*.rs` reach the replayable seed.
+fanos-aphantos = { path = ".", features = ["testing"] }
 # The measurement-conditions stamp: a wall-clock number must publish what it is worth (#255).
 fanos-testkit = { path = "../fanos-testkit" }
 proptest.workspace = true

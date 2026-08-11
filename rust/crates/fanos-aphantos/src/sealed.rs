@@ -150,6 +150,13 @@ impl FreshSeed {
     /// Deliberately named for what it is. A test wants a replayable packet, which is the exact property
     /// production must never have, so the two are different constructors rather than one `From<&[u8]>` that
     /// makes them indistinguishable at the call site.
+    ///
+    /// **Off in every shipped build** (#194's precedent, applied to #285). The name is a comment, and a
+    /// comment is not something a caller's compiler enforces: an embedder could reach for this and get a
+    /// two-time pad on a real circuit, the exact failure [`build`] devotes a paragraph to. `cfg(test)` alone
+    /// would not do it — this crate's integration tests link the library as an *external* crate, where
+    /// `cfg(test)` is false — so the `testing` feature is what they use, and nothing else enables it.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn replayable_for_test(bytes: &[u8]) -> Self {
         Self(bytes.to_vec())

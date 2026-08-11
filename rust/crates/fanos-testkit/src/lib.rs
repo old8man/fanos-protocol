@@ -450,9 +450,69 @@ pub mod source {
             .join("\n")
     }
 
+    /// Whether an attribute line removes the item it decorates from **every** shipped build.
+    ///
+    /// The same knowledge [`production_part`] carries, one granularity down: that cuts a whole `#[cfg(test)]`
+    /// module, this classifies a single attribute on a single item. They live together so they cannot drift —
+    /// a scan that agrees with one and disagrees with the other reads a tree nobody builds.
+    ///
+    /// Deliberately narrow, because the wide version is a hole. `#[cfg(feature = "vpn")]` also keeps an item
+    /// out of the default build, and a capability parked behind it must still be counted: `vpn` and
+    /// `validator` are configurations users run. Only `test` and the `testing` feature name a build nobody
+    /// ships, so those are the only leaves accepted.
+    ///
+    /// Any `not(` disqualifies the line outright rather than being parsed — `#[cfg(not(test))]` ships, and a
+    /// scan that reasoned about negation would be one wrong turn away from exempting production code.
+    ///
+    /// Found by #285: `FreshSeed::replayable_for_test` sat behind `cfg(any(test, feature = "testing"))` and
+    /// the unwired-capability guard counted it anyway. That is not merely noise — it is **unclosable**, since
+    /// such an item's only legitimate callers live under `crates/*/tests/`, which that guard excludes by
+    /// construction. The single action clearing it would have been raising the number the guard exists to
+    /// hold down.
+    #[must_use]
+    pub fn excluded_from_every_shipping_build(attr: &str) -> bool {
+        let Some(inner) = attr.trim().strip_prefix("#[cfg(").and_then(|r| r.strip_suffix(")]")) else {
+            return false;
+        };
+        if inner.contains("not(") {
+            return false;
+        }
+        let leaves: Vec<&str> = inner
+            .split([',', '(', ')'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "any" && *s != "all")
+            .collect();
+        !leaves.is_empty() && leaves.iter().all(|l| *l == "test" || *l == "feature = \"testing\"")
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// **The exemption, falsified in both directions.** An exemption is the one part of a ratchet that can
+        /// quietly widen until the ratchet holds nothing, so it gets a test rather than a promise. The
+        /// shipped-feature cases are the ones that matter: if `vpn` ever passed here, a whole datapath's
+        /// public surface would leave every unwired count at once.
+        #[test]
+        fn the_shipping_exemption_admits_only_builds_nobody_runs() {
+            for gated in ["#[cfg(test)]", "#[cfg(feature = \"testing\")]", "#[cfg(any(test, feature = \"testing\"))]"] {
+                assert!(excluded_from_every_shipping_build(gated), "`{gated}` is in no shipped build");
+            }
+            for ships in [
+                "#[cfg(feature = \"vpn\")]",
+                "#[cfg(feature = \"validator\")]",
+                "#[cfg(not(test))]",
+                "#[cfg(any(test, feature = \"vpn\"))]",
+                "#[cfg(unix)]",
+                "#[must_use]",
+                "#[allow(dead_code)]",
+            ] {
+                assert!(
+                    !excluded_from_every_shipping_build(ships),
+                    "`{ships}` reaches a build someone runs — a capability behind it must still be counted"
+                );
+            }
+        }
 
         /// **The slice itself, falsified in both directions** — the guard set is only as wide as this function.
         ///

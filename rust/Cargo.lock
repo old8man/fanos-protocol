@@ -902,6 +902,7 @@ dependencies = [
 name = "fanos-aphantos"
 version = "0.1.0"
 dependencies = [
+ "fanos-aphantos",
  "fanos-field",
  "fanos-geometry",
  "fanos-nyx",
