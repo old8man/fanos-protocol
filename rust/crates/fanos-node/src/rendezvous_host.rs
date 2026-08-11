@@ -42,7 +42,7 @@ use fanos_rendezvous::{
     line_member_coords, meeting_lines, seal_host_register,
 };
 use fanos_runtime::{Command, Notification};
-use fanos_session::{ChannelTransport, serve_over_channels_paced};
+use fanos_session::{ChannelTransport, serve_over_channels_paced_observed};
 
 use crate::mixdir::build_cell_mix_directory;
 use rand_core::CryptoRng;
@@ -240,6 +240,7 @@ pub fn serve_anonymous<R, H, Fut>(
                                 handler.clone(),
                                 seal_tx.clone(),
                                 done_tx.clone(),
+                                client.clone(),
                             );
                             sessions.insert(cookie, Session { in_tx, task, last_active: Instant::now() });
                         }
@@ -738,6 +739,7 @@ fn spawn_anonymous_session<H, Fut>(
     handler: Arc<H>,
     seal_tx: Sender<(SessionId, Vec<u8>)>,
     done_tx: UnboundedSender<SessionId>,
+    reporter: Client,
 ) -> (Sender<Vec<u8>>, JoinHandle<()>)
 where
     H: Fn(DuplexStream) -> Fut + Send + Sync + 'static,
@@ -745,6 +747,21 @@ where
 {
     let (in_tx, in_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
     let (out_tx, mut out_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
+    // Discards reported by this session reach the operator here (#276). **`line` is `None`, and that is the
+    // design, not an omission**: on the anonymous path the host does not learn a client coordinate — the
+    // whole point — so the station can say *what* was thrown away and never *by whom*. On the Direct path
+    // the same station does carry the peer, and the difference between the two readings is itself the
+    // profile's privacy claim made visible.
+    let (ingest_tx, mut ingest_rx) = channel::<fanos_diaulos::Ingest>(crate::diaulos::INGEST_REPORTS);
+    tokio::spawn(async move {
+        while let Some(outcome) = ingest_rx.recv().await {
+            reporter.record_station(
+                Station::SessionIngestDropped,
+                None,
+                u64::try_from(outcome.index()).ok(),
+            );
+        }
+    });
     // Outbound: this session's cells are funnelled to the central loop for sealing through its reply route.
     tokio::spawn(async move {
         while let Some(cell) = out_rx.recv().await {
@@ -764,7 +781,7 @@ where
     // client dials at ([`crate::rendezvous::RENDEZVOUS_TICK`]) — so replies do not flood the return path
     // faster than the per-hop threshold gathers can peel them (the anti-livelock discipline the reference
     // hand-rolled; here it is the shared paced session driver).
-    let stream = serve_over_channels_paced(
+    let stream = serve_over_channels_paced_observed(
         keypair,
         rng,
         ChannelTransport {
@@ -772,6 +789,7 @@ where
             inbound: in_rx,
         },
         crate::rendezvous::RENDEZVOUS_TICK,
+        Some(ingest_tx),
     );
     let task = tokio::spawn(async move {
         handler(stream).await;

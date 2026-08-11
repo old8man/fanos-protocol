@@ -408,6 +408,12 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         Station::RestrictedFrameDropped => {
             fanos_wire::FrameType::ALL.iter().find(|f| f.code() == tag).map(|f| f.name())
         }
+        // A dense index into `Ingest::ALL`, not a wire code — `usize::try_from` can only fail on a tag
+        // outside the vocabulary, which is the same "no name" answer the `find` above gives.
+        Station::SessionIngestDropped => usize::try_from(tag)
+            .ok()
+            .and_then(|i| fanos_diaulos::Ingest::ALL.get(i))
+            .map(|o| o.name()),
         Station::ReadShardRefused => {
             fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
         }

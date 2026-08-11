@@ -85,7 +85,7 @@ pub fn stream_over_channels_paced(
     tick: Duration,
 ) -> DuplexStream {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(drive(session, driver_side, transport, tick, None));
+    tokio::spawn(drive(session, driver_side, transport, tick, None, None));
     app_side
 }
 
@@ -109,7 +109,7 @@ pub fn stream_over_channels_confirmed(
 ) -> (DuplexStream, oneshot::Receiver<()>) {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
     let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(drive(session, driver_side, transport, tick, Some(ready_tx)));
+    tokio::spawn(drive(session, driver_side, transport, tick, Some(ready_tx), None));
     (app_side, ready_rx)
 }
 
@@ -141,6 +141,45 @@ pub fn serve_over_channels_paced<R: CryptoRng + Send + 'static>(
     transport: ChannelTransport,
     tick: Duration,
 ) -> DuplexStream {
+    serve_over_channels_paced_observed(keypair, rng, transport, tick, None)
+}
+
+/// [`serve_over_channels`] with a telemetry sink — the tick stays the crate's default, because a caller
+/// that only wants the reports has no business choosing a retransmit cadence (#276).
+#[must_use]
+pub fn serve_over_channels_observed<R: CryptoRng + Send + 'static>(
+    keypair: Arc<StaticKeypair>,
+    rng: R,
+    transport: ChannelTransport,
+    ingest: Option<Sender<Ingest>>,
+) -> DuplexStream {
+    serve_over_channels_paced_observed(keypair, rng, transport, TICK, ingest)
+}
+
+/// Like [`serve_over_channels_paced`], but reports every **discarded** inbound payload to `ingest` (#276).
+///
+/// # Why the accepting side, and why a channel
+///
+/// This side is fed by *any* peer: a client that cannot speak the protocol and one that is probing it both
+/// arrive here, and until #244 both were answered by silence. The session now names the class
+/// ([`Ingest`]) and tallies it, but a tally inside a task nobody can reach is not observability — and this
+/// crate deliberately depends on neither `fanos-ports` nor `tracing`, so it cannot record a station itself.
+/// A channel keeps that separation: the crate says *what happened*, the node decides *where it goes*.
+///
+/// The dialing side is deliberately **not** given one. Its discards are per-attempt, and the meeting-point
+/// walk that consumes them already takes the same action for every class — reading a reason there would be
+/// a field nobody acts on ([[built-but-nothing-calls-it]]).
+///
+/// Reports are dropped rather than queued when `ingest` is full: a session's data path may not stall
+/// because its telemetry is not being drained.
+#[must_use]
+pub fn serve_over_channels_paced_observed<R: CryptoRng + Send + 'static>(
+    keypair: Arc<StaticKeypair>,
+    rng: R,
+    transport: ChannelTransport,
+    tick: Duration,
+    ingest: Option<Sender<Ingest>>,
+) -> DuplexStream {
     let (app_side, driver_side) = tokio::io::duplex(DUPLEX_BUF);
     let server = ServerStream {
         server: ServerSession::new(),
@@ -148,7 +187,7 @@ pub fn serve_over_channels_paced<R: CryptoRng + Send + 'static>(
         rng,
         stream_id: None,
     };
-    tokio::spawn(drive(server, driver_side, transport, tick, None));
+    tokio::spawn(drive(server, driver_side, transport, tick, None, ingest));
     app_side
 }
 
@@ -460,6 +499,18 @@ impl Emit {
     }
 }
 
+/// Forward a discard to the telemetry sink, if there is one; a `Folded` payload is not news.
+///
+/// Non-blocking on purpose — see `drive`'s `ingest` parameter. A caller that stops draining loses reports,
+/// never cells.
+fn report(sink: Option<&Sender<Ingest>>, outcome: Ingest) {
+    if outcome.is_drop()
+        && let Some(tx) = sink
+    {
+        let _ = tx.try_send(outcome);
+    }
+}
+
 async fn drive<S: SessionStream>(
     mut session: S,
     driver_side: DuplexStream,
@@ -469,6 +520,15 @@ async fn drive<S: SessionStream>(
     // awaiting it learns "established" from `Ok` and "gave up" from `Err` without a second channel to
     // contradict the first ([`stream_over_channels_confirmed`]).
     mut ready: Option<oneshot::Sender<()>>,
+    // Where a discarded inbound payload is reported, if anyone is listening (#276). A second out-of-band
+    // signal beside `ready`, deliberately the same shape rather than a field on `ChannelTransport`: the
+    // transport carries the peer's bytes, this carries what happened to them, and merging the two would
+    // make a telemetry sink part of the wire contract.
+    //
+    // `try_send` on a full channel drops the report. That is correct here and is the one thing this must
+    // never do otherwise: a session's data path may not stall because nobody is draining its telemetry.
+    // The loss is bounded and visible — the sink's own capacity is the bound.
+    ingest: Option<Sender<Ingest>>,
 ) {
     let ChannelTransport {
         outbound,
@@ -577,9 +637,9 @@ async fn drive<S: SessionStream>(
                     // accountings of one event. Acting on it — abandoning a session whose every payload
                     // is discarded — is a give-up rule, and this platform derives those before it ships
                     // them (#244, and see the residual on `ready` in that task).
-                    let _: Ingest = session.handle_payload(&payload);
+                    report(ingest.as_ref(), session.handle_payload(&payload));
                     while let Ok(more) = inbound.try_recv() {
-                        let _: Ingest = session.handle_payload(&more);
+                        report(ingest.as_ref(), session.handle_payload(&more));
                     }
                     emit = Emit::Reactive;
                 }
@@ -612,6 +672,69 @@ async fn drive<S: SessionStream>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// The accepting side must **report** what it threw away, or the wire added in #276 carries no current.
+    ///
+    /// One class is enough here, and that is deliberate: this test is about the *wire*, not the
+    /// classification. Which discard becomes which `Ingest` is settled by `fanos-diaulos`'s own unit tests
+    /// against the type; re-asserting it through a driver, a channel and a sink would test the same thing
+    /// down a longer path, and would need this test to know the frame format — copying a source of truth
+    /// that lives one crate over.
+    ///
+    /// `Unframed` needs no such knowledge — but it needed one correction. My first input was three bytes of
+    /// `0xFF`, on the assumption that arbitrary bytes are not a frame; the test reported `OutOfState`
+    /// instead. `unframe` is `split_first`, so *any* non-empty payload is a frame with some tag, and the
+    /// only payload that is not one is the **empty** payload. The expectation was wrong, not the code, and
+    /// the input below is the one the definition actually admits.
+    ///
+    /// **The control needed a real fold, and the first version of it did not have one.** I wrote a "quiet
+    /// session reports nothing" assertion and claimed it would catch a sink that forwarded `Folded` too —
+    /// then falsified it and the test stayed green. Of course it did: nothing in that version ever folded,
+    /// so removing the filter changed nothing. The control was vacuous and its doc was a false claim.
+    ///
+    /// So a genuine `ClientHello` goes first. It folds; the empty payload after it does not. The sink must
+    /// yield `Unframed` **first** — if `Folded` were forwarded the first item would be that instead, which
+    /// is a discriminator rather than a hope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_reports_a_payload_it_discards() {
+        use super::*;
+        let mut rng = SeedRng::from_seed(b"ingest-report-key");
+        let keypair = Arc::new(StaticKeypair::generate(&mut rng));
+        // The hello is built before the keypair moves into the driver — the client only needs the public
+        // half, and taking it first keeps the borrow from outliving the move.
+        let mut crng = SeedRng::from_seed(b"ingest-report-client");
+        let mut client = ClientSession::dial([0, 1, 0], keypair.public(), &mut crng);
+        let hellos = client.poll_payloads();
+
+        let (c2s_tx, c2s_rx) = channel(ChannelTransport::CAP);
+        let (s2c_tx, _s2c_rx) = channel(ChannelTransport::CAP);
+        let (ingest_tx, mut ingest_rx) = channel(16);
+        let _stream = serve_over_channels_paced_observed(
+            keypair,
+            SeedRng::from_seed(b"ingest-report-rng"),
+            ChannelTransport { outbound: s2c_tx, inbound: c2s_rx },
+            TICK,
+            Some(ingest_tx),
+        );
+
+        // A real hello, so the session has something to FOLD before it has something to discard.
+        for payload in hellos {
+            c2s_tx.send(payload).await.expect("the driver is alive");
+        }
+        c2s_tx.send(Vec::new()).await.expect("the driver is alive");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ingest_rx.recv())
+            .await
+            .expect("a discard must be reported within the deadline")
+            .expect("the sink outlives the driver");
+        assert_eq!(
+            outcome,
+            Ingest::Unframed,
+            "the FIRST report must be the discard: the hello before it folded, and a sink that forwarded \
+             folds too would have put `Folded` here (#276)"
+        );
+    }
+
+
     /// **The give-up window must admit enough attempts to be evidence of absence — measured, not claimed.**
     ///
     /// `HANDSHAKE_GIVE_UP` is a *duration*, while the `ClientHello` resend backs off in *polls*

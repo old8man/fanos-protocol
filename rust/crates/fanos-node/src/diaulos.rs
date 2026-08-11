@@ -18,8 +18,9 @@ use fanos_proxy::{DialError, Dialer, Target, UdpDialer, UdpTunnel};
 use fanos_quic::Client;
 use fanos_rendezvous::meeting_lines;
 use fanos_runtime::{Command, Notification};
+use fanos_diaulos::Ingest;
 use fanos_session::{
-    ChannelTransport, GIVE_UP_ATTEMPTS, OverlayTransport, dial_over_transport, serve_over_channels,
+    ChannelTransport, GIVE_UP_ATTEMPTS, OverlayTransport, dial_over_transport, serve_over_channels_observed,
 };
 use rand_core::CryptoRng;
 use std::collections::{BTreeMap, HashMap};
@@ -65,6 +66,17 @@ pub(crate) const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the accept loop sweeps for idle sessions to evict.
 pub(crate) const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many un-drained discard reports one session's telemetry channel holds before it starts losing them
+/// (#276).
+///
+/// **Derived from what the reports are for, not from comfort.** They answer "is this peer talking and being
+/// thrown away?", which is a *rate* question: the drain task does nothing but one `record_station` per
+/// report, so a backlog this deep only forms if the runtime is already starved — and in that case the right
+/// behaviour is to lose telemetry, never to stall the session's data path behind it. One window's worth of
+/// inbound cells (`fanos_stream::SACK_WIDTH`) is the natural unit: a whole window discarded is already the
+/// answer, and the reports after it add nothing a counter would not.
+pub(crate) const INGEST_REPORTS: usize = fanos_diaulos::budget::QUEUE_DEPTH / 2;
 
 /// One live client session in a service accept loop: the channel feeding it inbound datagrams, its
 /// handler task (aborted on idle/cap eviction, so a wedged handler is reclaimed, not merely detached), and
@@ -292,19 +304,32 @@ where
 {
     let (in_tx, in_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
     let (out_tx, mut out_rx) = channel::<Vec<u8>>(ChannelTransport::CAP);
+    // Discards reported by the session reach the operator here, where the node handle is (#276).
+    let (ingest_tx, mut ingest_rx) = channel::<Ingest>(INGEST_REPORTS);
+    let reporter = client.clone();
+    tokio::spawn(async move {
+        while let Some(outcome) = ingest_rx.recv().await {
+            reporter.record_station(
+                fanos_runtime::ports::stations::Station::SessionIngestDropped,
+                Some(from),
+                u64::try_from(outcome.index()).ok(),
+            );
+        }
+    });
     // Outbound: this session's cells are addressed to the client coordinate over the node.
     tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
             client.command(Command::Send { to: from, payload });
         }
     });
-    let stream = serve_over_channels(
+    let stream = serve_over_channels_observed(
         keypair,
         rng,
         ChannelTransport {
             outbound: out_tx,
             inbound: in_rx,
         },
+        Some(ingest_tx),
     );
     let task = tokio::spawn(async move {
         handler(stream).await;

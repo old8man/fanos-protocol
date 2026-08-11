@@ -316,6 +316,19 @@ pub enum Station {
     /// else, since a connection in this state is in no table and so has no per-peer counter.
     RestrictedFrameDropped,
 
+    /// A DIAULOS session **discarded** an inbound payload, tagged by which of `Ingest`'s classes it fell in
+    /// (#244).
+    ///
+    /// The session layer had no counter at all: four anonymous `return`s answered an unparseable frame, a
+    /// frame in the wrong state, a refused handshake, and a delivery from the wrong coordinate alike, so
+    /// "the service never answered" and "the service answered and I threw it all away" were the same
+    /// reading. On the accepting side the path is fed by *any* peer, which makes this the only trace a
+    /// probe leaves.
+    ///
+    /// Keyed by line where the caller knows it — the accepting side binds a client coordinate on the first
+    /// accepted hello, so a `WrongSender` drop names the *bound* peer, not the one that sent it.
+    SessionIngestDropped,
+
     /// A dialed coordinate was **vacant at the address the directory named**, and the peer that answered
     /// proved a *different* one — the peer moved and our entry is stale (#240).
     ///
@@ -902,6 +915,7 @@ impl Station {
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedFrameDropped,
+        Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
         Self::DirectoryMovedPeerRetained,
         Self::ConnSurplusHeld,
@@ -960,6 +974,7 @@ impl Station {
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
+            Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
             Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
             Self::ConnSurplusHeld => "conns.surplus_held",
@@ -1027,6 +1042,7 @@ impl Station {
             | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
             | Self::ActorDied                 // fanos_quic::DriverActor
             | Self::RestrictedFrameDropped    // fanos_wire::FrameType
+            | Self::SessionIngestDropped      // fanos_diaulos::Ingest (dense index)
             => TagKind::Vocabulary,
 
             // --- The tag is a number that means itself. ---
