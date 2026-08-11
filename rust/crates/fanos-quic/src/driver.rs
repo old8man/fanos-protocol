@@ -4875,6 +4875,74 @@ mod tests {
             ceiling,
         );
     }
+    /// **Does the ACCEPTOR learn that the dialer dropped its handle?** The whole pruning rule rests on it.
+    ///
+    /// `live_conn` keeps an entry while `close_reason().is_none()`, so "the peer closed it" has to become
+    /// visible here or the list is a graveyard. A measurement says it does not: a late-joining node closes
+    /// six of its seven connections to a cell, and that cell reads the surplus list **3537 times and prunes
+    /// zero** (#267). Either the closes never leave the dialer, or they never register on the acceptor, or
+    /// the scenario differs from this one in some way worth naming — and only an experiment on the bare
+    /// transport can say which.
+    ///
+    /// Deliberately minimal: two endpoints, one dial, drop the dialer's only handle, watch the accepted
+    /// side. No FANOS layers, because the question is about quinn's contract and nothing above it.
+    #[tokio::test]
+    async fn dropping_a_dialers_last_handle_is_visible_to_the_acceptor() {
+        let creds = NodeCredentials::generate().expect("credentials");
+        let (server, client, _cert) = node_configs_mutual_from(&creds).expect("tls");
+
+        let accepted: Arc<Mutex<Vec<Connection>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener =
+            Endpoint::server(server, "127.0.0.1:0".parse().expect("listen addr")).expect("listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let sink = accepted.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = listener.accept().await {
+                if let Ok(conn) = incoming.await
+                    && let Ok(mut held) = sink.lock()
+                {
+                    held.push(conn);
+                }
+            }
+        });
+
+        let mut dialer =
+            Endpoint::client("127.0.0.1:0".parse().expect("client addr")).expect("dialer");
+        dialer.set_default_client_config(client);
+        let conn = dialer.connect(addr, "fanos.node").expect("dial").await.expect("connection");
+
+        // Wait for the acceptor to have it at all, so a `None` below cannot be "it never arrived".
+        for _ in 0..200 {
+            if accepted.lock().is_ok_and(|h| !h.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            accepted.lock().map_or(0, |h| h.len()),
+            1,
+            "the acceptor never saw the connection, so this measures a dial that did not land"
+        );
+
+        drop(conn); // the dialer's only handle — quinn closes the connection on the last drop
+
+        let mut observed = None;
+        for _ in 0..300 {
+            observed = accepted.lock().ok().and_then(|h| h.first().and_then(Connection::close_reason));
+            if observed.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed.is_some(),
+            "three seconds after the dialer dropped its last handle, the acceptor still reports the \
+             connection live. Then `close_reason().is_none()` is not a liveness test on this path, every \
+             list `live_conn` prunes against is a graveyard, and the send picks a corpse for as long as the \
+             peer stays away (#267)."
+        );
+    }
+
     /// Two connections proving one coordinate, and the reader must hand back the **newest** (#266).
     ///
     /// The property is not a preference: a second connection exists either because both sides dialed at
