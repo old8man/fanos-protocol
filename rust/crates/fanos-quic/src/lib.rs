@@ -46,7 +46,11 @@ mod tls;
 
 pub use directory::{Directory, WriteOutcome};
 pub use reflexive::ReflexiveAddr;
-pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, reflexive_quorum,
+// `Sampled` rides here because `Client::sample_availability` returns it, and `mod driver` is private: without
+// this line the door #173 cut is public but its ANSWER is unnameable outside the crate — a caller could invoke
+// it and then have no type to bind the result to. Found by `cargo doc -D warnings`, which is the only gate
+// that reads a public signature against what the crate actually exports (#286).
+pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sampled, reflexive_quorum,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,
     Fabric, spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_persistent_over,

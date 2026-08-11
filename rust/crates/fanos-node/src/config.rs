@@ -65,7 +65,7 @@ pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 /// So by UHM's own name for it this is a **fossil**: a constant with no incoming observations is a fixed
 /// point of any transmission chain, because its only source is itself. The discipline that rule prescribes
 /// is a *revision clock*, and this one has it —
-/// [`the_mixnet_defaults_revision_clock_has_not_rung`](self::tests) fails the moment the sweep becomes
+/// `the_mixnet_defaults_revision_clock_has_not_rung` fails the moment the sweep becomes
 /// buildable again, so the obligation cannot become satisfiable unnoticed.
 ///
 /// **What unblocks it:** `THRESHOLD_ONION_LEN` large enough that `depth_for(slot_len(8)) ≥ 2`. The clock

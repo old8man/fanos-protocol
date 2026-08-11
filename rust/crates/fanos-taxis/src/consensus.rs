@@ -1195,7 +1195,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// Set the per-block reward pool `F` distributed to a block's commit-certificate signers on finalization
     /// (`R = F/Q` per signer). Default `0` (no reward). A driver sets this from the fees it collects per block.
     ///
-    /// **Refuses a non-zero reward on a state machine that does not pay it** ([`S::PAYS_BLOCK_REWARD`]),
+    /// **Refuses a non-zero reward on a state machine that does not pay it** ([`StateMachine::PAYS_BLOCK_REWARD`](crate::state::StateMachine)),
     /// returning `false` (#138). The reveal-gated beneficiary set is computed on every finalization and handed
     /// to `apply_block_reward`, whose trait default is a no-op — so on a plain ledger the whole payment
     /// mechanism ran and credited nobody, while the startup ceremony had already asserted that `R ≥ c` held.

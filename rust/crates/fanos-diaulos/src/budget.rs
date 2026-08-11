@@ -72,7 +72,7 @@ pub const MAX_SESSIONS: usize = SESSION_MEMORY_BUDGET / (2 * QUEUE_DEPTH * CELL_
 ///
 /// [`MAX_SESSIONS`] above divides the budget by the session's *transport* queues. This is the other
 /// container in the same session: each [`Connection`](crate::Connection) holds up to
-/// [`MAX_CONCURRENT_STREAMS`] streams, and each of those holds a receive window of
+/// [`MAX_CONCURRENT_STREAMS`](crate::conn::MAX_CONCURRENT_STREAMS) streams, and each of those holds a receive window of
 /// [`DEFAULT_WINDOW`](fanos_stream::DEFAULT_WINDOW) segments of at most
 /// [`MAX_SEGMENT`](fanos_stream::MAX_SEGMENT) bytes.
 ///
@@ -103,7 +103,7 @@ pub const STREAM_STATE_PER_SESSION: usize =
 /// * **[`QUEUE_DEPTH`] is at its floor** by its own derivation, and lowering it is what #205 explicitly
 ///   refused: depth 30 satisfies the arithmetic and destroys the property the depth exists for.
 ///
-/// What remains is [`MAX_CONCURRENT_STREAMS`], and its own doc admits what it is: "`256` mirrors the
+/// What remains is [`MAX_CONCURRENT_STREAMS`](crate::conn::MAX_CONCURRENT_STREAMS), and its own doc admits what it is: "`256` mirrors the
 /// concurrency a well-behaved QUIC endpoint grants by default" — a **borrowed number**, counting another
 /// system's object. Deriving it needs the question this layer has never answered: how many streams one
 /// DIAULOS connection must carry at once. Production today carries exactly **one** (the primary), so the

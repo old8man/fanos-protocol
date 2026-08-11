@@ -491,7 +491,7 @@ mod tests {
 ///
 /// A cell's level is the worst any of its members published, and disagreement among them is counted rather
 /// than smoothed away. That errs the same way "silence is not health" does — away from false comfort — and
-/// it has a stated cost: frames are not publisher-bound (see [`coherence_record`]), so one forged frame can
+/// it has a stated cost: frames are not publisher-bound (see `coherence_record`), so one forged frame can
 /// carry a cell to its worst level. `disagreed` is what tells an operator not to trust a single level, and
 /// the honest summary is that a census is a lead to follow, never an input to anything automatic.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
