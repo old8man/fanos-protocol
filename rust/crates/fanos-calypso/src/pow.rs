@@ -90,12 +90,35 @@ impl AdaptiveDifficulty {
     }
 
     /// Fold in a completed window's `admitted` intro count and adjust the difficulty:
-    /// tighten (`+1`) over target, ease (`-1`) when comfortably under it (below half target),
-    /// otherwise hold — always within `[floor, ceil]`.
+    /// tighten (`+1`) over target, ease (`-1`) below half target, otherwise hold — always within
+    /// `[floor, ceil]`.
+    ///
+    /// **Why the dead band is exactly `[target/2, target]`, derived rather than chosen.** The type's own
+    /// doc states the actuator's gain: one step of difficulty roughly doubles a client's work, so it halves
+    /// the request rate a fixed-compute flooder sustains. The band must therefore be **exactly one actuator
+    /// step wide**, and both inequalities pin it:
+    ///
+    /// * *Narrower oscillates.* A raise fired at `admitted = target + ε` lands the next window at about
+    ///   `target/2`. If the ease threshold sat anywhere above `target/2` — say `¾·target` — that very
+    ///   window would fire an ease, undoing the raise, and the controller would ring at every step.
+    /// * *Wider leaves steady-state error.* Easing only below `target/4` means tolerating a window running
+    ///   four times under target: admission stays priced for load that is not there, which is the cost the
+    ///   controller exists to avoid paying.
+    ///
+    /// Same argument in the other direction: an ease fired at `target/2 − ε` lands at just under `target`,
+    /// inside the band, so it does not immediately re-tighten. The band is symmetric because the actuator
+    /// is, and a factor of 2 is the only width with both properties. "Hysteresis, to avoid oscillation" —
+    /// what this said before — is the requirement, not the derivation, and it does not pick a number.
     pub fn observe_window(&mut self, admitted: u32) {
         if admitted > self.target {
             self.difficulty = (self.difficulty + 1).min(self.ceil);
-        } else if admitted * 2 < self.target {
+        } else if admitted < self.target.div_ceil(2) {
+            // `admitted < ⌈target/2⌉` is exactly `2·admitted < target` over the integers, and unlike the
+            // multiply it cannot wrap. The old form was unreachable-but-real: a `u32` window count past
+            // 2³¹ would wrap to a small number, satisfy the test, and *lower* the difficulty at the very
+            // moment admission is highest — a controller inverted by its own guard. Not reachable through
+            // any admission cap this crate enforces, and removed rather than argued (the #110 precedent:
+            // close it, or state the reason at the site; closing is cheaper here).
             self.difficulty = self.difficulty.saturating_sub(1).max(self.floor);
         }
     }
@@ -157,5 +180,72 @@ mod tests {
             6,
             "steady load at target holds difficulty"
         );
+    }
+
+    /// **The dead band is exactly one actuator step, and a correction lands inside it.**
+    ///
+    /// The band's width is not a literal to pin — `observe_window`'s doc derives it, and a test that
+    /// re-asserted `target/2` would only restate the constant. What the derivation actually claims is a
+    /// *closed-loop* property: because one difficulty step halves the rate a fixed-compute flooder
+    /// sustains, a correction must move the load INTO the band rather than past it. That is what settles
+    /// the factor, so that is what is checked, against a plant that models the stated gain.
+    ///
+    /// Falsified by widening the ease threshold to `¾·target`: the raise below then over-corrects into an
+    /// ease and the controller rings, which is the oscillation the band exists to prevent.
+    #[test]
+    fn one_correction_lands_inside_the_dead_band_in_both_directions() {
+        const TARGET: u32 = 100;
+        // The plant, as the type's doc states it: each +1 of difficulty halves the sustainable rate.
+        let rate = |load: u32, from: u32, to: u32| -> u32 {
+            if to >= from { load >> (to - from) } else { load << (from - to) }
+        };
+
+        // TIGHTENING. Load a hair over target fires a raise; the halved load must not fire an ease back.
+        let mut ctl = AdaptiveDifficulty::new(4, 20, TARGET);
+        ctl.observe_window(TARGET + 1);
+        let after_raise = ctl.difficulty();
+        assert_eq!(after_raise, 5, "over target must tighten by exactly one step");
+        let settled = rate(TARGET + 1, 4, after_raise);
+        ctl.observe_window(settled);
+        assert_eq!(
+            ctl.difficulty(),
+            after_raise,
+            "the raise put the load at {settled} against target {TARGET}, and the controller immediately \
+             undid it — the band is narrower than one actuator step, so every correction rings (#244)"
+        );
+
+        // EASING, the same argument mirrored: a hair under half target eases, and the doubled load must
+        // land under target rather than over it.
+        //
+        // The controller has to be lifted OFF its floor first, and the first draft of this test was not —
+        // `new` starts at `floor`, so the ease it fired was clamped straight back and the assertion read as
+        // "the controller refuses to ease". The floor was doing that, not the band.
+        let mut ctl = AdaptiveDifficulty::new(4, 20, TARGET);
+        ctl.observe_window(TARGET + 1);
+        ctl.observe_window(TARGET + 1);
+        assert_eq!(ctl.difficulty(), 6, "two raises lift the controller clear of its floor");
+        ctl.observe_window(TARGET / 2 - 1);
+        let after_ease = ctl.difficulty();
+        assert_eq!(after_ease, 5, "below half target must ease by exactly one step");
+        let settled = rate(TARGET / 2 - 1, 6, after_ease);
+        ctl.observe_window(settled);
+        assert_eq!(
+            ctl.difficulty(),
+            after_ease,
+            "the ease put the load at {settled} against target {TARGET}, and the controller immediately \
+             re-tightened — the band is not symmetric with the actuator it drives (#244)"
+        );
+    }
+
+    /// A window count large enough to wrap `admitted * 2` must not read as *below* half target.
+    ///
+    /// Not reachable through any admission cap this crate enforces, and pinned anyway: the old form
+    /// inverted the controller exactly where load is highest, and an unreachable inversion in a
+    /// **defensive** control loop is worth one assertion rather than a paragraph of reassurance.
+    #[test]
+    fn an_enormous_window_tightens_rather_than_wrapping_into_an_ease() {
+        let mut ctl = AdaptiveDifficulty::new(4, 20, 10);
+        ctl.observe_window(u32::MAX);
+        assert_eq!(ctl.difficulty(), 5, "the largest possible window is over target, so it tightens");
     }
 }
