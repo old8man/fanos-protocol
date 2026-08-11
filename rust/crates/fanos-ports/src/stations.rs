@@ -383,6 +383,18 @@ pub enum Station {
     /// Keyed by the peer's coordinate, tagged with how many entries that read removed.
     ConnSurplusRead,
 
+    /// A peer announced a verified move, and this is how many of its connections travelled with it (#271).
+    ///
+    /// **The number is the point.** Re-keying used to carry exactly the connection the announcement arrived
+    /// on, which was complete while the map held one connection per coordinate and stopped being complete
+    /// the moment #265 made the value a list. Measured then: six left behind against one moved, each kept
+    /// alive by `keep_alive_interval` and unreachable for pruning because #241's directory retraction means
+    /// nothing addresses the vacated point again.
+    ///
+    /// So a `1` here on a peer that held several is the defect returning, and a `0` is a different world
+    /// again — the old point held nothing. Keyed by the peer's NEW coordinate, tagged with the count moved.
+    ConnMovedWithPeer,
+
     /// A second **unjudged** connection from a coordinate this node already holds one for was refused a
     /// reader and dropped, which closes it (#267).
     ///
@@ -895,6 +907,7 @@ impl Station {
         Self::ConnSurplusHeld,
         Self::RestrictedSurplusDropped,
         Self::ConnSurplusRead,
+        Self::ConnMovedWithPeer,
         Self::DirectoryEntryFallback,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
@@ -952,6 +965,7 @@ impl Station {
             Self::ConnSurplusHeld => "conns.surplus_held",
             Self::RestrictedSurplusDropped => "hello.restricted_surplus_dropped",
             Self::ConnSurplusRead => "conns.surplus_read",
+            Self::ConnMovedWithPeer => "conns.moved_with_peer",
             Self::DirectoryEntryFallback => "directory.entry_fallback",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
@@ -1025,7 +1039,7 @@ impl Station {
             // vocabulary. The two are not a contradiction and must not be merged: one carries a code the
             // registry has a name for, the other carries the codes it does not. Folding them would hand the
             // resolver an unresolvable tag and force it to invent a name or return a hole (#268).
-            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::ConnSurplusRead => {
+            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::ConnSurplusRead | Self::ConnMovedWithPeer => {
                 TagKind::Quantity
             }
 

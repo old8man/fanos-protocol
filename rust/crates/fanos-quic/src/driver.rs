@@ -3559,15 +3559,60 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                     if let Some(moved) = verified_move(&t, &conn, &frame, from) {
                         tracing::debug!(?from, ?moved, "peer moved; re-keying its live connection");
                         if let Ok(mut map) = t.conns.lock() {
-                            // Re-key this connection only: a peer moving takes ITS connection along, and any
-                            // other live one under the old point belongs to whoever still holds it.
+                            // **Move every connection this peer holds here, not just the one that carried the
+                            // announcement** (#271). The rule the old comment stated is right and unchanged —
+                            // a peer takes ITS connections along, and anything else under the vacated point
+                            // belongs to whoever still holds it — but the discriminator had to change. When
+                            // the map held one connection per coordinate, "this connection only" *was* all of
+                            // them. #265 made the value a list, so the peer's surplus stayed behind: measured
+                            // at 6 left under the old point against 1 moved, with `keep_alive_interval = 10 s`
+                            // pinging every one of them and #241's directory retraction guaranteeing nothing
+                            // would ever address that point again to prune them.
+                            //
+                            // Identity is what separates "this peer's surplus" from "the next occupant's",
+                            // and it is the same answer `Distrust::seat` already gives one field over: the
+                            // verdict is keyed on the identity precisely so it survives a move. Read from the
+                            // certificate each connection authenticated with, so nothing has to be stored.
+                            let mine = peer_cert_der(&conn).map(|c| identity_of(&c));
+                            let mut moving = Vec::new();
                             if let Some(old) = map.get_mut(&from) {
-                                old.retain(|c| c.stable_id() != conn.stable_id());
+                                old.retain(|c| {
+                                    // `None` for our own identity means the cert is unreadable, which is not
+                                    // a licence to take everything: fall back to the single connection the
+                                    // announcement arrived on, which is what this did before.
+                                    let same = mine.is_some()
+                                        && peer_cert_der(c).map(|d| identity_of(&d)) == mine;
+                                    if same || c.stable_id() == conn.stable_id() {
+                                        moving.push(c.clone());
+                                        return false;
+                                    }
+                                    true
+                                });
                                 if old.is_empty() {
                                     map.remove(&from);
                                 }
                             }
-                            file_conn(&mut map, moved, conn.clone());
+                            // **The announcing connection is filed even when the old key held nothing.**
+                            // The previous code did this unconditionally and my first version did not, so a
+                            // move whose old coordinate had no entry — the peer was never filed there, or was
+                            // already re-keyed — silently filed nothing at all. The station caught it on the
+                            // first run: `#0` appeared repeatedly, and a move that carries zero connections
+                            // is a peer this node just stopped being able to reach.
+                            if !moving.iter().any(|c| c.stable_id() == conn.stable_id()) {
+                                moving.push(conn.clone());
+                            }
+                            let carried = moving.len();
+                            for c in moving {
+                                file_conn(&mut map, moved, c);
+                            }
+                            // Counted because the surplus is exactly what used to be lost, and a zero here
+                            // after a move would mean the old point held nothing — a different world from
+                            // "held six and moved six".
+                            t.record_station(
+                                Station::ConnMovedWithPeer,
+                                Some(moved),
+                                Some(carried as u64),
+                            );
                         }
                         if let Ok(mut map) = t.peer_addrs.lock()
                             && let Some(addr) = map.remove(&from)
