@@ -361,6 +361,28 @@ pub enum Station {
     /// this one, which is zero on every ordinary accept.
     ConnSurplusHeld,
 
+    /// A send **read a peer's connection list while it held more than one**, and this is how many entries
+    /// it found already closed (#267).
+    ///
+    /// **The discriminator between two very different worlds.** The peer at the other end may be closing
+    /// connections this node still holds — in the late-join scenario it closes six of seven — and
+    /// `Connection::close_reason` reports only a closure this side has *observed*, which costs a round trip.
+    /// Either the closes arrive and get pruned, in which case sending into a corpse is a bounded transient,
+    /// or they never do and the list is a graveyard whose head is permanently dead. The repair differs
+    /// completely between those, so the counter has to separate them.
+    ///
+    /// **Fired on every surplus read, including the ones that prune nothing — and the first version was not.**
+    /// Recording only when something was pruned makes a zero mean two incompatible things: "read the list,
+    /// found nothing dead" and "never read the list at all". The measurement it was built for produced
+    /// exactly that ambiguity and could not be concluded from. Tagging every read with its prune count —
+    /// `#0` included — is what makes absence mean *the send path never consulted this peer*.
+    ///
+    /// Bounded by design: a single-entry list is the steady state and does not report, so this fires only
+    /// where two connections to one coordinate actually coexist.
+    ///
+    /// Keyed by the peer's coordinate, tagged with how many entries that read removed.
+    ConnSurplusRead,
+
     /// A second **unjudged** connection from a coordinate this node already holds one for was refused a
     /// reader and dropped, which closes it (#267).
     ///
@@ -872,6 +894,7 @@ impl Station {
         Self::DirectoryMovedPeerRetained,
         Self::ConnSurplusHeld,
         Self::RestrictedSurplusDropped,
+        Self::ConnSurplusRead,
         Self::DirectoryEntryFallback,
         Self::PorosRotationUnarmed,
         Self::DirectorySeatSuperseded,
@@ -928,6 +951,7 @@ impl Station {
             Self::DirectoryMovedPeerRetained => "directory.moved_peer_retained",
             Self::ConnSurplusHeld => "conns.surplus_held",
             Self::RestrictedSurplusDropped => "hello.restricted_surplus_dropped",
+            Self::ConnSurplusRead => "conns.surplus_read",
             Self::DirectoryEntryFallback => "directory.entry_fallback",
             Self::PorosRotationUnarmed => "poros.rotation_unarmed",
             Self::DirectorySeatSuperseded => "directory.seat_superseded",
@@ -1001,7 +1025,9 @@ impl Station {
             // vocabulary. The two are not a contradiction and must not be merged: one carries a code the
             // registry has a name for, the other carries the codes it does not. Folding them would hand the
             // resolver an unresolvable tag and force it to invent a name or return a hole (#268).
-            Self::AssignmentWithheld | Self::FrameTypeUnknown => TagKind::Quantity,
+            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::ConnSurplusRead => {
+                TagKind::Quantity
+            }
 
             // --- No tag. ---
             //

@@ -518,14 +518,18 @@ type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
 /// succeeds locally, and the write is buffered into silence. Nothing reports a failure to fall back *from*.
 /// That lagging predicate is also why picking the oldest was actively harmful and not merely arbitrary: it
 /// pinned every redial onto the dead entry for a full idle timeout, which is longer than most exchanges live.
-fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> Option<Connection> {
-    let live = map.get_mut(&peer)?;
+fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> (Option<Connection>, usize) {
+    let Some(live) = map.get_mut(&peer) else {
+        return (None, 0);
+    };
+    let before = live.len();
     live.retain(|c| c.close_reason().is_none());
+    let pruned = before - live.len();
     if live.is_empty() {
         map.remove(&peer);
-        return None;
+        return (None, pruned);
     }
-    live.last().cloned()
+    (live.last().cloned(), pruned)
 }
 
 /// File a connection under `peer`, pruning closed ones first. Returns how many live connections were
@@ -2586,7 +2590,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
                 conn
             }
             // Known-dead address, or none at all: whatever is already live, and no waiting.
-            _ => cached(&t.conns, to),
+            _ => cached(&t, to),
         };
         if let Some(conn) = direct {
             send_uni(&conn, &t.shaper, t.joining(&conn), &frame).await;
@@ -2667,7 +2671,7 @@ async fn send_uni(conn: &Connection, shaper: &Shaper, joining: bool, frame: &[u8
 fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<(Triple, Connection)> {
     let mut map = conns.lock().ok()?;
     let peers: Vec<Triple> = map.keys().copied().filter(|&p| p != exclude).collect();
-    peers.into_iter().find_map(|p| live_conn(&mut map, p).map(|c| (p, c)))
+    peers.into_iter().find_map(|p| live_conn(&mut map, p).0.map(|c| (p, c)))
 }
 
 /// A [`ConnectReq`](FrameType::ConnectReq) frame asking a hub to broker a hole-punch to `target`. One
@@ -2704,7 +2708,7 @@ fn decode_relay(body: &[u8]) -> Option<(Triple, Triple, &[u8])> {
 /// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
 /// cert check), and start reading frames the peer sends back on it.
 async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<Connection> {
-    if let Some(conn) = cached(&t.conns, to) {
+    if let Some(conn) = cached(t, to) {
         return Some(conn);
     }
     // Bound the dial: a peer that has gone away (shut down, NAT-dropped) must fail FAST, not hang the send
@@ -2896,9 +2900,25 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
 }
 
 /// A cached, still-open connection to `peer`, if any.
-fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
-    let mut map = conns.lock().ok()?;
-    live_conn(&mut map, peer)
+///
+/// Takes the whole [`Transport`] rather than just the map so the pruning can be **reported** (#267).
+/// `live_conn` hands back how many entries it dropped, and discarding that number is what left the
+/// question "does this node ever observe the peer closing its surplus" unanswerable — the single most
+/// consequential fact about a list whose other end has a different retention rule.
+fn cached(t: &Transport, peer: Triple) -> Option<Connection> {
+    let (conn, pruned, surplus) = {
+        let mut map = t.conns.lock().ok()?;
+        let surplus = map.get(&peer).is_some_and(|l| l.len() > 1);
+        let (conn, pruned) = live_conn(&mut map, peer);
+        (conn, pruned, surplus)
+    };
+    // Reported on every surplus read, **including the ones that prune nothing**. Recording only the
+    // non-zero case makes absence mean two incompatible things — "read it, nothing was dead" and "never
+    // read it" — and the measurement this was built for landed on exactly that ambiguity.
+    if surplus {
+        t.record_station(Station::ConnSurplusRead, Some(peer), Some(pruned as u64));
+    }
+    conn
 }
 
 /// Whether a new inbound connection from `ip` is admitted under the per-source cap
@@ -3598,7 +3618,7 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                             {
                                 break;
                             }
-                        } else if let Some(hub_conn) = cached(&t.conns, target) {
+                        } else if let Some(hub_conn) = cached(&t, target) {
                             // We are the hub: pass the whole Relay on to the target (re-shaped for that hop).
                             send_uni(&hub_conn, &t.shaper, t.joining(&hub_conn), &frame).await;
                         }
@@ -3640,7 +3660,7 @@ async fn broker_holepunch(t: &Transport, requester: Triple, req_conn: &Connectio
     // dialed in earlier under a since-rebound mapping.
     let requester_addr = requester_addr.unwrap_or_else(|| req_conn.remote_address());
     // Tell the target to dial the requester (over our cached connection to the target)…
-    if let Some(target_conn) = cached(&t.conns, target) {
+    if let Some(target_conn) = cached(t, target) {
         send_framed(
             &target_conn,
             &t.shaper,
@@ -4906,7 +4926,7 @@ mod tests {
         assert_eq!(file_conn(&mut map, peer, older.clone()), 0, "the first is not surplus");
         assert_eq!(file_conn(&mut map, peer, newer.clone()), 1, "the second arrives over one held");
 
-        let picked = live_conn(&mut map, peer).expect("both are live, so one must come back");
+        let picked = live_conn(&mut map, peer).0.expect("both are live, so one must come back");
         assert_eq!(
             picked.stable_id(),
             newer.stable_id(),
@@ -4916,7 +4936,7 @@ mod tests {
         );
 
         newer.close(0u32.into(), b"gone");
-        let survivor = live_conn(&mut map, peer).expect("the older one is still live");
+        let survivor = live_conn(&mut map, peer).0.expect("the older one is still live");
         assert_eq!(
             survivor.stable_id(),
             older.stable_id(),
