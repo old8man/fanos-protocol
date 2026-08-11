@@ -24,8 +24,8 @@ use fanos_geometry::Plane;
 use fanos_primitives::{BeaconSeed, Epoch};
 use fanos_quic::{Client, CoordinateProver};
 use fanos_runtime::Notification;
-use fanos_telemetry::CoherenceFrame;
 use fanos_telemetry::dp::PrivacyBudget;
+use fanos_telemetry::{AlarmLevel, CellId, CoherenceFrame};
 use fanos_vrf::{VrfProof, VrfPublic};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -279,7 +279,7 @@ mod tests {
     /// A frame for the binding tests — the values do not matter, only that it round-trips.
     fn sample_frame() -> CoherenceFrame {
         CoherenceFrame {
-            cell_id: fanos_telemetry::CellId([9; 16]),
+            cell_id: CellId([9; 16]),
             epoch: 3,
             syndrome: 0,
             verdict: 0,
@@ -429,7 +429,7 @@ mod tests {
         let mut differed = 0;
         for i in 0..32u32 {
             let frame = CoherenceFrame {
-                cell_id: fanos_telemetry::CellId([0; 16]),
+                cell_id: CellId([0; 16]),
                 epoch: u64::from(i),
                 syndrome: 0,
                 verdict: 0,
@@ -470,84 +470,193 @@ mod tests {
 ///
 /// ## Silence is not health
 ///
-/// Unreadable cells are counted separately and never folded into "healthy". A monitor that treats a quiet cell
-/// as a well one reports its best news exactly when a partition is at its worst — which is the failure mode
-/// [`read_coherence`]'s three-valued result exists to prevent, and it would be undone here by a single
-/// `unwrap_or_default`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Unreadable coordinates are counted separately and never folded into "healthy". A monitor that treats a
+/// quiet slot as a well one reports its best news exactly when a partition is at its worst — which is the
+/// failure mode [`read_coherence`]'s three-valued result exists to prevent, and it would be undone here by a
+/// single `unwrap_or_default`.
+///
+/// ## A coordinate is not a cell
+///
+/// The population asked is a list of *coordinates*, and what comes back describes a *cell* — those are
+/// different things, and conflating them is how this type first shipped. `fanos census` polls
+/// [`cell_telemetry_coords`], "every point of the base cell"; every one of those nodes publishes a frame
+/// about the cell it belongs to; and `overlay::cell_id` is a pure function of `(genesis, plane order)`, so
+/// "every node in the cell derives the same id". Seven readings, one cell. Counting them as seven let a
+/// four-of-seven majority **inside one cell** print as `NETWORK`, which is the precise opposite of what an
+/// operator does next — escalate rather than heal locally.
+///
+/// The discriminator was free and already on the wire: [`CoherenceFrame::cell_id`]. Readings are now folded
+/// per cell, and a network verdict needs at least **two** answering cells, because with one cell "my cell"
+/// and "the network" are the same population and the question this census exists for is unavailable.
+///
+/// A cell's level is the worst any of its members published, and disagreement among them is counted rather
+/// than smoothed away. That errs the same way "silence is not health" does — away from false comfort — and
+/// it has a stated cost: frames are not publisher-bound (see [`coherence_record`]), so one forged frame can
+/// carry a cell to its worst level. `disagreed` is what tells an operator not to trust a single level, and
+/// the honest summary is that a census is a lead to follow, never an input to anything automatic.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Census {
-    /// Cells reporting `Φ ≥ 1` and `P ≥ 2/N` — integrated and above the viability floor.
-    pub healthy: usize,
-    /// Cells reporting the **integration** alarm: `Φ < 1` but still viable. The earliest warning (V17).
-    pub integration: usize,
-    /// Cells reporting the **structure** alarm: `Φ < 1` and `P < 2/N` — below viability, where the
-    /// V-preservation gate has closed and self-recovery is no longer possible without help.
-    pub structure: usize,
-    /// Cells that published nothing for this epoch. A definite negative: the slot is empty.
-    pub silent: usize,
-    /// Cells whose read did not conclude. **Not** a negative and not evidence of anything — a timeout.
-    pub unreachable: usize,
+    /// One entry per **distinct cell** that answered — never per coordinate.
+    cells: Vec<CellReading>,
+    /// Coordinates that answered, however few cells they turned out to describe.
+    answering_coordinates: usize,
+    /// Coordinates that published nothing for this epoch. A definite negative: the slot is empty. Counted as
+    /// coordinates, not cells, because a coordinate that says nothing names no cell to attribute it to.
+    silent: usize,
+    /// Coordinates whose read did not conclude. **Not** a negative and not evidence of anything — a timeout.
+    unreachable: usize,
+}
+
+/// One cell's reading, folded from however many of its members answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellReading {
+    id: CellId,
+    /// The worst level any member published for this cell.
+    worst: AlarmLevel,
+    /// Whether members disagreed about their own cell's level.
+    disagreed: bool,
+}
+
+/// How bad a level is, as a number that can be compared.
+///
+/// Written out rather than `derive(Ord)` on [`AlarmLevel`]: a derived order is a fact about *declaration
+/// order* in another crate, and reordering the variants there would silently invert the fold here.
+const fn severity(level: AlarmLevel) -> u8 {
+    match level {
+        AlarmLevel::Healthy => 0,
+        AlarmLevel::Integration => 1,
+        AlarmLevel::Structure => 2,
+    }
+}
+
+/// What a census can conclude.
+///
+/// Four-valued, and the fourth is the point: [`SingleCell`](Verdict::SingleCell) is the state the shipped
+/// deployment is actually in, and it is neither "the network is sick" nor "the network is well" — it is *the
+/// question cannot be answered from here*. It still carries the cell's own alarm, because that half **is**
+/// actionable and suppressing it would trade one silence for another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Verdict {
+    /// No cell answered. Not a healthy network and not a sick one.
+    NoReading,
+    /// Exactly one cell answered, at this level. "My cell" and "the network" are the same population.
+    SingleCell(AlarmLevel),
+    /// A majority of the answering cells are alarmed — the network is the story.
+    NetworkWide,
+    /// Most answering cells are healthy — whatever is wrong belongs to a cell, not the network.
+    NotNetworkWide,
 }
 
 impl core::fmt::Display for Census {
     /// One line per count, plus the verdict — the shape `fanos status` and a person with `socat` both read.
+    ///
+    /// The units are in the key names. `asked`/`silent`/`unreachable` count **coordinates**; `healthy` and
+    /// the two alarms count **cells**. Leaving that to the reader is what the defect above was made of.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "asked: {}", self.asked())?;
-        writeln!(f, "healthy: {}", self.healthy)?;
-        writeln!(f, "integration_alarm: {}", self.integration)?;
-        writeln!(f, "structure_alarm: {}", self.structure)?;
-        writeln!(f, "silent: {}", self.silent)?;
-        writeln!(f, "unreachable: {}", self.unreachable)?;
+        writeln!(f, "coordinates_asked: {}", self.asked())?;
+        writeln!(f, "coordinates_answering: {}", self.answering_coordinates)?;
+        writeln!(f, "cells_answering: {}", self.answering_cells())?;
+        writeln!(f, "healthy_cells: {}", self.healthy())?;
+        writeln!(f, "integration_alarm_cells: {}", self.integration())?;
+        writeln!(f, "structure_alarm_cells: {}", self.structure())?;
+        writeln!(f, "cells_whose_members_disagreed: {}", self.disagreed())?;
+        writeln!(f, "coordinates_silent: {}", self.silent)?;
+        writeln!(f, "coordinates_unreachable: {}", self.unreachable)?;
         // Stated rather than left to arithmetic: the verdict is over the cells that *answered*, and saying so
         // is what stops a reader treating the silent ones as a vote either way.
         writeln!(
             f,
             "verdict: {}",
-            if self.answered() == 0 {
-                "no reading — no cell answered"
-            } else if self.network_wide() {
-                "NETWORK — most answering cells are alarmed"
-            } else {
-                "not network-wide — most answering cells are healthy"
+            match self.verdict() {
+                Verdict::NoReading => "no reading — no cell answered".to_owned(),
+                Verdict::SingleCell(level) => format!(
+                    "MY CELL ({}) — one cell answered, so this census cannot tell a cell fault from a \
+                     network one; that needs a second cell to compare against",
+                    level.as_str()
+                ),
+                Verdict::NetworkWide => "NETWORK — most answering cells are alarmed".to_owned(),
+                Verdict::NotNetworkWide =>
+                    "not network-wide — most answering cells are healthy".to_owned(),
             }
         )
     }
 }
 
 impl Census {
-    /// How many cells answered at all.
+    /// How many distinct **cells** answered at all.
     #[must_use]
-    pub fn answered(&self) -> usize {
-        self.healthy + self.integration + self.structure
+    pub fn answering_cells(&self) -> usize {
+        self.cells.len()
     }
 
-    /// How many cells were asked.
+    /// Cells reporting `Φ ≥ 1` and `P ≥ 2/N` — integrated and above the viability floor.
+    #[must_use]
+    pub fn healthy(&self) -> usize {
+        self.count(AlarmLevel::Healthy)
+    }
+
+    /// Cells reporting the **integration** alarm: `Φ < 1` but still viable. The earliest warning (V17).
+    #[must_use]
+    pub fn integration(&self) -> usize {
+        self.count(AlarmLevel::Integration)
+    }
+
+    /// Cells reporting the **structure** alarm: `Φ < 1` and `P < 2/N` — below viability, where the
+    /// V-preservation gate has closed and self-recovery is no longer possible without help.
+    #[must_use]
+    pub fn structure(&self) -> usize {
+        self.count(AlarmLevel::Structure)
+    }
+
+    /// How many answering cells had members that did not agree on their own cell's level.
+    #[must_use]
+    pub fn disagreed(&self) -> usize {
+        self.cells.iter().filter(|c| c.disagreed).count()
+    }
+
+    fn count(&self, level: AlarmLevel) -> usize {
+        self.cells.iter().filter(|c| c.worst == level).count()
+    }
+
+    /// How many **coordinates** were asked.
     #[must_use]
     pub fn asked(&self) -> usize {
-        self.answered() + self.silent + self.unreachable
+        self.answering_coordinates + self.silent + self.unreachable
     }
 
-    /// Whether the *network* is the story rather than any one cell: a majority of the cells that answered are
-    /// alarmed.
+    /// What this census concludes — see [`Verdict`].
     ///
-    /// Deliberately over the cells that **answered**, not over those asked. Counting silence as health would
-    /// hide a partition; counting it as sickness would let one unreachable cell speak for the network. Neither
-    /// is a reading, so the fraction is taken over the population that actually reported and the rest is
-    /// carried alongside for the operator to weigh.
-    #[must_use]
-    pub fn network_wide(&self) -> bool {
-        let answered = self.answered();
-        answered > 0 && (self.integration + self.structure) * 2 > answered
+    /// The fraction is deliberately over the cells that **answered**, not over the coordinates asked.
+    /// Counting silence as health would hide a partition; counting it as sickness would let one unreachable
+    /// coordinate speak for the network. Neither is a reading, so the rest is carried alongside for the
+    /// operator to weigh.
+    pub fn verdict(&self) -> Verdict {
+        match self.cells.as_slice() {
+            [] => Verdict::NoReading,
+            [only] => Verdict::SingleCell(only.worst),
+            many => {
+                let alarmed = many.iter().filter(|c| c.worst != AlarmLevel::Healthy).count();
+                if alarmed * 2 > many.len() { Verdict::NetworkWide } else { Verdict::NotNetworkWide }
+            }
+        }
     }
 
-    /// Fold one cell's read into the census.
+    /// Fold one coordinate's read into the census, attributing it to the cell its frame names.
     fn observe(&mut self, read: &Read<CoherenceFrame>) {
         match read {
-            Read::Found(frame) => match frame.alarm() {
-                fanos_telemetry::AlarmLevel::Healthy => self.healthy += 1,
-                fanos_telemetry::AlarmLevel::Integration => self.integration += 1,
-                fanos_telemetry::AlarmLevel::Structure => self.structure += 1,
-            },
+            Read::Found(frame) => {
+                self.answering_coordinates += 1;
+                let level = frame.alarm();
+                if let Some(seen) = self.cells.iter_mut().find(|c| c.id == frame.cell_id) {
+                    seen.disagreed |= seen.worst != level;
+                    if severity(level) > severity(seen.worst) {
+                        seen.worst = level;
+                    }
+                } else {
+                    self.cells.push(CellReading { id: frame.cell_id, worst: level, disagreed: false });
+                }
+            }
             Read::Absent => self.silent += 1,
             Read::Unknown => self.unreachable += 1,
         }
@@ -585,9 +694,9 @@ mod census_tests {
     /// verdict at zero, so every cell read as healthy and the network test could not fail. Worth knowing about
     /// the frame: a consumer that recomputes the alarm from the measures would be second-guessing the cell
     /// that made it.
-    fn frame(alarm: u8) -> CoherenceFrame {
+    fn frame_of(cell: CellId, alarm: u8) -> CoherenceFrame {
         CoherenceFrame {
-            cell_id: CellId([0u8; 16]),
+            cell_id: cell,
             epoch: 1,
             syndrome: 0,
             verdict: alarm << 2, // ALARM_SHIFT
@@ -602,48 +711,129 @@ mod census_tests {
     }
 
     #[test]
-    fn a_silent_cell_is_never_counted_as_a_healthy_one() {
+    fn a_silent_coordinate_is_never_counted_as_a_healthy_cell() {
         // The property this type exists to protect. A monitor that folds silence into health reports its best
         // news exactly when a partition is at its worst — the failure mode `read_coherence`'s three-valued
         // result exists to prevent, and one `unwrap_or_default` here would undo it.
         let mut c = Census::default();
-        c.observe(&Read::Found(frame(0)));
+        c.observe(&Read::Found(frame_of(CellId([0u8; 16]), 0)));
         c.observe(&Read::Absent);
         c.observe(&Read::Unknown);
-        assert_eq!(c.healthy, 1, "only the cell that said so is healthy");
+        assert_eq!(c.healthy(), 1, "only the cell that said so is healthy");
         assert_eq!(c.silent, 1, "an empty slot is a definite negative, kept apart");
         assert_eq!(c.unreachable, 1, "a timeout is not evidence of anything, kept apart again");
-        assert_eq!(c.answered(), 1, "one cell reported");
-        assert_eq!(c.asked(), 3, "three were asked");
+        assert_eq!(c.answering_cells(), 1, "one cell reported");
+        assert_eq!(c.asked(), 3, "three coordinates were asked");
     }
 
     #[test]
     fn the_network_verdict_is_taken_over_the_cells_that_answered() {
         // Counting silence as health would hide a partition; counting it as sickness would let one unreachable
-        // cell speak for the network. Neither is a reading, so the fraction is over those that reported.
+        // coordinate speak for the network. Neither is a reading, so the fraction is over those that reported.
+        //
+        // The cells here are DISTINCT, and that is the whole point: the first version of this test read one
+        // cell four times and asserted the majority was "the network", which is the defect the type now
+        // refuses. A fixture that cannot tell the two apart cannot pin the property either.
         let mut c = Census::default();
-        for _ in 0..3 {
-            c.observe(&Read::Found(frame(2))); // the structure alarm — below viability
+        for i in 0..3u8 {
+            c.observe(&Read::Found(frame_of(CellId([i; 16]), 2))); // the structure alarm — below viability
         }
-        c.observe(&Read::Found(frame(0)));
-        assert!(c.network_wide(), "three of four answering cells alarmed is the network, not a cell");
+        c.observe(&Read::Found(frame_of(CellId([9u8; 16]), 0)));
+        assert_eq!(
+            c.verdict(),
+            Verdict::NetworkWide,
+            "three of four answering cells alarmed is the network, not a cell"
+        );
 
         let mut quiet = Census::default();
-        quiet.observe(&Read::Found(frame(0)));
+        quiet.observe(&Read::Found(frame_of(CellId([0u8; 16]), 0)));
         for _ in 0..20 {
             quiet.observe(&Read::Unknown);
         }
-        assert!(
-            !quiet.network_wide(),
-            "twenty unreachable cells must not vote — one healthy answer is the only reading there is"
+        assert_eq!(
+            quiet.verdict(),
+            Verdict::SingleCell(AlarmLevel::Healthy),
+            "twenty unreachable coordinates must not vote — and one healthy answer is not a network reading"
         );
     }
 
     #[test]
     fn an_empty_census_makes_no_claim() {
         // Zero answers is not a healthy network and not a sick one.
-        assert!(!Census::default().network_wide());
+        assert_eq!(Census::default().verdict(), Verdict::NoReading);
         assert_eq!(Census::default().asked(), 0);
+    }
+
+    /// **The census must not answer "my cell or the network?" from one cell's members.**
+    ///
+    /// This is the exact population the shipped CLI polls: `fanos.rs` passes
+    /// [`cell_telemetry_coords`], whose own doc says "every point of the base cell" and whose test is named
+    /// `the_monitor_roster_is_the_whole_cell`. Every one of those nodes publishes a frame describing *its
+    /// cell*, and `overlay::cell_id` is a pure function of `(genesis, plane order)` — "every node in the cell
+    /// derives the same id". So the seven slots hold seven opinions about **one** cell, and folding them as
+    /// seven cells makes a within-cell majority print as a network verdict.
+    ///
+    /// The operator's action inverts on that line: "NETWORK" says stop healing locally and escalate.
+    #[test]
+    fn a_cells_own_members_cannot_carry_a_network_verdict() {
+        let mine = CellId([7u8; 16]);
+        let mut c = Census::default();
+        for _ in 0..4 {
+            c.observe(&Read::Found(frame_of(mine, 2))); // four members in structure alarm
+        }
+        for _ in 0..3 {
+            c.observe(&Read::Found(frame_of(mine, 0)));
+        }
+        assert_eq!(c.answering_cells(), 1, "seven members of one cell are one answering cell");
+        assert_eq!(c.asked(), 7, "seven coordinates were asked — that number is about coordinates");
+        assert_eq!(
+            c.verdict(),
+            Verdict::SingleCell(AlarmLevel::Structure),
+            "one cell cannot distinguish itself from the network: the census must say so, and carry the \
+             cell's own alarm, which is the part that IS actionable"
+        );
+
+        // And the rendering, because the operator reads the *string* — a correct verdict that prints the old
+        // sentence would leave the defect exactly where it was.
+        let printed = c.to_string();
+        println!("{printed}");
+        assert!(printed.contains("MY CELL (structure)"), "the verdict line must name the cell: {printed}");
+        assert!(!printed.contains("NETWORK —"), "and must not carry the network sentence: {printed}");
+        assert!(
+            printed.contains("cells_answering: 1") && printed.contains("coordinates_asked: 7"),
+            "the two populations must be printed with their units, never one number for both: {printed}"
+        );
+    }
+
+    /// One vote per cell, worst reading wins — and members disagreeing about their own cell is its own fact.
+    #[test]
+    fn members_of_one_cell_are_one_vote_at_the_worst_level_they_reported() {
+        let mine = CellId([1u8; 16]);
+        let mut c = Census::default();
+        c.observe(&Read::Found(frame_of(mine, 0)));
+        c.observe(&Read::Found(frame_of(mine, 2)));
+        c.observe(&Read::Found(frame_of(mine, 1)));
+        assert_eq!(c.answering_cells(), 1);
+        assert_eq!(c.structure(), 1, "the worst reading a member published is the cell's level");
+        assert_eq!(c.healthy(), 0, "and it does not also count as healthy");
+        assert_eq!(c.disagreed(), 1, "members disagreeing about their own cell is worth an operator's eye");
+    }
+
+    /// And the network verdict is still *reachable* — a guard that can only refuse is not a discriminator.
+    #[test]
+    fn two_cells_can_still_pronounce_on_the_network() {
+        let mut c = Census::default();
+        c.observe(&Read::Found(frame_of(CellId([1u8; 16]), 2)));
+        c.observe(&Read::Found(frame_of(CellId([2u8; 16]), 2)));
+        c.observe(&Read::Found(frame_of(CellId([3u8; 16]), 0)));
+        assert_eq!(c.answering_cells(), 3);
+        assert_eq!(c.verdict(), Verdict::NetworkWide, "two of three answering cells alarmed is the network");
+
+        let mut healthy = Census::default();
+        healthy.observe(&Read::Found(frame_of(CellId([1u8; 16]), 2)));
+        healthy.observe(&Read::Found(frame_of(CellId([2u8; 16]), 0)));
+        healthy.observe(&Read::Found(frame_of(CellId([3u8; 16]), 0)));
+        assert_eq!(healthy.verdict(), Verdict::NotNetworkWide, "one sick cell of three is that cell's story");
     }
 }
 
