@@ -58,7 +58,16 @@ pub struct CoherenceSnapshot {
     pub cell_id: CellId,
     /// The agreed epoch of the observation.
     pub epoch: u64,
-    /// Integration `Φ = 6r²` — is the cell one bound subject (`Φ ≥ 1`)? (the ECG.)
+    /// Integration `Φ` — is the cell one bound subject (`Φ ≥ 1`)? (the ECG.)
+    ///
+    /// **Not `6r²`.** This doc used to state the flat closed form as the definition; that is the
+    /// equicorrelated stratum's special case, and #219 deleted it from the code precisely so the stratum
+    /// could not be assumed by omission (UHM T-312/T-316). The general law is `Φ = r²·(1−p)/p` with `p` the
+    /// cell's *diagonal* purity, and a reader who computes `6·mean_correlation²` on a cell whose behavioural
+    /// weight is concentrated gets a number that is not this one.
+    ///
+    /// A reader who wants the relation back can have it from this struct alone: `p = purity/(1 + phi)`,
+    /// since `P = p·(1 + Φ)`.
     pub phi: f64,
     /// Structuredness `P = Tr(Γ²)` — viable while `P > 2/N`.
     pub purity: f64,

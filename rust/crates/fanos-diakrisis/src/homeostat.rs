@@ -43,7 +43,9 @@ pub enum BandControl {
     /// treats a healthy cell — shedding correlation from a legitimate subject is forbidden.
     Hold,
     /// Over-coupled (`r > r_over`, `R < 1/3` — a common-mode flood driving the cell into groupthink): shed
-    /// synchronisation with `effort ∈ (0, 1]`. This *lowers* `Φ = (N−1)r²` and `r` back into the band and
+    /// synchronisation with `effort ∈ (0, 1]`. This *lowers* `Φ` — the general `r²(1−p)/p`, not the flat
+    /// `(N−1)r²` this line used to name, which holds only on the equicorrelated stratum (#219) — and `r`
+    /// back into the band and
     /// restores `R ≥ 1/3`. Effort is proportional to the over-excursion and capped so it never drives `r`
     /// below the band.
     Decouple {

@@ -637,6 +637,60 @@ pub fn purity_equicorrelated(n: usize, r: f64) -> f64 {
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 mod tests {
+    /// The flat closed form is **wrong on a real cell**, by a margin big enough to mislead — which is why
+    /// two docs that stated it as the definition were corrected (#219 follow-up, UHM T-316).
+    ///
+    /// `Φ = (N−1)r²` holds only where the diagonal is flat. `fanos-telemetry`'s operator-facing snapshot
+    /// said `Φ = 6r²` outright, and the homeostat's shed doc named `(N−1)r²` as the thing it lowers. Neither
+    /// named a stratum, so a reader on a lopsided cell would compute a number the cell does not have.
+    ///
+    /// This measures the gap rather than asserting the rule: a cell whose behavioural weight is
+    /// concentrated on one node, with the correlation held fixed, and the two laws compared. It also shows
+    /// the recovery path the corrected doc promises — `p = P/(1 + Φ)` — actually returns the diagonal
+    /// purity, so a reader holding only the snapshot can still get the general law.
+    #[test]
+    fn the_flat_law_misreports_a_lopsided_cell_and_p_is_recoverable_from_the_snapshot() {
+        // Sylvester–Hadamard rows: mutually orthogonal and zero-mean, so the correlation is exactly `r`
+        // while node 0 carries twice the amplitude — same correlations, concentrated diagonal.
+        let h = |i: usize, t: usize| if (i & t).count_ones().is_multiple_of(2) { 1.0f64 } else { -1.0f64 };
+        let r: f64 = 0.45;
+        let (a, b) = (sqrt(r), sqrt(1.0 - r));
+        let signals: Vec<Vec<f64>> = (0..7)
+            .map(|i| {
+                let scale = if i == 0 { 2.0 } else { 1.0 };
+                (0..16).map(|t| scale * (a * h(1, t) + b * h(i + 2, t))).collect()
+            })
+            .collect();
+        let g = CoherenceMatrix::from_signals(&signals).expect("a well-formed matrix");
+        let m = g.measures();
+        let p = g.diagonal_purity();
+
+        // The general law reproduces the measured Φ; the flat one does not, and the gap is not a rounding.
+        let general = phi_at(g.mean_correlation(), p);
+        let flat = 6.0 * g.mean_correlation() * g.mean_correlation();
+        assert!(
+            (general - m.phi).abs() < 1e-9,
+            "the general law must reproduce the measured Φ: {general} vs {}",
+            m.phi
+        );
+        // The harm, not merely a gap: the flat form reads 1.215 where the cell measures 0.718, so it
+        // crosses `Φ ≥ 1` and calls an UNBOUND cell a bound subject. A wrong number that lands on the
+        // right side of the verdict is a different defect from a wrong number.
+        assert!(
+            flat >= PHI_TH && m.phi < PHI_TH,
+            "the flat form must cross the integration threshold while the measurement does not — that is \
+             the harm the corrected docs exist to prevent: flat={flat}, measured={}, p={p}",
+            m.phi
+        );
+
+        // And the snapshot's promise: `p = P/(1 + Φ)` recovers the diagonal purity from three fields.
+        let recovered = m.purity / (1.0 + m.phi);
+        assert!(
+            (recovered - p).abs() < 1e-9,
+            "P = p(1 + Φ) must invert: recovered {recovered} against measured {p}"
+        );
+    }
+
 
     /// **`Alarm::Integration` was unreachable from any matrix a node could build** — the detector the docs
     /// call the platform's earliest warning and its centralization sensor (#104).
