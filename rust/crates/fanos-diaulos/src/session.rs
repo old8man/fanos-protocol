@@ -77,7 +77,14 @@ impl PendingDial {
     pub fn establish(self, server_hello: &[u8]) -> Option<Dialed> {
         let keys = self.handshake?.finish(server_hello)?;
         let mut conn = keys.client_connection();
-        let primary = conn.open_stream();
+        // `client_connection` returns a connection built one line above with an empty stream map, so
+        // the cap `open_stream` enforces (#273) cannot be reached here. It is stated rather than
+        // propagated on purpose: this function's `None` already means "malformed or non-contributory
+        // ServerHello", and folding a third, structurally impossible cause into it would make the
+        // report ambiguous where it is currently exact.
+        let primary = conn
+            .open_stream()
+            .expect("a connection built with an empty stream map is below MAX_CONCURRENT_STREAMS");
         Some(Dialed { conn, primary })
     }
 }

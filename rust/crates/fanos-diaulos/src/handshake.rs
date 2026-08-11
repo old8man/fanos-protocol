@@ -338,7 +338,7 @@ mod tests {
         // The derived keys actually drive a working multiplexed connection.
         let mut client = client_keys.client_connection();
         let mut service_conn = server_keys.server_connection();
-        let sid = client.open_stream();
+        let sid = client.open_stream().expect("a fresh connection is below the cap");
         let payload: Vec<u8> = (0..1500u32).map(|i| i as u8).collect();
         client.write(sid, &payload);
         client.finish(sid);

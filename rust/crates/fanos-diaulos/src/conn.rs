@@ -80,12 +80,29 @@ impl Connection {
         }
     }
 
-    /// Open a new locally-initiated stream; returns its id.
-    pub fn open_stream(&mut self) -> u32 {
+    /// Open a new locally-initiated stream, or `None` when the connection already holds
+    /// [`MAX_CONCURRENT_STREAMS`].
+    ///
+    /// **The cap is on the connection's memory, not on who asked for the stream** (#273). The peer-opened
+    /// path has enforced it since F2 — an implicit OPEN beyond the cap is refused — and this path did not,
+    /// so a local application could hold any number: measured at 512 against a cap of 256 before this
+    /// returned an `Option`. The bytes a stream pins are the same whichever end opened it, so the same
+    /// bound applies; the asymmetry was an omission, not a policy.
+    ///
+    /// **Refusing is the only honest answer, hence the `Option`.** The two doors that free a slot,
+    /// [`retire_stream`](Self::retire_stream) and [`reset_stream`](Self::reset_stream), have no production
+    /// caller anywhere in the tree, so nothing shrinks this map on its own. Silently exceeding the cap
+    /// would make the bound a comment; silently reusing an id would be worse. The caller learns, and what
+    /// it does about it — retire a finished stream, or fail the request — is its own decision.
+    #[must_use]
+    pub fn open_stream(&mut self) -> Option<u32> {
+        if self.streams.len() >= MAX_CONCURRENT_STREAMS {
+            return None;
+        }
         let id = self.next_local_id;
         self.next_local_id = self.next_local_id.wrapping_add(2);
         self.streams.insert(id, Stream::new(id));
-        id
+        Some(id)
     }
 
     /// The next inbound stream the peer opened (implicit OPEN), if any — the service-side accept.
@@ -360,8 +377,8 @@ mod tests {
         let mut client = Connection::new(c2s, s2c, true); // initiator → even ids
         let mut service = Connection::new(s2c, c2s, false); // responder
 
-        let a = client.open_stream(); // id 0
-        let b = client.open_stream(); // id 2
+        let a = client.open_stream().expect("a fresh connection is below the cap"); // id 0
+        let b = client.open_stream().expect("a fresh connection is below the cap"); // id 2
         let da: Vec<u8> = (0..4000u32).map(|i| i as u8).collect();
         let db: Vec<u8> = (0..2000u32).map(|i| (i * 5) as u8).collect();
         client.write(a, &da);
@@ -422,10 +439,10 @@ mod tests {
     fn initiator_and_responder_ids_never_collide() {
         let mut client = Connection::new([1u8; 32], [2u8; 32], true);
         let mut service = Connection::new([2u8; 32], [1u8; 32], false);
-        assert_eq!(client.open_stream(), 0);
-        assert_eq!(client.open_stream(), 2); // initiator: even
-        assert_eq!(service.open_stream(), 1);
-        assert_eq!(service.open_stream(), 3); // responder: odd
+        assert_eq!(client.open_stream(), Some(0));
+        assert_eq!(client.open_stream(), Some(2)); // initiator: even
+        assert_eq!(service.open_stream(), Some(1));
+        assert_eq!(service.open_stream(), Some(3)); // responder: odd
     }
 
     #[test]
@@ -454,7 +471,7 @@ mod tests {
         );
 
         // open_stream still hands out id 0 as a fresh local stream, uncorrupted by the injection.
-        assert_eq!(initiator.open_stream(), 0);
+        assert_eq!(initiator.open_stream(), Some(0));
 
         // A DATA for an ODD id — the peer's space — is a legitimate implicit open and is accepted.
         let odd = Frame::Data(Segment {
@@ -477,7 +494,7 @@ mod tests {
         let (c2s, s2c) = ([5u8; 32], [6u8; 32]);
         let mut client = Connection::new(c2s, s2c, true);
         let mut service = Connection::new(s2c, c2s, false);
-        let id = client.open_stream();
+        let id = client.open_stream().expect("a fresh connection is below the cap");
         client.write(id, b"hello");
         client.finish(id);
 
@@ -556,7 +573,7 @@ mod tests {
         let mut client = Connection::new(c2s, s2c, true); // opens even ids
         let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)
 
-        let id = client.open_stream(); // 0
+        let id = client.open_stream().expect("a fresh connection is below the cap"); // 0
         client.write(id, b"ping");
         client.finish(id);
 
@@ -643,7 +660,7 @@ mod tests {
         let mut client = Connection::new(c2s, s2c, true); // opens even ids
         let mut service = Connection::new(s2c, c2s, false); // peer parity 0 (even)
 
-        let id = client.open_stream(); // 0
+        let id = client.open_stream().expect("a fresh connection is below the cap"); // 0
         client.write(id, b"hello");
         client.finish(id);
         // Deliver so the service implicitly opens the stream.
@@ -707,7 +724,7 @@ mod tests {
         let mut client = Connection::new(c2s, s2c, true);
         let mut service = Connection::new(s2c, c2s, false);
 
-        let id = client.open_stream();
+        let id = client.open_stream().expect("a fresh connection is below the cap");
         client.write(id, b"first");
         client.flush(id); // `write` only buffers — nothing leaves until a segment is sealed.
         for cell in client.outbound() {
@@ -733,13 +750,79 @@ mod tests {
         // **The control, without which the assertion above is vacuous.** A bare `write` seals nothing, so
         // an empty queue would prove nothing on its own: the same write-then-flush on a LIVE stream must
         // produce a cell. Three earlier versions of this probe were unfalsifiable for want of this.
-        let live = client.open_stream();
+        let live = client.open_stream().expect("a fresh connection is below the cap");
         client.write(live, b"same sequence, live stream");
         client.flush(live);
         assert!(
             !client.outbound().is_empty(),
             "write+flush produced nothing even on a live stream, so the check above measures the sealing \
              rule and not the reset (#244)"
+        );
+    }
+
+    /// **Is the concurrency cap symmetric?** The peer-opened half is capped and tested; this asks the
+    /// local half the same question (#273).
+    ///
+    /// `open_stream` inserts without consulting `MAX_CONCURRENT_STREAMS`, and the only two doors that free
+    /// a slot — `retire_stream` and `reset_stream` — have **no production caller anywhere in the tree**.
+    /// If both readings hold, a long-lived connection's local stream map grows for as long as the
+    /// application opens streams, and the module header's claim that retirement keeps a connection "within
+    /// the cap without ever refusing a fresh stream" describes a call that is never made.
+    ///
+    /// Measured rather than argued: the last four claims about this file were each wrong in a different way.
+    #[test]
+    fn the_local_open_path_is_capped_the_same_way_the_peer_opened_one_is() {
+        let (c2s, s2c) = ([9u8; 32], [8u8; 32]);
+        let mut client = Connection::new(c2s, s2c, true);
+
+        // Open well past the cap, completing nothing — the shape of an application that opens a stream per
+        // request and never retires, which is what the absent caller for `retire_stream` makes the only
+        // available shape. Before this cap existed the loop ended holding 512 streams.
+        let mut admitted = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..(MAX_CONCURRENT_STREAMS * 2) {
+            match client.open_stream() {
+                Some(_) => admitted += 1,
+                None => refused += 1,
+            }
+        }
+        assert_eq!(
+            client.stream_count(),
+            MAX_CONCURRENT_STREAMS,
+            "the local open path must stop at the same bound the peer-opened path enforces (#273)"
+        );
+        assert_eq!(admitted, MAX_CONCURRENT_STREAMS, "every admitted open must occupy a slot");
+
+        // The refusal has to be VISIBLE, not merely effective: a cap that silently discarded the request
+        // would leave the caller writing into an id it believes it owns. `refused` counts the `None`s.
+        assert_eq!(
+            refused,
+            MAX_CONCURRENT_STREAMS,
+            "each open past the cap must report its refusal to the caller (#273)"
+        );
+
+        // The bound must not be a one-way door, and which door opens it is itself the finding. Nothing
+        // here is `is_stream_done` — these streams sent nothing and received nothing — so `retire_stream`
+        // REFUSES, and it is right to: it will not discard unacknowledged state to make room.
+        let held = client.streams.keys().copied().take(3).collect::<Vec<_>>();
+        for &id in &held {
+            assert!(
+                !client.retire_stream(id),
+                "an unfinished stream must not be retired just because the connection wants its slot"
+            );
+        }
+        assert_eq!(client.stream_count(), MAX_CONCURRENT_STREAMS, "a refused retire frees nothing");
+
+        // `reset_stream` is the door that opens under pressure — it abandons the stream deliberately,
+        // which is what a driver shedding a stalled peer actually wants. It frees, and the freed slot is
+        // usable by the same local path that was refused a moment ago.
+        for &id in &held {
+            assert!(client.reset_stream(id).is_some(), "reset frees a held slot unconditionally");
+        }
+        assert_eq!(client.stream_count(), MAX_CONCURRENT_STREAMS - 3);
+        assert!(
+            client.open_stream().is_some(),
+            "a slot freed by `reset_stream` must be usable by the local open path (#273)"
         );
     }
 
@@ -761,7 +844,7 @@ mod tests {
             "no cover cell after exhaustion"
         );
         assert!(c.outbound().is_empty(), "no data/ack cell after exhaustion");
-        let id = c.open_stream();
+        let id = c.open_stream().expect("a fresh connection is below the cap");
         c.write(id, b"x");
         assert!(
             c.reset_stream(id).is_none(),
@@ -799,7 +882,7 @@ mod tests {
             let n = payloads.len();
             let mut ids = Vec::with_capacity(n);
             for p in &payloads {
-                let id = client.open_stream();
+                let id = client.open_stream().expect("a fresh connection is below the cap");
                 client.write(id, p);
                 client.finish(id);
                 ids.push(id);
