@@ -36,6 +36,22 @@
 //! 5. **Hierarchical lift is a degeneracy, not a face**. Out of scope here — this module lifts *within* a
 //!    cell. See #167.
 //!
+//! # The other actuator was checked too, and it was already safe
+//!
+//! An actuator built to help reaches harm at the far end of its own range, and that is a *class*, not an
+//! incident — so the cell's other control was put to the same question. `Decouple`'s far end is a total
+//! shed, which would drive the effective correlation to zero and dissolve the collective subject: the exact
+//! mirror of the erasure this module's `apply` could reach.
+//!
+//! It cannot. `overlay::decouple_ceiling` is `1 − (lo + setback)/healthy` with `lo` the band's **lower
+//! edge**, so the shed is bounded by the floor it must not cross — at most `1 − 0.4082/1 ≈ 0.59` of the
+//! coupling even at a maximal baseline, and `0` when the cell is already at the floor. The bound comes from
+//! the destination the actuator must stay above, which is the same shape the `λ` search below arrives at
+//! from the other side: evaluate the result against the edge, rather than trusting the caller's range.
+//!
+//! So the class has two members and both are now limit-checked. The shed was safe by a derivation someone
+//! did on purpose (#91, #92); the lift was not, until its limit was measured.
+//!
 //! # What this module is not
 //!
 //! It **decides**; it does not act. There is no protocol message here and no caller in a running node. That
