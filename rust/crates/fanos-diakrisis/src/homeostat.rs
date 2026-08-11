@@ -111,6 +111,17 @@ impl Homeostat {
     /// [`CoherenceMatrix::equicorrelated`](crate::CoherenceMatrix::equicorrelated) produces.
     #[must_use]
     pub fn control(self, purity: f64, mean_r: f64, diagonal_purity: f64, n: usize) -> BandControl {
+        // **The two purities are not independent, and the signature cannot say so** (#272). `Measures`
+        // computes `P = p·(1 + Φ)` with `Φ ≥ 0`, so `P ≥ p` always and `p = 0` forces `P = 0`. Taking them
+        // as two free floats makes an impossible pair expressible, and this function would answer one
+        // confidently: a zero diagonal beside a purity above the gate reaches the band's `(∞, ∞)`
+        // fallthrough and prescribes `Bind` — more coupling for a cell with no carriers. Unreachable
+        // through `Measures`, and stated here rather than trusted, because the caller is what changes.
+        debug_assert!(
+            purity + 1e-12 >= diagonal_purity && (diagonal_purity > 0.0 || purity <= 1e-12),
+            "purity {purity} and diagonal purity {diagonal_purity} cannot both come from one matrix: \
+             P = p·(1 + Φ) with Φ ≥ 0 (#272)"
+        );
         // Below viability the V-preservation gate is zero: no amount of rate `κ` regenerates, external help
         // is required (T-104 §5, the "point of no return without external support").
         if purity <= p_crit(n) {
@@ -231,5 +242,51 @@ mod tests {
         assert_eq!(Homeostat::new(0.01).gain(), KAPPA_BOOTSTRAP);
         assert_eq!(Homeostat::conservative().gain(), KAPPA_BOOTSTRAP);
         assert_eq!(Homeostat::default().gain(), KAPPA_BOOTSTRAP);
+    }
+
+    /// **A degenerate behavioural diagonal escalates — and the reason is algebra, not the band** (#272).
+    ///
+    /// `collective_subject_window_at` returns `(∞, ∞)` for `p ≤ 0`, which `classify_collective_at` reads as
+    /// [`Aggregate`](crate::CollectiveState::Aggregate) — under-coupled — whose prescription is `Bind`, more
+    /// coupling. That would be exactly the wrong direction for a cell with no carriers, so the question is
+    /// whether anything reaches it.
+    ///
+    /// Nothing does, and the guarantee is not the ordering of the checks: `Measures` computes
+    /// `purity = diag · (1 + Φ)`, so `diagonal_purity = 0` **forces** `purity = 0`, and the viability gate
+    /// fires first for every consistent input. The band is never consulted with an infinite window.
+    ///
+    /// **The first version of this test proved the opposite by passing an impossible pair** — purity just
+    /// above the gate beside a zero diagonal — and got `Bind { authority: 1e-9 }`. No matrix can produce
+    /// that pair; the probe had built a state the constructor refuses, which is the trap this tree already
+    /// has a note about. What survived is not a live defect but a contract gap, and it is guarded below.
+    #[test]
+    fn a_degenerate_diagonal_escalates_across_the_whole_correlation_range() {
+        const N: usize = 7;
+        for r in [0.0, 0.3, 0.577, 0.9, 1.0] {
+            let verdict = Homeostat::conservative().control(0.0, r, 0.0, N);
+            assert_eq!(
+                verdict,
+                BandControl::Escalate,
+                "a cell with no behavioural carriers answered {verdict:?} at r = {r}. If that is `Bind`, \
+                 the window's `(∞, ∞)` fallthrough read it as under-coupled and prescribed MORE coupling \
+                 — the direction that empties it (#272)."
+            );
+        }
+    }
+
+    /// The two purities are **algebraically dependent**, and the signature lets a caller pass a pair that
+    /// no matrix can produce (#272).
+    ///
+    /// `P = p·(1 + Φ)` with `Φ ≥ 0`, so `P ≥ p` always, and `p = 0` forces `P = 0`. `control` takes them as
+    /// two free `f64`s, so an impossible pair is expressible — and it answers such a pair confidently,
+    /// which is how the first version of the test above manufactured a defect that cannot occur. The
+    /// `debug_assert` in `control` closes that: the contract is now stated where it is relied on rather
+    /// than in a comment two modules away.
+    #[test]
+    #[should_panic(expected = "purity")]
+    fn an_impossible_purity_pair_is_refused_rather_than_answered() {
+        // Purity above the viability gate beside a vanished diagonal: `P ≥ p` is satisfied, but
+        // `p = 0 ⟹ P = 0` is not, and this is exactly the pair that produced the phantom finding.
+        let _ = Homeostat::conservative().control(p_crit(7) + 1e-9, 0.9, 0.0, 7);
     }
 }
