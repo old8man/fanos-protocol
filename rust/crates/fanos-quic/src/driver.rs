@@ -483,7 +483,49 @@ const INPUT_CAP: usize = 1024;
 const MAX_PEER_SEND_QUEUE: usize = INPUT_CAP;
 
 /// A coordinate → live connection cache. A `Connection` is a cheap handle (an `Arc` inside).
-type ConnMap = Arc<Mutex<HashMap<Triple, Connection>>>;
+/// Live connections to each peer — **a list, not one** (#265).
+///
+/// It held exactly one, and every write was a blind overwrite, so a peer that opened a second connection
+/// while the first worked cost the *acceptor* its only route home: the surplus is the dialer's to discard
+/// and the acceptor's to depend on, and each side decides alone. Measured at
+/// `conns.route_replaced = 5` on the run where the reverse send times out.
+///
+/// **The ceiling is not a new constant.** A coordinate is held by one node, and how many connections that
+/// node can have open here is already bounded on the accept path by `MAX_INBOUND_PER_SOURCE` (per IP) under
+/// `MAX_INBOUND_CONNECTIONS` (globally). Both are enforced before a handshake runs, so this list inherits
+/// them; [`file_conn`] additionally drops closed entries on every write, so the steady state is the number
+/// of connections the peer is actually keeping open.
+///
+/// **Why a list rather than "keep the older" or "keep the newer".** Neither is right by construction: the
+/// newest is the good one when a peer migrates and the doomed one when it is surplus, and the acceptor
+/// cannot tell which at accept time — that is the whole difficulty. Holding both and letting closure decide
+/// is self-healing: a send that picks a just-closed connection fails once, the entry is pruned, and the next
+/// send picks the survivor. Neither the old behaviour nor refusing the write recovers at all.
+type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
+
+/// The one place the liveness rule is applied: drop closed connections to `peer` and hand back the first
+/// survivor. Every reader goes through this so "live" cannot come to mean two things in two callers.
+fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> Option<Connection> {
+    let live = map.get_mut(&peer)?;
+    live.retain(|c| c.close_reason().is_none());
+    if live.is_empty() {
+        map.remove(&peer);
+        return None;
+    }
+    live.first().cloned()
+}
+
+/// File a connection under `peer`, pruning closed ones first. Returns how many live connections were
+/// **already** held — zero on the ordinary path, and non-zero exactly when this one is surplus.
+fn file_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple, conn: Connection) -> usize {
+    let live = map.entry(peer).or_default();
+    live.retain(|c| c.close_reason().is_none());
+    let held = live.len();
+    if !live.iter().any(|c| c.stable_id() == conn.stable_id()) {
+        live.push(conn);
+    }
+    held
+}
 
 /// Shared reflexive-address discovery state — peers' observations of this node's public address (#119).
 type Reflexive = Arc<Mutex<ReflexiveAddr>>;
@@ -2582,13 +2624,9 @@ async fn send_uni(conn: &Connection, shaper: &Shaper, joining: bool, frame: &[u8
 /// not directly reachable (#119) — **with its coordinate**, which the caller needs to remember which hubs it
 /// has already asked to broker a punch. `None` if this node has no other live connection to relay via.
 fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<(Triple, Connection)> {
-    let map = conns.lock().ok()?;
-    for (&peer, conn) in map.iter() {
-        if peer != exclude && conn.close_reason().is_none() {
-            return Some((peer, conn.clone()));
-        }
-    }
-    None
+    let mut map = conns.lock().ok()?;
+    let peers: Vec<Triple> = map.keys().copied().filter(|&p| p != exclude).collect();
+    peers.into_iter().find_map(|p| live_conn(&mut map, p).map(|c| (p, c)))
 }
 
 /// A [`ConnectReq`](FrameType::ConnectReq) frame asking a hub to broker a hole-punch to `target`. One
@@ -2761,13 +2799,13 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // redundant one; the read-then-write form of this is the window #241 closed in the
                     // directory with `remove_if`.
                     let filed = match t.conns.lock() {
-                        Ok(mut map) => match map.get(&actual) {
-                            Some(live) if live.close_reason().is_none() => false,
-                            _ => {
-                                map.insert(actual, conn.clone());
-                                true
-                            }
-                        },
+                        // Filed unconditionally now (#265): the list holds it beside whatever is already
+                        // there, so there is nothing to compare against and nothing to evict. #264's
+                        // compare-and-insert existed only because the map held one connection per peer.
+                        Ok(mut map) => {
+                            file_conn(&mut map, actual, conn.clone());
+                            true
+                        }
                         Err(_) => false,
                     };
                     if filed {
@@ -2805,20 +2843,15 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     // The dialer knows the peer identity intrinsically (it chose `to`): tag replies with it.
     tokio::spawn(read_frames(conn.clone(), to, t.clone()));
     if let Ok(mut map) = t.conns.lock() {
-        map.insert(to, conn.clone());
+        file_conn(&mut map, to, conn.clone());
     }
     Some(conn)
 }
 
 /// A cached, still-open connection to `peer`, if any.
 fn cached(conns: &ConnMap, peer: Triple) -> Option<Connection> {
-    let map = conns.lock().ok()?;
-    let conn = map.get(&peer)?;
-    if conn.close_reason().is_none() {
-        Some(conn.clone())
-    } else {
-        None
-    }
+    let mut map = conns.lock().ok()?;
+    live_conn(&mut map, peer)
 }
 
 /// Whether a new inbound connection from `ip` is admitted under the per-source cap
@@ -2961,13 +2994,12 @@ async fn accept_loop(t: Transport) {
             // a connection about to close" and "there was never a route" were the same silence.
             //
             // Under one lock, so the observation cannot disagree with the write it describes.
-            if let Ok(mut map) = t.conns.lock() {
-                let displaced_live = map.get(&from).is_some_and(|old| old.close_reason().is_none());
-                map.insert(from, conn.clone());
-                drop(map);
-                if displaced_live {
-                    t.record_station(Station::ConnRouteReplaced, Some(from), None);
-                }
+            let already_held = match t.conns.lock() {
+                Ok(mut map) => file_conn(&mut map, from, conn.clone()),
+                Err(_) => 0,
+            };
+            if already_held > 0 {
+                t.record_station(Station::ConnSurplusHeld, Some(from), None);
             }
             // Remember the public source address this peer dialed in from, keyed by its proven coordinate:
             // the hub's hole-punch table (#119). When a third party later asks us to broker a connection to
@@ -3223,7 +3255,7 @@ async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notificati
                 // Snapshot the peer set, then send outside the lock: a send awaits, and holding a `std::sync::Mutex`
                 // across an await is how a transport deadlocks itself.
                 let peers: Vec<Connection> = match t.conns.lock() {
-                    Ok(map) => map.values().cloned().collect(),
+                    Ok(map) => map.values().flatten().cloned().collect(),
                     Err(_) => continue,
                 };
                 for conn in peers {
@@ -3440,8 +3472,15 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                     if let Some(moved) = verified_move(&t, &conn, &frame, from) {
                         tracing::debug!(?from, ?moved, "peer moved; re-keying its live connection");
                         if let Ok(mut map) = t.conns.lock() {
-                            map.remove(&from);
-                            map.insert(moved, conn.clone());
+                            // Re-key this connection only: a peer moving takes ITS connection along, and any
+                            // other live one under the old point belongs to whoever still holds it.
+                            if let Some(old) = map.get_mut(&from) {
+                                old.retain(|c| c.stable_id() != conn.stable_id());
+                                if old.is_empty() {
+                                    map.remove(&from);
+                                }
+                            }
+                            file_conn(&mut map, moved, conn.clone());
                         }
                         if let Ok(mut map) = t.peer_addrs.lock()
                             && let Some(addr) = map.remove(&from)

@@ -387,9 +387,18 @@ mod tests {
             "the forged record must actually land, or the read below proves nothing"
         );
 
-        assert!(client.driver_stations().is_empty(), "nothing has been refused yet");
+        // **Counted by NAME, not by an empty plane** (#265). This read `driver_stations().is_empty()`, which
+        // was a proxy for "no refusal yet" that held only while nothing else on the data-path plane ever
+        // fired during cell assembly. `conns.surplus_held` now does — a peer opening a second connection
+        // while the first is live turns out to be ORDINARY on a cell coming up, which is itself worth
+        // knowing — so the proxy broke while the property it stood for never changed. Asserting the station
+        // this test is about is both narrower and stronger.
+        let refusals = |c: &Client| -> Vec<_> {
+            c.driver_stations().into_iter().filter(|o| o.station == Station::AuthenticationRejected).collect()
+        };
+        assert!(refusals(&client).is_empty(), "nothing has been refused yet");
         assert_eq!(resolve_capability(&client, coord, epoch).await, None, "a forgery resolves to nothing");
-        let after = client.driver_stations();
+        let after = refusals(&client);
         assert_eq!(after.len(), 1, "exactly one refusal is recorded: {after:?}");
         let o = &after[0];
         assert_eq!(o.station, Station::AuthenticationRejected);
@@ -406,7 +415,7 @@ mod tests {
             Some((id, capability)),
             "a valid record resolves"
         );
-        assert_eq!(client.driver_stations(), after, "and adds nothing to the plane");
+        assert_eq!(refusals(&client), after, "and adds no refusal to the plane");
 
         for n in cell.nodes {
             n.shutdown();
