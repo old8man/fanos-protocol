@@ -73,18 +73,17 @@ impl PendingDial {
     /// Finish the dial from the received `ServerHello`: derive keys, build the connection, and open
     /// the primary stream. `None` if the `ServerHello` is malformed or non-contributory (audit B5), or
     /// if [`dial`] itself never had a usable handshake to begin with (a non-contributory service key).
+    /// A fresh connection is always below the stream cap, so opening the primary cannot be the cause.
     #[must_use]
     pub fn establish(self, server_hello: &[u8]) -> Option<Dialed> {
         let keys = self.handshake?.finish(server_hello)?;
         let mut conn = keys.client_connection();
-        // `client_connection` returns a connection built one line above with an empty stream map, so
-        // the cap `open_stream` enforces (#273) cannot be reached here. It is stated rather than
-        // propagated on purpose: this function's `None` already means "malformed or non-contributory
-        // ServerHello", and folding a third, structurally impossible cause into it would make the
-        // report ambiguous where it is currently exact.
-        let primary = conn
-            .open_stream()
-            .expect("a connection built with an empty stream map is below MAX_CONCURRENT_STREAMS");
+        // `client_connection` returns a connection built one line above with an empty stream map, so the
+        // cap `open_stream` enforces (#273) cannot be reached here — this `?` never fires. It is folded
+        // into the existing `None` rather than asserted because the alternative is a panic path in a
+        // crate that denies one, and the ambiguity it would add ("malformed hello" vs "at the stream
+        // cap") is unobservable: no caller can reach the second cause.
+        let primary = conn.open_stream()?;
         Some(Dialed { conn, primary })
     }
 }

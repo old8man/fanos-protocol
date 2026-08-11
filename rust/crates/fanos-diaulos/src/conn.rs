@@ -185,6 +185,22 @@ impl Connection {
         self.streams.len()
     }
 
+    /// **Bytes this connection is holding across every stream** — the quantity
+    /// [`crate::budget::SESSION_MEMORY_BUDGET`] is denominated in.
+    ///
+    /// [`stream_count`](Self::stream_count) reports pressure on the *slot* budget; this reports pressure
+    /// on the *memory* budget, and they are not interchangeable — a connection at one stream out of 256
+    /// can hold more than one at 256 empty ones. #205 held the session's transport queues against the
+    /// budget; the stream state inside each connection is the other half of that product, and it needs a
+    /// reader before it can be held against anything (#274).
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.streams
+            .values()
+            .map(|s| s.sender.buffered_bytes() + s.receiver.buffered_bytes())
+            .sum()
+    }
+
     /// Retire a completed stream, freeing its reliability state and its slot against the concurrency cap
     /// ([`MAX_CONCURRENT_STREAMS`]). Returns `true` only if the stream existed and was done in **both**
     /// directions — so no unacknowledged send data and no unreceived segment is ever discarded; an

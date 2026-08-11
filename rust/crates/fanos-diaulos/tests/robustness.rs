@@ -40,7 +40,7 @@ proptest! {
             conn.on_cell(blob); // must never panic
         }
         // The connection is still usable: open a stream, write, and produce outbound cells.
-        let sid = conn.open_stream().expect("a fresh connection is below the cap");
+        let sid = conn.open_stream().unwrap();
         conn.write(sid, b"still alive");
         conn.finish(sid);
         let cells = conn.outbound();

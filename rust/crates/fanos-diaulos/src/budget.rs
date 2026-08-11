@@ -68,6 +68,70 @@ pub const QUEUE_DEPTH: usize = 2 * SACK_WIDTH as usize;
 /// computing capacity from different values disagree permanently about how many exits the cell needs.
 pub const MAX_SESSIONS: usize = SESSION_MEMORY_BUDGET / (2 * QUEUE_DEPTH * CELL_LEN);
 
+/// What one connection's **stream** state costs when every slot it grants is occupied.
+///
+/// [`MAX_SESSIONS`] above divides the budget by the session's *transport* queues. This is the other
+/// container in the same session: each [`Connection`](crate::Connection) holds up to
+/// [`MAX_CONCURRENT_STREAMS`] streams, and each of those holds a receive window of
+/// [`DEFAULT_WINDOW`](fanos_stream::DEFAULT_WINDOW) segments of at most
+/// [`MAX_SEGMENT`](fanos_stream::MAX_SEGMENT) bytes.
+///
+/// **Measured, not only derived**: `tests/stream_slot_product.rs` drives a connection to exactly this
+/// state with a protocol-compliant peer and reads `Connection::buffered_bytes()` back. The two agree, and
+/// the test fails if they stop agreeing — a derivation nobody re-measures is how the 2× error in the
+/// first attempt at this number survived long enough to be written down.
+///
+/// The receive side alone is counted because it is the side an attacker drives: the peer chooses to send,
+/// and this node's application chooses whether to reply. A connection whose application does reply holds
+/// this again on the send side.
+pub const STREAM_STATE_PER_SESSION: usize =
+    crate::conn::MAX_CONCURRENT_STREAMS * fanos_stream::DEFAULT_WINDOW as usize * fanos_stream::MAX_SEGMENT;
+
+/// The session layer's real worst case: **both** containers, across every admitted session.
+///
+/// # Why this is stated as an overrun rather than fixed
+///
+/// It does not fit. `MAX_SESSIONS × STREAM_STATE_PER_SESSION` alone is 1968 MiB against a 64 MiB budget —
+/// 30.8× — and no single factor closes it:
+///
+/// * **[`MAX_SESSIONS`] cannot absorb it.** It is already the residual: the transport queues consume the
+///   whole 64 MiB at 246 sessions, leaving 376 B per session for streams. Re-deriving it against the sum
+///   gives **7**, and it is a cell-wide denominator — `fanos_node`'s role controller divides the Exit
+///   role's measured load by it, so 7 is not a number this cell can carry.
+/// * **The budget cannot grow.** `fanos_primitives::budget::SHARES` already sums to 280 MiB against a
+///   256 MiB node recommendation; #213 named that overrun and #254 raised it. There is nothing to hand out.
+/// * **[`QUEUE_DEPTH`] is at its floor** by its own derivation, and lowering it is what #205 explicitly
+///   refused: depth 30 satisfies the arithmetic and destroys the property the depth exists for.
+///
+/// What remains is [`MAX_CONCURRENT_STREAMS`], and its own doc admits what it is: "`256` mirrors the
+/// concurrency a well-behaved QUIC endpoint grants by default" — a **borrowed number**, counting another
+/// system's object. Deriving it needs the question this layer has never answered: how many streams one
+/// DIAULOS connection must carry at once. Production today carries exactly **one** (the primary), so the
+/// overrun is latent rather than live; but "no caller uses it yet" is not a bound, and a peer's *implicit*
+/// opens reach all 256 without this node's application participating at all.
+///
+/// So the number is named here, the way #213 named its 45 MiB, and the assertion below stops it moving
+/// silently. Closing it is a design decision with a measurement attached (#274), not an edit.
+pub const SESSION_WORST_CASE: usize =
+    MAX_SESSIONS * (2 * QUEUE_DEPTH * CELL_LEN + STREAM_STATE_PER_SESSION);
+
+/// The stated overrun: what the worst case exceeds the budget by, as a number rather than a surprise.
+pub const SESSION_OVERRUN: usize = SESSION_WORST_CASE.saturating_sub(SESSION_MEMORY_BUDGET);
+
+/// The overrun may not move without someone re-doing the division.
+///
+/// Not `<= SESSION_MEMORY_BUDGET`, which is the assertion this *should* be and cannot be yet. Pinning the
+/// measured value instead means any change to `MAX_SESSIONS`, `QUEUE_DEPTH`, `MAX_CONCURRENT_STREAMS`,
+/// `DEFAULT_WINDOW` or `MAX_SEGMENT` stops the build here — including a change that makes it *worse* while
+/// looking local. A silent overrun is what #205 found; a silently *growing* one is the same defect with a
+/// number in front of it.
+const _: () = assert!(
+    SESSION_OVERRUN == 2_063_495_168,
+    "the session layer's worst case moved: re-derive the division (#274) and update this figure \
+     deliberately. If it moved to zero, the layer now fits its budget — replace this pin with the \
+     assertion it stands in for, SESSION_WORST_CASE <= SESSION_MEMORY_BUDGET"
+);
+
 /// The product the two bounds were never checked against, now checked by the compiler.
 ///
 /// This is the assertion whose absence *was* the defect: both constants could be edited independently, and

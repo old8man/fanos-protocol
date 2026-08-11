@@ -577,6 +577,16 @@ impl StreamSender {
         self.finished && self.acked >= self.total()
     }
 
+    /// **Bytes this sender is holding on the heap** — the unacknowledged window plus the unsealed tail.
+    ///
+    /// The quantity a memory budget is denominated in, which no existing accessor reports: `total()`
+    /// counts segments and `stalled_attempts()` counts retries, and neither converts to bytes without
+    /// assuming every segment is full. Reads what is actually held (#274).
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.segments.iter().map(Vec::len).sum::<usize>() + self.pending.len()
+    }
+
     /// **How many times the most-retransmitted unacknowledged segment has been resent** — TCP's `R2`
     /// statistic (RFC 1122 §4.2.3.5), the input to deciding that a peer is gone rather than slow.
     ///
@@ -695,6 +705,17 @@ impl StreamReceiver {
             }
         }
         self.ack()
+    }
+
+    /// **Bytes this receiver is holding on the heap** — every segment admitted and not yet dropped by
+    /// [`take`](Self::take), whether it is part of the contiguous run or an out-of-order hold.
+    ///
+    /// Bounded by `recv_window × MAX_SEGMENT` because admission is anchored on `delivered` rather than
+    /// `next`, but the bound is what the *code* guarantees; this reports what is *held*, which is what a
+    /// budget has to be checked against (#274).
+    #[must_use]
+    pub fn buffered_bytes(&self) -> usize {
+        self.received.values().map(Vec::len).sum()
     }
 
     /// The current selective ack: cumulative next-needed sequence, out-of-order bitmap, and remaining
