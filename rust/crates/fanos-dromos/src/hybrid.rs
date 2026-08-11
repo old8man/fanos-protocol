@@ -1191,6 +1191,10 @@ impl StateMachine for HybridLedger {
         self.audit_beacon = beacon;
     }
 
+    /// Pays, out of the treasury — see below. Declared so an incentivised cell may be composed over this
+    /// ledger and refused over one that would silently drop the reward (#138).
+    const PAYS_BLOCK_REWARD: bool = true;
+
     fn apply_block_reward(&mut self, beneficiaries: &[HybridVerifier], amount: u64) {
         // Pay the block reward from the TREASURY — which accumulates transaction fees and slashed stake — so
         // users' fees and forfeited stakes fund the validators who finalize blocks (the economic loop closes;

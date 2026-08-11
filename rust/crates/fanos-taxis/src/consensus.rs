@@ -1194,8 +1194,23 @@ impl<S: StateMachine> ConsensusEngine<S> {
 
     /// Set the per-block reward pool `F` distributed to a block's commit-certificate signers on finalization
     /// (`R = F/Q` per signer). Default `0` (no reward). A driver sets this from the fees it collects per block.
-    pub fn set_reward_per_block(&mut self, reward: u64) {
+    ///
+    /// **Refuses a non-zero reward on a state machine that does not pay it** ([`S::PAYS_BLOCK_REWARD`]),
+    /// returning `false` (#138). The reveal-gated beneficiary set is computed on every finalization and handed
+    /// to `apply_block_reward`, whose trait default is a no-op — so on a plain ledger the whole payment
+    /// mechanism ran and credited nobody, while the startup ceremony had already asserted that `R ≥ c` held.
+    /// The two facts lived in different crates and neither could see the other.
+    ///
+    /// Refusing here rather than warning, because the number is the *only* observable difference between a
+    /// cell that pays and one that does not: accepted, it makes every downstream reading — the equilibrium
+    /// assertion, the reward gauge, an operator's read of the config — describe an economy that does not run.
+    #[must_use]
+    pub fn set_reward_per_block(&mut self, reward: u64) -> bool {
+        if reward > 0 && !S::PAYS_BLOCK_REWARD {
+            return false;
+        }
         self.reward_per_block = reward;
+        true
     }
 
     /// The on-chain anti-MEV **decryption-key commitment** this validator agreed to at genesis — the canonical

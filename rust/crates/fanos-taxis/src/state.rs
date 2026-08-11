@@ -74,6 +74,21 @@ pub trait StateMachine {
     /// default is a no-op — a plain ledger has no block reward.
     fn apply_block_reward(&mut self, _beneficiaries: &[HybridVerifier], _amount: u64) {}
 
+    /// Whether this state machine **actually credits** [`apply_block_reward`](Self::apply_block_reward)
+    /// (#138).
+    ///
+    /// The no-op default above is deliberate and correct — a plain ledger has no block reward — but it made
+    /// the equilibrium check and the payment capability two facts in two components with nothing joining
+    /// them. `Economics::is_runnable` asserts `R = F/Q ≥ c` at startup from the *configured* `F`, and a cell
+    /// composed `Incentivised { fee: 1000, … }` over a plain ledger passed that assertion and paid nobody:
+    /// the theorem's hypothesis satisfied by a number the composition then discarded. Three implementations
+    /// exist and only one pays.
+    ///
+    /// So the capability is declared, and it travels with the default: `false` beside the no-op, and any
+    /// override of one owes an override of the other. `Engine::set_reward_per_block` refuses a non-zero
+    /// reward when this is `false`, so the number cannot be installed where it would be fiction.
+    const PAYS_BLOCK_REWARD: bool = false;
+
     /// How many executed blocks have left one of this state machine's **own invariants** broken — zero on a
     /// correct ledger, and monotonic.
     ///

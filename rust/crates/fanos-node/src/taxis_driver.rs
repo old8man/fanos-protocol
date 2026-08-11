@@ -484,7 +484,16 @@ where
             params.epoch,
             params.genesis_state,
         );
-        engine.set_reward_per_block(params.reward_per_block);
+        // A reward the composed ledger will not credit is refused, not held (#138). The cell then runs
+        // unincentivised, which is what it actually is — the alternative is a config, a startup equilibrium
+        // assertion and an operator's reading that all describe an economy no block pays out.
+        if !engine.set_reward_per_block(params.reward_per_block) {
+            tracing::error!(
+                reward = params.reward_per_block,
+                "the composed state machine does not credit block rewards — running UNINCENTIVISED, and the \
+                 equilibrium the configuration asserts does not hold"
+            );
+        }
         if let Some(s) = params.sortition {
             engine.enable_sortition(s.secret, s.roots, s.base);
         }

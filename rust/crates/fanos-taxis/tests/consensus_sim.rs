@@ -2030,7 +2030,14 @@ fn a_finalized_blocks_commit_certificate_is_recorded_as_the_next_blocks_last_com
     // concern — the reference `Accounts` has no treasury; `fanos-dromos` tests the `HybridLedger` crediting.
     let mut c = Cluster::new(&genesis());
     for e in &mut c.engines {
-        e.set_reward_per_block(500);
+        // The sentence above — "the reference `Accounts` has no treasury" — is a checked fact now (#138):
+        // the engine refuses a reward a state machine will not credit, so a cell cannot be configured with
+        // an economy it silently drops. This test is about the consensus half and is unaffected by the
+        // refusal; what it verifies is that the block records the finalizer set an execution WOULD reward.
+        assert!(
+            !e.set_reward_per_block(500),
+            "`Accounts` does not pay block rewards, so the engine must refuse to hold a non-zero one"
+        );
     }
     let tx = c.seal(Transfer { from: ALICE, to: BOB, amount: 100, nonce: 0 }, b"reward");
     c.submit_all(&tx);
