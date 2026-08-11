@@ -87,9 +87,23 @@ fn epoch_unknown(node: &Node) -> u64 {
 }
 
 /// How many times this node put a peer it could not judge into the restricted state instead of dropping
-/// it — the entry condition of the only path a beacon has to an unverified node (#235).
+/// it — the entry condition of the path a beacon has to an unverified node (#235).
+///
+/// **Measured constant at 1 across 20 runs**, delivering and not, so it is printed and never asserted on:
+/// a predicate that never varies cannot discriminate, and a guard keyed on it cannot fail (#267).
 fn peer_unjudged(node: &Node) -> u64 {
     station_total(node, "hello.peer_unjudged")
+}
+
+/// Everything the restricted connection carried — frames the filter admitted plus frames it dropped.
+///
+/// **This is the discriminator, and it was found by tabulating every printed field over 20 runs rather
+/// than by argument** (#267). It is 2 on every failing run and 38–324 on every succeeding one, with no
+/// overlap. Deliberately the SUM: `admitted` alone is 0 on three of the five successes, so it separates
+/// nothing — what distinguishes a join is whether the connection carried traffic, not whether a beacon did.
+fn restricted_traffic(node: &Node) -> u64 {
+    station_total(node, "hello.restricted_frame_admitted")
+        + station_total(node, "hello.restricted_frame_dropped")
 }
 
 fn station_total(node: &Node, name: &str) -> u64 {
@@ -331,28 +345,36 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_joins_by_the_restri
     // have been quoted as a rate it does not have. Printed, never asserted. What IS asserted is the ROUTE,
     // which holds on every run, delivering or not.
     //
-    // **The mechanism, read off the station dump of a delivering run.** The arrival refuses the cell's
-    // HELLO seven times (`hello.epoch_unknown = 7`): holding only `(0, genesis)` it genuinely cannot judge
-    // a peer proving epoch 10. It does not drop the connection — `hello.peer_unjudged = 1` puts it in the
-    // restricted state, which admits `FrameType::Beacon` and nothing else, and `restricted_frame_dropped =
-    // 49` beside `restricted_frame_admitted = 2` shows the filter doing exactly that. Two beacon rounds
-    // crossed a connection to a peer the arrival had not verified, and that is the whole answer to "how
-    // does a beacon reach a node with no verified peer".
+    // **THE DISCRIMINATOR, from 20 runs tabulated field by field (#267).** Every column was correlated
+    // against the outcome before anything here was written, because the first version of this comment was
+    // read off ONE delivering run and got the mechanism wrong.
     //
-    // Three shipped pieces had to hold for those two frames to arrive, and all three are visible in the
-    // same dump. `directory.entry_fallback` on all seven coordinates (#263): the arrival could not route
-    // by coordinate at all, so every send fell back to the configured entry address. `moved_peer_retained`
-    // twice (#264): the dial was answered by a peer proving a different coordinate and the connection was
-    // kept rather than discarded. `conns.surplus_held@[1,1,0] = 7` on the cell (#265 + #266): the cell
-    // holds seven connections to the arrival's coordinate and answers on the NEWEST — which is the one the
-    // arrival most recently dialed and is still reading. With `first()` it answered into the oldest, and
-    // that is the run where nothing crossed.
+    // One field separates the two groups with no overlap: `hello.restricted_frame_dropped` on the arrival
+    // is **exactly 2** on all fifteen failing runs and **38–324** on all five that succeed. So the question
+    // is not "did a beacon arrive" but "did the restricted connection carry traffic at all" — a failing run
+    // receives two frames and then silence.
+    //
+    // **What that refuted.** `restricted_frame_admitted` is **0 on three of the five delivering runs**, so
+    // the beacon crossing the restricted channel is NOT the mechanism on the majority of successes. There
+    // are two modes, and the earlier single-run reading saw only the rarer one:
+    //   * `admitted = 0`, `arrival->cell` delivers, nobody verifies, the seat never commits. The arrival
+    //     cannot judge the cell, but the restriction is on what it ACCEPTS — it still sends, and the cell
+    //     (which can judge a genesis claim since the pin, #235) accepts and delivers. No beacon involved.
+    //   * `admitted = 2`, both sides verify, `seat.committed = 1`. Here the beacon does cross and the
+    //     arrival adopts the epoch. This is the mode the first reading described as if it were the only one.
+    //
+    // **What stayed true.** `hello.epoch_unknown ≈ 7` on the arrival in every run, delivering or not, and
+    // `entry_fallback` fires on 6–7 coordinates in every run: the arrival always refuses, and always falls
+    // back to the entry address (#263). `hello.peer_unjudged = 1` in all twenty — which is why it makes a
+    // USELESS assertion and the first version of this guard, keyed on it, could not fail. Constant columns
+    // discriminate nothing; the guard below is keyed on the one that does.
     assert!(
-        !delivered || peer_unjudged(&b) > 0,
-        "a late-arriving node completed an exchange without ever holding an unproven peer's connection \
-         (peer_unjudged = 0), so the beacon reached it by a path this file does not know about and the \
-         restricted channel is NOT the mechanism after all. Find the real one before trusting the join \
-         (#235)."
+        !delivered || restricted_traffic(&b) > 2,
+        "the exchange completed with only {} frames on the restricted connection. Across 20 measured runs \
+         that number is 2 on every failing run and at least 38 on every succeeding one, so a success at \
+         2 means delivery no longer needs the restricted channel to carry anything — the route changed and \
+         the note above is describing a mechanism that is no longer the one in use (#267).",
+        restricted_traffic(&b)
     );
     assert!(
         delivered || on_cell + on_arrival > 0,
@@ -393,10 +415,16 @@ async fn probe_a_node_arriving_after_the_cell_leaves_genesis_joins_by_the_restri
          this stays non-zero on the runs that now succeed: the arrival refuses AND joins, because the \
          restricted channel carries the beacon past the refusal rather than around it."
     );
+    // The discriminator and the constant are printed side by side on purpose: the next reader must be able
+    // to see that `peer_unjudged` does not move while `restricted_traffic` does, without re-running the
+    // 20-run table to learn it (#267).
     println!(
         "MEASURED delivered: cell->arrival {cell_to_arrival}, arrival->cell {arrival_to_cell}; \
-         hello.epoch_unknown -> cell: {on_cell}, arrival: {on_arrival}; arrival seat {arrival_seat_before:?} \
+         hello.epoch_unknown -> cell: {on_cell}, arrival: {on_arrival}; restricted_traffic {} \
+         (peer_unjudged {}, constant at 1 across 20 runs); arrival seat {arrival_seat_before:?} \
          -> {:?} (moved: {})",
+        restricted_traffic(&b),
+        peer_unjudged(&b),
         b.address(),
         b.address() != arrival_seat_before,
     );
