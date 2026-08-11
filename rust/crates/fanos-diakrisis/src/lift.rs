@@ -47,6 +47,7 @@ use alloc::vec;
 
 use crate::coherence::CoherenceMatrix;
 use crate::eig::eigenvalues_symmetric;
+use crate::mathfns::sqrt;
 use crate::window::CollectiveState;
 
 /// A prescribed injection: feed `recipient` from `donor` at convex weight `lambda`.
@@ -96,6 +97,20 @@ pub const MAX_LAMBDA: f64 = 0.02;
 /// The smallest weight worth prescribing. Below this the mixture is inside the estimator's own noise on a
 /// realistic observation window, so a "lift" would be a report rather than a treatment.
 pub const MIN_LAMBDA: f64 = 1e-4;
+
+/// The share of a node's behavioural variance that is **never** mixed — the personal anchor.
+///
+/// Its size is not a taste: on the equicorrelated stratum the correlation matrix's smallest eigenvalue is
+/// `1 − c`, and a full dose can reach at most `c = (1−a)/√(a² + (1−a)²)`, so the anchor's share **is** the
+/// guaranteed remainder of the cell's last dimension. At `a = 0.15` a full dose reaches `c = 0.985` and
+/// leaves `λ_min ≥ 0.015` — the self-model stays non-degenerate however hard the dial is turned.
+///
+/// **The value is a floor, not a derivation, and that is stated rather than hidden.** What `a` must be
+/// depends on how much of the seventh dimension the Fano syndrome needs to keep localising one fault among
+/// seven, and that derivation does not exist yet (#139). This one is the smallest share that keeps the
+/// spectrum clear of the eigen solver's own convergence floor by two orders of magnitude, so it is
+/// defensible as a *minimum* and must be raised, never lowered, when the real bound arrives.
+pub const ANCHOR_SHARE: f64 = 0.15;
 
 /// How far below an equal share counts as hungry, as a fraction of that equal share.
 ///
@@ -164,6 +179,29 @@ fn specialised_donor(g: &CoherenceMatrix, axis: usize) -> Option<usize> {
 
 /// Apply a lift and return the resulting cell, or `None` if the result is not a state a cell can be in.
 ///
+/// # The anchor is inside this function, not beside it (#139 condition 2)
+///
+/// The first version of this mixed the recipient's row toward the donor's with no reserved part, and
+/// `tests/anchor.rs` measured what that buys at full weight: `c = 1.000000`, every other coupling equal to
+/// the donor's, and a smallest eigenvalue of `1.2e-16` — the cell's seventh dimension gone. Healing and
+/// erasure were the same lever at different settings, which is exactly the condition UHM's personal anchor
+/// exists to rule out, and a lever that reaches erasure is one a bug reaches too.
+///
+/// So the recipient keeps [`ANCHOR_SHARE`] of its variance in a component the mixture never touches.
+/// Writing `a` for that share, the recipient's signal is `a·mine + (1−a)·shareable`, the lift moves only
+/// the shareable part, and the resulting couplings follow by covariance:
+///
+/// ```text
+///   cov(r', k) = (1−a)·[(1−λ)·c_rk + λ·c_dk]
+///   var(r')    = a² + (1−a)²·[(1−λ)² + λ² + 2λ(1−λ)·c_rd]
+///   c'_rk      = cov / √var
+/// ```
+///
+/// The normalisation is the half the first version dropped, and it is what makes this the matrix image of
+/// a real signal mixture rather than an arithmetic on rows that can leave the reachable set. At `λ = 1` it
+/// gives `c_rd = (1−a)/√(a² + (1−a)²) < 1` for any `a > 0`, so no dose erases: on the equicorrelated
+/// stratum the smallest eigenvalue is `1 − c`, hence the anchor's size **is** the dimension it keeps.
+///
 /// The mixture is on the **recipient's couplings only** — `c_rk ← (1−λ)c_rk + λ c_dk` for every other node
 /// `k`, and `c_rd ← (1−λ)c_rd + λ` toward the donor's own unit self-coupling. That is the convex form of
 /// condition 3 written at the level the matrix exposes: the recipient's row moves a little way toward the
@@ -186,14 +224,23 @@ pub fn apply(g: &CoherenceMatrix, lift: Lift) -> Option<CoherenceMatrix> {
             *c.get_mut(i * n + j)? = g.pairwise(i, j)?;
         }
     }
+    let a = ANCHOR_SHARE;
+    let (lam, keep) = (lift.lambda, 1.0 - lift.lambda);
+    let c_rd = g.pairwise(r, d)?;
+    // The recipient's new variance: its untouched anchor, plus the mixed shareable part.
+    let var = a * a + (1.0 - a) * (1.0 - a) * (keep * keep + lam * lam + 2.0 * lam * keep * c_rd);
+    if var <= 0.0 {
+        return None;
+    }
+    let norm = sqrt(var);
     for k in 0..n {
         if k == r {
             continue;
         }
-        // The donor's coupling to itself is 1, which is what makes this a mixture toward the donor rather
-        // than an average with it.
+        // Mixing toward the donor means toward the donor's coupling to `k`; the donor's coupling to itself
+        // is 1, which is what makes this a mixture *toward* it rather than an average *with* it.
         let toward = if k == d { 1.0 } else { g.pairwise(d, k)? };
-        let mixed = (1.0 - lift.lambda) * g.pairwise(r, k)? + lift.lambda * toward;
+        let mixed = (1.0 - a) * (keep * g.pairwise(r, k)? + lam * toward) / norm;
         let mixed = mixed.clamp(-1.0, 1.0);
         *c.get_mut(r * n + k)? = mixed;
         *c.get_mut(k * n + r)? = mixed;
