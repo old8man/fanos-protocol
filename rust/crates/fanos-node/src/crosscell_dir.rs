@@ -11,10 +11,32 @@
 //!
 //! The trust model is the sibling directories': a certificate/receipt is self-verifying against the *source*
 //! cell's committee keys ([`ExecCertificate::verify`] / [`CrossCellReceipt::verify`]), so a forged one at a
-//! cell's slot is simply rejected — never a security break. **These are transport-ready:** they compose with a
-//! TAXIS engine running over the real transport (a validator publishing its `latest_checkpoint`), which is the
-//! remaining live-node piece; the wire forms + verification they rely on are complete and tested in
-//! `fanos-taxis`.
+//! cell's slot is simply rejected — never a security break. The wire forms and verification they rely on are
+//! complete and tested in `fanos-taxis`.
+//!
+//! ## Why nothing in a shipped binary calls any of this (#167)
+//!
+//! [`spawn_health_publisher`] has **no callers at all**, and [`crate::spawn_checkpoint_publisher`] has one,
+//! in a test. That was read for a long time as "the wiring is pending", and it is not — the missing piece is
+//! not a caller.
+//!
+//! **A FANOS deployment has exactly one cell, or none.** `Health::reflexive` is `config.plane_order == 2`,
+//! and its doc says why: the DIAKRISIS unit is a seven-member cell, and only `PG(2,2)` forms one from the
+//! plane itself; on a larger plane a node discovers peers but nothing tells it which seven are its cell
+//! (#145). So at `q = 2` the cell *is* the network — a cross-cell publisher's counterpart is itself — and at
+//! `q > 2` no cell forms to be a counterpart. There is never a second cell.
+//!
+//! That also relocates the blocker. It was recorded as an open *cell-identity* question, and identity is not
+//! what is missing: `overlay::cell_id` already derives a stable id per `(genesis, plane order)`, which is
+//! exactly right for the one cell that exists. What is missing is a cell-**formation** mechanism above
+//! `q = 2`, which is #145. Wiring a publisher before then buys an address nobody can be at.
+//!
+//! The `cell: u32` these slots are keyed by is the visible edge of the same thing: every caller must supply a
+//! number the platform has no way to derive, because the space it would index does not exist yet.
+//!
+//! The observability sibling of this is [`crate::telemetry_dir::Census`], and it is worth reading together:
+//! there the same "one cell only" fact was not stated, and an operator-facing verdict claimed to compare
+//! cells while reading one cell's members (#280).
 
 use fanos_code::federation;
 use fanos_code::golay::{self, Report};
