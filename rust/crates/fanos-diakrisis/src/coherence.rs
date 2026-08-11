@@ -588,6 +588,76 @@ impl CoherenceMatrix {
         self.d.iter().map(|x| x * x).sum()
     }
 
+    /// The per-node **activity shares** `d` — each node's share of the cell's behavioural variance,
+    /// summing to 1.
+    ///
+    /// Until now the only public reading of the diagonal was [`diagonal_purity`](Self::diagonal_purity),
+    /// the scalar `p = Σᵢ dᵢ²`, and **a scalar folds two opposite illnesses together**. Weight concentrates
+    /// when one node is *starving* and when one node is *swallowing the cell*; `p` rises either way. A
+    /// matched pair is in `tests/starved_or_dominant.rs`: node 0 at 0.30 amplitude and node 0 dominant,
+    /// with `r` and `p` equal to six decimals, `Φ`, `P`, `R` agreeing to `3e-3`, and the same
+    /// `CollectiveState` and `Alarm`. Every scalar the platform publishes says the two cells are the same
+    /// cell, and the correct responses are opposite: feed the first, decouple the second.
+    ///
+    /// This is the vector those two diseases differ in, and it is the numerator of the **address** a cure
+    /// needs — UHM `1ea2b27` measured that blind cell-wide exchange monotonically dilutes everyone and past
+    /// a threshold collapses the colony, while naming the hungry axis and drawing from one specialised
+    /// donor passes every threshold (#139, condition 4).
+    ///
+    /// **Cell-local only.** This must not widen the exported frame: `design-telemetry.md` §1.2.2 is that
+    /// anything finer than the cell aggregate is *both* blind and forbidden, and the ε-DP floor releases
+    /// one scalar. The surface that may read it is the node's own — local, unprivatized, and by §3 R4
+    /// costing no anonymity.
+    #[must_use]
+    pub fn activity_shares(&self) -> &[f64] {
+        &self.d
+    }
+
+    /// The **hungry axis**: the node furthest *below* an equal share, and its shortfall `1/n − dᵢ`.
+    ///
+    /// `None` for a degenerate cell (`n < 2`), where there is no axis to name. The shortfall is reported
+    /// rather than the raw share so a caller compares against zero rather than re-deriving `1/n`, and so
+    /// the two readings ([`starved_axis`](Self::starved_axis) and
+    /// [`dominant_axis`](Self::dominant_axis)) are on one scale with opposite signs of the same quantity.
+    ///
+    /// It always names *someone*: on a perfectly uniform cell the shortfall is `0`, which is the honest
+    /// answer — an axis exists, it is simply not hungry. A caller that wants "is anyone starving" must
+    /// compare the shortfall against a threshold it derives, and this deliberately does not choose one:
+    /// UHM's dose result says the cure has a *therapeutic window* (below it nothing heals, above it the
+    /// coherence being served is destroyed), so the trigger and the dose belong to the executor that has
+    /// measured that window, not to the sensor (`bccc3d7`, #139 condition 1).
+    #[must_use]
+    pub fn starved_axis(&self) -> Option<(usize, f64)> {
+        self.extreme_axis(true)
+    }
+
+    /// The **dominant axis**: the node furthest *above* an equal share, and its excess `dᵢ − 1/n`.
+    ///
+    /// The mirror of [`starved_axis`](Self::starved_axis), and the reason both exist: `p` cannot tell them
+    /// apart, and they call for opposite treatments.
+    #[must_use]
+    pub fn dominant_axis(&self) -> Option<(usize, f64)> {
+        self.extreme_axis(false)
+    }
+
+    /// The node whose share deviates furthest from uniform in the requested direction, with the magnitude
+    /// of that deviation. Ties go to the lowest index, so the answer is deterministic across a cell whose
+    /// seats a rotation may permute.
+    fn extreme_axis(&self, below: bool) -> Option<(usize, f64)> {
+        if self.n < 2 {
+            return None;
+        }
+        let uniform = 1.0 / self.n as f64;
+        let mut best = (0usize, f64::NEG_INFINITY);
+        for (i, &share) in self.d.iter().enumerate() {
+            let deviation = if below { uniform - share } else { share - uniform };
+            if deviation > best.1 {
+                best = (i, deviation);
+            }
+        }
+        Some(best)
+    }
+
     /// The collective-subject classification from the mean correlation (spec §18.2, V19):
     /// `Aggregate` (too weak to bind), `CollectiveSubject` (in the band), or `OverCoupled`.
     ///
