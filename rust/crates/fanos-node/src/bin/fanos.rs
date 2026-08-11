@@ -1961,8 +1961,14 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
 ///
 /// A refused handshake and a broken conversation are both logged rather than propagated: this is one caller of
 /// many, and a messenger that stops serving because one peer sent garbage has been denied service by that peer.
-async fn converse(stream: DuplexStream, secret: &fanos_pqcrypto::kem::HybridKemSecret) {
-    let mut talk = match fanos_node::angelos_driver::Conversation::respond(stream, secret).await {
+///
+/// Takes the identity **material** rather than the key pair: `DoubleRatchet::respond` owns the KEM secret as
+/// its initial ratchet key and replaces it with a fresh one on the first reply (#282), so each conversation
+/// needs its own. The pair is a pure function of the host secret, so re-deriving it per conversation is the
+/// same key every time and costs a keygen, not a design.
+async fn converse(stream: DuplexStream, identity: &[u8; 32]) {
+    let (secret, public) = fanos_pqcrypto::kem::HybridKemSecret::generate(&mut SeedRng::from_seed(identity));
+    let mut talk = match fanos_node::angelos_driver::Conversation::respond(stream, secret, &public).await {
         Ok(c) => c,
         Err(e) => {
             info!(error = %e, "angelos handshake refused");
@@ -2030,9 +2036,9 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
     let address = Address::from_bundle(&bundle);
     // The messenger's own long-term KEM identity, derived from the same seed under its own label so the
     // transport identity and the end-to-end identity are not the same key doing two jobs.
-    let (kem_secret, kem_public) = fanos_pqcrypto::kem::HybridKemSecret::generate(
-        &mut SeedRng::from_seed(&fanos_primitives::hash_labeled("FANOS-v1/angelos-identity", &host_secret)),
-    );
+    let angelos_identity = fanos_primitives::hash_labeled("FANOS-v1/angelos-identity", &host_secret);
+    let (_kem_secret, kem_public) =
+        fanos_pqcrypto::kem::HybridKemSecret::generate(&mut SeedRng::from_seed(&angelos_identity));
 
     let config = node_config_from_args(rest)?;
     let mut node = Node::start_on_plane(config).await?;
@@ -2043,11 +2049,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         return Err(e);
     }
 
-    let secret = Arc::new(kem_secret);
-    let handler = move |stream: DuplexStream| {
-        let secret = Arc::clone(&secret);
-        async move { converse(stream, &secret).await }
-    };
+    let handler = move |stream: DuplexStream| async move { converse(stream, &angelos_identity).await };
     let _driver = spawn_rendezvous_host(
         node.client(),
         node.address(),

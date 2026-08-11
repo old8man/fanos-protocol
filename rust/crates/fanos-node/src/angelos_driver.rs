@@ -19,6 +19,12 @@
 //!   security from its double ratchet. It survives a compromised host, a compromised relay, and the recovery of
 //!   either party's long-term key after the fact.
 //!
+//! That second sentence was false for as long as this module existed (#282). It held a
+//! `fanos_angelos::session::Session` — the **symmetric** half, whose own doc says the asymmetric KEM ratchet
+//! "builds on it in `crate::ratchet`" — so the shipped conversation had forward secrecy and no healing after a
+//! compromise, while `DoubleRatchet` sat exported from `lib.rs` with no caller anywhere, not even inside its
+//! own crate. The argument for keeping two encryption layers rested on the property the wired half lacked.
+//!
 //! Collapsing them would trade the second property for one less encryption pass. That is the wrong trade for a
 //! messenger, and it is exactly the trade a "the transport is already encrypted" argument talks you into.
 //!
@@ -30,8 +36,9 @@
 //! permanently. A bound on the length is enforced, because the count is read from the wire before the body is.
 
 use fanos_angelos::message::Message;
-use fanos_angelos::session::Session;
+use fanos_angelos::ratchet::DoubleRatchet;
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
+use fanos_pqcrypto::rng::SeedRng;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 /// The largest frame this driver will read, in bytes.
@@ -47,7 +54,7 @@ pub use fanos_wire::MAX_FRAME;
 /// A messaging session bound to one byte stream.
 pub struct Conversation<S> {
     stream: S,
-    session: Session,
+    ratchet: DoubleRatchet,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Conversation<S> {
@@ -63,10 +70,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conversation<S> {
         recipient: &HybridKemPublic,
         rng_seed: &[u8],
     ) -> std::io::Result<Self> {
-        let (session, handshake) = Session::initiate(recipient, rng_seed)
+        let (ratchet, handshake) = DoubleRatchet::initiate(recipient, rng_seed)
             .ok_or_else(|| std::io::Error::other("angelos: could not build the handshake"))?;
         write_frame(&mut stream, &handshake).await?;
-        Ok(Self { stream, session })
+        Ok(Self { stream, ratchet })
     }
 
     /// Accept a conversation as the **responder**: read the initiator's handshake and open with it.
@@ -74,19 +81,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conversation<S> {
     /// # Errors
     /// I/O on the stream, or a handshake that does not verify — which is refused rather than answered, since a
     /// responder that replies to a bad handshake tells an unauthenticated prober that it is a messenger.
-    pub async fn respond(mut stream: S, kem_secret: &HybridKemSecret) -> std::io::Result<Self> {
+    /// Takes the KEM secret **by value**: the ratchet owns it as its initial ratchet key and drops it for a
+    /// fresh one on the first reply, which is what healing after a compromise means. A responder that kept a
+    /// borrowed static key would be the symmetric half again.
+    pub async fn respond(
+        mut stream: S,
+        kem_secret: HybridKemSecret,
+        kem_public: &HybridKemPublic,
+    ) -> std::io::Result<Self> {
         let handshake = read_frame(&mut stream).await?;
-        let session = Session::respond(kem_secret, &handshake)
+        let ratchet = DoubleRatchet::respond(kem_secret, kem_public, &handshake)
             .ok_or_else(|| std::io::Error::other("angelos: handshake did not verify"))?;
-        Ok(Self { stream, session })
+        Ok(Self { stream, ratchet })
     }
 
     /// Seal `message` and write it.
     ///
+    /// Draws a **fresh OS seed per message**, because a ratchet step mints a new key pair and its randomness is
+    /// what the healing is made of: a reused draw would re-derive the same ratchet key and buy nothing. An
+    /// entropy failure refuses to send rather than falling back to a predictable draw — the same rule the DP
+    /// export follows, for the same reason.
+    ///
     /// # Errors
-    /// I/O on the stream.
+    /// I/O on the stream, no OS entropy, or a ratchet that refuses to seal.
     pub async fn send(&mut self, message: &Message) -> std::io::Result<()> {
-        let sealed = self.session.seal(&message.to_bytes());
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed)
+            .map_err(|_| std::io::Error::other("angelos: no OS entropy for the ratchet step"))?;
+        let mut rng = SeedRng::from_seed(&seed);
+        let sealed = self
+            .ratchet
+            .seal(&mut rng, &message.to_bytes())
+            .ok_or_else(|| std::io::Error::other("angelos: the ratchet refused to seal"))?;
         write_frame(&mut self.stream, &sealed).await
     }
 
@@ -100,7 +126,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conversation<S> {
     pub async fn recv(&mut self) -> std::io::Result<Option<Message>> {
         let Some(sealed) = read_frame_eof(&mut self.stream).await? else { return Ok(None) };
         let plain = self
-            .session
+            .ratchet
             .open(&sealed)
             .ok_or_else(|| std::io::Error::other("angelos: message did not open — the ratchet has diverged"))?;
         let message = Message::from_bytes(&plain)
@@ -154,7 +180,6 @@ async fn read_frame_eof<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use fanos_pqcrypto::rng::SeedRng;
 
     /// A correspondent's long-term key pair.
     fn keypair(seed: &[u8]) -> (HybridKemSecret, HybridKemPublic) {
@@ -164,10 +189,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_message_crosses_the_stream_and_arrives_intact() {
         let (secret, public) = keypair(b"angelos-driver-recipient-seed-32");
+        let public_for_responder = public.clone();
         let (client, server) = tokio::io::duplex(64 * 1024);
 
         let responder = tokio::spawn(async move {
-            let mut c = Conversation::respond(server, &secret).await.expect("handshake");
+            let mut c = Conversation::respond(server, secret, &public_for_responder).await.expect("handshake");
             c.recv().await.expect("read").expect("a message")
         });
 
@@ -186,10 +212,11 @@ mod tests {
         // The ratchet advances per message, so the second and later ones are the real test: a framing bug that
         // splits or merges ciphertexts passes the first exchange and fails here.
         let (secret, public) = keypair(b"angelos-driver-many-messages-see");
+        let public_for_responder = public.clone();
         let (client, server) = tokio::io::duplex(64 * 1024);
 
         let responder = tokio::spawn(async move {
-            let mut c = Conversation::respond(server, &secret).await.expect("handshake");
+            let mut c = Conversation::respond(server, secret, &public_for_responder).await.expect("handshake");
             let mut got = Vec::new();
             while let Some(m) = c.recv().await.expect("read") {
                 got.push(m.as_text().unwrap_or_default().to_owned());
@@ -215,9 +242,10 @@ mod tests {
         // The difference between "the conversation ended" and "the conversation broke" — a messenger that
         // cannot tell them apart reports a hang-up as a failure.
         let (secret, public) = keypair(b"angelos-driver-clean-eof-seedxxx");
+        let public_for_responder = public.clone();
         let (client, server) = tokio::io::duplex(1024);
         let responder = tokio::spawn(async move {
-            let mut c = Conversation::respond(server, &secret).await.expect("handshake");
+            let mut c = Conversation::respond(server, secret, &public_for_responder).await.expect("handshake");
             c.recv().await
         });
         let initiator = Conversation::initiate(client, &public, b"eof-seed").await.unwrap();
@@ -246,11 +274,67 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_handshake_that_does_not_verify_is_refused_rather_than_answered() {
         // A responder that replies to garbage tells an unauthenticated prober it is a messenger.
-        let (secret, _public) = keypair(b"angelos-driver-bad-handshake-see");
+        let (secret, public_for_responder) = keypair(b"angelos-driver-bad-handshake-see");
         let (client, server) = tokio::io::duplex(4096);
-        let responder = tokio::spawn(async move { Conversation::respond(server, &secret).await.is_ok() });
+        let responder = tokio::spawn(async move { Conversation::respond(server, secret, &public_for_responder).await.is_ok() });
         let mut client = client;
         write_frame(&mut client, b"not a handshake").await.unwrap();
         assert!(!responder.await.unwrap(), "a bad handshake must not open a session");
+    }
+
+    /// **The shipped conversation must ratchet asymmetrically** (#282) — the property the module doc uses to
+    /// argue for two encryption layers, and the one the wired half did not have.
+    ///
+    /// `Session` and `DoubleRatchet` differ observably on the wire: a ratchet message (the first of a new
+    /// sending chain) leads with flag `1` and carries a full ML-KEM ratchet public key, so it is *kilobytes*
+    /// larger than an in-chain message (flag `0`, a 32-byte key id). `Session` produces neither flag nor key.
+    /// Reverting the driver to `Session` fails this on the flag; a driver that merely holds a `DoubleRatchet`
+    /// but never steps it fails on the size gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_wired_conversation_takes_a_kem_ratchet_step_not_just_a_chain_step() {
+        let (secret, public) = keypair(b"angelos-driver-pcs-ratchet-seedx");
+        let public_for_responder = public.clone();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+
+        let responder = tokio::spawn(async move {
+            let mut c = Conversation::respond(server, secret, &public_for_responder).await.expect("handshake");
+            // Receive, then reply — the reply is the responder's first send after seeing a peer ratchet key,
+            // so the alternation invariant says it MUST be a ratchet message.
+            let _first = c.recv().await.expect("read").expect("a message");
+            c.send(&Message::text([3u8; 32], [4u8; 32], 1, "reply")).await.expect("reply seals");
+            c.into_inner()
+        });
+
+        let mut initiator =
+            Conversation::initiate(client, &public, b"pcs-fresh-ephemeral-seed-value").await.unwrap();
+        initiator.send(&Message::text([1u8; 32], [2u8; 32], 0, "hello")).await.unwrap();
+
+        // Read the reply's raw frame rather than opening it: the question is what went on the wire.
+        let frame = read_frame(&mut initiator.stream).await.expect("the reply frame");
+        let flag = *frame.first().expect("a non-empty frame");
+        println!("reply frame: {} bytes, leading flag {flag}", frame.len());
+        assert_eq!(flag, 1, "the responder's first reply must be a RATCHET message, not an in-chain one");
+        assert!(
+            frame.len() > 1024,
+            "a ratchet message carries a full ML-KEM public key; {} bytes is an in-chain message wearing the \
+             flag",
+            frame.len()
+        );
+
+        // The other half, so the discriminator is demonstrated rather than asserted: the same plaintext
+        // through the symmetric-only `Session` this driver used to hold.
+        let (s_secret, s_public) = keypair(b"angelos-driver-pcs-session-halfx");
+        let (mut a, hs) = fanos_angelos::session::Session::initiate(&s_public, b"seed-for-the-old-half").unwrap();
+        let mut b = fanos_angelos::session::Session::respond(&s_secret, &hs).unwrap();
+        let _ = b.open(&a.seal(b"hello"));
+        let session_frame = b.seal(&Message::text([3u8; 32], [4u8; 32], 1, "reply").to_bytes());
+        println!("session frame: {} bytes, leading byte {}", session_frame.len(), session_frame.first().copied().unwrap_or(255));
+        assert!(
+            session_frame.len() < 1024,
+            "the symmetric half carries no ratchet key, so it cannot reach the size this guard checks: {}",
+            session_frame.len()
+        );
+
+        let _ = responder.await.unwrap();
     }
 }
