@@ -87,12 +87,20 @@ pub enum Request {
     Health,
     /// The roles the **cell** has assigned this node, which is not always what its config offered.
     Roles,
-    /// A **census** of the cells this node can see — the answer to "is this my cell, or the network?".
+    /// A **census** of the cells this node can read — "is this my cell, or the network?", *when it can be
+    /// answered*.
     ///
-    /// Reads every cell coordinate's published ε-private coherence frame for the current epoch and reports the
-    /// distribution: healthy, alarmed, silent, unreachable. Slower than the other verbs by design — it goes to
-    /// the overlay store rather than to local state — and issued serially, since a monitor that fans out over a
-    /// federation at once is a load spike on a network it may be asking about because it is under load.
+    /// Reads every coordinate's published ε-private coherence frame for the current epoch, folds the readings
+    /// **per cell** (`CoherenceFrame::cell_id`), and reports the distribution: healthy cells, alarmed cells,
+    /// cells whose members disagreed, and — counted as coordinates, not cells — the silent and unreachable
+    /// slots. Slower than the other verbs by design (it goes to the overlay store rather than to local state)
+    /// and issued serially, since a monitor that fans out over a federation at once is a load spike on a
+    /// network it may be asking about because it is under load.
+    ///
+    /// On a shipped deployment the verdict is `MY CELL`, and that is the honest answer rather than a missing
+    /// feature: the coordinates polled are the seven points of *this* cell, every frame describes the same
+    /// cell, and one cell cannot be compared against a network (#280). It still names the cell's own alarm,
+    /// which is the half an operator can act on.
     Census,
     /// **Why this validator sits where it does** — the consensus engine's own position and the counters behind it.
     ///

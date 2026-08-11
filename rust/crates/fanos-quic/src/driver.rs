@@ -1019,6 +1019,50 @@ impl Client {
         }
     }
 
+    /// **Sample a value's data availability** without downloading it (spec §L4.3) — the light-client check.
+    ///
+    /// Probes a few unpredictable Fano lines and concludes as soon as every sampled line is fully present.
+    /// By the Steiner soundness in `fanos_code::da`, an unavailable value has at most one of the seven lines
+    /// external, so `DA_SAMPLES = 3` distinct lines give certain detection.
+    ///
+    /// **This is the door that was never cut (#173).** `Command::SampleAvailability` has existed with the
+    /// engine handling it end to end — sampling, probing, the timeout sweep, the notification — and no way
+    /// for anything outside the engine to issue one. The only issuers in the tree were two simulator tests,
+    /// so no shipped binary, no embedder through the C ABI, and no `fanos-vpn` could ask the question the
+    /// mechanism exists to answer.
+    ///
+    /// The subscription is taken **before** the command is sent, for the reason `read` registers its waiter
+    /// first: a sample that concludes locally (this node already holds enough shards) notifies immediately,
+    /// and a subscription taken afterwards would miss it and then wait out the full timeout.
+    ///
+    /// [`Unavailable`](Sampled::Unavailable) is the engine's own conclusion and is deliberately conservative:
+    /// it folds "a sampled line was missing" together with "the probe did not answer in time", because for
+    /// data availability those must not be told apart in the caller's favour — a withheld value that reads as
+    /// available is the failure this check exists to prevent. [`Inconclusive`](Sampled::Inconclusive) is
+    /// strictly about *this call* failing to reach a conclusion at all.
+    pub async fn sample_availability(&self, key: Vec<u8>) -> Sampled {
+        let digest = storage_digest(&key);
+        let mut events = self.subscribe();
+        if !self.command(Command::SampleAvailability { key }) {
+            return Sampled::Inconclusive; // the node stopped — nothing was established
+        }
+        let wait = async {
+            loop {
+                match events.recv().await {
+                    Ok(Notification::Availability { key: k, available }) if k == digest => {
+                        return if available { Sampled::Available } else { Sampled::Unavailable };
+                    }
+                    // Two different reasons, one behaviour: another sample's answer or an unrelated
+                    // notification is simply not ours, and a lag *may* have dropped ours but may not have.
+                    // Neither is a conclusion, so both keep waiting and let the bound below decide.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Sampled::Inconclusive,
+                }
+            }
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, wait).await.unwrap_or(Sampled::Inconclusive)
+    }
+
     /// [`read`](Self::read), for the callers that genuinely treat both negatives alike.
     ///
     /// Kept because most call sites want the bytes and will retry regardless of why they are missing — a
@@ -1109,6 +1153,24 @@ impl Client {
     pub fn subscribe(&self) -> broadcast::Receiver<Notification> {
         self.events_tx.subscribe()
     }
+}
+
+/// What a [`Client::sample_availability`] call established (spec §L4.3).
+///
+/// Three-valued for the reason every read on this client is: a call that did not conclude is not a negative,
+/// and folding it into one would let an unreachable node read as a withheld value — or worse, the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum Sampled {
+    /// Every sampled Fano line was fully present: the value's shards are retrievable.
+    Available,
+    /// The engine concluded the value is **not** confirmed available — a sampled line was incomplete, or its
+    /// probes did not answer within the engine's own timeout. Conservative by design; see
+    /// [`sample_availability`](Client::sample_availability).
+    Unavailable,
+    /// This call did not reach a conclusion: the node had stopped, or the wait elapsed. **Not** evidence of
+    /// anything, and in particular not evidence that the value is unavailable.
+    Inconclusive,
 }
 
 /// The router actor: sole owner of the engine's notification stream. It resolves content-addressed

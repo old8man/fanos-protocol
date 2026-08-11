@@ -90,20 +90,32 @@ pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Opt
     ExecCertificate::from_bytes(&bytes)
 }
 
-/// A parent cell anchors its `children`'s finalities for `epoch`: resolve each child's published checkpoint and
-/// [`attest`](ChildRegistry::attest) it into `registry` (each child's committee must already be registered).
-/// Returns the `(cell, height, state_root)` newly anchored — a child that has not published, or whose
-/// certificate fails to verify or does not advance, is skipped. This is parent-attests-child made live.
+/// A parent cell anchors its `children`'s finalities for `epoch`: resolve each child's published checkpoint
+/// and [`attest_available`](ChildRegistry::attest_available) it into `registry` (each child's committee must
+/// already be registered). Returns the `(cell, height, state_root)` newly anchored — a child that has not
+/// published, or whose certificate fails to verify, does not advance, **or whose data is not available**, is
+/// skipped. This is parent-attests-child made live.
+///
+/// **Each child is named with its availability mask, and that is deliberate (#173).** `ChildRegistry` had two
+/// public doors — `attest` and `attest_available` — differing only in whether the parent refuses to vouch for
+/// a state whose data is withheld, and this function went through the unguarded one. The safe door was
+/// documented as the protection and had no caller anywhere; the guarded twin is now the only door, and the
+/// evidence is an argument nobody can forget to pass.
+///
+/// A caller with no mask for a child has two honest options and no third: leave the child out, or pass a mask
+/// that says what it actually knows. `0` means "nothing present" and refuses — the safe direction. Producing
+/// a real mask needs the §L4.3 sampler, which no shipped binary issues yet (#173); this signature is where
+/// that shows up rather than being skipped in silence.
 pub async fn attest_children(
     client: &Client,
     registry: &mut ChildRegistry,
-    children: &[u32],
+    children: &[(u32, u8)],
     epoch: Epoch,
 ) -> Vec<(u32, u64, [u8; 32])> {
     let mut anchored = Vec::new();
-    for &cell in children {
+    for &(cell, present) in children {
         if let Some(cert) = resolve_checkpoint(client, cell, epoch).await
-            && let Some((height, root)) = registry.attest(cell, cert)
+            && let Some((height, root)) = registry.attest_available(cell, cert, present)
         {
             anchored.push((cell, height, root));
         }

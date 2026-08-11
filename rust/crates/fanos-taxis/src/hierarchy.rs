@@ -61,11 +61,19 @@ impl ChildRegistry {
         self.committees.insert(committee.cell, committee);
     }
 
-    /// Verify and record a child's execution certificate. Returns the newly-attested `(height, state_root)` iff
-    /// the certificate verifies under the child's registered committee **and strictly advances** that child's
-    /// attested height (finality only moves forward). Rejects an unknown child, an invalid or sub-quorum
-    /// certificate, or a stale/replayed height.
-    pub fn attest(&mut self, cell: u32, cert: ExecCertificate) -> Option<(u64, [u8; 32])> {
+    /// Verify and record a child's execution certificate, **without checking that its data is available**.
+    ///
+    /// Private, and that is the fix rather than an accident of scope. This and
+    /// [`attest_available`](Self::attest_available) were both public, differing only in whether the parent
+    /// refuses to vouch for a state whose data is withheld — and the one production path that anchors
+    /// children (`fanos_node::crosscell_dir::attest_children`) called *this* one. The safe door existed, was
+    /// documented as the protection, and no caller went through it. A security property offered as an
+    /// alternative method is a property nobody gets.
+    ///
+    /// Returns the newly-attested `(height, state_root)` iff the certificate verifies under the child's
+    /// registered committee **and strictly advances** that child's attested height (finality only moves
+    /// forward). Rejects an unknown child, an invalid or sub-quorum certificate, or a stale/replayed height.
+    fn attest(&mut self, cell: u32, cert: ExecCertificate) -> Option<(u64, [u8; 32])> {
         let committee = self.committees.get(&cell)?;
         if !cert.verify(committee.quorum, &committee.verifiers) {
             return None; // not a genuine Q-quorum of this child
@@ -78,10 +86,18 @@ impl ChildRegistry {
         Some(anchor)
     }
 
-    /// Verify + record a child certificate **only if its data is available** — the parent additionally checks
-    /// the child block's DA sample: `present` is the child-shard availability bitmask (bit `p` set ⇒ point
-    /// `p`'s shard is retrievable). An unavailable child payload (`!is_recoverable_fano`) is refused, so the
-    /// parent never anchors a state whose data is withheld. Otherwise identical to [`attest`](Self::attest).
+    /// Verify + record a child certificate **only if its data is available** — the one way a parent anchors a
+    /// child.
+    ///
+    /// `present` is the child-shard availability bitmask (bit `p` set ⇒ point `p`'s shard is retrievable). An
+    /// unavailable child payload (`!is_recoverable_fano`) is refused, so the parent never anchors a state
+    /// whose data is withheld.
+    ///
+    /// The mask is an argument the caller must produce, never a default: a parent that cannot establish a
+    /// child's availability must anchor nothing, and passing `0` says "nothing is present" and refuses,
+    /// which is the safe direction. Today nothing produces one — the §L4.3 sampler yields `available: bool`
+    /// per store key, and no shipped binary issues even that (#173) — so this is where that gap becomes
+    /// visible instead of being skipped.
     pub fn attest_available(&mut self, cell: u32, cert: ExecCertificate, present: u8) -> Option<(u64, [u8; 32])> {
         let missing = (!present) & 0x7F;
         if !is_recoverable_fano(missing) {
@@ -118,6 +134,9 @@ impl ChildRegistry {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    /// Every Fano point's shard retrievable — what these tests assume unless they are about availability.
+    const ALL_PRESENT: u8 = 0x7F;
+
     use super::*;
     use fanos_pqcrypto::{HybridSigSecret, SeedRng};
 
@@ -146,11 +165,11 @@ mod tests {
         let mut reg = ChildRegistry::new();
         reg.register(committee);
         let c = cert(4, [0xAA; 32], &secrets, 5);
-        assert_eq!(reg.attest(2, c), Some((4, [0xAA; 32])), "a valid Q-quorum child cert is anchored");
+        assert_eq!(reg.attest_available(2, c, ALL_PRESENT), Some((4, [0xAA; 32])), "a valid Q-quorum child cert is anchored");
         assert_eq!(reg.latest(2).map(|c| c.height), Some(4));
         // Finality advances; a later height is anchored, an equal/earlier one is not.
-        assert_eq!(reg.attest(2, cert(5, [0xBB; 32], &secrets, 5)), Some((5, [0xBB; 32])));
-        assert_eq!(reg.attest(2, cert(5, [0xCC; 32], &secrets, 5)), None, "finality does not regress");
+        assert_eq!(reg.attest_available(2, cert(5, [0xBB; 32], &secrets, 5), ALL_PRESENT), Some((5, [0xBB; 32])));
+        assert_eq!(reg.attest_available(2, cert(5, [0xCC; 32], &secrets, 5), ALL_PRESENT), None, "finality does not regress");
     }
 
     #[test]
@@ -158,13 +177,13 @@ mod tests {
         let (secrets, committee) = child(2, 0x20);
         let mut reg = ChildRegistry::new();
         // Unknown child.
-        assert_eq!(reg.attest(9, cert(1, [1; 32], &secrets, 5)), None);
+        assert_eq!(reg.attest_available(9, cert(1, [1; 32], &secrets, 5), ALL_PRESENT), None);
         reg.register(committee);
         // Sub-quorum (4 < 5).
-        assert_eq!(reg.attest(2, cert(1, [1; 32], &secrets, 4)), None);
+        assert_eq!(reg.attest_available(2, cert(1, [1; 32], &secrets, 4), ALL_PRESENT), None);
         // A certificate signed by a DIFFERENT committee's keys is refused.
         let (other_secrets, _) = child(2, 0x99);
-        assert_eq!(reg.attest(2, cert(1, [1; 32], &other_secrets, 5)), None);
+        assert_eq!(reg.attest_available(2, cert(1, [1; 32], &other_secrets, 5), ALL_PRESENT), None);
     }
 
     #[test]
@@ -177,7 +196,7 @@ mod tests {
         let hyperoval = (0u8..=0x7F).find(|&m| !is_recoverable_fano(m)).unwrap();
         assert_eq!(reg.attest_available(3, c.clone(), (!hyperoval) & 0x7F), None, "unavailable child is not anchored");
         // Full availability → anchored.
-        assert_eq!(reg.attest_available(3, c, 0x7F), Some((1, [0x77; 32])));
+        assert_eq!(reg.attest_available(3, c, ALL_PRESENT), Some((1, [0x77; 32])));
     }
 
     #[test]
@@ -185,7 +204,7 @@ mod tests {
         let (secrets, committee) = child(4, 0x40);
         let mut reg = ChildRegistry::new();
         reg.register(committee);
-        reg.attest(4, cert(7, [0xA0; 32], &secrets, 5)).unwrap();
+        reg.attest_available(4, cert(7, [0xA0; 32], &secrets, 5), ALL_PRESENT).unwrap();
         // The child committee certifies a DIFFERENT root at the same height (>f equivocated) → parent has proof.
         let forked = cert(7, [0xB0; 32], &secrets, 5);
         assert_eq!(reg.conflict(4, &forked), Some((7, [0xA0; 32], [0xB0; 32])));

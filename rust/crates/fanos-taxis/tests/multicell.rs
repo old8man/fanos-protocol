@@ -25,6 +25,9 @@ use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry};
 use fanos_taxis::state::{ExecOutcome, StateMachine};
 use fanos_taxis::{Accounts, CellParams, SealedTx, Transaction, Transfer};
 
+
+/// Every Fano point's shard retrievable — what a test not about availability assumes.
+const ALL_PRESENT: u8 = 0x7F;
 const N: usize = 7;
 const SEED: BeaconSeed = BeaconSeed::new([0x11; 32]);
 const EPOCH: Epoch = Epoch::new(1);
@@ -294,8 +297,19 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
     let mut parent = ChildRegistry::new();
     parent.register(cell_a.committee(1));
     parent.register(cell_b.committee(CELL_B));
-    assert_eq!(parent.attest(1, cert_a).map(|(h, _)| h), Some(0), "the parent anchors cell A's finality");
-    assert!(parent.attest(CELL_B, cert_b).is_some(), "the parent anchors cell B's finality");
+    // The availability mask is the parent's own evidence, and it is now the only door (#173): `attest` and
+    // `attest_available` used to be two public doors differing in whether the parent refuses to vouch for a
+    // withheld state, and the production path took the unguarded one. Here both children's shards are
+    // present, which is what this test is about — the availability refusal has its own test in `hierarchy`.
+    assert_eq!(
+        parent.attest_available(1, cert_a, ALL_PRESENT).map(|(h, _)| h),
+        Some(0),
+        "the parent anchors cell A's finality"
+    );
+    assert!(
+        parent.attest_available(CELL_B, cert_b, ALL_PRESENT).is_some(),
+        "the parent anchors cell B's finality"
+    );
     // Both children are now anchored in the parent — anyone trusting the parent trusts both, without re-executing.
     assert!(parent.latest(1).is_some() && parent.latest(CELL_B).is_some());
 }
