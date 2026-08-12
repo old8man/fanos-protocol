@@ -412,6 +412,24 @@ const HELLO_LEN: usize = TRIPLE_WIRE_LEN;
 /// private `const` here with a second `pub const` in `fanos-node`'s ANGELOS driver — see
 /// [`fanos_wire::MAX_FRAME`] for what that cost.
 use fanos_wire::MAX_FRAME;
+/// How a verifier turns a peer's proven VRF output plus the coordinate it proved into that peer's **probe
+/// index** — the first component of the arbitration order (`fanos_vrf::claim_beats`).
+///
+/// A function pointer rather than a type parameter, and that is the whole point (#249). The index IS
+/// derivable from what a handshake recovers — `fanos_vrf::probe_index_of`'s own doc says a verifier "learns
+/// how far along `p` sits for that peer **without being told**", which is what keeps
+/// `verify_coordinate_claim` non-recursive. Nothing was ever missing from the wire. What was missing was the
+/// TYPE at the site: walking the plane needs `F`, and `F` is monomorphised away at spawn, so by the time the
+/// send loop holds a `Proven(actual)` there is no type left to walk with. Carrying the walk as a value
+/// closes that without touching a frame, a proof, or a witness chain.
+type ProbeIndex = fn(&fanos_vrf::VrfOutput, Triple) -> Option<u16>;
+
+/// [`ProbeIndex`] for a concrete plane — monomorphised where `F` is still known and passed down as a value.
+fn probe_index_on<F: Field>(output: &fanos_vrf::VrfOutput, coord: Triple) -> Option<u16> {
+    let point = Point::<F>::new(coord)?;
+    fanos_vrf::probe_index_of::<F>(output, &point)
+}
+
 /// Bytes a [`Relay`](FrameType::Relay) wrapper adds around an inner frame, **at the largest inner there
 /// can be**.
 ///
@@ -654,6 +672,12 @@ struct Transport {
     /// Coordinates a dialed-but-unjudgeable connection is already being held open for (#235) — the dial
     /// side's ceiling, deliberately the same shape as `punching` above. See [`spawn_restricted`].
     unjudged: Arc<Mutex<BTreeSet<Triple>>>,
+    /// The plane's probe walk, carried as a value so the send path can RANK a peer it verified (#249).
+    ///
+    /// `None` is not a disabled check but an **absent mechanism** — the distinction `fanos_node::bound`
+    /// draws with `Option<BeaconSeed>`. A pinned-coordinate deployment has no VRF walk at all, so a peer's
+    /// verified claim genuinely has no index to derive and an unranked binding is the whole truth there.
+    probe_index: Option<ProbeIndex>,
 }
 
 /// How long a store `get`/`put` waits for its reply before giving up. A store request whose
@@ -1449,6 +1473,9 @@ pub async fn spawn(
         // No `F` here: a bare engine carries no plane to ask, so the base cell's budget stands. A caller
         // running a larger plane reaches the transport through `spawn_self_certifying*`, which derives it.
         REFLEXIVE_QUORUM_FANO,
+        // And the same absence answers #249: with no plane there is no probe walk, so a peer's verified
+        // claim has no index to derive and an unranked binding is the whole truth here.
+        None,
     )
 }
 
@@ -1692,7 +1719,7 @@ where
             server,
             client,
             bind,
-            reflexive_quorum(F::Q),
+            reflexive_quorum(F::Q), Some(probe_index_on::<F>), // `F` lives here, nowhere downstream (#249)
         )?
             .with_claims(book.clone());
     // Re-bind our genesis point *with* its rank — unless someone else's address is already there.
@@ -2134,6 +2161,9 @@ pub async fn spawn_shaped(
         // No `F` here: a bare engine carries no plane to ask, so the base cell's budget stands. A caller
         // running a larger plane reaches the transport through `spawn_self_certifying*`, which derives it.
         REFLEXIVE_QUORUM_FANO,
+        // And the same absence answers #249: with no plane there is no probe walk, so a peer's verified
+        // claim has no index to derive and an unranked binding is the whole truth here.
+        None,
     )
 }
 
@@ -2348,6 +2378,8 @@ fn spawn_inner(
     mut client_cfg: ClientConfig,
     fabric: Fabric,
     reflexive_quorum: usize,
+    // The plane's probe walk, or `None` for a pinned-coordinate deployment — see `Transport::probe_index`.
+    probe_index: Option<ProbeIndex>,
 ) -> Result<NodeHandle, QuicError> {
     let addr = engine.address();
 
@@ -2449,6 +2481,7 @@ fn spawn_inner(
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
         unjudged: Arc::new(Mutex::new(BTreeSet::new())),
+        probe_index,
     };
     supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
     supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(accept_loop(transport.clone())));
@@ -2850,7 +2883,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             // dialer now does too, rather than inventing a second constant for one quantity.
             let handshake = tokio::time::timeout(HELLO_DEADLINE, hello_exchange(&conn, t, id))
                 .await
-                .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false });
+                .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None });
             // **The breaker reads the shaped round trip, not the QUIC handshake** (#231). Shaping starts at
             // the stream, so the handshake completing says nothing about the morph — a censor that admits
             // the handshake and kills the data phase used to be recorded as a success, resetting the breaker
@@ -2876,54 +2909,46 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             //
             // The payload is NOT redirected to `actual`. A coordinate is the overlay identity, so delivering
             // it there would be a misdelivery, not a repair — this fixes the map and fails the send.
-            match handshake.peer {
+            let Handshake { peer: proven, rank, .. } = handshake;
+            match proven {
                 PeerIdentity::Proven(actual) if actual == to => {}
                 PeerIdentity::Proven(actual) => {
                     // Sound by the same rule `spawn_punch` already follows: an address binding is recorded
                     // only for a coordinate that was *proved* at it, and this one was, over mutual TLS to an
                     // address we chose ourselves.
                     //
-                    // **Unranked on purpose, and not for want of a rank.** The handshake did recover the
-                    // peer's VRF output — `PeerClaimed::output` *is* its rank — but `insert_ranked` writes a
-                    // claim of `(rank, probe index)` and the index is the half a handshake cannot supply:
-                    // `PeerClaimed` deliberately omits it so that verifying a witness never unfolds into the
-                    // witness's own chain. Writing rank with a fabricated index 0 would let this entry win
-                    // an arbitration against a peer legitimately seated further along its walk. Unranked is
-                    // the honest encoding of what was proved, and it yields to the peer's own ranked claim —
-                    // which is better evidence than our observation and may already be present, in which
-                    // case this write is correctly a no-op.
+                    // **RANKED, and #249 needed no wire change to get there.** For a long time this wrote
+                    // an unranked binding, and the comment here argued that "the index is the half a
+                    // handshake cannot supply". That premise was false, and `fanos_vrf::probe_index_of`'s
+                    // own doc says so: a verifier "learns how far along `p` sits for that peer **without
+                    // being told**", which is exactly what keeps `verify_coordinate_claim` non-recursive.
+                    // Nothing was missing from the frame. TWO things were dropped at TWO boundaries:
                     //
-                    // **MEASURED COST OF THIS DECISION, 2026-08-12 (#249).** The argument above is sound and
-                    // stays. What it never stated is the price when the peer's own ranked claim does not
-                    // arrive. A 7-node cell forced to draw a collision resolved it correctly — 7 distinct
-                    // points, six at probe index 0 and one advanced to 1 — and every node verified 5–7 peers'
-                    // claims. Each dial table still held exactly ONE ranked binding: `route [1,1,1,1,1,1,1]`,
-                    // which is the node's own, written by `insert_claimed` on its own coordinate. Nothing a
-                    // peer proves to us ever becomes routable, and the roster never agreed (`agreed=None`).
+                    //  * the peer's VRF output — its rank — which `hello_exchange` had in hand and bound to
+                    //    `peer: _`, now carried as `Handshake::rank`; and
+                    //  * the plane type `F`, monomorphised away at spawn, now carried back as the value
+                    //    `Transport::probe_index`.
                     //
-                    // That is not a defect in this rule — it is a gap in what the wire carries. `PeerClaimed`
-                    // omits the probe index deliberately, and until it carries one (with its own proof, so a
-                    // witness still cannot be unfolded) a verified claim cannot become a ranked binding. Same
-                    // shape as #13 and #143: the field a decision needs is absent from the frame, so the
-                    // decision degrades to the honest-but-inert answer. Fabricating index 0 here is exactly
-                    // what the paragraph above forbids, and stays forbidden.
+                    // With both, the index is DERIVED here from what the handshake proved. It cannot be
+                    // fabricated — given (output, point) it is determined — so the old fear of writing a
+                    // false index 0 and beating a peer legitimately seated further along its walk does not
+                    // arise: a wrong index is not expressible, only an absent one.
                     //
-                    // **The same omission is load-bearing one layer over**, and the two were reasoned about
-                    // separately until now. `fanos_node::bound`'s `Entitlement` also leaves the exact probe
-                    // index out — same reason, same `CoordinateClaim` named as what would supply it — and
-                    // pays for it in a different currency: a forged record is refused at 49 of PG(2,7)'s
-                    // other 56 points instead of all of them. One missing quantity, two consequences, and
-                    // each site argued its own local trade honestly. Neither alone buys a change to the
-                    // frame; together they are one change, and whoever makes it must land both.
+                    // The measured cost of the old rule was `route [1,1,1,1,1,1,1]`: every node reached
+                    // exactly one point, its own, and the roster never agreed.
+                    let outcome = match (t.probe_index, rank) {
+                        (Some(index_of), Some(rank)) => match index_of(&rank, actual) {
+                            Some(index) => t.directory.insert_claimed(actual, addr, rank, index),
+                            // Proved a coordinate that is not on its own walk. Not our business to resolve —
+                            // record reachability and let the claim book's arbitration judge the claim.
+                            None => t.directory.insert(actual, addr),
+                        },
+                        // No plane (a pinned deployment) or no rank recovered: an unranked binding is the
+                        // whole truth, exactly as before.
+                        _ => t.directory.insert(actual, addr),
+                    };
                     //
-                    // The outcome is deliberately not branched on, because all three lead here anyway and
-                    // the *send* has already failed above regardless: `Bound` recorded the peer's new
-                    // address, `Unchanged` means it was already known, and `Superseded` means the peer's own
-                    // ranked claim for `actual` is in the table at some other address — better evidence than
-                    // this observation, which is exactly the arbitration this write submits itself to. It is
-                    // counted, though: a rise means a *ranked* entry is squatting a point a peer just proved
-                    // at a different address, which no other reading names.
-                    match t.directory.insert(actual, addr) {
+                    match outcome {
                         WriteOutcome::Superseded { keeping } => {
                             t.record_station(Station::DirectoryRouteSuperseded, Some(actual), None);
                             tracing::debug!(?actual, ?addr, ?keeping, "proved route not recorded; a better claim holds the point");
@@ -3360,7 +3385,7 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
     // handshake, matching the connection-map convention elsewhere in this driver — and it is a *local*
     // fault, so it says nothing about the transport.
     let Ok(hello) = id.hello.read().map(|h| h.clone()) else {
-        return Handshake { peer: PeerIdentity::Rejected, round_trip: false };
+        return Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None };
     };
     // Asked BEFORE the first byte goes out, which is the whole point: by the time an inbound frame could
     // tell us, ours has already left in the wrong shape (#234).
@@ -3372,27 +3397,28 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
                 coord,
                 version,
                 capabilities,
-                // The claim material is recorded by the verifier closure itself (`spawn_self_certifying`),
+                // The claim material is ALSO recorded by the verifier closure (`spawn_self_certifying`),
                 // which is the only place holding the peer's certificate DER — the identity the coordinate
-                // VRF binds to.
-                peer: _,
+                // VRF binds to. That copy feeds the settle oracle; this one feeds the dial table, and until
+                // #249 the second consumer simply had nothing (`peer: _`).
+                peer,
             } => {
                 send_hello_ack(conn, &t.shaper, joining, version, capabilities).await;
-                Handshake { peer: PeerIdentity::Proven(coord), round_trip: true }
+                Handshake { peer: PeerIdentity::Proven(coord), round_trip: true, rank: Some(peer.output) }
             }
             HelloResult::Incompatible(err) => {
                 tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
                 send_error(conn, &t.shaper, joining, err).await;
                 // A version disagreement is proof the shaped bytes crossed intact — we read and parsed them.
-                Handshake { peer: PeerIdentity::Rejected, round_trip: true }
+                Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None }
             }
         },
         // No `HELLO_ACK` and no `ERROR`: an ACK echoes *agreed* parameters, and nothing was agreed — we
         // could not read the peer's claim. An ERROR would be worse: it tells a stranger which of our gates
         // it hit (§L0), and this peer is very likely honest and simply ahead of us.
-        PeerHello::Unjudgeable(u) => Handshake { peer: PeerIdentity::Unjudged(u), round_trip: true },
-        PeerHello::Refused => Handshake { peer: PeerIdentity::Rejected, round_trip: true },
-        PeerHello::Silent => Handshake { peer: PeerIdentity::Rejected, round_trip: false },
+        PeerHello::Unjudgeable(u) => Handshake { peer: PeerIdentity::Unjudged(u), round_trip: true, rank: None },
+        PeerHello::Refused => Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None },
+        PeerHello::Silent => Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None },
     }
 }
 
@@ -3405,6 +3431,17 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
 struct Handshake {
     /// What the exchange settled about **who** the peer is.
     peer: PeerIdentity,
+    /// The peer's proven VRF **output** — its rank — when the exchange recovered one (#249).
+    ///
+    /// It was always here and always discarded: `hello_exchange`'s `Established` arm binds `peer: _` with a
+    /// comment saying the verifier closure records the claim material, which is true and is about a
+    /// *different consumer* (the settle oracle's `ClaimBook`). The dial table needs it too, and dropping it
+    /// at this boundary is half of why a verified peer could never become a ranked binding — the other half
+    /// being that `F` is monomorphised away before the send loop, which [`Transport::probe_index`] carries
+    /// back as a value.
+    ///
+    /// `None` on every non-`Proven` outcome, and on a `Proven` one reached by a path that never had it.
+    rank: Option<fanos_vrf::VrfOutput>,
     /// Whether a shaped frame completed the round trip. **A refusal counts as `true`**: we decoded what the
     /// peer sent and rejected its contents, so the transport is not what failed.
     round_trip: bool,
