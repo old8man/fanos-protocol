@@ -67,6 +67,21 @@
 //! (the trigger is reachable unauthenticated), and a credential authorising the asker that cannot be the
 //! signing key itself. `fanos-cli/tests/frame_registry.rs` fails the moment such a frame is allocated, so
 //! this paragraph cannot go stale in the other direction either.
+//!
+//! **The fourth of those — "a credential authorising the asker" — is the only one whose CONSUMPTION is
+//! already built and shipping, and a reader would not guess it from here.** `fanos-node/src/poros.rs`
+//! answers the same question for ingress admission and answers it in two parts: its proof of work is named
+//! honestly as a *rate* limiter and not a Sybil cap (Boneh et al. CRYPTO'18 — a sequential cost bounds
+//! identity-creation rate, never total identities), while the cap itself arrives as `Sybil::Capped`
+//! carrying a trust layer's **admitted coordinate set**, and `on_request` serves only a requester that
+//! clears both gates. It deliberately consumes the *set* rather than the graph, so it is independent of
+//! which mechanism produces it.
+//!
+//! A share gather can use that same seam for "who may ask", unchanged. What neither has is the set's
+//! PRODUCER — a fast-mixing trust graph or proof-of-personhood — which is one missing subsystem holding up
+//! two separate pieces of work rather than two independent blockers. Worth stating because the shape of
+//! "needs a credential" invites designing one from scratch, and half of it exists, in production, one
+//! module over.
 
 use alloc::vec::Vec;
 
