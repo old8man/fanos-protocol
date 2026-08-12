@@ -20,7 +20,7 @@
 #
 # USAGE
 #   ./gate.sh              # everything below
-#   ./gate.sh clippy       # one group: clippy | tests | run | docs | nostd
+#   ./gate.sh clippy       # one group: clippy | tests | run | docs | nostd | prune
 #   ./gate.sh clippy tests
 #
 # Costs, measured on this project: a no-op test target is ~0.2 s, `clippy --all-targets` on fanos-node ~76 s,
@@ -122,6 +122,30 @@ trap 'rm -f "$LOGS/pid"' EXIT
 
 echo "gate — logs in $LOGS"
 
+# `./gate.sh prune` — the only removal this script performs, and it is deliberately the safe half.
+#
+# `debug/incremental` is pure cache: deleting it costs compile time and nothing else, and since
+# CARGO_INCREMENTAL=0 above it is not even being written any more — whatever is there is left over from before
+# that line existed. Measured: one full `tests` run used to deposit 6.7 GB here.
+#
+# `debug/deps` is NOT touched, and that omission is the finding rather than laziness. It grows 37 GB per run
+# because cargo keeps every superseded `.rlib` for ever, but from the outside a stale artefact and a current
+# one look identical — only cargo's fingerprints know which is which. Deleting by age would eventually throw
+# away something current; that costs only a rebuild, never correctness, but it also would not be a policy, it
+# would be a guess wearing a number. The honest tool is `cargo-sweep`, which reads the fingerprints. Until it
+# is available this step reports the size and names the command, and refuses to pretend it has pruned.
+# NAMED ONLY. `want` is true when nothing was selected, so a bare `./gate.sh` would have run this too — a
+# destructive step reached by the path that means "check everything". Removal must be asked for by name.
+if [ "${#SELECT[@]}" -gt 0 ] && want prune ${SELECT[@]+"${SELECT[@]}"}; then
+  echo "prune"
+  before=$(free_mb)
+  rm -rf target/debug/incremental
+  after=$(free_mb)
+  echo "  incremental cache removed — $((after - before)) MB reclaimed"
+  echo "  deps NOT pruned: only cargo's fingerprints can tell a stale .rlib from a live one."
+  echo "  install cargo-sweep and run: cargo sweep --installed   # or cargo clean, at one full rebuild"
+fi
+
 if want clippy ${SELECT[@]+"${SELECT[@]}"}; then
   echo "clippy"
   run clippy-default   clippy --workspace --all-targets -- -D warnings
@@ -192,9 +216,18 @@ echo
 # switched off. This is two syscalls and is exact for the question asked — how much less room is there now.
 FREE_AT_END=$(free_mb)
 if [ -n "${FREE_AT_START:-}" ] && [ -n "${FREE_AT_END:-}" ]; then
-  echo "disk — $((FREE_AT_START / 1024)) GB free before, $((FREE_AT_END / 1024)) GB after (this run cost $((FREE_AT_START - FREE_AT_END)) MB)"
+  delta=$((FREE_AT_START - FREE_AT_END))
+  if [ "$delta" -lt 0 ]; then
+    echo "disk — $((FREE_AT_START / 1024)) GB free before, $((FREE_AT_END / 1024)) GB after (reclaimed $((-delta)) MB)"
+  else
+    echo "disk — $((FREE_AT_START / 1024)) GB free before, $((FREE_AT_END / 1024)) GB after (this run cost $delta MB)"
+  fi
 fi
-if [ "$FAILED" -eq 0 ]; then
+# "GREEN" with nothing gated is the same lie as a skipped step reported as a pass: `prune` runs no cargo at
+# all, so it must not borrow the word.
+if [ "${#SUMMARY[@]}" -eq 0 ]; then
+  echo "NO GATE STEPS RAN — logs in $LOGS"
+elif [ "$FAILED" -eq 0 ]; then
   echo "GATE GREEN — ${#SUMMARY[@]} steps, every status read from cargo — logs in $LOGS"
 else
   echo "GATE RED — logs in $LOGS"
