@@ -4942,3 +4942,123 @@ was last checked in, so the next reader can see the claim's age instead of assum
   one log line and the record that outlives the process cannot be queried.
 * `Command::SampleAvailability` (§L4.3) is constructed only by two simulator tests — the light-client
   availability check has no light client.
+
+# Four defences that are built and not reachable, found by scanning types instead of functions (2026-08-12)
+
+A pass that started as memory accounting and ended in the anonymity layer. Nothing here is fixed; all four are
+filed. What ties them together is a question the existing sweeps could not ask: **the unwired scan looks for
+functions nobody calls, and every one of these is a function that is called — inside a type nobody builds.**
+
+## The instrument, and the two versions of it that lied
+
+For every `pub struct` in a crate's `src/`, count the construction sites (`T::new`, `T { `) in the file's
+*production region*. Production region = the text before the first `#[cfg(test)]` — classifying test from
+production by **position**, the technique this tree already uses — with comments stripped.
+
+Both qualifiers are load-bearing, and both were established by a control rather than by care. The control:
+`NyxNode`, whose non-instantiation `config.rs` states outright, must appear in the output.
+
+* **v1** did not cut in-file `#[cfg(test)]` modules. It reported "NyxNode: 2 production sites, ThresholdRouter:
+  0" — the exact inverse of the truth, because every `ThresholdRouter::new` it found was the `test_relay(...)`
+  helper.
+* **v2** cut the modules and kept comments. `NyxNode` vanished from the output, on the strength of a doc
+  comment in `sealed.rs` that mentions `NyxNode::new`. A comment is not a call site — the same lesson the
+  unwired sweep already had to learn, relearned one crate over.
+
+Only v3 passed its control. 435 public structs, 12 with no production construction site at all. Five are
+false (`Plane`, `Gf2m`, `GfP`, `Flag`, `TimerToken` are built by `at()`, tuple forms, const fns); one is
+`GuardSet`, unwired on purpose as an open feature; one is `MixRelay`, superseded rather than missing — the
+E4∩E5 beacon/onion lock it exists for is performed by the shipping `CellNode`, which also carries the overlay
+and the rendezvous relay. The rest are below.
+
+**State the instrument's limit with it:** it finds the absence of a *construction site*, not unreachability. A
+factory sitting in production that nothing calls looks alive to it. So a hit is strong evidence and a miss is
+none.
+
+## The §L5 replay defence is in the engine nothing runs
+
+`fanos_aphantos` ships two mixnet engines. `NyxNode` carries the anti-replay cache: `replay_tag`s of
+recently-forwarded cells, `MAX_REPLAY_CACHE = 8192` with FIFO eviction "so a flood of distinct cells cannot
+grow it without bound", checked at both ingress points, with `tests/replay_attack.rs` proving it. And
+`config.rs` says of it, in as many words: "APHANTOS_LITE names `NyxNode`, **which no binary instantiates**".
+
+`ThresholdRouter` is what a relay actually runs — `composition.rs` builds it inside `if what.relay` and wraps
+it in a `CellNode`. It has no replay cache. The word "replay" occurs three times in the file and never as a
+mechanism: one comment about sans-I/O determinism, twice as the name of a test closure. `MAX_RESOLVED = 512`
+is not it — that is a ring of *gather outcomes* (peeled / expired / foreign), keyed by request id, for
+attributing late shares. Nothing at the layer above dedupes either.
+
+The shipping router's own test then **pins the gap as expected behaviour**. It re-injects a recorded onion:
+delivered at t=0, delivered *again* after one rotation ("an onion in flight across one rotation still peels
+(grace window)"), unpeelable after two ("E4 forward secrecy"). Correct for what it is named for. In passing it
+asserts that a recorded cell is accepted twice, so no regression will ever fire.
+
+What that costs is not duplicate delivery — the session layer discards by sequence. It is a **circuit
+confirmation oracle**: record a cell off the wire, re-inject it at a candidate relay, watch whether it emits
+toward the expected next hop. That is the primitive §L5 exists to deny, and it is available for one epoch
+rotation.
+
+## Two costs of `MAX_OUTBOX`, neither of them summed
+
+`MAX_OUTBOX = 2048` bounds the constant-rate outbox, and the queued item is `encode_onion(next, &padded)` —
+a full `THRESHOLD_ONION_LEN = 20480` onion. That is **40 MiB per relay, as a floor**, and it is in neither
+`budget.rs::SHARES` nor the register of known absentees that `allocated()`'s own doc keeps ("inbound QUIC
+credit (#245) and the VPN datapath (#247) have never claimed one"). A third absentee that the list of
+absentees does not name.
+
+The second cost has never been written down at all. `DEFAULT_COVER_INTERVAL = 500 ms` is the *mean* of an
+exponential gap (`arm_cover`: `gap = −interval·ln u`), a real forward *displaces* a cover slot, and there is
+one slot stream per router. So a Full-profile relay carries **2 cells/s ≈ 40 KiB/s in total** — not per
+circuit, per node. Above it the queue fills in `2048/(λ−2)` seconds and `pop_front()` discards real cargo with
+no counter, no station, no notification.
+
+That also settles what #135 left open for the Relay role ("its sensor is a rate and the bound is a level, so
+it needs a throughput measurement"): the bound is `1/cover_interval`, derived, units matching.
+
+And it bounds the scope of an E6 claim that is stated without one. "Emitted volume is its slot count,
+independent of the real traffic it carries" holds while the queue absorbs; above the slot rate the observable
+moves to the *drop*, which surfaces as retransmissions at the edges.
+
+## The twin branch of that same function is bounded by nothing
+
+`forward_send` has two arms. Cover on: the bounded outbox above. Cover off with a mix delay: `mix_pending`,
+a `BTreeMap<u64, (Triple, Vec<u8>)>` with no cap, no eviction, and one live `ArmTimer` per entry.
+
+That arm is not hypothetical. `cover_interval` is a config-file key, and `config.rs` presents zeroing it as a
+supported trade: "an operator can zero them to trade anonymity for bandwidth/latency". More than supported —
+`a_relays_gpa_defence_is_on_by_default` leans on that configuration as the residual defence: "an operator who
+zeroes `cover_interval` for bandwidth still gets the per-cell delay".
+
+Little's law at `DEFAULT_MIX_DELAY = 120 ms`: 12 cells at λ=100/s, 1200 at λ=10 000/s, **12 000 ≈ 240 MiB** at
+λ=100 000/s against a 256 MiB node budget, plus 12 000 live timers. λ is the adversary's to choose and
+`forward_send` is reached straight from the `Forward` peel arm with no admission check.
+
+The usual remedy here — a per-source quota, as #211 used for shards — is **unavailable by construction**: the
+router deliberately does not know the source. That is precisely why the sibling branch carries a global cap,
+and why its absence on this one cannot be waved off as an oversight a quota would close.
+
+## Half of §12.3 is wired; the half about seizure is not
+
+`ThresholdRendezvous` names two weaknesses of single-host hosting and removes both: the host **reads every
+request alone** (removed by threshold-decrypting the sealed intro), and the host **alone holds the service
+identity** (removed by a `SealedShare` per member, reconstructed from `≥ threshold` only when the service must
+authenticate — "no single host holds the service identity in the clear; seizing `< threshold` members can
+neither read requests nor impersonate the service").
+
+Production wires the first half: `composition.rs` builds `ServiceNode::new(base, ThresholdService::new(...))`.
+
+It does not wire the second. The shipping hidden service is `fanos host` →
+`spawn_rendezvous_host(.., HostedService { signer, .. }, ..)`, and `signer: HybridSigSecret` is the whole
+service signing identity at one node — the field's own doc: "Hosting **requires** a signing identity, and that
+is forced rather than chosen".
+
+And no operator can ask for the alternative. `ThresholdRendezvous` appears in exactly four places: its module,
+the `lib.rs` re-export, a `fanos-sim` scenario, and a reference from `fanos_calypso::hosting`. Zero config
+keys, zero flags, zero composition sites. Built, exported, exercised by the simulator, unreachable from any
+deployment — the shape of §53's holonomy authenticator, one subsystem over.
+
+Seizing one host therefore yields the identity outright, and the adversary can sign registrations at the
+meeting points and take the address over. Wiring it is not a flag: the shares need a **ceremony** (closer to
+`fanos keygen` than to a config key), and `reconstruct_identity` needs `≥ threshold` live members every epoch
+the registration is renewed — a liveness floor that owes an observable and a bound of its own, which is the
+lesson the two queues above were teaching.
