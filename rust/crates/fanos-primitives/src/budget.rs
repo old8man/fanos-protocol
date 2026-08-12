@@ -14,14 +14,16 @@
 //! | gathers | 64 MiB | per-entry cost corrected in #218 |
 //! | exit datagrams | 16 MiB | named in #254 — spent all along, counted only now |
 //! | proxy associations | 8 MiB | named in #254 — and the naming is what created the bound |
+//! | threshold router queues | 40 MiB | named in #294 — one of the two was spent all along, the other had no bound |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
 //! | inbound QUIC credit | **unnamed** | ≈250 MB *per connection* by quinn's defaults (#245) |
 //!
-//! So the named shares plus the measured resident cost are **325 MiB against a 256 MiB recommendation** — a
-//! 69 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
+//! So the named shares plus the measured resident cost are **365 MiB against a 256 MiB recommendation** — a
+//! 109 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
 //!
 //! **The overcommit rising is the module working, not the node getting heavier.** It read 45 MiB when three
-//! shares were named and 61 once the exit's receive buffers were; nothing was allocated in between. Every
+//! shares were named, 61 once the exit's receive buffers were, and 109 once the router's were; nothing was
+//! allocated at any of those steps — see each share's own doc for which of the two reasons applies. Every
 //! future naming moves it the same way, and a reader who treats the figure as a health score rather than as
 //! a coverage report will draw the opposite conclusion from the one the evidence supports. The VPN datapath
 //! left this table on the other side: #247 cut its per-flow buffer by 51× and it now fits inside ordinary
@@ -178,25 +180,37 @@ mod tests {
 
     const MIB: usize = 1024 * 1024;
 
-    /// **The ratchet.** The overcommit is 69 MiB today. It may shrink — a rebalance is exactly the decision
+    /// **The ratchet.** The overcommit is 109 MiB today. It may shrink — a rebalance is exactly the decision
     /// this module exists to inform — but it must not grow, and a further subsystem taking "a share" must
     /// fail here rather than in a deployment.
     ///
-    /// **It went 45 → 61 → 69 MiB as #254 named two consumers, and neither step is a regression.** The
-    /// exit's 16 MiB were already being spent, every day, on every node running the exit role; the proxy's
-    /// 8 MiB were *unbounded* until the share created the bound. What changed is that the sum can see them.
-    /// A reader who takes the rise as "the node got heavier" has it exactly backwards: 45 was understated,
-    /// and the consumer this module's header still lists as unnamed means 69 is understated too. The figure
-    /// only becomes trustworthy by going *up* first.
+    /// **It went 45 → 61 → 69 → 109 MiB as #254 named two consumers and #294 a third, and no step is a
+    /// regression.** The exit's 16 MiB were already being spent, every day, on every node running the exit
+    /// role; the proxy's 8 MiB were *unbounded* until the share created the bound. What changed is that the
+    /// sum can see them. A reader who takes the rise as "the node got heavier" has it exactly backwards: 45
+    /// was understated, and the consumer this module's header still lists as unnamed means 109 is
+    /// understated too. The figure only becomes trustworthy by going *up* first.
+    ///
+    /// **The 40 MiB #294 added are not new bytes, and they repeat #254's two reasons at once** — which is
+    /// possible because [`THRESHOLD_ROUTER_SHARE`] is one share over two mutually exclusive queues. With
+    /// cover traffic on, the `outbox` held `2048 × THRESHOLD_ONION_LEN` = exactly 40 MiB before anyone
+    /// summed it, so those are *newly counted*, the exit's case. With cover traffic off, `mix_pending` had
+    /// no bound at all and the share is what created one, so those are *newly bounded*, the proxy's case.
+    /// Neither queue was made to hold a byte it could not hold the day before.
+    ///
+    /// **This ratchet was red at `237e0e1` and the commit that moved the sum is what left it so.** That
+    /// commit added the share, updated `allocated()`, and even corrected the citation in `fanos-node`'s
+    /// exit tests to 109 — while this bound, in the crate that owns the number, stayed at 69. A per-crate
+    /// gate cannot see it: the share is declared here and spent two crates away.
     #[test]
     fn the_overcommit_does_not_grow() {
         assert!(
-            overcommit() <= 69 * MIB,
+            overcommit() <= 109 * MIB,
             "the named shares plus the measured resident cost now exceed the node recommendation by {} MiB, \
-             up from 69. Either a share grew or one was added. If it was added, that is progress and this \
+             up from 109. Either a share grew or one was added. If it was added, that is progress and this \
              bound moves WITH a note saying whether the bytes are new or merely newly counted; if a share \
              grew, it is a decision to take against this sum rather than against a comment in one subsystem \
-             (#213, #254).",
+             (#213, #254, #294).",
             overcommit() / MIB
         );
     }
@@ -210,9 +224,14 @@ mod tests {
             256 * MIB,
             "the three shares written before anyone summed them were exactly the whole recommendation"
         );
-        assert_eq!(allocated(), 280 * MIB, "and the two consumers #254 named are over it on their own");
+        assert_eq!(
+            allocated(),
+            320 * MIB,
+            "and the three consumers found outside the sum since — #254's two and #294's router queues — \
+             are 64 MiB on top of a recommendation the first three had already spent whole"
+        );
         assert_eq!(unallocated(), 0, "a further consumer would be dividing zero");
-        assert_eq!(overcommit(), 69 * MIB, "before the transport takes a byte");
+        assert_eq!(overcommit(), 109 * MIB, "before the transport takes a byte");
     }
 
     /// Every share is listed, so the sum cannot drift away from the terms it is made of.
