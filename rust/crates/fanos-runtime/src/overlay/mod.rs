@@ -72,7 +72,15 @@ pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 pub(crate) const CELL_POINTS: usize = 7;
 
 /// The Byzantine fault budget of a cell of `n` nodes: `f = ⌊(n − 1)/3⌋`.
-pub(crate) const fn fault_budget(n: usize) -> usize {
+///
+/// Public because a cross-crate reader needs the budget itself and not only [`corroboration_quorum`]'s
+/// `f + 1` view of it. `fanos-sim`'s beacon flood-spread measurement (#288) sizes its reconstruction
+/// threshold `2f + 1` from this, and it must do so at **both** plane orders it compares: a Fano anchor and a
+/// `q = 7` anchor sized by different rules would differ in when `BeaconReady` fires for reasons that have
+/// nothing to do with the flood, and the comparison would measure the rule instead of the plane.
+///
+/// Restating `(n − 1)/3` over there would work and is exactly the copy that drifts.
+pub const fn fault_budget(n: usize) -> usize {
     n.saturating_sub(1) / 3
 }
 
