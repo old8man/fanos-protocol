@@ -138,14 +138,6 @@ impl PartialEq<&[u8]> for Datagram {
     }
 }
 
-impl Datagram {
-    /// Take the bytes, releasing the permit.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-}
-
 /// Why a datagram did not make it into a tunnel queue. Every arm is a drop — UDP's own failure model —
 /// but they are different events and an operator reading a count of them wants them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

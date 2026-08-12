@@ -93,8 +93,15 @@ pub const UDP_TUNNEL_BUFFER: usize = 64;
 /// `fanos-vpn` queue through this one mechanism and never in one process, so they get one share for it,
 /// and a share for a mechanism belongs with the mechanism. The parameter would only have offered callers
 /// a way to pass the wrong pool.
-pub static TUNNEL_MEMORY: Semaphore =
-    Semaphore::const_new(fanos_primitives::budget::TUNNEL_BACKLOG_SHARE);
+pub static TUNNEL_MEMORY: Semaphore = Semaphore::const_new(TUNNEL_BACKLOG_MEMORY_BUDGET);
+
+/// This crate's name for the share `fanos_primitives::budget` grants the relayed-UDP tunnel queues.
+///
+/// **It exists because the register's guard requires it**, and the requirement is right: every share in
+/// `SHARES` must have a `*_MEMORY_BUDGET` a consumer declares, "or the sum is over a subset nobody chose".
+/// A share named only on the register's side is a number with no crate answering for it — the same
+/// direction problem `UDP_TUNNEL_BUFFER` had before #300 moved it here, one level up.
+pub const TUNNEL_BACKLOG_MEMORY_BUDGET: usize = fanos_primitives::budget::TUNNEL_BACKLOG_SHARE;
 
 /// Charge `bytes` to [`TUNNEL_MEMORY`], or refuse. The permit rides with the datagram and returns itself
 /// when the datagram is consumed or dropped — see [`crate::dialer::Datagram`] for why RAII and not a
@@ -118,6 +125,12 @@ pub(crate) async fn charge_tunnel_waiting(bytes: usize) -> Option<tokio::sync::S
 /// A relayed UDP flow's queue is `2 directions × UDP_TUNNEL_BUFFER × the datagram ceiling`, and every
 /// flow map multiplies it again. Pinned as a number rather than left to a task note, because a quantity
 /// with no name is invisible to the register that is supposed to sum it.
+///
+/// Behind `testing` because it is a RATCHET helper: it computes what the queues could hold if nothing
+/// debited them, and nothing reserves that — a production caller would be reserving a number this crate
+/// deliberately stopped honouring. `fanos-vpn` reaches it as a dev-dependency, the same way it reaches
+/// `EchoDialer`.
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub const fn tunnel_queue_ceiling(flows: usize, datagram_ceiling: usize) -> usize {
     flows.saturating_mul(2).saturating_mul(UDP_TUNNEL_BUFFER).saturating_mul(datagram_ceiling)

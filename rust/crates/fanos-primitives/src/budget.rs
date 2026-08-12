@@ -175,8 +175,8 @@ pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 /// use.
 pub const PROXY_SHARE: usize = 8 * 1024 * 1024;
 
-/// What the relayed-UDP tunnel queues may hold at once — the **floor that keeps the mechanism working**,
-/// not a ceiling on the worst case (#300).
+/// What the relayed-UDP tunnel queues may hold at once (`fanos_proxy::budget::TUNNEL_BACKLOG_MEMORY_BUDGET`)
+/// — the **floor that keeps the mechanism working**, not a ceiling on the worst case (#300).
 ///
 /// **Derived as a floor, because a ceiling is not purchasable.** A tunnel queue costs
 /// `flows × 2 directions × depth × payload`. The payload is fixed by the MTU and both other factors are
