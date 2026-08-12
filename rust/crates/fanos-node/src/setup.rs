@@ -317,13 +317,23 @@ pub fn memory_high_bytes() -> usize {
 /// every factor of which is itself derived (#245 for the first two, #190 for the third). Measured today at
 /// **2.00 GiB**, which is 6.4× the whole named-share total.
 ///
-/// **This figure is not yet the whole worst case, and the first version of this doc claimed it was.** It
+/// **This figure was not the whole worst case, and the first version of this doc claimed it was.** It
 /// called the QUIC credit "the largest quantity in the node's memory picture, and the only one an adversary
 /// picks the size of". Continuing the enumeration found the SOCKS5 UDP tunnel map at **8.6 GB per
 /// association** — 3.6× this whole `MemoryMax` — held by a *local* runaway application rather than a remote
-/// peer. Whether that term joins this sum or gets bounded down to fit the proxy's share is #300's decision;
-/// until it is taken, `MemoryMax` admits a full QUIC flood and would kill the node under a UDP-relay one.
-/// Stated here rather than quietly raised, because raising it would ratify a ceiling nobody derived.
+/// peer.
+///
+/// **#300 took the decision, and it was neither of the two this doc offered.** "Join the sum" and "bound it
+/// down to fit the proxy's share" both assume the term must be sized against its worst case; the arithmetic
+/// says no share can buy that one — the entire node budget funds depth 26 of the declared 64. So the queues
+/// are **metered** instead: each datagram debits `fanos_primitives::budget::TUNNEL_BACKLOG_SHARE` for its
+/// actual bytes and repays on consumption. That share is inside `allocated()`, so it reaches this figure
+/// through `memory_high_bytes()` without a term of its own here, and the 8.6 GB is now a ratchet on what
+/// the queues COULD hold rather than a hole this ceiling has to cover.
+///
+/// The ceiling was **not** raised to cover the unmetered figure while it stood, and that was the right
+/// call: raising it would have ratified a number nobody derived, and the derivation, when it came, said
+/// the number should not exist.
 ///
 /// Two things this figure honestly is not:
 ///
