@@ -498,6 +498,17 @@ fn linkability_seeded(mix: Option<(Duration, Duration)>, seed: u64) -> (f64, f64
 /// matcher this file shipped with; the two must see the SAME traffic, which is why the scorer is a parameter
 /// rather than a second copy of the harness ([[discrimination-needs-differing-inputs]]).
 fn linkability_seeded_with(mix: Option<(Duration, Duration)>, seed: u64, max_lag: usize) -> (f64, f64) {
+    linkability_scored(mix, seed, max_lag, false)
+}
+
+/// The same experiment again, with `minimise` inverting the ranking: an adversary that assigns the WEAKEST
+/// correlation first. Nonsense against a normal channel — and the matrix says this one is not normal.
+fn linkability_scored(
+    mix: Option<(Duration, Duration)>,
+    seed: u64,
+    max_lag: usize,
+    minimise: bool,
+) -> (f64, f64) {
     const K: usize = 5;
     const BIN_MS: u64 = 200;
     const SPAN_MS: u64 = 8_000;
@@ -535,7 +546,8 @@ fn linkability_seeded_with(mix: Option<(Duration, Duration)>, seed: u64, max_lag
     let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         for (j, x) in exits.iter().enumerate() {
-            pairs.push((best_lag_score(e, x, max_lag), i, j));
+            let raw = best_lag_score(e, x, max_lag);
+            pairs.push((if minimise { -raw } else { raw }, i, j));
         }
     }
     pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -557,7 +569,7 @@ fn linkability_seeded_with(mix: Option<(Duration, Duration)>, seed: u64, max_lag
 /// Mean matching accuracy over several seeds — with `K = 5`, a single run moves in steps of 0.2, so one draw is not a
 /// result. Averaging is the difference between a number and an anecdote.
 fn linkability(mix: Option<(Duration, Duration)>) -> (f64, f64) {
-    const RUNS: u64 = 12;
+    const RUNS: u64 = 60;
     let mut acc = 0.0;
     let mut chance = 0.0;
     for seed in 0..RUNS {
@@ -589,60 +601,76 @@ fn sweep_linkability_against_the_schedule() {
 }
 
 #[test]
-fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
-    let (undefended, chance) = linkability(None);
-    let (defended, _) = linkability(Some(shipping()));
+fn the_defence_reduces_flow_matching_far_but_not_to_chance() {
+    /// The lag window the adversary scans — 5 bins of 200 ms is 1000 ms, over eight mix-delay means and two
+    /// whole cover periods at the shipping schedule.
+    const MAX_LAG: usize = 5;
+    const RUNS: u64 = 12;
+
+    // The adversary is BOTH rankings, because an adversary is not obliged to use the one this file happened
+    // to write first. Measured on identical traffic — the ranking is a parameter of one harness.
+    let best = |mix| {
+        let (mut hi, mut lo, mut chance) = (0.0, 0.0, 0.0);
+        for seed in 0..RUNS {
+            let (a, c) = linkability_scored(mix, seed, MAX_LAG, false);
+            let (b, _) = linkability_scored(mix, seed, MAX_LAG, true);
+            hi += a;
+            lo += b;
+            chance = c;
+        }
+        (hi / RUNS as f64, lo / RUNS as f64, chance)
+    };
+
+    let (u_max, u_min, chance) = best(None);
+    let (d_max, d_min, _) = best(Some(shipping()));
+    let undefended = u_max.max(u_min);
+    let defended = d_max.max(d_min);
     println!(
-        "flow-matching accuracy over 5 concurrent flows — chance {chance:.2}, undefended {undefended:.2}, \
-         shipping defaults (mix {}ms, cover {}ms) {defended:.2}",
+        "flow matching over 5 concurrent flows — chance {chance:.2}\n  undefended: maximising {u_max:.3} \
+         minimising {u_min:.3}\n  shipping (mix {}ms, cover {}ms): maximising {d_max:.3} minimising \
+         {d_min:.3}",
         millis(DEFAULT_MIX_DELAY),
         millis(DEFAULT_COVER_INTERVAL)
     );
-    // The undefended baseline must actually be attackable, or the experiment proves nothing about the defence.
+
+    // The undefended baseline must be attackable, or the experiment proves nothing about the defence.
     assert!(
         undefended > chance,
-        "an undefended cell must leak the matching (got {undefended:.2} vs chance {chance:.2}) — otherwise this \
-         measures nothing"
+        "an undefended cell must leak the matching (got {undefended:.3} vs chance {chance:.2})"
     );
-    // A real, measured reduction — this is what the retracted metric could not see, because it penalised conservation at
-    // every setting rather than the implementation.
+    // The defence is real and large: 1.000 to about 0.30.
     assert!(
         defended < undefended - 0.3,
-        "the defence must materially reduce matching (defended {defended:.2}, undefended {undefended:.2})"
+        "the defence must materially reduce matching (defended {defended:.3}, undefended {undefended:.3})"
     );
-    // And the honest other half. This assertion used to read `defended > chance` — "linkability remains" — and it
-    // held at the 50/1000 defaults it was written against. Pointed at the defaults that actually ship (120/500) it
-    // fails, and **not because the system became anonymous**: the accuracy is 0.00, which is *below* chance.
+
+    // **AND THE HALF THIS TEST USED TO GET WRONG, WHICH IS WHY IT WAS RENAMED.**
     //
-    // Below chance is not safety, and the arithmetic says so. The score is `|Pearson|` at zero lag, and the assignment
-    // is greedy, so a matcher reduced to guessing produces something distributed like a random permutation of `K = 5`.
-    // Its expected fixed-point fraction is `1/K = 0.20` — but the *probability of zero* fixed points is only
-    // `D₅/5! = 44/120 ≈ 0.367`. Twelve seeds all scoring zero therefore has probability `0.367¹² ≈ 3e-6` under the
-    // guessing hypothesis. The matcher is not guessing; it is systematically *avoiding* the truth, which means the
-    // score matrix still carries information about it. An anonymous system drives this metric to chance, not to zero.
+    // It was called `the_adversary_cannot_match_concurrent_flows_much_better_than_chance` and pinned the
+    // shipping accuracy BELOW chance — 0.00 against 0.20 — while its own comment admitted that below chance
+    // is not safety and named a suspect (zero-lag correlation) it had not tested. Both halves are now
+    // measured, and both are answered:
     //
-    // THE NAMED SUSPECT HAS BEEN TESTED, AND IT IS NOT THE CAUSE (#187 (c)). The hypothesis written here was
-    // that `pearson` compares at **zero lag only** while mixing displaces the exit series, so a lag-scanning
-    // adversary would recover the matching. `measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one`
-    // runs both scorers over the SAME traffic — the scorer is a parameter of one harness, so nothing else can
-    // differ — and measures, over 12 seeds:
+    //   * the suspect is refuted — a lag-scanning adversary moves 0.000 to only 0.017
+    //     (`measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one`);
+    //   * the real mechanism is that the TRUE pair scores LOWEST. Printing the matrix instead of a summary
+    //     shows `entry 0 -> exit 0 = 0.006`, the smallest number in it, against `entry 0 -> exit 3 = 0.280`
+    //     (`measure_whether_the_score_matrix_is_degenerate`, which also refutes degeneracy — every series
+    //     has healthy variance and `pearson`'s constant guard never fires).
     //
-    //     undefended   chance 0.20   zero-lag 1.000   lag-scan(0..=5 bins) 1.000
-    //     shipping     chance 0.20   zero-lag 0.000   lag-scan(0..=5 bins) 0.017
+    // So the matrix carried information with the wrong SIGN, and an adversary that assigns the WEAKEST
+    // correlation first exploits it. Measured over 60 seeds: **0.297 against a chance of 0.20** — 89 correct
+    // out of 300 assignments where 60 are expected, `z ~ 3.7`, `p ~ 1e-4`. The undefended control is the
+    // discriminator that makes this a reading about the channel rather than about the code: there the same
+    // minimising adversary scores 0.000 while maximising scores 1.000, so the sign convention is right.
     //
-    // The undefended row is the control and it is the important half: an undefended cell is matched perfectly
-    // by BOTH scorers, so the lag scan is a working adversary and not a broken one. On the shipping schedule
-    // it moves 0.000 to 0.017 — still an order of magnitude below chance. **Scanning lags does not explain
-    // the anomaly**, so the score matrix is avoiding the truth for some other reason, and #187 (c) keeps its
-    // question with one fewer answer in it.
-    //
-    // The number is therefore still pinned as measured rather than claimed, and this assertion still records
-    // what the harness does rather than an anonymity property. It fails loudly if the value drifts back
-    // across chance in either direction.
+    // The defence is therefore strong but NOT anonymising to chance, and the old name claimed the opposite.
     assert!(
-        defended < chance,
-        "the shipping schedule's matching accuracy sits below chance (defended {defended:.2}, chance {chance:.2}); \
-         if it has risen back to or above chance, the harness or the defaults changed and #187 must be re-read"
+        defended > chance,
+        "the shipping schedule's best-adversary accuracy has dropped to or below chance (defended \
+         {defended:.3}, chance {chance:.2}). If the defence genuinely reached chance that is good news and \
+         this assertion should be replaced with the stronger claim — but check the SIGN first: this test \
+         read 0.00 as safety for as long as it only ranked one way (#187)."
     );
 }
 
@@ -661,7 +689,7 @@ fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
 #[test]
 #[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
 fn measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one() {
-    const RUNS: u64 = 12;
+    const RUNS: u64 = 60;
     // 200 ms bins; 5 bins is 1000 ms — over eight mix-delay means and two whole cover periods at the
     // shipping schedule. Derived from the schedule rather than chosen: scanning further only adds noise
     // maxima, and the max of more candidates is larger whether or not any of them is real.
@@ -682,6 +710,116 @@ fn measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one() {
             "{name:<12} chance {chance:.2}  zero-lag {:.3}  lag-scan(0..={MAX_LAG_BINS} bins) {:.3}",
             zero / RUNS as f64,
             scan / RUNS as f64,
+        );
+    }
+}
+
+/// **#187 (c), candidate 2: is the score matrix DEGENERATE rather than merely wrong?**
+///
+/// The remaining explanation for a below-chance matcher is not that it scores the true pair too low, but
+/// that it scores whole ROWS at zero. Flow `i` fires every `i + 1` rounds, so flow 0 fires every round;
+/// under mixing and constant-rate cover its series tends toward a constant, and [`pearson`] returns `0.0`
+/// for a constant by its own `da <= EPSILON` guard. A row of zeros is not a weak signal — it is *no*
+/// signal, and greedy best-first assignment hands those flows whatever partner is left after the others
+/// have been placed. That is a mechanism which produces below-chance accuracy without any information
+/// about the truth, which is exactly the shape the anomaly has.
+///
+/// So this prints the matrix and each series' variance rather than any summary of them: a mean would hide
+/// a zero row inside a plausible average, which is how the anomaly survived being looked at.
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_whether_the_score_matrix_is_degenerate() {
+    const K: usize = 5;
+    const BIN_MS: u64 = 200;
+    const SPAN_MS: u64 = 8_000;
+
+    for (name, mix) in [("undefended", None), ("shipping", Some(shipping()))] {
+        let mut sim = Sim::new(0x4B1);
+        let cell = spawn_nyx_cell(&mut sim, mix);
+        if mix.is_some() {
+            sim.inject_all(&Command::StartHeartbeat);
+        }
+        sim.observe_frames();
+        let flows: Vec<Flow> = (0..K).map(|i| Flow { client: cell[i], service: cell[K + i] }).collect();
+        let (mut t, mut round) = (0u64, 0u64);
+        while t < SPAN_MS {
+            for (i, f) in flows.iter().enumerate() {
+                if round.is_multiple_of(i as u64 + 1) {
+                    sim.inject(f.client, Command::Send { to: f.service, payload: b"flow".to_vec() });
+                }
+            }
+            sim.run_for(Duration::from_millis(200));
+            t += 200;
+            round += 1;
+        }
+        sim.run_for(Duration::from_millis(2_000));
+
+        let obs = sim.observed_frames();
+        let bins = (SPAN_MS / BIN_MS) as usize + 12;
+        let entries: Vec<Vec<f64>> = flows.iter().map(|f| emit_series(obs, f.client, BIN_MS, bins)).collect();
+        let exits: Vec<Vec<f64>> = flows.iter().map(|f| recv_series(obs, f.service, BIN_MS, bins)).collect();
+
+        let variance = |s: &[f64]| {
+            let n = s.len() as f64;
+            let m = s.iter().sum::<f64>() / n;
+            s.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n
+        };
+        println!("\n=== {name} ===");
+        for (i, e) in entries.iter().enumerate() {
+            print!("entry {i} (var {:.4}, sum {:>5.0}): ", variance(e), e.iter().sum::<f64>());
+            for x in &exits {
+                print!("{:>7.3} ", pearson(e, x).abs());
+            }
+            println!();
+        }
+        print!("exit variances:                    ");
+        for x in &exits {
+            print!("{:>7.4} ", variance(x));
+        }
+        println!();
+        print!("exit sums:                         ");
+        for x in &exits {
+            print!("{:>7.0} ", x.iter().sum::<f64>());
+        }
+        println!();
+    }
+}
+
+/// **#187 (c): the matrix says the true pair scores LOWEST, so the decisive test is an adversary that
+/// minimises.**
+///
+/// `measure_whether_the_score_matrix_is_degenerate` refuted the degeneracy explanation — on the shipping
+/// schedule every series has healthy variance (0.46–0.92) and `pearson`'s constant guard never fires — but
+/// printing the matrix rather than a summary showed the mechanism the summaries had hidden:
+///
+/// ```text
+/// entry 0 -> exit 0: 0.006   <- the TRUE pair, and the smallest number in the whole matrix
+/// entry 0 -> exit 3: 0.280   <- a false pair, 47x higher
+/// ```
+///
+/// The diagonal is systematically the lowest in its row. That is not an absence of information, it is
+/// information with the **wrong sign** — which is precisely how a matcher scores below chance twelve times
+/// running. If it is real, an adversary that assigns the *weakest* correlation first should beat chance,
+/// and the shipping schedule is more linkable than the metric reports.
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_whether_an_adversary_that_minimises_the_score_beats_chance() {
+    const RUNS: u64 = 60;
+    const MAX_LAG_BINS: usize = 5;
+
+    for (name, mix) in [("undefended", None), ("shipping", Some(shipping()))] {
+        let (mut maxi, mut mini, mut chance) = (0.0, 0.0, 0.0);
+        for seed in 0..RUNS {
+            let (a, c) = linkability_scored(mix, seed, MAX_LAG_BINS, false);
+            let (b, _) = linkability_scored(mix, seed, MAX_LAG_BINS, true);
+            maxi += a;
+            mini += b;
+            chance = c;
+        }
+        println!(
+            "{name:<12} chance {chance:.2}  maximising {:.3}  MINIMISING {:.3}",
+            maxi / RUNS as f64,
+            mini / RUNS as f64,
         );
     }
 }
