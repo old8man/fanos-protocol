@@ -1675,14 +1675,22 @@ mod tests {
             // heard of its rival" and "it heard and had nowhere to go" look identical in the index alone:
             //   * `claims` — how many peers' coordinate claims this node verified. Low ⇒ it never learned of the contender.
             //   * `peers`  — how many peers it knows at all, which bounds the above.
+            //   * `route`  — how many points it can actually route to (#249): ranked bindings in its dial table.
             // A node with high `claims` and `index = None` heard everything and still failed to place, which is the
             // line-restricted walk being exhausted (or the settle path declining to bind at all).
+            //
+            // `route` is the third reading because the first two cannot separate the case that matters most here.
+            // `claims` counts what the CLAIM BOOK verified; `route` counts what the DIAL TABLE will resolve, and the
+            // arbitration rule can refuse a write whose claim verified fine (`WriteOutcome::Superseded`). A node with
+            // `claims` high and `route` low heard its rivals and cannot reach them — which is a table state, not a
+            // propagation failure, and the two were previously one symptom. `peers` sees neither, counting seeds too.
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
             let peers: Vec<_> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
+            let route: Vec<_> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
             fleet.shutdown().await;
             let roster = trace.map(|a| a.roster);
             println!(
-                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} peers {peers:?} → final rosters {:?} agreed={:?}",
+                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} route {route:?} peers {peers:?} → final rosters {:?} agreed={:?}",
                 distinct.len(),
                 roster.last(),
                 roster.stable_agreement_at().map(|d| d.as_secs())
