@@ -52,7 +52,8 @@ pub use reflexive::ReflexiveAddr;
 // that reads a public signature against what the crate actually exports (#286).
 // `max_wire` is exported as the READ-BOUND AUTHORITY, not as a convenience: the simulator models the
 // receive path without a socket (#195) and must be handed this number rather than keep its own.
-pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sampled, max_wire, reflexive_quorum,
+pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sampled, inbound_frame_capacity,
+    max_wire, reflexive_quorum,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,
     Fabric, spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_persistent_over,

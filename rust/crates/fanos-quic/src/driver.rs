@@ -65,6 +65,24 @@ use crate::tls::{NodeCredentials, TlsError, node_configs, node_configs_mutual_fr
 /// is a change that would silently drop frames, so it must fail the build rather than the wire.
 const MAX_PEER_UNI_STREAMS: u32 = 4;
 
+/// How many **unconsumed frames** a peer that has stopped reading can pin on one inbound connection.
+///
+/// One frame rides one uni-stream, and `MAX_PEER_UNI_STREAMS` of them may be open at once, so a sender
+/// facing a receiver that never reads gets exactly this many frames out before its next `open_uni` stalls
+/// on the peer's stream limit. That stall is the back-pressure boundary — the sender waits, it is not told
+/// no and nothing is lost. In bytes the same bound is `MAX_PEER_UNI_STREAMS × max_wire()`, which is what
+/// `receive_window` is set to.
+///
+/// **Public because the simulator needs it and must not restate it (#246).** Its transport had no retention
+/// axis at all — a message was delivered or lost, never held — so the whole class #245 belongs to (a
+/// transport library buffering on our behalf, bounded only by its own default) was invisible by
+/// construction. Modelling that needs this number, and a copy of it would drift from the transport config
+/// above without anything failing.
+#[must_use]
+pub fn inbound_frame_capacity() -> usize {
+    MAX_PEER_UNI_STREAMS as usize
+}
+
 /// Per-stream flow-control credit: exactly what a reader is willing to read.
 ///
 /// [`max_wire`] is the largest byte string `read_frames` will accept (`MAX_FRAME` + relay wrapper + PROTEUS

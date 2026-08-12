@@ -6,7 +6,7 @@
 //! real fleet.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use fanos_runtime::ports::stations::GatherHealth;
 
@@ -306,6 +306,15 @@ pub struct Sim {
     /// The latest DIAKRISIS diagnostic verdict each node reached (`Notification::Verdict`), banked the
     /// same way — the diagnosis layer, distinct from the coherence frame.
     latest_verdict: BTreeMap<Triple, Verdict>,
+    /// Nodes that have **stopped reading** — see [`stop_consuming`](Sim::stop_consuming). Frames addressed
+    /// to one of these do not vanish: the transport holds them, which is the ninth axis (#246).
+    not_consuming: BTreeSet<Triple>,
+    /// Per-destination held frames, oldest first. Bounded by [`fanos_quic::inbound_frame_capacity`]; a
+    /// sender that fills it is refused rather than buffered further, which is where production's writer
+    /// would block instead.
+    held: BTreeMap<Triple, VecDeque<(Triple, Vec<u8>)>>,
+    /// Hand-back slot for [`hold_for_deaf_receiver`](Sim::hold_for_deaf_receiver) — see its doc.
+    pending_frame: Option<Vec<u8>>,
 }
 
 impl Sim {
@@ -330,7 +339,42 @@ impl Sim {
             frame_tap: None,
             latest_observed: BTreeMap::new(),
             latest_verdict: BTreeMap::new(),
+            not_consuming: BTreeSet::new(),
+            held: BTreeMap::new(),
+            pending_frame: None,
         }
+    }
+
+    /// **Stop `node` reading** — the ninth transport axis (#246).
+    ///
+    /// The sim's transport had four axes (latency, jitter, loss, partition) and a message was either
+    /// delivered or lost; nothing could WAIT. That made the whole class #245 belongs to invisible by
+    /// construction — a transport library buffering on our behalf, bounded only by its own default — and a
+    /// run that could not find it read as "clean" rather than "not measured".
+    ///
+    /// A node that has stopped reading is **not** partitioned and **not** down: frames addressed to it are
+    /// held, up to [`fanos_quic::inbound_frame_capacity`], and arrive when it resumes. Those three states
+    /// are genuinely different and production tells them apart, so the sim must too.
+    pub fn stop_consuming(&mut self, node: Triple) {
+        self.not_consuming.insert(node);
+    }
+
+    /// Resume reading, delivering everything held for `node` in arrival order at the current clock.
+    ///
+    /// Ordered, because the transport is per-stream ordered and a reader that catches up sees its backlog
+    /// as it was sent — reordering here would fabricate a defect the wire cannot produce.
+    pub fn resume_consuming(&mut self, node: Triple) {
+        self.not_consuming.remove(&node);
+        let backlog = self.held.remove(&node).unwrap_or_default();
+        for (from, frame) in backlog {
+            self.schedule(self.clock, Event::Deliver { to: node, from, frame });
+        }
+    }
+
+    /// How many frames the transport is holding for `node` right now — the observable the axis exists for.
+    #[must_use]
+    pub fn held_for(&self, node: Triple) -> usize {
+        self.held.get(&node).map_or(0, VecDeque::len)
     }
 
     /// Turn the event trace on or off (off by default; see [`Sim::trace`]).
@@ -613,12 +657,58 @@ impl Sim {
         self.apply(addr, effects);
     }
 
+
+    /// Hold a frame for a receiver that has **stopped reading**, or refuse it at the capacity boundary.
+    ///
+    /// `true` means this frame's fate is settled here and the network model must not be consulted. When it
+    /// returns `false` the frame is handed back through `pending_frame` — an owned `Vec<u8>` cannot be
+    /// returned by reference and cloning every frame to keep a tidy signature would tax every ordinary send
+    /// for a branch that fires only in a retention scenario.
+    fn hold_for_deaf_receiver(&mut self, from: Triple, to: Triple, name: &str, frame: Vec<u8>) -> bool {
+        if !self.not_consuming.contains(&to) {
+            self.pending_frame = Some(frame);
+            return false;
+        }
+        let capacity = fanos_quic::inbound_frame_capacity();
+        let queue = self.held.entry(to).or_default();
+        let room = queue.len() < capacity;
+        if room {
+            queue.push_back((from, frame));
+        }
+        let depth = queue.len();
+        if room {
+            self.report.metrics.frames_withheld += 1;
+            self.log(format!(
+                "hold {name} {}→{} ({depth}/{capacity})",
+                fmt_coord(from),
+                fmt_coord(to)
+            ));
+        } else {
+            // The back-pressure boundary. **What the sim cannot model, stated rather than hidden:**
+            // production's sender BLOCKS here — its next `open_uni` waits on the peer's stream limit — and a
+            // sans-I/O engine emitting fire-and-forget `Send` effects has no way to wait. So the frame is
+            // refused and counted, which gets the arithmetic right (nothing more is pinned) and the timing
+            // wrong (the sender carries on instead of stalling). A scenario about throughput under a stalled
+            // reader must read `frames_backpressured`, not the delivery count.
+            self.report.metrics.frames_backpressured += 1;
+            self.log(format!("backpressure {name} {}→{} (holding {depth})", fmt_coord(from), fmt_coord(to)));
+        }
+        true
+    }
+
     fn apply(&mut self, node: Triple, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
                 Effect::Send { to, frame } => {
                     self.report.metrics.frames_sent += 1;
                     let name = frame_name(&frame);
+                    // Retention (#246) is asked BEFORE the network verdict, and the order is the claim: a
+                    // receiver that has stopped reading is not a lossy link, so letting an `rng.chance`
+                    // delete a frame production would have HELD reports loss where the truth is backlog.
+                    if self.hold_for_deaf_receiver(node, to, &name, frame) {
+                        continue;
+                    }
+                    let Some(frame) = self.pending_frame.take() else { continue };
                     let wire = crate::network::wire_len_of(frame.len());
                     match self.net.deliver(node, to, wire, &mut self.rng) {
                         Delivery::After(d) => {

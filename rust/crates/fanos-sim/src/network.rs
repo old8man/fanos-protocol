@@ -1,4 +1,29 @@
-//! The in-memory transport port: latency, loss, and partition models.
+//! The in-memory transport port: latency, loss, partition, **size** and **retention**.
+//!
+//! ## The axes, and why the list is worth keeping honest
+//!
+//! For a long time there were three — latency+jitter, loss, partition — and the module said so as if that
+//! were the adversarial surface. It was the surface *the tests then needed*, which is a different claim, and
+//! two whole defect classes turned out to live in the gap:
+//!
+//! | axis | asks | added by |
+//! |---|---|---|
+//! | latency + jitter | how long | original |
+//! | loss | does it arrive | original |
+//! | partition (hard, soft) | can these two reach each other | original |
+//! | **size** | is this frame too big for a real reader | #195 |
+//! | **retention** | how many unread frames does the transport hold for us | #246 (in [`crate::Sim`], which owns the queue) |
+//!
+//! The last two are stated together because they were found the same way and are still confused for one
+//! another: size is about the BYTES of one message, retention about the NUMBER of unconsumed ones. Different
+//! mechanisms, different fixes, and each hid a CRITICAL that no run of the old model could express (#190,
+//! #245). Both take their bound from production — [`fanos_quic::max_wire`] and
+//! [`fanos_quic::inbound_frame_capacity`] — rather than restating it.
+//!
+//! **The standing rule this serves:** the sim differs from production *only* in transport, and it is also
+//! the instrument that must pin every defect class. Those two only hold together if the transport models
+//! every way transport can fail. A class the model cannot express turns a run that misses it into
+//! "clean" rather than "not measured", which is the more dangerous of the two readings.
 //!
 //! This substitutes the network. A `Send` effect becomes a delayed `Deliver` input (or is
 //! dropped) according to this model — the engine is unchanged whether it runs here or over

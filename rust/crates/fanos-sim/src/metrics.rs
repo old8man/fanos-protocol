@@ -13,6 +13,19 @@ pub struct Metrics {
     pub frames_delivered: u64,
     /// Frames dropped (loss, partition, or crashed destination).
     pub frames_dropped: u64,
+    /// Frames the transport is **holding** for a receiver that stopped reading (#246).
+    ///
+    /// Neither delivered nor lost: a third fate the model could not express before. Distinct from
+    /// `frames_dropped` because the frame still exists and arrives when the reader returns, and distinct
+    /// from a partition because the peer is reachable — production tells those three apart and so must this.
+    pub frames_withheld: u64,
+    /// Sends refused because the receiver's hold was already full at [`fanos_quic::inbound_frame_capacity`].
+    ///
+    /// This is the back-pressure boundary. Production's sender BLOCKS here; the sim's sans-I/O engine emits
+    /// fire-and-forget `Send` effects and cannot wait, so the frame is refused and counted instead. The
+    /// arithmetic of what a stalled reader can pin is therefore right and the sender's timing is not — a
+    /// scenario about throughput under a stalled reader must read this counter rather than the delivery one.
+    pub frames_backpressured: u64,
     /// Frames a production reader would have refused for **size** — the wire form exceeded
     /// [`fanos_quic::max_wire`] (#195).
     ///
@@ -65,6 +78,8 @@ impl Metrics {
         self.frames_delivered += other.frames_delivered;
         self.frames_dropped += other.frames_dropped;
         self.frames_oversize += other.frames_oversize;
+        self.frames_withheld += other.frames_withheld;
+        self.frames_backpressured += other.frames_backpressured;
         self.timers_fired += other.timers_fired;
         self.payloads_delivered += other.payloads_delivered;
         self.peer_downs += other.peer_downs;
