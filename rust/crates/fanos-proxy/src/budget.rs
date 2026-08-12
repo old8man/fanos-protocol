@@ -66,6 +66,29 @@ pub const CONNECTION_COST: usize = 2 * RELAY_BUF;
 /// What one live UDP association charges the pool: its single receive buffer.
 pub const ASSOCIATION_COST: usize = MAX_UDP;
 
+/// Datagrams a [`UdpTunnel`](crate::dialer::UdpTunnel) buffers **per direction** before UDP's lossy drop
+/// takes over — a few in flight smooth a burst without letting a stalled peer grow memory without bound.
+///
+/// **It lives here, beside the share it spends, and it used to live in a consumer.** `fanos-node` declared
+/// it privately next to the one call that passes it to `UdpTunnel::pair`, so the depth of *this crate's*
+/// channel was invisible to this crate — and therefore to the arithmetic below. That is the same direction
+/// problem `fanos_primitives::budget`'s header describes, one level down, and it is why the product went
+/// unsummed until #300.
+///
+/// 64 is not derived. It is "slack to smooth a burst", which is a scheduling claim nobody measured — the
+/// same honest position `fanos_diaulos::budget::QUEUE_DEPTH` states about itself and leaves at a floor.
+pub const UDP_TUNNEL_BUFFER: usize = 64;
+
+/// **What the tunnel queues can hold, which no share covers** (#300).
+///
+/// A relayed UDP flow's queue is `2 directions × UDP_TUNNEL_BUFFER × the datagram ceiling`, and every
+/// flow map multiplies it again. Pinned as a number rather than left to a task note, because a quantity
+/// with no name is invisible to the register that is supposed to sum it.
+#[must_use]
+pub const fn tunnel_queue_ceiling(flows: usize, datagram_ceiling: usize) -> usize {
+    flows.saturating_mul(2).saturating_mul(UDP_TUNNEL_BUFFER).saturating_mul(datagram_ceiling)
+}
+
 /// How many UDP associations the share buys **when nothing else is live**.
 ///
 /// A reading, not the enforced bound — [`PROXY_MEMORY`] is what admits. Kept because it is the number an
@@ -176,6 +199,54 @@ mod tests {
         assert_eq!(MAX_ASSOCIATIONS, 128);
         assert_eq!(MAX_CONNECTIONS, 4096);
         assert_eq!(RELAY_BUF, 1024, "the relay buffer is one downstream segment");
+    }
+
+    /// **What the tunnel queues can hold, pinned so the figure moves visibly** (#300).
+    ///
+    /// This is a RATCHET, not a pass: the number it records eats the entire share, and recording it is the
+    /// point. `PROXY_SHARE` covers an association's receive buffer and a connection's relay buffers; it
+    /// does not cover the queues, and the register that is supposed to sum every byte had no name for them
+    /// until this test gave them one.
+    ///
+    /// The remedy is decided and not yet built (#300): debit the pool with the datagram's **actual** bytes
+    /// at enqueue — the channel item becomes `(Vec<u8>, SemaphorePermit)` — so the bound is exact instead
+    /// of worst-case and `MAX_UDP_FLOWS` goes back to being a map cap. Reserving the ceiling is not an
+    /// option and the arithmetic here is why: the share buys ONE tunnel at this depth.
+    ///
+    /// **RAII rather than a counter, and the reason is drop.** A shared `AtomicUsize` incremented on send
+    /// and decremented on receive is smaller and wrong: a tunnel dropped with items still queued never
+    /// decrements, so the counter leaks by exactly the traffic that was in flight when a client went away —
+    /// which is every client. A permit travelling with the datagram returns itself.
+    #[test]
+    fn the_tunnel_queues_are_larger_than_the_share_and_that_is_the_finding() {
+        let per_tunnel = tunnel_queue_ceiling(1, MAX_UDP);
+        let per_association = tunnel_queue_ceiling(crate::udp::MAX_UDP_FLOWS, MAX_UDP);
+        println!(
+            "one tunnel {per_tunnel} B ({} MiB); one association {per_association} B ({} GB);              the share is {PROXY_MEMORY_BUDGET} B",
+            per_tunnel >> 20,
+            per_association / 1_000_000_000
+        );
+
+        let permille = per_tunnel * 1000 / PROXY_MEMORY_BUDGET;
+        assert_eq!(
+            permille, 999,
+            "one tunnel's queue is {permille}‰ of the whole share ({per_tunnel} B against \
+             {PROXY_MEMORY_BUDGET} B). If #300's byte debit landed, delete this ratchet and assert the \
+             debit instead; if a constant merely moved, say by how much and re-derive"
+        );
+        assert_eq!(
+            PROXY_MEMORY_BUDGET - per_tunnel,
+            128,
+            "the share misses covering one tunnel's queue by 128 B — 2 × 64 × 65535 against \
+             2 × 64 × 65536 — so \"the share buys ONE tunnel\" is exact arithmetic and not a rounded \
+             phrase. The two numbers have unrelated provenance: nobody chose the depth to make this come \
+             out even, which is why the near-identity is worth pinning rather than tidying away"
+        );
+        assert_eq!(
+            per_association, 8_589_803_520,
+            "the per-association queue ceiling moved. It is MAX_UDP_FLOWS × 2 × UDP_TUNNEL_BUFFER × \
+             MAX_UDP, and every factor is a decision someone took — re-derive rather than re-pin (#300)"
+        );
     }
 
     /// **The property the pool exists for: the two kinds cannot spend the share twice.**

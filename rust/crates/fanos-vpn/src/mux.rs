@@ -19,7 +19,25 @@ use crate::engine::{FlowKey, VpnAction, classify, response_packet};
 /// map). Traffic to many destinations (a scan, a peer-to-peer swarm) would otherwise grow the tunnel map —
 /// and its exit dials — without limit; at the cap the least-recently-used flow is evicted (dropping its
 /// sender tears the tunnel down). Matches the DIAULOS `MAX_SESSIONS` discipline.
-const MAX_UDP_FLOWS: usize = 4096;
+pub const MAX_UDP_FLOWS: usize = 4096;
+
+/// The MTU this build configures the userspace stack with, and therefore the largest IP packet it will ever
+/// hand up.
+///
+/// **Set explicitly rather than inherited from `IpStackConfig::default()`, because [`UDP_BUF`] is derived
+/// from it.** The default happens to be the same value today (ipstack's `MIN_MTU`), but a buffer sized from
+/// a dependency's default is sized from something that can change in a patch release without this crate
+/// noticing — and the failure would be a truncated datagram, not a build error. Stating it makes the
+/// derivation below true by construction instead of true by reading someone else's source.
+///
+/// 1280 is the IPv6 minimum link MTU (RFC 8200 §5) and ipstack's own floor; a tunnel that stays at or below
+/// it is deliverable over any path without path-MTU discovery, which is the property a VPN datapath wants.
+///
+/// **It moved here from `fulltunnel`, which is behind `feature = "device"` (#300).** This number is the
+/// ceiling on every datagram *this* module queues, and this module is not gated — so the quantity that
+/// bounds the mux's memory was only compiled when the device backend was. A bound that disappears with a
+/// feature cannot be summed by anything that does not enable it.
+pub const STACK_MTU: u16 = 1280;
 
 /// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
 struct Flow {
@@ -92,6 +110,44 @@ fn spawn_response_pump(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    /// **The other member of #300's class, and it is a different number for a structural reason.**
+    ///
+    /// The tunnel queue is the same object as the proxy's — `UdpTunnel::pair(UDP_TUNNEL_BUFFER)`, one call
+    /// site — so the depth is shared. What differs is the **ceiling on a queued item**, and that is set by
+    /// the producer, not the channel: the proxy reads a UDP socket and can push 65535 bytes, this crate
+    /// reads a TUN device and cannot exceed [`STACK_MTU`]. Hence `tunnel_queue_ceiling` takes the ceiling as
+    /// an argument rather than assuming one — a single constant would have silently handed the VPN the
+    /// proxy's 51x figure.
+    ///
+    /// **No share covers this, deliberately.** `fanos_primitives::budget` exempts the VPN because its cost
+    /// is per-flow and a deployment chooses the flow count; the exemption names the per-flow costs, and the
+    /// queue was not among them until #300. Pinned here so the omission is a number an operator can read
+    /// rather than an absence.
+    #[test]
+    fn the_tunnel_queues_are_a_per_client_quantity_no_share_carries() {
+        let ceiling = fanos_proxy::budget::tunnel_queue_ceiling(
+            MAX_UDP_FLOWS,
+            STACK_MTU as usize,
+        );
+        println!("one client's tunnel queues: {ceiling} B ({} MiB)", ceiling >> 20);
+        assert_eq!(
+            ceiling, 671_088_640,
+            "the per-client queue ceiling moved. MAX_UDP_FLOWS x 2 x UDP_TUNNEL_BUFFER x STACK_MTU — \
+             re-derive rather than re-pin, and check whether #300's byte debit makes this obsolete"
+        );
+
+        let proxy = fanos_proxy::budget::tunnel_queue_ceiling(
+            fanos_proxy::udp::MAX_UDP_FLOWS,
+            fanos_proxy::budget::MAX_UDP,
+        );
+        assert!(
+            proxy > ceiling * 12,
+            "the proxy's ceiling ({proxy} B) is supposed to dominate this one ({ceiling} B) because its \
+             producer may push a full 65535-byte datagram. If they converged, one of the two producers \
+             changed what it can emit, and that is the thing to look at"
+        );
+    }
     use std::time::Duration;
 
     use fanos_proxy::dialer::EchoDialer;

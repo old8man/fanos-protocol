@@ -751,9 +751,7 @@ impl<R: ServiceResolver> Dialer for FanosDialer<R> {
     }
 }
 
-/// Slack (datagrams per direction) a UDP tunnel buffers before UDP's lossy drop kicks in — a few
-/// in-flight datagrams smooth a burst without letting a stalled peer grow memory without bound.
-const UDP_TUNNEL_BUFFER: usize = 64;
+use fanos_proxy::budget::UDP_TUNNEL_BUFFER;
 
 impl<R: ServiceResolver> UdpDialer for FanosDialer<R> {
     /// Open a UDP tunnel to a **clearnet** `target` through the configured exit — the datagram counterpart

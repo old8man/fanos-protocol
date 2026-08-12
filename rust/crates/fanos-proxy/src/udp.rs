@@ -64,7 +64,7 @@ pub enum Associated {
 /// map). A client addressing many destinations (a UDP scanner, a DHT) would otherwise grow the tunnel map —
 /// and its exit dials — without limit; at the cap the least-recently-used tunnel is evicted (dropping its
 /// sender tears it down). Matches the DIAULOS `MAX_SESSIONS` discipline.
-const MAX_UDP_FLOWS: usize = 1024;
+pub const MAX_UDP_FLOWS: usize = 1024;
 
 /// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
 struct Flow {

@@ -14,18 +14,7 @@ use fanos_proxy::{Dialer, Target, UdpDialer};
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
-/// The MTU this build configures the userspace stack with, and therefore the largest IP packet it will ever
-/// hand up.
-///
-/// **Set explicitly rather than inherited from `IpStackConfig::default()`, because [`UDP_BUF`] is derived
-/// from it.** The default happens to be the same value today (ipstack's `MIN_MTU`), but a buffer sized from
-/// a dependency's default is sized from something that can change in a patch release without this crate
-/// noticing — and the failure would be a truncated datagram, not a build error. Stating it makes the
-/// derivation below true by construction instead of true by reading someone else's source.
-///
-/// 1280 is the IPv6 minimum link MTU (RFC 8200 §5) and ipstack's own floor; a tunnel that stays at or below
-/// it is deliverable over any path without path-MTU discovery, which is the property a VPN datapath wants.
-const STACK_MTU: u16 = 1280;
+use crate::mux::STACK_MTU;
 
 /// Run full-tunnel mode over `device` (a TUN presented as an async byte device): accept each TCP/UDP flow
 /// the kernel routes to the TUN and bridge it to the exit via `dialer`. Returns when the device closes.
