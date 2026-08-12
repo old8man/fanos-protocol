@@ -356,6 +356,32 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
     num / (da.sqrt() * db.sqrt())
 }
 
+/// Pearson between `a` and `b` with `b` shifted **later** by `lag` bins — the exit series read `lag` bins after
+/// the entry one. `lag = 0` is exactly [`pearson`].
+fn pearson_at_lag(a: &[f64], b: &[f64], lag: usize) -> f64 {
+    if lag >= a.len() || lag >= b.len() {
+        return 0.0;
+    }
+    pearson(&a[..a.len() - lag], &b[lag..])
+}
+
+/// The score a **lag-scanning** adversary computes: the strongest correlation over a window of delays, rather
+/// than the one at zero.
+///
+/// This is the matcher #187 named as the likely cause of an anomaly it could not explain: the shipping
+/// schedule's matching accuracy measured **0.00 against a chance of 0.20**, and below chance is not safety —
+/// twelve seeds of zero has probability `(44/120)¹² ≈ 3e-6` under guessing, so the score matrix was still
+/// carrying information and the matcher was systematically avoiding the truth. `pearson` compares series at
+/// zero lag **only**, while mixing displaces the exit series; a real flow-correlation adversary scans lags.
+///
+/// The window is derived, not chosen: the mix delay is a Poisson mean, so a packet's displacement is
+/// exponential and its tail matters — `MAX_LAG_BINS` covers `1000 ms` at a `200 ms` bin, which is over eight
+/// mean delays and two whole cover periods at the shipping schedule. Scanning further would only add noise
+/// maxima, which is itself a bias: the max of more candidates is larger whether or not any is real.
+fn best_lag_score(a: &[f64], b: &[f64], max_lag: usize) -> f64 {
+    (0..=max_lag).map(|l| pearson_at_lag(a, b, l).abs()).fold(0.0, f64::max)
+}
+
 #[test]
 #[ignore = "sweep, not an assertion — run with --ignored --nocapture"]
 fn sweep_bin_width_to_check_the_correlation_is_not_an_artefact() {
@@ -465,6 +491,13 @@ fn recv_series(obs: &[FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<
 
 /// The adversary's matching accuracy over `K` concurrent flows: the fraction it assigns correctly, against chance `1/K`.
 fn linkability_seeded(mix: Option<(Duration, Duration)>, seed: u64) -> (f64, f64) {
+    linkability_seeded_with(mix, seed, 0)
+}
+
+/// The same experiment, scored by an adversary that scans `max_lag` bins. `max_lag = 0` is the zero-lag
+/// matcher this file shipped with; the two must see the SAME traffic, which is why the scorer is a parameter
+/// rather than a second copy of the harness ([[discrimination-needs-differing-inputs]]).
+fn linkability_seeded_with(mix: Option<(Duration, Duration)>, seed: u64, max_lag: usize) -> (f64, f64) {
     const K: usize = 5;
     const BIN_MS: u64 = 200;
     const SPAN_MS: u64 = 8_000;
@@ -502,7 +535,7 @@ fn linkability_seeded(mix: Option<(Duration, Duration)>, seed: u64) -> (f64, f64
     let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         for (j, x) in exits.iter().enumerate() {
-            pairs.push((pearson(e, x).abs(), i, j));
+            pairs.push((best_lag_score(e, x, max_lag), i, j));
         }
     }
     pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -588,13 +621,67 @@ fn the_adversary_cannot_match_concurrent_flows_much_better_than_chance() {
     // guessing hypothesis. The matcher is not guessing; it is systematically *avoiding* the truth, which means the
     // score matrix still carries information about it. An anonymous system drives this metric to chance, not to zero.
     //
-    // So the number is pinned as measured, with the mechanism unexplained and tracked (#187): the likely cause is that
-    // `pearson` compares series at **zero lag only**, while mixing displaces the exit series by the mix delay — a real
-    // flow-correlation adversary scans lags. Until that is resolved this assertion records what the harness does, not
-    // an anonymity claim, and it fails loudly if the value drifts back across chance in either direction.
+    // THE NAMED SUSPECT HAS BEEN TESTED, AND IT IS NOT THE CAUSE (#187 (c)). The hypothesis written here was
+    // that `pearson` compares at **zero lag only** while mixing displaces the exit series, so a lag-scanning
+    // adversary would recover the matching. `measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one`
+    // runs both scorers over the SAME traffic — the scorer is a parameter of one harness, so nothing else can
+    // differ — and measures, over 12 seeds:
+    //
+    //     undefended   chance 0.20   zero-lag 1.000   lag-scan(0..=5 bins) 1.000
+    //     shipping     chance 0.20   zero-lag 0.000   lag-scan(0..=5 bins) 0.017
+    //
+    // The undefended row is the control and it is the important half: an undefended cell is matched perfectly
+    // by BOTH scorers, so the lag scan is a working adversary and not a broken one. On the shipping schedule
+    // it moves 0.000 to 0.017 — still an order of magnitude below chance. **Scanning lags does not explain
+    // the anomaly**, so the score matrix is avoiding the truth for some other reason, and #187 (c) keeps its
+    // question with one fewer answer in it.
+    //
+    // The number is therefore still pinned as measured rather than claimed, and this assertion still records
+    // what the harness does rather than an anonymity property. It fails loudly if the value drifts back
+    // across chance in either direction.
     assert!(
         defended < chance,
         "the shipping schedule's matching accuracy sits below chance (defended {defended:.2}, chance {chance:.2}); \
          if it has risen back to or above chance, the harness or the defaults changed and #187 must be re-read"
     );
+}
+
+/// **#187 (c): the anomaly, attacked with the adversary the file itself named.**
+///
+/// `the_adversary_cannot_match_concurrent_flows_much_better_than_chance` pins a matching accuracy of
+/// **0.00 against a chance of 0.20** at the shipping schedule, and its own comment says that is not safety:
+/// twelve seeds of zero has probability `(44/120)¹² ≈ 3e-6` under guessing, so the score matrix was still
+/// carrying information and the matcher was systematically *avoiding* the truth. The named suspect was the
+/// scorer: `pearson` correlates at **zero lag only**, while mixing displaces the exit series, and a real
+/// flow-correlation adversary scans lags.
+///
+/// This runs both adversaries **on the same traffic** — the scorer is a parameter of one harness, not a
+/// second copy — so any difference is the scorer and nothing else
+/// ([[discrimination-needs-differing-inputs]]).
+#[test]
+#[ignore = "measurement, not an assertion — run with --ignored --nocapture"]
+fn measure_whether_a_lag_scanning_adversary_beats_the_zero_lag_one() {
+    const RUNS: u64 = 12;
+    // 200 ms bins; 5 bins is 1000 ms — over eight mix-delay means and two whole cover periods at the
+    // shipping schedule. Derived from the schedule rather than chosen: scanning further only adds noise
+    // maxima, and the max of more candidates is larger whether or not any of them is real.
+    const MAX_LAG_BINS: usize = 5;
+
+    for (name, mix) in [("undefended", None), ("shipping", Some(shipping()))] {
+        let mut zero = 0.0;
+        let mut scan = 0.0;
+        let mut chance = 0.0;
+        for seed in 0..RUNS {
+            let (a, c) = linkability_seeded_with(mix, seed, 0);
+            let (b, _) = linkability_seeded_with(mix, seed, MAX_LAG_BINS);
+            zero += a;
+            scan += b;
+            chance = c;
+        }
+        println!(
+            "{name:<12} chance {chance:.2}  zero-lag {:.3}  lag-scan(0..={MAX_LAG_BINS} bins) {:.3}",
+            zero / RUNS as f64,
+            scan / RUNS as f64,
+        );
+    }
 }
