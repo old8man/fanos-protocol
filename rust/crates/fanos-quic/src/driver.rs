@@ -2883,6 +2883,14 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // decision degrades to the honest-but-inert answer. Fabricating index 0 here is exactly
                     // what the paragraph above forbids, and stays forbidden.
                     //
+                    // **The same omission is load-bearing one layer over**, and the two were reasoned about
+                    // separately until now. `fanos_node::bound`'s `Entitlement` also leaves the exact probe
+                    // index out — same reason, same `CoordinateClaim` named as what would supply it — and
+                    // pays for it in a different currency: a forged record is refused at 49 of PG(2,7)'s
+                    // other 56 points instead of all of them. One missing quantity, two consequences, and
+                    // each site argued its own local trade honestly. Neither alone buys a change to the
+                    // frame; together they are one change, and whoever makes it must land both.
+                    //
                     // The outcome is deliberately not branched on, because all three lead here anyway and
                     // the *send* has already failed above regardless: `Bound` recorded the peer's new
                     // address, `Unchanged` means it was already known, and `Superseded` means the peer's own

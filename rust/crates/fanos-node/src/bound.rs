@@ -23,6 +23,14 @@
 //! need the publisher's full witness chain (`CoordinateClaim`) and would raise the cost to the whole plane. That is the
 //! stronger form and the natural follow-up.
 //!
+//! **And it is not this module's follow-up alone (#249, found 2026-08-12).** The same omission — the exact probe index,
+//! absent for the same reason, supplied by the same `CoordinateClaim` — costs something quite different one layer over.
+//! `fanos_quic`'s `PeerClaimed` omits it too, so a peer whose coordinate a handshake *proved* can only be written to the
+//! dial table **unranked**, and a measured 7-node cell reads `route [1,1,1,1,1,1,1]`: every node routes to exactly one
+//! point, its own, and the roster never agrees. Two subsystems, one missing quantity, and each doc argued its own local
+//! trade honestly enough that nobody joined them — which is why the pair is written down here rather than left to be
+//! rediscovered. Neither consequence alone buys a wire change; together they are the same change.
+//!
 //! ## It applies only where coordinates are VRF-derived
 //!
 //! A *pinned* coordinate has no relation to the node's VRF output, so no publisher in a pinned cell can produce a bound
