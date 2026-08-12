@@ -14,6 +14,15 @@
 //! `fanos-calypso/src/hosting.rs`'s unit tests; re-running them over the network here would add a
 //! wire wrapper around the same local computation, not exercise anything new.
 //!
+//! **That scope note was right about the code and wrong about the record.** Two other documents —
+//! `hosting.rs`'s own header and `threshold_rendezvous.rs` — described the same mechanism as
+//! reconstruction "on demand … e.g. re-signing an epoch cert", which reads as the live protocol this file
+//! says does not exist. Both have been corrected to agree with what is here, because a sentence that
+//! justifies not testing something is the last place a reader looks for the truth about it, and it was the
+//! only one of the three that had it. The end-to-end control mechanism 1 *does* have now is
+//! `fanos-node/tests/ceremony_secrets.rs`, against the files the real dealer writes: `t` members recover
+//! the published identity, `t − 1` recover nothing.
+//!
 //! This test builds its own minimal `ServiceMember`/`Client` engines — a combiner-gather protocol
 //! mirroring `fanos_aphantos::threshold_router::ThresholdRouter`, simplified for this demonstration
 //! (a single in-flight intro per member; no req-id multiplexing, no mixing/cover traffic — those are

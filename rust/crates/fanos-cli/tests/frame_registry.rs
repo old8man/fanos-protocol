@@ -123,6 +123,49 @@ fn implemented() -> BTreeSet<String> {
     names
 }
 
+/// **Three documents claim §12.3 identity custody has no live protocol. This is what makes that checkable.**
+///
+/// `fanos_calypso::hosting`, `fanos_node::threshold_rendezvous` and `fanos-sim/tests/threshold_calypso.rs`
+/// all now state that identity custody is **at rest**: dealing is a one-time ceremony, recovery brings `t`
+/// members' files together deliberately, and no node ever asks another for its opened share. They did not
+/// always agree — two of them described reconstruction "on demand … e.g. re-signing an epoch cert", which
+/// reads as a protocol that does not exist, and the one that had it right was a scope note explaining why
+/// something need not be tested. A reader deciding whether a hosted service can rotate its own registration
+/// got the answer from whichever file they opened first.
+///
+/// Prose cannot hold that. **The registry can**: a live gather needs frame types, and there are none. So the
+/// day someone allocates `SVC_IDENTITY_*` this fails, and the failure lands on the author who is in the best
+/// position — the only position — to move the three claims with the code.
+///
+/// It is deliberately keyed on the WIRE and not on a function name. `recover_service_key` having a caller
+/// proves nothing either way (the ceremony calls it, correctly); what distinguishes at-rest custody from a
+/// live one is whether a share can cross a link.
+#[test]
+fn identity_custody_has_no_wire_protocol_and_three_documents_say_so() {
+    let implemented = implemented();
+    let identity_frames: Vec<&String> = implemented
+        .iter()
+        .filter(|n| n.contains("IDENTITY") || (n.starts_with("SVC_") && n.contains("SHARE") && n.contains("ID")))
+        .collect();
+    assert!(
+        identity_frames.is_empty(),
+        "the frame registry now allocates {identity_frames:?}, so a share can cross a link and identity \
+         custody is no longer only at-rest. Three documents state the opposite and must move with it: \
+         `fanos-calypso/src/hosting.rs` (module header, the (a) paragraph), \
+         `fanos-node/src/threshold_rendezvous.rs` (the identity-custody bullet), and \
+         `fanos-sim/tests/threshold_calypso.rs` (the scope note). Update all three, then this list.",
+    );
+
+    // CONTROL: the scan can see the frames that DO exist, so an empty result above is a fact about identity
+    // frames rather than about a filter that matches nothing. Without this the assertion passes for a
+    // registry it never read — the failure mode `falsify-the-scan-before-the-finding` is named for.
+    assert!(
+        implemented.contains("SVC_SHARE_REQ") && implemented.contains("SVC_PARTIAL"),
+        "the intro-gather frames must be visible to this scan, or its silence about identity means nothing: \
+         {implemented:?}",
+    );
+}
+
 #[test]
 fn the_spec_frame_table_and_the_wire_registry_name_the_same_types() {
     let (exact, prefixes) = spec_entries();

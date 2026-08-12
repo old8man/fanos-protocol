@@ -15,11 +15,18 @@
 //!   *inside* the threshold onion transport, which only protected routing — so the delivering combiner can no
 //!   longer read what it delivers.
 //! * **Identity custody (part a)** — the service's identity secret is dealt as one
-//!   [`SealedShare`] per member (`open_identity_share` opens this
-//!   member's slot with its own KEM secret), reconstructed on demand from `≥ threshold` opened shares
-//!   (`reconstruct_identity`) only when the service must authenticate — e.g. re-signing an epoch cert
-//!   (spec §12.6). So **no single host holds the service identity in the clear**; seizing `< threshold`
-//!   members can neither read requests nor impersonate the service.
+//!   [`SealedShare`] per member by `fanos service-deal` (`open_identity_share` opens this member's slot
+//!   with its own KEM secret). So **no single host holds the service identity in the clear**; seizing
+//!   `< threshold` members can neither read requests nor recover the identity.
+//!
+//!   **This is at-rest custody, and the clause that used to be here claimed more.** It said the identity is
+//!   "reconstructed on demand from `≥ threshold` opened shares … when the service must authenticate — e.g.
+//!   re-signing an epoch cert", which describes a live protocol that does not exist:
+//!   [`reconstruct_identity`] combines shares *already held in one process*, and nothing lets a node ask
+//!   another for its opened share. Recovery is an operator ceremony — `t` members' files brought together
+//!   once, deliberately — not something this engine does per epoch. `fanos_calypso::hosting`'s header
+//!   states the same thing and names what a live gather would need; the two must not drift apart again,
+//!   which is why the claim now lives in one voice rather than three.
 //!
 //! Once a request is threshold-decrypted, its reply travels back over the client's own reply circuit exactly
 //! as the single-host service already does — the combiner that decrypted it holds the route binding and

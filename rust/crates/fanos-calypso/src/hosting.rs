@@ -42,10 +42,31 @@
 //! engine) and `fanos_rendezvous::RendezvousService` (the cookie→reply-route binding and reply sealing).
 //! Both TODO parts are covered: **(b)** the client seals its whole `Request` in a [`SealedIntro`] to the line
 //! and no single member reads it (the composite surfaces the decrypted request only after a threshold of
-//! PartialDecs); **(a)** the service identity is dealt one [`SealedShare`] per member (a member opens its slot
-//! via [`open_service_share`], a combiner combines `≥ t` via [`recover_service_key`] on demand — spec §12.6),
-//! so no single host holds the identity in the clear. The reply-onion RNG stays local per-member (unlinkable
-//! regardless), separate from the custodied identity.
+//! PartialDecs); **(a)** the service identity is dealt one [`SealedShare`] per member by
+//! `fanos service-deal`, and a member opens its own slot via [`open_service_share`], so no single host holds
+//! the identity in the clear. The reply-onion RNG stays local per-member (unlinkable regardless), separate
+//! from the custodied identity.
+//!
+//! ## What (a) is, and the sentence that used to overstate it
+//!
+//! This paragraph said a combiner "combines `≥ t` via [`recover_service_key`] **on demand**". That reads as a
+//! live protocol and there is none: [`recover_service_key`] takes shares that are *already in one process*,
+//! and nothing anywhere lets a node obtain another node's opened share. `threshold_rendezvous.rs` carried the
+//! same implication ("re-signing an epoch cert"), while `fanos-sim/tests/threshold_calypso.rs` stated the
+//! opposite in its own scope note — three documents, two incompatible claims, and the reader who needed the
+//! answer was the one deciding whether a hosted service could rotate its own registration.
+//!
+//! **What custody actually buys today is at-rest**: the identity exists only as `t`-of-`(q+1)` sealed slots,
+//! so a seized member's disk yields nothing and a seized *dealer* yields nothing (it keeps no copy — see
+//! `fanos-node/tests/ceremony_secrets.rs`). **Recovery is an operator ceremony**, not a node behaviour: `t`
+//! members' files are brought together deliberately, once, to re-establish a service.
+//!
+//! A live per-epoch reconstruction is what the shipping `fanos host` would need to stop holding its whole
+//! signer, and it is genuinely absent: it wants frame types the registry does not allocate, a
+//! beacon-derived combiner (so an adversary cannot elect itself), a bound and a station on share release
+//! (the trigger is reachable unauthenticated), and a credential authorising the asker that cannot be the
+//! signing key itself. `fanos-cli/tests/frame_registry.rs` fails the moment such a frame is allocated, so
+//! this paragraph cannot go stale in the other direction either.
 
 use alloc::vec::Vec;
 
