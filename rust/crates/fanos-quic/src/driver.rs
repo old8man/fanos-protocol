@@ -489,10 +489,16 @@ pub(crate) const MAX_INBOUND_CONNECTIONS: usize = 512;
 /// occupy; it belongs to the difference between "beyond my design, throttle" and "definitely leaking, die",
 /// which is exactly the `MemoryHigh`/`MemoryMax` split (#207).
 ///
-/// One consequence worth stating: it is by far the largest quantity in the node's memory picture — measured
-/// at **2.00 GiB**, against 320 MiB of named shares — and it is the one an *adversary* chooses the size of,
-/// since filling a window is a peer's decision. An enforcement figure below it turns a flood the caps were
-/// designed to survive into a kill.
+/// It is large — **2.00 GiB**, against 320 MiB of named shares — and a peer chooses how much of it to use,
+/// since filling a window is the sender's decision. An enforcement figure below it turns a flood the caps
+/// were designed to survive into a kill.
+///
+/// **It is NOT the largest such term, and saying so here was wrong.** The first version of this doc called
+/// it "by far the largest quantity in the node's memory picture" and "the one an adversary chooses the size
+/// of". Enumerating the class one step further found the SOCKS5 UDP tunnel map:
+/// `MAX_UDP_FLOWS × 2 directions × UDP_TUNNEL_BUFFER × 65535` is **8.6 GB per association**, and one tunnel
+/// alone can hold the whole 8 MiB proxy share. A superlative is a claim about everything else, and this one
+/// was made after summing only what happened to be named (#300).
 #[must_use]
 pub fn inbound_credit_ceiling() -> usize {
     MAX_INBOUND_CONNECTIONS

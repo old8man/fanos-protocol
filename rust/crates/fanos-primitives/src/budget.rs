@@ -25,7 +25,14 @@
 //! when this table was written and neither is now: #245 replaced quinn's `VarInt::MAX` receive window with
 //! `MAX_PEER_UNI_STREAMS × max_wire()` and capped the connection count, which made the product computable —
 //! and nobody came back to take it. Measured, it is **2.00 GiB**, 6.4× everything else in this table put
-//! together, and it is the only term an *adversary* picks the size of.
+//! together.
+//!
+//! **It is not the largest contingent term, and this paragraph said it was.** The claim "the only term an
+//! *adversary* picks the size of" survived one enumeration step and no further: the test below named
+//! `the_unnamed_consumers_were_the_large_ones` already computes the SOCKS5 UDP tunnel map, and today it is
+//! `1024 × 2 × 64 × 65535` = **8.6 GB per association**, with `MAX_ASSOCIATIONS = 128` of them. One tunnel's
+//! worst case is the entire 8 MiB proxy share. It is picked by a *local* runaway application rather than a
+//! remote peer, which is why looking only at what an adversary controls missed it (#300).
 //!
 //! It is nonetheless **not** a share and is absent from [`allocated`] on purpose. Every other row is
 //! *steady*: a full store really does hold 128 MiB, and a full store is ordinary operation. Flow-control
@@ -290,6 +297,17 @@ mod tests {
         );
 
         // #247: MAX_UDP_FLOWS × 2 directions × UDP_TUNNEL_BUFFER × the packet ceiling.
+        //
+        // **4096 is the HISTORICAL flow cap; the code says 1024 today, and this test cannot read it.**
+        // `fanos-primitives` sits below `fanos-proxy`, the same direction problem this module's header
+        // describes — so the figure is frozen here and a *live* guard has to live where both are visible,
+        // beside `the_exit_datagram_buffers_fit_the_share_the_budget_grants_them` in `fanos-node`.
+        //
+        // Worth being exact about what that costs, because a past-tense test reads as a closed matter: at
+        // today's 1024 the product is still **8.6 GB per association**, and `MAX_ASSOCIATIONS = 128` of
+        // them are admissible — so the term this test calls historical is *live*, and one tunnel's worst
+        // case is the whole 8 MiB proxy share. That is #300, and it is why the assertion below would still
+        // pass with the real constant: `> 100 node budgets` is far too loose to notice a 4× move.
         let tunnels: usize = 4096 * 2 * 64 * 65_535;
         assert!(
             tunnels > 100 * NODE_MEMORY_BUDGET,

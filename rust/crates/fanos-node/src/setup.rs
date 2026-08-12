@@ -315,8 +315,15 @@ pub fn memory_high_bytes() -> usize {
 /// **The margin between them is derived, not chosen.** It is
 /// `fanos_quic::inbound_credit_ceiling()` = `MAX_INBOUND_CONNECTIONS × MAX_PEER_UNI_STREAMS × max_wire()`,
 /// every factor of which is itself derived (#245 for the first two, #190 for the third). Measured today at
-/// **2.00 GiB**, which is 6.4× the whole named-share total — the largest quantity in the node's memory
-/// picture, and the only one an adversary picks the size of.
+/// **2.00 GiB**, which is 6.4× the whole named-share total.
+///
+/// **This figure is not yet the whole worst case, and the first version of this doc claimed it was.** It
+/// called the QUIC credit "the largest quantity in the node's memory picture, and the only one an adversary
+/// picks the size of". Continuing the enumeration found the SOCKS5 UDP tunnel map at **8.6 GB per
+/// association** — 3.6× this whole `MemoryMax` — held by a *local* runaway application rather than a remote
+/// peer. Whether that term joins this sum or gets bounded down to fit the proxy's share is #300's decision;
+/// until it is taken, `MemoryMax` admits a full QUIC flood and would kill the node under a UDP-relay one.
+/// Stated here rather than quietly raised, because raising it would ratify a ceiling nobody derived.
 ///
 /// Two things this figure honestly is not:
 ///
