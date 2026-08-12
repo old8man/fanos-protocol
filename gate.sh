@@ -209,6 +209,18 @@ if want tests ${SELECT[@]+"${SELECT[@]}"}; then
   run test-quic        test -p fanos-quic --no-fail-fast
   run test-node        test -p fanos-node --no-fail-fast
   run test-validator   test -p fanos-node --features validator --no-fail-fast
+  # The `vpn` surface had a clippy phase and no test phase, and the gap was exactly one test:
+  # `cargo test -p fanos-vpn -- --list` yields 17 by default and 18 with `device`, the extra one being
+  # `fulltunnel::tests::a_flow_buffer_is_one_mtu_of_the_stack_this_build_configures` — #247's proof that the
+  # per-flow buffer is the MTU read back from the stack rather than a declared constant (268 MB -> 5.1 MB,
+  # 51x). `clippy-vpn --all-targets` COMPILED it all along; compiling a test says it exists and nothing
+  # about whether it passes.
+  #
+  # Deliberately `-p fanos-vpn` and not the `-p fanos-node --features vpn` form `test-validator` uses. The
+  # measured delta decides it: fanos-vpn's device tests cost ~1 s, while re-running fanos-node's suite under
+  # the feature cost 131 s + 93 s of integration time for a delta that is one subcommand's wiring, already
+  # linted. If that wiring grows real logic, this phase should grow with it.
+  run test-vpn         test -p fanos-vpn --features device --no-fail-fast
 fi
 
 if want run ${SELECT[@]+"${SELECT[@]}"}; then
