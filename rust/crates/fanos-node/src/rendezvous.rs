@@ -1015,4 +1015,51 @@ mod tests {
             "only the reply sealed to this session's key opens and reaches the DIAULOS session"
         );
     }
+
+    #[test]
+    fn two_fresh_sessions_meet_at_the_client_and_both_profile_docs_now_say_so() {
+        // #164. `Profile::Fresh` draws a new drop line per dial, and every such line passes through the
+        // client's own point. Two distinct lines through a point meet in that point ALONE — so two services
+        // that compare the reply circuits they were handed recover the client exactly, having paid nothing:
+        // they never capture a line, they are GIVEN one, which is why `route_leaks`' `2t - 1` does not price
+        // this. The two profile docs now state that trade in both directions; this pins the arithmetic
+        // underneath them so the claim cannot rot into prose.
+        let dir = fano_directory();
+        let client: Coord = [1, 0, 0];
+        let (epoch, beacon) = (Epoch::ZERO, BeaconSeed::GENESIS);
+
+        let Some(a) = client_drop_line::<F2>(client, b"session-A", epoch, &beacon, &dir, &[]) else {
+            panic!("the Fano directory can seal a line through the client")
+        };
+        let Some(b) = client_drop_line::<F2>(client, b"session-B", epoch, &beacon, &dir, &[]) else {
+            panic!("and a second, independently-drawn one")
+        };
+
+        // Control first: whatever else is true, each line must actually pass through the client — otherwise
+        // this test would be about two unrelated lines and its conclusion would be arithmetic, not evidence.
+        for line in [a, b] {
+            assert!(
+                fanos_rendezvous::line_member_coords::<F2>(line).contains(&client),
+                "a drop line is drawn through the client's own point"
+            );
+        }
+
+        let members_a = fanos_rendezvous::line_member_coords::<F2>(a);
+        let shared: Vec<Coord> = fanos_rendezvous::line_member_coords::<F2>(b)
+            .into_iter()
+            .filter(|m| members_a.contains(m))
+            .collect();
+        if a == b {
+            // Allowed and harmless: two draws may land on the same line (probability 1/(q+1) = 1/3 here),
+            // and then there is nothing to intersect. Not the interesting branch, but it must not fail.
+            assert_eq!(shared.len(), 3, "the Fano line has q + 1 = 3 members and shares all of them");
+        } else {
+            assert_eq!(
+                shared,
+                vec![client],
+                "two DISTINCT drop lines share exactly the client's point — the whole deanonymization, \
+                 one cross product and no work, which is what `Profile::Fresh`'s doc now prices"
+            );
+        }
+    }
 }

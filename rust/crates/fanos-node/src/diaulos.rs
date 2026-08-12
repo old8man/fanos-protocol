@@ -405,11 +405,29 @@ enum Profile {
     /// Direct: reach services by coordinate (fast, but reveals *where* each party is).
     Direct,
     /// Anonymous with **one fixed** rendezvous route reused across dials (the meeting line is still
-    /// per-target). Simple, but successive dials share the same intermediate hops — an observer can LINK
-    /// them; kept for the single-service test path.
+    /// per-target).
+    ///
+    /// **Sells:** successive dials share the same intermediate hops, so a network observer can LINK them.
+    /// **Buys — and this half went unwritten until #164:** every counterparty is handed the *same* reply
+    /// circuit, hence the same dead-drop line, so any number of colluding services have nothing to
+    /// intersect. Against endpoint collusion this is the strictly stronger profile, which is why the old
+    /// "kept for the single-service test path" line is gone: it read as scaffolding awaiting deletion, and
+    /// what it actually describes is a live security property.
     Fixed(crate::rendezvous::RendezvousRoute),
-    /// Anonymous with a **fresh unlinkable** route drawn per dial from the live directory — the general
-    /// proxy profile.
+    /// Anonymous with a **fresh unlinkable** route drawn per dial from the live directory.
+    ///
+    /// **Buys:** an observer cannot link a client's successive connections by their path.
+    /// **Sells — the half that was missing (#164):** each dial draws an independent drop line through the
+    /// client's own fixed point `R`, and two *distinct* lines through `R` meet in exactly `R`. Two
+    /// colluding services therefore recover the client's point with one cross product, at probability
+    /// `q/(q+1)` that their lines differ at all — 2/3 on the Fano plane, 31/32 at `q = 31`.
+    ///
+    /// That price is **zero**, and the cost model does not cover it: [`route_leaks`] prices naming an
+    /// endpoint at capturing `2t − 1` line members, because a *relay* must work for what it learns. A
+    /// service does no work — it is *given* the reply circuit, since it has to seal replies to it. So the
+    /// receiver's anonymity set against `k ≥ 2` colluding endpoints inside one epoch is **1**, not `q + 1`.
+    ///
+    /// [`route_leaks`]: crate::rendezvous::route_leaks
     Fresh(AnonRouteParams),
 }
 
@@ -436,9 +454,13 @@ impl<R: ServiceResolver> FanosDialer<R> {
     }
 
     /// An **anonymous** dialer with a single fixed `route`: every dial rides threshold onions along it to
-    /// the service's computed meeting line (per-target), hiding both parties' locations. Successive dials
-    /// share the route's intermediate hops, so they are linkable — for a general proxy use
-    /// [`anonymous_fresh`](Self::anonymous_fresh), which draws a new path per dial.
+    /// the service's computed meeting line (per-target), hiding both parties' locations.
+    ///
+    /// **Choose between this and [`anonymous_fresh`](Self::anonymous_fresh) by which adversary you have**,
+    /// because neither dominates and each buys what the other sells (#164). Here: successive dials are
+    /// linkable by an observer watching the shared hops, and **every counterparty receives the same reply
+    /// circuit**, so colluding services have no two lines to intersect. Pick this when the client talks to
+    /// services that might collude and a passive observer is the lesser worry.
     #[must_use]
     pub fn anonymous(
         client: Client,
@@ -457,6 +479,14 @@ impl<R: ServiceResolver> FanosDialer<R> {
     /// from `params`' live mix directory (spec §L5, #54): each connection gets new random forward/reply
     /// hops, so an observer cannot link a client's successive connections by their path — the property a
     /// real anonymity proxy needs. The per-target meeting line is derived from the resolved service key.
+    ///
+    /// **And it sells receiver anonymity against colluding endpoints to buy that (#164).** A fresh route
+    /// per dial means a fresh drop line per dial, every one of them through the client's own fixed point;
+    /// two distinct lines through a point meet in that point alone, so two services comparing notes locate
+    /// the client exactly, for free — they are *handed* the circuits rather than having to capture the
+    /// `2t − 1` line members [`route_leaks`](crate::rendezvous::route_leaks) prices an endpoint at. Against
+    /// that adversary use [`anonymous`](Self::anonymous), which gives every counterparty one and the same
+    /// line. Unlinkability and collusion-resistance are not ordered here; the caller states which it needs.
     #[must_use]
     pub fn anonymous_fresh(client: Client, resolver: R, params: AnonRouteParams) -> Self {
         Self {
