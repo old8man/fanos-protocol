@@ -361,10 +361,33 @@ impl Directory {
         self.inner.read().ok().and_then(|map| map.get(&coord).map(|b| b.addr))
     }
 
-    /// The number of known peers.
+    /// The number of known peers — **the dial book, and not a measure of reach** (#249).
+    ///
+    /// Every binding counts here, including one seeded from spawn order or a bootstrap list that no handshake
+    /// has ever confirmed. That makes `len()` a staircase that rises with acquaintance rather than with
+    /// reachability, which is why the roster-convergence investigation could not use it: it cannot tell "I
+    /// have an address for this point" from "I have reached this point". Use [`routable_points`](Self::routable_points) for
+    /// the second question.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.read().map_or(0, |map| map.len())
+    }
+
+    /// The number of coordinates this node holds a **ranked** binding for — the observable #249 named as its
+    /// prerequisite: *"this node can reach coordinate X"*, counted.
+    ///
+    /// A rank is only ever attached by [`insert_ranked`](Self::insert_ranked) /
+    /// [`insert_claimed`](Self::insert_claimed), which run after a handshake proved the peer's coordinate
+    /// against its certificate ([`crate::coordinate_from_cert`]). A seed address carries none. So this counts
+    /// points backed by evidence, where [`len`](Self::len) counts points backed by hearsay — the same
+    /// distinction [`claim_at`](Self::claim_at) already draws for one point, taken over the whole table.
+    ///
+    /// **It is a level, not a proof of liveness.** A ranked binding says the coordinate *was* proven, not that
+    /// the peer answers now; pairing it with the connection map is a further step. Stated because the failure
+    /// this method exists to unblock came from a number standing in for a neighbouring one.
+    #[must_use]
+    pub fn routable_points(&self) -> usize {
+        self.inner.read().map_or(0, |map| map.values().filter(|b| b.rank.is_some()).count())
     }
 
     /// Whether the directory is empty.
@@ -549,6 +572,32 @@ mod tests {
         let _ = dir.insert(coord, sa(9));
         let _ = dir.insert(coord, sa(8));
         assert_eq!(dir.resolve(coord), Some(sa(8)), "two unranked bindings keep the pre-existing last-writer rule");
+    }
+
+    /// **`routable_points` counts reach; `len` counts acquaintance** — the discriminator #249 named as its
+    /// prerequisite, asserted in both directions so the new method cannot become a second `len` under
+    /// another name.
+    ///
+    /// The failing direction is the one that matters: a table full of seeded addresses must read **zero**
+    /// reachable points. That is exactly the state a fleet is in right after spawn, and reading it as
+    /// progress is what let a stalled roster look like a converging one.
+    #[test]
+    fn routable_points_counts_only_ranked_bindings_where_len_counts_hearsay() {
+        let (a, b) = ([1u32, 0, 0], [0u32, 1, 0]);
+        let (rank, _) = ranks();
+
+        let dir = Directory::new();
+        let _ = dir.insert(a, sa(1));
+        let _ = dir.insert(b, sa(2));
+        assert_eq!(dir.len(), 2, "both seeds are known peers");
+        assert_eq!(dir.routable_points(), 0, "a seeded address is hearsay: no handshake proved either coordinate");
+
+        let _ = dir.insert_ranked(a, sa(3), rank);
+        assert_eq!(dir.len(), 2, "ranking an existing point adds no peer");
+        assert_eq!(dir.routable_points(), 1, "exactly the one point a proof now backs");
+
+        let _ = dir.insert_ranked(b, sa(4), rank);
+        assert_eq!(dir.routable_points(), 2, "and it rises with evidence, not with acquaintance");
     }
 
     #[test]

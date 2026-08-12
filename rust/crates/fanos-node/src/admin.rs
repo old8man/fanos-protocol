@@ -271,6 +271,8 @@ pub fn render_health(health: &Health) -> String {
     let _ = writeln!(s, "coordinate: {x}:{y}:{z}");
     let _ = writeln!(s, "listen: {}", health.local_addr);
     let _ = writeln!(s, "known_peers: {}", health.known_peers);
+    // Beside it deliberately: the contrast is the reading (#249) — acquaintance against reach.
+    let _ = writeln!(s, "routable_points: {}", health.routable_points);
     // Reported unconditionally, including the zero. A counter that appears only when non-zero teaches an
     // operator that its absence means "not measured" — and this is a health signal about the *cell*, since a
     // peer that stops draining is what makes it move (#89).
@@ -755,6 +757,8 @@ mod tests {
             address: [1, 2, 3],
             local_addr: "127.0.0.1:65001".parse().expect("addr"),
             known_peers: 41,
+            // Deliberately BELOW known_peers: the render test must show the contrast, not two equal numbers (#249).
+            routable_points: 17,
             reflexive: false,
             send_drops: 43,
             collisions: 44,

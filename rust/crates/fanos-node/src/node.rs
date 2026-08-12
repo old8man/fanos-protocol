@@ -935,6 +935,16 @@ pub struct Health {
     pub local_addr: SocketAddr,
     /// The number of peers currently in the address book.
     pub known_peers: usize,
+    /// Points this node holds a **ranked** binding for — what it can route to, as distinct from what it has
+    /// heard of (#249).
+    ///
+    /// The pair with [`verified_claims`](Self::verified_claims) is the point, and they are counted in
+    /// different structures on purpose: that is the *claim book* — peers whose coordinate proof this node
+    /// checked — while this is the *dial table*. They diverge exactly where the roster investigation stalls.
+    /// A claim verified but refused by the arbitration rule (`WriteOutcome::Superseded`) raises the first and
+    /// not the second: the node knows the peer and cannot route to its point. `known_peers` sees neither
+    /// case, because it counts seeded addresses too.
+    pub routable_points: usize,
     /// Whether this node has a **reflexive layer** at all — a coherence self-model, a liveness diagnosis and
     /// the §6.7 self-healing actions (#145).
     ///
@@ -1402,6 +1412,7 @@ impl Node {
             probe_index: self.directory.claim_at(address).map(|(index, _)| index),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
+            routable_points: self.directory.routable_points(),
             reflexive: self.reflexive,
             // The absence of a persister IS the `NotConfigured` answer — there is no other way to be without
             // one — so the two sources cannot disagree about which of the three states this node is in.
