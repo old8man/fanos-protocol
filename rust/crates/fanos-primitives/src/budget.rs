@@ -15,11 +15,12 @@
 //! | exit datagrams | 16 MiB | named in #254 — spent all along, counted only now |
 //! | proxy client buffers | 8 MiB | named in #254 — and the naming is what created the bound (#207 widened it) |
 //! | threshold router queues | 40 MiB | named in #294 — one of the two was spent all along, the other had no bound |
+//! | relayed UDP tunnel backlog | 16 MiB | derived in #300 as a FLOOR — no ceiling is purchasable, so it is metered |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
 //! | inbound QUIC credit | **2.00 GiB, contingent** | `fanos_quic::inbound_credit_ceiling()` (#245, #207) |
 //!
-//! So the named shares plus the measured resident cost are **365 MiB against a 256 MiB recommendation** — a
-//! 109 MiB overcommit before the transport takes a byte.
+//! So the named shares plus the measured resident cost are **381 MiB against a 256 MiB recommendation** — a
+//! 125 MiB overcommit before the transport takes a byte.
 //!
 //! **The last row used to read "unnamed", and "unnamed is not zero; it is unbounded".** Both halves were true
 //! when this table was written and neither is now: #245 replaced quinn's `VarInt::MAX` receive window with
@@ -33,6 +34,11 @@
 //! `1024 × 2 × 64 × 65535` = **8.6 GB per association**, with `MAX_ASSOCIATIONS = 128` of them. One tunnel's
 //! worst case is the entire 8 MiB proxy share. It is picked by a *local* runaway application rather than a
 //! remote peer, which is why looking only at what an adversary controls missed it (#300).
+//!
+//! That figure is now what the queues *could* hold and not what they may: #300 meters them against
+//! [`TUNNEL_BACKLOG_SHARE`]. The correction above stands as written because it is a record of a wrong claim,
+//! not a description of today — but a reader reaching this paragraph for the current bound should take it
+//! from that share.
 //!
 //! It is nonetheless **not** a share and is absent from [`allocated`] on purpose. Every other row is
 //! *steady*: a full store really does hold 128 MiB, and a full store is ordinary operation. Flow-control
@@ -48,8 +54,8 @@
 //! constant is outside what that scan can see, and no green run could have said so.
 //!
 //! **The overcommit rising is the module working, not the node getting heavier.** It read 45 MiB when three
-//! shares were named, 61 once the exit's receive buffers were, and 109 once the router's were; nothing was
-//! allocated at any of those steps — see each share's own doc for which of the two reasons applies. Every
+//! shares were named, 61 once the exit's receive buffers were, 109 once the router's were, and 125 once the
+//! tunnel backlog was; nothing was allocated at any of those steps — see each share's own doc for which of the two reasons applies. Every
 //! future naming moves it the same way, and a reader who treats the figure as a health score rather than as
 //! a coverage report will draw the opposite conclusion from the one the evidence supports.
 //!
@@ -62,9 +68,22 @@
 //! node budget, and a quantity #247 never measured.
 //!
 //! Two costs, one exemption, granted on the one that was fixed. The proxy has the same pair and the same
-//! `UdpTunnel::pair` call, at `2 × 64 × 65535` = **8 MiB per tunnel** — one tunnel's worst case is the whole
-//! proxy share. Neither is in [`allocated`]; both are contingent in the way the QUIC credit is. That is
-//! #300, and until it is decided this table under-reports by more than everything in it.
+//! `UdpTunnel::pair` call, at `2 × 64 × 65535` = **8 MiB per tunnel** — one tunnel's worst case was the
+//! whole proxy share.
+//!
+//! **#300 closed it, and the resolution changed what kind of quantity this is.** The figures above are
+//! products of ceilings, and no share can buy one: giving the datapath the *entire* node budget funds depth
+//! 26 of the declared 64, and the flow cap and the depth are both already spoken for. So the queue stopped
+//! being sized against its worst case and started being *metered*. Every datagram debits
+//! [`TUNNEL_BACKLOG_SHARE`] for its **actual** bytes at enqueue and repays on consumption, which makes the
+//! share a bound on concurrent backlog — a quantity the node can afford — and lets the share be derived as
+//! a FLOOR: enough for every admitted flow to hold one datagram each way. The 656 MB and the 8 MiB survive
+//! only as ratchets in `fanos-vpn` and `fanos-proxy`, pinning what the queues *could* hold if nothing
+//! debited them.
+//!
+//! It is therefore in [`allocated`] now, unlike the QUIC credit, and the difference is worth stating: that
+//! credit is a ceiling a peer can drive us to and nobody meters, this is a pool we hand out and take back.
+//! A contingent term and a metered one look alike in a table and behave nothing alike under load.
 //!
 //! ## Why this module states the deficit instead of removing it
 //!

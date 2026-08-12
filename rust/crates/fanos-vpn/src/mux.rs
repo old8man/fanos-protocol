@@ -142,10 +142,12 @@ mod tests {
     /// an argument rather than assuming one — a single constant would have silently handed the VPN the
     /// proxy's 51x figure.
     ///
-    /// **No share covers this, deliberately.** `fanos_primitives::budget` exempts the VPN because its cost
-    /// is per-flow and a deployment chooses the flow count; the exemption names the per-flow costs, and the
-    /// queue was not among them until #300. Pinned here so the omission is a number an operator can read
-    /// rather than an absence.
+    /// **This is what the queues COULD hold, not what they may.** When it was first pinned, no share covered
+    /// it at all: the VPN was exempt from the register because its cost is per-flow and a deployment picks
+    /// the flow count, and the tunnel queue was not among the per-flow costs that exemption named. #300
+    /// closed that — `TUNNEL_BACKLOG_SHARE` meters the queues by actual bytes — so this number is now a
+    /// ratchet on the ceiling rather than a report of an unfunded quantity. It stays because the ceiling
+    /// moving is still worth a build failure: it is the figure that decides whether metering is required.
     /// **The share the budget grants must at least cover one datagram per direction per admitted flow.**
     ///
     /// This is the reader `TUNNEL_BACKLOG_SHARE` needs — a share named and never checked against the thing
@@ -232,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tunnel_queues_are_a_per_client_quantity_no_share_carries() {
+    fn the_per_client_queue_ceiling_the_share_is_metered_against() {
         let ceiling = fanos_proxy::budget::tunnel_queue_ceiling(
             MAX_UDP_FLOWS,
             MAX_QUEUED_PAYLOAD,
