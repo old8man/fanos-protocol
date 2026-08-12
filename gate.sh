@@ -84,9 +84,18 @@ run() {
 #
 # `${A[@]+"${A[@]}"}` and not `"${A[@]}"`: under `set -u`, bash 3.2 (what macOS ships) treats an empty array
 # expansion as an unbound variable, so a full run would have died before its first step.
+#
+# **The emptiness that matters is the SELECTION's, not this function's**, and the check was on the wrong one
+# — one line above where it belonged. Every call passes the group name, so `$#` here is never 0 and the guard
+# never fired: `./gate.sh` with no arguments, the form this file's own USAGE calls "everything below",
+# matched nothing and gated nothing. Shift the name off first, and what remains IS the selection.
+#
+# Note the shape, because the comment above describes the *same* defect one fix earlier: `GROUPS` was a bash
+# built-in, the assignment did nothing, and a bare run matched no group. That fix renamed the array and left
+# this half standing — the guarded path and its unguarded twin, inside six lines.
 want() {
-  [ "$#" -eq 0 ] && return 0
   local g="$1"; shift
+  [ "$#" -eq 0 ] && return 0
   for a in "$@"; do [ "$a" = "$g" ] && return 0; done
   return 1
 }
