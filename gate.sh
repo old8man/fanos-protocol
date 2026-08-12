@@ -221,6 +221,13 @@ if want tests ${SELECT[@]+"${SELECT[@]}"}; then
   # the feature cost 131 s + 93 s of integration time for a delta that is one subcommand's wiring, already
   # linted. If that wiring grows real logic, this phase should grow with it.
   run test-vpn         test -p fanos-vpn --features device --no-fail-fast
+  # Same shape, second member. `--list` measures it: fanos-telemetry has 45 tests by default and 46 with
+  # `sysinfo`, the extra one being `sysmetrics::tests::sysinfo_probe_reads_real_vitals_in_range` — the only
+  # check that the REAL host probe returns plausible numbers rather than the fixture's. The other two
+  # single-clippy features are clean and were checked the same way: `fanos-observatory --features sim` is
+  # 22/22 (the feature gates the `fanos-lab` BINARY via required-features, adding no tests) and
+  # `fanos-wasm --features wasm` is 3/3.
+  run test-sysinfo     test -p fanos-telemetry --features sysinfo --no-fail-fast
 fi
 
 if want run ${SELECT[@]+"${SELECT[@]}"}; then
