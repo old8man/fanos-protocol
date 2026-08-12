@@ -2867,6 +2867,22 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // the honest encoding of what was proved, and it yields to the peer's own ranked claim —
                     // which is better evidence than our observation and may already be present, in which
                     // case this write is correctly a no-op.
+                    //
+                    // **MEASURED COST OF THIS DECISION, 2026-08-12 (#249).** The argument above is sound and
+                    // stays. What it never stated is the price when the peer's own ranked claim does not
+                    // arrive. A 7-node cell forced to draw a collision resolved it correctly — 7 distinct
+                    // points, six at probe index 0 and one advanced to 1 — and every node verified 5–7 peers'
+                    // claims. Each dial table still held exactly ONE ranked binding: `route [1,1,1,1,1,1,1]`,
+                    // which is the node's own, written by `insert_claimed` on its own coordinate. Nothing a
+                    // peer proves to us ever becomes routable, and the roster never agreed (`agreed=None`).
+                    //
+                    // That is not a defect in this rule — it is a gap in what the wire carries. `PeerClaimed`
+                    // omits the probe index deliberately, and until it carries one (with its own proof, so a
+                    // witness still cannot be unfolded) a verified claim cannot become a ranked binding. Same
+                    // shape as #13 and #143: the field a decision needs is absent from the frame, so the
+                    // decision degrades to the honest-but-inert answer. Fabricating index 0 here is exactly
+                    // what the paragraph above forbids, and stays forbidden.
+                    //
                     // The outcome is deliberately not branched on, because all three lead here anyway and
                     // the *send* has already failed above regardless: `Bound` recorded the peer's new
                     // address, `Unchanged` means it was already known, and `Superseded` means the peer's own

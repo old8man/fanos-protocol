@@ -1022,7 +1022,8 @@ remaining two rows the same way — look for claims that no assertion checks, no
 - **Not the cause** (each measured, do not re-test): placement — trials reach 7 of 7 distinct with nodes visibly advanced along
   their probe walks; claim propagation — 3–7 peers' claims verified per node; the three-valued read fix — already in
   (`Scan<T>`, `role_loop::may_relax`), and it is what made the injective case converge.
-- **Not established:** `known_peers` is `Directory::len()` (the dial book, seeded in spawn order — a staircase even when
+- **MEASURED 2026-08-12, and it names the cause.** With the observable built (`Directory::routable_points`, `Health::routable_points`), a forced-collision trial reads: `7 distinct of 7`, `index [0,0,0,0,0,0,1]`, `claims [5,6,6,6,6,7,6]`, **`route [1,1,1,1,1,1,1]`**, `agreed=None`. Collision resolution WORKS and propagation WORKS; each node can route to exactly one point — its own. A verified peer claim never becomes a ranked binding, because `insert_ranked` needs `(rank, probe index)` and `PeerClaimed` omits the index on purpose (`driver.rs` ~2861, so verifying a witness cannot unfold its chain). **The residual is a WIRE field, not a directory fix** — same shape as #13 and #143.
+- **Superseded, kept for the record:** `known_peers` is `Directory::len()` (the dial book, seeded in spawn order — a staircase even when
   converged), so it cannot carry the conclusion. **Prerequisite: an observable meaning "this node can reach coordinate X".**
 - `NodeFleet::spawn`'s injective draw stays until a forced-collision run reaches `agreed`.
 
