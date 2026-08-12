@@ -11,9 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// IPv4/IPv6 protocol / next-header number for UDP.
 pub const IPPROTO_UDP: u8 = 17;
-const IPV4_HEADER_LEN: usize = 20;
-const IPV6_HEADER_LEN: usize = 40;
-const UDP_HEADER_LEN: usize = 8;
+pub(crate) const IPV4_HEADER_LEN: usize = 20;
+pub(crate) const IPV6_HEADER_LEN: usize = 40;
+pub(crate) const UDP_HEADER_LEN: usize = 8;
 
 /// A parsed UDP datagram: source and destination `(address, port)` and the UDP payload. The address family
 /// (v4/v6) is carried in the [`IpAddr`], so the flow engine is version-agnostic.

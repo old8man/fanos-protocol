@@ -39,6 +39,28 @@ pub const MAX_UDP_FLOWS: usize = 4096;
 /// feature cannot be summed by anything that does not enable it.
 pub const STACK_MTU: u16 = 1280;
 
+/// The largest item this module can put in a tunnel queue: a UDP **payload**, not a link-sized packet.
+///
+/// **Derived, and the derivation is the correction.** `run_udp_datapath` queues `payload` — the bytes
+/// `parse_udp_body` returns *after* the UDP header, from a packet that already lost its IP header. So the
+/// ceiling is `STACK_MTU - IP header - UDP header`, and IPv4 is the worst case because its header is 20 B
+/// against IPv6's 40, leaving MORE payload at the same MTU.
+///
+/// #300's first ratchet pinned `STACK_MTU` itself and was wrong by 2.2% — small in the number, total in the
+/// meaning: a ratchet on the link MTU verifies a quantity this module never queues, and tells the next
+/// reader to re-derive from the wrong factors. `fanos_primitives::budget`'s own header had it right at
+/// `~1252` all along; the two numbers only disagreed out loud because both were written down.
+pub const MAX_QUEUED_PAYLOAD: usize =
+    STACK_MTU as usize - crate::packet::IPV4_HEADER_LEN - crate::packet::UDP_HEADER_LEN;
+
+/// IPv4 is the worst case: at one MTU it leaves more payload than IPv6, so sizing on it covers both.
+const _: () = assert!(
+    STACK_MTU as usize - crate::packet::IPV6_HEADER_LEN - crate::packet::UDP_HEADER_LEN
+        < MAX_QUEUED_PAYLOAD,
+    "IPv6 was expected to leave less payload than IPv4 at one MTU; if that changed, the ceiling must be the \
+     max of the two rather than the IPv4 figure"
+);
+
 /// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
 struct Flow {
     outbound: mpsc::Sender<Vec<u8>>,
@@ -116,7 +138,7 @@ mod tests {
     /// The tunnel queue is the same object as the proxy's — `UdpTunnel::pair(UDP_TUNNEL_BUFFER)`, one call
     /// site — so the depth is shared. What differs is the **ceiling on a queued item**, and that is set by
     /// the producer, not the channel: the proxy reads a UDP socket and can push 65535 bytes, this crate
-    /// reads a TUN device and cannot exceed [`STACK_MTU`]. Hence `tunnel_queue_ceiling` takes the ceiling as
+    /// reads a TUN device and cannot exceed [`MAX_QUEUED_PAYLOAD`]. Hence `tunnel_queue_ceiling` takes the ceiling as
     /// an argument rather than assuming one — a single constant would have silently handed the VPN the
     /// proxy's 51x figure.
     ///
@@ -128,12 +150,13 @@ mod tests {
     fn the_tunnel_queues_are_a_per_client_quantity_no_share_carries() {
         let ceiling = fanos_proxy::budget::tunnel_queue_ceiling(
             MAX_UDP_FLOWS,
-            STACK_MTU as usize,
+            MAX_QUEUED_PAYLOAD,
         );
         println!("one client's tunnel queues: {ceiling} B ({} MiB)", ceiling >> 20);
         assert_eq!(
-            ceiling, 671_088_640,
-            "the per-client queue ceiling moved. MAX_UDP_FLOWS x 2 x UDP_TUNNEL_BUFFER x STACK_MTU — \
+            ceiling, 656_408_576,
+            "the per-client queue ceiling moved. MAX_UDP_FLOWS x 2 x UDP_TUNNEL_BUFFER x \
+             MAX_QUEUED_PAYLOAD — \
              re-derive rather than re-pin, and check whether #300's byte debit makes this obsolete"
         );
 
