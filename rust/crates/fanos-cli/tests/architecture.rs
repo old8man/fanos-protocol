@@ -1764,3 +1764,75 @@ fn no_cryptographic_crate_is_duplicated_without_a_stated_cause() {
          one: {stale:?}"
     );
 }
+
+/// **The data-path plane is node-local, and that is held by two structural facts rather than by care.**
+///
+/// A `Station` count carries a `tag` — a dimension the count is split by, and in the threshold router
+/// twelve of those tags are a COORDINATE. Differential privacy calibrates noise to the sensitivity of a
+/// counter; exporting a counter split by a tag under the budget computed for the unsplit one is not weaker
+/// privacy, it is none: fewer cells per group, the same noise. So the question "can a station observation
+/// reach a published surface" has to be answerable, and today the answer is no for two reasons that are
+/// each one line from being undone:
+///
+/// 1. **`Observation` does not derive `Wire`.** It cannot be encoded onto a frame at all — the boundary is
+///    a missing impl, not a rule somebody follows.
+/// 2. **`fanos-telemetry` does not depend on `fanos-ports`.** The DP export and the history snapshot
+///    cannot so much as name the type. `snapshot.rs` states this in prose — "station counts stay
+///    node-local", "adding them would be a defect rather than an omission" — and prose is what this
+///    replaces.
+///
+/// Both are asserted, because either alone is insufficient: a `Wire` derive would let a frame carry it
+/// past a crate boundary that no longer matters, and a dependency edge would let the exporter reach it
+/// without any wire at all.
+///
+/// The local reader (`fanos-node`'s admin socket, a `UnixListener`) is deliberately NOT restricted. Tags
+/// are what make a refusal legible to an operator (#209, #256); the property being pinned is the
+/// **surface**, not the tagging.
+#[test]
+fn a_station_observation_cannot_reach_a_published_surface() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let stations = std::fs::read_to_string(root.join("crates/fanos-ports/src/stations.rs"))
+        .expect("the stations module is readable");
+
+    // FACT 1: the observation type is not encodable.
+    let observation_derive = stations
+        .split("pub struct Observation")
+        .next()
+        .and_then(|before| before.rsplit("#[derive(").next())
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        !observation_derive.contains("Wire"),
+        "`Observation` now derives Wire (`{}`), so a frame can carry a station count and its tag off this \
+         node. The tag is a dimension the count is split by — twelve of them are a coordinate — and no \
+         export path budgets for a split counter. If this is intended, the DP sensitivity has to be \
+         recomputed for the SPLIT counter first (#8, #278).",
+        observation_derive.trim(),
+    );
+
+    // CONTROL for fact 1: the scan can see a derive that IS there, so the absence of `Wire` above is a
+    // fact about the declaration rather than about a split that matched nothing.
+    assert!(
+        observation_derive.contains("Debug"),
+        "the derive scan read `{observation_derive}` and did not find `Debug` — it is not looking at \
+         `Observation`'s derive list, so its silence about `Wire` means nothing",
+    );
+
+    // FACT 2: the exporter cannot name the type.
+    let telemetry = std::fs::read_to_string(root.join("crates/fanos-telemetry/Cargo.toml"))
+        .expect("the telemetry manifest is readable");
+    assert!(
+        !telemetry.contains("fanos-ports"),
+        "`fanos-telemetry` now depends on `fanos-ports`, so `dp.rs`'s export and `history.rs`'s snapshot \
+         can reach `Observation` directly — no wire needed. `snapshot.rs` says station counts stay \
+         node-local and that adding them 'would be a defect rather than an omission'; this is that \
+         sentence with teeth.",
+    );
+
+    // CONTROL for fact 2: the manifest really is the one that lists this crate's dependencies, so the
+    // absence above is not a fact about an empty or misread file.
+    assert!(
+        telemetry.contains("fanos-diakrisis") || telemetry.contains("[dependencies]"),
+        "the telemetry manifest read has no dependency section — the `fanos-ports` check above is vacuous",
+    );
+}
