@@ -30,6 +30,28 @@ set -u
 
 cd "$(dirname "$0")/rust" || exit 2
 
+# MEASURED, 2026-08-12 (#286). One full `tests` run grows `target` by ~44 GB: `debug/deps` +37 GB and
+# `debug/incremental` +6.7 GB. The gate compiles each crate exactly ONCE per run, so the incremental cache buys
+# it nothing — that cache pays off in the edit-run-edit loop, which is not what this script does. Turning it off
+# is 6.7 GB per run for free.
+#
+# It is NOT the fix for the accumulation, and saying so would be lying by a factor of five. Cargo never removes
+# a superseded artefact: every fingerprint change leaves the old `.rlib` in `deps` forever, which is where the
+# other 37 GB goes. That needs pruning by age (`cargo-sweep`), and until it exists the floor below is what
+# stands between this repo and the failure it already caused once.
+export CARGO_INCREMENTAL=0
+
+# A run needs ~44 GB of headroom, so refuse below 50. Derived from the measurement above plus one run's slack,
+# not chosen: at 0 bytes free the harness cannot even create a file, `bash` stops working entirely, and the
+# session that discovers this cannot run the `rm` that would fix it. Failing loudly here costs one message;
+# failing there cost an hour and a hand-written instruction to the operator.
+FREE_GB=$(df -g . 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${FREE_GB:-}" ] && [ "$FREE_GB" -lt 50 ]; then
+  echo "REFUSING TO START: ${FREE_GB} GB free, a full run needs ~44 GB (measured #286)." >&2
+  echo "  du -h -d 1 $(pwd)/target   # then prune debug/incremental (safe) or debug/deps (costs a rebuild)" >&2
+  exit 4
+fi
+
 FAILED=0
 SUMMARY=()
 
