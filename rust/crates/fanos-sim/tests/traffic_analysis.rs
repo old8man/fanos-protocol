@@ -658,11 +658,25 @@ fn the_defence_reduces_flow_matching_far_but_not_to_chance() {
     //     (`measure_whether_the_score_matrix_is_degenerate`, which also refutes degeneracy — every series
     //     has healthy variance and `pearson`'s constant guard never fires).
     //
-    // So the matrix carried information with the wrong SIGN, and an adversary that assigns the WEAKEST
-    // correlation first exploits it. Measured over 60 seeds: **0.297 against a chance of 0.20** — 89 correct
-    // out of 300 assignments where 60 are expected, `z ~ 3.7`, `p ~ 1e-4`. The undefended control is the
-    // discriminator that makes this a reading about the channel rather than about the code: there the same
-    // minimising adversary scores 0.000 while maximising scores 1.000, so the sign convention is right.
+    // **And the mechanism, measured rather than inferred — the SIGNED matrix rules out the obvious story.**
+    // If the defence merely inverted the correlation (a real forward displacing a cover slot, say), the
+    // diagonal would be systematically negative. It is not: `+0.006, +0.069, +0.151, -0.053, -0.112`, mixed
+    // signs and all near zero, while off-diagonal entries reach `±0.28`.
+    //
+    // So the defence does exactly what it was built to do — it **destroys the true pair's correlation** —
+    // and it does *not* destroy the spurious correlation between unrelated series. Being **uncorrelated is
+    // therefore itself the signature**, and `|r|` ranks surviving noise above a destroyed signal. That is
+    // why maximising fails (0.017) and minimising succeeds: nearest-to-zero identifies the true pair.
+    //
+    // Measured over 60 seeds: **0.297 against a chance of 0.20** — 89 correct out of 300 assignments where
+    // 60 are expected, `z ~ 3.7`, `p ~ 1e-4`. The undefended control is what makes this a reading about the
+    // channel rather than about the code: there the same minimising adversary scores 0.000 while maximising
+    // scores 1.000.
+    //
+    // The design consequence is worth stating where the number is: a defence that drives the true pair to
+    // zero while leaving everyone else at `±0.2` has not hidden the pair, it has **labelled** it. Making the
+    // true pair look like the others — rather than like nothing — is a different requirement from removing
+    // its correlation, and this harness is now able to tell the two apart.
     //
     // The defence is therefore strong but NOT anonymising to chance, and the old name claimed the opposite.
     assert!(
@@ -764,11 +778,11 @@ fn measure_whether_the_score_matrix_is_degenerate() {
             let m = s.iter().sum::<f64>() / n;
             s.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n
         };
-        println!("\n=== {name} ===");
+        println!("\n=== {name} === (SIGNED r, so displacement shows as a minus)");
         for (i, e) in entries.iter().enumerate() {
             print!("entry {i} (var {:.4}, sum {:>5.0}): ", variance(e), e.iter().sum::<f64>());
             for x in &exits {
-                print!("{:>7.3} ", pearson(e, x).abs());
+                print!("{:>+7.3} ", pearson(e, x));
             }
             println!();
         }
