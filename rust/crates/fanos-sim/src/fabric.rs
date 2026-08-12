@@ -1687,10 +1687,14 @@ mod tests {
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
             let peers: Vec<_> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
             let route: Vec<_> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
+            // The FIFTH reading, and it says what the fourth is worth (#289): a roster count from an incomplete
+            // scan is a race the next epoch settles; the same count from a complete one is the cell deciding on
+            // an input its members do not share. Without it `agreed=None` names no cause.
+            let complete: Vec<_> = fleet.nodes().iter().map(|n| n.assignment().complete).collect();
             fleet.shutdown().await;
             let roster = trace.map(|a| a.roster);
             println!(
-                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} route {route:?} peers {peers:?} → final rosters {:?} agreed={:?}",
+                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} route {route:?} peers {peers:?} complete {complete:?} → final rosters {:?} agreed={:?}",
                 distinct.len(),
                 roster.last(),
                 roster.stable_agreement_at().map(|d| d.as_secs())

@@ -449,11 +449,23 @@ pub struct Assignment {
     pub roster: usize,
     /// The epoch it was computed for.
     pub epoch: Epoch,
+    /// Whether the directory scans behind [`roster`](Self::roster) were **complete** (#289).
+    ///
+    /// The count alone cannot be judged, and that is not a nicety. When two nodes report different rosters
+    /// there are two worlds needing opposite responses: both scans complete and genuinely disagreeing means
+    /// the cell is deciding on an input its members do not share (the #130 shape); one scan incomplete means
+    /// a race that the next epoch settles, and there is no defect at all. Without this the two are one
+    /// number and an observer must guess.
+    ///
+    /// It was computed all along — `assign_epoch` returns `caps_complete && load_complete` and the refresh
+    /// tick feeds it to the backoff — so this adds no measurement, only a READER. A value that steers
+    /// control and reaches no observer is the shape this tree keeps finding.
+    pub complete: bool,
 }
 
 impl Assignment {
     /// The empty assignment, before the first one is computed.
-    pub const NONE: Self = Self { roles: RoleSet::EMPTY, roster: 0, epoch: Epoch::ZERO };
+    pub const NONE: Self = Self { roles: RoleSet::EMPTY, roster: 0, epoch: Epoch::ZERO, complete: false };
 
     /// Whether this node saw **no other member** — so the assignment is its own guess, not the cell's decision.
     ///
@@ -575,13 +587,15 @@ impl LiveRoleController {
         epoch: Epoch,
         beacon: &BeaconSeed,
         setpoint: Demand,
+        // Whether the scans that produced `members` were complete — see `Assignment::complete`.
+        complete: bool,
     ) -> Assignment {
         self.last_agreed = Some(setpoint);
         let weighted = self.reputation.adjust(members);
         let report = fanos_core::roles::assign_report(&weighted, epoch, beacon, self.demand_for(setpoint));
         self.last_deficit = report.deficit;
         let roles = report.roles.get(&self.node_id).copied().unwrap_or(RoleSet::EMPTY);
-        Assignment { roles, roster: members.len(), epoch }
+        Assignment { roles, roster: members.len(), epoch, complete }
     }
 
     /// This node's own identity — what a published record must name for this node to be in it.
@@ -1278,7 +1292,9 @@ async fn assign_epoch<F: Field>(
     // the roster was computed inside this function at one instant and the peer count read from outside at a
     // later one, so the address book had grown in between. The sound version of that measurement is taken
     // *here*, where both values are read together, and it has not been taken. See #151.
-    let roles = live.step(&members, epoch, &beacon, setpoint);
+    // The completeness the caller already computed travels WITH the count it qualifies, instead of being
+    // consumed for backoff and then dropped (#289).
+    let roles = live.step(&members, epoch, &beacon, setpoint, caps_complete && load_complete);
     note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
     (roles, caps_complete && load_complete)
@@ -1563,7 +1579,7 @@ mod tests {
         );
 
         // An unread new value is still a live controller — a settled cell reassigns nothing for epochs.
-        let _ = tx.send(Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1) });
+        let _ = tx.send(Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1), complete: true });
         assert_eq!(org.standing(), RoleStanding::Deciding, "an unread update is not a dead writer");
 
         drop(tx); // what a panic, a cancellation and a clean return all do
@@ -1574,7 +1590,7 @@ mod tests {
         );
         assert_eq!(
             *org.assigned.borrow(),
-            Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1) },
+            Assignment { roles: RoleSet::EMPTY, roster: 5, epoch: Epoch(1), complete: true },
             "and the frozen value is STILL readable — that is exactly why it needs the state beside it"
         );
     }
@@ -2018,7 +2034,7 @@ mod tests {
         let mut demand_after = 0;
         for i in 0..5u8 {
             let mut live = LiveRoleController::new(node(i), ctrl());
-            if live.step(&members, Epoch::new(1), &beacon, setpoint).roles.has(Role::Relay) {
+            if live.step(&members, Epoch::new(1), &beacon, setpoint, true).roles.has(Role::Relay) {
                 active += 1;
             }
             demand_after = live.demand().of(Role::Relay);
@@ -2054,9 +2070,9 @@ mod tests {
                         RoleController::new(Demand::default(), Demand::default(), GAIN),
                     );
                     for &(e, n) in history {
-                        live.step(&members, Epoch::new(e), &beacon, sp(n));
+                        live.step(&members, Epoch::new(e), &beacon, sp(n), true);
                     }
-                    live.step(&members, Epoch::new(6), &beacon, sp(5)).roles.has(Role::Relay)
+                    live.step(&members, Epoch::new(6), &beacon, sp(5), true).roles.has(Role::Relay)
                 })
                 .count()
         };
