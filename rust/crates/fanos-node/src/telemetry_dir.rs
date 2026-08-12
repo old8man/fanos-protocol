@@ -494,7 +494,30 @@ mod tests {
 /// it has a stated cost: frames are not publisher-bound (see `coherence_record`), so one forged frame can
 /// carry a cell to its worst level. `disagreed` is what tells an operator not to trust a single level, and
 /// the honest summary is that a census is a lead to follow, never an input to anything automatic.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// ## Every published level is a **model's** level, so the observer's own cell is not read from the wire
+///
+/// The frames this reads are the ε-private exports, and `privatize` re-derives `Φ`, `P` and the alarm from
+/// one released scalar by rebuilding an **equicorrelated** cell (`dp.rs`). So a published alarm is the flat
+/// model's verdict about a cell that does not exist, not the publisher's own reading — and the difference is
+/// not academic. Measured over 3636 cells spanning six shapes × six dispersions × 101 exchange strengths
+/// (`fanos-telemetry/tests/privatized_stratum.rs`, at ε = 10⁹ so noise is out of it):
+///
+/// - **0** cells had a real alarm hidden by the export, and
+/// - **100** (2.8%) had one *invented* — every single one a `Healthy` cell exported as `Structure`, the
+///   most severe level, skipping `Integration` entirely.
+///
+/// The direction is the safe one, and this type errs that way everywhere else too. But a `worst` fold means
+/// **one** member landing in that band carries the whole cell, so a healthy cell reads as below-viability
+/// with probability at least the per-frame rate.
+///
+/// Against a *foreign* cell that cost is what ε buys and there is nothing to do about it. Against the
+/// observer's **own** cell it is paid for nothing: the node has the exact frame from its own reflexive loop,
+/// and reading its own export back out of the directory is paying the model cost for privacy against itself.
+/// So [`Census::new`] takes that local frame, the own cell's level comes from it, and the published frames
+/// for that cell are still folded — to report whether they **disagreed** with it, which is this defect class
+/// becoming visible in production rather than only in a test (#278).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Census {
     /// One entry per **distinct cell** that answered — never per coordinate.
     cells: Vec<CellReading>,
@@ -505,6 +528,8 @@ pub struct Census {
     silent: usize,
     /// Coordinates whose read did not conclude. **Not** a negative and not evidence of anything — a timeout.
     unreachable: usize,
+    /// The observer's own cell, read **exactly** from its own reflexive loop rather than through the export.
+    own: Option<OwnReading>,
 }
 
 /// One cell's reading, folded from however many of its members answered.
@@ -515,6 +540,23 @@ struct CellReading {
     worst: AlarmLevel,
     /// Whether members disagreed about their own cell's level.
     disagreed: bool,
+}
+
+/// The observer's own cell, as its own engine sees it — no export, no model substitution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnReading {
+    id: CellId,
+    /// The alarm the node's **exact** frame carries.
+    level: AlarmLevel,
+    /// Whether any published frame for this same cell carried a different level.
+    ///
+    /// Not a fault on its own — members legitimately measure the cell differently, and #280 already counts
+    /// that as `disagreed`. What makes this one worth its own field is that it is the only place the ε-export's
+    /// **model** error is observable on a running node: the published frames and this reading describe the
+    /// same cell in the same window, so a difference is either a peer seeing something this node does not, or
+    /// the flat rebuild inverting a verdict. An operator who sees it set knows not to act on the published
+    /// level alone.
+    export_disagreed: bool,
 }
 
 /// How bad a level is, as a number that can be compared.
@@ -535,6 +577,12 @@ const fn severity(level: AlarmLevel) -> u8 {
 /// deployment is actually in, and it is neither "the network is sick" nor "the network is well" — it is *the
 /// question cannot be answered from here*. It still carries the cell's own alarm, because that half **is**
 /// actionable and suppressing it would trade one silence for another.
+///
+/// "The cell's **own** alarm" was false when it was written and is true now. The level came from the
+/// published frames, which are ε-private exports of a flat rebuild — a model's verdict about the cell, and
+/// one measured to invent a `Structure` alarm on a healthy cell in 2.8% of the swept parameter space. When
+/// the single cell is the observer's own, the level now comes from [`Census::new`]'s local exact frame; the
+/// published fold is still reported, and disagreeing with it is its own line (#278).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Verdict {
@@ -563,6 +611,15 @@ impl core::fmt::Display for Census {
         writeln!(f, "cells_whose_members_disagreed: {}", self.disagreed())?;
         writeln!(f, "coordinates_silent: {}", self.silent)?;
         writeln!(f, "coordinates_unreachable: {}", self.unreachable)?;
+        // The two lines that say which epistemology the own-cell level came from. `unknown` is not "healthy"
+        // and not "alarmed" — it is this node having no observation window of its own yet, in which case
+        // every level above is a model's.
+        writeln!(
+            f,
+            "own_cell_local_level: {}",
+            self.own_level().map_or("unknown", AlarmLevel::as_str)
+        )?;
+        writeln!(f, "own_cell_export_disagreed: {}", self.own_export_disagreed())?;
         // Stated rather than left to arithmetic: the verdict is over the cells that *answered*, and saying so
         // is what stops a reader treating the silent ones as a vote either way.
         writeln!(
@@ -584,7 +641,78 @@ impl core::fmt::Display for Census {
 }
 
 impl Census {
+    /// Start a census that will answer about the observer's own cell from `own` — its **exact**, un-exported
+    /// coherence frame — and about every other cell from what those cells published.
+    ///
+    /// `own` is a required argument rather than a builder call or a `Default`, because a census composed
+    /// without it is not merely less informative: it answers about the observer's own cell with the flat
+    /// model's verdict, which is the defect this argument exists to close. A caller that genuinely has no
+    /// local reading — the node's engine has not completed an observation window, or the census is being
+    /// taken by a tool that is not a cell member — has to write `None` and thereby say so
+    /// ([[opt-in-security-defaults-off]]).
+    #[must_use]
+    pub fn new(own: Option<&CoherenceFrame>) -> Self {
+        Self {
+            cells: Vec::new(),
+            answering_coordinates: 0,
+            silent: 0,
+            unreachable: 0,
+            own: own.map(|f| OwnReading {
+                id: f.cell_id,
+                level: f.alarm(),
+                export_disagreed: false,
+            }),
+        }
+    }
+
+    /// Every cell this census can state a level for, and the level it states.
+    ///
+    /// The one place the substitution happens, so no reader can take a published level for the observer's
+    /// own cell by forgetting to ask. Two rules, both needed:
+    ///
+    /// - the observer's own cell reports its **local** level, never the published fold;
+    /// - the observer's own cell is present even if no coordinate published for it, because the observer
+    ///   has the reading directly. Without this a totally silent directory would answer `NoReading` on a
+    ///   node that is looking straight at its own alarm.
+    fn levels(&self) -> Vec<(CellId, AlarmLevel)> {
+        let mut out: Vec<(CellId, AlarmLevel)> =
+            self.cells.iter().map(|c| (c.id, self.level_of(c))).collect();
+        if let Some(own) = self.own
+            && !out.iter().any(|&(id, _)| id == own.id)
+        {
+            out.push((own.id, own.level));
+        }
+        out
+    }
+
+    /// The level reported for one published cell reading — local for the observer's own, published otherwise.
+    fn level_of(&self, cell: &CellReading) -> AlarmLevel {
+        match self.own {
+            Some(own) if own.id == cell.id => own.level,
+            _ => cell.worst,
+        }
+    }
+
+    /// Whether the published frames for the observer's own cell disagreed with its local exact reading.
+    ///
+    /// `false` when there is no local reading, which is the same answer as "they agreed" and deliberately so:
+    /// this is a *difference* detector, and with one of the two sides missing there is no difference to
+    /// report. What tells the two apart is [`Census::own_level`] returning `None`.
+    #[must_use]
+    pub fn own_export_disagreed(&self) -> bool {
+        self.own.is_some_and(|o| o.export_disagreed)
+    }
+
+    /// The observer's own cell's level as its own engine measured it, or `None` if it had no local reading.
+    #[must_use]
+    pub fn own_level(&self) -> Option<AlarmLevel> {
+        self.own.map(|o| o.level)
+    }
+
     /// How many distinct **cells** answered at all.
+    ///
+    /// Counts cells that **published**, so it stays true to its name. The observer's own cell can be in
+    /// [`Census::levels`] without being here — it is not a coordinate that answered.
     #[must_use]
     pub fn answering_cells(&self) -> usize {
         self.cells.len()
@@ -616,7 +744,7 @@ impl Census {
     }
 
     fn count(&self, level: AlarmLevel) -> usize {
-        self.cells.iter().filter(|c| c.worst == level).count()
+        self.levels().iter().filter(|&&(_, l)| l == level).count()
     }
 
     /// How many **coordinates** were asked.
@@ -632,22 +760,30 @@ impl Census {
     /// coordinate speak for the network. Neither is a reading, so the rest is carried alongside for the
     /// operator to weigh.
     pub fn verdict(&self) -> Verdict {
-        match self.cells.as_slice() {
+        match self.levels().as_slice() {
             [] => Verdict::NoReading,
-            [only] => Verdict::SingleCell(only.worst),
+            [(_, only)] => Verdict::SingleCell(*only),
             many => {
-                let alarmed = many.iter().filter(|c| c.worst != AlarmLevel::Healthy).count();
+                let alarmed = many.iter().filter(|&&(_, l)| l != AlarmLevel::Healthy).count();
                 if alarmed * 2 > many.len() { Verdict::NetworkWide } else { Verdict::NotNetworkWide }
             }
         }
     }
 
     /// Fold one coordinate's read into the census, attributing it to the cell its frame names.
+    ///
+    /// Frames for the observer's own cell are folded like any other — the fold is what `disagreed` and
+    /// `export_disagreed` are computed from — but [`Census::level_of`] is what decides the level anyone reads.
     fn observe(&mut self, read: &Read<CoherenceFrame>) {
         match read {
             Read::Found(frame) => {
                 self.answering_coordinates += 1;
                 let level = frame.alarm();
+                if let Some(own) = self.own.as_mut()
+                    && own.id == frame.cell_id
+                {
+                    own.export_disagreed |= own.level != level;
+                }
                 if let Some(seen) = self.cells.iter_mut().find(|c| c.id == frame.cell_id) {
                     seen.disagreed |= seen.worst != level;
                     if severity(level) > severity(seen.worst) {
@@ -668,13 +804,17 @@ impl Census {
 /// Reads are issued one at a time rather than concurrently: this is an operator's occasional question, not a
 /// data path, and a monitor that fans out over a whole federation at once is itself a load spike on a network
 /// it may be asking about *because* it is under load.
+///
+/// `own` is the caller's **own** exact coherence frame — see [`Census::new`] for why it is a required
+/// argument and what passing `None` costs.
 pub async fn take_census<F: Field>(
     client: &Client,
     coords: &[Coord],
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
+    own: Option<&CoherenceFrame>,
 ) -> Census {
-    let mut census = Census::default();
+    let mut census = Census::new(own);
     for &coord in coords {
         census.observe(&read_coherence::<F>(client, coord, epoch, beacon).await);
     }
@@ -715,7 +855,7 @@ mod census_tests {
         // The property this type exists to protect. A monitor that folds silence into health reports its best
         // news exactly when a partition is at its worst — the failure mode `read_coherence`'s three-valued
         // result exists to prevent, and one `unwrap_or_default` here would undo it.
-        let mut c = Census::default();
+        let mut c = Census::new(None);
         c.observe(&Read::Found(frame_of(CellId([0u8; 16]), 0)));
         c.observe(&Read::Absent);
         c.observe(&Read::Unknown);
@@ -734,7 +874,7 @@ mod census_tests {
         // The cells here are DISTINCT, and that is the whole point: the first version of this test read one
         // cell four times and asserted the majority was "the network", which is the defect the type now
         // refuses. A fixture that cannot tell the two apart cannot pin the property either.
-        let mut c = Census::default();
+        let mut c = Census::new(None);
         for i in 0..3u8 {
             c.observe(&Read::Found(frame_of(CellId([i; 16]), 2))); // the structure alarm — below viability
         }
@@ -745,7 +885,7 @@ mod census_tests {
             "three of four answering cells alarmed is the network, not a cell"
         );
 
-        let mut quiet = Census::default();
+        let mut quiet = Census::new(None);
         quiet.observe(&Read::Found(frame_of(CellId([0u8; 16]), 0)));
         for _ in 0..20 {
             quiet.observe(&Read::Unknown);
@@ -760,8 +900,8 @@ mod census_tests {
     #[test]
     fn an_empty_census_makes_no_claim() {
         // Zero answers is not a healthy network and not a sick one.
-        assert_eq!(Census::default().verdict(), Verdict::NoReading);
-        assert_eq!(Census::default().asked(), 0);
+        assert_eq!(Census::new(None).verdict(), Verdict::NoReading);
+        assert_eq!(Census::new(None).asked(), 0);
     }
 
     /// **The census must not answer "my cell or the network?" from one cell's members.**
@@ -777,7 +917,7 @@ mod census_tests {
     #[test]
     fn a_cells_own_members_cannot_carry_a_network_verdict() {
         let mine = CellId([7u8; 16]);
-        let mut c = Census::default();
+        let mut c = Census::new(None);
         for _ in 0..4 {
             c.observe(&Read::Found(frame_of(mine, 2))); // four members in structure alarm
         }
@@ -809,7 +949,7 @@ mod census_tests {
     #[test]
     fn members_of_one_cell_are_one_vote_at_the_worst_level_they_reported() {
         let mine = CellId([1u8; 16]);
-        let mut c = Census::default();
+        let mut c = Census::new(None);
         c.observe(&Read::Found(frame_of(mine, 0)));
         c.observe(&Read::Found(frame_of(mine, 2)));
         c.observe(&Read::Found(frame_of(mine, 1)));
@@ -822,18 +962,124 @@ mod census_tests {
     /// And the network verdict is still *reachable* — a guard that can only refuse is not a discriminator.
     #[test]
     fn two_cells_can_still_pronounce_on_the_network() {
-        let mut c = Census::default();
+        let mut c = Census::new(None);
         c.observe(&Read::Found(frame_of(CellId([1u8; 16]), 2)));
         c.observe(&Read::Found(frame_of(CellId([2u8; 16]), 2)));
         c.observe(&Read::Found(frame_of(CellId([3u8; 16]), 0)));
         assert_eq!(c.answering_cells(), 3);
         assert_eq!(c.verdict(), Verdict::NetworkWide, "two of three answering cells alarmed is the network");
 
-        let mut healthy = Census::default();
+        let mut healthy = Census::new(None);
         healthy.observe(&Read::Found(frame_of(CellId([1u8; 16]), 2)));
         healthy.observe(&Read::Found(frame_of(CellId([2u8; 16]), 0)));
         healthy.observe(&Read::Found(frame_of(CellId([3u8; 16]), 0)));
         assert_eq!(healthy.verdict(), Verdict::NotNetworkWide, "one sick cell of three is that cell's story");
+    }
+
+    /// **The observer's own cell is answered from its own engine, never from its own export** (#278).
+    ///
+    /// The published frames are ε-private rebuilds of an equicorrelated cell. Measured over 3636 cells they
+    /// never hide a real alarm and invent a `Structure` one on a healthy cell 2.8% of the time — and with a
+    /// `worst` fold, one member landing in that band carries the cell. This is that scenario exactly: seven
+    /// members publish `Structure` for a cell whose own node measures `Healthy`.
+    ///
+    /// The control comes first and is the whole reading. Without it, "the verdict is Healthy" is
+    /// indistinguishable from a fixture that never produced an alarm at all.
+    #[test]
+    fn the_own_cell_is_read_from_the_local_frame_not_from_the_published_export() {
+        let mine = CellId([7u8; 16]);
+
+        // CONTROL: the same published frames, with no local reading, must still say Structure. If this side
+        // is already Healthy the test below proves nothing.
+        let mut blind = Census::new(None);
+        for _ in 0..7 {
+            blind.observe(&Read::Found(frame_of(mine, 2)));
+        }
+        assert_eq!(
+            blind.verdict(),
+            Verdict::SingleCell(AlarmLevel::Structure),
+            "a census with no local reading must report what was published — otherwise the substitution \
+             below is being measured against a fixture that alarms nowhere"
+        );
+
+        // And now the same directory, read by the node whose cell it is.
+        let local = frame_of(mine, 0);
+        let mut c = Census::new(Some(&local));
+        for _ in 0..7 {
+            c.observe(&Read::Found(frame_of(mine, 2)));
+        }
+        assert_eq!(
+            c.verdict(),
+            Verdict::SingleCell(AlarmLevel::Healthy),
+            "the node's own cell must be reported at the level its own engine measured, not at the level \
+             its ε-private export rebuilt"
+        );
+        assert_eq!(c.healthy(), 1, "and the distribution moves with the verdict, not only the verdict");
+        assert_eq!(c.structure(), 0);
+        assert!(
+            c.own_export_disagreed(),
+            "the export and the local reading differ here, and that difference is the only place this \
+             defect class is visible on a running node — it must not be swallowed"
+        );
+
+        // The operator reads the string, so the string carries it.
+        let printed = c.to_string();
+        println!("{printed}");
+        assert!(printed.contains("own_cell_local_level: healthy"), "{printed}");
+        assert!(printed.contains("own_cell_export_disagreed: true"), "{printed}");
+    }
+
+    /// The substitution is scoped to the observer's **own** cell. A foreign cell is answered by what it
+    /// published, because its export is all there is and that is what ε buys.
+    #[test]
+    fn a_foreign_cell_is_still_answered_by_what_it_published() {
+        let mine = CellId([7u8; 16]);
+        let theirs = CellId([9u8; 16]);
+        let local = frame_of(mine, 0);
+        let mut c = Census::new(Some(&local));
+        c.observe(&Read::Found(frame_of(mine, 0)));
+        c.observe(&Read::Found(frame_of(theirs, 2)));
+        assert_eq!(c.answering_cells(), 2);
+        assert_eq!(
+            c.structure(),
+            1,
+            "the foreign cell's published alarm must survive: this node has no better reading of it, and \
+             suppressing it would be inventing health"
+        );
+        assert_eq!(c.verdict(), Verdict::NotNetworkWide, "one of two cells alarmed is that cell's story");
+        assert!(!c.own_export_disagreed(), "my own cell's export agreed with me here");
+    }
+
+    /// A silent directory does not silence a node that is looking straight at its own alarm.
+    ///
+    /// Before the local reading existed this was `NoReading` — correct about the directory and useless to the
+    /// operator, who was standing on the one node that had the answer.
+    #[test]
+    fn a_local_reading_survives_a_directory_that_answered_nothing() {
+        let local = frame_of(CellId([7u8; 16]), 2);
+
+        // CONTROL: with no local reading, silence is genuinely no reading.
+        let mut blind = Census::new(None);
+        for _ in 0..7 {
+            blind.observe(&Read::Absent);
+        }
+        assert_eq!(blind.verdict(), Verdict::NoReading);
+
+        let mut c = Census::new(Some(&local));
+        for _ in 0..7 {
+            c.observe(&Read::Absent);
+        }
+        assert_eq!(
+            c.verdict(),
+            Verdict::SingleCell(AlarmLevel::Structure),
+            "the node's own reading is a reading even when nothing was published"
+        );
+        assert_eq!(c.answering_cells(), 0, "and it is not counted as a cell that answered — none did");
+        assert_eq!(c.silent, 7);
+        assert!(
+            !c.own_export_disagreed(),
+            "nothing was published to disagree with; absence is not disagreement"
+        );
     }
 }
 

@@ -190,10 +190,30 @@ impl CoherenceFrame {
     /// convenient design, it is the more accurate one.** The model error this doc is about costs 5 regime
     /// misses over 401 points at zero noise; tripling the noise on `r` costs 2.6× more than that.
     ///
-    /// What remains of #278 is therefore the other branch: stop shipping verdict bits a consumer will read
-    /// as the cell's own, which is a decision about what `Census` should answer on rather than a
-    /// sensitivity to derive. "Just release `p`" was ruled out by the earlier measurement, and now the
-    /// whole family is.
+    /// **Branch (b) — which way the alarm bit is wrong, measured.** The paragraph above says a consumer must
+    /// not read these bits as the cell's own; what it did not say is that the error has a *direction*, and
+    /// the direction decides how much it costs. Swept over 3636 cells — six line weights × six off-line
+    /// weights × 101 exchange strengths, at `ε = 10⁹` so noise is out of it
+    /// (`tests/privatized_stratum.rs`):
+    ///
+    /// | | count | share |
+    /// |---|---|---|
+    /// | agree | 3536 | 97.2 % |
+    /// | alarm **invented** (`Healthy` → `Structure`) | 100 | 2.8 % |
+    /// | alarm **hidden** | **0** | 0 % |
+    ///
+    /// Every invented one is the same flip, and it skips `Integration` entirely: a healthy cell exports as
+    /// *below viability*, the most severe level there is. So the model error is loud rather than silent,
+    /// which is the survivable direction and the one the rest of the observability path already errs in —
+    /// but a `worst` fold over a cell's members means **one** member in that band carries the whole cell.
+    ///
+    /// That is what decided branch (b), and the answer is not to stop shipping the bits: against a foreign
+    /// cell they are all there is, and 2.8% loud is worth more than nothing. It is that **the observer's own
+    /// cell must not be read from its own export**. A node has the exact frame from its own reflexive loop;
+    /// reading its ε-private copy back out of the directory pays the model cost for privacy against itself.
+    /// `Census::new` now takes that local frame, and reports the published fold beside it as
+    /// `own_cell_export_disagreed` — which makes this error observable on a running node rather than only in
+    /// this test.
     #[must_use]
     pub fn privatize(&self, budget: PrivacyBudget, rng: &mut impl Rng) -> Self {
         // ε ≤ 0 is meaningless; fall back to the strongest representable floor rather than divide by ≤ 0.

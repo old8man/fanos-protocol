@@ -602,13 +602,22 @@ async fn read_data_path(
     }
 }
 
-/// Await this node's own coherence frame after an `Observe`, or say why there is none.
+/// Await this node's own **exact** coherence frame after an `Observe`, with the liveness footprint if it
+/// survived the same broadcast — or the reason there is none, already worded for an operator.
 ///
 /// Drains until a `Notification::Observed` arrives, because `Observe` raises the data-path plane on the same
 /// stream. A node too young or too alone to have a liveness view raises no observation at all — the overlay
 /// emits the coherence half only when `cell_liveness` resolves — so the timeout is a real answer here and not
 /// merely a guard: "this node cannot yet see its cell" is what an operator needs to be told.
-async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
+///
+/// The footprint is returned as an `Option` **beside** the frame rather than being required with it, because
+/// its two readers need different things: `status coherence` prints the mask and cannot report a frame
+/// without it, while `status census` only needs the alarm. Requiring it for both would let a dropped
+/// notification cost the census its own-cell reading — a precondition stricter than that reader has any
+/// use for.
+async fn observe_own_frame(
+    notes: &mut tokio::sync::broadcast::Receiver<Notification>,
+) -> Result<(fanos_telemetry::CoherenceFrame, Option<(u8, u16)>), String> {
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     // The footprint arrives in its own notification, immediately before the frame. Held rather than awaited
     // separately: one `Observe` raises both, so a second round trip would double the cost of the verb and
@@ -618,29 +627,37 @@ async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notificatio
         match tokio::time::timeout_at(deadline, notes.recv()).await {
             Ok(Ok(Notification::Liveness { degraded, alive, .. })) => seen = Some((degraded, alive)),
             Ok(Ok(Notification::Observed(bytes))) => {
-                // **`(0, 0)` would read as "nothing degraded, nobody alive", which is a claim rather than
-                // an absence.** The footprint arrives on the same lossy broadcast as the frame, immediately
-                // before it, so a `Lagged` between the two used to make `fanos status coherence` print a
-                // confident report of a cell it had not seen. Reported as unknown instead (#88).
-                let Some((degraded, alive)) = seen else {
-                    return "the coherence frame arrived without its liveness footprint (the notification \
-                            stream dropped it under load) — re-run `fanos status coherence`\n"
-                        .to_owned();
-                };
                 return fanos_telemetry::CoherenceFrame::decode(&bytes).map_or_else(
-                    || "the node emitted a frame this build cannot decode\n".to_owned(),
-                    |f| fanos_node::admin::render_coherence(&f, degraded, alive),
+                    || Err("the node emitted a frame this build cannot decode\n".to_owned()),
+                    |f| Ok((f, seen)),
                 );
             }
             Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return "the node is shutting down\n".to_owned();
+                return Err("the node is shutting down\n".to_owned());
             }
             Err(_) => {
-                return "no coherence observation within the probe timeout: this node cannot yet see its \
-                        cell (too few peers, or no heartbeats have completed a window)\n"
-                    .to_owned();
+                return Err("no coherence observation within the probe timeout: this node cannot yet see \
+                            its cell (too few peers, or no heartbeats have completed a window)\n"
+                    .to_owned());
             }
+        }
+    }
+}
+
+/// `status coherence`: this node's own frame rendered with its liveness footprint.
+async fn read_coherence(notes: &mut tokio::sync::broadcast::Receiver<Notification>) -> String {
+    match observe_own_frame(notes).await {
+        Err(why) => why,
+        // **`(0, 0)` would read as "nothing degraded, nobody alive", which is a claim rather than an
+        // absence.** The footprint arrives on the same lossy broadcast as the frame, immediately before it,
+        // so a `Lagged` between the two used to make `fanos status coherence` print a confident report of a
+        // cell it had not seen. Reported as unknown instead (#88).
+        Ok((_, None)) => "the coherence frame arrived without its liveness footprint (the notification \
+                          stream dropped it under load) — re-run `fanos status coherence`\n"
+            .to_owned(),
+        Ok((frame, Some((degraded, alive)))) => {
+            fanos_node::admin::render_coherence(&frame, degraded, alive)
         }
     }
 }
@@ -712,9 +729,30 @@ fn answer_control<N: Controllable>(
             // worth pausing the node it is about.
             let (client, epoch, beacon) = node.census_source();
             tokio::spawn(async move {
+                // This node's own cell is answered from its own engine, never from its own ε-private export
+                // read back out of the directory: the published frames are rebuilds of an equicorrelated
+                // cell, measured to invent a `Structure` alarm on a healthy cell in 2.8% of the swept
+                // parameter space, and the exact frame is one `Observe` away (#278).
+                //
+                // Subscribed *before* the command is issued, or the answer can land in the gap between the
+                // two. A node that cannot answer — no observation window yet, engine not accepting commands —
+                // gets `None`, and the census says so on its own line rather than silently falling back to
+                // the export.
+                let mut notes = client.subscribe();
+                let own = if client.command(fanos_node::Command::Observe) {
+                    observe_own_frame(&mut notes).await.ok().map(|(frame, _)| frame)
+                } else {
+                    None
+                };
                 let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
-                let census =
-                    fanos_node::telemetry_dir::take_census::<F2>(&client, &coords, epoch, beacon).await;
+                let census = fanos_node::telemetry_dir::take_census::<F2>(
+                    &client,
+                    &coords,
+                    epoch,
+                    beacon,
+                    own.as_ref(),
+                )
+                .await;
                 let _ = reply.send(census.to_string());
             });
             return Control::Go;

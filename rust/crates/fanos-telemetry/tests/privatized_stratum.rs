@@ -51,8 +51,18 @@ fn noise(seed: u64, len: usize) -> Vec<f64> {
 
 /// The cell at exchange strength `lambda`, off the stratum: one Fano line at full weight, four at 0.7.
 fn cell_at(lambda: f64) -> CoherenceMatrix {
+    cell_shaped(lambda, 1.0, 0.7)
+}
+
+/// The same construction with the two weights exposed, so a sweep can cover cells of differing
+/// **dispersion** rather than one shape at differing strength.
+///
+/// `line_w == rest_w` puts the cell back on the equicorrelated stratum, which is the control the sweep
+/// needs: on the stratum the export is exact by construction, so any flip found there would be a bug in the
+/// harness rather than a reading about the model.
+fn cell_shaped(lambda: f64, line_w: f64, rest_w: f64) -> CoherenceMatrix {
     let shared = noise(0x00C0_FFEE, T);
-    let weights = [1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.7];
+    let weights = [line_w, line_w, line_w, rest_w, rest_w, rest_w, rest_w];
     let signals: Vec<Vec<f64>> = (0..N)
         .map(|i| {
             let own = noise(0x5EED + i as u64, T);
@@ -399,5 +409,125 @@ fn splitting_the_budget_three_ways_is_bounded_before_any_sensitivity_is_derived(
         "branch (a)'s best possible case is {:.1}× worse than today's export — the noise cost of splitting \
          ε dominates the model cost it was meant to remove",
         split_rate / today_rate,
+    );
+}
+
+/// How bad a level is, as a number that can be compared — a local copy of the fold `Census` uses.
+///
+/// Deliberately a copy rather than an import: `fanos-telemetry` does not depend on `fanos-node`, and the
+/// point of the sweep below is to characterise the *frame*, not that one consumer's arithmetic.
+fn severity(level: AlarmLevel) -> u8 {
+    match level {
+        AlarmLevel::Healthy => 0,
+        AlarmLevel::Integration => 1,
+        AlarmLevel::Structure => 2,
+    }
+}
+
+/// Can the export **hide** a real alarm, or only invent a false one? (#278 branch (b))
+///
+/// This is the question that decides whether the model cost is a defect in the code or a defect in the
+/// documentation. `Census` — the one production consumer of these frames — folds `alarm()` from every
+/// published frame into a per-cell worst level and answers "is my cell sick, or the network?" off it. The
+/// frames it reads are all privatized, so every level in that answer is the flat model's, never a cell's
+/// own.
+///
+/// Two directions, and they are not equally bad:
+///
+/// - **Invented** (`exported` worse than `exact`): a cell that is fine is published as alarmed. Costly and
+///   noisy, but it errs the way the rest of the census errs — toward looking, not toward comfort.
+/// - **Hidden** (`exported` better than `exact`): a cell in real trouble publishes as healthy, and the
+///   operator's only cell-level instrument goes quiet exactly when it should not. That is a silent
+///   failure, and if it exists the export cannot keep shipping a verdict at all.
+///
+/// The sweep covers shapes as well as strengths, because the model error is driven by off-diagonal
+/// **dispersion**: `Φ_true = (N−1)(r² + v)` against the flat `Φ_flat = (N−1)r²`. One shape at many `λ`
+/// would measure a line through the space, not the space.
+#[test]
+fn measure_whether_the_export_can_hide_a_real_alarm_or_only_invent_one() {
+    let mut hidden: Vec<(f64, f64, f64, AlarmLevel, AlarmLevel)> = Vec::new();
+    let mut invented: Vec<(f64, f64, f64, AlarmLevel, AlarmLevel)> = Vec::new();
+    let mut agreed = 0usize;
+    let mut on_stratum_flips = 0usize;
+    let mut alarmed_exact = 0usize;
+
+    for &line_w in &[1.0_f64, 0.9, 0.8, 0.6, 0.4, 0.2] {
+        for &rest_w in &[1.0_f64, 0.7, 0.5, 0.3, 0.1, 0.0] {
+            for k in 0..=100 {
+                let lambda = f64::from(k) / 100.0;
+                let g = cell_shaped(lambda, line_w, rest_w);
+                let exact = CoherenceFrame::observe(CellId([7; 16]), 3, &g, 0, 0.0, -1, 0, true);
+                let exported = exact.privatize(PrivacyBudget::new(1e9), &mut Still);
+                let (a, b) = (exact.alarm(), exported.alarm());
+                if severity(a) > 0 {
+                    alarmed_exact += 1;
+                }
+                if a == b {
+                    agreed += 1;
+                    continue;
+                }
+                // On the stratum (`line_w == rest_w`) the export rebuilds the very cell it measured, so a
+                // flip there is the harness lying, not the model. Counted, and asserted zero below.
+                if (line_w - rest_w).abs() < 1e-12 {
+                    on_stratum_flips += 1;
+                }
+                let row = (lambda, line_w, rest_w, a, b);
+                if severity(b) < severity(a) {
+                    hidden.push(row);
+                } else {
+                    invented.push(row);
+                }
+            }
+        }
+    }
+
+    let total = agreed + hidden.len() + invented.len();
+    println!(
+        "swept {total} cells: {agreed} agree, {} invent an alarm, {} hide one; {alarmed_exact} of the \
+         cells are genuinely alarmed",
+        invented.len(),
+        hidden.len(),
+    );
+
+    // Controls first, or neither count means anything.
+    assert!(
+        alarmed_exact > 0,
+        "not one cell in the sweep is alarmed in its EXACT reading, so 'the export never hides an alarm' \
+         would be true of an empty set. Widen the sweep — the alarm needs Φ < 1, which needs low λ"
+    );
+    assert_eq!(
+        on_stratum_flips, 0,
+        "the export disagreed with the exact frame on an EQUICORRELATED cell, where it rebuilds the same \
+         matrix it measured. That is a harness or `privatize` bug, not a model cost, and every number \
+         below is suspect until it is explained"
+    );
+
+    for (lambda, lw, rw, a, b) in hidden.iter().take(8) {
+        println!("  HIDDEN  λ={lambda:.2} line={lw:.1} rest={rw:.1}: exact {a:?} → exported {b:?}");
+    }
+    for (lambda, lw, rw, a, b) in invented.iter().take(8) {
+        println!("  INVENT  λ={lambda:.2} line={lw:.1} rest={rw:.1}: exact {a:?} → exported {b:?}");
+    }
+
+    // **This is the load-bearing half, so it is an assertion and not a printout.** `Census`'s whole argument
+    // for still shipping a published alarm at all — see its doc in `fanos-node/src/telemetry_dir.rs` — is
+    // that the export errs the way the rest of that type errs, toward looking rather than toward comfort. A
+    // single hidden alarm falsifies that argument: it would mean a cell below viability can publish as
+    // healthy, and the census would have to stop reporting a foreign cell's level rather than merely
+    // labelling it.
+    assert!(
+        hidden.is_empty(),
+        "the ε-private export HID {} real alarm(s) — e.g. {:?}. `Census` documents the opposite direction \
+         as measured fact and reports foreign cells' published levels on the strength of it. Re-open #278 \
+         branch (b): the question is no longer 'whose verdict is this' but 'may a foreign cell's level be \
+         reported at all'",
+        hidden.len(),
+        hidden.first(),
+    );
+    assert!(
+        !invented.is_empty(),
+        "no cell in the sweep had an alarm invented either, so this test now measures nothing. Either the \
+         export stopped substituting a flat cell — in which case the 2.8% figure quoted in `Census`'s doc \
+         and in `privatize`'s is stale — or the sweep no longer crosses the alarm boundary"
     );
 }
