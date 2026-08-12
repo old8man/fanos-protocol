@@ -471,6 +471,35 @@ pub fn max_wire() -> usize {
 /// one finishes. Generous next to a cell's `N-1` real neighbours; it only bounds abuse.
 pub(crate) const MAX_INBOUND_CONNECTIONS: usize = 512;
 
+/// The most **inbound receive credit** this node can have outstanding at once, across every connection.
+///
+/// `fanos_primitives::budget`'s table lists this term as *"inbound QUIC credit — **unnamed**"*, and says
+/// "unnamed is not zero; it is unbounded". That was true when the table was written and stopped being true
+/// when #245 landed: the per-connection window is no longer quinn's `VarInt::MAX` but
+/// `MAX_PEER_UNI_STREAMS × max_wire()`, and the connection count is capped at
+/// [`MAX_INBOUND_CONNECTIONS`]. The product has been computable ever since, and nobody went back to take it.
+/// Exported so the sum can be taken where all three factors are visible, which is not inside
+/// `fanos-primitives` — it sits below this crate and cannot see `MAX_FRAME` or the connection cap.
+///
+/// **It is deliberately not a `*_MEMORY_BUDGET` share, and the difference is not bookkeeping.** Every term
+/// in that table is *steady*: the store holds its 128 MiB whenever it is full, and a full store is ordinary
+/// operation. This is *contingent* — flow-control credit is a promise, and the bytes exist only for peers
+/// that actually fill their windows and only until this node reads them. A node at rest holds ~none of it.
+/// So it must not be added to `allocated()`, where it would report a permanent 2 GiB the node does not
+/// occupy; it belongs to the difference between "beyond my design, throttle" and "definitely leaking, die",
+/// which is exactly the `MemoryHigh`/`MemoryMax` split (#207).
+///
+/// One consequence worth stating: it is by far the largest quantity in the node's memory picture — measured
+/// at **2.00 GiB**, against 320 MiB of named shares — and it is the one an *adversary* chooses the size of,
+/// since filling a window is a peer's decision. An enforcement figure below it turns a flood the caps were
+/// designed to survive into a kill.
+#[must_use]
+pub fn inbound_credit_ceiling() -> usize {
+    MAX_INBOUND_CONNECTIONS
+        .saturating_mul(MAX_PEER_UNI_STREAMS as usize)
+        .saturating_mul(max_wire())
+}
+
 /// Per-source-IP inbound cap (audit A6, #69). A single host can hold at most this many of the
 /// [`MAX_INBOUND_CONNECTIONS`] slots, so monopolizing the accept path — a slowloris / connection-pinning
 /// DoS — takes many distinct source IPs, which QUIC's address-validated handshake makes hard to spoof,

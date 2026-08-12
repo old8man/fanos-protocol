@@ -286,6 +286,50 @@ impl ServiceManager {
 /// service an operator cannot get rid of with this tool.
 pub const UNIT_NAME: &str = "fanos.service";
 
+/// The node's **steady-state** memory ceiling: every named share, plus the measured resident cost of the
+/// process outside them.
+///
+/// This is `MemoryHigh=` — the figure past which the node is holding more than its own design accounts for,
+/// and systemd should apply reclaim pressure rather than kill. Nothing above this is planned: the shares are
+/// each derived against their subsystem's own admission rule (`fanos_primitives::budget`), and residency is
+/// measured. A node steadily above it has a leak or an unnamed consumer, and either is a thing to look at
+/// rather than a thing to die of.
+///
+/// **It is above `NODE_MEMORY_BUDGET`, and that is the accounting speaking, not a slack factor.** The shares
+/// sum to 320 MiB against a 256 MiB recommendation; `budget::overcommit()` is that 109 MiB gap and exists to
+/// be reported, not hidden. Writing 256M here would put the throttle below what the code's own bounds
+/// permit at rest — systemd squeezing a node that is doing exactly what it was designed to do.
+#[must_use]
+pub fn memory_high_bytes() -> usize {
+    fanos_primitives::budget::allocated() + fanos_primitives::budget::PROCESS_RESIDENT
+}
+
+/// The node's **worst-case** memory ceiling: the steady one, plus every byte of inbound QUIC receive credit
+/// a hostile set of peers can make this node hold at once.
+///
+/// This is `MemoryMax=` — the figure past which the node is definitely leaking and should die. The two
+/// directives answer different questions and a single number cannot answer both: throttling at the
+/// contingent ceiling would never fire, and killing at the steady one would kill the node under **exactly
+/// the flood its caps exist to survive**, which is the failure mode #207 was opened to avoid.
+///
+/// **The margin between them is derived, not chosen.** It is
+/// `fanos_quic::inbound_credit_ceiling()` = `MAX_INBOUND_CONNECTIONS × MAX_PEER_UNI_STREAMS × max_wire()`,
+/// every factor of which is itself derived (#245 for the first two, #190 for the third). Measured today at
+/// **2.00 GiB**, which is 6.4× the whole named-share total — the largest quantity in the node's memory
+/// picture, and the only one an adversary picks the size of.
+///
+/// Two things this figure honestly is not:
+///
+/// - **A recommendation.** `NODE_MEMORY_BUDGET` says a node is documented to run in 256 MiB; this says a
+///   node under a full inbound flood may reach ~2.4 GiB before systemd is right to conclude it is broken.
+///   Those are different claims and the gap between them is a fact about the bounds, not about the doc.
+/// - **A reason to raise the shares.** Nothing here allocates anything. It is the enforcement figure that
+///   admits what the existing bounds already permit.
+#[must_use]
+pub fn memory_max_bytes() -> usize {
+    memory_high_bytes() + fanos_quic::inbound_credit_ceiling()
+}
+
 /// Render a systemd unit that runs `exe` against `config`.
 ///
 /// The hardening directives are not decoration. A relay node's whole job is to accept traffic from strangers, so
@@ -315,6 +359,12 @@ pub fn render_systemd_unit(exe: &Path, config: &Path, data: &Path, user_unit: bo
     let _ = writeln!(s, "TimeoutStopSec=30");
     // A node that cannot reach the overlay retries forever by design; without this, systemd gives up on it.
     let _ = writeln!(s, "StartLimitIntervalSec=0");
+    // **Two ceilings, because "beyond my design" and "definitely broken" are different questions** (#207).
+    // Computed, never typed: both come from `fanos_primitives::budget`'s summed shares and — for the gap
+    // between them — from `fanos_quic::inbound_credit_ceiling()`. Writing either as a literal here would
+    // put a memory decision in a unit file, one indirection away from every derivation that justifies it.
+    let _ = writeln!(s, "MemoryHigh={}", memory_high_bytes());
+    let _ = writeln!(s, "MemoryMax={}", memory_max_bytes());
     let _ = writeln!(s, "StateDirectory=fanos");
     let _ = writeln!(s, "WorkingDirectory={}", data.display());
     if !user_unit {
@@ -728,6 +778,63 @@ mod tests {
         let taken = held.local_addr().expect("its address").port();
         let found = free_udp_port(taken, 16).expect("a later port is free");
         assert_ne!(found, taken, "the probe handed back a port it could not have bound");
+    }
+
+    /// **The kill ceiling must sit above the worst case the node's own bounds permit** (#207).
+    ///
+    /// The whole reason this pair exists rather than one number: `MemoryMax` is where systemd concludes the
+    /// process is broken, and a peer filling its QUIC receive windows is not the process being broken — it
+    /// is the caps doing their job. Set the kill at the steady ceiling and a flood becomes a kill, which is
+    /// the failure this task was opened to avoid rather than to ship.
+    ///
+    /// Read back out of the **rendered text**, not from the functions, and compared against the three
+    /// derivations independently. A guard that called `memory_max_bytes()` on both sides would be an
+    /// identity, green the day someone writes a literal into the unit.
+    #[test]
+    fn the_units_kill_ceiling_admits_a_full_inbound_flood() {
+        let unit = render_systemd_unit(
+            Path::new("/usr/local/bin/fanos"),
+            Path::new("/etc/fanos/fanos.conf"),
+            Path::new("/var/lib/fanos"),
+            false,
+        );
+        let read = |key: &str| -> usize {
+            unit.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the unit must state {key} as a byte count:\n{unit}"))
+        };
+        let (high, max) = (read("MemoryHigh="), read("MemoryMax="));
+
+        let steady =
+            fanos_primitives::budget::allocated() + fanos_primitives::budget::PROCESS_RESIDENT;
+        let flood = fanos_quic::inbound_credit_ceiling();
+        println!(
+            "MemoryHigh={} MiB  MemoryMax={} MiB  (steady {} MiB + inbound credit {} MiB)",
+            high >> 20,
+            max >> 20,
+            steady >> 20,
+            flood >> 20
+        );
+
+        assert_eq!(
+            high, steady,
+            "MemoryHigh is the *steady* ceiling: every named share plus measured residency. It reads \
+             {high} and the shares sum to {steady} — either a share moved and the unit did not follow, or \
+             a number was typed here instead of computed."
+        );
+        assert!(
+            max >= steady + flood,
+            "MemoryMax is {max}, below the {} bytes a full inbound flood can reach ({steady} steady + \
+             {flood} of QUIC receive credit). systemd would kill the node under exactly the load \
+             MAX_INBOUND_CONNECTIONS and the per-connection window exist to survive (#207, #245).",
+            steady + flood
+        );
+        assert!(
+            max > high,
+            "MemoryMax ({max}) must sit strictly above MemoryHigh ({high}), or the kill fires before the \
+             throttle and the two directives answer one question instead of two"
+        );
     }
 
     #[test]

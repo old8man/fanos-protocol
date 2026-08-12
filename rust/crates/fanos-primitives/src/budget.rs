@@ -16,10 +16,29 @@
 //! | proxy associations | 8 MiB | named in #254 — and the naming is what created the bound |
 //! | threshold router queues | 40 MiB | named in #294 — one of the two was spent all along, the other had no bound |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
-//! | inbound QUIC credit | **unnamed** | ≈250 MB *per connection* by quinn's defaults (#245) |
+//! | inbound QUIC credit | **2.00 GiB, contingent** | `fanos_quic::inbound_credit_ceiling()` (#245, #207) |
 //!
 //! So the named shares plus the measured resident cost are **365 MiB against a 256 MiB recommendation** — a
-//! 109 MiB overcommit before the transport takes a byte. Unnamed is not zero; it is unbounded.
+//! 109 MiB overcommit before the transport takes a byte.
+//!
+//! **The last row used to read "unnamed", and "unnamed is not zero; it is unbounded".** Both halves were true
+//! when this table was written and neither is now: #245 replaced quinn's `VarInt::MAX` receive window with
+//! `MAX_PEER_UNI_STREAMS × max_wire()` and capped the connection count, which made the product computable —
+//! and nobody came back to take it. Measured, it is **2.00 GiB**, 6.4× everything else in this table put
+//! together, and it is the only term an *adversary* picks the size of.
+//!
+//! It is nonetheless **not** a share and is absent from [`allocated`] on purpose. Every other row is
+//! *steady*: a full store really does hold 128 MiB, and a full store is ordinary operation. Flow-control
+//! credit is a *promise* — the bytes exist only for peers that fill their windows and only until this node
+//! reads them, so a node at rest holds ~none of it. Adding it here would report a permanent 2 GiB the node
+//! does not occupy. Where it does belong is the difference between "beyond my design, throttle" and
+//! "definitely leaking, die": `fanos_node::setup::memory_high_bytes` is this table's sum, and
+//! `memory_max_bytes` is that plus this row (#207).
+//!
+//! Worth noting how it stayed invisible: the guard that keeps this register honest
+//! (`every_memory_budget_in_the_tree_is_one_of_the_summed_shares`) scans for constants named
+//! `*_MEMORY_BUDGET`. A quantity that is a *product of three derived factors* rather than a declared
+//! constant is outside what that scan can see, and no green run could have said so.
 //!
 //! **The overcommit rising is the module working, not the node getting heavier.** It read 45 MiB when three
 //! shares were named, 61 once the exit's receive buffers were, and 109 once the router's were; nothing was
