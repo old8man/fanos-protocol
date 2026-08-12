@@ -20,7 +20,7 @@
 #
 # USAGE
 #   ./gate.sh              # everything below
-#   ./gate.sh clippy       # one group: clippy | tests | run | docs | nostd | prune
+#   ./gate.sh clippy       # one group: clippy | guards | tests | run | docs | nostd | prune
 #   ./gate.sh clippy tests
 #
 # Costs, measured on this project: a no-op test target is ~0.2 s, `clippy --all-targets` on fanos-node ~76 s,
@@ -137,6 +137,7 @@ echo "gate — logs in $LOGS"
 # NAMED ONLY. `want` is true when nothing was selected, so a bare `./gate.sh` would have run this too — a
 # destructive step reached by the path that means "check everything". Removal must be asked for by name.
 if [ "${#SELECT[@]}" -gt 0 ] && want prune ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "prune"
   before=$(free_mb)
   rm -rf target/debug/incremental
@@ -147,6 +148,7 @@ if [ "${#SELECT[@]}" -gt 0 ] && want prune ${SELECT[@]+"${SELECT[@]}"}; then
 fi
 
 if want clippy ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "clippy"
   run clippy-default   clippy --workspace --all-targets -- -D warnings
   run clippy-validator clippy --workspace --all-targets --features validator -- -D warnings
@@ -159,7 +161,34 @@ if want clippy ${SELECT[@]+"${SELECT[@]}"}; then
   run clippy-wasm      clippy -p fanos-wasm --features wasm --all-targets -- -D warnings
 fi
 
+# **The cross-crate guards, split out because the full `tests` run is too slow to be a per-change gate.**
+#
+# MEASURED, 2026-08-12: one `tests` run took 2 h 40 min and was still going, which means its verdict is about
+# whatever the tree was when it STARTED. A gate that cannot finish inside the life of a working tree does not
+# verify that tree — and this is not hypothetical: today a real regression (`no_new_public_capability_arrives_
+# unwired`, fanos-sim 40 > 37) reached three commits deep because everything in between was checked with
+# `clippy -p <crate>` and targeted tests, neither of which runs a guard that lives in fanos-cli and reads the
+# whole workspace.
+#
+# These guards are the part that catches exactly that class. Their cost has TWO components and quoting only
+# the friendly one would repeat the mistake this whole group exists to fix:
+#   * running them, once built: `--test architecture` measured 2.04 s;
+#   * BUILDING them, which dominates and is shared with whatever else the tree has compiled. Measured here:
+#     a `guards` run started while `tests` was mid-flight recompiled the dependency chain from `fanos-field`
+#     up and had not finished in 10 minutes. It was not blocked on cargo's lock — the log shows `Compiling`.
+# So: seconds when the tree is warm, a full dependency build when it is not. Run this after every change
+# that touches a public surface; run `tests` when there is time for it.
+if want guards ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
+  echo "guards"
+  # The whole fanos-cli test directory: architecture ratchets, the composition seam, the frame registry, the
+  # conformance vectors, the skew windows. Every one of them reads ACROSS crates, which is why no per-crate
+  # invocation can substitute.
+  run guards-crosscrate test -p fanos-cli --no-fail-fast
+fi
+
 if want tests ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "tests"
   # `--no-fail-fast` everywhere, and it is not a style preference: `cargo test` stops at the first failing
   # TARGET, so one red target hides every target after it.
@@ -174,6 +203,7 @@ if want tests ${SELECT[@]+"${SELECT[@]}"}; then
 fi
 
 if want run ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "run"
   run verifier         run -p fanos-cli
   run sim-demo         run -p fanos-sim --bin fanos-sim-demo
@@ -183,11 +213,13 @@ if want run ${SELECT[@]+"${SELECT[@]}"}; then
 fi
 
 if want docs ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "docs"
   RUSTDOCFLAGS="-D warnings" run doc doc --workspace --no-deps
 fi
 
 if want nostd ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
   echo "no_std on the HOST target"
   # On the host, not wasm: wasm has native f64.ceil/f64.nearest, so a wasm-only check supplies the very
   # facility `libm` exists to replace and cannot fail on a std call that slipped in.
@@ -225,8 +257,17 @@ if [ -n "${FREE_AT_START:-}" ] && [ -n "${FREE_AT_END:-}" ]; then
 fi
 # "GREEN" with nothing gated is the same lie as a skipped step reported as a pass: `prune` runs no cargo at
 # all, so it must not borrow the word.
-if [ "${#SUMMARY[@]}" -eq 0 ]; then
-  echo "NO GATE STEPS RAN — logs in $LOGS"
+if [ "${RAN_GROUP:-0}" -eq 0 ]; then
+  echo "NO GATE GROUP MATCHED — logs in $LOGS"
+  # **And say it in the exit code too.** The line above was already honest; `exit 0` was not, and a caller
+  # that reads `$?` — CI, a shell `&&`, a wrapper script — saw a pass. `./gate.sh guardz` (a typo for a real
+  # group) gated nothing and reported success: the human-readable half told the truth and the
+  # machine-readable half did not.
+  #
+  # Keyed on whether a GROUP ran, not on whether cargo ran, and that distinction is not pedantry — the first
+  # version keyed on the step count and broke `prune`, which is a real group that deliberately invokes no
+  # cargo at all. Caught by running both arms: a typo must fail, and every real group must not.
+  exit 1
 elif [ "$FAILED" -eq 0 ]; then
   echo "GATE GREEN — ${#SUMMARY[@]} steps, every status read from cargo — logs in $LOGS"
 else
