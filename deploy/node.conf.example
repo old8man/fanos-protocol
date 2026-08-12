@@ -31,3 +31,21 @@ role = relay,storage
 
 # Begin liveness heartbeats on start (true/false). Leave true for a normal node.
 heartbeat = true
+
+# --- PROTEUS transport shaping (§13.4), off by default ---------------------------
+# A shared community secret turns on censorship-resistant frame shaping: the transport
+# carries no static FANOS signature, and the shape rotates each epoch. Every peer that
+# must interoperate needs the SAME bytes — it is a bridge/community password, not a
+# per-node key — so it is minted once and copied to each member out of band.
+#
+# Two ways in, and BOTH require a file only its owner can read:
+#   * a separate file:  (umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > /etc/fanos/proteus.secret)
+#     then `fanos node --config … --proteus-secret-file /etc/fanos/proteus.secret`
+#   * or the key below — but then THIS file holds a secret, and the install line in
+#     deploy/fanos-node.service puts it at 0644. Re-install it 0600 (`install -Dm600`)
+#     or the node refuses to start and says so. There is no --proteus-secret VALUE
+#     flag: an argv value is readable by every local account via `ps`.
+# proteus_secret = YOUR-COMMUNITY-SECRET
+#
+# The morph (wire codec + traffic shaper) does NOTHING without a secret:
+# proteus_morph = polymorph
