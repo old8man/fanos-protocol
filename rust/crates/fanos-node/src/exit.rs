@@ -745,7 +745,12 @@ mod tests {
     ///
     /// It fails in either direction, which is the point: raise `MAX_SESSIONS` or `MAX_DATAGRAM_LEN` and the
     /// exit outgrows its share; shrink the share and the same. Both are decisions to take against
-    /// `budget::overcommit()`, which is already 61 MiB over the recommendation.
+    /// `budget::overcommit()`, which is already **109 MiB** over the recommendation.
+    ///
+    /// That figure has now been wrong here twice, in the same direction and for the same reason: this line
+    /// copies a number the function computes. It said 61 while #254's proxy share had already taken it to
+    /// 69, and 69 was passed when #294 named the threshold router's 40 MiB. Read `budget::overcommit()`;
+    /// this sentence is a signpost, not the value.
     #[test]
     fn the_exit_datagram_buffers_fit_the_share_the_budget_grants_them() {
         let admitted = fanos_diaulos::budget::MAX_SESSIONS;

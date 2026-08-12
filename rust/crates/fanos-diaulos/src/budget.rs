@@ -98,8 +98,11 @@ pub const STREAM_STATE_PER_SESSION: usize =
 ///   whole 64 MiB at 246 sessions, leaving 376 B per session for streams. Re-deriving it against the sum
 ///   gives **7**, and it is a cell-wide denominator — `fanos_node`'s role controller divides the Exit
 ///   role's measured load by it, so 7 is not a number this cell can carry.
-/// * **The budget cannot grow.** `fanos_primitives::budget::SHARES` already sums to 280 MiB against a
-///   256 MiB node recommendation; #213 named that overrun and #254 raised it. There is nothing to hand out.
+/// * **The budget cannot grow.** `fanos_primitives::budget::SHARES` already sums to 320 MiB against a
+///   256 MiB node recommendation; #213 named that overrun, #254 raised it, and #294 raised it again by
+///   naming the threshold router's send queues, which had been spending 40 MiB outside the sum. There is
+///   nothing to hand out. The figure lives in `budget::allocated()` — this line is a citation, and a
+///   citation drifts: it said 280 while the sum was already 320.
 /// * **[`QUEUE_DEPTH`] is at its floor** by its own derivation, and lowering it is what #205 explicitly
 ///   refused: depth 30 satisfies the arithmetic and destroys the property the depth exists for.
 ///

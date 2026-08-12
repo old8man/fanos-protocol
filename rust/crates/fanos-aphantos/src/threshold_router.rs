@@ -218,9 +218,53 @@ pub struct ThresholdRouter<F: Field> {
     delivery_check: Option<(Vec<Triple>, Vec<u8>)>,
 }
 
+/// What the router's **send-side queues** may hold — see [`THRESHOLD_ROUTER_SHARE`] for why one share
+/// covers both of them.
+///
+/// [`THRESHOLD_ROUTER_SHARE`]: fanos_primitives::budget::THRESHOLD_ROUTER_SHARE
+const ROUTER_QUEUE_MEMORY_BUDGET: usize = fanos_primitives::budget::THRESHOLD_ROUTER_SHARE;
+
+/// What **one** queued forward costs, in the bytes the queue actually holds.
+///
+/// Not `THRESHOLD_ONION_LEN`. What is pushed is `encode_onion(next, &padded)` — a tag byte, an encoded
+/// triple, then the padded onion — beside the destination `Triple` in the tuple. The previous bound divided
+/// a budget nobody had written down by the onion alone, which is [`MAX_PENDING`]'s own defect (#218) one
+/// queue over: **the prose named the frame and the arithmetic counted the payload.**
+///
+/// The correction moves the derived count from 2048 to 2045 — three cells stricter, which is the safe
+/// direction and the reason it is worth stating rather than rounding away.
+const QUEUED_CELL_BYTES: usize =
+    1 + 12 + threshold::THRESHOLD_ONION_LEN + size_of::<Triple>();
+
 /// Bound on the constant-rate [`outbox`](ThresholdRouter::outbox): real forwards queued for a send slot.
-/// Beyond this the oldest is dropped (the reliability layer retransmits) — bounded memory under flood.
-const MAX_OUTBOX: usize = 2048;
+/// Beyond this the **oldest** is dropped — correct here because the reliability layer retransmits and this
+/// queue is a rate smoother, not a mixer. The drop is counted ([`Station::RelayCargoDropped`]).
+///
+/// It is what the budget buys at the true per-entry cost, so it is not a round number and should not be
+/// made one — the discipline [`MAX_PENDING`] and `fanos_diaulos::budget::MAX_SESSIONS` both state.
+///
+/// **The relay's throughput ceiling lives here, and had never been written down.** A real forward *displaces*
+/// a cover slot rather than adding a send, and there is one slot stream per router, so the sustained rate a
+/// Full-profile relay can carry is `1 / cover_interval` — ≈2 cells/s ≈ 40 KiB/s at the shipping 500 ms
+/// default, for the **whole node**, not per circuit. Offered `λ`, this queue fills in `MAX_OUTBOX / (λ − 2)`
+/// seconds and cargo is shed from then on. That figure is also what #135 left open for the `Relay` role: its
+/// capacity is a derived protocol bound, not a measurement waiting to be taken.
+const MAX_OUTBOX: usize = ROUTER_QUEUE_MEMORY_BUDGET / QUEUED_CELL_BYTES;
+
+/// Bound on [`mix_pending`](ThresholdRouter::mix_pending) — the cover-**off** queue, which had none (#295).
+///
+/// Same share, same per-entry cost, therefore the same count: the two queues cannot fill together.
+///
+/// **The overflow rule is the opposite of its sibling's, and derived rather than copied.** The outbox evicts
+/// the oldest; here the oldest entry is the one whose exponential delay is closest to firing, so evicting it
+/// would throw away the wait already served *and* thin the batch a cell is being hidden in — the mix's whole
+/// product. So a full queue refuses the **newest** arrival, protecting what is already in flight, and counts
+/// the refusal ([`Station::RelayMixRefused`]).
+///
+/// Steady state is `λ × mean_delay` by Little's law, so at the shipping 120 ms mean this cap is reached at
+/// roughly `λ = 17 000 /s` — far above any honest relay and reachable by a flood, which is what it is for.
+/// Each entry also holds a live timer, so the bound caps two resources, not one.
+const MAX_MIX_PENDING: usize = ROUTER_QUEUE_MEMORY_BUDGET / QUEUED_CELL_BYTES;
 
 impl<F: Field> ThresholdRouter<F> {
     /// A router at `coord`, peeling hops that need a threshold of `t`. `kem_secret` (the node's long-term
@@ -443,7 +487,10 @@ impl<F: Field> ThresholdRouter<F> {
     fn forward_send(&mut self, to: Triple, frame: Vec<u8>) -> Vec<Effect> {
         if self.cover_interval.as_nanos() != 0 {
             if self.outbox.len() >= MAX_OUTBOX {
+                // Shedding real cargo, past the relay's `1 / cover_interval` ceiling. Counted, because an
+                // operator whose relay is discarding traffic must not be the last to know (#294).
                 self.outbox.pop_front();
+                self.stations.record(Station::RelayCargoDropped, Some(to));
             }
             self.outbox.push_back((to, frame));
             return if self.covering {
@@ -454,6 +501,12 @@ impl<F: Field> ThresholdRouter<F> {
         }
         if self.mean_delay.as_nanos() == 0 {
             return alloc::vec![Effect::Send { to, frame }];
+        }
+        if self.mix_pending.len() >= MAX_MIX_PENDING {
+            // Refuse the newest rather than evict the oldest — see `MAX_MIX_PENDING`. No timer is armed, so
+            // the cap bounds live timers as well as bytes (#295).
+            self.stations.record(Station::RelayMixRefused, Some(to));
+            return Vec::new();
         }
         self.mix_seq += 1;
         let id = self.mix_seq;
@@ -1311,6 +1364,76 @@ mod tests {
                 .is_empty(),
             "no cover configured ⇒ StartHeartbeat is a no-op"
         );
+    }
+
+    #[test]
+    fn the_mix_queue_stops_at_its_cap_and_refuses_the_newest(){
+        // #295. The cover-OFF branch had no bound at all: `mix_pending` grew with the offered rate, one
+        // live timer per entry, on a configuration `config.rs` presents as a supported trade.
+        //
+        // The bound is on a COUNT, so this drives it with tiny frames rather than real onions — the cap is
+        // reached at the same length either way, and 2045 x 20 KiB of allocation would only make the test
+        // slow enough to be skipped.
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"mix-cap"));
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
+            .with_mixing(Duration::from_millis(120));
+        let dest = Point::<F2>::at(3).coords();
+
+        // Below the cap the queue grows, every arrival arms a timer, and nothing is refused. Without this
+        // half the test would pass against a router that refuses everything.
+        for _ in 0..8 {
+            let out = r.forward_send(dest, alloc::vec![7u8; 4]);
+            assert_eq!(out.len(), 1, "an accepted forward arms exactly one mix timer");
+        }
+        assert_eq!(r.mix_pending.len(), 8, "eight held, none refused");
+        assert_eq!(r.stations().total(Station::RelayMixRefused), 0, "and the counter stays silent");
+
+        // Past the cap the length STOPS and the refusals are counted.
+        let first_id = *r.mix_pending.keys().next().expect("a held cell");
+        for _ in 8..MAX_MIX_PENDING + 32 {
+            let out = r.forward_send(dest, alloc::vec![7u8; 4]);
+            assert!(out.len() <= 1, "a refusal arms no timer, so the cap bounds timers too");
+        }
+        assert_eq!(r.mix_pending.len(), MAX_MIX_PENDING, "the queue stops at its cap, not at the flood");
+        assert_eq!(
+            r.stations().total(Station::RelayMixRefused),
+            32,
+            "and every refusal past the cap is counted — a silent shed is what #295 was"
+        );
+
+        // The RULE, and the half that separates this from its sibling: the cells already in flight survive.
+        // Drop-oldest would have evicted `first_id`, whose exponential delay is closest to firing — throwing
+        // away the wait already served and thinning the batch the mix exists to hide a cell in.
+        assert!(
+            r.mix_pending.contains_key(&first_id),
+            "a full mix queue refuses the NEWEST; evicting the oldest would discard the nearly-delivered"
+        );
+    }
+
+    #[test]
+    fn shedding_real_cargo_from_the_outbox_is_counted() {
+        // #294. The cover-ON branch was bounded and silent: past `1 / cover_interval` the relay discards
+        // real forwards, and an operator had no way to learn their node was doing it.
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"outbox-shed"));
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
+            .with_cover(Duration::from_millis(500));
+        let dest = Point::<F2>::at(3).coords();
+
+        for _ in 0..MAX_OUTBOX {
+            r.forward_send(dest, alloc::vec![9u8; 4]);
+        }
+        assert_eq!(r.outbox.len(), MAX_OUTBOX, "filled to the cap");
+        assert_eq!(
+            r.stations().total(Station::RelayCargoDropped),
+            0,
+            "nothing shed while the queue still had room — the control that makes the count below mean something"
+        );
+
+        for _ in 0..5 {
+            r.forward_send(dest, alloc::vec![9u8; 4]);
+        }
+        assert_eq!(r.outbox.len(), MAX_OUTBOX, "still capped");
+        assert_eq!(r.stations().total(Station::RelayCargoDropped), 5, "and each shed cell is named");
     }
 
     #[test]

@@ -109,20 +109,53 @@ pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 /// down with it, not to ration ordinary use.
 pub const PROXY_ASSOCIATION_SHARE: usize = 8 * 1024 * 1024;
 
+/// The threshold router's **send-side queues** (`fanos_aphantos`'s `ROUTER_QUEUE_MEMORY_BUDGET`) — the
+/// constant-rate `outbox` when cover traffic is on, and `mix_pending` when it is off (#294, #295).
+///
+/// **One share for two queues, because the two modes are mutually exclusive.** `forward_send` branches on
+/// `cover_interval`: non-zero queues to the outbox and returns, zero falls through to the per-cell mix
+/// delay. A router in cover mode never fills `mix_pending`; a router without cover never fills the outbox.
+/// So the share is what *whichever one is active* may hold, and both counts divide it — splitting it would
+/// reserve half for a queue that is provably empty.
+///
+/// 40 MiB is not a new cost. It is what the existing `MAX_OUTBOX = 2048` already held at
+/// `THRESHOLD_ONION_LEN` per cell, now named so it can be summed — which is the whole subject of #213, and
+/// this is the third consumer to be found outside the sum after the two the doc below already names. Naming
+/// it raises the reported [`overcommit`] rather than lowering it, and that is the honest direction: the
+/// memory was always being used.
+///
+/// **The second queue had no bound at all**, and naming the share is what created one. `mix_pending` grew
+/// with the offered rate on a configuration the tree presents as a supported trade (`cover_interval = 0`,
+/// "an operator can zero them to trade anonymity for bandwidth/latency") — with one live timer per entry
+/// and no admission check. The remedy could not be a per-source quota, the shape #211 used for shards,
+/// because an onion router deliberately does not know the source. A global cap was the only form available,
+/// which is precisely why the sibling branch already had one.
+pub const THRESHOLD_ROUTER_SHARE: usize = 40 * 1024 * 1024;
+
 /// Every named share, so a reader cannot see the sum without seeing the terms.
-pub const SHARES: [(&str, usize); 5] = [
+pub const SHARES: [(&str, usize); 6] = [
     ("store", STORE_SHARE),
     ("sessions", SESSION_SHARE),
     ("gathers", GATHER_SHARE),
     ("exit datagrams", EXIT_DATAGRAM_SHARE),
     ("proxy associations", PROXY_ASSOCIATION_SHARE),
+    ("threshold router queues", THRESHOLD_ROUTER_SHARE),
 ];
 
 /// The sum of every **named** share. Two known consumers are absent from it by their own defect, not by
 /// design: inbound QUIC credit (#245) and the VPN datapath (#247) have never claimed one.
+///
+/// A third was absent until #294 — the threshold router's send queues — and it was absent from *this list of
+/// absentees* too, which is the part worth keeping in view: a register of known gaps is not a proof that the
+/// gaps are known. It was found by scanning every `MAX_*` bound for a per-item size, not by reading here.
 #[must_use]
 pub const fn allocated() -> usize {
-    STORE_SHARE + SESSION_SHARE + GATHER_SHARE + EXIT_DATAGRAM_SHARE + PROXY_ASSOCIATION_SHARE
+    STORE_SHARE
+        + SESSION_SHARE
+        + GATHER_SHARE
+        + EXIT_DATAGRAM_SHARE
+        + PROXY_ASSOCIATION_SHARE
+        + THRESHOLD_ROUTER_SHARE
 }
 
 /// How far the named shares plus the measured resident cost exceed the recommendation. **Zero would mean the

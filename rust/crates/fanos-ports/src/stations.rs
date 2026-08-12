@@ -158,6 +158,23 @@ pub enum Station {
     /// A pending gather evicted at the in-flight cap, not by its deadline — capacity pressure, which is a
     /// different world from a slow line and must not be summed with it.
     GatherEvicted,
+    /// A real forward was discarded because the constant-rate `outbox` was full (#294).
+    ///
+    /// The relay's sustained capacity is one cell per cover slot — `1 / cover_interval`, ≈2 cells/s at the
+    /// shipping default, for the whole node rather than per circuit. Above it the queue fills and cargo is
+    /// dropped. That was silent, and silence here reads as "the E6 volume claim holds" when what actually
+    /// holds is that the emission rate is *capped*: past the slot rate the observable moves from the
+    /// emission to the drop, and the drop surfaces as retransmissions at the edges.
+    RelayCargoDropped,
+    /// A forward was refused because the per-cell mixing queue was full (#295).
+    ///
+    /// Distinct from [`Self::RelayCargoDropped`] in both branch and rule. That one evicts the *oldest*
+    /// queued cell, which is right there because the reliability layer retransmits and the queue is a rate
+    /// smoother. This one refuses the *newest*: `mix_pending` is a mixer, its oldest entry is the one whose
+    /// exponential delay is closest to firing, and evicting it would discard the wait already served and
+    /// thin the batch the mix exists to hide a cell in. Under flood the right thing is to protect the cells
+    /// already in flight.
+    RelayMixRefused,
 
     /// A gather reached its threshold and the **open still failed** — the shares were tampered with, or came
     /// from a line that does not agree on the key.
@@ -879,6 +896,8 @@ impl Station {
         Self::GatherUnpeelable,
         Self::GatherSelfShareMissing,
         Self::GatherEvicted,
+        Self::RelayCargoDropped,
+        Self::RelayMixRefused,
         Self::ShareRequestNotAMember,
         Self::SharePartialFailed,
         Self::ShareForUnknownRequest,
@@ -956,6 +975,8 @@ impl Station {
             Self::GatherUnpeelable => "gather.unpeelable",
             Self::GatherSelfShareMissing => "gather.self_share_missing",
             Self::GatherEvicted => "gather.evicted",
+            Self::RelayCargoDropped => "relay.cargo_dropped",
+            Self::RelayMixRefused => "relay.mix_refused",
             Self::GatherOpenFailed => "gather.open_failed",
             Self::ShareRequestNotAMember => "share.not_a_member",
             Self::SharePartialFailed => "share.partial_failed",
@@ -1080,6 +1101,8 @@ impl Station {
             | Self::HostForwardUnsealable
             | Self::RequestForUnknownHost
             | Self::GatherEvicted
+            | Self::RelayCargoDropped
+            | Self::RelayMixRefused
             | Self::GatherOpenFailed
             | Self::ShareRequestNotAMember
             | Self::SharePartialFailed
