@@ -478,6 +478,34 @@ impl Assignment {
     pub fn is_solitary(self) -> bool {
         self.roster <= 1
     }
+
+    /// Whether `other` is the **same assignment** — `(roles, roster, epoch)`, deliberately *not* `complete`.
+    ///
+    /// An assignment's identity is what the cell decided. [`complete`](Self::complete) is a property of the
+    /// *read that produced it* — the reader's luck — and folding it into the comparison makes "the same
+    /// assignment, read worse" count as a different assignment.
+    ///
+    /// **That was a live defect (#293), and it cost the thing the refresh loop exists to protect.** The loop
+    /// scores a repeat as evidence and relaxes its scan period on accumulated evidence. With derived equality:
+    /// a node at `A{R,7,E}` with `stable = 2` hits one timed-out read, gets the identical `A{R,7,E}` back with
+    /// `complete: false`, and the comparison calls it a change — so the baseline is replaced. The very next
+    /// *successful* read then returns `A{R,7,E}` with `complete: true`, differs from the poisoned baseline
+    /// again, and is scored as "a complete change", which voids everything accumulated. Roles, roster and
+    /// epoch never moved across all three steps.
+    ///
+    /// [`next_stable`] was written precisely so an inconclusive scan is "not a change, and not a reset" — its
+    /// own test says so — and this comparison upstream was denying it the chance. Completeness still gates
+    /// stability, once, where it belongs: as `next_stable`'s third argument.
+    ///
+    /// Derived `PartialEq` stays exact and is left alone. A `PartialEq` that silently ignores a field is a
+    /// trap for the next reader, and it would disarm the destructuring guard (#193) that makes a newly added
+    /// field a compile error.
+    #[must_use]
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.roles.bits() == other.roles.bits()
+            && self.roster == other.roster
+            && self.epoch == other.epoch
+    }
 }
 
 /// A node's **sans-I/O** live role controller: it holds the epoch-persistent [`RoleController`] state and, for a
@@ -771,7 +799,7 @@ pub fn spawn_role_loop<F: Field>(
                     let ring: Vec<(Epoch, BeaconSeed)> = window.iter().copied().collect();
                     // Read out of the borrow before the await: a `watch` guard is not `Send`.
                     let sensed = *sensed_rx.borrow();
-                    (settled, _) =
+                    settled =
                         assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed, prover: prover.as_ref(), sensed, window: &ring }, capacity, &roles_tx)
                             .await;
                     // An epoch advance re-randomises the lottery, so the assignment is expected to move: re-arm the
@@ -833,11 +861,11 @@ pub fn spawn_role_loop<F: Field>(
                 _ = refresh.tick() => {
                     let ring: Vec<(Epoch, BeaconSeed)> = window.iter().copied().collect();
                     let sensed = *sensed_rx.borrow();
-                    let (now, complete) =
+                    let now =
                         assign_epoch::<F>(&client, &mut live, AssignAt { epoch: cur, beacon: seed, closed, prover: prover.as_ref(), sensed, window: &ring }, capacity, &roles_tx)
                             .await;
-                    if now == settled {
-                        stable = next_stable(stable, true, complete);
+                    if now.same_as(&settled) {
+                        stable = next_stable(stable, true, now.complete);
                         // Local stability is *not* evidence of the global fixed point, and conflating the two is the
                         // same error one level up. A solitary assignment is the one value that cannot distinguish "the
                         // cell really is just me" from "I have not discovered anyone yet" — so a node holding one has no
@@ -863,12 +891,12 @@ pub fn spawn_role_loop<F: Field>(
                         // understates the roster in exactly the way a genuine absence does, so two partial scans agree with
                         // each other while both disagree with the cell — and relaxing on that agreement is what left a
                         // frozen roster with nothing to indicate why. `complete` is the distinction that was missing.
-                        if may_relax(stable, now.roster, peers(), complete) {
+                        if may_relax(stable, now.roster, peers(), now.complete) {
                             backoff = (backoff * 2).min(ROSTER_REFRESH_MAX);
                         }
                     } else {
                         settled = now;
-                        stable = next_stable(stable, false, complete);
+                        stable = next_stable(stable, false, now.complete);
                         backoff = ROSTER_REFRESH;
                     }
                     refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
@@ -1211,7 +1239,7 @@ async fn assign_epoch<F: Field>(
     at: AssignAt<'_>,
     capacity: Demand,
     roles_tx: &watch::Sender<Assignment>,
-) -> (Assignment, bool) {
+) -> Assignment {
     let vrf = at.prover.is_some();
     // The two directories are independent reads, so they are scanned concurrently rather than back to back: an
     // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
@@ -1308,7 +1336,9 @@ async fn assign_epoch<F: Field>(
     let roles = live.step(&members, epoch, &beacon, setpoint, settled);
     note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
-    (roles, settled)
+    // The `Assignment` alone: it already carries `complete` (#289), and returning the bool beside it made one
+    // quantity travel under two names — which is how the comparison above came to fold it in (#293).
+    roles
 }
 
 /// Keep the previously published assignment, and **say so**: the same value, `complete = false`, and one
@@ -1327,13 +1357,17 @@ fn withhold(
     client: &Client,
     roles_tx: &watch::Sender<Assignment>,
     roster: usize,
-) -> (Assignment, bool) {
+) -> Assignment {
     client.record_station(
         fanos_runtime::ports::stations::Station::AssignmentWithheld,
         Some(client.address()),
         Some(roster as u64),
     );
-    (*roles_tx.borrow(), false)
+    // `complete: false` ON the assignment, not beside it. It used to be `(*roles_tx.borrow(), false)` — the
+    // doc above promised "the same value, `complete = false`" and delivered it in the tuple element the
+    // callers discarded, while the `Assignment` itself kept whatever completeness the last published one had.
+    // The two halves of one return actively disagreed (#293).
+    Assignment { complete: false, ..*roles_tx.borrow() }
 }
 
 /// Record a provisioning shortfall where an operator will see it — one
@@ -2179,6 +2213,45 @@ mod tests {
     /// Fixture: `(coord, value)` pairs for a `Scan`, coordinates being irrelevant to what is asserted.
     fn alloc_pairs(values: &[u8]) -> Vec<(fanos_diaulos::Coord, u8)> {
         values.iter().map(|&v| ([1, 0, 0], v)).collect()
+    }
+
+    #[test]
+    fn one_timed_out_read_must_not_void_evidence_a_motionless_assignment_earned() {
+        // #293, replayed as the refresh loop replays it: `same_as` picks the branch, `next_stable` scores it.
+        // Both are production's, composed in production's order — a hand-rolled copy of the loop would pin my
+        // reading of it rather than the loop.
+        let at = |complete| Assignment {
+            roles: RoleSet::EMPTY,
+            roster: 7,
+            epoch: Epoch::new(4),
+            complete,
+        };
+        let step = |settled: Assignment, now: Assignment, stable: u32| {
+            if now.same_as(&settled) {
+                (settled, next_stable(stable, true, now.complete))
+            } else {
+                (now, next_stable(stable, false, now.complete))
+            }
+        };
+
+        // Roles, roster and epoch never move across all three reads. Only the reader's luck does.
+        let (mut settled, mut stable) = (at(true), 2u32);
+        (settled, stable) = step(settled, at(true), stable);
+        assert_eq!(stable, 3, "a complete repeat is evidence");
+        (settled, stable) = step(settled, at(false), stable);
+        assert_eq!(stable, 3, "one timed-out read is not a change, so it neither adds nor voids");
+        (settled, stable) = step(settled, at(true), stable);
+        assert_eq!(
+            stable, 4,
+            "and the next successful read continues the run. With `complete` inside the comparison the \
+             timed-out read replaced the baseline, this recovery then differed from it too, and the run was \
+             scored as `a complete change` — 4 became 0, not 3 (#293)"
+        );
+
+        // The other direction, and the one that must NOT be weakened: a real change still voids.
+        let moved = Assignment { roster: 6, ..at(true) };
+        let (_, after) = step(settled, moved, stable);
+        assert_eq!(after, 0, "a genuine change on a complete read still resets the evidence");
     }
 
     #[test]
