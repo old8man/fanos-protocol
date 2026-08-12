@@ -175,6 +175,12 @@ pub enum Station {
     /// thin the batch the mix exists to hide a cell in. Under flood the right thing is to protect the cells
     /// already in flight.
     RelayMixRefused,
+    /// An onion this router had already accepted arrived again and was dropped (§L5, #296).
+    ///
+    /// Non-zero is an attack signal, not congestion: no honest path re-sends identical bytes, because every
+    /// emission re-seals. A recorded cell re-injected at a relay peels identically and forwards to the same
+    /// next hop, so accepting it would answer "is this relay on that circuit?" for whoever injected it.
+    ReplayDropped,
 
     /// A gather reached its threshold and the **open still failed** — the shares were tampered with, or came
     /// from a line that does not agree on the key.
@@ -898,6 +904,7 @@ impl Station {
         Self::GatherEvicted,
         Self::RelayCargoDropped,
         Self::RelayMixRefused,
+        Self::ReplayDropped,
         Self::ShareRequestNotAMember,
         Self::SharePartialFailed,
         Self::ShareForUnknownRequest,
@@ -977,6 +984,7 @@ impl Station {
             Self::GatherEvicted => "gather.evicted",
             Self::RelayCargoDropped => "relay.cargo_dropped",
             Self::RelayMixRefused => "relay.mix_refused",
+            Self::ReplayDropped => "relay.replay_dropped",
             Self::GatherOpenFailed => "gather.open_failed",
             Self::ShareRequestNotAMember => "share.not_a_member",
             Self::SharePartialFailed => "share.partial_failed",
@@ -1103,6 +1111,7 @@ impl Station {
             | Self::GatherEvicted
             | Self::RelayCargoDropped
             | Self::RelayMixRefused
+            | Self::ReplayDropped
             | Self::GatherOpenFailed
             | Self::ShareRequestNotAMember
             | Self::SharePartialFailed

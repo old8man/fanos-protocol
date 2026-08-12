@@ -19,7 +19,7 @@
 //! transport. Member coordinates come from the projective geometry (`points_on`), so the router
 //! needs no directory; only the client that *builds* an onion needs the hops' member public keys.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use fanos_field::Field;
@@ -189,6 +189,10 @@ pub struct ThresholdRouter<F: Field> {
     mean_delay: Duration,
     /// Forwards held for their sampled mix delay, keyed by mix id (timer token = `MIX_FLAG | id`).
     mix_pending: BTreeMap<u64, (Triple, Vec<u8>)>,
+    /// Tags of onions this router has already accepted — the §L5 anti-replay set (#296). Membership is
+    /// the test; [`replay_order`](Self::replay_order) is the eviction order, so the pair is a bounded FIFO.
+    replay_seen: BTreeSet<[u8; crate::sealed::REPLAY_TAG_LEN]>,
+    replay_order: VecDeque<[u8; crate::sealed::REPLAY_TAG_LEN]>,
     mix_seq: u64,
     /// A **secret** PRF key for the mixing-delay schedule, derived from the node's KEM secret. Keying the
     /// schedule on a secret (not the public coordinate) means a global passive adversary cannot recompute
@@ -251,6 +255,22 @@ const QUEUED_CELL_BYTES: usize =
 /// capacity is a derived protocol bound, not a measurement waiting to be taken.
 const MAX_OUTBOX: usize = ROUTER_QUEUE_MEMORY_BUDGET / QUEUED_CELL_BYTES;
 
+/// What the §L5 replay set may hold, carved from the router's own share rather than claimed separately.
+///
+/// 256 KiB against the 40 MiB the queues take: the set stores 16-byte **tags**, not onions, so it is three
+/// orders of magnitude cheaper than the thing it protects and does not move [`MAX_OUTBOX`].
+const REPLAY_CACHE_BYTES: usize = 256 * 1024;
+
+/// How many onion tags the router remembers — the §L5 window, expressed as a count (#296).
+///
+/// **Why a count is the right shape for a time window.** A cell older than the E4 grace window is
+/// unpeelable anyway — the router's own `a_recorded_onion_is_unpeelable_past_the_grace_window` test proves
+/// it, because the epoch key is gone — so the set only has to cover cells that are *still* peelable. At the
+/// relay's derived ceiling of one cell per cover slot ([`MAX_OUTBOX`]'s doc: ≈2 cells/s at the shipping
+/// default) this is roughly 16 384 / 2 ≈ 2.3 hours of traffic, comfortably past a grace window measured in
+/// epochs. The two derivations compose: #294 established the throughput ceiling, and this reads it.
+const MAX_REPLAY_TAGS: usize = REPLAY_CACHE_BYTES / crate::sealed::REPLAY_TAG_LEN;
+
 /// Bound on [`mix_pending`](ThresholdRouter::mix_pending) — the cover-**off** queue, which had none (#295).
 ///
 /// Same share, same per-entry cost, therefore the same count: the two queues cannot fill together.
@@ -298,6 +318,8 @@ impl<F: Field> ThresholdRouter<F> {
             seq: 0,
             mean_delay: Duration(0),
             mix_pending: BTreeMap::new(),
+            replay_seen: BTreeSet::new(),
+            replay_order: VecDeque::new(),
             mix_seq: 0,
             mix_seed,
             cover_interval: Duration(0),
@@ -518,6 +540,38 @@ impl<F: Field> ThresholdRouter<F> {
         }]
     }
 
+    /// Remember `onion`'s tag and report whether it is **new** — the §L5 replay test (#296).
+    ///
+    /// **Keyed on the whole packet, deliberately not on a fixed offset.** `sealed::replay_tag` reads the KEM
+    /// ciphertext at a known position, which is right for that engine's flat layout. A threshold onion is a
+    /// fixed-slot `slots::Packet` carrying a share slot per member per hop, and an offset into it is exactly
+    /// the kind of thing that silently keys on a region that is not fresh per cell — padding, or a slot
+    /// belonging to a hop this router does not own. The packet is one constant width, a replay is
+    /// byte-identical, and every honest cell carries fresh KEM encapsulations, so the whole-packet digest
+    /// is unique per cell by the same argument and cannot be aimed at the wrong bytes.
+    ///
+    /// **No honest path re-sends identical bytes**, which is what makes a wide tag safe rather than
+    /// over-eager. Each of the three ways an onion reaches the wire re-seals: a client retry is a fresh
+    /// `emit_anonymously(&mut rng)`, a relay forwards each peeled onion once, and a host reply is sealed
+    /// with fresh per-onion seeds (`rendezvous_host`'s module doc). A session-layer retransmission produces
+    /// a *different* onion for the same payload, and the test below pins that.
+    fn admit_onion(&mut self, onion: &[u8]) -> bool {
+        let digest = fanos_primitives::hash_labeled("FANOS-v1/threshold-replay-tag", onion);
+        let mut tag = [0u8; crate::sealed::REPLAY_TAG_LEN];
+        let Some(head) = digest.get(..crate::sealed::REPLAY_TAG_LEN) else { return true };
+        tag.copy_from_slice(head);
+        if !self.replay_seen.insert(tag) {
+            return false;
+        }
+        self.replay_order.push_back(tag);
+        if self.replay_order.len() > MAX_REPLAY_TAGS
+            && let Some(oldest) = self.replay_order.pop_front()
+        {
+            self.replay_seen.remove(&oldest);
+        }
+        true
+    }
+
     /// Sample an exponential mixing delay with the configured mean (`−mean·ln u`), seeded from the node's
     /// **secret** `mix_seed` (not its public coordinate), so the delay sequence cannot be recomputed from
     /// public data — the timing correlation Poisson mixing exists to destroy (audit E2).
@@ -639,6 +693,15 @@ impl<F: Field> ThresholdRouter<F> {
     /// Handle an onion addressed to us as the combiner of `line`: seed a pending peel with our own
     /// partial and fan out share-requests to the rest of the line.
     fn on_onion(&mut self, now: Instant, line: Triple, onion: Vec<u8>) -> Vec<Effect> {
+        // §L5, BEFORE any peel work (#296). A recorded cell re-injected here would peel identically and
+        // forward to the same next hop, which is a circuit-confirmation oracle: the adversary learns this
+        // relay is on the path by watching whether it emits. Dropping it costs one hash of a 20 KiB packet
+        // against a hybrid-KEM decapsulation and a `t`-subset search, so the cheap-drop property the
+        // sibling engine's `sealed::replay_tag` doc names survives the move.
+        if !self.admit_onion(&onion) {
+            self.stations.record(Station::ReplayDropped, Some(line));
+            return Vec::new();
+        }
         let req_id = self.seq;
         self.seq += 1;
 
@@ -1265,7 +1328,7 @@ mod tests {
         fn image<F: Field>() -> usize {
             Plane::<F>::lines()
                 .filter_map(|l| ThresholdRouter::<F>::combiner_of(l.coords()))
-                .collect::<alloc::collections::BTreeSet<_>>()
+                .collect::<BTreeSet<_>>()
                 .len()
         }
         for (q, image) in [(2usize, image::<F2>()), (7, image::<F7>())] {
@@ -1756,7 +1819,7 @@ mod tests {
         // reachable as the combiner of a line through its own coordinate — the service's replies have
         // to route to a *designated* rendezvous (combiner) point that relays them to the client.
         let n = Plane::<F2>::N as usize;
-        let combiners: alloc::collections::BTreeSet<Triple> = (0..n)
+        let combiners: BTreeSet<Triple> = (0..n)
             .filter_map(|l| combiner_for::<F2>(Line::<F2>::at(l).coords()))
             .collect();
         assert!(!combiners.is_empty());
@@ -1820,16 +1883,19 @@ mod tests {
         }
     }
 
+    /// Two properties that used to be checked by one predicate, now checked separately (#296).
+    ///
+    /// The original drove ONE recorded onion at three times and read `has_delivery` each time. Its middle
+    /// assertion — the same recorded onion delivered again after one rotation — is exactly what §L5 forbids,
+    /// and it was pinning that as correct. Correct for the forward-secrecy property it was named for, and it
+    /// meant no regression could ever fire on the replay gap.
+    ///
+    /// So: replay is tested with a replay, forward secrecy is tested with a FRESH onion sealed to the old
+    /// epoch's key, and the honest-retransmission case that makes a whole-packet tag safe is tested too. One
+    /// observable per property.
     #[test]
-    fn a_recorded_onion_survives_one_rotation_then_becomes_unpeelable() {
-        // E4 end-to-end forward secrecy WITH graceful rotation. An onion sealed to a relay's epoch-0
-        // onion key delivers at epoch 0; after ONE rotation it still delivers (the relay's grace window
-        // keeps the previous epoch decap-able, so onions in flight across a boundary are not dropped);
-        // but once the relay is TWO rotations on, epoch 0 has fallen out of the retain=1 window and the
-        // SAME recorded onion can no longer be peeled — a passive adversary that captured it and later
-        // compromised the relay decrypts nothing. With t = 1 the combiner peels with its own share.
+    fn a_replay_is_refused_while_forward_secrecy_is_measured_on_fresh_cells() {
         let line_coord = Line::<F2>::at(3).coords();
-        let members = ThresholdRouter::<F2>::line_members(line_coord);
         let t = 1usize;
         let onion_seed = [0xE4u8; 32];
         let m0 = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
@@ -1837,54 +1903,57 @@ mod tests {
         let (_i2, p2) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xE4, 2]));
         let pubs = [m0.public(), &p1, &p2];
         let payload = b"fs-payload";
-        let onion = seal_onion(
-            &[HopLine {
-                line: line_coord,
-                members: &pubs,
-            }],
-            t as u8,
-            payload,
-            b"fs-seed",
-        )
-        .unwrap();
-
+        // A fresh seal of the SAME payload each time — which is what every honest emission does: a client
+        // retry re-calls `emit_anonymously(&mut rng)`, and a host reply is sealed with fresh per-onion seeds.
+        let seal = |salt: &[u8]| {
+            seal_onion(&[HopLine { line: line_coord, members: &pubs }], t as u8, payload, salt).unwrap()
+        };
+        let members = ThresholdRouter::<F2>::line_members(line_coord);
         let combiner = Point::<F2>::new(members[0]).unwrap();
         let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"fs-identity"));
         let mut router = ThresholdRouter::<F2>::new(combiner, &identity, t, onion_seed);
-        // Re-inject the SAME recorded onion at time `at` and report whether it was delivered.
-        let replay = |router: &mut ThresholdRouter<F2>, at: u64| {
+        let inject = |r: &mut ThresholdRouter<F2>, at: u64, onion: &[u8]| {
             has_delivery(
-                &router.step(
+                &r.step(
                     Instant(at),
-                    Input::Message {
-                        from: [9, 9, 9],
-                        frame: launch_frame(line_coord, &onion),
-                    },
+                    Input::Message { from: [9, 9, 9], frame: launch_frame(line_coord, onion) },
                 ),
                 payload,
             )
         };
 
-        // Epoch 0: the current-epoch relay peels its own share (t = 1) and delivers.
-        assert!(
-            replay(&mut router, 0),
-            "the current-epoch relay peels a current-epoch onion"
+        let first = seal(b"fs-seed");
+        assert!(inject(&mut router, 0, &first), "the current-epoch relay peels a current-epoch onion");
+
+        // §L5: the SAME bytes again. This is the circuit-confirmation oracle, and it must not answer.
+        assert!(!inject(&mut router, 1, &first), "a recorded onion re-injected is refused");
+        assert_eq!(
+            router.stations().total(Station::ReplayDropped),
+            1,
+            "and the refusal is named — a silent drop here is indistinguishable from a dead relay"
         );
 
-        // One rotation: the epoch-0 key is now in the grace window, so an onion in flight still delivers.
-        router.step(Instant(1), Input::Command(Command::AdvanceEpoch));
-        assert_eq!(router.onion_epoch(), Epoch::new(1));
+        // The condition that makes a whole-packet tag safe rather than over-eager: an honest re-emission of
+        // the same payload is a DIFFERENT onion, and must pass. If this ever reddens, the tag is too wide
+        // and the cache is eating cargo.
         assert!(
-            replay(&mut router, 2),
-            "an onion in flight across one rotation still peels (grace window)"
+            inject(&mut router, 2, &seal(b"fs-seed-retransmit")),
+            "an honest re-seal of the same payload is a different cell and must still be delivered"
         );
 
-        // A second rotation: epoch 0 falls out of the retain=1 window and its secret is gone.
+        // E4 forward secrecy, on its own observable: a FRESH onion sealed to the epoch-0 key, after that key
+        // has fallen out of the retain window. Not a replay, so the cache is not what refuses it.
         router.step(Instant(3), Input::Command(Command::AdvanceEpoch));
+        router.step(Instant(4), Input::Command(Command::AdvanceEpoch));
         assert_eq!(router.onion_epoch(), Epoch::new(2));
         assert!(
-            !replay(&mut router, 4),
-            "past the grace window the recorded onion is unpeelable (E4 forward secrecy)"
+            !inject(&mut router, 5, &seal(b"fs-seed-stale")),
+            "past the grace window an epoch-0 onion is unpeelable — the key is gone (E4)"
+        );
+        assert_eq!(
+            router.stations().total(Station::ReplayDropped),
+            1,
+            "and that refusal was forward secrecy, NOT the replay cache — the counter has not moved"
         );
     }
 
