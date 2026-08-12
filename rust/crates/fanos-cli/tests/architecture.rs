@@ -1836,3 +1836,144 @@ fn a_station_observation_cannot_reach_a_published_surface() {
         "the telemetry manifest read has no dependency section — the `fanos-ports` check above is vacuous",
     );
 }
+
+/// **A `crate::x` in bare backticks is a reference rustdoc cannot check, and five of them were wrong.**
+///
+/// The doc gate runs `cargo doc -D warnings`, which verifies **intra-doc links** — `` [`crate::foo`] `` in
+/// brackets. It says nothing about `` `crate::foo` `` in plain backticks, and prose is written in plain
+/// backticks by default. #281 found one member of this class the hard way: a module doc named `drain_inbox`,
+/// which did not exist, written so the link checker could not fail on it.
+///
+/// Swept: five references named a `crate::<module>` the crate does not have, and **not one was a bracketed
+/// link** — every single one was in the form the checker is blind to. Two were stale after a move
+/// (`crate::stations` outlived the module's migration to `fanos-ports`); two named a module that never
+/// existed (`crate::sync` in `fanos-taxis`, where state-sync is `crate::checkpoint`); one was a
+/// cross-crate reference wearing `crate::` (`crate::sealed` from `fanos-threshold`, where the module lives
+/// in `fanos-aphantos`); and one was a *quotation* of another crate's doc, correct there and wrong here.
+///
+/// The last of those is the reason this guard reads modules rather than trusting judgement: a quoted
+/// `crate::` is right in the file it was copied from, so a reader checking it in the wrong crate concludes
+/// the reference is fine.
+///
+/// **Re-exports are counted, and that was the difference between 13 findings and 5.** The first scan flagged
+/// `crate::build_cell_mix_directory` and seven like it — all `pub use` re-exports at the crate root, and all
+/// legitimate. A scan of this shape without the re-export pass reports mostly noise, and noise is what gets
+/// a guard deleted.
+#[test]
+fn no_doc_comment_names_a_crate_path_its_crate_does_not_have() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let crates_dir = root.join("crates");
+    let mut findings: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+
+    for entry in std::fs::read_dir(&crates_dir).expect("crates/ is readable").flatten() {
+        let src = entry.path().join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        scanned += 1;
+
+        // What this crate genuinely offers under `crate::`: module files, module directories, `mod`
+        // declarations, lowercase root items, and — the pass that removes the noise — every name a
+        // `pub use` re-exports.
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for f in std::fs::read_dir(&src).expect("a crate src is readable").flatten() {
+            let p = f.path();
+            if p.is_dir() {
+                if let Some(n) = p.file_name().and_then(|s| s.to_str()) {
+                    names.insert(n.to_owned());
+                }
+            } else if p.extension().is_some_and(|e| e == "rs")
+                && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && stem != "lib"
+            {
+                names.insert(stem.to_owned());
+            }
+        }
+        let sources: Vec<(PathBuf, String)> = rust_files_under(&src);
+        for (_p, text) in &sources {
+            for line in text.lines() {
+                let t = line.trim();
+                for kw in ["mod ", "pub mod ", "pub(crate) mod "] {
+                    if let Some(rest) = t.strip_prefix(kw)
+                        && let Some(name) = rest.split([';', ' ', '{']).next()
+                        && !name.is_empty()
+                    {
+                        names.insert(name.to_owned());
+                    }
+                }
+                if let Some(rest) = t.strip_prefix("pub use ") {
+                    for tok in rest.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if !tok.is_empty() {
+                            names.insert(tok.to_owned());
+                        }
+                    }
+                }
+                for kw in ["pub fn ", "pub const fn ", "pub async fn ", "pub const ", "pub static "] {
+                    if let Some(rest) = t.strip_prefix(kw)
+                        && let Some(name) = rest.split(['(', ':', '<', ' ']).next()
+                        && !name.is_empty()
+                    {
+                        names.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+
+        for (path, text) in &sources {
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim();
+                if !(t.starts_with("///") || t.starts_with("//!")) {
+                    continue;
+                }
+                for (pos, _) in line.match_indices("crate::") {
+                    let tail = &line[pos + "crate::".len()..];
+                    let ident: String =
+                        tail.chars().take_while(|c| c.is_ascii_lowercase() || *c == '_' || c.is_ascii_digit()).collect();
+                    if ident.is_empty() || names.contains(&ident) {
+                        continue;
+                    }
+                    let rel = path.strip_prefix(&root).unwrap_or(path);
+                    findings.push(format!("{}:{}  crate::{ident}", rel.display(), i + 1));
+                }
+            }
+        }
+    }
+
+    // CONTROL: the sweep must have looked at a real number of crates. A `read_dir` that returned nothing
+    // would produce an empty findings list and read as a clean tree.
+    assert!(
+        scanned > 20,
+        "the sweep found only {scanned} crates with a src/ directory — it is not reading the workspace, so \
+         an empty result below means nothing",
+    );
+
+    assert!(
+        findings.is_empty(),
+        "these doc comments name a `crate::<module>` their own crate does not have, in plain backticks \
+         where `cargo doc -D warnings` cannot see them (#281's class):\n  {}\n\
+         Either the module moved (name the crate it moved to), the reference is cross-crate (write the \
+         crate, not `crate::`), or it is a quotation of another crate's doc (say whose).",
+        findings.join("\n  "),
+    );
+}
+
+/// Every `.rs` under a directory, read once, so a scan does not re-walk the tree per question.
+fn rust_files_under(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                out.push((p, text));
+            }
+        }
+    }
+    out
+}

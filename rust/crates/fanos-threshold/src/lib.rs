@@ -101,7 +101,7 @@ pub const THRESHOLD_ONION_LEN: usize = 20480;
 /// looks like ciphertext (the receiver's [`ThresholdSealed::from_bytes`] self-delimits and ignores
 /// it). Errors with [`ThresholdError::TooLong`] if the onion already exceeds the bucket.
 ///
-/// **Length-hiding is weaker here than in `crate::sealed` (audit Finding 4).** This padding is a
+/// **Length-hiding is weaker here than in `fanos_aphantos::sealed` (audit Finding 4).** This padding is a
 /// *public* deterministic function of the onion bytes (`hash_xof("…threshold-onion-pad", onion)`), and
 /// the header's `ct_len`/`members` are cleartext — so a party that sees the *decrypted* onion bytes (an
 /// on-path line member, or any observer of an un-encrypted hop) can read the exact layer length and even

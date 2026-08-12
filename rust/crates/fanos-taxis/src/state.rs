@@ -160,7 +160,7 @@ pub trait StateMachine {
     /// state machine commits only its application state.
     fn state_root(&self) -> [u8; 32];
 
-    /// Serialize the **entire** state to canonical bytes — a state-sync snapshot (`crate::sync`). It MUST be
+    /// Serialize the **entire** state to canonical bytes — a state-sync snapshot ([`crate::checkpoint`]). It MUST be
     /// **deterministic** (two semantically-identical states encode identically) and **total** with
     /// [`restore`](Self::restore) such that `restore(s.snapshot()).state_root() == s.state_root()`. This is the
     /// full state, not a Merkle summary: `state_root` proves *what* the state is; `snapshot` carries *the state

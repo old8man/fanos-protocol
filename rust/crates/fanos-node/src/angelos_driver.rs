@@ -21,7 +21,7 @@
 //!
 //! That second sentence was false for as long as this module existed (#282). It held a
 //! `fanos_angelos::session::Session` — the **symmetric** half, whose own doc says the asymmetric KEM ratchet
-//! "builds on it in `crate::ratchet`" — so the shipped conversation had forward secrecy and no healing after a
+//! "builds on it in `fanos_angelos::ratchet`" (that doc writes `crate::`, correct there and misleading here) — so the shipped conversation had forward secrecy and no healing after a
 //! compromise, while `DoubleRatchet` sat exported from `lib.rs` with no caller anywhere, not even inside its
 //! own crate. The argument for keeping two encryption layers rested on the property the wired half lacked.
 //!

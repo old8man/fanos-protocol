@@ -35,7 +35,7 @@
 //! ## What must NOT be added here
 //!
 //! This is an **export** surface — its JSON leaves the node. The data-path plane's counters
-//! (`crate::stations`) are therefore deliberately absent, and adding them would be a defect rather than
+//! (`fanos_ports::stations`) are therefore deliberately absent, and adding them would be a defect rather than
 //! an improvement: their per-family DP sensitivities are not yet derived (the way `Δr = 1/21` was for the
 //! coherence frame), and a rate keyed by line is a signal a global passive adversary can correlate against
 //! observed traffic. Station counts stay node-local until that analysis exists — see

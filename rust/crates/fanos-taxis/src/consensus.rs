@@ -507,7 +507,7 @@ pub enum ConsensusMsg {
     /// A validator's execution attestation `(height, state_root)` — the executed-state checkpoint.
     ExecVote(ExecVote),
     /// A lagging **or diverged** node's catch-up request — "I am at `have_height` holding `have_root`; offer
-    /// me something better." (audit §3.9 / §4; `crate::sync` state-sync.)
+    /// me something better." (audit §3.9 / §4; state-sync lives in [`crate::checkpoint`].)
     SyncReq {
         /// The requester's current next-height.
         have_height: u64,
