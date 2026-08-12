@@ -113,6 +113,7 @@ jobs:
         run: cargo run -p fanos-sim --example forecast
       - name: Catastrophe probe (loss · churn · scale)
         run: cargo run -p fanos-sim --example catastrophe
+          cargo run -p fanos-sim --example minima
       - name: Benchmarks compile (hot paths)
         run: cargo bench -p fanos-bench --no-run
       # The docs are where this codebase carries its reasoning, and an intra-doc link is the only part of a

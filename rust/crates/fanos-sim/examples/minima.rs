@@ -1,4 +1,4 @@
-//! `minima` — how few nodes will do, measured rather than asserted.
+//! `minima` — how few nodes will do, measured against what three derivations predict.
 //!
 //! Run: `cargo run -p fanos-sim --example minima --release`
 //!
@@ -134,8 +134,20 @@ fn growth_sweep() -> Vec<Row> {
     rows
 }
 
+/// One row of the attrition sweep. The hyperoval counts are carried, not just printed, because the
+/// `[7,3,4]` theorem's claim is an **exactly**, and checking an "exactly" needs both directions.
+struct Attrition {
+    lost: usize,
+    survivors: usize,
+    patterns: usize,
+    ok: usize,
+    failures: usize,
+    failed_hyperovals: usize,
+    hyperovals: usize,
+}
+
 /// For each number of losses, run **every** pattern and report how many still serve the read.
-fn attrition_sweep() -> Vec<(usize, usize, usize, usize)> {
+fn attrition_sweep() -> Vec<Attrition> {
     println!("== Attrition: a full cell that dispersed a value, then lost members ==\n");
     println!("  Every loss pattern is run, not sampled — at four losses the outcome depends on which four.\n");
     println!("  lost  survivors   patterns   reads ok   hyperovals among the failures");
@@ -169,7 +181,15 @@ fn attrition_sweep() -> Vec<(usize, usize, usize, usize)> {
                 format!("{failed_hyperovals} of {failures}")
             }
         );
-        out.push((lost_count as usize, survivors, masks.len(), ok));
+        out.push(Attrition {
+            lost: lost_count as usize,
+            survivors,
+            patterns: masks.len(),
+            ok,
+            failures,
+            failed_hyperovals,
+            hyperovals: masks.iter().filter(|&&m| is_hyperoval_fano(m)).count(),
+        });
     }
     println!();
     out
@@ -181,8 +201,8 @@ fn main() {
 
     println!("== Where the knees fall ==\n");
     let all_healthy = growth.iter().find(|r| r.healthy == r.k && r.k >= MIN_VIABLE_CELL).map(|r| r.k);
-    let always_reads = attrition.iter().filter(|(_, _, n, ok)| n == ok).map(|(_, s, _, _)| *s).min();
-    let ever_reads = attrition.iter().filter(|(_, _, _, ok)| *ok > 0).map(|(_, s, _, _)| *s).min();
+    let always_reads = attrition.iter().filter(|a| a.patterns == a.ok).map(|a| a.survivors).min();
+    let ever_reads = attrition.iter().filter(|a| a.ok > 0).map(|a| a.survivors).min();
 
     println!("  fewest members whose cell calls itself healthy   : {all_healthy:?}");
     println!("  fewest survivors that ALWAYS serve a read        : {always_reads:?}");
@@ -196,4 +216,66 @@ fn main() {
     println!("  That is NOT 'smaller is sturdier'. Each fault costs less in a bigger cell at the same rate,");
     println!("  so the tolerated FRACTION is 1 − 1/√2 ≈ 29.3% at every size and the absorbed COUNT grows:");
     println!("  2 faults at N=7, 291 at N=993. See fanos_diakrisis::minima result 6.");
+
+    std::process::exit(verdict(&attrition));
+}
+
+/// **The disagreement this sweep exists to find, made reportable.**
+///
+/// The header has always said "agreement is evidence and disagreement is a bug worth having", and until
+/// now the sweep printed its numbers and exited 0 whatever they were — a verdict that lived only in a
+/// reader's eye, for output nobody read, because no gate ran this. An alarm with no way to sound is not a
+/// weaker alarm; it is a decoration that reads as one.
+///
+/// Checked against `fanos_code::lrc`'s theorem, whose claim is an **exactly** and therefore needs BOTH
+/// directions — "every failure is a hyperoval" and "every hyperoval fails" are different statements, and a
+/// bug that satisfied one while breaking the other is exactly the kind this sweep is meant to catch.
+///
+/// Deliberately NOT checked: `CellParams::derive`'s Byzantine quorum. The sweep does not measure it, so
+/// there is nothing here to compare a derivation against, and a check with no measurement behind it would
+/// be the defect this function was written to remove.
+fn verdict(attrition: &[Attrition]) -> i32 {
+    let mut disagreements = Vec::new();
+
+    for a in attrition {
+        // `[7,3,4]` peels back any three losses. Below four, a failure means the code or the store
+        // disagrees with the algebra.
+        if a.lost <= 3 && a.ok != a.patterns {
+            disagreements.push(format!(
+                "at {} losses {} of {} patterns failed to read; the [7,3,4] code peels back any three, so \
+                 one of the two is wrong",
+                a.lost,
+                a.failures,
+                a.patterns
+            ));
+        }
+        // At four, the theorem is an EXACTLY: the failures are the hyperovals and nothing else.
+        if a.lost == 4 {
+            if a.failed_hyperovals != a.failures {
+                disagreements.push(format!(
+                    "at four losses {} patterns failed but only {} were hyperovals — something that is not \
+                     a hyperoval defeated the code",
+                    a.failures, a.failed_hyperovals
+                ));
+            }
+            if a.failed_hyperovals != a.hyperovals {
+                disagreements.push(format!(
+                    "at four losses {} of the {} hyperovals still served the read — the theorem says a \
+                     hyperoval always defeats it",
+                    a.hyperovals - a.failed_hyperovals,
+                    a.hyperovals
+                ));
+            }
+        }
+    }
+
+    if disagreements.is_empty() {
+        println!("\n  AGREEMENT: every checked prediction of fanos_code::lrc held on every pattern run.");
+        return 0;
+    }
+    println!("\n  DISAGREEMENT — this is the bug this sweep exists to have:");
+    for d in &disagreements {
+        println!("    * {d}");
+    }
+    1
 }

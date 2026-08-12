@@ -237,6 +237,12 @@ if want run ${SELECT[@]+"${SELECT[@]}"}; then
   run sim-demo         run -p fanos-sim --bin fanos-sim-demo
   run forecast         run -p fanos-sim --example forecast
   run catastrophe      run -p fanos-sim --example catastrophe
+  # The third example. It was runnable and unrun, and its own header promised that "disagreement is a bug
+  # worth having" while the code had no way to report one — no assertion, no non-zero exit, not even the
+  # word `mismatch`. A verdict that lives only in a reader's eye, for output nobody read. It now compares
+  # the measured attrition against `fanos_code::lrc`'s theorem in BOTH directions (every failure at four
+  # losses is a hyperoval, and every hyperoval fails) and exits 1 on disagreement.
+  run minima           run -p fanos-sim --example minima
   run bench-compile    bench -p fanos-bench --no-run
 fi
 
