@@ -146,6 +146,34 @@ mod tests {
     /// is per-flow and a deployment chooses the flow count; the exemption names the per-flow costs, and the
     /// queue was not among them until #300. Pinned here so the omission is a number an operator can read
     /// rather than an absence.
+    /// **The share the budget grants must at least cover one datagram per direction per admitted flow.**
+    ///
+    /// This is the reader `TUNNEL_BACKLOG_SHARE` needs — a share named and never checked against the thing
+    /// it is meant to cover is the shape #227 exists to catch. It is deliberately a FLOOR check and not a
+    /// ceiling one: the test below shows a ceiling is unpurchasable, and the floor is what makes admitting
+    /// a flow honest. Below it, `MAX_UDP_FLOWS` promises capacity the pool cannot fund.
+    ///
+    /// Same shape as `fanos-node`'s `the_exit_datagram_buffers_fit_the_share_the_budget_grants_them`, and
+    /// for the same reason: `fanos-primitives` sits below both this crate and `fanos-proxy` and can see
+    /// neither factor, so the share is the granted number and the product is proved against it here.
+    #[test]
+    fn the_share_covers_one_datagram_each_way_for_every_flow_the_cap_admits() {
+        use fanos_primitives::budget::TUNNEL_BACKLOG_SHARE;
+
+        let floor = MAX_UDP_FLOWS * 2 * MAX_QUEUED_PAYLOAD;
+        println!(
+            "floor {floor} B ({} MiB) against a granted {TUNNEL_BACKLOG_SHARE} B ({} MiB)",
+            floor >> 20,
+            TUNNEL_BACKLOG_SHARE >> 20
+        );
+        assert!(
+            floor <= TUNNEL_BACKLOG_SHARE,
+            "the flow cap now needs {floor} B just to hold one datagram each way, past the granted \
+             {TUNNEL_BACKLOG_SHARE} B. Either raise the share with its derivation, or lower the cap — but \
+             do not leave the cap admitting flows the pool cannot fund"
+        );
+    }
+
     /// **Why #300's remedy is the only one: no affordable share buys both the flow cap and the depth.**
     ///
     /// The usual idiom here is to name a share and derive the count from it — `STORE_SHARE` gave

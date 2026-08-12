@@ -156,6 +156,32 @@ pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 /// use.
 pub const PROXY_SHARE: usize = 8 * 1024 * 1024;
 
+/// What the relayed-UDP tunnel queues may hold at once — the **floor that keeps the mechanism working**,
+/// not a ceiling on the worst case (#300).
+///
+/// **Derived as a floor, because a ceiling is not purchasable.** A tunnel queue costs
+/// `flows × 2 directions × depth × payload`. The payload is fixed by the MTU and both other factors are
+/// already spoken for — the flow cap is how many destinations a client may address at once, the depth is
+/// the burst slack the channel exists to give. `fanos-vpn`'s
+/// `no_affordable_share_buys_both_the_flow_cap_and_the_declared_depth` runs the arithmetic: the **entire**
+/// [`NODE_MEMORY_BUDGET`] buys depth 26 of the declared 64, and buying 64 needs 2.45× everything the node
+/// has. So there is no worst-case share to name, at any price.
+///
+/// What *is* derivable is the other end. A flow that cannot hold **one** datagram in each direction cannot
+/// relay at all, so `flows × 2 × payload` is the point below which admitting a flow is a lie. On the VPN's
+/// cap that is `4096 × 2 × 1252` = 9.78 MiB; 16 MiB is the next binary step, the same convention
+/// [`EXIT_DATAGRAM_SHARE`] uses so that a cap which moves slightly does not immediately breach.
+///
+/// **The floor is affordable precisely because the debit is by actual bytes.** Depth above one is not
+/// reserved by anyone: it is spare pool bytes lent to whichever flow is bursting, which is what a byte pool
+/// does well and a per-channel slot count cannot do at all. Sizing this against the product of ceilings
+/// would have forced depth 1 — the same quantity, bought at 64× the price and with the burst slack deleted.
+///
+/// It is one share for a mechanism two crates use, and that is deliberate: `fanos-proxy` and `fanos-vpn`
+/// queue through one `UdpTunnel::pair`, never in one process (`fanos vpn` is its own subcommand), so a
+/// second share would reserve bytes that cannot be spent at the same time as the first.
+pub const TUNNEL_BACKLOG_SHARE: usize = 16 * 1024 * 1024;
+
 /// The threshold router's **send-side queues** (`fanos_aphantos`'s `ROUTER_QUEUE_MEMORY_BUDGET`) — the
 /// constant-rate `outbox` when cover traffic is on, and `mix_pending` when it is off (#294, #295).
 ///
@@ -180,12 +206,13 @@ pub const PROXY_SHARE: usize = 8 * 1024 * 1024;
 pub const THRESHOLD_ROUTER_SHARE: usize = 40 * 1024 * 1024;
 
 /// Every named share, so a reader cannot see the sum without seeing the terms.
-pub const SHARES: [(&str, usize); 6] = [
+pub const SHARES: [(&str, usize); 7] = [
     ("store", STORE_SHARE),
     ("sessions", SESSION_SHARE),
     ("gathers", GATHER_SHARE),
     ("exit datagrams", EXIT_DATAGRAM_SHARE),
     ("proxy client buffers", PROXY_SHARE),
+    ("relayed UDP tunnel backlog", TUNNEL_BACKLOG_SHARE),
     ("threshold router queues", THRESHOLD_ROUTER_SHARE),
 ];
 
@@ -209,6 +236,7 @@ pub const fn allocated() -> usize {
         + EXIT_DATAGRAM_SHARE
         + PROXY_SHARE
         + THRESHOLD_ROUTER_SHARE
+        + TUNNEL_BACKLOG_SHARE
 }
 
 /// How far the named shares plus the measured resident cost exceed the recommendation. **Zero would mean the
@@ -256,9 +284,9 @@ mod tests {
     #[test]
     fn the_overcommit_does_not_grow() {
         assert!(
-            overcommit() <= 109 * MIB,
+            overcommit() <= 125 * MIB,
             "the named shares plus the measured resident cost now exceed the node recommendation by {} MiB, \
-             up from 109. Either a share grew or one was added. If it was added, that is progress and this \
+             up from 125. Either a share grew or one was added. If it was added, that is progress and this \
              bound moves WITH a note saying whether the bytes are new or merely newly counted; if a share \
              grew, it is a decision to take against this sum rather than against a comment in one subsystem \
              (#213, #254, #294).",
@@ -277,12 +305,13 @@ mod tests {
         );
         assert_eq!(
             allocated(),
-            320 * MIB,
-            "and the three consumers found outside the sum since — #254's two and #294's router queues — \
-             are 64 MiB on top of a recommendation the first three had already spent whole"
+            336 * MIB,
+            "and the four consumers found outside the sum since — #254's two, #294's router queues and \
+             #300's tunnel backlog — are 80 MiB on top of a recommendation the first three had already \
+             spent whole"
         );
         assert_eq!(unallocated(), 0, "a further consumer would be dividing zero");
-        assert_eq!(overcommit(), 109 * MIB, "before the transport takes a byte");
+        assert_eq!(overcommit(), 125 * MIB, "before the transport takes a byte");
     }
 
     /// Every share is listed, so the sum cannot drift away from the terms it is made of.
