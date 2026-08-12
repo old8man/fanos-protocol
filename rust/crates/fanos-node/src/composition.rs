@@ -64,8 +64,15 @@ pub struct CellComposition {
     pub mix_mean_delay: Duration,
     /// Constant-rate cover interval; zero leaves cover off.
     pub cover_interval: Duration,
-    /// Threshold-service hosting: `(member seed, the line's coordinates, reconstruction threshold)`.
-    pub service: Option<([u8; 32], Vec<Triple>, usize)>,
+    /// Threshold-service hosting: `(member seed, the line's coordinates, reconstruction threshold, this
+    /// member's identity-custody slot)`.
+    ///
+    /// The fourth element is `None` for a line that carries request confidentiality only — §12.3's half (b)
+    /// without half (a). The two halves are separable in exactly that direction and not the other: a line
+    /// can read intros without custodying an identity, but custody with no line to hold it is not a
+    /// deployment.
+    #[allow(clippy::type_complexity)]
+    pub service: Option<([u8; 32], Vec<Triple>, usize, Option<fanos_calypso::hosting::SealedShare>)>,
     /// **POROS ingress hosting** — this node is one member of a community's ingress line
     /// (`docs/design-anonymity-substrate.md` §6), holding one threshold share of its entry-peer descriptor.
     /// Composed *over* everything below, exactly as `service` is: an ingress frame is dispatched to the host,
@@ -259,13 +266,21 @@ pub fn compose_engine<F: Field + 'static>(
         None => Box::new(overlay),
     };
     let base = match &what.service {
-        Some((seed, line, threshold)) => {
+        Some((seed, line, threshold, identity_share)) => {
             // Regenerated in memory from the seed and never serialized (audit #124); the matching public is
-            // the one the operator collected into the published line.
+            // the one the operator collected into the published line. The same secret opens both this
+            // member's per-intro share slots (half (b)) and its identity-custody slot (half (a)) — one
+            // member, one key, which is why the slot travels beside it rather than in a second field.
             let (secret, _public) = HybridKemSecret::generate(&mut SeedRng::from_seed(seed));
             Box::new(ServiceNode::new(
                 base,
-                ThresholdService::new(coord.coords(), secret, line.clone(), *threshold),
+                ThresholdService::new(
+                    coord.coords(),
+                    secret,
+                    line.clone(),
+                    *threshold,
+                    identity_share.clone(),
+                ),
             ))
         }
         None => base,

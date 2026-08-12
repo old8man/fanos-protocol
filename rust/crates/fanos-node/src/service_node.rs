@@ -168,7 +168,7 @@ mod tests {
         let coord = Point::<F2>::at(0).coords();
         let (secret, public) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xCA, seed]));
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
-        let service = ThresholdService::new(coord, secret, vec![coord], 1);
+        let service = ThresholdService::new(coord, secret, vec![coord], 1, None);
         (ServiceNode::new(Box::new(overlay), service), public)
     }
 
@@ -305,7 +305,7 @@ mod tests {
         let (secret, public0) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xCA, 10]));
         let (_s1, public1) = HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xCA, 11]));
         let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
-        let service = ThresholdService::new(coord, secret, vec![coord, other], 2);
+        let service = ThresholdService::new(coord, secret, vec![coord, other], 2, None);
         let mut node = ServiceNode::new(Box::new(overlay), service);
 
         let intro = SealedIntro::seal(b"req", 2, &[&public0, &public1], b"seed2").unwrap();

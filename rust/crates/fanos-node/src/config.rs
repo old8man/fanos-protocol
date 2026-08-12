@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fanos_calypso::hosting::Share;
+use fanos_calypso::hosting::{SealedShare, Share};
 use fanos_wire::capability::Capabilities;
 use zeroize::Zeroizing;
 use fanos_core::roles::{Role, RoleSet as CoreRoleSet};
@@ -370,6 +370,25 @@ pub struct ServiceParams {
     pub line: Vec<Triple>,
     /// The reconstruction threshold `t` — how many members must cooperate to serve an intro.
     pub threshold: usize,
+    /// This member's **identity-custody slot**: one [`SealedShare`] of the service's signing secret, dealt
+    /// at the ceremony and openable only under [`seed`](Self::seed)'s KEM half (spec §12.3 half (a)).
+    ///
+    /// **This is the half of §12.3 that had no provisioning path at all**, which is why the shipping hidden
+    /// service holds its whole `HybridSigSecret` on one node: the mechanism
+    /// ([`deal_service_key`](fanos_calypso::hosting::deal_service_key) /
+    /// [`open_service_share`](fanos_calypso::hosting::open_service_share) /
+    /// [`recover_service_key`](fanos_calypso::hosting::recover_service_key)) was built and tested, and
+    /// nothing could put a share into a member's hands. Custody lives here because the line *is* the
+    /// service — the same place the intro-reading threshold already lives, not a second roster beside it.
+    ///
+    /// `None` for a line that carries request confidentiality only (half (b)) and custodies no signing
+    /// identity. It is an `Option` rather than a required field because those are genuinely different
+    /// deployments and a zero-valued share would be a share that opens to nothing — the shape
+    /// [[fallback-holds-a-value-nobody-set]] warns about, where a default fabricates agreement.
+    ///
+    /// Secret material: it is an *encrypted* slot, so a passive read discloses nothing on its own, but it is
+    /// one of `t` inputs to the service's identity and it travels in the same 0600 file as `seed`.
+    pub identity_share: Option<SealedShare>,
 }
 
 // The seed regenerates the member secret, so it is itself key material — redacted from `Debug` (which
@@ -380,6 +399,10 @@ impl fmt::Debug for ServiceParams {
             .field("seed", &"<redacted>")
             .field("line", &self.line)
             .field("threshold", &self.threshold)
+            // Redacted as *presence*, not as bytes: whether this member custodies the identity is the fact an
+            // operator debugging a line needs, and it is exactly what `<redacted>` on the whole field would
+            // hide. The slot's own contents stay out, because it is one of `t` inputs to the signing secret.
+            .field("identity_share", &self.identity_share.as_ref().map(|_| "<redacted, present>"))
             .finish()
     }
 }
@@ -591,10 +614,38 @@ impl ExitParams {
 }
 
 impl ServiceParams {
+    /// Render as the `key = value` provisioning file `fanos service-deal` writes and `fanos node` reads.
+    ///
+    /// **Written through the type rather than by the ceremony's own `format!`, which is why this exists.**
+    /// The dealer used to compose these three keys by hand, so the writer and [`from_config_str`] were two
+    /// statements of one format that nothing held together — and `identity_share` is exactly the kind of
+    /// addition that drifts through such a seam: a field the parser accepts and the dealer never emits
+    /// produces a line provisioned with no custody, silently, which is the defect §12.3 half (a) is about.
+    ///
+    /// The whole file is secret (`seed` alone makes it so), which is why nothing here is split out as
+    /// "public" the way `IngressParams` separates its binding.
+    #[must_use]
+    pub fn to_config_string(&self) -> String {
+        use core::fmt::Write as _;
+        use fanos_wire::Wire as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "seed = {}", hex_encode(&self.seed));
+        let roster: Vec<String> =
+            self.line.iter().map(|[x, y, z]| format!("{x}:{y}:{z}")).collect();
+        let _ = writeln!(s, "line = {}", roster.join(", "));
+        let _ = writeln!(s, "threshold = {}", self.threshold);
+        if let Some(share) = &self.identity_share {
+            let _ = writeln!(s, "identity_share = {}", hex_encode(&share.to_wire()));
+        }
+        s
+    }
+
     /// Parse service parameters from a `key = value` text file — the out-of-band provisioning a service
     /// operator hands each line member. Recognised keys: `seed` (64 hex chars: the 32-byte member-key
-    /// seed), `line` (comma-separated `x:y:z` member coordinates, in the client's seal order), and
-    /// `threshold` (the reconstruction `t`). All three are required; an unrecognised key is an error.
+    /// seed), `line` (comma-separated `x:y:z` member coordinates, in the client's seal order),
+    /// `threshold` (the reconstruction `t`), and the optional `identity_share` (this member's sealed slot
+    /// of the service's signing secret, §12.3 half (a)). The first three are required; an unrecognised key
+    /// is an error.
     ///
     /// # Errors
     /// [`NodeError::Config`] on a malformed line, an unknown key, a bad value, or a missing key.
@@ -602,6 +653,7 @@ impl ServiceParams {
         let mut seed: Option<[u8; 32]> = None;
         let mut line: Vec<Triple> = Vec::new();
         let mut threshold: Option<usize> = None;
+        let mut identity_share: Option<SealedShare> = None;
         for (n, raw) in text.lines().enumerate() {
             let l = raw.split('#').next().unwrap_or("").trim();
             if l.is_empty() {
@@ -620,6 +672,20 @@ impl ServiceParams {
                 "threshold" => {
                     threshold = Some(value.trim().parse().map_err(|_| {
                         NodeError::Config(format!("bad service threshold '{}'", value.trim()))
+                    })?);
+                }
+                "identity_share" => {
+                    use fanos_wire::Wire as _;
+                    let bytes = hex_decode(value.trim())?;
+                    // Refused here rather than at first use: a slot that does not decode is a file the
+                    // operator can still fix, while the same failure at the first reconstruction arrives
+                    // during whatever emergency made the service need its identity.
+                    identity_share = Some(SealedShare::from_wire(&bytes).map_err(|_| {
+                        NodeError::Config(
+                            "service config `identity_share` is not a well-formed sealed share — it is \
+                             the slot `fanos service-deal` wrote for THIS member, copied whole"
+                                .to_owned(),
+                        )
                     })?);
                 }
                 other => {
@@ -641,6 +707,7 @@ impl ServiceParams {
             seed,
             line,
             threshold,
+            identity_share,
         })
     }
 }
@@ -1728,6 +1795,60 @@ mod tests {
         // The seed is redacted from Debug (it regenerates the member secret).
         assert!(format!("{p:?}").contains("<redacted>"));
         assert!(!format!("{p:?}").contains("0011"));
+        // A file with no `identity_share` is a line that carries request confidentiality only — a
+        // deployment, not an error. Asserted so that making custody mandatory has to be a decision.
+        assert!(p.identity_share.is_none());
+    }
+
+    /// **The custody slot survives the file, and the writer and the parser are one format.**
+    ///
+    /// `service-deal` used to compose this file with its own `format!`, so the emitter and
+    /// [`ServiceParams::from_config_str`] were two independent statements of the same thing. This asserts
+    /// the round trip through the real dealing primitives rather than a hand-built value: an
+    /// `identity_share` that renders but does not re-open would be a line provisioned with custody that
+    /// cannot be used, discovered only in an emergency.
+    #[test]
+    fn a_dealt_identity_slot_round_trips_through_the_provisioning_file() {
+        use fanos_calypso::hosting::{deal_service_key, open_service_share};
+        use fanos_pqcrypto::{HybridKemSecret, SeedRng};
+
+        let secrets: Vec<_> = (0u8..3)
+            .map(|i| HybridKemSecret::generate(&mut SeedRng::from_seed(&[0xD0, i])))
+            .collect();
+        let publics: Vec<_> = secrets.iter().map(|(_s, p)| p.clone()).collect();
+        let refs: Vec<_> = publics.iter().collect();
+        let identity = b"the service's 32-byte signing seed .";
+        let sealed = deal_service_key(identity, 2, &refs, &[7u8; 128], b"kem").expect("deals");
+
+        let before = ServiceParams {
+            seed: [0x5e; 32],
+            line: vec![[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            threshold: 2,
+            identity_share: Some(sealed.get(1).expect("member 1's slot").clone()),
+        };
+        let after = ServiceParams::from_config_str(&before.to_config_string())
+            .expect("what the dealer writes, the node reads");
+
+        assert_eq!(after.seed, before.seed);
+        assert_eq!(after.line, before.line);
+        assert_eq!(after.threshold, before.threshold);
+        assert_eq!(
+            after.identity_share, before.identity_share,
+            "the slot must survive the file byte for byte — hex, `Wire`, and back"
+        );
+        // And it is still a usable share, not merely equal bytes: it opens under member 1's own key.
+        let mine = &secrets.get(1).expect("member 1").0;
+        let other = &secrets.first().expect("member 0").0;
+        let opened = open_service_share(after.identity_share.as_ref().expect("present"), mine);
+        assert!(opened.is_some(), "the slot that came back out of the file still opens for its member");
+        // The falsification the equality above cannot give: it must NOT open for a different member.
+        assert!(
+            open_service_share(after.identity_share.as_ref().expect("present"), other).is_none(),
+            "a slot that opened for any member would make the whole per-member sealing decorative"
+        );
+        // Presence is visible in Debug, contents are not — an operator debugging a line needs the first.
+        let rendered = format!("{after:?}");
+        assert!(rendered.contains("redacted, present"), "custody shows as present: {rendered}");
     }
 
     #[test]

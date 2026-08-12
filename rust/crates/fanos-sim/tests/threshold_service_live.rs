@@ -37,7 +37,7 @@ fn spawn_line(sim: &mut Sim, n: usize, t: usize) -> (Vec<Triple>, Vec<HybridKemP
         secrets.push(secret);
     }
     for (i, secret) in secrets.into_iter().enumerate() {
-        sim.add(Box::new(ThresholdService::new(line[i], secret, line.clone(), t)));
+        sim.add(Box::new(ThresholdService::new(line[i], secret, line.clone(), t, None)));
     }
     (line, pubs)
 }

@@ -93,16 +93,38 @@ pub struct ThresholdService {
     /// identical whether its line disagreed on the key, its intros were being flooded, or its shares were
     /// arriving tampered — the exact "eleven candidate causes, one clock" position #55 was diagnosed from.
     stations: Stations,
+    /// This member's **identity-custody slot** — one [`SealedShare`] of the service's signing secret
+    /// (§12.3 half (a)), or `None` for a line that carries request confidentiality only.
+    ///
+    /// **It lives here, beside `secret`, because `secret` is the only key that opens it.** The slot and the
+    /// KEM secret are one member's pair; holding them in two different types is how they drift apart, and
+    /// the drift is undetectable until the service has to authenticate. `ThresholdRendezvous` used to hold
+    /// the slot and pass it down to this engine's opener on every call — the same two halves, one seam
+    /// further apart.
+    identity_share: Option<SealedShare>,
 }
 
 impl ThresholdService {
     /// A service-line member at `coord` holding `secret`, hosting the service `threshold`-of-`line.len()`.
     /// `line` is every member's coordinate in the exact order the client sealed their public keys — a
     /// member's position in it is its share index.
+    ///
+    /// `identity_share` is this member's §12.3 half-(a) custody slot, `None` for a line that carries
+    /// request confidentiality only. **A constructor argument rather than a `with_identity_share` builder,
+    /// deliberately**: a security property reached by an extra call is off in every composition whose author
+    /// did not know to make it, and the two shipping compositions here are written in different crates. As
+    /// an argument, a caller that has no slot has to say so.
     #[must_use]
-    pub fn new(coord: Triple, secret: HybridKemSecret, line: Vec<Triple>, threshold: usize) -> Self {
+    pub fn new(
+        coord: Triple,
+        secret: HybridKemSecret,
+        line: Vec<Triple>,
+        threshold: usize,
+        identity_share: Option<SealedShare>,
+    ) -> Self {
         let my_index = line.iter().position(|&c| c == coord);
         Self {
+            identity_share,
             coord,
             secret,
             line,
@@ -148,8 +170,19 @@ impl ThresholdService {
     /// authenticate (e.g. re-signing an epoch cert, spec §12.6) — so **no single host holds the service
     /// identity in the clear**, the same seizure-resistance the per-intro sharing gives request confidentiality.
     #[must_use]
-    pub fn open_identity_share(&self, sealed: &SealedShare) -> Option<Share> {
-        open_service_share(sealed, &self.secret)
+    pub fn open_identity_share(&self) -> Option<Share> {
+        open_service_share(self.identity_share.as_ref()?, &self.secret)
+    }
+
+    /// Whether this member custodies a slot of the service's signing identity at all (§12.3 half (a)).
+    ///
+    /// Distinct from [`open_identity_share`](Self::open_identity_share) returning `None`, and the two must
+    /// not be folded: *no slot* is a deployment choice, while *a slot that will not open* is a
+    /// misprovisioning. Collapsing them into one `Option` is how the second would read as the first —
+    /// a line that quietly custodies nothing while its operator believes otherwise.
+    #[must_use]
+    pub fn custodies_identity(&self) -> bool {
+        self.identity_share.is_some()
     }
 
     fn intro_id(intro: &SealedIntro) -> IntroId {
@@ -442,7 +475,7 @@ mod tests {
         let mut secrets = secrets.into_iter();
         let combiner_secret = secrets.next().unwrap();
         let member_1_secret = secrets.next().unwrap();
-        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), t);
+        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), t, None);
 
         // Cold: nothing measured yet, so the bootstrap deadline stands.
         let intro = SealedIntro::seal(b"first", t as u8, &refs, b"seed-0").unwrap();
@@ -514,7 +547,7 @@ mod tests {
         let refs: Vec<&HybridKemPublic> = publics.iter().collect();
         let pinned = Duration::from_millis(250);
         let combiner_secret = secrets.into_iter().next().unwrap();
-        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), 2)
+        let mut svc = ThresholdService::new(line[0], combiner_secret, line.clone(), 2, None)
             .with_gather_timeout(pinned);
         let intro = SealedIntro::seal(b"pinned", 2, &refs, b"seed-pin").unwrap();
         let effects = svc.step(Instant(0), Input::Message { from: line[2], frame: intro_frame(&intro) });

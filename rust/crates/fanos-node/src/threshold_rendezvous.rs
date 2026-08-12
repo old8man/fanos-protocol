@@ -56,9 +56,6 @@ pub struct ThresholdRendezvous<F: Field> {
     gather: ThresholdService,
     /// The route-binding + reply path: parses the decrypted request, binds cookie→reply-circuit, seals replies.
     service: RendezvousService<F>,
-    /// This member's identity-custody share of the service's threshold-hosted identity secret (part a).
-    /// `None` for a service that does not custody an authenticating identity (request confidentiality only).
-    identity_share: Option<SealedShare>,
     _f: PhantomData<F>,
 }
 
@@ -86,9 +83,9 @@ impl<F: Field> ThresholdRendezvous<F> {
         reply_secret: &[u8],
         identity_share: Option<SealedShare>,
     ) -> Self {
-        let gather = ThresholdService::new(coord, secret, line, threshold);
+        let gather = ThresholdService::new(coord, secret, line, threshold, identity_share);
         let service = RendezvousService::new(directory, threshold as u8, reply_secret);
-        Self { gather, service, identity_share, _f: PhantomData }
+        Self { gather, service, _f: PhantomData }
     }
 
     /// **Pin** the combiner's intro-gather deadline, disabling the measured one — see
@@ -123,7 +120,14 @@ impl<F: Field> ThresholdRendezvous<F> {
     /// only when the service must authenticate (spec §12.6) — so no single host holds it in the clear.
     #[must_use]
     pub fn open_identity_share(&self) -> Option<Share> {
-        self.gather.open_identity_share(self.identity_share.as_ref()?)
+        self.gather.open_identity_share()
+    }
+
+    /// Whether this member custodies a slot of the service identity at all — see
+    /// [`ThresholdService::custodies_identity`], which is where the slot now lives.
+    #[must_use]
+    pub fn custodies_identity(&self) -> bool {
+        self.gather.custodies_identity()
     }
 
     /// Reconstruct the service identity secret from `threshold` (or more) members' opened identity

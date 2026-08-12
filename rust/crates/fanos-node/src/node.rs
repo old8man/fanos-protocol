@@ -636,7 +636,9 @@ fn beacon_params_checked(config: &NodeConfig) -> Result<(), NodeError> {
 /// a single host; above the line size can never be met). Validated here so bad provisioning fails
 /// [`Node::start`] rather than the infallible engine builder.
 #[allow(clippy::type_complexity)]
-fn service_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<Triple>, usize)>, NodeError> {
+fn service_params(
+    config: &NodeConfig,
+) -> Result<Option<([u8; 32], Vec<Triple>, usize, Option<fanos_calypso::hosting::SealedShare>)>, NodeError> {
     if !config.roles.service {
         return Ok(None);
     }
@@ -664,7 +666,32 @@ fn service_params(config: &NodeConfig) -> Result<Option<([u8; 32], Vec<Triple>, 
             params.line.len(),
         )));
     }
-    Ok(Some((params.seed, params.line.clone(), params.threshold)))
+    // **An identity-custody slot must open under THIS member's own key, and that is checked here or never.**
+    //
+    // A `SealedShare` is addressed to one member: it opens under the KEM secret `seed` regenerates and under
+    // no other. So the two fields are only correct as a pair, and the ways an operator gets them wrong are
+    // ordinary — the wrong `service-<i>.conf` copied to a host, two members' files swapped, a file kept
+    // across a re-deal that drew fresh seeds.
+    //
+    // Every one of those produces a line that starts, serves intros perfectly (half (b) uses `seed` and
+    // never touches this slot), and is discovered to be unable to reconstruct its own identity only when it
+    // is asked to — which by construction is during whatever emergency made the service need it. The
+    // failure is silent, deferred, and lands at the worst possible moment: exactly the shape a startup check
+    // exists to convert into a refusal an operator can still act on. `IngressParams` states the same rule
+    // one field over ("the binding is not optional and is not separable from the share").
+    if let Some(sealed) = &params.identity_share {
+        let (secret, _public) = fanos_pqcrypto::HybridKemSecret::generate(&mut SeedRng::from_seed(&params.seed));
+        if fanos_calypso::hosting::open_service_share(sealed, &secret).is_none() {
+            return Err(NodeError::Config(
+                "this service config's `identity_share` does not open under the key its own `seed` \
+                 regenerates — the two are one member's pair, so the file carries another member's slot (a \
+                 swapped `service-<i>.conf`, or one kept across a re-deal). The line would start, serve \
+                 every intro, and fail only when the service had to authenticate."
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(Some((params.seed, params.line.clone(), params.threshold, params.identity_share.clone())))
 }
 
 /// Validate the `exit` role's parameters, returning the service-key seed and allowed-port list to run
@@ -1834,6 +1861,7 @@ mod tests {
                     seed: [0x5e; 32],
                     line: vec![[1, 0, 0], [0, 1, 0]],
                     threshold,
+                    identity_share: None,
                 }),
                 ..NodeConfig::default()
             })
@@ -1860,6 +1888,7 @@ mod tests {
                 seed: [0x5e; 32],
                 line: vec![[1, 0, 0], [0, 1, 0], [0, 0, 1]],
                 threshold: 2,
+                identity_share: None,
             }),
             ..NodeConfig::default()
         })
@@ -2247,7 +2276,12 @@ mod tests {
                 authority: None,
             }),
             roles: RoleSet { service: true, ..RoleSet::default() },
-            service: Some(ServiceParams { seed: [0x7A; 32], line: line.clone(), threshold }),
+            service: Some(ServiceParams {
+                seed: [0x7A; 32],
+                line: line.clone(),
+                threshold,
+                identity_share: None,
+            }),
             ..NodeConfig::default()
         };
 
@@ -2260,6 +2294,76 @@ mod tests {
         assert!(
             Node::start::<F2>(start(2)).await.is_ok(),
             "2-of-3 is the smallest line that means what the design says, and it must still run",
+        );
+    }
+
+    /// **A member whose custody slot belongs to somebody else is refused at startup, not at the emergency.**
+    ///
+    /// §12.3 half (a) deals one `SealedShare` per member, openable under the KEM secret that member's `seed`
+    /// regenerates and under no other. `seed` and `identity_share` are therefore one member's pair — and the
+    /// ways an operator separates them are the ordinary ones: `service-2.conf` copied to the wrong host, two
+    /// files swapped, one file kept across a re-deal that drew fresh seeds.
+    ///
+    /// Every one of those starts, serves every intro correctly (half (b) reads `seed` and never touches this
+    /// slot), and is discovered only when the service must authenticate — which is, by construction, the
+    /// moment it least can afford to find out. This is the check that converts a deferred silent failure
+    /// into a refusal an operator can still act on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_custody_slot_sealed_to_another_member_is_refused_at_startup() {
+        use fanos_calypso::hosting::deal_service_key;
+        use fanos_pqcrypto::HybridKemSecret;
+        use fanos_vrf::vss::{DeterministicRng, deal};
+
+        use crate::config::ServiceParams;
+
+        let (_shares, commitment) = deal(&[0xE3; 32], 2, 3, &mut DeterministicRng::new(b"svc-custody")).unwrap();
+        let line: Vec<Triple> = (0..3).map(|i| Point::<F2>::at(i).coords()).collect();
+
+        // Deal a real identity across three members whose seeds are the ones their files would carry.
+        let seeds: [[u8; 32]; 3] = [[0xA1; 32], [0xB2; 32], [0xC3; 32]];
+        let publics: Vec<_> = seeds
+            .iter()
+            .map(|s| HybridKemSecret::generate(&mut SeedRng::from_seed(s)).1)
+            .collect();
+        let refs: Vec<_> = publics.iter().collect();
+        let sealed = deal_service_key(b"a service identity seed, 32 bytes", 2, &refs, &[9u8; 128], b"kem")
+            .expect("the ceremony deals");
+
+        let start = |seed_index: usize, slot_index: usize| NodeConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            beacon: Some(BeaconParams {
+                network_id: NetworkId::from_seed(b"test-network"),
+                commitment: commitment.clone(),
+                threshold: 2,
+                share: None,
+                authority: None,
+            }),
+            roles: RoleSet { service: true, ..RoleSet::default() },
+            service: Some(ServiceParams {
+                seed: *seeds.get(seed_index).expect("a seed this test dealt"),
+                line: line.clone(),
+                threshold: 2,
+                // `expect`, not `.cloned()`: an out-of-range index would silently become `None` — no
+                // custody at all — and the mismatch assertion below would then pass for the opposite
+                // reason to the one it claims.
+                identity_share: Some(sealed.get(slot_index).expect("a slot this test dealt").clone()),
+            }),
+            ..NodeConfig::default()
+        };
+
+        // THE CONTROL FIRST, so a refusal that refuses everything cannot pass for this check: the pair the
+        // ceremony actually wrote together must start.
+        assert!(
+            Node::start::<F2>(start(1, 1)).await.is_ok(),
+            "the seed and the slot the ceremony wrote into ONE file must run — otherwise this guard is \
+             refusing custody as such rather than refusing a mismatch",
+        );
+
+        // And the mismatch — member 1's seed beside member 2's slot — must not.
+        assert!(
+            Node::start::<F2>(start(1, 2)).await.is_err(),
+            "a slot sealed to another member must be refused at startup: it opens for nobody here, so this \
+             node would serve every intro and be unable to contribute to its own service's identity",
         );
     }
 

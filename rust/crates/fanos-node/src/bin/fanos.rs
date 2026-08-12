@@ -2725,21 +2725,90 @@ fn cmd_service_deal(args: &[String]) -> Result<(), NodeError> {
         )));
     }
 
-    for (i, coord) in line.iter().enumerate() {
+    // **Every member's seed is drawn first, because the identity is dealt to their PUBLIC keys.** The
+    // per-member seed regenerates that member's hybrid-KEM keypair (`composition.rs` does exactly this at
+    // startup), so this tool can derive each public and seal that member its own slot — the same direction
+    // `ingress-deal` uses. Drawing them inside the write loop, as this did, made the publics unavailable
+    // while the shares were being sealed.
+    let mut seeds: Vec<[u8; 32]> = Vec::with_capacity(line.len());
+    let mut member_publics: Vec<HybridKemPublic> = Vec::with_capacity(line.len());
+    for _ in &line {
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
-        let roster: Vec<String> =
-            line.iter().map(|[x, y, z]| format!("{x}:{y}:{z}")).collect();
-        let body = format!(
-            "seed = {}\nline = {}\nthreshold = {threshold}\n",
-            fanos_node::config::hex_encode(&seed),
-            roster.join(", "),
-        );
+        let (_secret, public) = fanos_pqcrypto::HybridKemSecret::generate(&mut SeedRng::from_seed(&seed));
+        seeds.push(seed);
+        member_publics.push(public);
+    }
+
+    // **The service's signing identity, minted here and dealt away — §12.3 half (a).**
+    //
+    // What is sharded is the 32-byte SEED, not the key: `HybridSigSecret` has no `to_bytes`, deliberately,
+    // because this tree carries secrets as seeds and regenerates them in memory (audit #124). A threshold of
+    // members reconstructs the seed and re-derives the identical keypair — which is also why
+    // `recover_service_key` returns bytes rather than a key type.
+    //
+    // The whole seed exists only inside this function: it is `Zeroizing`, it is never written to any file,
+    // and after the shares are sealed nothing anywhere holds it. That is the property the ceremony buys —
+    // a hidden service whose signing identity was, until now, derivable from one file on one host.
+    let identity_seed = {
+        let mut s = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(s.as_mut()).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+        s
+    };
+    let (_signer, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(identity_seed.as_ref()));
+
+    // The sharing polynomial and the per-member KEM encapsulation randomness, both from OS entropy. Sized
+    // as `ingress-deal` sizes its own: `len × threshold + 32` covers `threshold − 1` coefficients of the
+    // secret's width with slack, and `shard_service_key` refuses if it is short rather than silently
+    // reusing bytes.
+    let mut key_randomness = vec![0u8; identity_seed.len() * threshold + 32];
+    getrandom::fill(&mut key_randomness).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let mut kem_seed = [0u8; 32];
+    getrandom::fill(&mut kem_seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
+    let public_refs: Vec<&HybridKemPublic> = member_publics.iter().collect();
+    let sealed = fanos_calypso::hosting::deal_service_key(
+        identity_seed.as_ref(),
+        u8::try_from(threshold).unwrap_or(u8::MAX),
+        &public_refs,
+        &key_randomness,
+        &kem_seed,
+    )
+    .map_err(|e| NodeError::Config(format!("cannot deal the service identity: {e}")))?;
+    drop(identity_seed); // Zeroized here; from this point the identity exists only as `threshold`-of-n slots.
+
+    // **The count is checked before the loop, not assumed inside it.** Zipping three vectors silently
+    // writes `min(len)` files, and indexing with `.cloned()` silently writes a file with no custody — both
+    // turn "the dealer produced fewer slots than there are members" into a line that starts and cannot
+    // reconstruct. It cannot happen (`deal_service_key` returns one slot per key it was handed), and that
+    // is precisely why it must be stated: an invariant nothing checks is the one that changes quietly.
+    if sealed.len() != line.len() || seeds.len() != line.len() {
+        return Err(NodeError::Config(format!(
+            "the ceremony produced {} slots and {} seeds for a {}-member line — refusing to write files \
+             whose members would hold no identity",
+            sealed.len(),
+            seeds.len(),
+            line.len(),
+        )));
+    }
+    for (i, ((coord, seed), slot)) in line.iter().zip(&seeds).zip(&sealed).enumerate() {
+        let params = ServiceParams {
+            seed: *seed,
+            line: line.clone(),
+            threshold,
+            identity_share: Some(slot.clone()),
+        };
         let [x, y, z] = *coord;
         let path = format!("{out}/service-{}.conf", i + 1);
-        write_dealt(&path, body, true)?;
+        write_dealt(&path, params.to_config_string(), true)?;
         println!("  ↳ for the member at {x}:{y}:{z}");
     }
+
+    // The verifier is PUBLIC and is what a client checks a registration against — the only half of the
+    // identity that survives this process. Written to its own file precisely because it is not secret: an
+    // operator who cannot tell which of these files may be copied will copy the wrong one.
+    let pub_path = format!("{out}/service-identity.pub");
+    write_dealt(&pub_path, format!("verifier = {}\n", fanos_node::config::hex_encode(&verifier.encode())), false)?;
+
     println!(
         "dealt a {threshold}-of-{} service line; run each member with `fanos node --service service-<i>.conf` \
          (the flag implies the role, and `service = PATH` is a config key)",
@@ -2748,6 +2817,13 @@ fn cmd_service_deal(args: &[String]) -> Result<(), NodeError> {
     println!(
         "every file carries the SAME roster and threshold — which is the point: a line whose members \
          disagree by one coordinate cannot reconstruct, and says nothing when it fails to."
+    );
+    println!(
+        "the service's SIGNING IDENTITY was minted here and is gone: it exists only as the {threshold}-of-{} \
+         `identity_share` slots in those files, and no copy was written anywhere (§12.3 half (a)). \
+         Fewer than {threshold} seized members cannot reconstruct it — which is the guarantee, and it is \
+         void if you keep these files together.",
+        line.len()
     );
     Ok(())
 }
