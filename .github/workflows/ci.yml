@@ -348,8 +348,17 @@ jobs:
         run: |
           set -o pipefail
           cargo bench -p fanos-bench 2>&1 | tee -a measurements.txt
-      # Without this the numbers exist for the length of one log retention and are then gone, which makes a
-      # trend — the thing a measurement is actually for — impossible to read.
+      # Without this the numbers exist for the length of one log retention and are then gone.
+      #
+      # CORRECTION, 2026-08-12 (#186): this line used to end "…which makes a trend — the thing a measurement is
+      # actually for — impossible to read", and that claims more than the step delivers. An upload makes the
+      # numbers SURVIVE; reading a trend needs run N compared against run N−1, and no step here downloads a
+      # previous artifact, keeps a baseline, or fails on a regression. Retention was standing in for
+      # comparability — a report carrying a quantity correlated with the claim instead of the claim.
+      #
+      # So the honest statement is: the numbers are kept, and nothing yet reads them across runs. Closing that
+      # needs a baseline the job can fetch and a stated tolerance per metric; until it exists, a measurement
+      # here answers "what is it now", never "is it drifting".
       - name: Keep the numbers
         if: always()
         uses: actions/upload-artifact@v4
