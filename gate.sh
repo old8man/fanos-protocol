@@ -45,9 +45,11 @@ export CARGO_INCREMENTAL=0
 # not chosen: at 0 bytes free the harness cannot even create a file, `bash` stops working entirely, and the
 # session that discovers this cannot run the `rm` that would fix it. Failing loudly here costs one message;
 # failing there cost an hour and a hand-written instruction to the operator.
-FREE_GB=$(df -g . 2>/dev/null | awk 'NR==2 {print $4}')
-if [ -n "${FREE_GB:-}" ] && [ "$FREE_GB" -lt 50 ]; then
-  echo "REFUSING TO START: ${FREE_GB} GB free, a full run needs ~44 GB (measured #286)." >&2
+free_mb() { df -m . 2>/dev/null | awk 'NR==2 {print $4}'; }
+FREE_MB=$(free_mb)
+FREE_AT_START=$FREE_MB
+if [ -n "${FREE_MB:-}" ] && [ "$FREE_MB" -lt 51200 ]; then
+  echo "REFUSING TO START: $((FREE_MB / 1024)) GB free, a full run needs ~44 GB (measured #286)." >&2
   echo "  du -h -d 1 $(pwd)/target   # then prune debug/incremental (safe) or debug/deps (costs a rebuild)" >&2
   exit 4
 fi
@@ -179,6 +181,19 @@ printf '  %s\n' ${SUMMARY[@]+"${SUMMARY[@]}"}
 echo
 # The path is printed again HERE, not only at the top. A caller that keeps the tail of a long run — which is
 # every caller — otherwise ends up holding the verdict without the evidence.
+# What this run COST the disk, printed whether it passed or failed.
+#
+# The accumulation was invisible until it stopped the machine: `target` reached 188 GB, and at zero bytes free
+# the harness could not create a file, so `bash` itself stopped working. Nothing in the tree measured the
+# growth, and nothing removes it — cargo keeps every superseded `.rlib` in `deps` forever. A floor alone only
+# reports the last moment before the wall; this reports the rate that walks you there.
+#
+# `df`, not `du`: reading 128 GB of directory entries takes minutes, and an instrument that expensive gets
+# switched off. This is two syscalls and is exact for the question asked — how much less room is there now.
+FREE_AT_END=$(free_mb)
+if [ -n "${FREE_AT_START:-}" ] && [ -n "${FREE_AT_END:-}" ]; then
+  echo "disk — $((FREE_AT_START / 1024)) GB free before, $((FREE_AT_END / 1024)) GB after (this run cost $((FREE_AT_START - FREE_AT_END)) MB)"
+fi
 if [ "$FAILED" -eq 0 ]; then
   echo "GATE GREEN — ${#SUMMARY[@]} steps, every status read from cargo — logs in $LOGS"
 else
