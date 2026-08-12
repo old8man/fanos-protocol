@@ -35,6 +35,36 @@
 //! byte-for-byte identically — the discipline the network's `conformance/vectors` follow. The transport
 //! (NYX/DIAULOS), the rendezvous (CALYPSO), the ONOMA identity binding, and the offline mailbox protocol compose
 //! underneath these planes.
+//!
+//! # What no binary reaches yet, and the DIFFERENT reason for each (#283)
+//!
+//! Six of the nine modules have zero production mentions outside this crate. That count is a fact about
+//! wiring, not a verdict — but "five unreachable modules" is the shape of a shared justification held by
+//! non-members, and each of these is blocked on something else. Measured 2026-08-12; two of the readings below
+//! are corrections of my own scans, which is why they are stated as findings rather than assumptions.
+//!
+//! * [`call`] — **no consumer.** `MessageKind::CallSignal` has zero production handlers anywhere outside this
+//!   crate. Signalling rides the message plane, which *is* wired, so what is absent is a node-side router that
+//!   recognises the kind. Smallest missing piece of the five in mechanism, largest in reach.
+//! * [`media`] — **the transport exists; the key agreement does not.** My first scan looked only in
+//!   `fanos-quic/src` and read zero, which was wrong: the datagram path is in `fanos-proteus::datagram` and
+//!   `fanos-node::{diaulos, rendezvous, node}`. What is missing is the per-call, per-direction epoch key agreed
+//!   over the control plane, plus an exposure of that datagram path to this crate. Glue, not a subsystem.
+//! * [`group`] — **the ceremony is genuinely absent.** The only `group_key` in the whole tree is
+//!   `fanos-vrf/src/vss.rs`'s threshold commitment — a different quantity that shares a name. Nothing anywhere
+//!   distributes a sender-key group key over 1:1 sessions, so this module is blocked on a mechanism that has
+//!   not been written, not on wiring.
+//! * [`bot`] — **the runtime is the missing half, by this module's own design.** It is a pure `Event → Outgoing`
+//!   handler that deliberately does no I/O; the SDK runtime is supposed to encrypt, transport and decrypt around
+//!   it, reached through the C ABI. `fanos-ffi` has no bot surface at all — my scan first reported two hits and
+//!   both were the substring `bot` inside the English word "both" in comments.
+//! * [`attachment`] — **its dependency is already there.** `fanos_quic::Client::put`/`get` exist, so the content
+//!   store this module needs is live. What is missing is only the edge seal and the descriptor round-trip. The
+//!   cheapest of the five to close.
+//! * `chain` — private, and the same zero. It is the symmetric ratchet's chain, used by [`session`].
+//!
+//! [`message`], [`session`] and [`ratchet`] are wired; `ratchet` only became so when #282 found that the driver
+//! held the *symmetric* half while its own doc claimed post-compromise security from the asymmetric one.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
