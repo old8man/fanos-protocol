@@ -924,26 +924,68 @@ impl<F: Field> ThresholdRouter<F> {
     /// combiner (itself a member) hands the body to its own application; every other member receives a
     /// dead-drop cell. Only the receiver's [`ReplyKeys`](crate::nostos::ReplyKeys) opens it, so no node —
     /// not the combiner, not any member — learns which of the `q+1` is the receiver (spec §5, NOSTOS).
-    fn deaddrop_multicast(&self, line: Triple, e2e: &[u8]) -> Vec<Effect> {
+    ///
+    /// ## The `q` cells go out through [`forward_send`](Self::forward_send), one call each (#134)
+    ///
+    /// They used to be `Effect::Send`s built here and returned together from one `step`, which put them on
+    /// the wire at a single instant and past **both** of the router's emission defences: `mean_delay` was
+    /// never sampled and the constant-rate `outbox` was never touched. `cf55ead` had already made a drop cell
+    /// byte-identical in width to a forwarded onion frame, so what was left of the dead drop's signature was
+    /// entirely in the timing — and it was a loud one. Measured on the GPA tape
+    /// (`fanos-sim/tests/deaddrop_burst.rs`), as the widest simultaneous fan-out of cell-width frames from the
+    /// peeling node: `2` on `PG(2,2)` and `4` on `PG(2,4)` against `1` for the ordinary forwarded onion the
+    /// same node peels in the same position — **the burst width was `q`**, so it announced both that a reply
+    /// had landed there and which plane the cell runs. It read the same under the shipping cover profile,
+    /// whose whole invariant is *at most one cell per slot*: `q` cells at one instant is `q` cells that never
+    /// entered the slot machinery, i.e. volume **added** to the constant rate rather than displacing it.
+    ///
+    /// The flattest evidence that both defences were being skipped is the arrival time. Undefended, a drop cell
+    /// reached its member **60 ms after the launch under every schedule alike** — bare, mixing at 120 ms, and
+    /// the full shipping cover profile all read 60.0 ms mean over 32 cells. A number that does not move when the
+    /// defence is switched on is a number the defence never touched.
+    ///
+    /// A dead-drop delivery **is `q` forwards**, not one send, and that is the derivation — the remedy
+    /// introduces no constant of its own. Each cell is an independent hand-off to a different member with no
+    /// ordering constraint between them and no reason to be simultaneous, so each takes the same treatment a
+    /// forwarded hop takes: an independent `Exp(mean_delay)` hold with cover off, or one constant-rate slot
+    /// with cover on. The spacing is therefore whatever the operator's already-derived schedule is, and where
+    /// that schedule does not defend (both zero) neither is the dead drop defended — which is the honest
+    /// reading of a router told not to mix, not a gap here.
+    ///
+    /// **The cost is the receiver's own cell waiting its turn**, since only one of the `q` is its — and it is
+    /// paid, not waved through. Under mixing it is `E[Exp(mean_delay)] = mean_delay`, precisely what every other
+    /// hop of the circuit already pays, so the last hop stops being free rather than becoming expensive. Under
+    /// cover the outbox draw is uniform, so the receiver waits `(q+1)/2` slots in expectation: `1.5 ×
+    /// cover_interval` at `q = 2`. Measured against those derivations, mean over 32 cells on `PG(2,2)`:
+    ///
+    /// | schedule | arrival | against undefended | derived |
+    /// |---|---|---|---|
+    /// | bare | 60.0 ms | — | — |
+    /// | mixing 120 ms | 144.9 ms | +84.9 ms | +120 ms (`SEM ≈ 21 ms` on 32 exponential draws) |
+    /// | shipping (mix 120, cover 500) | 808.2 ms | +748.2 ms | **+750 ms** |
+    fn deaddrop_multicast(&mut self, line: Triple, e2e: &[u8]) -> Vec<Effect> {
         let me = self.coord.coords();
-        Self::line_members(line)
-            .into_iter()
-            .filter_map(|member| {
-                if member == me {
-                    return Some(Effect::Notify(Notification::Delivered {
-                        from: ANONYMOUS,
-                        payload: e2e.to_vec(),
-                    }));
-                }
-                // `encode_drop` refuses a body too wide for the bucket, and that cannot happen here:
-                // `e2e` arrived inside an onion of exactly `THRESHOLD_ONION_LEN` (`Packet::from_bytes`
-                // rejects any other width), so it is strictly shorter than the room a cell leaves. Stated
-                // rather than trusted, and the fallback is a *skipped member* rather than a short frame —
-                // a narrow cell on the wire would be precisely the distinguisher the padding removes, so
-                // the property degrades to a lost delivery and never to a leaking one.
-                encode_drop(line, e2e).map(|frame| Effect::Send { to: member, frame })
-            })
-            .collect()
+        let mut effects = Vec::new();
+        for member in Self::line_members(line) {
+            if member == me {
+                // Our own copy never reaches the wire, so it is not the emission the schedule governs — it
+                // goes straight to the application, as a local delivery always has.
+                effects.push(Effect::Notify(Notification::Delivered {
+                    from: ANONYMOUS,
+                    payload: e2e.to_vec(),
+                }));
+                continue;
+            }
+            // `encode_drop` refuses a body too wide for the bucket, and that cannot happen here:
+            // `e2e` arrived inside an onion of exactly `THRESHOLD_ONION_LEN` (`Packet::from_bytes`
+            // rejects any other width), so it is strictly shorter than the room a cell leaves. Stated
+            // rather than trusted, and the fallback is a *skipped member* rather than a short frame —
+            // a narrow cell on the wire would be precisely the distinguisher the padding removes, so
+            // the property degrades to a lost delivery and never to a leaking one.
+            let Some(frame) = encode_drop(line, e2e) else { continue };
+            effects.extend(self.forward_send(member, frame));
+        }
+        effects
     }
 
     /// Receive a dead-drop cell as a member of `line`: hand the end-to-end body to our application, which
@@ -2036,6 +2078,114 @@ mod tests {
             drop_dests, expected,
             "the dead-drop is multicast to every other member of L (the combiner keeps its own copy)",
         );
+    }
+
+    /// **The dead drop leaves under the router's own emission schedule, one independent draw per cell** (#134).
+    ///
+    /// The multicast used to build `q` `Effect::Send`s inline and return them from a single `step`, so every cell
+    /// hit the wire at one instant and neither `mean_delay` nor the cover outbox was ever consulted. Measured on
+    /// the GPA tape (`fanos-sim/tests/deaddrop_burst.rs`) that was a simultaneous fan-out of **2** on `PG(2,2)` and
+    /// **4** on `PG(2,4)`, against **1** for the ordinary forwarded onion the same node peels in the same
+    /// position — a burst whose width is the plane order.
+    ///
+    /// This is the crate-local half of the guard, and it pins the part the sim cannot see: that the `q` holds are
+    /// **independent**. A single shared delay would move the burst intact and score identically on any
+    /// widest-instant metric taken at one schedule, so "distinct mix tokens" is the assertion that separates a
+    /// stagger from a postponement.
+    #[test]
+    fn a_dead_drop_is_staggered_by_the_mix_schedule_with_an_independent_draw_per_cell() {
+        use crate::nostos::{ReplyKeys, seal_reply};
+
+        let l = Line::<F2>::at(1).coords();
+        let members = ThresholdRouter::<F2>::line_members(l);
+        let t = 2usize;
+        let onion_seed = |i: u8| {
+            let mut s = [0x64u8; 32];
+            s[31] = i;
+            s
+        };
+        let (m0, m1) = (
+            OnionKeyRatchet::new(onion_seed(0), Epoch::ZERO),
+            OnionKeyRatchet::new(onion_seed(1), Epoch::ZERO),
+        );
+        let m2 = OnionKeyRatchet::new(onion_seed(2), Epoch::ZERO);
+        let pubs = [m0.public(), m1.public(), m2.public()];
+        let (reply_keys, reply_pub) = ReplyKeys::generate(b"staggered-reply");
+        let hops = [HopLine { line: l, members: &pubs }];
+        let payload = b"the homecoming, in its own time";
+        let onion = seal_reply(&reply_pub, &hops, t as u8, payload, b"stagger-seed").unwrap();
+
+        let combiner = Point::<F2>::new(members[0]).unwrap();
+        let (identity, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"stagger-id"));
+        let mut router = ThresholdRouter::<F2>::new(combiner, &identity, t, onion_seed(0))
+            .with_mixing(Duration::from_millis(120));
+        router.step(Instant(0), Input::Message { from: [9, 9, 9], frame: launch_frame(l, &onion) });
+        let honest1 = member_partial::<F2>(&onion, 1, m1.secret()).unwrap();
+        let effects = router.step(Instant(1), Input::Message { from: members[1], frame: encode_rep(0, &honest1) });
+
+        // THE PROPERTY: not one cell reaches the wire in the peel step.
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "a dead-drop delivery must not put any cell on the wire at the instant it peels"
+        );
+        // The local copy is still immediate — it never crosses the wire, so no schedule governs it.
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Notify(Notification::Delivered { .. })))
+                .count(),
+            1,
+            "the combiner still hands its own copy straight to its application"
+        );
+
+        // One mix token per remote member, all DISTINCT — independent holds, not one shared postponement.
+        let tokens: alloc::collections::BTreeSet<u64> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ArmTimer { token: TimerToken(tok), .. } if tok & MIX_FLAG != 0 => Some(*tok),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            members.len() - 1,
+            "each remote member's cell must take its own hold: {} tokens for {} cells",
+            tokens.len(),
+            members.len() - 1,
+        );
+        let delays: alloc::collections::BTreeSet<u64> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::ArmTimer { token: TimerToken(tok), after } if tok & MIX_FLAG != 0 => Some(after.as_nanos()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delays.len(),
+            members.len() - 1,
+            "the holds must be independent draws — equal delays would move the burst rather than remove it"
+        );
+
+        // And nothing is lost: firing each token releases exactly one cell, to a distinct member, still openable.
+        let mut released: Vec<Triple> = Vec::new();
+        for tok in tokens {
+            let out = router.step(Instant(2), Input::Timer(TimerToken(tok)));
+            match out.as_slice() {
+                [Effect::Send { to, frame }] => {
+                    let (tag, body) = frame.split_first().unwrap();
+                    assert_eq!(*tag, TAG_DROP, "a released cell is still a dead-drop frame");
+                    let (line, e2e) = decode_drop(body).unwrap();
+                    assert_eq!(line, l);
+                    assert_eq!(reply_keys.open(&e2e).as_deref(), Some(&payload[..]));
+                    released.push(*to);
+                }
+                other => panic!("a held dead-drop cell must release exactly one send, got {}", other.len()),
+            }
+        }
+        released.sort_unstable();
+        let mut expected = alloc::vec![members[1], members[2]];
+        expected.sort_unstable();
+        assert_eq!(released, expected, "every member of the drop line still gets its cell — staggered, not dropped");
     }
 
     #[test]

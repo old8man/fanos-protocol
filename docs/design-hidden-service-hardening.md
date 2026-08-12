@@ -509,9 +509,39 @@ Two properties of the setting were established on the way, and both belong here 
    while every *subsequent* hop keeps per-epoch rotation. This trades a little unlinkability at the edge for a
    large reduction in eventual-compromise probability, and the trade should be quantified in the simulator before
    it is chosen.
-4. **Shape the reply path.** PROTEUS already provides per-morph size and timing shaping; the hidden-service reply
-   dead-drop is a distinctive pattern (a burst to a line the client is a member of) and should be explicitly
-   covered by a morph rather than inheriting whatever the transport does.
+4. **Shape the reply path.** ~~The hidden-service reply dead-drop is a distinctive pattern (a burst to a line the
+   client is a member of).~~ **The burst is DONE at the router; the morph half remains.**
+
+   Both halves of the pattern this item named have now been closed where they are produced, which is the emitting
+   node rather than the transport. The **size** half went in `cf55ead`: a drop cell is padded to the onion's own
+   bucket, so it is byte-identical in width to a forwarded onion frame instead of carrying the reply's plaintext
+   length. The **burst** half is #134: `deaddrop_multicast` built its `q` cells inline and returned them from one
+   `step`, past both of the router's emission defences — `mean_delay` was never sampled and the constant-rate
+   `outbox` never touched. Measured on the simulator's GPA tape (`fanos-sim/tests/deaddrop_burst.rs`), as the widest
+   simultaneous fan-out of cell-width frames from the peeling node:
+
+   | plane | dead-drop reply | ordinary forwarded onion (control) |
+   |---|---|---|
+   | `PG(2,2)` | **2** | 1 |
+   | `PG(2,4)` | **4** | 1 |
+
+   — so the burst width was `q`, disclosing both that a reply had landed there and which plane the cell runs. It
+   read the same under the shipping cover profile, whose invariant is *at most one cell per slot*, which makes `q`
+   cells at one instant `q` cells that never entered the slot machinery. The flattest evidence is the arrival
+   time: undefended, a drop cell reached its member **60 ms after launch under every schedule alike** — bare,
+   mixing at 120 ms, and full cover all read 60.0 ms mean over 32 cells, and a number that does not move when the
+   defence is switched on is a number the defence never touched.
+
+   Each cell now goes through `forward_send` — a dead-drop delivery *is* `q` forwards — so the fan-out is `1` at
+   both plane orders on both defended schedules, with **no constant introduced**: the spacing is the operator's
+   already-derived `mix_mean_delay` or `cover_interval`. The price is the receiver's own cell waiting its turn
+   among the `q`, measured against its own derivation: `144.9 ms` under mixing alone (derived `+mean_delay =
+   120 ms`) and `808.2 ms` under the shipping profile against a derived `(q+1)/2 × cover_interval = +750 ms`.
+
+   **What is left is the morph.** PROTEUS's per-morph size and timing shaping still does not name the dead drop, and
+   the two defences are not substitutes: the router makes a delivery indistinguishable from a *forward* to an
+   observer of FANOS traffic, while a morph is about resembling some *cover protocol* to a censor's classifier. The
+   second is still inherited from whatever the transport does.
 
 ---
 
