@@ -263,3 +263,141 @@ fn releasing_the_diagonal_purity_is_measured_before_its_sensitivity_is_derived()
          model cost, so #278's derivation of Δp is worth doing and this assertion must be inverted"
     );
 }
+
+/// A deterministic LCG, so the miss counts below are the same on every machine. Numerical recipes'
+/// constants; quality is irrelevant here — what is measured is how a verdict moves under Laplace noise of
+/// a given scale, not the noise's own statistics.
+struct Lcg(u64);
+impl TryRng for Lcg {
+    type Error = Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok((self.try_next_u64()? >> 32) as u32)
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        Ok(self.0)
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        for chunk in dst.chunks_mut(8) {
+            let w = self.try_next_u64()?.to_le_bytes();
+            let n = chunk.len();
+            chunk.copy_from_slice(&w[..n]);
+        }
+        Ok(())
+    }
+}
+
+/// Laplace(0, b) from two uniforms, matching `dp::laplace`'s `b·(E₁ − E₂)` shape.
+fn laplace(b: f64, rng: &mut Lcg) -> f64 {
+    let mut e = || {
+        let u = (rng.try_next_u64().unwrap_or(1) >> 11) as f64 / (1u64 << 53) as f64;
+        -(1.0 - u).max(f64::MIN_POSITIVE).ln()
+    };
+    b * (e() - e())
+}
+
+/// **#278 branch (a), decided by an upper bound instead of a derivation.**
+///
+/// The open question is whether releasing three statistics — `r`, the diagonal purity `p`, and the
+/// off-diagonal dispersion `v`, since the verdict is a function of exactly `(N, r, p, v)` — beats today's
+/// single release. It costs the ε budget split three ways, so each statistic carries **three times** the
+/// noise. The task says explicitly: do not start by deriving `Δp` and `Δv`; measure first, because the
+/// last proposal here ("just release `p`") was refuted by a measurement after being written down as the
+/// answer.
+///
+/// This is that measurement, and it is shaped so the derivation is not needed at all. Branch (a) is given
+/// its **best possible case**:
+///
+/// * today's arm: `r` noised at `Δr/ε` — the real `privatize`, full budget — then the flat model;
+/// * branch (a)'s arm: `r` noised at `Δr/(ε/3)` — the honest three-way split — but `p` and `v` **exact**,
+///   with *zero* noise, which is better than any `Δp`/`Δv` derivation could ever deliver.
+///
+/// If the bounded arm does not beat today's, no sensitivity derivation can make branch (a) win, because
+/// the derivation can only add noise to an arm that is already losing. That closes the branch with an
+/// argument rather than with work — and if it *does* win, the margin is the budget for deriving the two
+/// sensitivities, which is the number the task asks for.
+#[test]
+fn splitting_the_budget_three_ways_is_bounded_before_any_sensitivity_is_derived() {
+    const EPSILON: f64 = 1.0;
+    const DRAWS: usize = 200;
+    let n = N as f64;
+    let mut rng = Lcg(0x0D15_EA5E_0BAD_C0DE);
+
+    let (mut today_wrong, mut split_wrong, mut trials) = (0usize, 0usize, 0usize);
+
+    for k in 0..=400 {
+        let g = cell_at(f64::from(k) / 400.0);
+        let (r, p, v) = (g.mean_correlation(), g.diagonal_purity(), g.dispersion());
+        let truth = g.collective_state();
+
+        for _ in 0..DRAWS {
+            trials += 1;
+
+            // TODAY: the whole ε on `r`, then the flat re-derivation `privatize` performs.
+            let r_today = (r + laplace(R_SENSITIVITY / EPSILON, &mut rng)).clamp(-1.0 / (n - 1.0), 1.0);
+            if CoherenceMatrix::equicorrelated(N, r_today).collective_state() != truth {
+                today_wrong += 1;
+            }
+
+            // BRANCH (a), BOUNDED: a third of ε on `r`, and `p`/`v` for free. The law is the exact one the
+            // verdict is a function of — `Φ = (N−1)(r² + v)`, `P = p(1 + Φ)`, `R = 1/(N·P)` — so nothing
+            // here is a model error. Only the tripled noise on `r` is.
+            let r_split =
+                (r + laplace(R_SENSITIVITY / (EPSILON / 3.0), &mut rng)).clamp(-1.0 / (n - 1.0), 1.0);
+            let phi3 = (n - 1.0) * (r_split * r_split + v);
+            let purity3 = p * (1.0 + phi3);
+            let reflection3 = if purity3 > 0.0 { 1.0 / (n * purity3) } else { 0.0 };
+            if fanos_diakrisis::window::classify_collective(r_split, p, reflection3) != truth {
+                split_wrong += 1;
+            }
+        }
+    }
+
+    let today_rate = today_wrong as f64 / trials as f64;
+    let split_rate = split_wrong as f64 / trials as f64;
+    println!(
+        "over {trials} trials at ε={EPSILON}: TODAY (whole ε on r, flat model) misses the regime \
+         {today_wrong} times ({:.2}%); BRANCH (a) BOUNDED (ε/3 on r, exact p and v, exact law) misses it \
+         {split_wrong} times ({:.2}%)",
+        today_rate * 100.0,
+        split_rate * 100.0,
+    );
+
+    // The measurement must be able to see a miss at all, or the comparison is between two zeros.
+    assert!(
+        today_wrong > 0,
+        "today's arm was right on every trial, so this sweep cannot compare anything — the noise scale or \
+         the sweep is wrong, not the finding",
+    );
+
+    // **THE FINDING, and it went the other way from the proposal.** Branch (a) loses badly — 16.77 %
+    // against 6.53 % at ε = 1 — with `p` and `v` handed to it exactly and for free. The model error this
+    // whole task is about (substituting a flat cell) costs 5 regime misses over 401 points at zero noise;
+    // tripling the noise on `r` costs about 2.6× more than that. The single release is not merely the
+    // convenient design, it is the more accurate one, and now by a number.
+    //
+    // Since deriving `Δp` and `Δv` can only ADD noise to the arm that is already losing, no sensitivity
+    // derivation can reverse this. Branch (a) is closed by a bound rather than by work — which is exactly
+    // what the task asked for when it said to measure before deriving.
+    //
+    // The assertion pins the MEASURED direction. If a future change flips it — a different verdict
+    // boundary, a plane order where the model error grows, a tighter `Δr` — this reddens, and #278's
+    // branch (a) has to be re-opened with the new number in hand rather than from the old intuition.
+    assert!(
+        split_rate > today_rate,
+        "branch (a) now BEATS today's export ({:.2}% vs {:.2}%), which the bound above said it could not. \
+         Something that changes the balance has changed: re-open #278 branch (a), derive Δp and Δv, and \
+         re-run this with the real noise on all three statistics — the margin here is the budget for that \
+         work.",
+        split_rate * 100.0,
+        today_rate * 100.0,
+    );
+
+    // And the margin is stated, not merely ordered: a factor, so a future reader can see whether a change
+    // moved it a little or inverted it.
+    println!(
+        "branch (a)'s best possible case is {:.1}× worse than today's export — the noise cost of splitting \
+         ε dominates the model cost it was meant to remove",
+        split_rate / today_rate,
+    );
+}

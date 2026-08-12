@@ -173,10 +173,27 @@ impl CoherenceFrame {
     /// The verdict is `classify_collective(r, p, R)` with `R = 1/(N·P)`, `P = p(1 + Φ)` and
     /// `Φ = (N−1)(r² + v)` where `v` is the off-diagonal **dispersion**. So it is a function of exactly
     /// `(N, r, p, v)`: closing this needs **three** releases where there is one, each with its own derived
-    /// sensitivity, and the ε budget split three ways. Whether that is worth its accuracy — a third of the
-    /// ε per statistic is a third of the noise budget — is the open question, and the honest alternative is
-    /// to stop shipping verdict bits a consumer will read as the cell's own. Tracked as #278; not attempted
-    /// here, and deliberately not attempted as "just release `p`", which the measurement rules out.
+    /// sensitivity, and the ε budget split three ways.
+    ///
+    /// **That was the open question, and it is now closed by a bound — against the proposal.** Measured
+    /// over 80 200 trials at `ε = 1` (`tests/privatized_stratum.rs`), with the three-statistic arm given
+    /// its *best possible* case — a third of ε on `r`, and `p` and `v` handed to it **exactly, with zero
+    /// noise**, which is better than any `Δp`/`Δv` derivation could deliver:
+    ///
+    /// | arm | regime misses |
+    /// |---|---|
+    /// | today: whole ε on `r`, flat model | **6.53 %** |
+    /// | three statistics: ε/3 on `r`, exact `p` and `v`, exact law | **16.77 %** |
+    ///
+    /// Branch (a) loses by **2.6×** at its ceiling. Deriving the two sensitivities can only *add* noise to
+    /// an arm that is already losing, so no derivation reverses it: **the single release is not merely the
+    /// convenient design, it is the more accurate one.** The model error this doc is about costs 5 regime
+    /// misses over 401 points at zero noise; tripling the noise on `r` costs 2.6× more than that.
+    ///
+    /// What remains of #278 is therefore the other branch: stop shipping verdict bits a consumer will read
+    /// as the cell's own, which is a decision about what `Census` should answer on rather than a
+    /// sensitivity to derive. "Just release `p`" was ruled out by the earlier measurement, and now the
+    /// whole family is.
     #[must_use]
     pub fn privatize(&self, budget: PrivacyBudget, rng: &mut impl Rng) -> Self {
         // ε ≤ 0 is meaningless; fall back to the strongest representable floor rather than divide by ≤ 0.
