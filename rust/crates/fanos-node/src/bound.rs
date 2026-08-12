@@ -23,13 +23,20 @@
 //! need the publisher's full witness chain (`CoordinateClaim`) and would raise the cost to the whole plane. That is the
 //! stronger form and the natural follow-up.
 //!
-//! **And it is not this module's follow-up alone (#249, found 2026-08-12).** The same omission — the exact probe index,
-//! absent for the same reason, supplied by the same `CoordinateClaim` — costs something quite different one layer over.
-//! `fanos_quic`'s `PeerClaimed` omits it too, so a peer whose coordinate a handshake *proved* can only be written to the
-//! dial table **unranked**, and a measured 7-node cell reads `route [1,1,1,1,1,1,1]`: every node routes to exactly one
-//! point, its own, and the roster never agrees. Two subsystems, one missing quantity, and each doc argued its own local
-//! trade honestly enough that nobody joined them — which is why the pair is written down here rather than left to be
-//! rediscovered. Neither consequence alone buys a wire change; together they are the same change.
+//! **A cross-reference to #249 stood here and was WRONG — corrected 2026-08-12, the same day it was written.** It
+//! claimed `fanos_quic`'s unranked peer bindings suffered "the same omission", so the two were one wire change. They
+//! are not the same, and #249 needed no wire change at all: the index is a *function of the peer's VRF output*
+//! ([`probe_index_of`]'s own doc: a verifier learns it "without being told"), so over there it was derivable all along
+//! and merely dropped at two internal boundaries. Fixed by carrying the peer's output and the plane type down to the
+//! send path; the measured roster went `route [1,1,1,1,1,1,1]` → `[2,2,4,2,4,2,4]`.
+//!
+//! **What that leaves here is genuinely different, and it survives.** This module does not want to know *whether* the
+//! coordinate is on the walk — it computes that already, on the line below. It wants to know that the publisher is at
+//! the point it *settled* on, and settling is where a competitor displaced it: that fact is not a function of the
+//! publisher's own output, which is exactly why it needs the witness chain and why the cost stays at 49-of-56. The two
+//! problems shared a word ("probe index") and nothing else, and joining them cost a day.
+//!
+//! [`probe_index_of`]: fanos_vrf::probe_index_of
 //!
 //! ## It applies only where coordinates are VRF-derived
 //!
