@@ -33,11 +33,32 @@ pub async fn serve_proxy<D>(
 {
     tokio::pin!(shutdown);
     loop {
+        // Room BEFORE the accept — see `fanos_proxy::budget::reserve` for why back-pressure belongs in the
+        // kernel's accept queue rather than in a userspace refusal. Only one `select!` arm runs, so the
+        // permit moves into whichever connection is accepted, or is dropped on shutdown.
+        let permit = if let Some(p) =
+            fanos_proxy::budget::try_reserve(fanos_proxy::budget::CONNECTION_COST)
+        {
+            p
+        } else {
+            {
+                warn!(
+                    cap = fanos_proxy::budget::MAX_CONNECTIONS,
+                    "the proxy memory share has no room for another relay: not accepting until a \
+                     connection ends"
+                );
+                let Some(p) = fanos_proxy::budget::reserve(fanos_proxy::budget::CONNECTION_COST).await
+                else {
+                    break;
+                };
+                p
+            }
+        };
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            accepted = socks.accept() => spawn_proxy_conn(accepted, &dialer, Proxy::Socks5),
-            accepted = accept_opt(http.as_ref()) => spawn_proxy_conn(accepted, &dialer, Proxy::Http),
+            accepted = socks.accept() => spawn_proxy_conn(accepted, &dialer, Proxy::Socks5, permit),
+            accepted = accept_opt(http.as_ref()) => spawn_proxy_conn(accepted, &dialer, Proxy::Http, permit),
         }
     }
 }
@@ -52,10 +73,17 @@ async fn accept_opt(listener: Option<&TcpListener>) -> std::io::Result<(TcpStrea
 }
 
 /// Spawn a per-connection handler for one accepted (or failed) TCP accept, tunnelling it through `dialer`.
+///
+/// `permit` is the room in the proxy's memory share this connection's relay buffers spend; the caller took
+/// it **before** accepting (#207). This is the shipped accept loop — `fanos_proxy::{socks5,http}::serve` are
+/// the library's own, reachable from an embedder — and all three spawned per connection with no counter
+/// until now, which is why the bound lives in `fanos_proxy::budget` where every one of them reads it rather
+/// than in any one loop.
 fn spawn_proxy_conn<D>(
     accepted: std::io::Result<(TcpStream, SocketAddr)>,
     dialer: &Arc<D>,
     proxy: Proxy,
+    permit: tokio::sync::SemaphorePermit<'static>,
 ) where
     D: Dialer + UdpDialer + Send + Sync + 'static,
 {
@@ -68,6 +96,8 @@ fn spawn_proxy_conn<D>(
     };
     let dialer = dialer.clone();
     tokio::spawn(async move {
+        // Held for the task's life, so the bytes return on completion, panic or cancellation.
+        let _permit = permit;
         // `FanosDialer` is `Sync`, so holding `&*dialer` across the copy_bidirectional await is sound.
         let result = match proxy {
             Proxy::Socks5 => fanos_proxy::socks5::handle(sock, &*dialer).await,

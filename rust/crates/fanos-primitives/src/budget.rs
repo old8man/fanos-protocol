@@ -13,7 +13,7 @@
 //! | sessions | 64 MiB | derived in #205 |
 //! | gathers | 64 MiB | per-entry cost corrected in #218 |
 //! | exit datagrams | 16 MiB | named in #254 — spent all along, counted only now |
-//! | proxy associations | 8 MiB | named in #254 — and the naming is what created the bound |
+//! | proxy client buffers | 8 MiB | named in #254 — and the naming is what created the bound (#207 widened it) |
 //! | threshold router queues | 40 MiB | named in #294 — one of the two was spent all along, the other had no bound |
 //! | **process resident** | **45 MiB** | measured, quoted by `fanos_diaulos::budget`'s header |
 //! | inbound QUIC credit | **2.00 GiB, contingent** | `fanos_quic::inbound_credit_ceiling()` (#245, #207) |
@@ -115,8 +115,8 @@ pub const GATHER_SHARE: usize = 64 * 1024 * 1024;
 /// slightly does not immediately breach.
 pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 
-/// SOCKS5 UDP association receive buffers (`fanos_proxy::udp::ASSOCIATION_MEMORY_BUDGET`) — one
-/// `MAX_UDP` per live association, and `MAX_ASSOCIATIONS` is what this share then buys (#254).
+/// The local proxy's per-client buffers (`fanos_proxy::budget::PROXY_MEMORY_BUDGET`) — a UDP association's
+/// `MAX_UDP` receive buffer, or a relayed TCP connection's two staging buffers (#254, #207).
 ///
 /// **The one place in this table where naming the share also had to create the bound.** The exit's count was
 /// capped already and only the accounting was missing; here nothing limited how many associations could
@@ -124,11 +124,19 @@ pub const EXIT_DATAGRAM_SHARE: usize = 16 * 1024 * 1024;
 /// and trusted" was a qualification living in an author's head rather than in the code. A share with no
 /// enforcement is a wish.
 ///
+/// **It was named `PROXY_ASSOCIATION_SHARE` and that name was doing harm.** #254 closed the UDP door and left
+/// three TCP accept loops spawning per connection with no counter — its own doc named them — and the narrow
+/// name is part of why: a share called "association" invites the next author to leave the *other* item type
+/// out of it. It covers both now, and because the two are **not** mutually exclusive (a client holds
+/// associations and connections at once, unlike #294's two router queues) the enforcement had to become a
+/// pool of bytes rather than two counts.
+///
 /// 8 MiB is half the exit's, and the asymmetry is the point: the exit serves a cell, a SOCKS5 proxy serves
-/// one operator's own applications. 128 concurrent UDP associations is far past what a desktop's browser,
-/// resolver and torrent client hold at once, and the bound exists to stop a runaway loop taking the node
-/// down with it, not to ration ordinary use.
-pub const PROXY_ASSOCIATION_SHARE: usize = 8 * 1024 * 1024;
+/// one operator's own applications. What it buys — 128 associations, or 4096 relayed connections, or any
+/// mix summing to the share — is far past what a desktop's browser, resolver and torrent client hold at
+/// once, and the bound exists to stop a runaway loop taking the node down with it, not to ration ordinary
+/// use.
+pub const PROXY_SHARE: usize = 8 * 1024 * 1024;
 
 /// The threshold router's **send-side queues** (`fanos_aphantos`'s `ROUTER_QUEUE_MEMORY_BUDGET`) — the
 /// constant-rate `outbox` when cover traffic is on, and `mix_pending` when it is off (#294, #295).
@@ -159,7 +167,7 @@ pub const SHARES: [(&str, usize); 6] = [
     ("sessions", SESSION_SHARE),
     ("gathers", GATHER_SHARE),
     ("exit datagrams", EXIT_DATAGRAM_SHARE),
-    ("proxy associations", PROXY_ASSOCIATION_SHARE),
+    ("proxy client buffers", PROXY_SHARE),
     ("threshold router queues", THRESHOLD_ROUTER_SHARE),
 ];
 
@@ -175,7 +183,7 @@ pub const fn allocated() -> usize {
         + SESSION_SHARE
         + GATHER_SHARE
         + EXIT_DATAGRAM_SHARE
-        + PROXY_ASSOCIATION_SHARE
+        + PROXY_SHARE
         + THRESHOLD_ROUTER_SHARE
 }
 

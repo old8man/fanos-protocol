@@ -23,6 +23,9 @@ tracing.workspace = true
 # For the memory share this crate's UDP associations are bounded by — declared where it can be summed
 # with its neighbours (#213/#254), never restated here.
 fanos-primitives = { workspace = true, features = ["std"] }
+# For `MAX_SEGMENT` — the downstream write unit the relay buffer is derived from (#207). A leaf crate with
+# no dependencies of its own, so importing the real number costs nothing and removes a copy.
+fanos-stream.workspace = true
 
 [features]
 # The in-process loopback fixtures (`dialer::EchoDialer`, `dialer::RefuseDialer`) — off in every shipped

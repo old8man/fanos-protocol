@@ -37,48 +37,10 @@ use crate::dialer::UdpDialer;
 use crate::socks5::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, REP_SUCCESS, VER};
 use crate::target::Target;
 
-/// The largest datagram the relay socket reads — the SOCKS5 header plus payload. A UDP datagram carries at
-/// most 65535 bytes total, so this bounds the whole wrapped frame.
-///
-/// One of these is allocated **per live association**, which is why [`MAX_ASSOCIATIONS`] exists.
-pub const MAX_UDP: usize = 65535;
+/// The budget these associations spend, and the pool they spend it from — see [`crate::budget`] for why the
+/// admission rule is bytes rather than a count, and why this crate's two item types could not each have one.
+pub use crate::budget::{ASSOCIATION_COST, MAX_ASSOCIATIONS, MAX_UDP, PROXY_MEMORY_BUDGET};
 
-/// This process's share of memory for SOCKS5 UDP association buffers — taken from
-/// `fanos_primitives::budget`, never restated here (#213's direction, #254's term).
-pub const ASSOCIATION_MEMORY_BUDGET: usize = fanos_primitives::budget::PROXY_ASSOCIATION_SHARE;
-
-/// How many UDP associations may be live at once: one [`MAX_UDP`] receive buffer each.
-///
-/// **Naming the share is what created this bound; before it there was none at all.** Neither accept loop —
-/// `crate::serve` nor `fanos_node::proxy::serve_proxy` — limits concurrency, so the number of associations
-/// was whatever a client opened, each holding 64 KiB. "The client is local and trusted" was true and was
-/// also a qualification that lived only in an author's head: a looping application, not an attacker, is
-/// enough to exhaust a node with it.
-pub const MAX_ASSOCIATIONS: usize = ASSOCIATION_MEMORY_BUDGET / MAX_UDP;
-
-/// **The cap spends the share and does not exceed it — both directions, at compile time.**
-///
-/// `const` asserts rather than a test, following #205: the quantities are constants, so a violation is a
-/// build error on the author who changed one, not a red suite someone reads later. The second half matters
-/// as much as the first: a cap far under what the share buys would have the budget counting bytes no
-/// deployment can use, which understates what is left for every other subsystem.
-const _: () = assert!(
-    MAX_ASSOCIATIONS * MAX_UDP <= ASSOCIATION_MEMORY_BUDGET,
-    "the association cap needs more memory than the share this crate was granted"
-);
-const _: () = assert!(
-    (MAX_ASSOCIATIONS + 1) * MAX_UDP > ASSOCIATION_MEMORY_BUDGET,
-    "the share buys more associations than the cap allows, so the budget is reserving memory nothing uses"
-);
-
-/// The permits [`associate`] holds while an association is live.
-///
-/// **Process-wide on purpose, and this is the opposite call from the one `stations.rs` makes.** A station
-/// counter must never be a global, because `fanos-sim` runs many nodes in one process and a shared counter
-/// would blend their data paths into one unreadable sum. A memory limit is the reverse: the memory really is
-/// shared by everything in the process, so a bound that is *not* global would let N in-process proxies
-/// allocate N times the share this crate was granted. The quantity decides the scope, not the convention.
-static ASSOCIATIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_ASSOCIATIONS);
 
 /// What happened to a client's `ASSOCIATE` — [`associate`]'s own outcome, so a refusal for want of capacity
 /// is not indistinguishable from a client that hung up.
@@ -133,15 +95,17 @@ pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::
     // association — `try_acquire`, never `acquire`: a client made to wait for a slot is a client holding a
     // TCP connection open against a proxy that has already decided it has no room, which converts a memory
     // bound into a connection bound one layer up. Refuse now, say so, and let it retry.
-    let Ok(_permit) = ASSOCIATIONS.try_acquire() else {
+    let Some(_permit) = crate::budget::try_reserve(ASSOCIATION_COST) else {
         // RFC 1928 §6: `0x01` is "general SOCKS server failure", the only reply code for "not right now".
         // Sent rather than dropped, so a client sees a refusal instead of a hang, and logged with the cap
         // because that is the number an operator would change.
         let _ = write_capacity_refusal(&mut control).await;
         tracing::warn!(
             cap = MAX_ASSOCIATIONS,
-            "refused a SOCKS5 UDP association: this process is at its association cap and each one holds a \
-             64 KiB receive buffer (fanos_primitives::budget::PROXY_ASSOCIATION_SHARE)"
+            cost = ASSOCIATION_COST,
+            "refused a SOCKS5 UDP association: this process has no room left in its proxy memory share for \
+             another 64 KiB receive buffer. The share is spent by associations AND relayed TCP connections \
+             together (fanos_proxy::budget), so the cap quoted here is what it buys with nothing else live"
         );
         return Ok(Associated::AtCapacity { cap: MAX_ASSOCIATIONS });
     };
@@ -344,8 +308,9 @@ mod tests {
     async fn a_client_arriving_at_the_cap_is_told_so() {
         use tokio::io::AsyncReadExt as _;
 
-        let held = ASSOCIATIONS
-            .acquire_many(u32::try_from(MAX_ASSOCIATIONS).expect("the cap fits a u32"))
+        let _serial = crate::budget::POOL.lock().await;
+        let held = crate::budget::PROXY_MEMORY
+            .acquire_many(u32::try_from(PROXY_MEMORY_BUDGET).expect("the share fits a u32"))
             .await
             .expect("the semaphore is never closed");
 

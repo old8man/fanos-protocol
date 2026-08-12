@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod dialer;
 pub mod http;
 pub mod socks5;

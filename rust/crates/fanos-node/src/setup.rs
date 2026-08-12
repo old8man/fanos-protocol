@@ -330,6 +330,46 @@ pub fn memory_max_bytes() -> usize {
     memory_high_bytes() + fanos_quic::inbound_credit_ceiling()
 }
 
+/// The file descriptors a node can have open at once, summed from what actually consumes them (#207).
+///
+/// **The sum, not a guess.** This task's first note proposed "2× the session count"; the enumeration says
+/// something else, because the terms are not all sessions:
+///
+/// | consumer | count | why |
+/// |---|---|---|
+/// | QUIC endpoint | 1 | quinn is **one UDP socket** regardless of peer count — the overlay's 512 inbound connections cost one descriptor between them |
+/// | exit outbound TCP | `MAX_SESSIONS` | one socket per relayed clear-net session |
+/// | exit outbound UDP | `MAX_UDP_DATAGRAM_SESSIONS` | one socket per relayed datagram session |
+/// | local proxy clients | `MAX_CONNECTIONS` | one accepted socket per relayed connection… |
+/// | proxy UDP associations | `MAX_ASSOCIATIONS` | …and one relay socket per association |
+/// | listeners + control socket + tun | 4 | SOCKS5, HTTP, the admin `UnixListener`, the VPN device |
+/// | stdio | 3 | |
+///
+/// The two proxy terms are *both* counted although one memory share buys them, because a descriptor is not
+/// memory: the share makes them mutually exclusive in **bytes**, not in count, and the file table has to
+/// hold whichever mix the client asks for. Summing them is the conservative reading and the only one that
+/// cannot be wrong.
+///
+/// **This could not be written until the proxy accept loops had a bound at all** (#207): three of them
+/// spawned per accepted connection with no counter, and no sum over an unbounded term is a sum.
+///
+/// Measured today the terms are `1 + 246 + 256 + 4096 + 128 + 4 + 3 = 4734`, and the limit is the next power
+/// of two above it — **8192**. Rounding up rather than writing 4734 leaves the store's own file work (a
+/// snapshot writes one temp file and renames it) and the allocator's mappings inside the limit without
+/// giving either its own term, and a power of two is what an operator comparing this against `ulimit -n`
+/// expects to see. The rounding is the only chosen part; every term under it is a bound derived elsewhere.
+#[must_use]
+pub fn open_files_limit() -> usize {
+    let derived = 1                                                    // quinn's single UDP socket
+        + fanos_diaulos::budget::MAX_SESSIONS                          // exit TCP
+        + crate::exit::MAX_UDP_DATAGRAM_SESSIONS                       // exit UDP
+        + fanos_proxy::budget::MAX_CONNECTIONS                         // proxy clients
+        + fanos_proxy::budget::MAX_ASSOCIATIONS                        // proxy associations
+        + 4                                                            // listeners, control socket, tun
+        + 3; // stdio
+    derived.next_power_of_two()
+}
+
 /// Render a systemd unit that runs `exe` against `config`.
 ///
 /// The hardening directives are not decoration. A relay node's whole job is to accept traffic from strangers, so
@@ -365,6 +405,8 @@ pub fn render_systemd_unit(exe: &Path, config: &Path, data: &Path, user_unit: bo
     // put a memory decision in a unit file, one indirection away from every derivation that justifies it.
     let _ = writeln!(s, "MemoryHigh={}", memory_high_bytes());
     let _ = writeln!(s, "MemoryMax={}", memory_max_bytes());
+    // Derived from what consumes descriptors, not from a habit — `open_files_limit` has the enumeration.
+    let _ = writeln!(s, "LimitNOFILE={}", open_files_limit());
     let _ = writeln!(s, "StateDirectory=fanos");
     let _ = writeln!(s, "WorkingDirectory={}", data.display());
     if !user_unit {
@@ -837,6 +879,23 @@ mod tests {
              MAX_INBOUND_CONNECTIONS and the per-connection window exist to survive (#207, #245).",
             steady + flood
         );
+        // And the descriptor limit, which is only derivable because every accept loop now has a bound.
+        let nofile = read("LimitNOFILE=");
+        println!("LimitNOFILE={nofile}");
+        let consumers = 1
+            + fanos_diaulos::budget::MAX_SESSIONS
+            + crate::exit::MAX_UDP_DATAGRAM_SESSIONS
+            + fanos_proxy::budget::MAX_CONNECTIONS
+            + fanos_proxy::budget::MAX_ASSOCIATIONS
+            + 4
+            + 3;
+        assert!(
+            nofile >= consumers,
+            "LimitNOFILE is {nofile}, below the {consumers} descriptors this node's own bounds permit at \
+             once. A node that hits the OS limit fails in whichever subsystem asks next, not in the one \
+             that overspent (#207)."
+        );
+
         assert!(
             max > high,
             "MemoryMax ({max}) must sit strictly above MemoryHigh ({high}), or the kill fires before the \

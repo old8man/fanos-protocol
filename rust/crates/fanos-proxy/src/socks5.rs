@@ -7,7 +7,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::dialer::{Dialer, UdpDialer};
@@ -155,7 +155,13 @@ pub async fn handle<D: Dialer + UdpDialer>(
         Ok(mut upstream) => {
             write_reply(&mut client, REP_SUCCESS).await?;
             // Splice the two streams until either side closes.
-            let _ = copy_bidirectional(&mut client, &mut upstream).await;
+            let _ = copy_bidirectional_with_sizes(
+                &mut client,
+                &mut upstream,
+                crate::budget::RELAY_BUF,
+                crate::budget::RELAY_BUF,
+            )
+            .await;
             Ok(())
         }
         Err(e) => {
@@ -167,6 +173,10 @@ pub async fn handle<D: Dialer + UdpDialer>(
 
 /// Accept and serve SOCKS5 clients on `listener`, dialing each target through `dialer`.
 ///
+/// Every accepted connection first takes [`CONNECTION_COST`](crate::budget::CONNECTION_COST) bytes from the
+/// proxy's memory share; without room it is refused before a task exists. See [`crate::budget`] for why the
+/// bound is bytes and why this loop had none at all (#207).
+///
 /// # Errors
 /// Returns an I/O error only if `accept` itself fails; per-connection errors are logged and dropped.
 pub async fn serve<D>(listener: TcpListener, dialer: D) -> std::io::Result<()>
@@ -174,9 +184,26 @@ where
     D: Dialer + UdpDialer + Clone + Send + Sync + 'static,
 {
     loop {
+        // Room BEFORE the accept: back-pressure belongs in the kernel's accept queue (see
+        // `crate::budget::reserve` for the two refusal designs that were tried and why both were wrong).
+        let permit = if let Some(p) = crate::budget::try_reserve(crate::budget::CONNECTION_COST) {
+            p
+        } else {
+            tracing::warn!(
+                cap = crate::budget::MAX_CONNECTIONS,
+                "the proxy memory share has no room for another SOCKS5 relay: not accepting until a \
+                 connection ends"
+            );
+            let Some(p) = crate::budget::reserve(crate::budget::CONNECTION_COST).await else {
+                continue;
+            };
+            p
+        };
         let (client, peer) = listener.accept().await?;
         let dialer = dialer.clone();
         tokio::spawn(async move {
+            // Held for the task's life, so the bytes come back on completion, panic or cancellation.
+            let _permit = permit;
             if let Err(e) = handle(client, &dialer).await {
                 tracing::debug!(%peer, error = %e, "socks5 connection ended");
             }

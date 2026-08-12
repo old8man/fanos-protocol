@@ -1,0 +1,214 @@
+//! The local proxy's memory share, and the **one pool both transports draw from** (#207).
+//!
+//! # Why a pool of bytes rather than two counts
+//!
+//! This crate holds per-client buffers of two shapes: a UDP association's 64 KiB receive buffer, and a
+//! relayed TCP connection's two staging buffers. #254 named the share and derived a count for the first
+//! —`MAX_ASSOCIATIONS = share / MAX_UDP` — which is the tree's usual idiom (`STORE_SHARE →
+//! MAX_STORE_ENTRIES`, `SESSION_MEMORY_BUDGET → MAX_SESSIONS`). It works when a share buys **one** kind of
+//! thing.
+//!
+//! It does not work here, and the reason is not bookkeeping: the two are **not mutually exclusive**. A
+//! client can hold 128 associations *and* a thousand relayed connections at once, so two independently
+//! derived counts would each be honest about its own item and together spend the share twice. The router's
+//! two send queues (#294) got one share precisely because they *are* exclusive — `forward_send` branches and
+//! only one can fill. The opposite fact demands the opposite structure.
+//!
+//! So the admission rule is on **bytes**: one process-wide semaphore whose permits are bytes, from which an
+//! association takes [`ASSOCIATION_COST`] and a connection takes [`CONNECTION_COST`]. The per-kind ceilings
+//! below are then *readings* of what the share buys when only that kind is live — useful to an operator, and
+//! never the thing enforced.
+//!
+//! # Why the TCP side had no bound at all
+//!
+//! `MAX_ASSOCIATIONS`'s own doc named both unguarded doors — *"Neither accept loop — `crate::serve` nor
+//! `fanos_node::proxy::serve_proxy` — limits concurrency"* — and #254 closed only the UDP one. Three accept
+//! loops (`socks5::serve`, `http::serve`, `fanos_node::proxy::serve_proxy`) spawned a task per accepted TCP
+//! connection with no counter, so a looping application could grow this process without limit. The
+//! qualification "the client is local and trusted" is the same one #254 rejected for the UDP path, one file
+//! over.
+//!
+//! Finding it was not an audit: `LimitNOFILE=` cannot be derived over an unbounded accept loop, so #207's
+//! descriptor half walked into it.
+
+use tokio::sync::Semaphore;
+
+/// The largest datagram the relay socket reads — the SOCKS5 header plus payload. A UDP datagram carries at
+/// most 65535 bytes total, so this bounds the whole wrapped frame.
+///
+/// One of these is allocated **per live association**, which is why the pool charges [`ASSOCIATION_COST`].
+pub const MAX_UDP: usize = 65535;
+
+/// This process's share of memory for the local proxy's per-client buffers — taken from
+/// `fanos_primitives::budget`, never restated here (#213's direction, #254's term).
+pub const PROXY_MEMORY_BUDGET: usize = fanos_primitives::budget::PROXY_SHARE;
+
+/// One direction's staging buffer while relaying a TCP connection.
+///
+/// **Derived, and the derivation is the whole reason this constant exists rather than tokio's default.**
+/// `copy_bidirectional` allocates two buffers of a size tokio keeps private (8 KiB today); a bound computed
+/// against a dependency's unexported default is a bound that can move under it without a build error, and
+/// there is nothing to import ([[the-guard-becomes-the-defect]]). `copy_bidirectional_with_sizes` takes the
+/// number, so the number becomes ours.
+///
+/// Its value is **one downstream write unit**. The proxy stages bytes between a TCP socket and a
+/// `Dialer`-produced stream, and that stream ships them a segment at a time; a buffer larger than one
+/// segment does not travel faster, it only holds more bytes waiting for the same drain. That is #247's
+/// lesson exactly — a buffer sized for something the stack below cannot produce — and it cost 51× there.
+///
+/// `fanos-stream` is a leaf crate with no dependencies of its own, so importing the real number costs this
+/// crate nothing in coupling and removes the copy that would otherwise need a cross-crate guard.
+pub const RELAY_BUF: usize = fanos_stream::MAX_SEGMENT;
+
+/// What one relayed TCP connection charges the pool: a staging buffer in each direction.
+pub const CONNECTION_COST: usize = 2 * RELAY_BUF;
+
+/// What one live UDP association charges the pool: its single receive buffer.
+pub const ASSOCIATION_COST: usize = MAX_UDP;
+
+/// How many UDP associations the share buys **when nothing else is live**.
+///
+/// A reading, not the enforced bound — [`PROXY_MEMORY`] is what admits. Kept because it is the number an
+/// operator reads in a refusal message and the one they would change.
+pub const MAX_ASSOCIATIONS: usize = PROXY_MEMORY_BUDGET / ASSOCIATION_COST;
+
+/// How many relayed TCP connections the share buys **when nothing else is live**. Same status as
+/// [`MAX_ASSOCIATIONS`]: a reading of the pool, not a second bound beside it.
+pub const MAX_CONNECTIONS: usize = PROXY_MEMORY_BUDGET / CONNECTION_COST;
+
+/// **Every charge is a whole number of buffers, and the two ceilings spend the share without exceeding it.**
+///
+/// `const` asserts rather than a test, following #205: the quantities are constants, so a violation is a
+/// build error on the author who changed one. The second half of each pair matters as much as the first — a
+/// ceiling far under what the share buys would have the budget counting bytes no deployment can use, which
+/// understates what is left for every other subsystem.
+const _: () = assert!(
+    MAX_ASSOCIATIONS * ASSOCIATION_COST <= PROXY_MEMORY_BUDGET,
+    "the association ceiling needs more memory than the share this crate was granted"
+);
+const _: () = assert!(
+    (MAX_ASSOCIATIONS + 1) * ASSOCIATION_COST > PROXY_MEMORY_BUDGET,
+    "the share buys more associations than the ceiling states, so the budget reserves memory nothing uses"
+);
+const _: () = assert!(
+    MAX_CONNECTIONS * CONNECTION_COST <= PROXY_MEMORY_BUDGET,
+    "the connection ceiling needs more memory than the share this crate was granted"
+);
+const _: () = assert!(
+    (MAX_CONNECTIONS + 1) * CONNECTION_COST > PROXY_MEMORY_BUDGET,
+    "the share buys more connections than the ceiling states, so the budget reserves memory nothing uses"
+);
+
+/// A permit is one byte, so the pool must be expressible in `Semaphore`'s own currency.
+const _: () = assert!(
+    PROXY_MEMORY_BUDGET <= Semaphore::MAX_PERMITS,
+    "the proxy share exceeds what one Semaphore can hold; the pool would silently admit everything"
+);
+
+/// The bytes this process's local proxy may hold in per-client buffers, as permits.
+///
+/// **Process-wide on purpose, and this is the opposite call from the one `stations.rs` makes.** A station
+/// counter must never be a global, because `fanos-sim` runs many nodes in one process and a shared counter
+/// would blend their data paths into one unreadable sum. A memory limit is the reverse: the memory really is
+/// shared by everything in the process, so a bound that is *not* global would let N in-process proxies
+/// allocate N times the share this crate was granted. The quantity decides the scope, not the convention.
+pub static PROXY_MEMORY: Semaphore = Semaphore::const_new(PROXY_MEMORY_BUDGET);
+
+/// Take `bytes` from [`PROXY_MEMORY`], or `None` if the pool cannot spare them **right now**.
+///
+/// The non-waiting half of the pair, so a caller can tell an operator it is *about* to wait before it does
+/// — the `warn!` at every call site is the only way "the proxy is at its share" reaches a human, and a
+/// silent stall is the dead end #199 and #243 exist to prevent. [`reserve`] is what then waits.
+///
+/// The returned permit releases on drop, so a task that panics or is cancelled returns its bytes.
+#[must_use = "dropping the permit immediately returns the bytes, so the buffer is unaccounted"]
+pub fn try_reserve(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let want = u32::try_from(bytes).ok()?;
+    PROXY_MEMORY.try_acquire_many(want).ok()
+}
+
+/// Wait for `bytes` in [`PROXY_MEMORY`]. Pairs with [`try_reserve`] for the caller that has already
+/// decided to wait and wants to say so first.
+///
+/// **An accept loop should stop accepting rather than accept-and-refuse, and finding that out cost two
+/// wrong designs.** The first wrote a protocol refusal (`503`, SOCKS5 `0xFF`) and closed. It arrives as a
+/// TCP **reset**: closing a socket with unread bytes in its receive buffer sends `RST`, which discards
+/// whatever was queued the other way, so the client reports "connection reset" and never sees the reason.
+/// The second drained the pending request first — and `accept` returns on the SYN, before the request has
+/// arrived, so there is usually nothing to drain and the reset happens anyway.
+///
+/// The fix is not a better refusal, it is **not accepting**: leave the client in the kernel's accept queue
+/// until a connection ends. That needs no task, no buffer and no write, which matters because every one of
+/// those is the resource that just ran out — and a backlog that overflows is refused by the OS, which is
+/// the answer a TCP client is built to understand. The `warn!` at the call site is what an operator gets;
+/// the client gets back-pressure.
+pub async fn reserve(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let want = u32::try_from(bytes).ok()?;
+    PROXY_MEMORY.acquire_many(want).await.ok()
+}
+
+/// **A process-global budget makes this crate's own tests tests over shared state, and that is a real cost
+/// of the design rather than a test-harness detail.**
+///
+/// Tests in one binary run concurrently by default. A test that drains [`PROXY_MEMORY`] therefore makes
+/// every *other* test that goes through an accept loop see a refusal — which is the mechanism working, and
+/// indistinguishable from a bug when it lands on `a_non_connect_method_gets_400`. It did, on the first run
+/// after the pool landed: three `http` tests failed with `ConnectionReset`, because `serve` had correctly
+/// answered `503` and closed.
+///
+/// So every test that *takes* permits holds this, not only the ones that drain. Half a lock is worse than
+/// none: it would serialise the draining tests against each other and leave exactly the collision above.
+#[cfg(test)]
+pub(crate) static POOL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The readings the docs and the refusal messages quote, pinned so they cannot drift silently.
+    #[test]
+    fn the_share_buys_what_the_ceilings_say() {
+        println!(
+            "share {PROXY_MEMORY_BUDGET} bytes: {MAX_ASSOCIATIONS} associations at {ASSOCIATION_COST} \
+             B, or {MAX_CONNECTIONS} connections at {CONNECTION_COST} B"
+        );
+        assert_eq!(MAX_ASSOCIATIONS, 128);
+        assert_eq!(MAX_CONNECTIONS, 4096);
+        assert_eq!(RELAY_BUF, 1024, "the relay buffer is one downstream segment");
+    }
+
+    /// **The property the pool exists for: the two kinds cannot spend the share twice.**
+    ///
+    /// Two independently derived counts would each admit its own maximum, so a client holding every
+    /// association *and* every connection would take `128 × 64 KiB + 4096 × 2 KiB` — twice the share. The
+    /// pool is what makes that unreachable, and this asserts it by exhausting one kind and demanding the
+    /// other be refused.
+    #[tokio::test]
+    async fn associations_and_connections_cannot_both_reach_their_ceiling() {
+        let _serial = POOL.lock().await;
+        // Control FIRST: on an untouched pool a connection is admitted, or the refusal below proves nothing.
+        let probe = try_reserve(CONNECTION_COST);
+        assert!(probe.is_some(), "an idle pool must admit a connection, or this test cannot fail");
+        drop(probe);
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_ASSOCIATIONS {
+            held.push(try_reserve(ASSOCIATION_COST).expect("the share buys this many associations"));
+        }
+        assert!(
+            try_reserve(ASSOCIATION_COST).is_none(),
+            "the {MAX_ASSOCIATIONS}th association must exhaust the pool"
+        );
+        assert!(
+            try_reserve(CONNECTION_COST).is_none(),
+            "with the share spent on associations there is nothing left for a connection — two separate \
+             counts would have admitted {MAX_CONNECTIONS} of them on top"
+        );
+
+        // And the pool recovers: a permit returns its bytes on drop, so capacity is a level and not a tally.
+        drop(held.pop());
+        assert!(try_reserve(CONNECTION_COST).is_some(), "freeing an association must free its bytes");
+        drop(held);
+    }
+}
