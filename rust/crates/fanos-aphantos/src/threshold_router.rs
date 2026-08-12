@@ -2139,7 +2139,7 @@ mod tests {
         );
 
         // One mix token per remote member, all DISTINCT — independent holds, not one shared postponement.
-        let tokens: alloc::collections::BTreeSet<u64> = effects
+        let tokens: BTreeSet<u64> = effects
             .iter()
             .filter_map(|e| match e {
                 Effect::ArmTimer { token: TimerToken(tok), .. } if tok & MIX_FLAG != 0 => Some(*tok),
@@ -2153,7 +2153,7 @@ mod tests {
             tokens.len(),
             members.len() - 1,
         );
-        let delays: alloc::collections::BTreeSet<u64> = effects
+        let delays: BTreeSet<u64> = effects
             .iter()
             .filter_map(|e| match e {
                 Effect::ArmTimer { token: TimerToken(tok), after } if tok & MIX_FLAG != 0 => Some(after.as_nanos()),
