@@ -1329,6 +1329,7 @@ dependencies = [
  "fanos-onoma",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-proteus",
  "fanos-quic",
  "fanos-rendezvous",
  "fanos-runtime",
