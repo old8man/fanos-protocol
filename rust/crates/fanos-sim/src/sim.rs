@@ -796,7 +796,7 @@ impl Sim {
                         _ => {}
                     }
                     self.log(format!("notify {} {}", fmt_coord(node), note_desc(&note)));
-                    self.report.notifications.push(Observed { node, note });
+                    self.report.notifications.push(Observed { node, at: self.clock, note });
                 }
             }
         }

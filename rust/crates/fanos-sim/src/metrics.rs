@@ -1,7 +1,7 @@
 //! Observability: counters and collected notifications from a run.
 
 use fanos_diakrisis::Verdict;
-use fanos_runtime::{Notification, Triple};
+use fanos_runtime::{Instant, Notification, Triple};
 use fanos_runtime::ports::ReadOutcome;
 
 /// Aggregate counters over a simulation run. Deterministic for a given `(seed, scenario)`.
@@ -102,6 +102,14 @@ impl Metrics {
 pub struct Observed {
     /// The node that emitted the notification.
     pub node: Triple,
+    /// **Virtual time of emission** — without it this log answers ORDER and not DURATION (#196).
+    ///
+    /// It was absent for a long time and nothing noticed, because the one reader that mattered
+    /// (`Sim::tick_epoch`) takes `max(epoch)`, which is order-free. Every question of the shape "how long
+    /// did this take to cross the cell" — beacon flood spread against the epoch period being the one that
+    /// blocked #196's tripwire — was unanswerable from a log that records who and in what sequence but
+    /// never when.
+    pub at: Instant,
     /// The notification.
     pub note: Notification,
 }
