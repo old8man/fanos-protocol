@@ -1357,6 +1357,7 @@ dependencies = [
  "fanos-incentives",
  "fanos-pqcrypto",
  "fanos-primitives",
+ "fanos-taxis",
  "fanos-threshold",
  "fanos-vrf",
  "fanos-wire",

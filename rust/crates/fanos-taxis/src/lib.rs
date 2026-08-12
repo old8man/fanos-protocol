@@ -51,6 +51,16 @@ pub use incentive::{
 };
 pub use keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committee};
 pub use params::CellParams;
-pub use state::{Accounts, ExecOutcome, StateMachine, Transfer};
+pub use state::{ExecOutcome, StateMachine};
+/// The reference instantiation is a **fixture**, and only a build that asked for fixtures may name it.
+///
+/// `Accounts` moves value on nonce and balance alone — there is no authorisation check in it and no field in
+/// `Transfer` to carry one. That is the right shape for the 7-node consensus simulation, which is testing
+/// *ordering*, and the wrong shape for anything else. Exported unconditionally it was a wrong-by-default door
+/// beside a right one in a different crate: an integrator reaching into the chain crate for something called
+/// `Accounts` would get a chain where anyone spends anyone's balance. The shipping state machine is
+/// `fanos_dromos::HybridLedger` — hybrid-PQ-signed transfers, the #94 conservation gate, parallel execution.
+#[cfg(any(test, feature = "testing"))]
+pub use state::{Accounts, Transfer};
 pub use tx::{SealedTx, Transaction, TxCommit};
 pub use vote::{Certificate, Phase, SignedVote, Vote};

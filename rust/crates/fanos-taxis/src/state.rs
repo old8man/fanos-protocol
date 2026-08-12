@@ -7,21 +7,45 @@
 //! (post-REVEAL), and records the resulting [`StateMachine::state_root`] in the chain. Anyone replaying the
 //! same ordered transactions from genesis reaches the same root — the ledger property.
 //!
-//! [`Accounts`] is the reference machine: balances and per-account nonces, with a [`Transfer`] transaction.
-//! It is deliberately simple; a real deployment swaps in its own `StateMachine` (a full VM, a UTXO set, …)
-//! without touching consensus.
+//! ## The reference machine is a fixture, and does not ship
+//!
+//! `Accounts` — balances and per-account nonces, moved by a `Transfer` — exists so the 7-node consensus
+//! simulation has something to execute. It checks nonce and balance and **nothing else**: there is no
+//! authorisation check in `apply`, and no field in `Transfer` that could carry one. For testing *ordering*
+//! that is exactly right, and it is why the fixture is deliberately this small.
+//!
+//! For anything else it is wrong by default, so both types are behind `cfg(any(test, feature = "testing"))`
+//! and are absent from every shipping build. The reason is the door, not the code: an integrator reaching
+//! into the chain crate for a type called `Accounts` and getting a chain where any transaction spends any
+//! account is a mistake the API should not make available. Consensus is unaffected either way — TAXIS orders
+//! transactions and never interprets them, which is the whole point of the split above.
+//!
+//! What a real deployment runs is `fanos_dromos::HybridLedger`: hybrid-PQ-signed transfers bound to the
+//! account id, the #94 conservation gate over every system transfer, and parallel execution. A deployment
+//! that wants neither still implements this trait itself — the trait is what ships, not the instantiation.
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use fanos_pqcrypto::HybridVerifier;
-use fanos_primitives::codec::{Reader, put_map, put_u64, read_map};
-use fanos_primitives::hash_labeled;
-use fanos_wire::Wire;
-use fanos_wire_derive::Wire;
 
 use crate::tx::Transaction;
 
+// **Everything below is the fixture's, and the compiler proved it.** Gating `Accounts` and `Transfer` left
+// these six imports and this label unused — which is the sharpest available statement of what this module
+// ships: the `StateMachine` trait and `ExecOutcome`, and nothing else. Balance maps, the snapshot codec, the
+// state-root hash and the wire derive all existed to serve the reference instantiation.
+#[cfg(any(test, feature = "testing"))]
+use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(any(test, feature = "testing"))]
+use fanos_primitives::codec::{Reader, put_map, put_u64, read_map};
+#[cfg(any(test, feature = "testing"))]
+use fanos_primitives::hash_labeled;
+#[cfg(any(test, feature = "testing"))]
+use fanos_wire::Wire;
+#[cfg(any(test, feature = "testing"))]
+use fanos_wire_derive::Wire;
+
+#[cfg(any(test, feature = "testing"))]
 const STATE_ROOT_LABEL: &str = "FANOS-v1/taxis-state-root";
 
 /// The outcome of applying one transaction to the state.
@@ -156,6 +180,11 @@ pub trait StateMachine {
 
 /// A reference account transfer: move `amount` from `from` to `to`, valid only at the sender's current
 /// `nonce` (replay protection).
+///
+/// **Unauthenticated by construction** — there is no signature field here, and adding one is not the fix:
+/// the authenticated form already exists as `fanos_dromos::token::SignedTransfer`, which carries the owner's
+/// hybrid PQ key and binds `from` to a hash of it. See the module header for why this one is a fixture.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Wire)]
 pub struct Transfer {
     /// The sender account (a 32-byte identifier).
@@ -168,6 +197,7 @@ pub struct Transfer {
     pub nonce: u64,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Transfer {
     /// Encode this transfer as a [`Transaction`] payload.
     #[must_use]
@@ -176,13 +206,16 @@ impl Transfer {
     }
 }
 
-/// The reference state machine: account balances and per-account nonces.
+/// The reference state machine: account balances and per-account nonces. A **fixture** — see the module
+/// header; it authorises nothing, and the shipping state machine is `fanos_dromos::HybridLedger`.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Accounts {
     balances: BTreeMap<[u8; 32], u64>,
     nonces: BTreeMap<[u8; 32], u64>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Accounts {
     /// A fresh empty ledger.
     #[must_use]
@@ -209,6 +242,7 @@ impl Accounts {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl StateMachine for Accounts {
     fn apply(&mut self, tx: &Transaction) -> ExecOutcome {
         let Ok(t) = Transfer::from_wire(&tx.payload) else {
