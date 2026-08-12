@@ -17,6 +17,52 @@ use fanos_runtime::{Duration, Triple};
 
 use crate::rng::Rng;
 
+/// What became of one frame handed to the transport.
+///
+/// Named causes rather than `Option`, so a scenario can assert *why* — see [`NetworkModel::deliver`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use]
+pub enum Delivery {
+    /// Arrives at the destination after this delay.
+    After(Duration),
+    /// Sender and receiver are in different hard-partition groups: nothing crosses, ever, until the cut heals.
+    Partitioned,
+    /// An independent loss draw, or the soft-partition crossing draw — the frame is gone and a retry may work.
+    Lost,
+    /// The wire form exceeds what a production reader will accept, so a real receiver discards the stream and
+    /// the sender's write still reports success (#190). Deterministic: a retry of the same frame fails again.
+    Oversize {
+        /// The bytes this frame would occupy on the wire.
+        wire_len: usize,
+        /// [`fanos_quic::max_wire`] — the number `read_to_end` is given in production.
+        ceiling: usize,
+    },
+}
+
+/// The wire bytes a frame of `frame_len` occupies once production's transforms are applied.
+///
+/// The sim **accounts** for the growth without performing it: obfuscating here would buy nothing (nobody
+/// inspects these bytes) while costing every scenario the CPU. What must be identical is the arithmetic, so
+/// the one term that grows a frame on every path is taken from the crate that owns it. The relay wrapper is
+/// deliberately *not* added: when a frame travels through a hub the engine has already emitted it
+/// relay-encoded, so its bytes are in `frame_len` — adding the wrapper here would charge it twice and make
+/// the sim refuse frames production accepts.
+#[must_use]
+pub fn wire_len_of(frame_len: usize) -> usize {
+    frame_len + fanos_proteus::MAX_WIRE_OVERHEAD
+}
+
+/// The largest wire form a production reader accepts — **imported, never restated** (#195).
+///
+/// [`fanos_quic::max_wire`] is `MAX_FRAME + relay_overhead() + MAX_WIRE_OVERHEAD`, every term derived in
+/// #190. A literal here would track it only until one of them moved, and a simulator that silently disagrees
+/// with production is worse than one with no size axis at all: it would report a green run for a frame the
+/// real receiver drops.
+#[must_use]
+pub fn wire_ceiling() -> usize {
+    fanos_quic::max_wire()
+}
+
 /// Latency / loss / partition parameters of the simulated network.
 #[derive(Clone, Debug)]
 pub struct NetworkModel {
@@ -75,22 +121,34 @@ impl NetworkModel {
             .any(|group| group.contains(&from) && group.contains(&to))
     }
 
-    /// The delivery delay for a message, or `None` if it is dropped (loss or partition).
-    #[must_use]
-    pub fn delay(&self, from: Triple, to: Triple, rng: &mut Rng) -> Option<Duration> {
+    /// What the transport does with one frame — **four outcomes, because there are four causes**.
+    ///
+    /// This replaced an `Option<Duration>` whose `None` meant "loss *or* partition", a collapse that was
+    /// harmless only while those were the sole causes. Adding the size axis (#195) to that shape would have
+    /// buried an oversize drop in the same silence — which is precisely the defect #190 was: a frame the
+    /// sender believed it had sent, discarded with nothing to read afterwards. A scenario must be able to
+    /// assert on the cause, not infer it from an absence.
+    pub fn deliver(&self, from: Triple, to: Triple, wire_len: usize, rng: &mut Rng) -> Delivery {
         if !self.reachable(from, to) {
-            return None;
+            return Delivery::Partitioned;
+        }
+        // **The size axis, and it comes first among the random causes on purpose**: it is deterministic. A
+        // frame too big for a production reader is dropped on *every* run, and letting an earlier `rng.chance`
+        // draw claim it would make a certain failure look intermittent.
+        let ceiling = wire_ceiling();
+        if wire_len > ceiling {
+            return Delivery::Oversize { wire_len, ceiling };
         }
         if self.loss > 0.0 && rng.chance(self.loss) {
-            return None;
+            return Delivery::Lost;
         }
         // A soft partition: a message crossing between two soft groups is dropped with `cross_loss` — a lossy
         // but not fully-cut bisection (§6.5 incipient split).
         if self.cross_loss > 0.0 && self.crosses_soft(from, to) && rng.chance(self.cross_loss) {
-            return None;
+            return Delivery::Lost;
         }
         let jitter = (rng.unit() * self.jitter.as_nanos() as f64) as u64;
-        Some(Duration(
+        Delivery::After(Duration(
             self.base_latency.as_nanos().saturating_add(jitter),
         ))
     }

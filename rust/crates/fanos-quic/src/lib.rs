@@ -50,7 +50,9 @@ pub use reflexive::ReflexiveAddr;
 // this line the door #173 cut is public but its ANSWER is unnameable outside the crate — a caller could invoke
 // it and then have no type to bind the result to. Found by `cargo doc -D warnings`, which is the only gate
 // that reads a public signature against what the crate actually exports (#286).
-pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sampled, reflexive_quorum,
+// `max_wire` is exported as the READ-BOUND AUTHORITY, not as a convenience: the simulator models the
+// receive path without a socket (#195) and must be handed this number rather than keep its own.
+pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sampled, max_wire, reflexive_quorum,
     Client, NodeHandle, ProteusConfig, QuicError, spawn, spawn_self_certifying,
     Fabric, spawn_self_certifying_persistent, spawn_self_certifying_persistent_on,
     spawn_self_certifying_persistent_over,

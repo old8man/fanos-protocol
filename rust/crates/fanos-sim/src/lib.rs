@@ -50,7 +50,10 @@ pub use fleet::{AlarmCounts, ClusterStats, FleetSnapshot, NodeState, RegimeCount
 pub use hierarchy::Hierarchy;
 pub use unified::UnifiedCluster;
 pub use metrics::{Metrics, Observed, Report};
-pub use network::NetworkModel;
+// The transport's four-valued verdict and the two size helpers travel with the model: a scenario asserting
+// on an oversize drop (#195) needs to name the cause, and one packing a frame to the limit needs the very
+// ceiling production reads with.
+pub use network::{Delivery, NetworkModel, wire_ceiling, wire_len_of};
 pub use observatory::{
     CascadeForecast, CoherenceReading, CriticalSlowingDown, HealthField, forecast_cascade,
     lag1_autocorrelation, read, windowed_variance,

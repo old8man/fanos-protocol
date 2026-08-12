@@ -9,6 +9,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use fanos_runtime::ports::stations::GatherHealth;
+
+use crate::network::Delivery;
 use fanos_runtime::ports::ReadOutcome;
 use fanos_runtime::{
     AdmissionOutcome, Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification,
@@ -617,29 +619,45 @@ impl Sim {
                 Effect::Send { to, frame } => {
                     self.report.metrics.frames_sent += 1;
                     let name = frame_name(&frame);
-                    if let Some(d) = self.net.delay(node, to, &mut self.rng) {
-                        let at = self.clock.saturating_add(d);
-                        self.log(format!(
-                            "send {name} {}→{} +{}ms",
-                            fmt_coord(node),
-                            fmt_coord(to),
-                            ms(d)
-                        ));
-                        self.schedule(
-                            at,
-                            Event::Deliver {
-                                to,
-                                from: node,
-                                frame,
-                            },
-                        );
-                    } else {
-                        self.report.metrics.frames_dropped += 1;
-                        self.log(format!(
-                            "drop[net] {name} {}→{}",
-                            fmt_coord(node),
-                            fmt_coord(to)
-                        ));
+                    let wire = crate::network::wire_len_of(frame.len());
+                    match self.net.deliver(node, to, wire, &mut self.rng) {
+                        Delivery::After(d) => {
+                            let at = self.clock.saturating_add(d);
+                            self.log(format!(
+                                "send {name} {}→{} +{}ms",
+                                fmt_coord(node),
+                                fmt_coord(to),
+                                ms(d)
+                            ));
+                            self.schedule(
+                                at,
+                                Event::Deliver {
+                                    to,
+                                    from: node,
+                                    frame,
+                                },
+                            );
+                        }
+                        // **Counted apart from loss, and this is the point of the axis (#195).** An oversize
+                        // frame is not bad luck: production's reader discards it on every run while
+                        // `write_all` reports success, so a scenario that saw it inside `frames_dropped`
+                        // would read a deterministic protocol defect as a lossy network.
+                        Delivery::Oversize { wire_len, ceiling } => {
+                            self.report.metrics.frames_oversize += 1;
+                            self.log(format!(
+                                "drop[oversize] {name} {}→{} wire={wire_len} ceiling={ceiling}",
+                                fmt_coord(node),
+                                fmt_coord(to)
+                            ));
+                        }
+                        Delivery::Lost | Delivery::Partitioned => {
+                            self.report.metrics.frames_dropped += 1;
+                            self.log(format!(
+                                "drop[net] {name} {}→{}",
+                                fmt_coord(node),
+                                fmt_coord(to)
+                            ));
+                        }
                     }
                 }
                 Effect::ArmTimer { token, after } => {

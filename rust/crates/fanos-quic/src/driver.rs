@@ -418,7 +418,14 @@ fn relay_overhead() -> usize {
 /// design — a full TAXIS block — while `write_all` reports success and nothing counts the loss. Different
 /// quantities need different bounds, and each gap here is derived (from the encoder, and from the shape
 /// parameter ranges) rather than chosen, so neither can silently reopen the hole.
-fn max_wire() -> usize {
+///
+/// **Public because a second reader exists, and it must not restate this (#195).** The simulator models the
+/// receive path without a socket, so it needs the very number `read_to_end` is given. A copy over there
+/// would agree with this one until either moved, and a simulator that silently disagrees with production is
+/// worse than one that abstains — it reports a green run for a frame the real receiver drops. Anything
+/// modelling, conformance-checking or documenting the read bound imports this function.
+#[must_use]
+pub fn max_wire() -> usize {
     MAX_FRAME + relay_overhead() + fanos_proteus::MAX_WIRE_OVERHEAD
 }
 /// Cap on **concurrent inbound connection-handler tasks** (audit C3): each accepted connection spawns a

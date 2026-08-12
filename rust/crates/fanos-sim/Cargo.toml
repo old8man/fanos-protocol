@@ -26,6 +26,9 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
 # Real nodes over the modelled fabric: `fabric.rs` tests spawn genuine self-certifying nodes through the
 # `fanos_quic::Fabric::Abstract` seam, so the whole production path above the socket is exercised.
 fanos-quic.workspace = true
+# `MAX_WIRE_OVERHEAD` — the one transform that grows every frame on every path. The sim ACCOUNTS for the
+# growth without performing it (#195), so it needs the number and none of the obfuscation.
+fanos-proteus.workspace = true
 fanos-vrf.workspace = true
 # The composed-node fleet (`fabric::NodeFleet`) drives REAL deployed nodes over the modelled carrier, which is the
 # only way a scenario can observe the node's composition (docs/design-testing.md §5.1). No cycle: fanos-node does

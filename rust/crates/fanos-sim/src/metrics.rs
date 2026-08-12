@@ -13,6 +13,14 @@ pub struct Metrics {
     pub frames_delivered: u64,
     /// Frames dropped (loss, partition, or crashed destination).
     pub frames_dropped: u64,
+    /// Frames a production reader would have refused for **size** — the wire form exceeded
+    /// [`fanos_quic::max_wire`] (#195).
+    ///
+    /// Counted apart from [`frames_dropped`](Self::frames_dropped) because the two demand opposite
+    /// responses: loss is the network being itself and a retry may work, while an oversize frame fails
+    /// identically on every run and means a producer and a reader disagree about a bound. Summed into one
+    /// number, a deterministic protocol defect reads as a lossy link.
+    pub frames_oversize: u64,
     /// Timers fired.
     pub timers_fired: u64,
     /// Application payloads delivered.
@@ -56,6 +64,7 @@ impl Metrics {
         self.frames_sent += other.frames_sent;
         self.frames_delivered += other.frames_delivered;
         self.frames_dropped += other.frames_dropped;
+        self.frames_oversize += other.frames_oversize;
         self.timers_fired += other.timers_fired;
         self.payloads_delivered += other.payloads_delivered;
         self.peer_downs += other.peer_downs;
