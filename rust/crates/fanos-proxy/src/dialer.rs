@@ -134,7 +134,7 @@ impl UdpDialer for EchoDialer {
         &self,
         _target: &Target,
     ) -> impl Future<Output = Result<UdpTunnel, DialError>> + Send {
-        let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(64);
+        let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(crate::budget::UDP_TUNNEL_BUFFER);
         // Echo: every datagram sent toward the "destination" comes straight back.
         tokio::spawn(async move {
             while let Some(datagram) = outbound_rx.recv().await {

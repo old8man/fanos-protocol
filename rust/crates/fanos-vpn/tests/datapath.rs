@@ -62,7 +62,7 @@ impl UdpDialer for Recorder {
         }
         let sent = Arc::clone(&self.sent);
         async move {
-            let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(64);
+            let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(fanos_proxy::budget::UDP_TUNNEL_BUFFER);
             tokio::spawn(async move {
                 while let Some(datagram) = outbound_rx.recv().await {
                     sent.lock().await.push(datagram.clone());
