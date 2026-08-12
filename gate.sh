@@ -251,6 +251,18 @@ if want nostd ${SELECT[@]+"${SELECT[@]}"}; then
   echo "no_std on the HOST target"
   # On the host, not wasm: wasm has native f64.ceil/f64.nearest, so a wasm-only check supplies the very
   # facility `libm` exists to replace and cannot fail on a std call that slipped in.
+  # These verify the LIBRARY builds without std, and NOT its tests — `check` without `--all-targets` never
+  # compiles test code. That limit is worth stating because the six lines look uniform and are not:
+  # measured with `--list`, fanos-nyx (42) and fanos-runtime (65) keep every test std-free and would compile
+  # under this configuration, while fanos-diakrisis, fanos-telemetry and fanos-ports use `std`, `println!`
+  # and `String` in theirs and fail to build here. Neither is a defect — a no_std guarantee is about what
+  # ships, and a test harness needs a runner these targets do not have — but a reader must not take six
+  # identical-looking lines as identical coverage.
+  #
+  # Deliberately NOT upgraded to `check --all-targets` for the two that would pass it. That would enforce a
+  # property nobody in this tree has decided to hold, and the first std-using test added to fanos-nyx would
+  # redden the gate for something that is not a defect. If the tree ever decides test code stays std-free,
+  # this is the line to change and the measurement above is the evidence to change it against.
   run nostd-diakrisis-libm  check -p fanos-diakrisis --no-default-features --features libm
   run nostd-diakrisis-alloc check -p fanos-diakrisis --no-default-features --features "alloc libm"
   run nostd-telemetry       check -p fanos-telemetry --no-default-features --features "alloc libm"
