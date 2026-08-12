@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::bound::Entitlement;
-use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
+use crate::resolve::{Coverage, STORE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch capability advertisement lives at — domain-separated, keyed by
 /// the node's coordinate **and** the epoch (so each epoch's advertisement has its own address and a stale one
@@ -189,14 +189,15 @@ pub(crate) async fn build_capability_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> (Vec<(NodeId, Capability)>, Seating, bool) {
+) -> (Vec<(NodeId, Capability)>, Seating, Coverage) {
     let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
         read_capability::<F>(&client, coord, epoch, beacon).await
     })
     .await;
     // The third value is what the caller could not previously know: whether this is the whole cell or only the part that
-    // answered in time. An assignment derived from a partial view is not a settled answer (`role_loop`).
-    let complete = scan.complete();
+    // answered in time, and by how much it falls short. An assignment derived from a partial view is not a settled
+    // answer (`role_loop`), and the shortfall is what distinguishes ordinary jitter from a cell going dark.
+    let complete = scan.coverage();
     let mut seating: Seating = [None; 7];
     for (coord, (id, _)) in &scan.found {
         // Points past the seventh have no seat in the reflex's index space, and the diagnosis masks are `u8`.

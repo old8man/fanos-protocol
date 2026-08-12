@@ -45,6 +45,7 @@ use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced_observed};
 
 use crate::mixdir::build_cell_mix_directory;
+use crate::resolve::Coverage;
 use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
 use tokio::sync::broadcast;
@@ -576,8 +577,8 @@ struct HostContext {
 /// the role loop (`setpoint_to_track`, `next_stable`) are pure for the same reason, and the branch it guards
 /// is otherwise reachable only from a live cell whose store reads are being stalled.
 #[must_use]
-const fn may_register(resolved: usize, complete: bool) -> bool {
-    resolved > 0 && complete
+const fn may_register(resolved: usize, view: Coverage) -> bool {
+    resolved > 0 && view.complete()
 }
 
 /// One epoch's host rotation: rebuild the directory, register the anonymous forward route at the current
@@ -598,12 +599,16 @@ async fn rotate_host(
     let beacon = BeaconSeed::new(seed);
     // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
     // must prove its slot exactly where coordinates are VRF-derived (S1-M3, `mixdir::parse_bound_record`).
-    let (dir, complete) =
+    let (dir, view) =
         build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
-    if !may_register(dir.len(), complete) {
-        if !complete {
+    if !may_register(dir.len(), view) {
+        if !view.complete() {
             tracing::warn!(
                 resolved = dir.len(),
+                // The shortfall, not just its existence: one outstanding read on a busy cell is ordinary,
+                // and six is the read-stalling attack this refusal exists for. Same warning either way
+                // until the number is in it.
+                unresolved = view.unresolved,
                 "hidden service not registering this epoch: the cell's mix directory did not resolve in \
                  full, so any circuit drawn from it would be drawn from whichever lines answered rather \
                  than from the cell"
@@ -835,11 +840,17 @@ mod tests {
     /// that never registers at all.
     #[test]
     fn a_hidden_service_registers_only_on_a_directory_that_fully_resolved() {
-        assert!(may_register(7, true), "a complete read of a populated cell is what registration is for");
-        assert!(may_register(3, true), "a cell where four members published nothing is still a KNOWN cell");
-        assert!(!may_register(0, true), "nothing to seal to");
-        assert!(!may_register(7, false), "a full-looking view whose reads timed out is not a view of the cell");
-        assert!(!may_register(3, false), "and neither is a partial one");
+        let whole = Coverage { unresolved: 0 };
+        assert!(may_register(7, whole), "a complete read of a populated cell is what registration is for");
+        assert!(may_register(3, whole), "a cell where four members published nothing is still a KNOWN cell");
+        assert!(!may_register(0, whole), "nothing to seal to");
+        // The count is what separates these two from the pair above: same `resolved`, and the shortfall is
+        // now stated rather than implied by a bare `false`.
+        assert!(
+            !may_register(7, Coverage { unresolved: 1 }),
+            "a full-looking view with even one read outstanding is not a view of the cell"
+        );
+        assert!(!may_register(3, Coverage { unresolved: 4 }), "and neither is a partial one");
     }
 
     #[test]

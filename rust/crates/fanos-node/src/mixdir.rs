@@ -33,7 +33,7 @@ use fanos_primitives::BeaconSeed;
 use fanos_vrf::{VrfProof, VrfPublic};
 
 use crate::bound::Entitlement;
-use crate::resolve::{STORE_TIMEOUT, Read, resolve_directory};
+use crate::resolve::{Coverage, STORE_TIMEOUT, Read, resolve_directory};
 
 /// How a publisher obtains its coordinate proof: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
 ///
@@ -180,12 +180,12 @@ pub async fn build_cell_mix_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> (MixDirectory, bool) {
+) -> (MixDirectory, Coverage) {
     let scan = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
         read_mix_key_in_mode::<F>(&client, coord, epoch, beacon).await
     })
     .await;
-    let complete = scan.complete();
+    let complete = scan.coverage();
     let mut dir = MixDirectory::new();
     for (coord, public) in scan.found {
         dir.insert(coord, public);

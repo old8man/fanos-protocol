@@ -108,8 +108,10 @@ async fn a_running_node_publishes_the_cell_diagnosis_its_reputation_is_recompute
     // for bare ones parses nothing. Reading with the wrong mode is indistinguishable from an empty directory
     // (`Read::found_or_absent` calls a failed binding a definite absence), which is exactly how this test
     // first failed — the reader's mode is as load-bearing as the writer's.
-    let (records, complete) = read_diagnosis_window::<F2>(&node.client(), &window, true).await;
-    assert!(complete, "every read of the diagnosis window concluded");
+    let (records, view) = read_diagnosis_window::<F2>(&node.client(), &window, true).await;
+    // `assert_eq!` on the count, not `assert!` on the flag: a failure here now says how many of the window's
+    // reads were outstanding, which is the difference between a slow box and a cell that is not answering.
+    assert_eq!(view.unresolved, 0, "every read of the diagnosis window concluded");
     assert!(
         !records.is_empty(),
         "a node ran {} epochs with its heartbeat on and published NO diagnosis — the chain from \

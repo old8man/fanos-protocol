@@ -22,7 +22,7 @@ use fanos_pqcrypto::kem::HybridKemPublic;
 use fanos_pqcrypto::rng::SeedRng;
 use fanos_pqcrypto::sig::{HybridSigSecret, HybridVerifier};
 use fanos_node::{
-    AnonRouteParams, BeaconParams, BeaconSeed, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
+    AnonRouteParams, BeaconParams, BeaconSeed, Coverage, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
     NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
     HostedService, build_cell_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
@@ -1075,6 +1075,40 @@ async fn cmd_vpn(_args: &[String]) -> Result<(), NodeError> {
     ))
 }
 
+/// Why the anonymous profile is refusing, in the operator's terms — **and the remediation differs by cause**.
+///
+/// This existed as one `format!` giving one piece of advice: *"start relays that publish mix keys or lower
+/// `--threshold`"*. That advice is right for exactly one of the two ways `resolved < need` happens, and the
+/// call site could not tell them apart because it dropped the scan's completeness with `.0`.
+///
+/// * **The relays are genuinely absent.** Fewer than `need` members published a mix key. Start relays, or
+///   lower the threshold — the original message, now stated only when it is true.
+/// * **The reads did not conclude.** Every relay may be up and publishing while this node's store reads time
+///   out, which is congestion — or the read-stalling attack `mixdir`'s own module doc names, where slowing a
+///   chosen subset of slots is far cheaper than compromising a node. Here "start more relays" is advice for a
+///   problem the operator does not have, and "lower `--threshold`" is worse than useless: it edits their own
+///   anonymity parameter downward, permanently, in response to a transient failure. The honest instruction is
+///   to retry.
+///
+/// A pure function rather than an inline `format!` because a binary's inner `async fn` is not reachable from a
+/// test, and the message **is** the claim being made — an untestable report is a report that can quietly go
+/// back to giving one answer to two questions.
+#[must_use]
+fn too_few_relays(need: usize, epoch: u64, resolved: usize, view: Coverage) -> String {
+    let head =
+        format!("anonymous profile needs at least threshold+1={need} live mix relays for epoch {epoch}, found {resolved}");
+    if view.complete() {
+        format!("{head} — start relays that publish mix keys or lower --threshold")
+    } else {
+        format!(
+            "{head}, and {} more slot(s) did not answer in time — the cell may be fully staffed and merely \
+             slow to read. Retry before changing anything; do NOT lower --threshold, which would weaken this \
+             node's anonymity for what may be a transient read failure",
+            view.unresolved
+        )
+    }
+}
+
 /// Build the proxy's [`FanosDialer`] for the chosen routing profile. `direct` (when `anon` is `None`)
 /// reaches services by coordinate; `anonymous` reads the cell's live mix directory for `epoch` (every
 /// relay that published an onion key) and draws a *fresh, unlinkable* route per dial over it. Fails —
@@ -1096,14 +1130,15 @@ async fn build_proxy_dialer(
             .map_or((epoch, cfg.beacon), |(e, s)| (e, BeaconSeed::new(s)));
         // `Some(beacon)` — the live beacon resolved just above. A forged mix key at another relay's slot is
         // refused rather than sealed to (S1-M3).
-        let directory = build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await.0;
+        let (directory, view) =
+            build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
         let need = usize::from(cfg.threshold) + 1;
         if directory.len() < need {
-            return Err(NodeError::Config(format!(
-                "anonymous profile needs at least threshold+1={need} live mix relays for epoch {}, \
-                 found {} — start relays that publish mix keys or lower --threshold",
+            return Err(NodeError::Config(too_few_relays(
+                need,
                 epoch.get(),
                 directory.len(),
+                view,
             )));
         }
         info!(
@@ -1260,7 +1295,20 @@ async fn submit_tx_frame(
         return Ok(node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: frame.to_vec() }));
     }
     let client = node.client();
-    let directory = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await.0;
+    let (directory, view) = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await;
+    if !view.complete() {
+        // Not a refusal: unlike the proxy above, this path fails CLOSED — `emit_anonymously` returning
+        // `None` produces an error that offers `--direct` with its cost stated. What it does not do is
+        // say anything when it SUCCEEDS over a partial view, and that is the case worth a line: the
+        // circuit was then drawn from whichever lines answered rather than from the cell, which is
+        // exactly the placement an adversary stalling a chosen subset of store reads would shape.
+        warn!(
+            resolved = directory.len(),
+            unresolved = view.unresolved,
+            "submitting over a partially resolved mix directory: this circuit is drawn from the lines \
+             that answered, not from the whole cell"
+        );
+    }
     let params = AnonRouteParams {
         directory,
         threshold: mix_threshold_arg(args)?,
@@ -3800,6 +3848,49 @@ fn verb_block(text: &str, verb: &str) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::{Coverage, too_few_relays};
+
+    /// The anonymous profile's refusal must give **different** remediation for its two causes (#291).
+    ///
+    /// Both worlds hold `resolved` and `need` fixed — 3 relays where 4 are wanted — so the only thing that
+    /// differs between them is the scan's completeness. That is the discriminator being tested; a version
+    /// that ignores it produces byte-identical output for both and fails here twice.
+    ///
+    /// The negative assertions are the load-bearing half. `lower --threshold` is sound advice for a cell that
+    /// is genuinely short of relays and is *harmful* for one whose reads timed out: it edits the operator's
+    /// own anonymity parameter down, permanently, over a transient failure. A message that merely *added*
+    /// "some reads timed out" while keeping the old advice would satisfy a laxer test and still be wrong.
+    #[test]
+    fn the_refusal_advises_differently_when_relays_are_absent_than_when_reads_stalled() {
+        let absent = too_few_relays(4, 12, 3, Coverage { unresolved: 0 });
+        assert!(
+            absent.contains("start relays that publish mix keys or lower --threshold"),
+            "a cell genuinely short of relays gets the actionable advice: {absent}"
+        );
+        assert!(
+            !absent.contains("did not answer"),
+            "and is not told about reads that all concluded: {absent}"
+        );
+
+        let stalled = too_few_relays(4, 12, 3, Coverage { unresolved: 4 });
+        assert!(
+            stalled.contains("4 more slot(s) did not answer"),
+            "a stalled read names its shortfall, so one slow slot reads differently from six: {stalled}"
+        );
+        assert!(
+            stalled.contains("Retry"),
+            "and the operator is pointed at the only thing that can help: {stalled}"
+        );
+        assert!(
+            !stalled.contains("start relays that publish mix keys or lower --threshold"),
+            "and NOT at lowering their own anonymity parameter over a transient failure: {stalled}"
+        );
+
+        // Same shortfall, same epoch, same need — different text. If these ever agree, the flag has been
+        // dropped again somewhere between the scan and the report, which is the defect #291 was.
+        assert_ne!(absent, stalled, "the cause must reach the operator, not just the count");
+    }
+
     /// The three worlds the isolation warning must tell apart (#179).
     ///
     /// A test driving only the failing world passes against a build that always warns, so all three are here

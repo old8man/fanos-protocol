@@ -64,6 +64,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::capdir::{Seating, build_capability_directory, spawn_capability_publisher};
+use crate::resolve::Coverage;
 use crate::diagdir::{publish_diagnosis, read_diagnosis_window};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
@@ -1184,8 +1185,8 @@ async fn refresh_reputation<F: Field>(
     if window.len() < REP_WINDOW as usize {
         return; // not yet a window every node can be reading the same way
     }
-    let (records, complete) = read_diagnosis_window::<F>(client, window, prover.is_some()).await;
-    if !complete {
+    let (records, window_view) = read_diagnosis_window::<F>(client, window, prover.is_some()).await;
+    if !window_view.complete() {
         return; // a partial read is a per-node record set, which is the divergence being removed
     }
     let Some(latest) = window.iter().map(|(e, _)| e.get()).max() else {
@@ -1216,15 +1217,19 @@ async fn assign_epoch<F: Field>(
     // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
     let AssignAt { epoch, beacon, closed, .. } = at;
-    let ((members, seating, caps_complete), (setpoint, load_complete)) = tokio::join!(
+    let ((members, seating, caps_view), (setpoint, load_view)) = tokio::join!(
         build_capability_directory::<F>(client, epoch, vrf.then_some(beacon)),
         async {
             match closed.readable_for(epoch) {
                 // Verified against the seed of the epoch the records were PUBLISHED in, not the current one:
                 // a credential names its epoch, so the live seed rejects every closed record.
                 Some((e, s)) => build_cell_setpoint::<F>(client, e, capacity, vrf.then_some(s)).await,
-                // No readable closed epoch. Report incomplete so the caller holds; the value is unused.
-                None => (Demand::default(), false),
+                // No readable closed epoch, so no scan ran at all. The shortfall is the whole cell — every
+                // slot this scan would have read, none of which concluded — which is the honest count and
+                // not a stand-in: `Coverage` has no `Default` precisely so that "nothing resolved" cannot be
+                // written as a zero that reads as "everything did". The `Demand` beside it is unused, as the
+                // caller holds on an incomplete view.
+                None => (Demand::default(), Coverage { unresolved: Plane::<F>::N as usize }),
             }
         }
     );
@@ -1232,12 +1237,12 @@ async fn assign_epoch<F: Field>(
     // the reputation from the closed window. Both are here rather than in a publisher task of their own for
     // one reason: the record's roster must be the seating the assignment used, and this is the only place
     // that holds it. A second reader would produce a second seating and the two could disagree.
-    refresh_reputation::<F>(client, live, at, &seating, caps_complete).await;
+    refresh_reputation::<F>(client, live, at, &seating, caps_view.complete()).await;
     // The plane's own line size, so the threshold-line roles are floored at `t`-of-`(q+1)` for THIS plane
     // rather than at the base cell's three — the ceiling-computed-on-Fano defect (#122), one subsystem over.
     let (setpoint, hold) = setpoint_to_track(
         setpoint,
-        load_complete,
+        load_view.complete(),
         live.last_agreed(),
         Demand::supply(&members),
         Plane::<F>::LINE_SIZE as usize,
@@ -1294,10 +1299,16 @@ async fn assign_epoch<F: Field>(
     // *here*, where both values are read together, and it has not been taken. See #151.
     // The completeness the caller already computed travels WITH the count it qualifies, instead of being
     // consumed for backoff and then dropped (#289).
-    let roles = live.step(&members, epoch, &beacon, setpoint, caps_complete && load_complete);
+    //
+    // Reduced to a bool HERE rather than carried further: both consumers below can only branch on it, and a
+    // count handed to something that can only branch is the mirror of the defect #291 fixed — a number that
+    // reaches no reader. The builders carry `Coverage` because the information exists there; each consumer
+    // reduces it at its own decision, and the one that *reports* (`bin/fanos.rs`) is the one that does not.
+    let settled = caps_view.complete() && load_view.complete();
+    let roles = live.step(&members, epoch, &beacon, setpoint, settled);
     note_deficit(client, epoch, live.deficit());
     let _ = roles_tx.send(roles);
-    (roles, caps_complete && load_complete)
+    (roles, settled)
 }
 
 /// Keep the previously published assignment, and **say so**: the same value, `complete = false`, and one

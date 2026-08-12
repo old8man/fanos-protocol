@@ -334,6 +334,35 @@ impl<T> Read<T> {
     }
 }
 
+/// How much of a directory scan did not resolve, carried out to the caller as a **count** rather than a flag.
+///
+/// A `bool` is all four sibling builders used to return, and it is enough for every caller that merely *declines to
+/// act* on a partial view. It is not enough for the one that **reports to an operator**. `fanos --profile anonymous`
+/// refuses to start when fewer than `threshold + 1` mix relays resolved, and the remediation differs by cause: "start
+/// relays that publish mix keys, or lower `--threshold`" is right when the relays are genuinely absent, and actively
+/// harmful when every relay is up and the reads timed out — it invites the operator to edit their own anonymity
+/// parameter downward in response to congestion. `found.len()` cannot tell those apart, because "3 of 7 resolved" is
+/// equally consistent with "4 published nothing" and "4 did not answer in time".
+///
+/// **Deliberately not `Default`.** A defaulted `Coverage` reads `unresolved: 0`, i.e. *the whole cell answered* — a
+/// claim no scan made. The only honest way to obtain one is [`Scan::coverage`], from a scan that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Coverage {
+    /// How many reads did not conclude — [`Scan::unknown`], detached from the payload it was measured beside.
+    pub unresolved: usize,
+}
+
+impl Coverage {
+    /// Whether every read concluded, so this is the whole cell rather than the part of it that answered.
+    ///
+    /// `const` because [`crate::rendezvous_host`]'s `may_register` is — the rule it guards is pure, and being
+    /// pure is what lets it be asserted from both sides rather than only reached through a live stalled cell.
+    #[must_use]
+    pub const fn complete(self) -> bool {
+        self.unresolved == 0
+    }
+}
+
 /// The result of scanning a whole directory: what was found, and **how much was not established**.
 pub struct Scan<T> {
     /// The records that resolved, in coordinate order.
@@ -349,6 +378,15 @@ impl<T> Scan<T> {
     #[must_use]
     pub fn complete(&self) -> bool {
         self.unknown == 0
+    }
+
+    /// This scan's completeness, detached from `found` so a builder can transform the payload and still carry it out.
+    ///
+    /// Every directory builder in this crate does exactly that — it turns `found` into a roster, a seating or a key
+    /// directory, which is why the completeness cannot simply ride along inside [`Scan`].
+    #[must_use]
+    pub fn coverage(&self) -> Coverage {
+        Coverage { unresolved: self.unknown }
     }
 }
 

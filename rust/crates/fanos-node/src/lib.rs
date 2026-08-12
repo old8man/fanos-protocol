@@ -389,4 +389,6 @@ pub use fanos_session::dropped_payloads;
 // `fanos-runtime` — so without these re-exports a downstream crate cannot call either public method without
 // depending on `fanos-runtime` directly. Re-exported rather than duplicated: they are the same types.
 pub use fanos_runtime::{Command, Notification};
-pub use resolve::{NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service, verify_descriptor};
+pub use resolve::{
+    Coverage, NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service, verify_descriptor,
+};
