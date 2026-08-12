@@ -477,7 +477,9 @@ pub(crate) const MAX_INBOUND_CONNECTIONS: usize = 512;
 /// "unnamed is not zero; it is unbounded". That was true when the table was written and stopped being true
 /// when #245 landed: the per-connection window is no longer quinn's `VarInt::MAX` but
 /// `MAX_PEER_UNI_STREAMS × max_wire()`, and the connection count is capped at
-/// [`MAX_INBOUND_CONNECTIONS`]. The product has been computable ever since, and nobody went back to take it.
+/// `MAX_INBOUND_CONNECTIONS` (`pub(crate)`, so this doc names it rather than linking it — a public item
+/// may not link a private one, and rustdoc refuses). The product has been computable ever since, and nobody
+/// went back to take it.
 /// Exported so the sum can be taken where all three factors are visible, which is not inside
 /// `fanos-primitives` — it sits below this crate and cannot see `MAX_FRAME` or the connection cap.
 ///

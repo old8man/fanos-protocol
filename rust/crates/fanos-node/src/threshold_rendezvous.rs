@@ -22,7 +22,7 @@
 //!   **This is at-rest custody, and the clause that used to be here claimed more.** It said the identity is
 //!   "reconstructed on demand from `≥ threshold` opened shares … when the service must authenticate — e.g.
 //!   re-signing an epoch cert", which describes a live protocol that does not exist:
-//!   [`reconstruct_identity`] combines shares *already held in one process*, and nothing lets a node ask
+//!   [`reconstruct_identity`](ThresholdRendezvous::reconstruct_identity) combines shares *already held in one process*, and nothing lets a node ask
 //!   another for its opened share. Recovery is an operator ceremony — `t` members' files brought together
 //!   once, deliberately — not something this engine does per epoch. `fanos_calypso::hosting`'s header
 //!   states the same thing and names what a live gather would need; the two must not drift apart again,

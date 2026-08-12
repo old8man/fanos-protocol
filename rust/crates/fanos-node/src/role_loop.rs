@@ -493,7 +493,7 @@ impl Assignment {
     /// again, and is scored as "a complete change", which voids everything accumulated. Roles, roster and
     /// epoch never moved across all three steps.
     ///
-    /// [`next_stable`] was written precisely so an inconclusive scan is "not a change, and not a reset" — its
+    /// `next_stable` was written precisely so an inconclusive scan is "not a change, and not a reset" — its
     /// own test says so — and this comparison upstream was denying it the chance. Completeness still gates
     /// stability, once, where it belongs: as `next_stable`'s third argument.
     ///
@@ -1347,7 +1347,7 @@ async fn assign_epoch<F: Field>(
 ///
 /// The station is not decoration. Holding is a *deliberate non-action*, and a loop that silently keeps
 /// returning the same answer is indistinguishable from a converged one — the exact ambiguity the
-/// `complete`/`repeated` split in [`next_stable`] exists to remove one level up. It is also the only
+/// `complete`/`repeated` split in `next_stable` exists to remove one level up. It is also the only
 /// deterministic observable of this mechanism: the window it guards is tens of milliseconds on loopback, so a
 /// test sampling the published assignment catches it by luck, while the counter is exact.
 ///

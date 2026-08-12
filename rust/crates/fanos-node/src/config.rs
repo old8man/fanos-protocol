@@ -617,7 +617,7 @@ impl ServiceParams {
     /// Render as the `key = value` provisioning file `fanos service-deal` writes and `fanos node` reads.
     ///
     /// **Written through the type rather than by the ceremony's own `format!`, which is why this exists.**
-    /// The dealer used to compose these three keys by hand, so the writer and [`from_config_str`] were two
+    /// The dealer used to compose these three keys by hand, so the writer and [`from_config_str`](Self::from_config_str) were two
     /// statements of one format that nothing held together — and `identity_share` is exactly the kind of
     /// addition that drifts through such a seam: a field the parser accepts and the dealer never emits
     /// produces a line provisioned with no custody, silently, which is the defect §12.3 half (a) is about.

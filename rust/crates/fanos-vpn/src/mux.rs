@@ -24,7 +24,7 @@ pub const MAX_UDP_FLOWS: usize = 4096;
 /// The MTU this build configures the userspace stack with, and therefore the largest IP packet it will ever
 /// hand up.
 ///
-/// **Set explicitly rather than inherited from `IpStackConfig::default()`, because [`UDP_BUF`] is derived
+/// **Set explicitly rather than inherited from `IpStackConfig::default()`, because `fulltunnel`'s `UDP_BUF` is derived
 /// from it.** The default happens to be the same value today (ipstack's `MIN_MTU`), but a buffer sized from
 /// a dependency's default is sized from something that can change in a patch release without this crate
 /// noticing — and the failure would be a truncated datagram, not a build error. Stating it makes the

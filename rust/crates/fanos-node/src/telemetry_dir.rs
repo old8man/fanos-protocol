@@ -712,7 +712,7 @@ impl Census {
     /// How many distinct **cells** answered at all.
     ///
     /// Counts cells that **published**, so it stays true to its name. The observer's own cell can be in
-    /// [`Census::levels`] without being here — it is not a coordinate that answered.
+    /// `Census::levels` without being here — it is not a coordinate that answered.
     #[must_use]
     pub fn answering_cells(&self) -> usize {
         self.cells.len()
