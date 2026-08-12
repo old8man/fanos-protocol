@@ -1405,6 +1405,7 @@ dependencies = [
 name = "fanos-vpn"
 version = "0.1.0"
 dependencies = [
+ "fanos-primitives",
  "fanos-proxy",
  "ipstack",
  "tokio",

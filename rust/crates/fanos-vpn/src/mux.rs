@@ -146,6 +146,63 @@ mod tests {
     /// is per-flow and a deployment chooses the flow count; the exemption names the per-flow costs, and the
     /// queue was not among them until #300. Pinned here so the omission is a number an operator can read
     /// rather than an absence.
+    /// **Why #300's remedy is the only one: no affordable share buys both the flow cap and the depth.**
+    ///
+    /// The usual idiom here is to name a share and derive the count from it — `STORE_SHARE` gave
+    /// `MAX_STORE_ENTRIES`, `SESSION_SHARE` gave `MAX_SESSIONS`. Applied to a tunnel queue it fails, and
+    /// this test is the arithmetic that shows why. The product has three factors: `flows x 2 x depth x
+    /// payload`. The payload is fixed by the MTU. So a share buys `flows x depth`, and both are already
+    /// spoken for — `MAX_UDP_FLOWS` is how many destinations a client may talk to at once, and the depth
+    /// is the burst slack the channel exists to provide.
+    ///
+    /// Hand the VPN the **entire node budget** and worst-case accounting still buys depth 26 at the full
+    /// flow cap. Buying the declared 64 needs 2.45x the whole budget. Every share the node can actually
+    /// spare lands between depth 0 and depth 6.
+    ///
+    /// So a worst-case-sized share cannot be chosen without deleting a stated behaviour, and the answer is
+    /// not a smaller number: it is to stop sizing against a product of ceilings. Debiting the pool with
+    /// each datagram's **actual** bytes turns the share into a bound on *concurrent backlog*, which is a
+    /// quantity a node can afford and an operator can reason about — and the depth stops costing anything
+    /// while queues are empty, which is almost always.
+    ///
+    /// **This inverts the work order #300 recorded.** That task listed "derive the VPN share" as step 1
+    /// blocking the debit. The dependency runs the other way: the debit is what makes a derivable share
+    /// exist at all.
+    ///
+    /// The proxy has the same structure and worse numbers (its producer may push 65535 B, 51x this one),
+    /// but the VPN is the honest place to state it, because here the flow cap serves a function a user
+    /// would notice losing.
+    #[test]
+    fn no_affordable_share_buys_both_the_flow_cap_and_the_declared_depth() {
+        use fanos_primitives::budget::NODE_MEMORY_BUDGET;
+        use fanos_proxy::budget::UDP_TUNNEL_BUFFER;
+
+        let buys = |share: usize| {
+            let slots = share / (2 * MAX_QUEUED_PAYLOAD);
+            (slots / MAX_UDP_FLOWS, slots / UDP_TUNNEL_BUFFER)
+        };
+        for mib in [8usize, 16, 32, 64, 128, 256] {
+            let (depth, flows) = buys(mib * 1024 * 1024);
+            println!("{mib:>4} MiB share -> depth {depth:>3} at the full flow cap, or {flows:>5} flows at depth {UDP_TUNNEL_BUFFER}");
+        }
+
+        // The load-bearing claim: the WHOLE node budget is not enough, so no share can be.
+        let (depth_on_everything, _) = buys(NODE_MEMORY_BUDGET);
+        assert!(
+            depth_on_everything < UDP_TUNNEL_BUFFER,
+            "the entire node budget now buys depth {depth_on_everything} at the full flow cap, which \
+             reaches the declared {UDP_TUNNEL_BUFFER}. If that is real, a worst-case share IS derivable \
+             and #300's byte debit stops being forced — re-read the remedy before assuming it still is"
+        );
+
+        let worst_case = fanos_proxy::budget::tunnel_queue_ceiling(MAX_UDP_FLOWS, MAX_QUEUED_PAYLOAD);
+        assert!(
+            worst_case > 2 * NODE_MEMORY_BUDGET,
+            "the worst case ({worst_case} B) has come within 2x the node budget ({NODE_MEMORY_BUDGET} B). \
+             The argument above is a ratio, not a constant — restate it with the measured ratio"
+        );
+    }
+
     #[test]
     fn the_tunnel_queues_are_a_per_client_quantity_no_share_carries() {
         let ceiling = fanos_proxy::budget::tunnel_queue_ceiling(
