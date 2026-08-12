@@ -4945,9 +4945,15 @@ was last checked in, so the next reader can see the claim's age instead of assum
 
 # Four defences that are built and not reachable, found by scanning types instead of functions (2026-08-12)
 
-A pass that started as memory accounting and ended in the anonymity layer. Nothing here is fixed; all four are
-filed. What ties them together is a question the existing sweeps could not ask: **the unwired scan looks for
-functions nobody calls, and every one of these is a function that is called — inside a type nobody builds.**
+A pass that started as memory accounting and ended in the anonymity layer. What ties the findings together is
+a question the existing sweeps could not ask: **the unwired scan looks for functions nobody calls, and every
+one of these is a function that is called — inside a type nobody builds.**
+
+**Status, corrected in place.** This section first read "nothing here is fixed; all four are filed", which was
+true when it was written and false a few hours later — the inverse of the stale-open-HIGH defect §43 named,
+and the same defect. Three of the four landed the same day: the router's queue accounting and its missing
+bound in `237e0e1`, and the replay defence in `6c28fa1`. The fourth (§12.3's seizure half) is open and needs a
+ceremony rather than a fix.
 
 ## The instrument, and the two versions of it that lied
 
