@@ -65,9 +65,12 @@ impl UdpDialer for Recorder {
             let (tunnel, inbound_tx, mut outbound_rx) = UdpTunnel::pair(fanos_proxy::budget::UDP_TUNNEL_BUFFER);
             tokio::spawn(async move {
                 while let Some(datagram) = outbound_rx.recv().await {
-                    sent.lock().await.push(datagram.clone());
+                    // Record the bytes, then forward the datagram itself: a `Datagram` is deliberately not
+                    // `Clone`, because cloning one would duplicate the bytes while the pool had been charged
+                    // for a single copy (#300).
+                    sent.lock().await.push(datagram.to_vec());
                     // Echo, so the return leg is exercised too rather than only the outbound one.
-                    if inbound_tx.send(datagram).await.is_err() {
+                    if inbound_tx.forward(datagram).await.is_err() {
                         break;
                     }
                 }

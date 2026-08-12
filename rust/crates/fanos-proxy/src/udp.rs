@@ -68,7 +68,7 @@ pub const MAX_UDP_FLOWS: usize = 1024;
 
 /// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
 struct Flow {
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: crate::dialer::ChargedSender,
     last_used: Instant,
 }
 
@@ -168,7 +168,7 @@ pub async fn associate<D: UdpDialer>(mut control: TcpStream, dialer: &D) -> io::
 /// naming `source` and send it to the client's latched address. Ends when the tunnel closes.
 fn spawn_reply_pump(
     relay: Arc<UdpSocket>,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<crate::dialer::Datagram>,
     source: Target,
     client: SocketAddr,
 ) {
@@ -390,7 +390,7 @@ mod tests {
 
         let now = Instant::now();
         let mk = |secs_ago| Flow {
-            outbound: mpsc::channel::<Vec<u8>>(1).0,
+            outbound: crate::dialer::UdpTunnel::pair(1).0.outbound,
             last_used: now.checked_sub(Duration::from_secs(secs_ago)).unwrap(),
         };
         let (a, b, c) = (

@@ -76,9 +76,128 @@ pub trait Dialer {
 /// get their own tunnel).
 pub struct UdpTunnel {
     /// Datagrams to transmit toward the destination (the payloads, unframed).
-    pub outbound: mpsc::Sender<Vec<u8>>,
+    pub outbound: ChargedSender,
     /// Datagrams the destination sent back; yields `None` once the tunnel closes.
-    pub inbound: mpsc::Receiver<Vec<u8>>,
+    pub inbound: mpsc::Receiver<Datagram>,
+}
+
+/// A datagram sitting in a tunnel queue, carrying the pool permit that paid for its bytes (#300).
+///
+/// **RAII rather than a counter, and the reason is drop.** A shared `AtomicUsize` bumped on send and cut
+/// on receive is smaller and wrong: a tunnel dropped with items still queued never decrements, so the
+/// counter leaks by exactly the traffic in flight when a client went away — which is every client. A
+/// permit travelling with the bytes returns itself, whichever way the datagram leaves.
+///
+/// Derefs to its bytes, so a consumer writes `&datagram` exactly as it did when this was a `Vec<u8>`.
+pub struct Datagram {
+    bytes: Vec<u8>,
+    _permit: tokio::sync::SemaphorePermit<'static>,
+}
+
+impl std::ops::Deref for Datagram {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+/// Prints the LENGTH and not the bytes. A queued datagram is relayed user traffic, so a `Debug` that
+/// rendered its contents would put a client's payload into any log line that formatted a tunnel — the
+/// cheapest possible way to undo the thing this crate exists to provide.
+#[expect(clippy::missing_fields_in_debug, reason = "the omitted field IS the point: see the doc above")]
+impl std::fmt::Debug for Datagram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Datagram").field("len", &self.bytes.len()).finish()
+    }
+}
+
+/// Compares the bytes; the permit is bookkeeping, not identity.
+impl PartialEq for Datagram {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Datagram {}
+
+impl PartialEq<[u8]> for Datagram {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.bytes == other
+    }
+}
+
+impl PartialEq<Vec<u8>> for Datagram {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        &self.bytes == other
+    }
+}
+
+impl PartialEq<&[u8]> for Datagram {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.bytes == *other
+    }
+}
+
+impl Datagram {
+    /// Take the bytes, releasing the permit.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Why a datagram did not make it into a tunnel queue. Every arm is a drop — UDP's own failure model —
+/// but they are different events and an operator reading a count of them wants them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The pool had no bytes left: the node's total tunnel backlog is at its share.
+    NoBudget,
+    /// This tunnel's own queue is full, though the pool had room: one destination is not draining.
+    Full,
+    /// The far end of the tunnel is gone.
+    Closed,
+}
+
+/// The send half of one tunnel direction: **charges the pool before it queues**, so the bound is on bytes
+/// actually held rather than on a product of ceilings nobody can afford (#300).
+#[derive(Clone)]
+pub struct ChargedSender {
+    tx: mpsc::Sender<Datagram>,
+}
+
+impl ChargedSender {
+    /// Queue `bytes`, dropping rather than waiting — the right answer where the producer is a socket and
+    /// UDP's lossiness already is the contract.
+    pub fn try_send(&self, bytes: Vec<u8>) -> Result<(), Refused> {
+        let Some(permit) = crate::budget::charge_tunnel(bytes.len()) else {
+            return Err(Refused::NoBudget);
+        };
+        self.tx.try_send(Datagram { bytes, _permit: permit }).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => Refused::Full,
+            mpsc::error::TrySendError::Closed(_) => Refused::Closed,
+        })
+    }
+
+    /// Queue `bytes`, waiting for pool room and queue room — the right answer where the producer is a
+    /// byte-stream that can be back-pressured instead of dropped.
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<(), Refused> {
+        let Some(permit) = crate::budget::charge_tunnel_waiting(bytes.len()).await else {
+            return Err(Refused::NoBudget);
+        };
+        self.tx.send(Datagram { bytes, _permit: permit }).await.map_err(|_| Refused::Closed)
+    }
+
+    /// Move an already-charged datagram to another queue: the permit rides along, so nothing is charged
+    /// twice and nothing is released early.
+    pub async fn forward(&self, datagram: Datagram) -> Result<(), Refused> {
+        self.tx.send(datagram).await.map_err(|_| Refused::Closed)
+    }
+
+    /// Whether the receiving half is gone.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 impl UdpTunnel {
@@ -88,10 +207,14 @@ impl UdpTunnel {
     /// `buffer` bounds each direction's in-flight backlog (UDP is lossy: a full channel drops, never
     /// blocks the association).
     #[must_use]
-    pub fn pair(buffer: usize) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    pub fn pair(buffer: usize) -> (Self, ChargedSender, mpsc::Receiver<Datagram>) {
         let (outbound, outbound_rx) = mpsc::channel(buffer);
         let (inbound_tx, inbound) = mpsc::channel(buffer);
-        (Self { outbound, inbound }, inbound_tx, outbound_rx)
+        (
+            Self { outbound: ChargedSender { tx: outbound }, inbound },
+            ChargedSender { tx: inbound_tx },
+            outbound_rx,
+        )
     }
 }
 
@@ -138,7 +261,8 @@ impl UdpDialer for EchoDialer {
         // Echo: every datagram sent toward the "destination" comes straight back.
         tokio::spawn(async move {
             while let Some(datagram) = outbound_rx.recv().await {
-                if inbound_tx.send(datagram).await.is_err() {
+                // The permit rides along: an echo re-queues the same bytes, it does not buy them twice.
+                if inbound_tx.forward(datagram).await.is_err() {
                     break;
                 }
             }

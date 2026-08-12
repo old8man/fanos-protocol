@@ -79,7 +79,41 @@ pub const ASSOCIATION_COST: usize = MAX_UDP;
 /// same honest position `fanos_diaulos::budget::QUEUE_DEPTH` states about itself and leaves at a floor.
 pub const UDP_TUNNEL_BUFFER: usize = 64;
 
-/// **What the tunnel queues can hold, which no share covers** (#300).
+/// **The pool a tunnel queue debits, one datagram's ACTUAL bytes at a time** (#300).
+///
+/// Separate from [`PROXY_MEMORY`] because it funds a different thing: that one buys a per-client buffer
+/// that exists for as long as the client does, this one buys transient backlog. Sizing is
+/// `fanos_primitives::budget::TUNNEL_BACKLOG_SHARE`, derived there as a FLOOR — enough for every admitted
+/// flow to hold one datagram each way — because the arithmetic in `fanos-vpn` shows no ceiling is
+/// purchasable at any price the node can pay.
+///
+/// **A process-wide static rather than a constructor argument, and the reason is the derivation.** An
+/// earlier design made the pool a `pair()` parameter so each crate could name its own share; that was
+/// right while the VPN looked like it would need one of its own. It does not: `fanos-proxy` and
+/// `fanos-vpn` queue through this one mechanism and never in one process, so they get one share for it,
+/// and a share for a mechanism belongs with the mechanism. The parameter would only have offered callers
+/// a way to pass the wrong pool.
+pub static TUNNEL_MEMORY: Semaphore =
+    Semaphore::const_new(fanos_primitives::budget::TUNNEL_BACKLOG_SHARE);
+
+/// Charge `bytes` to [`TUNNEL_MEMORY`], or refuse. The permit rides with the datagram and returns itself
+/// when the datagram is consumed or dropped — see [`crate::dialer::Datagram`] for why RAII and not a
+/// counter.
+pub(crate) fn charge_tunnel(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let want = u32::try_from(bytes).ok()?;
+    TUNNEL_MEMORY.try_acquire_many(want).ok()
+}
+
+/// The awaiting form: used where the producer reads a byte-stream and back-pressure is the right answer,
+/// rather than a socket where UDP's own lossiness is.
+pub(crate) async fn charge_tunnel_waiting(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    let want = u32::try_from(bytes).ok()?;
+    TUNNEL_MEMORY.acquire_many(want).await.ok()
+}
+
+
+/// **What the tunnel queues COULD hold if nothing debited them** (#300) — kept as the figure the ratchet
+/// below pins, not as a quantity anything reserves.
 ///
 /// A relayed UDP flow's queue is `2 directions × UDP_TUNNEL_BUFFER × the datagram ceiling`, and every
 /// flow map multiplies it again. Pinned as a number rather than left to a task note, because a quantity
@@ -199,6 +233,58 @@ mod tests {
         assert_eq!(MAX_ASSOCIATIONS, 128);
         assert_eq!(MAX_CONNECTIONS, 4096);
         assert_eq!(RELAY_BUF, 1024, "the relay buffer is one downstream segment");
+    }
+
+    /// **The debit works in both directions: it refuses when the pool is spent, and ordinary traffic is
+    /// not refused.** The second half is the one that matters — a bound that refuses normal work is not a
+    /// bound, it is an outage, and #300's whole argument is that byte-accurate accounting buys the flow cap
+    /// and the depth that a product-of-ceilings share could not.
+    ///
+    /// Serialised on [`POOL`] because these arms move the process-wide semaphore. Cross-crate users of the
+    /// same mechanism (`fanos-vpn`) cannot collide with it: each crate's tests are a separate binary, so
+    /// each has its own copy of the static.
+    #[tokio::test]
+    async fn the_debit_refuses_a_spent_pool_and_admits_ordinary_traffic() {
+        let _serial = POOL.lock().await;
+        let (tunnel, _in_tx, _out_rx) = crate::dialer::UdpTunnel::pair(UDP_TUNNEL_BUFFER);
+
+        // ORDINARY TRAFFIC, first and deliberately: a full channel's worth of MTU-sized datagrams is
+        // admitted without one refusal. This is the direction a wrong bound breaks.
+        let ordinary = 1252;
+        for i in 0..UDP_TUNNEL_BUFFER {
+            assert_eq!(
+                tunnel.outbound.try_send(vec![0u8; ordinary]),
+                Ok(()),
+                "datagram {i} of an ordinary burst was refused; the share does not fund what the channel \
+                 depth admits, which is the failure mode #300 exists to avoid"
+            );
+        }
+        assert!(
+            TUNNEL_MEMORY.available_permits() >= PROXY_MEMORY_BUDGET,
+            "a full channel of ordinary datagrams should leave most of the share unspent; it left \
+             {} B",
+            TUNNEL_MEMORY.available_permits()
+        );
+
+        // SPENT POOL: hold everything that is left, and the next datagram is refused for the pool's
+        // reason, not the channel's — the two are different events and the caller can tell them apart.
+        let held = TUNNEL_MEMORY
+            .try_acquire_many(u32::try_from(TUNNEL_MEMORY.available_permits()).unwrap_or(u32::MAX));
+        assert!(held.is_ok(), "nothing else should be holding the pool inside this lock");
+        let (spare, _in2, _out2) = crate::dialer::UdpTunnel::pair(UDP_TUNNEL_BUFFER);
+        assert_eq!(
+            spare.outbound.try_send(vec![0u8; ordinary]),
+            Err(crate::dialer::Refused::NoBudget),
+            "with the pool spent the refusal must name the POOL; QueueFull here would send an operator to \
+             look at one destination for a node-wide condition"
+        );
+        drop(held);
+        assert_eq!(
+            spare.outbound.try_send(vec![0u8; ordinary]),
+            Ok(()),
+            "releasing the pool must let traffic through again — a permit that does not come back is the \
+             counter bug this design chose RAII to avoid"
+        );
     }
 
     /// **What the tunnel queues can hold, pinned so the figure moves visibly** (#300).

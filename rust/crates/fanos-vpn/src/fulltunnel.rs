@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use fanos_proxy::dialer::Refused;
 use fanos_proxy::{Dialer, Target, UdpDialer};
 use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
@@ -80,10 +81,12 @@ async fn bridge_udp<D: UdpDialer>(mut udp: IpStackUdpStream, dialer: Arc<D>, buf
                 }
                 // Non-blocking, UDP-lossy (matching the mux): a blocking `send().await` here would stall the
                 // whole select — and so the reply direction — whenever the exit tunnel is backed up. Drop on
-                // a full tunnel; stop only when it has closed.
+                // a full tunnel or an exhausted pool; stop only when it has closed. `NoBudget` joins the
+                // drop arm rather than the break one deliberately — the node's tunnel backlog being at its
+                // share is a transient the next datagram may not meet, where a closed tunnel is terminal.
                 match tunnel.outbound.try_send(buf.get(..n).unwrap_or(&[]).to_vec()) {
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    Ok(()) | Err(Refused::Full | Refused::NoBudget) => {}
+                    Err(Refused::Closed) => break,
                 }
             }
             reply = tunnel.inbound.recv() => {

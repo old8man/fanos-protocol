@@ -63,7 +63,7 @@ const _: () = assert!(
 
 /// An exit tunnel plus its last-use time, so the least-recently-used can be evicted at the cap.
 struct Flow {
-    outbound: mpsc::Sender<Vec<u8>>,
+    outbound: fanos_proxy::dialer::ChargedSender,
     last_used: Instant,
 }
 
@@ -115,7 +115,7 @@ pub async fn run_udp_datapath<D: UdpDialer>(
 /// Pump one flow's exit responses back to the TUN: each datagram becomes a TUN packet (from the flow's
 /// destination back to the client) written to `outbound`. Ends when the tunnel or the TUN sink closes.
 fn spawn_response_pump(
-    mut inbound: mpsc::Receiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<fanos_proxy::dialer::Datagram>,
     flow: FlowKey,
     outbound: mpsc::Sender<Vec<u8>>,
 ) {
@@ -327,7 +327,7 @@ mod tests {
     fn evict_lru_drops_the_least_recently_used_flow() {
         let now = Instant::now();
         let mk = |secs_ago| Flow {
-            outbound: mpsc::channel::<Vec<u8>>(1).0,
+            outbound: fanos_proxy::dialer::UdpTunnel::pair(1).0.outbound,
             last_used: now.checked_sub(Duration::from_secs(secs_ago)).unwrap(),
         };
         let key = |port| FlowKey { client: (CLIENT, port), dst: (RESOLVER, 53) };
