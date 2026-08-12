@@ -3,6 +3,8 @@
 # Install:
 #   install -Dm755 target/release/fanos            /usr/local/bin/fanos
 #   install -Dm644 deploy/node.conf.example        /etc/fanos/node.conf   # then edit it
+#     (use -Dm600 if you put a `proteus_secret` in it — that key is a shared community
+#      secret, and the node refuses to read it out of a file other accounts can reach)
 #   install -Dm644 deploy/fanos-node.service       /etc/systemd/system/fanos-node.service
 #   systemctl daemon-reload && systemctl enable --now fanos-node
 #

@@ -534,7 +534,14 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
         // written — that part was right, and the comment above says why.
         let _ = writeln!(s, "# proteus_morph above does NOTHING until a shared community secret is set. It is");
         let _ = writeln!(s, "# supplied out-of-band (never in this file, which gets copied between hosts), and");
-        let _ = writeln!(s, "# until then this node speaks unshaped FANOS on the wire.");
+        let _ = writeln!(s, "# until then this node speaks unshaped FANOS on the wire. Supply it by file:");
+        // **Naming the mechanism, not just the policy.** "Out of band" told the operator where the secret
+        // must not go and not how to supply it, and the flag that used to be the obvious answer took the
+        // secret as an argv value — readable by every local account from `ps` (#13). That flag now refuses,
+        // so the file recipe is written out here, umask included: the default umask writes the secret
+        // world-readable and the node refuses to read such a file at all.
+        let _ = writeln!(s, "#   (umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > proteus.secret)");
+        let _ = writeln!(s, "#   fanos node --proteus-secret-file proteus.secret");
     }
     s
 }

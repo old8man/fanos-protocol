@@ -193,7 +193,19 @@ fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
 
 fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     let mut config = match flag(args, "--config") {
-        Some(path) => NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?,
+        Some(path) => {
+            let config = NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?;
+            // **The config file is the other door the same secret comes through** (#13). Refusing
+            // `--proteus-secret` on the command line and then accepting `proteus_secret = …` out of a
+            // world-readable file would be a guarded path beside an unguarded twin: the exposure is the
+            // secret's, not the flag's, so the guard has to be on every channel that carries it. Checked
+            // only when the parsed config actually holds one — a config without a secret is public
+            // material (listen address, roles, bootstrap set) and there is nothing to protect.
+            if config.proteus_secret.is_some() {
+                require_private_file(path, "a shared PROTEUS community secret")?;
+            }
+            config
+        }
         None => NodeConfig::default(),
     };
     if let Some(s) = flag(args, "--listen") {
@@ -243,22 +255,47 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     if has_flag(args, "--no-heartbeat") {
         config.start_heartbeat = false;
     }
-    if let Some(s) = flag(args, "--proteus-secret") {
+    // **`--proteus-secret VALUE` is refused, not warned about** (#13).
+    //
+    // The failure sequence it used to allow: an operator runs `fanos node --proteus-secret hunter2`; the
+    // kernel keeps that command line for the life of the process; every other account on the host reads it
+    // with `ps -ef` or `cat /proc/<pid>/cmdline`, at any moment, without touching a single file. Holding the
+    // community secret is holding the shaping key of every peer in that community (§13.4), so one `ps` by
+    // one local user deanonymises the transport for everybody sharing it. The `Zeroizing` field this used to
+    // fill wipes the process's copy and cannot reach the kernel's, so no amount of care *inside* the binary
+    // closes it — only not putting the value in argv does.
+    //
+    // A warning was the previous answer and it is the "opt-in security default off" shape: the insecure path
+    // still worked, so it stayed in the scripts. Deleting the branch outright would be worse still — `flag`
+    // ignores arguments it does not recognise, so `--proteus-secret hunter2` would parse as nothing at all
+    // and the node would start UNSHAPED while the operator believed they had turned PROTEUS on. Hence an
+    // explicit refusal that names its replacement and prints the command that makes the file.
+    //
+    // Matched with `has_flag`, not `flag`: `flag` needs a following value, so a trailing `--proteus-secret`
+    // (or one whose value is another flag) would slip past a `flag`-based check — and that is precisely the
+    // invocation whose secret is in argv. The refusal is about the flag's presence.
+    if has_flag(args, "--proteus-secret") {
+        return Err(NodeError::Config(
+            "--proteus-secret is refused: its value becomes this process's command line, which every \
+             other account on this host can read from `ps` for as long as the node runs — and no wipe \
+             inside the process reaches the kernel's copy. Put the secret in a file only you can read \
+             and pass --proteus-secret-file instead:\n\
+             \x20   (umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > ~/.config/fanos/proteus.secret)\n\
+             \x20   fanos node --proteus-secret-file ~/.config/fanos/proteus.secret\n\
+             or set `proteus_secret = …` in a config file that is itself mode 0600."
+                .to_owned(),
+        ));
+    }
+    if let Some(path) = flag(args, "--proteus-secret-file") {
         // Enable PROTEUS: shape every frame with this shared community secret, rotating per epoch (§13.4).
-        //
-        // The config held it as a bare `Vec<u8>` and left it in freed heap for the process's life; it is
-        // `Zeroizing` now (#13). That closes the residue and NOT the bigger exposure on this path: a secret
-        // passed as an argv flag is readable in `ps` by every local user for as long as the node runs, and no
-        // wipe inside the process can reach the kernel's copy of the command line. The provisioning-file key
-        // (`proteus_secret = …`) is the surface that does not have that hole; this flag stays for a one-shot
-        // and says what it costs.
-        warn!("--proteus-secret puts a shared community secret in this process's command line, where any \
-               local user can read it from `ps`; prefer the `proteus_secret` provisioning-file key");
-        config.proteus_secret = Some(zeroize::Zeroizing::new(s.as_bytes().to_vec()));
+        // The secret arrives by the one channel that can be made unreadable to other accounts, and
+        // `read_secret_file` checks that it actually was — see its doc for why the mode is verified rather
+        // than assumed.
+        config.proteus_secret = Some(read_secret_file(path, "a shared PROTEUS community secret")?);
     }
     if let Some(m) = flag(args, "--proteus-morph") {
         // The morph selecting the codec + traffic-shaper (§13.3): plain, polymorph (default), tls-tunnel,
-        // masque-h3, fronted, webrtc, pluggable. Only takes effect with a --proteus-secret.
+        // masque-h3, fronted, webrtc, pluggable. Only takes effect with a --proteus-secret-file.
         config.proteus_morph = Morph::from_name(m).ok_or_else(|| {
             NodeError::Config(format!(
                 "unknown --proteus-morph '{m}' (expected: plain, polymorph, tls-tunnel, masque-h3, \
@@ -947,7 +984,8 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         None => {
             return Err(NodeError::Config(
                 "fanos host requires --host-key <file> — the service's secret seed and stable .fanos \
-                 identity (generate one with `head -c 32 /dev/urandom > svc.key`)"
+                 identity (generate one with `(umask 077; head -c 32 /dev/urandom > svc.key)`; the \
+                 umask is part of the recipe — the default one writes the seed world-readable)"
                     .to_owned(),
             ));
         }
@@ -1497,6 +1535,77 @@ fn write_dealt(path: &str, contents: impl AsRef<[u8]>, secret: bool) -> Result<(
         println!("wrote {path}");
     }
     Ok(())
+}
+
+/// Refuse `path` if any account other than its owner can reach its bytes — the read-side counterpart to
+/// [`write_file`]'s `secret` arm.
+///
+/// A file is *able* to carry `0600`; that is not the same as carrying it, and the difference is the whole
+/// value of moving a secret out of argv (#13). `echo hunter2 > secret` under the usual `umask 022` produces a
+/// world-readable file, and a node that read it without looking would have swapped one universally readable
+/// channel for another while reporting success. So the mode is verified, not assumed, at the moment the
+/// secret is taken in.
+///
+/// The mask is `0o077` — *no* bit set for group or other — matching
+/// [`fanos_node::durable`]'s guard rather than demanding an exact `0o600`, so an operator who narrowed the
+/// mode further still passes. The message names the fix (`chmod 600 <path>`) because a refusal an operator
+/// cannot act on is a refusal they will work around.
+///
+/// It does **not** claim more than it checks: a file inside a group-traversable directory, an ACL, or a
+/// shared home on a network filesystem can still expose it, and the mode is a snapshot taken just before
+/// the read rather than a lock. It is a guard against the operator's own `umask`, which is the exposure
+/// that actually happens; an attacker who can swap the file between the two syscalls could already have
+/// replaced the secret before the node started.
+///
+/// **And it does not yet cover every secret file this binary reads.** `--host-key`, `--key`, `--service`,
+/// `--exit`, `--beacon-params`, `--ingress-params` and `fanos validator --config` all take key material by
+/// path and read it at whatever mode it has. Those are a different defect — an operator's permission choice,
+/// on files this tool's own ceremonies already write `0600` through [`write_dealt`] — where the PROTEUS
+/// secret's was the tool *forcing* the exposure with no private channel offered at all. Named here so a
+/// reader does not take this guard for a property of the whole binary.
+fn require_private_file(path: &str, what: &str) -> Result<(), NodeError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| NodeError::Config(format!("cannot open '{path}' ({what}): {e}")))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(NodeError::Config(format!(
+            "'{path}' holds {what} and is reachable by other accounts on this host (mode {mode:o}) — run \
+             `chmod 600 {path}` and start again"
+        )));
+    }
+    Ok(())
+}
+
+/// Read key material out of an owner-only file.
+///
+/// Wiped on drop ([`Zeroizing`](zeroize::Zeroizing)), matching the config field it fills.
+///
+/// **One trailing newline is stripped**, and that is a correctness requirement rather than a convenience: a
+/// PROTEUS secret is *shared*, so two members who write it two ways must end up with the same bytes.
+/// `echo s > f` appends a newline and `printf %s s > f` does not; without the strip those two members shape
+/// their frames with different keys, and PROTEUS's failure mode for a key mismatch is silence — the
+/// handshake simply does not complete, with nothing anywhere saying why. The price is that a secret whose
+/// last byte is a newline cannot be expressed; stated because it is a real restriction and not an oversight.
+/// `\r\n` is stripped too, for a file that has been through a Windows editor on its way between hosts.
+///
+/// An empty file is refused rather than accepted as an empty secret: it is what a truncated copy, a failed
+/// `scp`, or a mistyped redirection leaves behind, and an empty shared secret shapes every frame identically
+/// for everyone — the exact opposite of what enabling PROTEUS asks for.
+fn read_secret_file(path: &str, what: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, NodeError> {
+    require_private_file(path, what)?;
+    let raw = zeroize::Zeroizing::new(std::fs::read(path)?);
+    let bytes: &[u8] = &raw;
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Err(NodeError::Config(format!(
+            "'{path}' is empty, so it holds no {what} — write the secret into it, e.g. \
+             `(umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > {path})`"
+        )));
+    }
+    Ok(zeroize::Zeroizing::new(bytes.to_vec()))
 }
 
 /// The address to listen on: the operator's if given, otherwise the first port in a window from the default that
@@ -2115,7 +2224,8 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         None => {
             return Err(NodeError::Config(
                 "fanos message serve requires --host-key <file> — the messenger's secret seed and stable \
-                 .fanos identity (generate one with `head -c 32 /dev/urandom > msg.key`)"
+                 .fanos identity (generate one with `(umask 077; head -c 32 /dev/urandom > msg.key)`; \
+                 the umask is part of the recipe — the default one writes the seed world-readable)"
                     .to_owned(),
             ));
         }
@@ -3807,14 +3917,16 @@ fn help_text() -> String {
 /// The rest of the help: the verbs an operator reaches for after the first day.
 ///
 /// Split from [`print_help`] because it is one string and it grew past what one function may hold — the
-/// boundary is where the text itself already put one.
+/// boundary is where the text itself already put one. Split again into [`help_reference`] for the same
+/// reason, at the same kind of boundary: this half is the *verb listing* (what to type), and everything
+/// after `fanos help` is *reference* (what the files and profiles mean).
 fn help_advanced() -> String {
-    String::from(
+    let mut s = String::from(
         "ADVANCED:\n\
          \x20 fanos node  [--config FILE] [--listen ADDR] [--identity PATH] [--data DIR] \\\n\
          \x20             [--bootstrap x:y:z@host:port,...] \\\n\
          \x20             [--role relay,storage,service,exit] [--service FILE] [--exit FILE] \\\n\
-         \x20             [--no-heartbeat] [--proteus-secret SECRET] [--proteus-morph MORPH] \\\n\
+         \x20             [--no-heartbeat] [--proteus-secret-file FILE] [--proteus-morph MORPH] \\\n\
          \x20             [--proteus-environment ENV] [--mix-delay-ms N] [--cover-interval-ms N] \\\n\
          \x20             [--plane-order 2|4|7|31] [--beacon-params FILE] [--ingress-params FILE]\n\
          \x20 fanos proxy [--socks-listen ADDR] [--http-listen ADDR] [--epoch N] [--min-pow BITS] \\\n\
@@ -3869,7 +3981,17 @@ fn help_advanced() -> String {
          \x20             ownership or balance floors; all legs apply or none do, which no single tag\n\
          \x20             expresses; --dry-run prints depth/cost/footprint and stops; --features validator)\n\
          \x20 fanos help\n\
-         \n\
+         ",
+    );
+    s.push_str(&help_reference());
+    s
+}
+
+/// The reference half of the help: what each provisioning file holds, what a proxy profile means, and the
+/// worked examples. Read after the verb listing has said what to type.
+fn help_reference() -> String {
+    String::from(
+        "\n\
          PROXY PROFILES:\n\
          \x20 direct     reach services by coordinate — fast, but reveals where each party is (default)\n\
          \x20 anonymous  draw a FRESH threshold-onion rendezvous route per dial from the live mix\n\
@@ -3889,6 +4011,17 @@ fn help_advanced() -> String {
          \x20  destinations — loopback, RFC1918, CGNAT, link-local — so `ports = 80,443` cannot be turned\n\
          \x20  into a proxy into your own network or your cloud metadata endpoint)\n\
          \x20 (providing it implies the `exit` role; the node logs its `coord`/`key` descriptor at startup)\n\
+         \n\
+         PROTEUS SECRET FILE (--proteus-secret-file, censorship-resistant shaping §13.4): a file holding\n\
+         \x20 the raw shared community secret — the same bytes on every peer that must interoperate. It is\n\
+         \x20 a bridge/community password, not a per-node key, and the node REFUSES to read it unless it is\n\
+         \x20 unreadable to other accounts:\n\
+         \x20   (umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > ~/.config/fanos/proteus.secret)\n\
+         \x20   fanos node --proteus-secret-file ~/.config/fanos/proteus.secret\n\
+         \x20 One trailing newline is ignored, so `echo` and `printf` give the same secret. There is no\n\
+         \x20 --proteus-secret VALUE flag: an argv value is readable by every local account via `ps` for as\n\
+         \x20 long as the node runs. `proteus_secret = …` in a mode-0600 config file does the same job.\n\
+         \x20 Without a secret, --proteus-morph and --proteus-environment do nothing (unshaped QUIC).\n\
          \n\
          CLEARNET (proxy): by default `fanos proxy` DISCOVERS an exit from the live cell directory (exits\n\
          \x20 advertise themselves each epoch) and routes clearnet (non-.fanos) targets through it. Pin a\n\
@@ -4131,6 +4264,154 @@ mod tests {
             config.roles.ingress,
             "and the role it implies is set — otherwise the node stores the parameters and hosts nothing, \
              which is exactly what `--service` and `--exit` avoid by implying theirs",
+        );
+    }
+
+    /// **A secret passed as an argv value is readable by every account on the host** (#13), so the flag that
+    /// took one must refuse rather than warn.
+    ///
+    /// The failure this pins: `fanos node --proteus-secret hunter2` put the shared community secret into
+    /// `/proc/<pid>/cmdline` for the life of the daemon, where `ps -ef` prints it to any local user. Holding
+    /// that secret is holding the shaping key of every peer in the community (§13.4). The old code logged a
+    /// warning and used it anyway — the insecure path still worked, so it stayed in the scripts.
+    ///
+    /// Three things are asserted, because a refusal that fails any one of them is not a fix:
+    /// * it is an `Err`, not a warning — the run stops;
+    /// * the message names the replacement flag, so the operator is not left guessing;
+    /// * a *valueless* trailing `--proteus-secret` is refused too. That is the `has_flag`-versus-`flag`
+    ///   distinction: `flag` needs a following argument, so a check built on it would have let the very
+    ///   invocation whose secret is already in argv through, silently unshaped.
+    #[test]
+    fn proteus_secret_in_argv_is_refused_and_names_the_file_flag() {
+        let args = vec!["--proteus-secret".to_owned(), "hunter2".to_owned()];
+        let err = node_config_from_args(&args).expect_err("an argv secret must stop the run, not warn");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--proteus-secret-file"),
+            "the refusal must name what to do instead, not only what is wrong: {msg}"
+        );
+        assert!(msg.contains("ps"), "and say why argv is not a private channel: {msg}");
+
+        // The flag with no value at all: `flag()` would return `None` here and wave it through.
+        let trailing = vec!["--proteus-secret".to_owned()];
+        assert!(
+            node_config_from_args(&trailing).is_err(),
+            "a valueless --proteus-secret is the same exposure and must be refused the same way"
+        );
+    }
+
+    /// The replacement channel has to be one that other accounts cannot read — **verified, not assumed**.
+    ///
+    /// Moving a secret from argv into a file buys nothing on its own: `echo hunter2 > secret` under the
+    /// default `umask 022` writes mode 0644, and a node that read it without looking would have swapped one
+    /// world-readable channel for another while reporting success. So the file's mode is checked at the
+    /// moment the secret is taken in.
+    ///
+    /// Also pins the newline strip, which is a *shared*-secret correctness property rather than a nicety:
+    /// `echo s > f` and `printf %s s > f` must give two members of one community the same bytes, because
+    /// PROTEUS's failure mode for mismatched shaping keys is silence — nothing connects and nothing says why.
+    #[test]
+    fn a_proteus_secret_file_must_be_unreadable_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = std::env::temp_dir().join(format!("fanos-proteus-{}.secret", std::process::id()));
+        // `echo`'s trailing newline on purpose — the form an operator actually types.
+        std::fs::write(&path, b"a-shared-bridge-secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let args = vec!["--proteus-secret-file".to_owned(), path.to_string_lossy().into_owned()];
+
+        let config = node_config_from_args(&args).unwrap();
+        assert_eq!(
+            config.proteus_secret.as_deref().map(Vec::as_slice),
+            Some(&b"a-shared-bridge-secret"[..]),
+            "the secret is read from the file, and the trailing newline is not part of it — one member \
+             using `echo` and another `printf` must end up with identical shaping keys"
+        );
+
+        // The same file, group- and world-readable: the exposure the file form exists to remove.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = node_config_from_args(&args)
+            .expect_err("a world-readable secret file is the argv exposure with extra steps");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chmod 600"),
+            "the refusal must say how to fix it, or an operator works around it instead: {msg}"
+        );
+
+        // A truncated copy or a mistyped redirection: empty is not a secret.
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            node_config_from_args(&args).is_err(),
+            "an empty file must not be accepted as an empty shared secret — it shapes every frame \
+             identically for everyone, which is the opposite of turning PROTEUS on"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **The config file is the same secret's other door** (#13).
+    ///
+    /// `proteus_secret = …` is a documented config key, so refusing the argv flag and then reading the same
+    /// secret out of a mode-0644 file would leave a guarded path beside an unguarded twin. And the guard must
+    /// be conditional: a config *without* a secret is public material — listen address, roles, bootstrap set
+    /// — that operators keep in `/etc` at 0644 on purpose, and refusing those would make this check
+    /// something people turn off.
+    #[test]
+    fn a_config_file_carrying_the_secret_must_be_private_but_a_public_one_need_not_be() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir();
+        let secretive = dir.join(format!("fanos-cfg-secret-{}.conf", std::process::id()));
+        std::fs::write(&secretive, "proteus_secret = a-shared-bridge-secret\n").unwrap();
+        std::fs::set_permissions(&secretive, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let args = vec!["--config".to_owned(), secretive.to_string_lossy().into_owned()];
+        let err = node_config_from_args(&args).expect_err("a world-readable config holding a secret");
+        assert!(err.to_string().contains("chmod 600"), "and it says how to fix it: {err}");
+
+        std::fs::set_permissions(&secretive, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = node_config_from_args(&args).unwrap();
+        assert!(config.proteus_secret.is_some(), "the same file at 0600 is accepted");
+
+        // The other half: a config with no secret in it is not key material and must stay readable.
+        let public = dir.join(format!("fanos-cfg-public-{}.conf", std::process::id()));
+        std::fs::write(&public, "plane_order = 2\n").unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let public_args = vec!["--config".to_owned(), public.to_string_lossy().into_owned()];
+        assert!(
+            node_config_from_args(&public_args).is_ok(),
+            "a config carrying no secret must not be refused for its mode — that would make the check a \
+             nuisance rather than a guard, and a nuisance gets removed"
+        );
+
+        std::fs::remove_file(&secretive).ok();
+        std::fs::remove_file(&public).ok();
+    }
+
+    /// **The shipped example config must parse**, and nothing checked that it did.
+    ///
+    /// `deploy/node.conf.example` is what an operator installs to `/etc/fanos/node.conf`, and
+    /// `NodeConfig::from_config_str` treats an unrecognised key as a **hard error** — deliberately, so a typo
+    /// fails at start rather than leaving a setting silently at its default. Put together, one stale key in
+    /// that file is a node that will not boot, discovered by the operator and by nobody here: no test, no
+    /// build step and no lint reads it. It is the provisioning surface again — wire decoders get audited,
+    /// the files that configure them do not.
+    ///
+    /// Found while documenting `proteus_secret` in it (#13), which is exactly the edit that would have
+    /// introduced such a key.
+    #[test]
+    fn the_shipped_example_config_still_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../deploy/node.conf.example");
+        let args = vec!["--config".to_owned(), path.to_string_lossy().into_owned()];
+        let config = node_config_from_args(&args).unwrap_or_else(|e| {
+            panic!("deploy/node.conf.example does not parse, so `fanos node --config` on a fresh install \
+                    fails at start: {e}")
+        });
+        assert_eq!(config.listen.port(), 9000, "and the values in it are the ones it shows");
+        assert!(
+            config.proteus_secret.is_none(),
+            "the example must not ship an ACTIVE proteus_secret — a shared community secret in a file \
+             that gets copied between hosts, installed 0644 by the unit's own install line"
         );
     }
 
