@@ -377,7 +377,12 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // 31: `Timeline::revisits` — the oscillation detector added for the role-setpoint measurement. It is a
     // scenario instrument, like most of this crate's entry: `until`, `until_settled`, `frozen`,
     // `changes_after` and `is_reached` are all called only from scenarios, which is what fanos-sim is for.
-    ("fanos-sim", 37),
+    // 40 (#246): `stop_consuming`, `resume_consuming` and `held_for` — the RETENTION axis's controls and its
+    // observable. Same category as the `isolate` / `with_loss` / `tick_epoch` already counted here: a
+    // simulator's controls are called by scenarios, because being called by scenarios is what they are for.
+    // Raised rather than wired, and the full test gate is what caught it — three commits after the last time
+    // this ratchet ran alone, which is the whole argument for `run-the-whole-suite-not-your-crate`.
+    ("fanos-sim", 40),
     ("fanos-stream", 3),
     ("fanos-taxis", 22),
     ("fanos-telemetry", 9),
