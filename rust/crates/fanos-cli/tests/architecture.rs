@@ -1492,48 +1492,68 @@ const TOLERATED_DUPLICATES: &[(&str, &str)] = &[
     ("block-buffer", "as sha2"),
 ];
 
-/// Every `[[package]]` in `Cargo.lock`, as `name -> the versions the build links`.
-fn locked_versions() -> BTreeMap<String, BTreeSet<String>> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let (mut name, mut version) = (None, None);
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')) {
-            name = Some(v.to_owned());
-            version = None;
-        } else if let Some(v) = line.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"')) {
-            version = Some(v.to_owned());
-        }
-        if let (Some(n), Some(v)) = (name.as_ref(), version.take()) {
-            out.entry(n.clone()).or_default().insert(v);
-        }
-    }
-    out
+/// One `[[package]]` block as the lock records it.
+struct LockedCopy {
+    version: String,
+    /// The raw dependency entries. The lock writes `"name"` when the name is unambiguous in the graph and
+    /// `"name version"` when it is not — so a package reaching a DUPLICATED crate always names the copy it
+    /// reached, which is the fact three of the guards below are built on.
+    deps: Vec<String>,
 }
 
-/// Everything that depends on `name version`, read from the lock's dependency lists.
-fn dependents_of(name: &str, version: &str) -> BTreeSet<String> {
+/// **The one parse of `Cargo.lock` in this file**, as `name -> the copies the build links`.
+///
+/// Four questions are asked of the lock here — which versions exist, who depends on a given copy, which
+/// `getrandom` a package reaches, and what the cryptographic trust boundary contains — and each used to open
+/// and scan the file for itself. Four scanners are four chances for one of them to read nothing and report a
+/// clean tree; the duplication guard below needed an explicit "parsed at least 300 packages" floor precisely
+/// because a broken parse and a tidy dependency graph are indistinguishable from the outside. One parse, and
+/// the floor covers every caller.
+fn locked_packages() -> BTreeMap<String, Vec<LockedCopy>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
     let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
-    let want = format!("{name} {version}");
-    let mut out = BTreeSet::new();
+    let mut out: BTreeMap<String, Vec<LockedCopy>> = BTreeMap::new();
+    // `skip(1)`: the chunk before the first `[[package]]` is the file header, whose `version = 4` is
+    // unquoted and so matches nothing below anyway.
     for block in text.split("[[package]]").skip(1) {
-        let Some(who) = block.lines().find_map(|l| l.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')))
-        else {
-            continue;
-        };
+        let (mut name, mut version): (Option<String>, Option<String>) = (None, None);
+        for line in block.lines() {
+            // First occurrence only — a dependency line is indented, so it never reaches these prefixes.
+            if name.is_none() {
+                name = line.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')).map(str::to_owned);
+            }
+            if version.is_none() {
+                version = line.strip_prefix("version = \"").and_then(|s| s.strip_suffix('"')).map(str::to_owned);
+            }
+        }
+        let mut deps = Vec::new();
         for dep in block.lines().skip_while(|l| !l.starts_with("dependencies")).skip(1) {
             let dep = dep.trim().trim_matches(|c| c == '"' || c == ',');
             if dep == "]" {
                 break;
             }
-            if dep == want {
-                out.insert(who.to_owned());
-            }
+            deps.push(dep.to_owned());
+        }
+        if let (Some(n), Some(v)) = (name, version) {
+            out.entry(n).or_default().push(LockedCopy { version: v, deps });
         }
     }
     out
+}
+
+/// Every `[[package]]` in `Cargo.lock`, as `name -> the versions the build links`.
+fn locked_versions() -> BTreeMap<String, BTreeSet<String>> {
+    locked_packages().into_iter().map(|(n, c)| (n, c.into_iter().map(|c| c.version).collect())).collect()
+}
+
+/// Everything that depends on `name version`, read from the lock's dependency lists.
+fn dependents_of(name: &str, version: &str) -> BTreeSet<String> {
+    let want = format!("{name} {version}");
+    locked_packages()
+        .into_iter()
+        .filter(|(_, copies)| copies.iter().any(|c| c.deps.contains(&want)))
+        .map(|(who, _)| who)
+        .collect()
 }
 
 /// **The one dependency holding the curve split open, and a tripwire for the day it stops** (#217).
@@ -1640,31 +1660,15 @@ fn the_old_rng_line_is_held_by_the_curve_branch_alone() {
 /// version-set guard never touches. A new dependency could move the identity path onto ring's copy and every
 /// existing assertion would stay green.
 fn getrandom_reached_by(pkg: &str) -> BTreeSet<String> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let text = std::fs::read_to_string(root.join("Cargo.lock")).expect("the workspace lock file");
-    let mut out = BTreeSet::new();
-    for block in text.split("[[package]]") {
-        let Some(name) = block.lines().find_map(|l| l.strip_prefix("name = \"").and_then(|s| s.strip_suffix('"')))
-        else {
-            continue;
-        };
-        if name != pkg {
-            continue;
-        }
-        // The lock writes a dependency as `"name"` when the name is unambiguous and `"name version"` when it
-        // is not — so a package reaching a DUPLICATED crate always names the version, which is exactly the
-        // case this reads. A bare `"getrandom"` would mean the duplication had collapsed.
-        for dep in block.lines().skip_while(|l| !l.starts_with("dependencies")).skip(1) {
-            let dep = dep.trim().trim_matches(|c| c == '"' || c == ',');
-            if dep == "]" {
-                break;
-            }
-            if let Some(rest) = dep.strip_prefix("getrandom") {
-                out.insert(rest.trim().to_owned());
-            }
-        }
-    }
-    out
+    // A bare `"getrandom"` dependency entry would strip to the empty string, and that is the honest answer:
+    // it would mean the duplication had collapsed and the version no longer needs naming.
+    let packages = locked_packages();
+    packages
+        .get(pkg)
+        .into_iter()
+        .flatten()
+        .flat_map(|copy| copy.deps.iter().filter_map(|d| d.strip_prefix("getrandom").map(|r| r.trim().to_owned())))
+        .collect()
 }
 
 /// **The identity path's entropy comes from ONE copy, and the lock says which** (#217).
@@ -1976,4 +1980,588 @@ fn rust_files_under(dir: &Path) -> Vec<(PathBuf, String)> {
         }
     }
     out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// The cryptographic trust boundary: DERIVED from the lock, its membership RECORDED, its advisories VENDORED.
+//
+// `CRYPTO_TCB` above names seventeen crates. That list answers "whose duplication is a security fact"; it was
+// never the trust boundary, and reading it as one is off by a factor of five. Trust is transitive: every
+// crate a trusted crate links is inside the boundary too, with the same access to the same address space and
+// — for the build-time half — to the machine doing the building. Computed rather than assumed, the boundary
+// is EIGHTY-SIX crates. The sixty-nine nobody had named include `cc` (which invokes a C compiler of its
+// choosing during the build), five proc-macro crates (which execute at compile time), and the entire
+// `wasm-bindgen` + `futures` stack, reached because `getrandom 0.2` — ring's copy — carries a `js` backend.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// **The trust boundary, computed rather than typed** (#206).
+///
+/// A hand-written list of "the crates we trust" drifts the moment a dependency adds one, and it drifts
+/// silently: nothing in a build fails because a crate you never heard of joined the graph underneath your
+/// signing key. So the boundary here is the transitive closure of [`CRYPTO_TCB`] over the lock's dependency
+/// lists — the seventeen named crates plus everything they reach.
+///
+/// Closure is taken by NAME, unioning a crate's copies. That is deliberately the wider answer, and it is the
+/// same premise the duplication guard runs on: two versions of one name are two implementations in one
+/// address space, so whatever either copy pulls is linked. It is why `js-sys` is here — `getrandom 0.2`,
+/// which the TLS stack reaches, has a browser backend, and the boundary is a superset of what any single
+/// target actually builds.
+fn crypto_trust_boundary() -> BTreeSet<String> {
+    let packages = locked_packages();
+    let mut boundary: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = CRYPTO_TCB.iter().map(|c| (*c).to_owned()).collect();
+    while let Some(name) = queue.pop() {
+        if boundary.contains(&name) {
+            continue;
+        }
+        let Some(copies) = packages.get(&name) else { continue };
+        for copy in copies {
+            for dep in &copy.deps {
+                let dep_name = dep.split(' ').next().unwrap_or(dep);
+                if !boundary.contains(dep_name) {
+                    queue.push(dep_name.to_owned());
+                }
+            }
+        }
+        boundary.insert(name);
+    }
+    boundary
+}
+
+/// FNV-1a over the sorted boundary names: one number that moves when, and only when, the membership does.
+fn boundary_digest(boundary: &BTreeSet<String>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for name in boundary {
+        for b in name.as_bytes().iter().chain(b"\n".iter()) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Who published a crate — which is who this workspace is actually trusting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Publisher {
+    /// A GitHub organisation: more than one person can review, and more than one person must be compromised
+    /// for a malicious release to be published.
+    Org,
+    /// One account. Not a judgement about the person — `dtolnay` and `BurntSushi` write better code than most
+    /// orgs ship — but a statement about the failure mode: a single credential stands between that account
+    /// and every build in this boundary.
+    Person,
+}
+
+/// **The publishers this workspace delegates to, and the ground for delegating** (#206).
+///
+/// The honest ground for trusting any of the eighty-six crates below is *delegation*: nobody in this repo has
+/// read `syn`. `cargo vet` calls this "trusted publisher", and naming the publisher is what turns an
+/// assumption into something a reader can dispute. A steward that appears here and nowhere in [`TRUSTED`] is
+/// removed by the guard, so this list cannot grow a name that stopped mattering.
+const STEWARDS: &[(&str, Publisher, &str)] = &[
+    ("RustCrypto", Publisher::Org, "the traits, hashes, formats, signature and KEM crates — the workspace's PQ half is theirs"),
+    ("dalek-cryptography", Publisher::Org, "curve25519 and its consumers; the classical half of every FANOS key"),
+    ("rust-random", Publisher::Org, "rand, rand_core, rand_chacha, getrandom — every bit of entropy a key is built from"),
+    ("rust-lang", Publisher::Org, "libc, cc, cfg-if and futures-rs; trusting them is trusting the toolchain already"),
+    ("dtolnay", Publisher::Person, "proc-macro2, quote, syn, semver, rustversion, unicode-ident — the derive substrate"),
+    ("serde-rs", Publisher::Org, "serde; reached only through ed25519-dalek's optional key serialisation"),
+    ("wasm-bindgen", Publisher::Org, "the JS bindings getrandom 0.2 uses on wasm targets"),
+    ("bytecodealliance", Publisher::Org, "the WASI backends getrandom selects on wasm"),
+    ("google", Publisher::Org, "zerocopy, under ppv-lite86's SIMD ChaCha"),
+    ("BLAKE3-team", Publisher::Org, "blake3 itself, by its designers"),
+    ("mit-plv", Publisher::Org, "fiat-crypto — field arithmetic with a machine-checked proof, which is why it outranks hand-written asm"),
+    ("rust-num", Publisher::Org, "num-traits, under module-lattice's arithmetic"),
+    ("tokio-rs", Publisher::Org, "slab, inside futures-util"),
+    ("r-efi", Publisher::Org, "the UEFI backend getrandom selects on that target"),
+    ("str4d", Publisher::Person, "vrf-r255 — Jack Grigg's ECVRF; the single pin holding the curve split open (#217)"),
+    ("BurntSushi", Publisher::Person, "memchr, inside futures-util's IO adapters"),
+    ("cryptocorrosion", Publisher::Person, "ppv-lite86 — the SIMD ChaCha core under rand_chacha"),
+    ("fizyk20", Publisher::Person, "generic-array — the pre-const-generics array under the RustCrypto 0.10 line"),
+    ("paholg", Publisher::Person, "typenum — the type-level integers generic-array and hybrid-array are built on"),
+    ("cesarb", Publisher::Person, "constant_time_eq — blake3's comparison, and the only thing between a hash check and a timing oracle"),
+    ("bluss", Publisher::Person, "arrayvec, blake3's subtree stack"),
+    ("droundy", Publisher::Person, "arrayref, blake3's chunk addressing"),
+    ("cuviper", Publisher::Person, "autocfg, a build-time rustc probe"),
+    ("fitzgen", Publisher::Person, "bumpalo, inside wasm-bindgen's macro expansion"),
+    ("matklad", Publisher::Person, "once_cell, inside wasm-bindgen"),
+    ("taiki-e", Publisher::Person, "pin-project-lite, inside futures-util"),
+    ("djc", Publisher::Person, "rustc_version, curve25519-dalek's build probe"),
+    ("comex", Publisher::Person, "shlex, which splits the command line cc executes"),
+    ("SergioBenitez", Publisher::Person, "version_check, generic-array's build probe"),
+];
+
+/// **Every crate inside the cryptographic trust boundary, recorded rather than assumed** (#206).
+///
+/// The guard insists this list and the derived closure are the SAME SET, in both directions: a crate that
+/// enters the boundary with no entry reddens the gate, and an entry for a crate that has left is deleted
+/// rather than kept as decoration. That is the whole mechanism — the list cannot drift, because drift is the
+/// failure it tests for.
+///
+/// Read the third column as the answer to "why is this in my crypto trust boundary at all". The ones marked
+/// BUILD-TIME never run in the node: they run in `cargo build`, on a developer's machine and on CI, with that
+/// machine's privileges — which for the purpose of supply-chain trust is worse, not better.
+const TRUSTED: &[(&str, &str, &str)] = &[
+    ("arrayref", "droundy", "fixed-size slice references for blake3's chunk addressing"),
+    ("arrayvec", "bluss", "blake3's stack of subtree chaining values"),
+    ("autocfg", "cuviper", "BUILD-TIME: num-traits probes the compiler with it"),
+    ("base64ct", "RustCrypto", "constant-time Base64 for the PEM encoding under spki"),
+    ("blake3", "BLAKE3-team", "ROOT: coordinates, MACs and content addresses are BLAKE3"),
+    ("block-buffer", "RustCrypto", "ROOT: block padding under digest and cipher"),
+    ("bumpalo", "fitzgen", "BUILD-TIME: the arena wasm-bindgen's macro expansion allocates in"),
+    ("cc", "rust-lang", "BUILD-TIME: compiles blake3's SIMD C — it chooses and invokes a C compiler during the build"),
+    ("cfg-if", "rust-lang", "target-conditional blocks in eight of the crates here"),
+    ("chacha20", "RustCrypto", "the stream cipher rand 0.10 draws its blocks from"),
+    ("cipher", "RustCrypto", "the block/stream cipher traits chacha20 implements"),
+    ("cmov", "RustCrypto", "constant-time conditional move, under ctutils"),
+    ("const-oid", "RustCrypto", "object identifier constants under der"),
+    ("constant_time_eq", "cesarb", "blake3's equality comparison"),
+    ("cpufeatures", "RustCrypto", "runtime CPU detection that selects the SIMD paths in blake3, sha2 and the curve"),
+    ("crypto-common", "RustCrypto", "ROOT: the KeyInit / KeySizeUser traits"),
+    ("ctutils", "RustCrypto", "the constant-time helpers ml-dsa and module-lattice sample with"),
+    ("curve25519-dalek", "dalek-cryptography", "ROOT: the curve under ed25519, x25519 and the VRF"),
+    ("curve25519-dalek-derive", "dalek-cryptography", "BUILD-TIME: the #[unsafe_target_feature] macro"),
+    ("der", "RustCrypto", "DER encoding under pkcs8"),
+    ("digest", "RustCrypto", "ROOT: the Digest trait every hash here implements"),
+    ("ed25519", "RustCrypto", "the signature encoding ed25519-dalek exposes"),
+    ("ed25519-dalek", "dalek-cryptography", "ROOT: a node's identity signature"),
+    ("fiat-crypto", "mit-plv", "ROOT: the formally verified field arithmetic under curve25519"),
+    ("find-msvc-tools", "rust-lang", "BUILD-TIME: cc's MSVC toolchain locator; not reached on unix"),
+    ("futures-channel", "rust-lang", "reached only through js-sys — see futures-util"),
+    ("futures-core", "rust-lang", "reached only through js-sys — see futures-util"),
+    ("futures-io", "rust-lang", "reached only through js-sys — see futures-util"),
+    ("futures-macro", "rust-lang", "BUILD-TIME: the derive half of futures-util"),
+    ("futures-sink", "rust-lang", "reached only through js-sys — see futures-util"),
+    ("futures-task", "rust-lang", "reached only through js-sys — see futures-util"),
+    ("futures-util", "rust-lang", "js-sys' async plumbing: the whole futures stack is inside the boundary because getrandom 0.2 has a browser backend"),
+    ("generic-array", "fizyk20", "the pre-const-generics array type under block-buffer 0.10 and crypto-common 0.1"),
+    ("getrandom", "rust-random", "ROOT: OS entropy, at three versions — TOLERATED_DUPLICATES says which serves which"),
+    ("hybrid-array", "RustCrypto", "the const-generic array replacing generic-array in the 0.11 line"),
+    ("inout", "RustCrypto", "in-place cipher IO under cipher"),
+    ("js-sys", "wasm-bindgen", "getrandom 0.2's browser backend — crypto.getRandomValues"),
+    ("keccak", "RustCrypto", "the permutation under sha3 and shake"),
+    ("kem", "RustCrypto", "the Encapsulate / Decapsulate traits ml-kem implements"),
+    ("libc", "rust-lang", "the syscalls getrandom and cpufeatures make"),
+    ("memchr", "BurntSushi", "substring search inside futures-util's IO adapters"),
+    ("ml-dsa", "RustCrypto", "ROOT: FIPS 204 signatures"),
+    ("ml-kem", "RustCrypto", "ROOT: FIPS 203 key encapsulation"),
+    ("module-lattice", "RustCrypto", "ROOT: the lattice arithmetic ml-kem and ml-dsa share"),
+    ("num-traits", "rust-num", "generic numeric traits inside module-lattice"),
+    ("once_cell", "matklad", "lazy statics inside wasm-bindgen"),
+    ("pin-project-lite", "taiki-e", "pin projection inside futures-util"),
+    ("pkcs8", "RustCrypto", "private-key serialisation for ed25519, ml-kem and ml-dsa"),
+    ("ppv-lite86", "cryptocorrosion", "the SIMD ChaCha core under rand_chacha"),
+    ("proc-macro2", "dtolnay", "BUILD-TIME: the token trees every derive in this boundary is built from"),
+    ("quote", "dtolnay", "BUILD-TIME: quasi-quoting, same derives"),
+    ("r-efi", "r-efi", "getrandom's UEFI backend; not reached on unix"),
+    ("rand", "rust-random", "ROOT: the RNG facade the workspace generates keys through"),
+    ("rand_chacha", "rust-random", "rand 0.9's block RNG"),
+    ("rand_core", "rust-random", "ROOT: the RngCore / CryptoRng traits, at three versions"),
+    ("rustc_version", "djc", "BUILD-TIME: curve25519-dalek's compiler probe"),
+    ("rustversion", "dtolnay", "BUILD-TIME: version-conditional attributes in wasm-bindgen"),
+    ("semver", "dtolnay", "BUILD-TIME: version parsing under rustc_version"),
+    ("serde", "serde-rs", "ed25519-dalek's optional key serialisation"),
+    ("serde_core", "serde-rs", "serde's own core, split out in 1.0.220"),
+    ("serde_derive", "serde-rs", "BUILD-TIME: serde's derive half"),
+    ("sha2", "RustCrypto", "ROOT: SHA-512 under ed25519 and the VRF"),
+    ("sha3", "RustCrypto", "SHA-3 / SHAKE under ml-kem"),
+    ("shake", "RustCrypto", "the XOF ml-dsa samples its matrix from"),
+    ("shlex", "comex", "BUILD-TIME: splits the command line cc executes"),
+    ("signature", "RustCrypto", "the Signer / Verifier traits"),
+    ("slab", "tokio-rs", "futures-util's task slab"),
+    ("spki", "RustCrypto", "SubjectPublicKeyInfo under pkcs8"),
+    ("sponge-cursor", "RustCrypto", "the sponge state cursor under shake"),
+    ("subtle", "dalek-cryptography", "constant-time selection and equality for every dalek primitive"),
+    ("syn", "dtolnay", "BUILD-TIME: the parser behind five derives in this boundary"),
+    ("typenum", "paholg", "type-level integers under generic-array and hybrid-array"),
+    ("unicode-ident", "dtolnay", "BUILD-TIME: identifier validation in proc-macro2 and syn"),
+    ("version_check", "SergioBenitez", "BUILD-TIME: generic-array's compiler probe"),
+    ("vrf-r255", "str4d", "ROOT: ECVRF-RISTRETTO255-SHA512 — the coordinate VRF, and the pin holding curve 4 open"),
+    ("wasi", "bytecodealliance", "getrandom's WASI preview-1 backend"),
+    ("wasip2", "bytecodealliance", "getrandom's WASI preview-2 backend"),
+    ("wasm-bindgen", "wasm-bindgen", "the JS binding layer getrandom 0.2 uses on wasm"),
+    ("wasm-bindgen-macro", "wasm-bindgen", "BUILD-TIME: its derive"),
+    ("wasm-bindgen-macro-support", "wasm-bindgen", "BUILD-TIME: its derive"),
+    ("wasm-bindgen-shared", "wasm-bindgen", "BUILD-TIME: its derive"),
+    ("wit-bindgen", "bytecodealliance", "component-model bindings under wasip2"),
+    ("x25519-dalek", "dalek-cryptography", "ROOT: the Diffie-Hellman half of the session handshake"),
+    ("zerocopy", "google", "the safe transmutes ppv-lite86 is written on"),
+    ("zerocopy-derive", "google", "BUILD-TIME: its derive"),
+    ("zeroize", "RustCrypto", "ROOT: secret erasure on drop"),
+];
+
+/// One RUSTSEC advisory, recorded so the check can run with no network.
+struct Advisory {
+    /// The RUSTSEC identifier — the thing to search for when re-checking.
+    id: &'static str,
+    /// The crate it is filed against, matched against the lock by name.
+    krate: &'static str,
+    /// Half-open version intervals `[introduced, fixed)`, exactly as RUSTSEC states "patched in".
+    affected: &'static [(&'static str, &'static str)],
+    what: &'static str,
+    /// The page that settles any dispute about the two fields above.
+    url: &'static str,
+}
+
+/// **The vendored advisory records for the trust boundary** (#206).
+///
+/// Small, and that is a fact about the boundary rather than about the effort: it is eighty-six crates of
+/// RustCrypto, dalek, rust-random and rust-lang held at current versions, which is close to the least
+/// advisory-prone dependency set a Rust project can have. The two entries here are not decoration — the first
+/// is the reason `curve25519-dalek 4.1.3` may never be allowed to resolve one patch lower.
+const ADVISORIES: &[Advisory] = &[
+    Advisory {
+        id: "RUSTSEC-2024-0344",
+        krate: "curve25519-dalek",
+        affected: &[("0.0.0", "4.1.3")],
+        what: "timing variability in `Scalar29::sub` / `Scalar52::sub` — the subtraction is not constant-time, \
+               so scalar operations leak. `vrf-r255 0.1.0` pins this workspace to the 4.x line (#217) and the \
+               lock resolves it at exactly 4.1.3, the first patched release: the identity path sits ON the \
+               floor, not above it.",
+        url: "https://rustsec.org/advisories/RUSTSEC-2024-0344.html",
+    },
+    Advisory {
+        id: "RUSTSEC-2022-0093",
+        krate: "ed25519-dalek",
+        affected: &[("0.0.0", "2.0.0")],
+        what: "the double public key signing function oracle: the pre-2.0 API let a caller sign under a public \
+               key that did not match the secret, which recovers the secret over a few queries. Fixed by the \
+               2.0 API that derives the public key from the secret; this workspace is on 3.0.",
+        url: "https://rustsec.org/advisories/RUSTSEC-2022-0093.html",
+    },
+];
+
+/// **When the advisory list above was last checked against RUSTSEC, and by what method** (#206).
+///
+/// A date implies a procedure, and the wrong procedure inferred from a date is worse than no date — so this
+/// says exactly what was done. The gate runs OFFLINE, locally and in CI, so this was **not** a `cargo audit`
+/// against a fetched index. It is one reviewer enumerating the derived boundary and recording the advisories
+/// they could name for those crates, each with the URL that settles it. The list is therefore **incomplete by
+/// construction**, and its incompleteness is not measurable from inside this file.
+///
+/// The first reviewer with a network is asked to close precisely that gap, once:
+///
+/// ```text
+/// git clone https://github.com/rustsec/advisory-db /tmp/advisory-db
+/// cargo install cargo-audit && cargo audit --db /tmp/advisory-db --file rust/Cargo.lock
+/// ```
+///
+/// — then add every hit against a boundary crate here with its interval and URL, and move this date. That
+/// procedure needs a network exactly once per review; this file is what carries the result to every machine
+/// that cannot reach one. A check that silently passes when the network is down would be worse than none,
+/// which is why the network is not in the gate's path at all.
+const REVIEWED_ON: (i64, i64, i64) = (2026, 8, 12);
+
+/// **How long a review may stand before the gate calls it stale.**
+///
+/// Derived from this repository's measured rate of boundary change rather than picked for roundness. Over the
+/// 111 commits that touched `Cargo.lock` between 2026-07-17 and 2026-08-12, the derived boundary's membership
+/// changed **4 times** — a boundary event every 6.75 days. Those events already force a re-review through
+/// [`REVIEWED_BOUNDARY_DIGEST`], so the calendar's only remaining job is the case a digest cannot see: the
+/// advisory database moving while our dependency set stands still.
+///
+/// The calendar must therefore be the DORMANCY backstop and never the routine trigger. A red that arrives on
+/// a schedule teaches its reader to re-date without reviewing — the same failure the duplication guard above
+/// avoided by refusing to flag all fifteen duplicates. Treating boundary events as Poisson at λ = 4/27 per
+/// day, the chance a window of T days contains no boundary event at all is e^(−λT); requiring that to be
+/// under one run in a thousand gives **T ≥ ln(1000)/λ = 46.6 days**.
+///
+/// Sixty is that floor rounded up to the next whole month, and the rounding is the only chosen part: a review
+/// is work a person schedules, and an interval that lands on a calendar boundary gets scheduled while 47 days
+/// gets postponed. Every day above the floor is exposure, so the rounding goes to the nearest month and not
+/// to the nearest comfortable number — 90 would have been the comfortable one.
+const MAX_REVIEW_AGE_DAYS: i64 = 60;
+
+/// The size of the derived boundary when [`REVIEWED_ON`] was set. Printed by the guard when it moves.
+const REVIEWED_BOUNDARY_SIZE: usize = 86;
+
+/// [`boundary_digest`] of the derived boundary when [`REVIEWED_ON`] was set.
+///
+/// The size alone would miss a swap — one crate in, one out — and a swap is exactly the shape a supply-chain
+/// substitution takes.
+const REVIEWED_BOUNDARY_DIGEST: u64 = 0x0d21_4e70_5152_cdd3;
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm, exact for any proleptic Gregorian
+/// date). Used so the review date can stay readable as `(2026, 8, 12)` rather than a hand-computed epoch
+/// constant nobody can check by eye.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `1.2.3`, `0.11.1+wasi-0.2.12` and `3.0.0-rc.1` reduced to something comparable.
+///
+/// The fourth element orders a pre-release BEFORE its release, so `4.1.3-rc.1` still counts as affected by an
+/// advisory patched in `4.1.3`. That direction is chosen: the other one under-reports, and an advisory check
+/// that under-reports is the failure mode this whole file exists to make impossible.
+fn semver_key(v: &str) -> (u64, u64, u64, u8) {
+    let core = v.split('+').next().unwrap_or(v);
+    let (core, released) = match core.split_once('-') {
+        Some((c, _)) => (c, 0u8),
+        None => (core, 1u8),
+    };
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0), released)
+}
+
+/// Whether `version` falls in any half-open `[introduced, fixed)` interval.
+fn version_in_any(intervals: &[(&str, &str)], version: &str) -> bool {
+    let v = semver_key(version);
+    intervals.iter().any(|(from, fixed)| semver_key(from) <= v && v < semver_key(fixed))
+}
+
+/// **Nothing enters the cryptographic trust boundary without someone recording who is trusted** (#206).
+///
+/// `CRYPTO_TCB` is seventeen names and was never the boundary. The boundary is what those seventeen *reach*,
+/// and reaching is what a hand list cannot track: a dependency adds a crate, the build stays green, and the
+/// set of publishers who can push code into a signing path grows by one with nothing said. Computed here, it
+/// is eighty-six crates from twenty-nine publishers, of which **twenty-one crates come from sixteen
+/// individual accounts** — `dtolnay` alone supplies six of them. The guard prints those numbers on a green
+/// run, because a count nobody sees until it fails is a count nobody knows.
+///
+/// The guard is `derived == recorded`, both directions. An unrecorded arrival reddens the gate; a recorded
+/// crate that has left is deleted rather than kept, for the same reason a finished migration must not stay in
+/// `TOLERATED_DUPLICATES` — a stale entry shelters the next real one.
+#[test]
+fn every_crate_in_the_cryptographic_trust_boundary_has_a_recorded_steward() {
+    let packages = locked_packages();
+    assert!(packages.len() >= 300, "parsed only {} packages from Cargo.lock; the parser is broken", packages.len());
+
+    // CONTROL 1, before any finding: every root resolves. A typo in CRYPTO_TCB would otherwise shrink the
+    // boundary in silence — the closure skips a name the lock does not have — and a smaller boundary is
+    // exactly what a green result looks like.
+    let unresolved: Vec<&str> = CRYPTO_TCB.iter().copied().filter(|c| !packages.contains_key(*c)).collect();
+    assert!(
+        unresolved.is_empty(),
+        "these CRYPTO_TCB names are not in Cargo.lock at all, so the closure below silently skipped them: \
+         {unresolved:?}"
+    );
+
+    let boundary = crypto_trust_boundary();
+
+    // CONTROL 2: the closure actually followed edges. Stated structurally rather than by naming a crate, so
+    // it cannot rot when the graph moves: there must be a member that is neither a root nor a root's direct
+    // dependency. Today `typenum` is one (crypto-common → generic-array → typenum). A BFS that stopped at
+    // depth one would leave this empty while every other assertion here passed.
+    let mut depth_one: BTreeSet<String> = CRYPTO_TCB.iter().map(|c| (*c).to_owned()).collect();
+    for root in CRYPTO_TCB {
+        for copy in packages.get(*root).into_iter().flatten() {
+            for dep in &copy.deps {
+                depth_one.insert(dep.split(' ').next().unwrap_or(dep).to_owned());
+            }
+        }
+    }
+    let deeper: Vec<&String> = boundary.difference(&depth_one).collect();
+    assert!(
+        !deeper.is_empty(),
+        "the closure reached nothing past the roots' direct dependencies — it is not following edges, and \
+         everything below would pass on a boundary that is 17 crates instead of 86"
+    );
+
+    let recorded: BTreeMap<&str, (&str, &str)> =
+        TRUSTED.iter().map(|(c, steward, why)| (*c, (*steward, *why))).collect();
+    assert_eq!(recorded.len(), TRUSTED.len(), "TRUSTED lists the same crate twice; one of the entries is unread");
+
+    let unrecorded: Vec<&String> = boundary.iter().filter(|c| !recorded.contains_key(c.as_str())).collect();
+    assert!(
+        unrecorded.is_empty(),
+        "these crates are inside the cryptographic trust boundary and nothing says who is trusted with them. \
+         They are reachable from CRYPTO_TCB, so they link into the same address space as the signing keys — \
+         or, if they are proc-macros or build scripts, they execute on the machine doing the build. Add each \
+         to TRUSTED with its publisher and what it does there, or remove the dependency that reaches it \
+         (#206). [boundary {} crates, recorded {}]:\n  {:?}",
+        boundary.len(),
+        recorded.len(),
+        unrecorded
+    );
+
+    let departed: Vec<&str> = recorded.keys().copied().filter(|c| !boundary.contains(*c)).collect();
+    assert!(
+        departed.is_empty(),
+        "these are recorded as trusted and are no longer in the boundary — delete the entries, so no future \
+         arrival can shelter behind a name someone already justified: {departed:?}"
+    );
+
+    // The steward column is only worth something if it cannot be invented at the point of use.
+    let stewards: BTreeMap<&str, Publisher> = STEWARDS.iter().map(|(n, p, _)| (*n, *p)).collect();
+    assert_eq!(stewards.len(), STEWARDS.len(), "STEWARDS lists the same publisher twice");
+    let unknown: Vec<&str> =
+        TRUSTED.iter().filter(|(_, s, _)| !stewards.contains_key(s)).map(|(c, _, _)| *c).collect();
+    assert!(
+        unknown.is_empty(),
+        "these entries name a steward that STEWARDS does not define — delegation has to be stated once, \
+         where the ground for it is written, not spelled freshly per crate: {unknown:?}"
+    );
+    let unused: Vec<&str> =
+        STEWARDS.iter().map(|(n, _, _)| *n).filter(|n| !TRUSTED.iter().any(|(_, s, _)| s == n)).collect();
+    assert!(unused.is_empty(), "these stewards are defined and trusted with nothing — delete them: {unused:?}");
+
+    // Instrument the success path too: a guard that only speaks when it fails leaves the number it is
+    // guarding unknown to everyone who reads a green run.
+    let by_person = TRUSTED.iter().filter(|(_, s, _)| stewards.get(s) == Some(&Publisher::Person)).count();
+    println!(
+        "cryptographic trust boundary: {} crates from {} publishers, {by_person} of them published by a \
+         single account",
+        boundary.len(),
+        stewards.len()
+    );
+}
+
+/// **The advisory review has a date, and going stale is a failure rather than a silence** (#206).
+///
+/// The gap this closes: nothing in this repository checked its dependencies against known vulnerabilities.
+/// There is no `deny.toml`, no `cargo audit`, `cargo deny` or `cargo vet` in any CI job — the duplication
+/// guard above measured that and it is still true of everything except this file.
+///
+/// **Why a vendored list and not a tool.** The gate runs offline, and a check that consults a network fetch
+/// passes quietly whenever the fetch fails: it would report the same green on a machine with no route as on a
+/// clean tree. So the database is committed, and the thing that can go wrong — the review ageing — is what
+/// the gate measures. Two triggers, because the review can be outrun from either side:
+///
+///   * the **content** trigger, exact and derived: the boundary's membership changed since the review, so
+///     crates are linked that this review never looked at;
+///   * the **calendar** trigger, for the other direction: the boundary stood still while RUSTSEC moved.
+#[test]
+fn the_vendored_advisory_review_has_not_gone_stale() {
+    let boundary = crypto_trust_boundary();
+    assert!(boundary.len() >= 50, "boundary of {} crates — the closure is broken, not the tree", boundary.len());
+
+    let digest = boundary_digest(&boundary);
+    assert_eq!(
+        (boundary.len(), digest),
+        (REVIEWED_BOUNDARY_SIZE, REVIEWED_BOUNDARY_DIGEST),
+        "the cryptographic trust boundary has changed since the advisory review was dated. Crates are linked \
+         that the review on {REVIEWED_ON:?} did not look at — which is the one thing a review date cannot \
+         tell you by itself. Check the new members against RUSTSEC (the procedure is on REVIEWED_ON), then \
+         set REVIEWED_BOUNDARY_SIZE = {}, REVIEWED_BOUNDARY_DIGEST = {digest:#018x} and move REVIEWED_ON. \
+         The diff is whatever TRUSTED gained or lost in the same commit.",
+        boundary.len()
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock at or after 1970")
+        .as_secs();
+    let today = i64::try_from(now / 86_400).expect("days since 1970 fit in i64");
+    let (y, m, d) = REVIEWED_ON;
+    let age = today - days_from_civil(y, m, d);
+
+    // Both directions, because a clock is an input like any other and only one of its two failures is loud.
+    assert!(
+        age >= 0,
+        "the advisory review is dated {age} days in the FUTURE ({REVIEWED_ON:?}). Either REVIEWED_ON was \
+         typed ahead — in which case the staleness bound below is disabled for that long — or this machine's \
+         clock is wrong, and a wrong clock is the one input that makes every other date here meaningless."
+    );
+    assert!(
+        age <= MAX_REVIEW_AGE_DAYS,
+        "the vendored advisory review is {age} days old ({REVIEWED_ON:?}) and the bound is \
+         {MAX_REVIEW_AGE_DAYS}. This is the failure it was built to produce: the database was committed so \
+         the gate could run offline, and the price of an offline database is that it ages. Re-run the review \
+         (the procedure is on REVIEWED_ON), record what it found, and move the date. Raising \
+         MAX_REVIEW_AGE_DAYS instead is available and is a decision about exposure — its derivation is \
+         written at the constant, so change the derivation or admit the choice."
+    );
+}
+
+/// **No version this build links matches a recorded advisory** (#206).
+///
+/// The assertion that could be vacuous, so it is the one with the controls. A matcher that answered "no" to
+/// everything — an off-by-one on the patched version, a version parser that returns zeroes, an empty database
+/// — produces exactly the green a clean tree does. Both controls are built from the lock at run time rather
+/// than written down, so they cannot rot into decoration when a version moves.
+#[test]
+fn no_linked_version_matches_a_recorded_advisory() {
+    let locked = locked_versions();
+    assert!(locked.len() >= 300, "parsed only {} packages from Cargo.lock; the parser is broken", locked.len());
+    assert!(!ADVISORIES.is_empty(), "an empty advisory database reports the same green as a clean one");
+
+    // KNOWN-POSITIVE CONTROL, asserted before the finding. Take a crate the boundary certainly links and
+    // build the advisory that must flag it.
+    let probe = CRYPTO_TCB[0];
+    let versions = locked.get(probe).unwrap_or_else(|| panic!("{probe} is a CRYPTO_TCB root and must be locked"));
+    let probe_version = versions.iter().next().expect("a locked crate has a version").clone();
+    let (maj, min, patch, _) = semver_key(&probe_version);
+    let above = format!("{maj}.{min}.{}", patch + 1);
+    assert!(
+        version_in_any(&[("0.0.0", above.as_str())], &probe_version),
+        "the matcher did not flag {probe} {probe_version} against an advisory patched in {above}, which it \
+         must. Every 'no advisory matches' result below is worth exactly what this assertion is worth."
+    );
+    // KNOWN-NEGATIVE, the same measurement from the other side: `fixed` is exclusive. An off-by-one here
+    // silently exempts every crate sitting exactly on a patched release — which is where
+    // curve25519-dalek 4.1.3 sits, by RUSTSEC-2024-0344.
+    assert!(
+        !version_in_any(&[("0.0.0", probe_version.as_str())], &probe_version),
+        "the matcher flagged {probe} {probe_version} against an advisory patched in that very version; \
+         `fixed` is exclusive, and this direction of the error would red the gate for every patched crate"
+    );
+
+    // A record for a crate that is no longer linked is dead weight, and dead weight is what a reader skims.
+    let orphaned: Vec<&str> =
+        ADVISORIES.iter().filter(|a| !locked.contains_key(a.krate)).map(|a| a.id).collect();
+    assert!(
+        orphaned.is_empty(),
+        "these advisories are recorded against crates this build no longer links — delete them: {orphaned:?}"
+    );
+
+    let hits: Vec<String> = ADVISORIES
+        .iter()
+        .flat_map(|a| {
+            locked
+                .get(a.krate)
+                .into_iter()
+                .flatten()
+                .filter(|v| version_in_any(a.affected, v))
+                .map(move |v| format!("{} — {} {v}\n      {}\n      {}", a.id, a.krate, a.what, a.url))
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "this build links a version with a recorded advisory against it:\n    {}",
+        hits.join("\n    ")
+    );
+
+    println!(
+        "advisory review: {} records checked against {} locked packages, reviewed {REVIEWED_ON:?}",
+        ADVISORIES.len(),
+        locked.len()
+    );
+}
+
+/// **The TLS stack is outside this boundary, and that is a gap with a tripwire on it** (#206).
+///
+/// `ring`, `rustls`, `rcgen` and `chacha20poly1305` hold key material — session keys, the node's certificate,
+/// datagram AEAD — and none of them is in the boundary above, because the boundary is what `CRYPTO_TCB`
+/// *reaches* and nothing in `CRYPTO_TCB` depends on them. They sit alongside it, not underneath it.
+///
+/// That is a scope limit, not an oversight, and it is written here rather than in prose because prose about a
+/// conditional obligation comes true unnoticed. Making them roots is a real option with a measured price:
+/// `ring` alone adds 13 crates, `rustls` 17, `rcgen` 44 — 136 in total against today's 86, most of the
+/// arrivals being `windows-*` target shims, `time`, `nom` and an ASN.1 parser. That is a decision about how
+/// much of the graph a human will actually keep justified, and it belongs to a human.
+///
+/// This fires the day someone makes it, or the day a crypto root grows an edge into the TLS stack — either
+/// way the paragraph above stops being true and has to be rewritten.
+#[test]
+fn the_tls_stack_sits_beside_the_boundary_and_not_inside_it() {
+    let locked = locked_versions();
+    let boundary = crypto_trust_boundary();
+    for c in ["ring", "rustls", "rcgen", "chacha20poly1305"] {
+        assert!(
+            locked.contains_key(c),
+            "{c} is no longer linked at all; the scope note on this guard names it, so rewrite the note"
+        );
+        assert!(
+            !boundary.contains(c),
+            "{c} is now reachable from CRYPTO_TCB, so the cryptographic trust boundary covers the TLS stack \
+             and the scope note on this guard is wrong. If that was deliberate, record the arrivals in \
+             TRUSTED — measured at the time of writing, the four TLS crates bring the boundary from 86 to \
+             136 — and delete this guard."
+        );
+    }
 }
