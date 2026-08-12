@@ -51,9 +51,20 @@
 //! shares were named, 61 once the exit's receive buffers were, and 109 once the router's were; nothing was
 //! allocated at any of those steps — see each share's own doc for which of the two reasons applies. Every
 //! future naming moves it the same way, and a reader who treats the figure as a health score rather than as
-//! a coverage report will draw the opposite conclusion from the one the evidence supports. The VPN datapath
-//! left this table on the other side: #247 cut its per-flow buffer by 51× and it now fits inside ordinary
-//! process residency rather than needing a share.
+//! a coverage report will draw the opposite conclusion from the one the evidence supports.
+//!
+//! **The VPN datapath was written out of this table on one of its two per-flow costs, and the exemption is
+//! wrong for the other.** #247 cut the per-flow *buffer* by 51× — `IP_MAXIMUM` down to `config.mtu`, 268 MB
+//! down to 5.1 MB across `MAX_UDP_FLOWS = 4096` — and on that measurement the datapath was said to "fit
+//! inside ordinary process residency rather than needing a share". True of the buffer. A flow also holds a
+//! **tunnel queue**: `FanosDialer::dial_udp` builds every flow through `UdpTunnel::pair(UDP_TUNNEL_BUFFER)`,
+//! so `2 directions × 64 slots × ~1252 B` is 160 KB per flow and **656 MB** across the cap — 2.5× the whole
+//! node budget, and a quantity #247 never measured.
+//!
+//! Two costs, one exemption, granted on the one that was fixed. The proxy has the same pair and the same
+//! `UdpTunnel::pair` call, at `2 × 64 × 65535` = **8 MiB per tunnel** — one tunnel's worst case is the whole
+//! proxy share. Neither is in [`allocated`]; both are contingent in the way the QUIC credit is. That is
+//! #300, and until it is decided this table under-reports by more than everything in it.
 //!
 //! ## Why this module states the deficit instead of removing it
 //!
@@ -178,8 +189,14 @@ pub const SHARES: [(&str, usize); 6] = [
     ("threshold router queues", THRESHOLD_ROUTER_SHARE),
 ];
 
-/// The sum of every **named** share. Two known consumers are absent from it by their own defect, not by
-/// design: inbound QUIC credit (#245) and the VPN datapath (#247) have never claimed one.
+/// The sum of every **named** share. Known consumers absent from it, by their own defect rather than by
+/// design: inbound QUIC credit (#245, now computable at 2.00 GiB), and the **tunnel queues** every relayed
+/// UDP flow holds — 8 MiB per proxy tunnel, 656 MB across the VPN's flow cap (#300).
+///
+/// The VPN used to be listed here as one absentee, "the VPN datapath (#247)". That entry was retired when
+/// #247 fixed the per-flow *buffer*, and the retirement was wrong: a flow has two costs and only one was
+/// measured. Retiring an absentee is the moment to re-enumerate what it was standing for, not to strike a
+/// line — see the module header.
 ///
 /// A third was absent until #294 — the threshold router's send queues — and it was absent from *this list of
 /// absentees* too, which is the part worth keeping in view: a register of known gaps is not a proof that the
