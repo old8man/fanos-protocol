@@ -94,6 +94,17 @@ jobs:
       # The step below is the coverage that flag actually needs.
       - name: Tests — fanos-node with validator features, alone
         run: cargo test -p fanos-node --features validator --no-fail-fast
+
+      # The feature surfaces above are LINTED by the clippy jobs and were never TESTED, which are different
+      # claims: `clippy --all-targets` compiles test code, so a gated test built on every run and never
+      # executed. Measured with `cargo test -- --list`, the gap was exactly two tests — fanos-vpn 17 -> 18
+      # with `device` (#247's proof that the per-flow buffer is the MTU read BACK from the stack) and
+      # fanos-telemetry 45 -> 46 with `sysinfo` (the only check that the REAL host probe returns plausible
+      # numbers). `sim` (22/22) and `wasm` (3/3) add no tests and need no step.
+      - name: Tests — the feature surfaces no other job runs
+        run: |
+          cargo test -p fanos-vpn --features device --no-fail-fast
+          cargo test -p fanos-telemetry --features sysinfo --no-fail-fast
       - name: Reference verifier (V1–V22)
         run: cargo run -p fanos-cli
       - name: Simulator demo (real engines, substituted transport)
