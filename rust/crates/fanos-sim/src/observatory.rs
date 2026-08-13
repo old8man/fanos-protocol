@@ -206,6 +206,13 @@ impl CascadeForecast {
     /// failure, in which case the value is negative and calling it a "lead time" inverts what
     /// happened. Read [`CascadeForecast::verdict`] to decide anything; use this only to report a
     /// magnitude the verdict has already given a sign to.
+    ///
+    /// The tree's other directional quantity, `fanos_holarch::Margins::headroom`, is the shape done
+    /// right and was already right before this: its doc states the convention outright ("negative ⇒
+    /// that boundary is violated") and `fanos-holarch/tests/gate.rs` refuses anything at or below
+    /// +10%, so the bad side of the sign cannot pass unnoticed. A scan of every directional name in
+    /// the tree — headroom, margin, slack, spare, surplus, lead, deficit, gap — found only these
+    /// two computing one, and only this one lacking both halves.
     #[must_use]
     pub fn lead(&self) -> Option<f64> {
         match (self.warn_progress, self.fail_progress) {
