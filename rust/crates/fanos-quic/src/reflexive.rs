@@ -174,6 +174,36 @@ mod tests {
         assert_eq!(r.observers(), 1);
     }
 
+    /// **When TWO addresses both clear quorum, the better-supported one wins — and nothing tested that**
+    /// (#325). Measured by falsification: turning `recompute`'s `max_by` into `min_by` left the whole
+    /// `reflexive` suite at 9/9 green, so the plurality rule was inert to every fixture here. The quorum
+    /// filter was carrying all of them, because no test ever put two addresses above it at once.
+    ///
+    /// That gap is worth a test rather than a comment, because the flipped rule is a live attack: a
+    /// coalition of `quorum` liars would take the confirmed address away from a LARGER honest majority, and
+    /// the confirmed address is this node's coordinate (#50). One character, no red.
+    ///
+    /// Falsified by that same `max_by` → `min_by`: this test goes red on the majority assertion while the
+    /// eight around it stay green — which is the discrimination, not merely a failure.
+    #[test]
+    fn the_better_supported_address_wins_when_two_both_clear_quorum() {
+        let mut r = ReflexiveAddr::new(2);
+        // Three honest peers on :9000, two liars on :6666 — BOTH sides clear a quorum of 2.
+        r.observe(peer(1), addr(9000));
+        r.observe(peer(2), addr(9000));
+        r.observe(peer(3), addr(9000));
+        r.observe(peer(4), addr(6666));
+        r.observe(peer(5), addr(6666));
+        assert_eq!(
+            r.confirmed(),
+            Some(addr(9000)),
+            "with both addresses over quorum the MAJORITY must win — a `min_by` here would hand this \
+             node's coordinate to a smaller coalition, and the quorum filter cannot catch it because both \
+             sides pass"
+        );
+        assert_eq!(r.observers(), 5, "and the setup really did seat five distinct voters");
+    }
+
     #[test]
     fn a_lone_liar_cannot_override_the_honest_quorum() {
         let mut r = ReflexiveAddr::new(2);
