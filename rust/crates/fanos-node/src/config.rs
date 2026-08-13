@@ -1291,8 +1291,28 @@ pub struct NodeConfig {
     /// it can be neither rotated nor revoked without a flag day: every epoch's shaping material is
     /// `H(root ‖ epoch)`, which gives unlinkability across epochs and *no* forward secrecy against a
     /// compromised root — an attacker holding it recomputes every epoch, past and future. That is the open
-    /// half of the class, shared with the keyper decryption key (#143), and it needs a generation on the wire
-    /// so two can be accepted during a changeover.
+    /// half of the class, shared with the keyper decryption key (#143), and it needs a generation so two can
+    /// be accepted during a changeover.
+    ///
+    /// # The keyper's fix does NOT transfer here, and the reason is worth stating (#307)
+    ///
+    /// `fanos_taxis::keyper` closed its half with a **signed, strictly-monotonic generation**: validator `i`
+    /// is the single writer for its own decryption key, speaking with the consensus identity `verifiers[i]`
+    /// already commits to, so two candidate certs are ordered by their generations and an equal generation
+    /// with a different key is that validator equivocating.
+    ///
+    /// **A community secret has no such writer.** It is a bridge password shared by peers who need not be a
+    /// consensus set — there is no committed identity whose signature could order two roots. So this is not
+    /// an authority fence and must not be built as one; what it needs is a **selector**: which live root a
+    /// receiver should try. A selector needs neither a signature nor monotonicity, because it makes no claim
+    /// — whether the shaping actually opens the frame is what decides.
+    ///
+    /// And "a generation **on the wire**" is the trap in the sentence above. A cleartext generation byte is a
+    /// near-static field in every frame, which is precisely the signature §13.4 exists to remove: it would
+    /// buy a changeover by reintroducing the distinguisher. The changeover must therefore be paid for by the
+    /// **receiver** — trial-opening against the small set of roots it holds during the overlap — not by the
+    /// sender announcing which one it used. Cost: one extra shaping attempt per frame while two roots are
+    /// live, bounded by the operator's overlap window and by nothing else.
     ///
     /// The buffer this is parsed out of — the whole provisioning file, read into a `String` — is not wiped
     /// either. Naming it here rather than leaving a partial wipe to read as a complete one.
