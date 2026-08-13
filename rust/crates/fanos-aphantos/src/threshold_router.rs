@@ -264,8 +264,16 @@ const REPLAY_CACHE_BYTES: usize = 256 * 1024;
 /// How many onion tags the router remembers — the §L5 window, expressed as a count (#296).
 ///
 /// **Why a count is the right shape for a time window.** A cell older than the E4 grace window is
-/// unpeelable anyway — the router's own `a_recorded_onion_is_unpeelable_past_the_grace_window` test proves
-/// it, because the epoch key is gone — so the set only has to cover cells that are *still* peelable. At the
+/// unpeelable anyway, because the epoch key is gone — so the set only has to cover cells that are *still*
+/// peelable.
+///
+/// **That premise is held one crate down, and this line used to cite a test that does not exist** (#322).
+/// It named "the router's own `a_recorded_onion_is_unpeelable_past_the_grace_window`"; no such function is
+/// in the tree, and the only occurrence of that name was the citation itself. The property is genuinely
+/// covered — by `fanos_pqcrypto::onion_ratchet`'s `a_ratchet_that_advances_cannot_decrypt_a_past_epochs_onion`
+/// and `the_grace_window_peels_across_one_rotation_then_forward_secrecy_takes_over`, over its
+/// `DEFAULT_RETAIN = 1` — so the derivation stands; what was wrong was the address, and an address that
+/// resolves to nothing is worse than none, because it stops the reader looking. At the
 /// relay's derived ceiling of one cell per cover slot ([`MAX_OUTBOX`]'s doc: ≈2 cells/s at the shipping
 /// default) this is roughly 16 384 / 2 ≈ 2.3 hours of traffic, comfortably past a grace window measured in
 /// epochs. The two derivations compose: #294 established the throughput ceiling, and this reads it.
