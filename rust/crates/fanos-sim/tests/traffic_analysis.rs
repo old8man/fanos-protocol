@@ -18,6 +18,9 @@ use fanos_node::config::{DEFAULT_COVER_INTERVAL, DEFAULT_MIX_DELAY};
 use fanos_pqcrypto::{HybridKemSecret, SeedRng};
 use fanos_runtime::{Command, Duration};
 use fanos_sim::{FrameObs, Sim};
+// The three flow-correlation statistics live in `fanos-testkit` so the composed-relay harness
+// (#181 step 2) can use the SAME ones. A second copy would not inherit #187's lag-scan finding.
+use fanos_testkit::gpa::{best_lag_score, pearson};
 
 /// The shipping schedule, **read from the constants rather than copied** (#187).
 ///
@@ -334,52 +337,6 @@ fn gpa_timing_correlation_binned(mix: Option<(Duration, Duration)>, bin_ms: u64)
         worst = worst.max(pearson(&ins, &outs).abs());
     }
     worst
-}
-
-/// Pearson correlation; `0.0` when either series is constant (no signal to read).
-fn pearson(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len().min(b.len()) as f64;
-    if n < 2.0 {
-        return 0.0;
-    }
-    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
-    let mut num = 0.0;
-    let (mut da, mut db) = (0.0, 0.0);
-    for (x, y) in a.iter().zip(b.iter()) {
-        num += (x - ma) * (y - mb);
-        da += (x - ma).powi(2);
-        db += (y - mb).powi(2);
-    }
-    if da <= f64::EPSILON || db <= f64::EPSILON {
-        return 0.0;
-    }
-    num / (da.sqrt() * db.sqrt())
-}
-
-/// Pearson between `a` and `b` with `b` shifted **later** by `lag` bins — the exit series read `lag` bins after
-/// the entry one. `lag = 0` is exactly [`pearson`].
-fn pearson_at_lag(a: &[f64], b: &[f64], lag: usize) -> f64 {
-    if lag >= a.len() || lag >= b.len() {
-        return 0.0;
-    }
-    pearson(&a[..a.len() - lag], &b[lag..])
-}
-
-/// The score a **lag-scanning** adversary computes: the strongest correlation over a window of delays, rather
-/// than the one at zero.
-///
-/// This is the matcher #187 named as the likely cause of an anomaly it could not explain: the shipping
-/// schedule's matching accuracy measured **0.00 against a chance of 0.20**, and below chance is not safety —
-/// twelve seeds of zero has probability `(44/120)¹² ≈ 3e-6` under guessing, so the score matrix was still
-/// carrying information and the matcher was systematically avoiding the truth. `pearson` compares series at
-/// zero lag **only**, while mixing displaces the exit series; a real flow-correlation adversary scans lags.
-///
-/// The window is derived, not chosen: the mix delay is a Poisson mean, so a packet's displacement is
-/// exponential and its tail matters — `MAX_LAG_BINS` covers `1000 ms` at a `200 ms` bin, which is over eight
-/// mean delays and two whole cover periods at the shipping schedule. Scanning further would only add noise
-/// maxima, which is itself a bias: the max of more candidates is larger whether or not any is real.
-fn best_lag_score(a: &[f64], b: &[f64], max_lag: usize) -> f64 {
-    (0..=max_lag).map(|l| pearson_at_lag(a, b, l).abs()).fold(0.0, f64::max)
 }
 
 #[test]

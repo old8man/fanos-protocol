@@ -12,6 +12,9 @@
 //! holds two of the three known load-sensitive tests — could not reach it at all. A guard that the paths
 //! needing it most cannot call is the same shape as a guard those paths simply do not call (#87).
 
+/// The flow-correlation statistics a GPA computes — shared so a second harness cannot re-derive them.
+pub mod gpa;
+
 pub mod corpus;
 
 use std::num::NonZeroUsize;
