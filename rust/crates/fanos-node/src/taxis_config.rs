@@ -157,6 +157,8 @@ impl ValidatorConfig {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(&VALIDATOR_MAGIC);
+        out.push(PROVISION_FORMAT_VERSION);
         out.push(self.me);
         out.extend_from_slice(&self.node_seed);
         out.extend_from_slice(&(self.cell.q()).to_be_bytes());
@@ -193,10 +195,18 @@ impl ValidatorConfig {
         out
     }
 
+    /// What `bytes` claims to be, without decoding: the three answers an operator needs told apart
+    /// (see [`ProvisionFormat`]). A caller reports the kind and the version distinctly; `from_bytes`
+    /// collapses both into `None` because it has nothing to say them with.
+    #[must_use]
+    pub fn format_of(bytes: &[u8]) -> ProvisionFormat {
+        classify(bytes, VALIDATOR_MAGIC)
+    }
+
     /// Decode from [`to_bytes`](Self::to_bytes); `None` on truncation or a bad length prefix.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = Cursor::new(bytes);
+        let mut r = Cursor::new(unframe(bytes, VALIDATOR_MAGIC)?);
         let me = r.u8()?;
         let node_seed = r.array32()?;
         // **Checked, not believed.** The three non-`q` fields are a pure function of `q`, so a file whose
@@ -261,6 +271,55 @@ impl ValidatorConfig {
     }
 }
 
+/// The provisioning artefacts' **layout** version. Bumped whenever any field on the wire changes width,
+/// order or meaning — the keyper cert gaining its rotation `generation` (#307) is exactly such a change,
+/// and it is what made this framing necessary: without it, a file from before that change simply failed to
+/// parse and the operator was told "malformed", which is what a corrupt file is also called.
+pub const PROVISION_FORMAT_VERSION: u8 = 1;
+
+/// Magic for a [`ValidatorConfig`] file (`validator-<i>.taxis`).
+const VALIDATOR_MAGIC: [u8; 4] = *b"FVCF";
+/// Magic for a [`ChainInfo`] file (`chain-info.taxis`).
+const CHAIN_INFO_MAGIC: [u8; 4] = *b"FCIN";
+
+/// What a provisioning file's frame says about itself — the three answers an operator needs told apart.
+///
+/// The **kind** lives in the magic and the **layout** in the version, deliberately: a chain-info file
+/// handed to `fanos validator --config` is a different mistake from a file written by an older build, and
+/// telling an operator "malformed" for both is the refusal-you-cannot-explain shape. Modelled on
+/// `fanos_telemetry`'s `FTS1` snapshot framing, which is the only other on-disk format here that carries
+/// one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProvisionFormat {
+    /// This kind of file, at this build's layout version — decoding may still fail on the body.
+    Current,
+    /// This kind of file, written at a **different** layout version. The operator needs a new file from
+    /// the ceremony, not a bug report.
+    OtherVersion(u8),
+    /// Not this kind of file at all: the magic does not match, or the bytes are too short to carry one.
+    WrongKind,
+}
+
+/// Classify `bytes` against `magic` without decoding the body.
+fn classify(bytes: &[u8], magic: [u8; 4]) -> ProvisionFormat {
+    let Some(rest) = bytes.strip_prefix(&magic) else {
+        return ProvisionFormat::WrongKind;
+    };
+    match rest.split_first() {
+        Some((&v, _)) if v == PROVISION_FORMAT_VERSION => ProvisionFormat::Current,
+        Some((&v, _)) => ProvisionFormat::OtherVersion(v),
+        None => ProvisionFormat::WrongKind,
+    }
+}
+
+/// Strip a frame this build can decode, or `None` — the shared half of every `from_bytes` below.
+fn unframe(bytes: &[u8], magic: [u8; 4]) -> Option<&[u8]> {
+    match classify(bytes, magic) {
+        ProvisionFormat::Current => bytes.get(magic.len() + 1..),
+        _ => None,
+    }
+}
+
 /// The **public** chain parameters a client needs to build, seal, and submit a transaction to a running TAXIS
 /// cell — everything except a secret key. `fanos taxis-deal` writes it (`chain-info.taxis`) and `fanos pay`
 /// reads it. Unlike a [`ValidatorConfig`], it carries the full keyper **registry** (the committee's KEM public
@@ -282,6 +341,8 @@ impl ChainInfo {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(&CHAIN_INFO_MAGIC);
+        out.push(PROVISION_FORMAT_VERSION);
         out.extend_from_slice(&self.cell.q().to_be_bytes());
         out.extend_from_slice(&u32_of(self.cell.n()).to_be_bytes());
         out.extend_from_slice(&u32_of(self.cell.f()).to_be_bytes());
@@ -295,9 +356,18 @@ impl ChainInfo {
     }
 
     /// Decode from [`to_bytes`](Self::to_bytes); `None` on truncation, a bad registry, or trailing bytes.
+    /// What `bytes` claims to be, without decoding — see [`ProvisionFormat`] and
+    /// [`ValidatorConfig::format_of`].
+    #[must_use]
+    pub fn format_of(bytes: &[u8]) -> ProvisionFormat {
+        classify(bytes, CHAIN_INFO_MAGIC)
+    }
+
+    /// Decode from [`to_bytes`](Self::to_bytes); `None` on a foreign frame, truncation or a bad length
+    /// prefix. Use [`format_of`](Self::format_of) to tell those apart for an operator.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let mut r = Cursor::new(bytes);
+        let mut r = Cursor::new(unframe(bytes, CHAIN_INFO_MAGIC)?);
         // **Checked, not believed.** The three non-`q` fields are a pure function of `q`, so a file whose
         // four disagree is either tampered or mistyped — and a `quorum` below `⌈(n+f+1)/2⌉` runs consensus in
         // which two quorums can be DISJOINT, so two conflicting blocks both finalize. That is a fork: a
@@ -467,7 +537,7 @@ mod tests {
             let params = c.to_taxis_params(None).expect("params rebuild");
             assert_eq!(params.me, c.me);
             assert_eq!(params.verifiers.len(), cell.n());
-            assert_eq!(params.keyper_commit, shared.keyper_commit);
+            assert_eq!(params.keyper_founding.commit(), shared.keyper_commit);
             assert_eq!(params.genesis_state.tokens().balance(&[0x11; 32]), 1_000_000, "genesis credited the alloc");
             assert_eq!(params.genesis_state.tokens().balance(&[0x22; 32]), 500);
             assert_eq!(params.genesis_state.tokens().balance(&[0x99; 32]), 0, "an unallocated account is empty");
@@ -513,6 +583,55 @@ mod tests {
             detect_equivocation(&vote([1u8; 32]), &vote([2u8; 32]), &verifier2).expect("a genuine equivocation");
 
         assert!(sealer(&ev).is_some(), "the sealer seals a genuine equivocation into a submittable slash");
+    }
+
+    /// **The frame tells an operator three different things apart** (#308).
+    ///
+    /// Without it, a file from an older build and a corrupt file were both "malformed", and a chain-info
+    /// file handed to `fanos validator --config` was a third mistake with the same word. The magic carries
+    /// the KIND and the version the LAYOUT, so each has its own answer — which is the whole reason the two
+    /// magics differ rather than sharing one.
+    #[test]
+    fn a_provisioning_file_says_which_kind_and_which_layout_it_is() {
+        let cell = CellParams::FANO;
+        let epoch = Epoch::new(9);
+        let beacon = BeaconSeed::new([0x44; 32]);
+        let (configs, registry) = deal_validators(
+            cell,
+            epoch,
+            beacon,
+            &[([1; 32], 100)],
+            Economics::Unincentivised,
+            &mut SeedRng::from_seed(b"frame"),
+        );
+        let info_bytes = ChainInfo { cell, epoch, beacon, keyper: registry }.to_bytes();
+        let cfg_bytes = configs[0].to_bytes();
+
+        assert_eq!(ChainInfo::format_of(&info_bytes), ProvisionFormat::Current);
+        assert_eq!(ValidatorConfig::format_of(&cfg_bytes), ProvisionFormat::Current);
+
+        // Each file is refused BY KIND when handed to the other reader — the property two distinct magics
+        // buy, and the one a shared magic would have lost.
+        assert_eq!(ValidatorConfig::format_of(&info_bytes), ProvisionFormat::WrongKind);
+        assert_eq!(ChainInfo::format_of(&cfg_bytes), ProvisionFormat::WrongKind);
+        assert!(ValidatorConfig::from_bytes(&info_bytes).is_none(), "and it does not decode either");
+
+        // A file from another layout is named as such, not called corrupt.
+        let mut older = info_bytes.clone();
+        older[CHAIN_INFO_MAGIC.len()] = PROVISION_FORMAT_VERSION.wrapping_add(1);
+        assert_eq!(
+            ChainInfo::format_of(&older),
+            ProvisionFormat::OtherVersion(PROVISION_FORMAT_VERSION.wrapping_add(1))
+        );
+        assert!(ChainInfo::from_bytes(&older).is_none(), "a foreign layout is refused, not guessed at");
+
+        // Too short to carry a frame is the same answer as a foreign one: not this kind of file.
+        assert_eq!(ChainInfo::format_of(&[]), ProvisionFormat::WrongKind);
+        assert_eq!(ChainInfo::format_of(&CHAIN_INFO_MAGIC), ProvisionFormat::WrongKind, "magic without a version");
+
+        // And the frame is not decoration: a body with the frame stripped must not decode.
+        let unframed = &info_bytes[CHAIN_INFO_MAGIC.len() + 1..];
+        assert!(ChainInfo::from_bytes(unframed).is_none(), "an unframed body is refused");
     }
 
     #[test]

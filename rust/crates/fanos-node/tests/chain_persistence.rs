@@ -54,7 +54,7 @@ fn engine(config: &fanos_node::taxis_config::ValidatorConfig) -> ConsensusEngine
         p.signer,
         p.kem_secret,
         p.verifiers,
-        p.keyper_commit,
+        p.keyper_founding,
         p.seed,
         p.epoch,
         p.genesis_state,

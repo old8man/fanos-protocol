@@ -110,11 +110,35 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
 /// accept the limit knowingly; one who is not told believes the profile's name.
 /// The mixnet hop threshold for this invocation: `--threshold` if given, else derived from `--plane-order`.
 ///
+#[cfg(feature = "validator")]
+fn provision_error(kind: &str, fmt: fanos_node::ProvisionFormat) -> NodeError {
+    NodeError::Config(match fmt {
+        fanos_node::ProvisionFormat::Current => {
+            format!("{kind} file is corrupt or truncated — its frame is this build's, its body did not decode")
+        }
+        fanos_node::ProvisionFormat::OtherVersion(v) => format!(
+            "{kind} file was written at provisioning format version {v}; this build reads {}. Re-run the \
+             dealing ceremony with this build rather than reusing the old file.",
+            fanos_node::PROVISION_FORMAT_VERSION
+        ),
+        fanos_node::ProvisionFormat::WrongKind => {
+            format!("that is not a {kind} file at all (wrong magic) — check the path")
+        }
+    })
+}
+
 /// One helper rather than three copies, because the client and the relay must agree exactly — a client seals
 /// each onion layer for precisely this many members — and three `None => 2` defaults are three chances to
 /// diverge. The derivation is [`fanos_node::node::mix_threshold`]: a hop is a line of `q+1` points, and a
 /// threshold fixed at the Fano value lets any two corrupt members own a hop however wide the line is
 /// (`docs/audit.md` E7).
+/// Turn a provisioning file's **frame** into an operator-facing reason (#308).
+///
+/// `Current` means the frame is ours and the *body* failed — a genuinely corrupt or truncated file. The
+/// other two are different mistakes with different fixes, and collapsing all three into "malformed" is
+/// what left an operator unable to tell an old file from a broken one. FANOS versions its wire
+/// (`PROTOCOL_VERSION`), its C ABI (`FANOS_ABI_VERSION`) and its telemetry snapshot (`FTS1`); the files
+/// carrying every constant a cell agrees on were the outlier.
 fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
     if let Some(s) = flag(args, "--threshold") {
         return s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")));
@@ -3069,8 +3093,9 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     // The public chain info (keyper registry + epoch + beacon + cell) — everything a client needs but a key.
     let info_path = flag(args, "--chain-info")
         .ok_or_else(|| NodeError::Config("fanos pay requires --chain-info chain-info.taxis".to_owned()))?;
-    let info = ChainInfo::from_bytes(&std::fs::read(info_path)?)
-        .ok_or_else(|| NodeError::Config("malformed chain-info file".to_owned()))?;
+    let info_bytes = std::fs::read(info_path)?;
+    let info = ChainInfo::from_bytes(&info_bytes)
+        .ok_or_else(|| provision_error("chain-info", ChainInfo::format_of(&info_bytes)))?;
 
     // The sender's 32-byte key seed (e.g. `founder.key`) → its signing keypair + account id.
     let key_path = flag(args, "--key")
@@ -3364,8 +3389,9 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     // transaction's bytes and does not care which tag is inside them.
     let info_path = flag(args, "--chain-info")
         .ok_or_else(|| NodeError::Config("fanos term requires --chain-info chain-info.taxis".to_owned()))?;
-    let info = ChainInfo::from_bytes(&std::fs::read(info_path)?)
-        .ok_or_else(|| NodeError::Config("malformed chain-info file".to_owned()))?;
+    let info_bytes = std::fs::read(info_path)?;
+    let info = ChainInfo::from_bytes(&info_bytes)
+        .ok_or_else(|| provision_error("chain-info", ChainInfo::format_of(&info_bytes)))?;
     let nonce: u64 = match flag(args, "--nonce") {
         Some(s) => s.parse().map_err(|_| NodeError::Config("bad --nonce".to_owned()))?,
         None => 0,
@@ -3418,8 +3444,9 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let config_path = flag(args, "--config")
         .ok_or_else(|| NodeError::Config("fanos validator requires --config validator-<i>.taxis".to_owned()))?;
-    let config = ValidatorConfig::from_bytes(&std::fs::read(config_path)?)
-        .ok_or_else(|| NodeError::Config("malformed validator config file".to_owned()))?;
+    let config_bytes = std::fs::read(config_path)?;
+    let config = ValidatorConfig::from_bytes(&config_bytes)
+        .ok_or_else(|| provision_error("validator config", ValidatorConfig::format_of(&config_bytes)))?;
     let me = config.me;
     let listen: SocketAddr = match flag(args, "--listen") {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?,
