@@ -216,6 +216,16 @@ fi
 # on both counts. Putting the certain, cheap verdicts first means a run that is interrupted, or read only
 # at its head, still delivers everything it can decide in minutes.
 #
+# `nostd` is 84 s, not the "seconds each" first claimed here — and the correction is worth keeping because
+# the cost is NOT where a reader would look for it. Measured per phase: five at 1 s and `nostd-telemetry`
+# at 79 s. It is not the one that checks the most; it checks the LEAST. The five cheap ones emit only
+# `Checking` lines (nyx alone covers 13 units in 1 s), while telemetry's log carries the group's single
+# `Compiling` line — `fanos-wire-derive`, a proc-macro, which `cargo check` must BUILD in full because a
+# macro has to run. So a check phase's cost tracks how many proc-macros its feature resolution drags in,
+# not how much source it inspects, and unit count inverts the truth here 3-units/79 s against 13/1 s.
+# (The 79 s absolute was taken while a full gate and two other sessions were compiling; the ratio between
+# the six is sound because all six ran in that same window, the absolute may be inflated.)
+#
 # They stay AFTER `clippy`, which is deliberate: clippy warms the target directory these two then reuse.
 # Moving them ahead of it would make the first one pay a cold dependency build and destroy the very cost
 # advantage this ordering exists to spend.
