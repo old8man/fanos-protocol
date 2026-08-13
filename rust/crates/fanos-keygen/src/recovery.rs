@@ -17,6 +17,17 @@ use fanos_primitives::codec::{Reader, put_u64, put_var_bytes};
 /// Domain separation for the signed `RGC` message — no other FANOS signature covers this byte string.
 const RGC_DOMAIN: &[u8] = b"FANOS-recovery-v1/rgc";
 
+/// The `RGC`'s kind marker (#309/#319), matching the family: `FTS1` a telemetry snapshot, `FVCF` a validator
+/// config, `FCIN` chain info, `FNID` a node identity.
+pub const RGC_MAGIC: fanos_wire::stored::Magic = *b"FRGC";
+
+/// The `RGC`'s layout version — **its own**, not shared with any other format.
+///
+/// A certificate's fields answer to `docs/design-recovery.md`; a validator config's answer to the provisioning
+/// ceremony; a node identity's to the TLS credential. One shared number would declare every certificate "from
+/// another build" the day an unrelated format gained a field ([[one-constant-two-quantities]]).
+pub const RGC_FORMAT_VERSION: u8 = 1;
+
 /// The smallest re-genesis threshold an authorization may name. Mirrors the resharing key-exfiltration floor
 /// (audit §3.1): `t' = 1` would let a single new holder reconstruct the fresh key alone.
 pub const MIN_REGENESIS_THRESHOLD: u8 = 2;
@@ -118,20 +129,29 @@ pub const fn authority_quorum(m: usize) -> usize {
 /// them, and the `generation` fences the whole cell: a node rejects any beacon artifact from an older
 /// generation (`docs/design-recovery.md` §2).
 ///
-/// # The one thing this framing does not give an operator (#308)
+/// # Why the certificate carries a kind and a layout (#308/#309/#319)
 ///
-/// There is no format magic and no layout version. That is **not** a safety hole — every field is inside
-/// the signature, so a build that changed the layout produces a certificate the verifier refuses, which is
-/// fail-closed and self-fencing. What it costs is the operator's ability to tell *why*: a certificate from
-/// an older build and a forged one both surface as "the authority's signature did not verify", and those
-/// need different actions — re-issue versus investigate an attack.
+/// [`to_bytes`](Self::to_bytes) writes [`RGC_MAGIC`] and [`RGC_FORMAT_VERSION`] ahead of the body, and
+/// [`from_bytes`](Self::from_bytes) reports which of the three it found. Without them the *absence* is not a
+/// safety hole — every field is inside the signature, so a build that changed the layout produces a
+/// certificate the verifier refuses, which is fail-closed and self-fencing. What it costs is the operator's
+/// ability to tell **why**: a certificate from an older build and a forged one both surface as "the
+/// authority's signature did not verify", and those need opposite actions — re-issue versus investigate an
+/// attack. An `RGC` is read when a cell is already frozen, which is the worst moment in the system's life to
+/// hand someone an ambiguous refusal.
 ///
-/// The provisioning files were given a kind-and-layout frame for exactly this reason (`taxis_config`'s
-/// `ProvisionFormat`), and the same treatment belongs here. It is deliberately **not** done yet: this path
-/// has no production caller, and `fanos-cli`'s
-/// `a_driver_carrying_a_re_genesis_certificate_must_also_read_its_own_stall` already fails the day one
-/// appears. Add the frame with the driver, in one review, rather than shipping a version byte nobody has
-/// yet had a reason to bump.
+/// **This was deliberately deferred once, and the deferral was wrong** — a note worth keeping, because the
+/// argument that retired it is not visible from here. The reasons given were that the path has no production
+/// caller and that a version byte nobody has a reason to bump is premature. The second is a misreading of
+/// what the byte is for: it is not there to be *bumped*, it is there to be *present before the first artefact
+/// is issued*. #309 had to give `NodeCredentials` a permanent legacy path — an unframed file is read as
+/// layout 0 and can never be refused — for exactly one reason: identities had already shipped unframed. An
+/// `RGC` has never been issued at all, so framing it costs **nothing** today and costs a permanent
+/// legacy branch the day after the first certificate reaches a survivor's hands. There is no third moment.
+///
+/// That asymmetry is why [`from_bytes`](Self::from_bytes) **refuses** an unframed certificate where
+/// `NodeCredentials::from_bytes` accepts one. Accepting unframed bytes here would not be compatibility with
+/// anything; it would be accepting whatever was handed over.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RecoveryAuthorization {
     /// The re-genesis generation — must be strictly greater than the cell's current `reshare_gen`. The fencing
@@ -255,10 +275,16 @@ impl RecoveryAuthorization {
             && self.survivors.is_sorted_by(|a, b| a < b)
     }
 
-    /// Canonical wire bytes.
+    /// Canonical wire bytes, framed with [`RGC_MAGIC`] and [`RGC_FORMAT_VERSION`].
+    ///
+    /// The frame is **outside** the signature and deliberately so: it says which parser to use, and
+    /// [`signable`](Self::signable) covers what was authorized. Folding the header into the signed message
+    /// would bind the authority's decision to a serialization detail, so a pure re-framing — the same
+    /// decision, written by a build with a wider layout — would read as a forgery.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        fanos_wire::stored::write_header(&mut out, RGC_MAGIC, RGC_FORMAT_VERSION);
         put_u64(&mut out, self.generation);
         put_u64(&mut out, self.epoch_fence.get());
         out.push(self.threshold);
@@ -272,12 +298,28 @@ impl RecoveryAuthorization {
         out
     }
 
-    /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed / truncated / trailing garbage.
+    /// Decode from [`to_bytes`](Self::to_bytes), naming which of [`RgcFormat`]'s three refusals applies.
     ///
     /// The signature count is bounded by [`MAX_AUTHORITY_MEMBERS`] before anything is allocated: the length
     /// arrives from the wire, and a `u64` of them would otherwise be a reservation request from an attacker.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    ///
+    /// # Errors
+    /// [`RgcFormat::Unframed`] if the bytes carry no `RGC` frame, [`RgcFormat::OtherVersion`] if they carry
+    /// one at a layout this build does not read, [`RgcFormat::Corrupt`] if the frame is this build's and the
+    /// body is truncated, malformed, or followed by trailing bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RgcFormat> {
+        let body = match fanos_wire::stored::classify(bytes, RGC_MAGIC, RGC_FORMAT_VERSION) {
+            fanos_wire::stored::StoredFormat::Current => bytes.get(fanos_wire::stored::HEADER_LEN..),
+            fanos_wire::stored::StoredFormat::OtherVersion(v) => return Err(RgcFormat::OtherVersion(v)),
+            fanos_wire::stored::StoredFormat::Unframed => return Err(RgcFormat::Unframed),
+        }
+        .ok_or(RgcFormat::Corrupt)?;
+        Self::decode_body(body).ok_or(RgcFormat::Corrupt)
+    }
+
+    /// The body parser, with the frame already stripped — kept separate so the frame's three verdicts and the
+    /// body's single one (`None` = corrupt) never have to be squeezed into one return type.
+    fn decode_body(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader::new(bytes);
         let generation = r.u64()?;
         let epoch_fence = Epoch::new(r.u64()?);
@@ -296,6 +338,27 @@ impl RecoveryAuthorization {
         r.finish()?;
         Some(Self { generation, epoch_fence, survivors, threshold, anchor, sigs })
     }
+}
+
+/// Why [`RecoveryAuthorization::from_bytes`] refused — the three answers that call for three different
+/// actions from whoever is holding a frozen cell.
+///
+/// The point of naming them is that the operator's next step differs in each, and the single `None` this
+/// replaced could not say which: re-run the ceremony, fetch a matching build, or treat the artefact as
+/// hostile. There is deliberately **no** `Legacy` arm — see the type's doc for why an unframed certificate is
+/// refused where an unframed node identity is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RgcFormat {
+    /// No `RGC` frame at all: some other file, or a hand-assembled body. The likeliest cause is the wrong
+    /// path, and the second likeliest is that someone is trying it on.
+    Unframed,
+    /// An `RGC` at a layout this build does not read. **Re-issuing is the wrong reflex** — a certificate is a
+    /// quorum's signed decision, and the authority may no longer be assembled. Run the build that wrote it.
+    OtherVersion(u8),
+    /// This build's frame over a body that does not decode — truncated in transit, altered, or carrying
+    /// trailing bytes. Distinct from a *signature* failure, which happens later and means something else:
+    /// this one says the bytes are not a certificate, not that the wrong party signed one.
+    Corrupt,
 }
 
 /// The honest-majority threshold for a committee of `n` anchors — the smallest `t` with `t > n/2`, clamped to
@@ -404,7 +467,11 @@ impl StallDetector {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+// `indexing_slicing` joins the pair for the same reason `fanos-node`'s `identity` module carries it (#309):
+// the format test builds an unframed body by slicing off a header it has just written, and an index out of
+// range there IS the failure it is hunting — a `get(..)` would turn "the header is not the width we wrote"
+// into a silent `None` and the assertion would pass on nothing.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
@@ -423,6 +490,70 @@ mod tests {
         let round = RecoveryAuthorization::from_bytes(&rgc.to_bytes()).expect("re-decodes");
         assert_eq!(round, rgc, "the wire form round-trips");
         assert!(round.verify(&vk), "and still verifies");
+    }
+
+    /// **The three refusals an operator of a frozen cell has to tell apart** (#319).
+    ///
+    /// Each names a different next action — fetch a matching build, check the path, treat it as hostile —
+    /// and the `Option<Self>` this replaced collapsed all three into "malformed", at the one moment in a
+    /// cell's life when guessing is most expensive.
+    ///
+    /// **The unframed case is asserted as a REFUSAL on purpose**, and that is the asymmetry with #309's
+    /// identity file: an identity had already shipped unframed, so refusing one would delete every deployed
+    /// node's coordinate. No `RGC` has ever been issued, so there is nothing to be compatible with, and
+    /// accepting an unframed body would mean accepting whatever was handed over.
+    ///
+    /// Falsified by dropping the `write_header` call from `to_bytes`: this test goes red at the very first
+    /// assertion, `left: Unframed, right: Current` — the certificate refusing its own issuer, which is the
+    /// one state the frame must never create. Two neighbouring tests fall with it, and that is the honest
+    /// shape: everything that decodes an `RGC` depends on the encoder writing a frame.
+    #[test]
+    fn a_certificate_says_which_of_three_things_is_wrong_with_it() {
+        let (sk, vk) = authority();
+        let rgc = RecoveryAuthorization::issue(&[(0, &sk)], 4, Epoch::new(21), &[2, 3, 4], 2, [0x33; 32]);
+        let framed = rgc.to_bytes();
+
+        // The frame is present and is this build's.
+        assert_eq!(
+            fanos_wire::stored::classify(&framed, RGC_MAGIC, RGC_FORMAT_VERSION),
+            fanos_wire::stored::StoredFormat::Current
+        );
+
+        // 1. Unframed: the body alone, which is what every pre-frame encoder produced. REFUSED.
+        let body = &framed[fanos_wire::stored::HEADER_LEN..];
+        assert_eq!(RecoveryAuthorization::from_bytes(body), Err(RgcFormat::Unframed));
+
+        // 2. Another layout: re-issuing is the wrong reflex, so the arm carries the version to report.
+        let mut future = framed.clone();
+        future[fanos_wire::stored::HEADER_LEN - 1] = RGC_FORMAT_VERSION.wrapping_add(1);
+        assert_eq!(
+            RecoveryAuthorization::from_bytes(&future),
+            Err(RgcFormat::OtherVersion(RGC_FORMAT_VERSION.wrapping_add(1)))
+        );
+
+        // 3. This build's frame over a body that does not decode.
+        let mut broken = framed.clone();
+        broken.truncate(fanos_wire::stored::HEADER_LEN + 3);
+        assert_eq!(RecoveryAuthorization::from_bytes(&broken), Err(RgcFormat::Corrupt));
+
+        // **The frame is OUTSIDE the signature**, and this is the half a round-trip test cannot see: the
+        // authority signed a decision, not a serialization. Re-framing the same certificate at a different
+        // layout must leave `verify` untouched, or a build that widened the header would make every
+        // previously-issued decision read as a forgery — the one refusal that sends an operator hunting an
+        // attacker who does not exist.
+        let reframed = RecoveryAuthorization::from_bytes(&framed).expect("this build's frame");
+        assert!(reframed.verify(&vk), "the header is not signed material, so re-framing cannot break verify");
+        assert_eq!(
+            RecoveryAuthorization::signable(rgc.generation, rgc.epoch_fence, &rgc.survivors, rgc.threshold, &rgc.anchor),
+            RecoveryAuthorization::signable(
+                reframed.generation,
+                reframed.epoch_fence,
+                &reframed.survivors,
+                reframed.threshold,
+                &reframed.anchor
+            ),
+            "the signed message must not mention the frame"
+        );
     }
 
     #[test]
