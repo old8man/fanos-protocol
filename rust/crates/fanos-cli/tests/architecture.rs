@@ -1413,6 +1413,56 @@ fn no_production_code_creates_a_directory_at_the_umask() {
     );
 }
 
+/// **`HOME` is read in exactly one place, and that place refuses rather than defaults (#312).**
+///
+/// The defect this closes was four independent readers, each written
+/// `map_or_else(|| PathBuf::from("."), PathBuf::from)`. An unset `HOME` therefore became the *current working
+/// directory* — and the user layout is where the node's configuration, its durable store and its **identity
+/// key** live, so a daemon started from two directories was two different nodes on the cell. Service managers
+/// routinely give a daemon a minimal environment, so this is the deployed case, not an exotic one.
+///
+/// Four hand-applied fixes would have been four chances to miss one, which is exactly what happened when the
+/// class was created: `setup.rs` had the canonical layout and the binary derived its own beside it. So the
+/// rule is mechanical, and it is deliberately stated as **one** number rather than as a list of sanctioned
+/// files: a second reader fails whether it is added in the binary or beside the sanctioned one.
+///
+/// **The control and the rule are the same assertion.** `readers.len() == 1` fails upward on a new reader and
+/// downward on a walk that reached nothing — so this guard cannot be green because it scanned an empty
+/// corpus, which is the failure mode a `is_empty()` assertion has by construction (#253).
+///
+/// Scope is production source (`src/`, above the test modules): a test that reads `HOME` is not a node whose
+/// identity moved. The guard's own file is outside that scope structurally rather than by an exemption it
+/// grants itself.
+#[test]
+fn the_home_directory_is_read_in_exactly_one_place() {
+    let mut readers: Vec<String> = Vec::new();
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        for (i, line) in production_part(&file.text).lines().enumerate() {
+            // Comments and doc comments stripped: this guard is about the code that runs, and both this
+            // function's prose and `home_dir`'s own doc name the variable.
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains(concat!('"', "HOME", '"')) {
+                readers.push(format!("{}:{}", file.rel, i + 1));
+            }
+        }
+    }
+    assert_eq!(
+        readers.len(),
+        1,
+        "the environment's home directory must be read by `fanos_node::setup::home_dir` and nowhere else — \
+         found {} readers: {readers:?}. A second reader is a second policy for an unset HOME, and the one \
+         that reads it silently answers with the working directory (#312). If this says 0, the scan reached \
+         nothing and every other guard built on this corpus is suspect too.",
+        readers.len(),
+    );
+    assert!(
+        readers[0].starts_with("crates/fanos-node/src/setup.rs:"),
+        "the one reader must be the canonical layout's, not {} — `home_dir` is where the refusal and its \
+         message live, and a reader elsewhere is a layout the operator cannot be told about",
+        readers[0],
+    );
+}
+
 /// **Every production dial of a peer-chosen remote address consults the shared realm policy (#170, #171).**
 ///
 /// The census that produced this: `connect(`/`lookup_host(` in non-test `src/` reduces to a handful of files,

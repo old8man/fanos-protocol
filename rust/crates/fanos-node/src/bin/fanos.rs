@@ -463,7 +463,7 @@ async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     // leaves the process before that task is polled again — so without this a normal shutdown leaves the path
     // behind. Not fatal (`serve` clears a stale socket, and `ask` reads a refused connection as "not running"),
     // but a state directory that is tidy after a clean stop is one an operator can trust at a glance.
-    let _ = std::fs::remove_file(&admin_socket);
+    remove_control_socket(admin_socket.as_ref());
     eprintln!("fanos node down");
     Ok(())
 }
@@ -507,14 +507,44 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Failing to bind is deliberately not fatal: a node that cannot open a control channel is still a working node,
 /// and refusing to run over one would be the tool getting in the way of the thing it exists to serve.
-fn control_socket(args: &[String]) -> (PathBuf, tokio::sync::mpsc::Receiver<fanos_node::admin::Envelope>) {
+///
+/// **Not knowing where the socket belongs is the same kind of failure, and is treated the same way** (#312).
+/// An environment with no `HOME` and no `--data` cannot name the directory — but the node's own state comes
+/// from its configuration file, so the only thing actually lost is the control channel. The returned path is
+/// therefore an `Option`: `None` means there is no socket file, which is now the *one* answer covering both a
+/// failed bind and an unknown directory. The previous signature handed back a path in both cases, so the
+/// caller's cleanup deleted a file this process had never created.
+fn control_socket(
+    args: &[String],
+) -> (Option<PathBuf>, tokio::sync::mpsc::Receiver<fanos_node::admin::Envelope>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<fanos_node::admin::Envelope>(16);
-    let path = fanos_node::admin::socket_path(&data_dir_for(args));
+    let path = match data_dir_for(args) {
+        Ok(dir) => fanos_node::admin::socket_path(&dir),
+        Err(e) => {
+            eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config");
+            return (None, rx);
+        }
+    };
     match fanos_node::admin::serve(&path, tx) {
-        Ok(_task) => eprintln!("control socket: {}", path.display()),
-        Err(e) => eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config"),
+        Ok(_task) => {
+            eprintln!("control socket: {}", path.display());
+            (Some(path), rx)
+        }
+        Err(e) => {
+            eprintln!("control socket unavailable ({e}) — `fanos status` will fall back to the config");
+            (None, rx)
+        }
     }
-    (path, rx)
+}
+
+/// Take this process's control socket off the filesystem on the way out, if it put one there.
+///
+/// One function rather than five copies of the `if let`, and it is why [`control_socket`] can return `None`
+/// without that spreading to every run loop.
+fn remove_control_socket(path: Option<&PathBuf>) {
+    if let Some(p) = path {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// What the control socket needs from whatever kind of node a role happens to be running.
@@ -831,9 +861,19 @@ fn answer_control<N: Controllable>(
 ///
 /// `--data` if given, else the platform layout this host was set up with, so `fanos status` finds the socket of a
 /// node started by the service unit without being told where to look.
-fn data_dir_for(args: &[String]) -> PathBuf {
-    flag(args, "--data")
-        .map_or_else(|| fanos_node::setup::Paths::detect().data, PathBuf::from)
+///
+/// `--data` is checked **first**, and that ordering is the escape hatch: an operator who names the directory
+/// never reaches the layout, so a process with no `HOME` is still fully usable — it just has to say where its
+/// files are instead of being guessed at (#312).
+///
+/// # Errors
+///
+/// [`NodeError::Config`] when `--data` is absent and the layout cannot be determined.
+fn data_dir_for(args: &[String]) -> Result<PathBuf, NodeError> {
+    match flag(args, "--data") {
+        Some(d) => Ok(PathBuf::from(d)),
+        None => Ok(fanos_node::setup::Paths::detect()?.data),
+    }
 }
 
 /// Run local SOCKS5 (and optional HTTP-CONNECT) proxy listeners that tunnel `CONNECT <name>.fanos:port`
@@ -967,7 +1007,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown().await;
-    let _ = std::fs::remove_file(&admin_socket);
+    remove_control_socket(admin_socket.as_ref());
     eprintln!("fanos proxy down");
     Ok(())
 }
@@ -1087,7 +1127,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown().await;
-    let _ = std::fs::remove_file(&admin_socket);
+    remove_control_socket(admin_socket.as_ref());
     eprintln!("fanos host down");
     Ok(())
 }
@@ -1161,7 +1201,7 @@ async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
         () = serve_control(&mut node, &mut admin_rx, NO_CHAIN) => {}
     }
     node.shutdown().await;
-    let _ = std::fs::remove_file(&admin_socket);
+    remove_control_socket(admin_socket.as_ref());
     eprintln!("fanos vpn down");
     Ok(())
 }
@@ -1668,7 +1708,7 @@ fn choose_listen(args: &[String]) -> Result<SocketAddr, NodeError> {
 fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     let assume_yes = has_flag(args, "--yes");
     let force = has_flag(args, "--force");
-    let paths = fanos_node::setup::Paths::detect();
+    let paths = fanos_node::setup::Paths::detect()?;
 
     eprintln!("fanos init — setting this host up as a FANOS node\n");
     eprintln!("  configuration : {}", paths.config.display());
@@ -1921,8 +1961,7 @@ fn install_service(paths: &fanos_node::setup::Paths, assume_yes: bool) -> Result
         eprintln!("  fanos node --config {}", paths.config.display());
         return Ok(());
     }
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let Some(unit_path) = manager.unit_path(&home) else { return Ok(()) };
+    let Some(unit_path) = manager.unit_path_here()? else { return Ok(()) };
     let exe = std::env::current_exe()?;
 
     let unit = match manager {
@@ -1981,8 +2020,7 @@ fn run_steps(what: &str, steps: &[Vec<String>]) {
 fn cmd_service_lifecycle(verb: &str) -> Result<(), NodeError> {
     use fanos_node::setup::ServiceManager;
     let manager = ServiceManager::detect();
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    let Some(unit) = manager.unit_path(&home) else {
+    let Some(unit) = manager.unit_path_here()? else {
         return Err(NodeError::Config(
             "no service manager on this host — run the node in the foreground with `fanos node --config …`"
                 .to_owned(),
@@ -2011,17 +2049,15 @@ fn cmd_service_lifecycle(verb: &str) -> Result<(), NodeError> {
 /// the identity key in place, so reinstalling returns the *same* node to the network at the same coordinate — the
 /// operator's peers keep their seed addresses. `--purge` deletes those too, which is not an undo: the coordinate
 /// is derived from the key, so a purged node comes back as a stranger.
-#[allow(clippy::unnecessary_wraps)] // uniform with every other `cmd_*`, which the dispatch table requires
 fn cmd_uninstall(args: &[String]) -> Result<(), NodeError> {
     use fanos_node::setup::ServiceManager;
     let assume_yes = has_flag(args, "--yes");
     let purge = has_flag(args, "--purge");
-    let paths = fanos_node::setup::Paths::detect();
+    let paths = fanos_node::setup::Paths::detect()?;
     let manager = ServiceManager::detect();
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
 
     eprintln!("fanos uninstall — removing FANOS from this host\n");
-    if let Some(unit) = manager.unit_path(&home).filter(|u| u.exists()) {
+    if let Some(unit) = manager.unit_path_here()?.filter(|u| u.exists()) {
         eprintln!("  service : {}", unit.display());
         if assume_yes || ask_yes_no("stop, disable and remove the service?", true) {
             run_steps("removing the service", &manager.deactivation(&unit));
@@ -2091,8 +2127,11 @@ fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
 /// take", and a status command that can only answer by connecting cannot distinguish "not configured" from
 /// "configured and down" — which are opposite problems.
 async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
-    let paths = fanos_node::setup::Paths::detect();
-    let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
+    // `--config` first, so an operator who names the file is never refused for want of a layout (#312).
+    let config_path = match flag(args, "--config") {
+        Some(p) => PathBuf::from(p),
+        None => fanos_node::setup::Paths::detect()?.config,
+    };
 
     // Which question to ask the running node. `health` by default — the one an operator asks first — but the
     // control socket serves six verbs and the shipped CLI could reach exactly one of them, so `census`,
@@ -2165,7 +2204,7 @@ async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     // --data X` looked under the platform default, and the answer was "running, but not answering its control
     // socket (an older build)" — a sentence that blames the node for the asker's arithmetic. Found by running
     // one against a node whose state was somewhere else.
-    let socket = fanos_node::admin::socket_path(&data_dir_for(args));
+    let socket = fanos_node::admin::socket_path(&data_dir_for(args)?);
     let live = fanos_node::admin::ask(&socket, verb).await.unwrap_or(None);
     if let Some(body) = live {
         println!("daemon        : running");
@@ -2322,8 +2361,10 @@ fn cmd_id(args: &[String]) -> Result<(), NodeError> {
     // (`docs/design-genesis.md`), so printing one without the network is printing a placement the node will
     // not have — and this command's last line is a bootstrap address, which is coordinate-*pinned*. Read the
     // same configuration the daemon reads, from the same default location, so the two cannot disagree.
-    let paths = fanos_node::setup::Paths::detect();
-    let config_path = flag(args, "--config").map_or(paths.config.clone(), PathBuf::from);
+    let config_path = match flag(args, "--config") {
+        Some(p) => PathBuf::from(p),
+        None => fanos_node::setup::Paths::detect()?.config,
+    };
     let config = config_path
         .exists()
         .then(|| std::fs::read_to_string(&config_path).map_err(NodeError::from))
@@ -3493,7 +3534,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     // The validator keeps its certified executed state here, so a whole-cell restart can re-seed from any
     // single survivor's disk (#57). `--data` names it, exactly as it names the store's.
     let params = config
-        .to_taxis_params(Some(data_dir_for(args)))
+        .to_taxis_params(Some(data_dir_for(args)?))
         .ok_or_else(|| NodeError::Config("the validator config carries a malformed verifier".to_owned()))?;
     let handle = spawn_taxis::<F2, HybridLedger>(node.client(), params);
     let mut events = handle.subscribe();
@@ -3554,7 +3595,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
         }
     }
     node.shutdown();
-    let _ = std::fs::remove_file(&admin_socket);
+    remove_control_socket(admin_socket.as_ref());
     eprintln!("fanos validator {me} down");
     Ok(())
 }

@@ -40,3 +40,17 @@ impl From<fanos_quic::QuicError> for NodeError {
         Self::Quic(e)
     }
 }
+
+/// An environment that does not say where this user's files live is a **configuration** problem, and lands in
+/// that variant rather than in a new one (#312).
+///
+/// `HOME` configures this run exactly as `--config` does — it is the input from which the whole path layout is
+/// derived — and the operator's next action is the same kind of action. A separate variant would widen the
+/// taxonomy for one cause without giving any caller a decision it can make differently, and
+/// [`setup::HomeUnknown`](crate::setup::HomeUnknown)'s own `Display` already carries which of the two cases it
+/// is and what to do about it.
+impl From<crate::setup::HomeUnknown> for NodeError {
+    fn from(e: crate::setup::HomeUnknown) -> Self {
+        Self::Config(e.to_string())
+    }
+}

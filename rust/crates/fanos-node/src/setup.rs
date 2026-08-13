@@ -72,14 +72,92 @@ impl Paths {
     }
 
     /// The layout for this process: system when running as root, otherwise the invoking user's.
-    #[must_use]
-    pub fn detect() -> Self {
+    ///
+    /// Fallible on exactly one input, and that is the whole point of the signature: the root branch is
+    /// determined (it asks `/etc` directly), the user branch needs a home directory, and a home directory is
+    /// something the environment may simply not name. See [`home_dir`] for why the previous `"."` answer was
+    /// the worst of the three possible ones.
+    pub fn detect() -> Result<Self, HomeUnknown> {
         if is_root() {
-            return Self::system();
+            return Ok(Self::system());
         }
-        let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-        Self::user_in(&home, cfg!(target_os = "macos"))
+        Ok(Self::user_in(&home_dir()?, cfg!(target_os = "macos")))
     }
+}
+
+/// Why this host's home directory could not be determined — the two ways `HOME` fails to name one.
+///
+/// Kept apart because the operator's fix differs: one is "give the process an environment", the other is
+/// "the environment it has is wrong".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeUnknown {
+    /// `HOME` is unset, or set to the empty string. What a service manager's minimal environment looks like
+    /// from inside the process it started.
+    Unset,
+    /// `HOME` names a **relative** path, so everything under it would depend on the directory this process
+    /// happened to start in — the same defect as no home at all, one indirection further away.
+    NotAbsolute(PathBuf),
+}
+
+impl core::fmt::Display for HomeUnknown {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unset => f.write_str(
+                "HOME is not set, so this host's FANOS layout has no home directory to sit under — start the \
+                 process with HOME set (a service manager gives a daemon a minimal environment, and this is \
+                 what that looks like from inside), or name the paths explicitly with --config and --data",
+            ),
+            Self::NotAbsolute(p) => write!(
+                f,
+                "HOME is '{}', which is a relative path — every file under it would then depend on the \
+                 directory this process was started from, which is not a property a node's identity may \
+                 have. Set HOME to an absolute path, or name the paths explicitly with --config and --data",
+                p.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HomeUnknown {}
+
+/// **The one reader of `HOME` in this workspace**, and the reason it is one (#312).
+///
+/// Four sites used to answer this question, each with `map_or_else(|| PathBuf::from("."), …)` — an unset
+/// `HOME` silently became the *current working directory*. That is not a mild fallback. The user layout puts
+/// this node's identity key, its configuration and its durable store under the home directory, so the answer
+/// `"."` puts a node's **identity** wherever the process happened to be started: a `cd` between two starts
+/// gives the cell two different nodes, and neither operator nor cell can see why. Service managers routinely
+/// start daemons with no `HOME` at all, so this is the deployed case rather than an exotic one.
+///
+/// The three candidate answers, and why this is the one:
+///
+/// * **`"."`** — silently wrong, above.
+/// * **the system layout** — worse than wrong: an unprivileged process cannot write `/etc/fanos`, and if it
+///   could, it would be reading *another* installation's files.
+/// * **refuse, and say which of the two things is missing** — the caller then either sets `HOME` or names the
+///   paths, both of which it can do. A refusal an operator can act on beats a default nobody chose.
+///
+/// An empty `HOME` counts as unset: `HOME=` is what an environment that meant to clear it produces, and
+/// `PathBuf::from("")` would join to a relative path. A relative `HOME` is refused for the same reason `"."`
+/// is — POSIX requires an absolute pathname here, and accepting a relative one reintroduces exactly the
+/// defect this function exists to remove.
+///
+/// # Errors
+///
+/// [`HomeUnknown::Unset`] if `HOME` is absent or empty, [`HomeUnknown::NotAbsolute`] if it is relative.
+pub fn home_dir() -> Result<PathBuf, HomeUnknown> {
+    classify_home(std::env::var_os("HOME"))
+}
+
+/// The decision [`home_dir`] makes, as a pure function of the variable's value.
+///
+/// Split out so the classification is testable without mutating the process environment — an env var is
+/// global state shared by every test in the binary, and a test that sets it is a test that decides another
+/// test's answer.
+fn classify_home(raw: Option<std::ffi::OsString>) -> Result<PathBuf, HomeUnknown> {
+    let raw = raw.filter(|v| !v.is_empty()).ok_or(HomeUnknown::Unset)?;
+    let path = PathBuf::from(raw);
+    if path.is_absolute() { Ok(path) } else { Err(HomeUnknown::NotAbsolute(path)) }
 }
 
 /// Whether this process may install to the system paths — asked, and now answered, as a **capability**.
@@ -172,13 +250,34 @@ impl ServiceManager {
     }
 
     /// Where this manager's unit file for FANOS belongs, given the user's home.
+    ///
+    /// The **pure** half, kept public because the per-OS layout is exactly the kind of thing a test must be
+    /// able to state without an environment. Production wants [`unit_path_here`](Self::unit_path_here), which
+    /// resolves the home itself — and only on the arms that read one.
     #[must_use]
     pub fn unit_path(self, home: &Path) -> Option<PathBuf> {
         match self {
-            Self::SystemdSystem => Some(PathBuf::from("/etc/systemd/system/fanos.service")),
+            Self::SystemdSystem => Some(PathBuf::from(SYSTEM_UNIT_PATH)),
             Self::SystemdUser => Some(home.join(".config/systemd/user/fanos.service")),
             Self::Launchd => Some(home.join("Library/LaunchAgents/network.fanos.node.plist")),
             Self::None => None,
+        }
+    }
+
+    /// Where this manager's unit file belongs **on this host** — the home resolved only where it is read.
+    ///
+    /// The distinction is not decoration (#312). `SystemdSystem`'s path is a constant, so resolving the home
+    /// first and passing it in would refuse a *root* install for want of a `HOME` that arm never looks at —
+    /// a guard wider than the thing it guards. Each arm therefore asks only for what it uses.
+    ///
+    /// # Errors
+    ///
+    /// [`HomeUnknown`] on the two per-user managers, when the environment does not name a home directory.
+    pub fn unit_path_here(self) -> Result<Option<PathBuf>, HomeUnknown> {
+        match self {
+            Self::SystemdSystem => Ok(Some(PathBuf::from(SYSTEM_UNIT_PATH))),
+            Self::None => Ok(None),
+            Self::SystemdUser | Self::Launchd => Ok(self.unit_path(&home_dir()?)),
         }
     }
 
@@ -285,6 +384,10 @@ impl ServiceManager {
 /// The systemd unit's name — one constant, because a name that disagrees between install and removal leaves a
 /// service an operator cannot get rid of with this tool.
 pub const UNIT_NAME: &str = "fanos.service";
+
+/// Where a machine-wide systemd unit belongs. Named once so the two functions that answer "where is the unit"
+/// cannot drift apart — the second would be a copy, and a copy is the defect one edit away.
+const SYSTEM_UNIT_PATH: &str = "/etc/systemd/system/fanos.service";
 
 /// The node's **steady-state** memory ceiling: every named share, plus the measured resident cost of the
 /// process outside them.
@@ -624,6 +727,61 @@ pub fn default_roles() -> RoleSet {
 mod tests {
     use crate::config::SeatSource;
     use super::*;
+
+    /// **An environment that does not name a home directory is refused, not answered with the cwd** (#312).
+    ///
+    /// The three refusable inputs are each a `HOME` a real deployment produces: unset is what a service
+    /// manager hands a daemon, empty is what a script that meant to clear it produces, and relative is what a
+    /// `HOME=fanos` in a container image produces. All three used to yield `PathBuf::from(".")`, which puts
+    /// the node's **identity key** wherever the process was started — so two starts from two directories are
+    /// two different nodes on the cell, with nothing anywhere saying why.
+    ///
+    /// Falsified by restoring the old body (`map_or_else(|| PathBuf::from("."), PathBuf::from)`): the first
+    /// three assertions fail, each naming the value it got. The fourth is the control — an ordinary absolute
+    /// `HOME` must still pass, or the guard would be green for the trivial reason that it refuses everything.
+    #[test]
+    fn a_home_that_would_make_the_layout_depend_on_the_working_directory_is_refused() {
+        use std::ffi::OsString;
+
+        assert_eq!(classify_home(None), Err(HomeUnknown::Unset), "an unset HOME must not become a path");
+        assert_eq!(
+            classify_home(Some(OsString::from(""))),
+            Err(HomeUnknown::Unset),
+            "an empty HOME is an unset HOME — `PathBuf::from(\"\")` joins to a relative path",
+        );
+        assert_eq!(
+            classify_home(Some(OsString::from("fanos/home"))),
+            Err(HomeUnknown::NotAbsolute(PathBuf::from("fanos/home"))),
+            "a relative HOME is the same defect one indirection away: the layout would follow the cwd",
+        );
+        // CONTROL: the ordinary case must pass, or every assertion above is satisfied by a guard that
+        // refuses unconditionally and says nothing about the classification.
+        assert_eq!(
+            classify_home(Some(OsString::from("/home/op"))),
+            Ok(PathBuf::from("/home/op")),
+            "an absolute HOME is the whole point of the layout and must be accepted",
+        );
+    }
+
+    /// A machine-wide install is not refused for want of a `HOME` its unit path never reads (#312).
+    ///
+    /// The guard against a fix that is wider than its defect. `unit_path_here` resolves the home per arm,
+    /// so `SystemdSystem` — whose answer is a constant — is reachable in any environment. Falsified by
+    /// hoisting `home_dir()?` above the `match`: this fails whenever the test process has no `HOME`, which
+    /// is exactly the deployment the hoisted version would have broken.
+    #[test]
+    fn the_machine_wide_unit_path_needs_no_home_directory() {
+        let system = ServiceManager::SystemdSystem
+            .unit_path_here()
+            .expect("a machine-wide unit path is a constant and cannot depend on the environment");
+        assert_eq!(
+            system.as_deref(),
+            Some(Path::new(SYSTEM_UNIT_PATH)),
+            "the root install's unit path must be the same constant `unit_path` returns",
+        );
+        // And the arm with no unit at all answers without consulting the environment either.
+        assert_eq!(ServiceManager::None.unit_path_here().expect("no manager, no question to ask"), None);
+    }
 
     #[test]
     fn the_rendered_config_reads_back_field_for_field() {
