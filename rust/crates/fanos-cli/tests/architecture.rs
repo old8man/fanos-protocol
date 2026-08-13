@@ -386,8 +386,10 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // spec §2.7/V15. Its caller is `examples/forecast.rs`, which `gate.sh` runs as a phase and which now
     // exits non-zero on a violation, so the capability is wired to a merge gate rather than to nothing.
     // This scan cannot see that: `production_sources` keeps only `RustSource::is_crate_src`, so `examples/`
-    // and `src/bin/` are invisible to it, and four of this tree's examples ARE gate phases. Deciding whether
-    // a gate-run example counts as a call site is a change to this guard, not to a budget.
+    // and `src/bin/` are invisible to it, while the gate's `run` group is built from exactly those two
+    // directories: three examples (`forecast`, `catastrophe`, `minima`) and two binaries (`fanos-cli`,
+    // `fanos-sim-demo`), every one of which gates a merge. Deciding whether a gate-run example counts as a
+    // call site is a change to this guard, not to a budget.
     //
     // How much that blindness hides was then MEASURED across all 41, rather than left as a worry, and the
     // answer is nothing: 20 are called from `#[cfg(test)]` modules inside `src/` (which `code_only` strips

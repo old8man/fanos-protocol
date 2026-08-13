@@ -347,10 +347,37 @@ fn main() {
 mod tests {
     use super::run_all_checks;
 
+    /// **A floor eight below the truth cannot see the loss it exists to see.** This asserted
+    /// `passed >= 18` while the verifier reproduced 26, so eight of the spec's headline claims could
+    /// have stopped being checked — silently, one at a time — and this test would have stayed green
+    /// the whole way down. A coverage number has to be pinned at its measured value, not under it.
+    ///
+    /// The total is split 19 + 7 because the two halves move for different reasons: the hand-written
+    /// `r.check(…)` calls across the six `verify_*` families, and however many the HOLARCH panel
+    /// returns, which this crate does not author. Both numbers came from the assertion refusing my
+    /// count of them — I read 20 + 6 off a grep, and the panel is 7. Asserting each separately means a changed number
+    /// names which half changed instead of leaving a reader to bisect.
+    ///
+    /// Both are meant to be raised when a claim is ADDED. A drop is a regression that owes an
+    /// explanation in the commit that causes it.
     #[test]
     fn all_reproduced_claims_hold() {
         let r = run_all_checks();
         assert_eq!(r.failed, 0, "{} reproduced claim(s) failed", r.failed);
-        assert!(r.passed >= 18, "expected ≥18 claims, got {}", r.passed);
+
+        let holarch = fanos_holarch::Panel::run().checks.len();
+        assert_eq!(
+            holarch, 7,
+            "the HOLARCH viability panel now returns {holarch} checks, not 7 — this crate does not \
+             author them, so raise the split below and say what the panel gained"
+        );
+        assert_eq!(
+            r.passed,
+            19 + holarch,
+            "the verifier reproduced {} claims, not the 19 hand-written ones plus the panel's \
+             {holarch}. If a claim was added, raise this; if one vanished, the gate stopped \
+             checking something the spec's headline list still promises",
+            r.passed
+        );
     }
 }
