@@ -12,8 +12,8 @@
 //!
 //! # Why it compares (subcommand, packages, features) and nothing finer
 //!
-//! Equality of the two files is the wrong property: they legitimately differ. `ci.yml` runs `cargo doc`,
-//! installs a toolchain and splits work across runners; `gate.sh` groups into named phases and prints their
+//! Equality of the two files is the wrong property: they legitimately differ. `ci.yml` installs a toolchain
+//! and splits work across runners; `gate.sh` groups into named phases and prints their
 //! cost. Counting lines would compare 24 against 33 and mean nothing.
 //!
 //! What must agree is **coverage**, so the comparison keeps only what decides coverage — which cargo
@@ -50,7 +50,10 @@ fn coverage_of(line: &str) -> Option<Coverage> {
     let rest = line.strip_prefix("cargo ")?;
     let mut words = rest.split_whitespace();
     let cmd = words.next()?.to_owned();
-    if !matches!(cmd.as_str(), "test" | "clippy" | "check") {
+    // `doc` belongs here and its absence was this guard's own defect. Under `RUSTDOCFLAGS=-D warnings`
+    // an unresolved intra-doc link is an ERROR, so the phase gates a merge exactly like the other three —
+    // and while it sat outside this comparison, six broken links lived on main at once.
+    if !matches!(cmd.as_str(), "test" | "clippy" | "check" | "doc") {
         return None;
     }
 
@@ -102,7 +105,19 @@ fn gate_coverage() -> BTreeSet<Coverage> {
     text.lines()
         .filter_map(|l| {
             // `run <name> <cargo-args…>` — the phase name is not part of the command.
-            let rest = l.trim().strip_prefix("run ")?;
+            //
+            // A phase may carry an environment prefix (`RUSTDOCFLAGS="-D warnings" run doc doc …`), and
+            // matching only on a LEADING `run ` silently dropped it. That is the second half of how the
+            // docs phase escaped this comparison, and it is the more dangerous half: the first half at
+            // least left `cargo doc` visible in `ci.yml`.
+            let line = l.trim();
+            if line.starts_with('#') {
+                return None; // a comment mentioning `run` is not a phase
+            }
+            let rest = match line.strip_prefix("run ") {
+                Some(r) => r,
+                None => line.split_once(" run ").map(|(_, r)| r)?,
+            };
             let args = rest.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
             coverage_of(&format!("cargo {args}"))
         })
@@ -159,7 +174,9 @@ fn covered_by_any(need: &Coverage, pool: &BTreeSet<Coverage>) -> bool {
 /// nothing consults is the same defect as a share nobody sums: it looks like a decision and enforces
 /// nothing. The guard found that in itself on its second run.
 ///
-/// `cargo doc` never appears here because [`coverage_of`] does not classify it as a check at all.
+/// `cargo doc` used to be absent from this comparison entirely — [`coverage_of`] did not classify it and
+/// [`gate_coverage`] did not parse its env-prefixed line. It is neither exempt nor invisible now; it is
+/// compared like every other check, which is what it always should have been.
 fn ci_only(c: &Coverage) -> Option<&'static str> {
     if c.release {
         return Some(
@@ -182,13 +199,13 @@ fn every_check_the_gate_runs_is_also_a_ci_step_and_the_reverse() {
 
     // Assert the scan before the finding: a parser that reads nothing agrees with everything.
     assert!(
-        gate.len() >= 15,
+        gate.len() >= 16,
         "gate.sh parsed to only {} checks, which is fewer than it plainly has — the parser broke before \
          the comparison could mean anything",
         gate.len()
     );
     assert!(
-        ci.len() >= 8,
+        ci.len() >= 9,
         "ci.yml parsed to only {} checks — same problem, and a guard that compares two empty sets passes \
          for the wrong reason",
         ci.len()
