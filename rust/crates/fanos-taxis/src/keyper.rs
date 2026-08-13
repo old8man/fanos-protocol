@@ -468,6 +468,54 @@ mod tests {
         assert!(!short.descends_from(&founding, &verifiers), "a partial registry is not a valid authority");
     }
 
+    /// **What a sealed transaction costs, measured rather than asserted** (#143 axis a).
+    ///
+    /// The task list said "the ciphertext does not scale past `q ≈ 7`" and the code said nothing at all —
+    /// the same record defect #305 closed for `Certificate`. This measures it.
+    ///
+    /// The per-member cost is taken as the DIFFERENCE between two real plane orders, so it is the slope the
+    /// wire actually has rather than my arithmetic on `CIPHERTEXT_LEN`: a codec that added framing per member
+    /// would change the slope and this would move with it.
+    #[test]
+    fn a_sealed_transaction_costs_one_kem_ciphertext_per_committee_member() {
+        let seal_at = |q: u32| -> usize {
+            let params = CellParams::for_order(q).expect("a valid plane order");
+            let (_s, _v, _k, registry) = cell(params.n());
+            let tx = Transaction::new(alloc::vec![7u8; 64]);
+            seal_to_keyper_committee(&registry, &tx, Epoch::new(2), params, b"width")
+                .expect("the whole cell is the committee, so sealing succeeds")
+                .to_bytes()
+                .len()
+        };
+
+        let (small, big) = (CellParams::FANO, CellParams::for_order(4).expect("q=4"));
+        let (w_small, w_big) = (seal_at(small.q()), seal_at(big.q()));
+        let members = big.n() - small.n(); // 21 − 7 = 14 extra members
+        let per_member = (w_big - w_small) / members;
+
+        // The measured slope must be at least one hybrid-KEM ciphertext: that is the object the design
+        // places at every member, and anything less would mean the seal is NOT reaching all of them.
+        assert!(
+            per_member >= fanos_pqcrypto::kem::CIPHERTEXT_LEN,
+            "each extra committee member must cost at least a full KEM ciphertext \
+             ({per_member} B measured, CIPHERTEXT_LEN is {})",
+            fanos_pqcrypto::kem::CIPHERTEXT_LEN
+        );
+
+        // And the cost is the COMMITTEE, not the payload: the 64-byte transaction is a rounding error
+        // against `n` ciphertexts, which is exactly why the width tracks the plane order and nothing else.
+        assert!(
+            w_small > 64 * 100,
+            "a 64-byte transaction seals to {w_small} B on the Fano cell — the payload is not the cost"
+        );
+        assert!(
+            w_big >= w_small + members * fanos_pqcrypto::kem::CIPHERTEXT_LEN,
+            "q=2 → {w_small} B, q=4 → {w_big} B: the growth is LINEAR IN THE CELL (#136 made the committee \
+             the whole cell, so n = q²+q+1, not a line of q+1). At q=7 that is 57 ciphertexts per \
+             transaction, and it multiplies by mempool rate rather than by block rate."
+        );
+    }
+
     #[test]
     fn sealing_to_the_committed_line_produces_a_transaction_the_elected_members_open() {
         let (_s, _v, kem_secrets, registry) = cell(7);

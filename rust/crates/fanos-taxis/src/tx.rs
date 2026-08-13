@@ -48,6 +48,29 @@ impl Transaction {
 /// committee members, and only they choose to release their shares (post-finality).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SealedTx {
+    // # What this costs, measured (#143 axis a)
+    //
+    // The seal carries **one hybrid-KEM ciphertext per committee member** (`ThresholdSealed.sealed_shares`),
+    // and since #136 the committee is the WHOLE CELL — `n = q² + q + 1`, not a line of `q + 1`. So the width
+    // of a sealed transaction tracks the plane order and almost nothing else. Measured on real fixtures by
+    // `keyper::tests::a_sealed_transaction_costs_one_kem_ciphertext_per_committee_member`, for a 64-byte
+    // transaction:
+    //
+    //   q = 2 (n = 7)   →   8 289 B      the 64-byte payload is 0.8 % of the wire
+    //   q = 4 (n = 21)  →  24 655 B
+    //   slope           →   1 169 B per member  ((24 655 − 8 289) / 14, measured — `CIPHERTEXT_LEN` is
+    //                                            1 120, the rest is the share and its framing)
+    //   q = 7 (n = 57)  →  ~66 739 B ≈ 65 KiB   extrapolated from the measured slope, not from arithmetic
+    //                                            on the constant
+    //
+    // The slope is taken as a DIFFERENCE between two real orders rather than computed from
+    // `CIPHERTEXT_LEN`, so a codec that added per-member framing would move it and the test with it.
+    //
+    // This is a per-TRANSACTION cost multiplied by mempool rate, not a per-block cost — which is what makes
+    // it the binding one. It is the same linear-where-constant shape as `Certificate` (#66), but **not the
+    // same gap**: #66/#67 wait on signature aggregation and key blinding, and this waits on addressing many
+    // recipients with one ciphertext — a KEM property, not a signature one. Do not fold it into that
+    // tripwire without reading first; the resemblance is in the shape, and the shape is not the blocker.
     /// The epoch this transaction was sealed in (binds its committee and its commitment).
     pub epoch: Epoch,
 
