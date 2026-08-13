@@ -382,7 +382,17 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // simulator's controls are called by scenarios, because being called by scenarios is what they are for.
     // Raised rather than wired, and the full test gate is what caught it — three commits after the last time
     // this ratchet ran alone, which is the whole argument for `run-the-whole-suite-not-your-crate`.
-    ("fanos-sim", 40),
+    // 41: `ForecastVerdict::violates_v15` — the predicate that decides whether a cascade sweep CONTRADICTS
+    // spec §2.7/V15. Its caller is `examples/forecast.rs`, which `gate.sh` runs as a phase and which now
+    // exits non-zero on a violation, so the capability is wired to a merge gate rather than to nothing.
+    // This scan cannot see that: `production_sources` keeps only `RustSource::is_crate_src`, so `examples/`
+    // and `src/bin/` are invisible to it, and four of this tree's examples ARE gate phases. Worth knowing
+    // before the next raise — the same blindness would hide a genuinely dead function in fanos-sim, and
+    // deciding whether a gate-run example counts as a call site is a change to this guard, not to a budget.
+    // (`verdict`, its sibling, is absent from the finding for an unrelated reason: the name is declared in
+    // more than one crate, so the attribution step drops it rather than guess. Two different blind spots,
+    // and only one of them is about examples.)
+    ("fanos-sim", 41),
     ("fanos-stream", 3),
     ("fanos-taxis", 22),
     ("fanos-telemetry", 9),

@@ -143,14 +143,87 @@ pub struct CascadeForecast {
     pub trajectory: Vec<(f64, CoherenceReading, usize)>,
 }
 
+/// What a sweep actually demonstrated about spec §2.7 / V15 — *"the systemic warning fires a
+/// measurable lead time before the first node fails"*.
+///
+/// **Five worlds, because two of them used to print as a third.** `CascadeForecast` carries two
+/// `Option<f64>` and a signed difference, which a reader has to combine correctly every time; the
+/// `forecast` example combined them into one `Some(..)` arm and one catch-all, and both were wrong
+/// in a way that reads as reassurance. A sweep where the indicator never fired at all printed *"No
+/// cascade detected (resilient regime)"* — the sentence says the opposite of what happened, since a
+/// node did fail. And a sweep where the warning arrived *after* the failure took the first arm and
+/// printed *"collapse was called before it happened"* beside a negative number, because
+/// [`CascadeForecast::lead`] is `f - w` and stays `Some` when the sign flips.
+///
+/// The classification belongs here, next to the fields, rather than at each reader: a caller that
+/// must re-derive which of five worlds it is in will eventually merge two of them, and the merge is
+/// invisible precisely when the mechanism failed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[must_use]
+pub enum ForecastVerdict {
+    /// No warning and no failure: the regime was resilient over the whole sweep. V15 says nothing
+    /// about a cascade that did not happen, so this is not evidence either way.
+    NoCascade,
+    /// The warning fired and no node ever failed. Not a V15 violation — the claim is about *order*,
+    /// and nothing collapsed — but it is not "no cascade" either, and a reader must be able to tell
+    /// a quiet run from an unconfirmed alarm.
+    WarnedWithoutFailure {
+        /// Cascade progress at which the systemic warning fired.
+        warn: f64,
+    },
+    /// **Violates V15.** A node fell below the viability threshold and the systemic warning never
+    /// fired at all: the leading indicator was blind to a real cascade.
+    MissedTheCascade {
+        /// Cascade progress at which the first node fell below the viability threshold.
+        fail: f64,
+    },
+    /// **Violates V15.** The warning fired, but at or after the first failure — a "leading"
+    /// indicator that trails. `lag` is how far behind it was, `≥ 0`.
+    WarnedTooLate {
+        /// How far the warning trailed the first failure, `≥ 0`.
+        lag: f64,
+    },
+    /// The claim holds on this sweep: the warning preceded the first failure by `lead > 0`.
+    Forecast {
+        /// How far the warning preceded the first failure, `> 0`.
+        lead: f64,
+    },
+}
+
+impl ForecastVerdict {
+    /// Whether this sweep CONTRADICTS spec §2.7 / V15. A resilient run does not, an unconfirmed
+    /// alarm does not, and both failure modes do.
+    #[must_use]
+    pub const fn violates_v15(self) -> bool {
+        matches!(self, Self::MissedTheCascade { .. } | Self::WarnedTooLate { .. })
+    }
+}
+
 impl CascadeForecast {
-    /// The forecast **lead time** (in cascade progress) between the coherence warning and the
-    /// first failure. `Some(Δ > 0)` means the warning genuinely preceded collapse.
+    /// The signed difference between the first failure and the warning, in cascade progress.
+    ///
+    /// **This is arithmetic, not a verdict.** It stays `Some` when the warning arrives *after* the
+    /// failure, in which case the value is negative and calling it a "lead time" inverts what
+    /// happened. Read [`CascadeForecast::verdict`] to decide anything; use this only to report a
+    /// magnitude the verdict has already given a sign to.
     #[must_use]
     pub fn lead(&self) -> Option<f64> {
         match (self.warn_progress, self.fail_progress) {
             (Some(w), Some(f)) => Some(f - w),
             _ => None,
+        }
+    }
+
+    /// Which of the five worlds this sweep landed in — see [`ForecastVerdict`].
+    pub fn verdict(&self) -> ForecastVerdict {
+        match (self.warn_progress, self.fail_progress) {
+            (None, None) => ForecastVerdict::NoCascade,
+            (Some(warn), None) => ForecastVerdict::WarnedWithoutFailure { warn },
+            (None, Some(fail)) => ForecastVerdict::MissedTheCascade { fail },
+            // Equality is a violation too: "before" is strict, and a warning that fires in the same
+            // step as the failure buys an operator nothing.
+            (Some(w), Some(f)) if f > w => ForecastVerdict::Forecast { lead: f - w },
+            (Some(w), Some(f)) => ForecastVerdict::WarnedTooLate { lag: w - f },
         }
     }
 }
@@ -334,6 +407,64 @@ mod tests {
             forecast.trajectory.last().unwrap().1.phi > 1.0,
             "fully coupled cell is over-integrated"
         );
+    }
+
+    /// **All five worlds, and the two that used to print as a third.** The live sweep above pins
+    /// one point in the parameter space; this pins the CLASSIFICATION, which is what a reader of
+    /// any sweep depends on. Constructed rather than simulated, because two of the five states are
+    /// exactly the ones a healthy simulator refuses to produce — and a state no fixture can reach
+    /// is a state no fixture can check.
+    #[test]
+    fn the_verdict_separates_a_quiet_run_from_a_blind_indicator() {
+        let at = |warn: Option<f64>, fail: Option<f64>| CascadeForecast {
+            warn_progress: warn,
+            fail_progress: fail,
+            trajectory: Vec::new(),
+        };
+
+        assert_eq!(at(None, None).verdict(), ForecastVerdict::NoCascade);
+        assert_eq!(
+            at(Some(0.4), None).verdict(),
+            ForecastVerdict::WarnedWithoutFailure { warn: 0.4 }
+        );
+        assert_eq!(
+            at(Some(0.3), Some(0.7)).verdict(),
+            ForecastVerdict::Forecast {
+                lead: 0.7_f64 - 0.3_f64
+            }
+        );
+
+        // The two that V15 forbids. Before this type they were indistinguishable from the two
+        // above at every call site: the blind indicator shared a catch-all with `NoCascade`, and
+        // the late one shared an arm with `Forecast` because `lead()` stays `Some` when negative.
+        let blind = at(None, Some(0.6));
+        assert_eq!(blind.verdict(), ForecastVerdict::MissedTheCascade { fail: 0.6 });
+        assert!(blind.verdict().violates_v15());
+        assert_eq!(blind.lead(), None, "the arithmetic cannot see this one at all");
+
+        let late = at(Some(0.8), Some(0.5));
+        assert_eq!(
+            late.verdict(),
+            ForecastVerdict::WarnedTooLate {
+                lag: 0.8_f64 - 0.5_f64
+            }
+        );
+        assert!(late.verdict().violates_v15());
+        assert!(
+            late.lead().is_some_and(|l| l < 0.0),
+            "and this one the arithmetic reports as a NEGATIVE lead, which the old example printed \
+             as `collapse was called before it happened`"
+        );
+
+        // Simultaneous is a violation: "before" is strict.
+        assert_eq!(
+            at(Some(0.5), Some(0.5)).verdict(),
+            ForecastVerdict::WarnedTooLate { lag: 0.0 }
+        );
+
+        // And the two legitimate worlds must NOT be flagged, or the exit code means nothing.
+        assert!(!at(None, None).verdict().violates_v15());
+        assert!(!at(Some(0.3), Some(0.7)).verdict().violates_v15());
     }
 
     #[test]

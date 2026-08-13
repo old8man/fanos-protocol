@@ -55,8 +55,8 @@ pub use metrics::{Metrics, Observed, Report};
 // ceiling production reads with.
 pub use network::{Delivery, NetworkModel, wire_ceiling, wire_len_of};
 pub use observatory::{
-    CascadeForecast, CoherenceReading, CriticalSlowingDown, HealthField, forecast_cascade,
-    lag1_autocorrelation, read, windowed_variance,
+    CascadeForecast, CoherenceReading, CriticalSlowingDown, ForecastVerdict, HealthField,
+    forecast_cascade, lag1_autocorrelation, read, windowed_variance,
 };
 pub use rng::Rng;
 pub use sim::{FrameObs, Sim};
