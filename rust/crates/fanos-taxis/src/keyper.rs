@@ -251,8 +251,21 @@ impl KeyperRegistry {
     /// superseded set gathers no honest share and is dropped after the reveal window. That is a **bounded
     /// liveness cost, never a safety break** — the identical trade this module already names for a
     /// transaction sealed to non-committed keys. It is also why a rotating validator must keep its previous
-    /// KEM secret until every transaction sealed to it has been revealed; that obligation belongs to the
-    /// node, and `fanos-cli`'s `a_rotating_keyper_must_retain_the_superseded_secret` holds it to it.
+    /// KEM secret until every transaction sealed to it has been revealed.
+    ///
+    /// **That obligation is NOT enforced anywhere, and this line used to say it was** (#321). It cited
+    /// `fanos-cli`'s `a_rotating_keyper_must_retain_the_superseded_secret` as holding the node to it; that
+    /// test's own doc says the opposite in as many words — it is an **alarm, not a rule**, because "kept the
+    /// old secret long enough" is a property of a key store *over time* and no predicate over source text
+    /// separates a correct retention from a plausible-looking one. The alarm fires the day something
+    /// registers at a non-genesis generation, which is the same moment the retention is first needed: it is
+    /// a handover note, not a guarantee, and it arrives with the defect rather than before it.
+    ///
+    /// The citation mattered because of *where* it sat — a reader at the rotation mechanism, told the
+    /// obligation was already held, would not build the retention. What would make it a rule is the type
+    /// that test names: a key store that hands out the current KEM secret only together with the superseded
+    /// one, so forgetting it is a compile error. Until that exists, the honest statement is that this
+    /// mechanism creates an obligation the tree does not keep.
     #[must_use]
     pub fn descends_from(&self, founding: &Self, verifiers: &[HybridVerifier]) -> bool {
         self.certs.len() == founding.certs.len()
