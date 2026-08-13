@@ -133,14 +133,14 @@ impl ValidatorConfig {
         let (signer, kem_secret) = keys_from_seed(&self.node_seed);
         // Reconstruct the keyper registry so this validator can seal an auto-submitted slash to the epoch line.
         let keyper = KeyperRegistry::from_bytes(&self.keyper)?;
-        let slash_sealer = Some(build_slash_sealer(verifiers.clone(), keyper, self.epoch, self.cell));
+        let slash_sealer = Some(build_slash_sealer(verifiers.clone(), keyper.clone(), self.epoch, self.cell));
         Some(TaxisParams {
             cell: self.cell,
             me: self.me,
             signer,
             kem_secret,
             verifiers,
-            keyper_commit: self.keyper_commit,
+            keyper_founding: keyper,
             seed: self.beacon,
             epoch: self.epoch,
             genesis_state: build_genesis(&self.genesis_alloc),
@@ -350,7 +350,7 @@ pub fn deal_validators<R: CryptoRng>(
         let (sig, sig_pub) = HybridSigSecret::generate(&mut kr);
         let (_kem, kem_pub) = HybridKemSecret::generate(&mut kr);
         verifiers.push(sig_pub.encode());
-        certs.push(KeyperKeyCert::register(u8_of(i), kem_pub, &sig));
+        certs.push(KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, u8_of(i), kem_pub, &sig));
         node_seeds.push(node_seed);
     }
     // The full registry (the committee's KEM public keys) is what a *client* needs to seal a transaction to

@@ -125,9 +125,9 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
     let keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
 
     // Spawn a TAXIS driver on every node, each over a genesis HybridLedger holding Alice's shielded note.
     let mut handles = Vec::with_capacity(N);
@@ -138,7 +138,7 @@ async fn a_private_transfer_executes_over_live_consensus_end_to_end() {
             signer: k.sig,
             kem_secret: k.kem,
             verifiers: verifiers.clone(),
-            keyper_commit,
+            keyper_founding: keyper_founding.clone(),
             seed: SEED,
             epoch: EPOCH,
             genesis_state: genesis_ledger(),
@@ -268,9 +268,9 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
     let keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
 
     let mut handles = Vec::with_capacity(N);
     for (i, k) in keys.into_iter().enumerate() {
@@ -280,7 +280,7 @@ async fn a_transaction_submitted_over_the_network_to_one_validator_reaches_the_w
             signer: k.sig,
             kem_secret: k.kem,
             verifiers: verifiers.clone(),
-            keyper_commit,
+            keyper_founding: keyper_founding.clone(),
             seed: SEED,
             epoch: EPOCH,
             genesis_state: genesis_ledger(),
@@ -371,9 +371,9 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
     let keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
 
     let mut handles = Vec::with_capacity(N);
     for (i, k) in keys.into_iter().enumerate() {
@@ -383,7 +383,7 @@ async fn a_hash_locked_contract_is_funded_and_claimed_over_live_consensus() {
             signer: k.sig,
             kem_secret: k.kem,
             verifiers: verifiers.clone(),
-            keyper_commit,
+            keyper_founding: keyper_founding.clone(),
             seed: SEED,
             epoch: EPOCH,
             genesis_state: htlc_genesis_ledger(&sender),

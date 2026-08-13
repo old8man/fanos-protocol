@@ -171,9 +171,9 @@ impl Cluster {
         // The on-chain decryption-key commitment: each validator self-certifies its KEM key under its signing
         // key, and every engine agrees on the resulting commitment (an agreed genesis constant).
         let registry = KeyperRegistry::new(
-            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
         );
-        let keyper_commit = registry.commit();
+        let keyper_founding = registry.clone();
         let mut engines = Vec::new();
         for (i, k) in keys.into_iter().enumerate() {
             engines.push(ConsensusEngine::new(
@@ -182,7 +182,7 @@ impl Cluster {
                 k.sig,
                 k.kem,
                 verifiers.clone(),
-                keyper_commit,
+                keyper_founding.clone(),
                 SEED,
                 EPOCH,
                 genesis.clone(),
@@ -1641,10 +1641,9 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
         let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
         // The agreed decryption-key commitment binds each validator's genuine KEM key under its genuine signing
         // key — a Byzantine validator misbehaves in consensus, not in key registration.
-        let keyper_commit = KeyperRegistry::new(
-            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
-        )
-        .commit();
+        let keyper_founding = KeyperRegistry::new(
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        );
         let mut engines = Vec::new();
         let mut byz_sig: BTreeMap<u8, HybridSigSecret> = BTreeMap::new();
         for (i, k) in keys.into_iter().enumerate() {
@@ -1653,9 +1652,9 @@ fn run_no_fork_trials(trials: u64, require_liveness: bool, ssle: bool) {
                 byz_sig.insert(idx, k.sig);
                 let mut r = SeedRng::from_seed(&[0xDD, idx]);
                 let (dummy, _) = HybridSigSecret::generate(&mut r);
-                engines.push(ConsensusEngine::new(CellParams::FANO, idx, dummy, k.kem, verifiers.clone(), keyper_commit, SEED, EPOCH, genesis()));
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, dummy, k.kem, verifiers.clone(), keyper_founding.clone(), SEED, EPOCH, genesis()));
             } else {
-                engines.push(ConsensusEngine::new(CellParams::FANO, idx, k.sig, k.kem, verifiers.clone(), keyper_commit, SEED, EPOCH, genesis()));
+                engines.push(ConsensusEngine::new(CellParams::FANO, idx, k.sig, k.kem, verifiers.clone(), keyper_founding.clone(), SEED, EPOCH, genesis()));
             }
         }
         let honest: Vec<usize> = (0..N).filter(|i| !byz.contains(&(*i as u8))).collect();
@@ -2085,7 +2084,7 @@ fn the_agreed_keyper_registry_is_the_only_accepted_decryption_authority() {
                 let mut rng = SeedRng::from_seed(&[0xF0, i as u8]);
                 let (sig, _sig_pub) = HybridSigSecret::generate(&mut rng);
                 let (_kem, kem_pub) = HybridKemSecret::generate(&mut rng);
-                KeyperKeyCert::register(i as u8, kem_pub, &sig)
+                KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, kem_pub, &sig)
             })
             .collect(),
     );
@@ -2101,13 +2100,13 @@ fn b1_only_authenticated_reveals_are_buffered() {
     let mut keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
     // An engine for validator 1; validator 0's key stays available to sign a genuine reveal.
     let k1 = keys.remove(1);
     let mut engine =
-        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_commit, SEED, EPOCH, genesis());
+        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_founding.clone(), SEED, EPOCH, genesis());
 
     let commit: [u8; 32] = [0x42; 32]; // a commitment naming no finalized tx → the buffering path
 
@@ -2138,12 +2137,12 @@ fn a_flood_cannot_choose_which_buffered_reveal_it_evicts() {
     let mut keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
     let k1 = keys.remove(1);
     let mut engine =
-        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_commit, SEED, EPOCH, genesis());
+        ConsensusEngine::new(CellParams::FANO, 1, k1.sig, k1.kem, verifiers, keyper_founding.clone(), SEED, EPOCH, genesis());
 
     // An HONEST keyper's early reveal, at the smallest possible commit — which is what the old key-ordered
     // rule evicted first, and what an attacker would therefore arrange.

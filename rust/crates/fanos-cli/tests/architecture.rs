@@ -846,6 +846,64 @@ fn a_driver_carrying_a_re_genesis_certificate_must_also_read_its_own_stall() {
     );
 }
 
+/// **A keyper rotation creates a retention obligation — and this guard states honestly what a text scan
+/// can and cannot hold it to.**
+///
+/// `KeyperRegistry::descends_from` makes the anti-MEV decryption authority rotatable: a validator replaces
+/// its own key by self-certifying at a strictly greater generation. What that creates is an obligation the
+/// registry cannot express — the rotating validator must keep its **superseded** KEM secret until every
+/// transaction already sealed to the old key has passed its reveal window. Drop it early and those
+/// transactions gather no share from that seat and are discarded: the bounded liveness cost the module
+/// already names, paid for nothing.
+///
+/// Nothing in production registers at a non-genesis generation today, so there is nothing to retain yet.
+/// This fires the day that changes, and its message is the handover.
+///
+/// # Why this is an alarm and not a rule
+///
+/// `a_driver_carrying_a_re_genesis_certificate_must_also_read_its_own_stall` above is a **rule**: correct
+/// wiring keeps it green, so it survives the change it watches for. This one cannot be. "Kept the old
+/// secret long enough" is a property of a key store *over time*; no predicate over source text separates a
+/// correct retention from a plausible-looking one, and a guard that pretended otherwise would be the
+/// [[a-silent-guard-is-not-evidence]] shape.
+///
+/// What would make it a rule is a **type**: a key store that hands out the current KEM secret only
+/// together with the superseded one, so forgetting it is a compile error rather than an omission. That is
+/// exactly how #234 held the genesis morph and #199 the admission outcomes — a type that cannot be
+/// ignored beats a guard that can be deleted. Build that when the rotation path is built, and replace
+/// this test with it.
+#[test]
+fn a_rotating_keyper_must_retain_the_superseded_secret() {
+    const CALL: &str = "KeyperKeyCert::register(";
+    let sources = production_sources();
+
+    // Assert the scan before the finding: the founding-registry site must be visible, or "no rotation in
+    // production" would be a claim about this scan.
+    assert!(
+        sources.iter().any(|(_, t)| t.contains(CALL)),
+        "the scan cannot see a single `{CALL}` in production, so its verdict about rotation sites is a \
+         claim about this scan and not about the tree"
+    );
+
+    let rotations: Vec<&str> = sources
+        .iter()
+        .filter(|(_, text)| {
+            text.match_indices(CALL)
+                .any(|(at, _)| !text[at + CALL.len()..].trim_start().starts_with("KeyperKeyCert::GENESIS_GENERATION"))
+        })
+        .map(|(krate, _)| krate.as_str())
+        .collect();
+    assert!(
+        rotations.is_empty(),
+        "production code in {rotations:?} now registers a keyper key at a NON-genesis generation — the \
+         anti-MEV decryption authority rotates. Two things must hold and neither is checkable here: the \
+         rotating validator keeps its SUPERSEDED KEM secret until every transaction sealed to the old key \
+         has passed its reveal window (else those transactions lose that seat's share and are dropped), \
+         and the served registry still satisfies `KeyperRegistry::descends_from` at every reader. Verify \
+         both, then replace this alarm with the key-store TYPE its doc describes."
+    );
+}
+
 /// The unwired public functions, by crate.
 fn unwired_by_crate() -> BTreeMap<String, BTreeSet<String>> {
     let sources = production_sources();

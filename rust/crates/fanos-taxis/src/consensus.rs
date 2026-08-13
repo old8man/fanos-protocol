@@ -889,10 +889,16 @@ pub struct ConsensusEngine<S: StateMachine> {
     signer: HybridSigSecret,
     kem_secret: HybridKemSecret,
     verifiers: Vec<HybridVerifier>,
-    // The on-chain anti-MEV decryption-key commitment (`crate::keyper`): the agreed hash of every validator's
-    // self-certified KEM decryption key. An agreed genesis constant alongside `verifiers` and `seed`; a
-    // validator only serves clients a keyper registry that both verifies against `verifiers` and matches this.
-    keyper_commit: [u8; 32],
+    // The cell's **founding** anti-MEV decryption-key registry (`crate::keyper`): every validator's
+    // self-certified KEM decryption key at `GENESIS_GENERATION`. An agreed genesis constant alongside
+    // `verifiers` and `seed`.
+    //
+    // The whole registry rather than its hash, because equality to a hash is what made the decryption
+    // authority immutable: leaked keyper secrets accumulated and nothing could replace them. A validator
+    // now serves a registry that *descends from* this one — identical certs, or strictly-later generations
+    // signed by the same consensus keys — so rotation and revocation are expressible without a new trust
+    // root. The hash is still available as `keyper_commit()`, derived rather than stored.
+    keyper_founding: crate::keyper::KeyperRegistry,
     seed: BeaconSeed,
     epoch: Epoch,
     round: u32,
@@ -1103,7 +1109,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
         signer: HybridSigSecret,
         kem_secret: HybridKemSecret,
         verifiers: Vec<HybridVerifier>,
-        keyper_commit: [u8; 32],
+        keyper_founding: crate::keyper::KeyperRegistry,
         seed: BeaconSeed,
         epoch: Epoch,
         genesis_state: S,
@@ -1114,7 +1120,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
             signer,
             kem_secret,
             verifiers,
-            keyper_commit,
+            keyper_founding,
             seed,
             epoch,
             round: 0,
@@ -1218,7 +1224,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// served registry names the real decryption authority.
     #[must_use]
     pub fn keyper_commit(&self) -> [u8; 32] {
-        self.keyper_commit
+        self.keyper_founding.commit()
     }
 
     /// Whether `registry` is the cell's agreed anti-MEV decryption authority: it must both **verify** against
@@ -1228,7 +1234,7 @@ impl<S: StateMachine> ConsensusEngine<S> {
     /// cell — closing the key-substitution gap ([`crate::keyper`]).
     #[must_use]
     pub fn accepts_keyper_registry(&self, registry: &crate::keyper::KeyperRegistry) -> bool {
-        registry.commit() == self.keyper_commit && registry.verify(&self.verifiers)
+        registry.descends_from(&self.keyper_founding, &self.verifiers)
     }
 
     /// The height currently being decided (the chain's next height).

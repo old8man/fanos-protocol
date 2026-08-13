@@ -129,10 +129,9 @@ impl<S: StateMachine + Clone> Cell<S> {
         let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
         let kem_dir: Vec<HybridKemPublic> = keys.iter().map(|k| k.kem_pub.clone()).collect();
         // The on-chain anti-MEV decryption-key commitment (each validator self-certifies its KEM key).
-        let keyper_commit = KeyperRegistry::new(
-            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
-        )
-        .commit();
+        let keyper_founding = KeyperRegistry::new(
+            keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        );
         let engines = keys
             .into_iter()
             .enumerate()
@@ -143,7 +142,7 @@ impl<S: StateMachine + Clone> Cell<S> {
                     k.sig,
                     k.kem,
                     verifiers.clone(),
-                    keyper_commit,
+                    keyper_founding.clone(),
                     SEED,
                     EPOCH,
                     genesis.clone(),

@@ -222,8 +222,10 @@ pub struct TaxisParams<S> {
     pub kem_secret: HybridKemSecret,
     /// Every validator's signature verifier, indexed by validator index.
     pub verifiers: Vec<HybridVerifier>,
-    /// The agreed on-chain decryption-key commitment ([`fanos_taxis::keyper`]).
-    pub keyper_commit: [u8; 32],
+    /// The cell's **founding** decryption-key registry ([`fanos_taxis::keyper`]) — the whole registry, not
+    /// its hash, because a served registry is accepted when it DESCENDS from this one (rotation/revocation),
+    /// not when it equals it. The commitment is derived from it by the engine.
+    pub keyper_founding: fanos_taxis::keyper::KeyperRegistry,
     /// The epoch beacon seed (fixes the leader schedule + keyper line).
     pub seed: BeaconSeed,
     /// The epoch this cell runs at.
@@ -479,7 +481,7 @@ where
             params.signer,
             params.kem_secret,
             params.verifiers,
-            params.keyper_commit,
+            params.keyper_founding,
             params.seed,
             params.epoch,
             params.genesis_state,

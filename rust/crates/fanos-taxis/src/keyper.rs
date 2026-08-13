@@ -6,10 +6,17 @@
 //! Ferveo solve this by registering the decryption key **on-chain**; this module is the FANOS post-quantum
 //! analogue.
 //!
-//! Each validator **self-certifies** its decryption key: [`KeyperKeyCert::register`] signs `idx ‖ kem_public`
-//! under the validator's *consensus signing key*, so the decryption key binds to the already-committed
-//! consensus identity `verifiers[idx]` — adding **no new trust root**. The [`KeyperRegistry`] is the full,
-//! ordered set of these certs.
+//! Each validator **self-certifies** its decryption key: [`KeyperKeyCert::register`] signs
+//! `generation ‖ idx ‖ kem_public` under the validator's *consensus signing key*, so the decryption key
+//! binds to the already-committed consensus identity `verifiers[idx]` — adding **no new trust root**. The
+//! [`KeyperRegistry`] is the full, ordered set of these certs.
+//!
+//! The `generation` is what makes the authority **rotatable and revocable**. Without it the registry was a
+//! genesis constant checked by equality, so a leaked keyper secret could never be replaced: leaks
+//! accumulate, `seal_threshold()` is the only thing between them and a transparent mempool, and that count
+//! never falls — the anti-MEV guarantee decayed monotonically with the cell's age. Rotation needs no
+//! ordering service, because the single writer for a validator's decryption key is that validator's own
+//! consensus key; see [`KeyperRegistry::descends_from`] for the rule and the fence it reuses.
 //!
 //! * [`KeyperRegistry::verify`] checks every cert against the committed consensus keys, binding the whole
 //!   decryption authority to the validator identities — run once at cell formation.
@@ -48,46 +55,74 @@ const COMMIT_LABEL: &str = "FANOS-v1/taxis-keyper-commit";
 /// [`commit`](KeyperRegistry::commit).
 #[derive(Clone)]
 pub struct KeyperKeyCert {
+    /// The **generation** this key belongs to — the fencing counter that makes rotation and revocation
+    /// expressible (see [`GENESIS_GENERATION`](Self::GENESIS_GENERATION) and
+    /// [`KeyperRegistry::descends_from`]). Signed, so a validator cannot be given a generation it did not
+    /// choose, and strictly monotone per validator, so at most one key is ever validly certified per
+    /// generation.
+    pub generation: u64,
     /// The validator's hybrid-KEM public (decryption) key — what transactions to it are sealed to.
     pub kem_public: HybridKemPublic,
     /// The validator's signature over [`signable`](Self::signable), `HYBRID_SIG_LEN` bytes.
     sig: Vec<u8>,
 }
 
+/// The fixed serialized width of one cert: `generation(8) ‖ kem_public ‖ sig`.
+const CERT_LEN: usize = 8 + PUBLIC_LEN + HYBRID_SIG_LEN;
+
 impl KeyperKeyCert {
-    /// The signed content binding a decryption key to its owner: the domain-separation label `‖ idx(1) ‖
-    /// kem_public(PUBLIC_LEN)`. A signature under validator `idx`'s key attests "validator `idx`'s anti-MEV
-    /// decryption key is exactly this key"; the label stops the signature being reused as any other TAXIS message.
+    /// The generation every cell's founding registry is dealt at. A rotation is any strictly greater value.
+    pub const GENESIS_GENERATION: u64 = 0;
+
+    /// The signed content binding a decryption key to its owner **at a generation**: the domain-separation
+    /// label `‖ generation(8) ‖ idx(1) ‖ kem_public(PUBLIC_LEN)`. A signature under validator `idx`'s key
+    /// attests "validator `idx`'s anti-MEV decryption key at generation `g` is exactly this key"; the label
+    /// stops the signature being reused as any other TAXIS message.
+    ///
+    /// The generation is **inside** the signature rather than beside it, which is the whole point: an
+    /// attacker holding a leaked key and its old cert cannot re-present it at a higher generation, and a
+    /// peer relaying a cert cannot renumber it.
     #[must_use]
-    fn signable(idx: u8, kem_public: &HybridKemPublic) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KEY_CERT_LABEL.len() + 1 + PUBLIC_LEN);
+    fn signable(generation: u64, idx: u8, kem_public: &HybridKemPublic) -> Vec<u8> {
+        let mut out = Vec::with_capacity(KEY_CERT_LABEL.len() + 8 + 1 + PUBLIC_LEN);
         out.extend_from_slice(KEY_CERT_LABEL.as_bytes());
+        out.extend_from_slice(&generation.to_be_bytes());
         out.push(idx);
         out.extend_from_slice(&kem_public.encode());
         out
     }
 
-    /// Validator `idx` self-certifies `kem_public` under its consensus signing key.
+    /// Validator `idx` self-certifies `kem_public` at `generation`, under its consensus signing key.
+    ///
+    /// The generation is an explicit argument with no default: a caller that means "the founding registry"
+    /// says [`GENESIS_GENERATION`](Self::GENESIS_GENERATION), and a caller that means "replace my
+    /// compromised key" says what it is replacing. A defaulted counter is a counter nobody advances.
     #[must_use]
-    pub fn register(idx: u8, kem_public: HybridKemPublic, signer: &HybridSigSecret) -> Self {
-        let sig = signer.sign(&Self::signable(idx, &kem_public)).to_bytes();
-        Self { kem_public, sig }
+    pub fn register(
+        generation: u64,
+        idx: u8,
+        kem_public: HybridKemPublic,
+        signer: &HybridSigSecret,
+    ) -> Self {
+        let sig = signer.sign(&Self::signable(generation, idx, &kem_public)).to_bytes();
+        Self { generation, kem_public, sig }
     }
 
     /// Whether this cert verifies under `verifier` — validator `idx`'s consensus signing key — i.e. the
-    /// decryption key genuinely belongs to that consensus identity.
+    /// decryption key genuinely belongs to that consensus identity **at this cert's generation**.
     #[must_use]
     pub fn verify(&self, idx: u8, verifier: &HybridVerifier) -> bool {
         let Some(sig) = HybridSignature::from_bytes(&self.sig) else {
             return false;
         };
-        verifier.verify(&Self::signable(idx, &self.kem_public), &sig)
+        verifier.verify(&Self::signable(self.generation, idx, &self.kem_public), &sig)
     }
 
-    /// Canonical bytes: `kem_public(PUBLIC_LEN) ‖ sig(HYBRID_SIG_LEN)`, both fixed width.
+    /// Canonical bytes: `generation(8) ‖ kem_public(PUBLIC_LEN) ‖ sig(HYBRID_SIG_LEN)`, all fixed width.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PUBLIC_LEN + HYBRID_SIG_LEN);
+        let mut out = Vec::with_capacity(CERT_LEN);
+        out.extend_from_slice(&self.generation.to_be_bytes());
         out.extend_from_slice(&self.kem_public.encode());
         out.extend_from_slice(&self.sig);
         out
@@ -96,12 +131,13 @@ impl KeyperKeyCert {
     /// Decode from [`to_bytes`](Self::to_bytes), or `None` if malformed / wrong length.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != PUBLIC_LEN + HYBRID_SIG_LEN {
+        if bytes.len() != CERT_LEN {
             return None;
         }
-        let kem_public = HybridKemPublic::decode(bytes.get(..PUBLIC_LEN)?)?;
-        let sig = bytes.get(PUBLIC_LEN..)?.to_vec();
-        Some(Self { kem_public, sig })
+        let generation = u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?);
+        let kem_public = HybridKemPublic::decode(bytes.get(8..8 + PUBLIC_LEN)?)?;
+        let sig = bytes.get(8 + PUBLIC_LEN..)?.to_vec();
+        Some(Self { generation, kem_public, sig })
     }
 }
 
@@ -137,7 +173,7 @@ impl KeyperRegistry {
     /// chain-info file so `fanos pay` can reconstruct the sealing authority.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.certs.len() * (PUBLIC_LEN + HYBRID_SIG_LEN));
+        let mut out = Vec::with_capacity(4 + self.certs.len() * CERT_LEN);
         out.extend_from_slice(&u32::try_from(self.certs.len()).unwrap_or(u32::MAX).to_be_bytes());
         for c in &self.certs {
             out.extend_from_slice(&c.to_bytes());
@@ -149,7 +185,7 @@ impl KeyperRegistry {
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let n = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-        let cert_len = PUBLIC_LEN + HYBRID_SIG_LEN;
+        let cert_len = CERT_LEN;
         let mut certs = Vec::with_capacity(n.min(4096));
         let mut off: usize = 4;
         for _ in 0..n {
@@ -181,6 +217,51 @@ impl KeyperRegistry {
                 .zip(verifiers)
                 .enumerate()
                 .all(|(i, (c, v))| c.verify(u8::try_from(i).unwrap_or(u8::MAX), v))
+    }
+
+    /// Whether `self` is a **valid successor** of the cell's founding registry: every cert is either
+    /// byte-identical to the founding one, or carries a *strictly greater* generation and verifies under the
+    /// same consensus key. This is what makes the anti-MEV decryption authority rotatable and revocable
+    /// without a new trust root, a new transaction kind, or any consensus change.
+    ///
+    /// # Why this shape, and why it needed no ordering mechanism
+    ///
+    /// Before this, `keyper_commit` was a genesis constant and the acceptance rule was *equality* to it, so
+    /// the decryption authority was fixed for the life of the cell. That is not merely inconvenient: leaked
+    /// keyper secrets **accumulate and nothing removes them**, so the only thing standing between the
+    /// accrued leaks and a transparent anti-MEV mempool is `seal_threshold()` — a count that never goes
+    /// down. The strength of the mempool decayed monotonically with the cell's age and no operator action
+    /// could reverse it.
+    ///
+    /// The fix reuses a fence FANOS already runs, one level down. `RecoveryAuthorization` subordinates a
+    /// returning partition with **single-writer authority + a strictly-monotonic generation**; here the
+    /// single writer for validator `i`'s decryption key is validator `i` itself, speaking with the consensus
+    /// key that `verifiers[i]` already commits to. So no ordering service is needed: two candidate certs for
+    /// one validator are resolved by their generations, and equal generations with different keys are
+    /// *equivocation by the validator itself* — refused here, because the identical-bytes branch is the only
+    /// way an equal generation passes.
+    ///
+    /// A client can check this with what it already holds: `GenesisParams` publishes the **whole founding
+    /// registry**, not just its commitment, so the founding certs — and through them `verifiers` — are in
+    /// hand.
+    ///
+    /// # The cost, stated where it is paid
+    ///
+    /// Two clients at different generations seal to different key sets, and a transaction sealed to a
+    /// superseded set gathers no honest share and is dropped after the reveal window. That is a **bounded
+    /// liveness cost, never a safety break** — the identical trade this module already names for a
+    /// transaction sealed to non-committed keys. It is also why a rotating validator must keep its previous
+    /// KEM secret until every transaction sealed to it has been revealed; that obligation belongs to the
+    /// node, and `fanos-cli`'s `a_rotating_keyper_must_retain_the_superseded_secret` holds it to it.
+    #[must_use]
+    pub fn descends_from(&self, founding: &Self, verifiers: &[HybridVerifier]) -> bool {
+        self.certs.len() == founding.certs.len()
+            && self.verify(verifiers)
+            && self
+                .certs
+                .iter()
+                .zip(&founding.certs)
+                .all(|(now, was)| now.generation > was.generation || now.to_bytes() == was.to_bytes())
     }
 
     /// The on-chain decryption-key commitment: `H_label(n(4) ‖ kem_public₀ ‖ … ‖ kem_public_{n−1})`. Bound to
@@ -260,7 +341,7 @@ mod tests {
             let (signer, verifier) = HybridSigSecret::generate(&mut rng);
             let mut krng = SeedRng::from_seed(&[0xB0, i as u8]);
             let (kem_secret, kem_public) = HybridKemSecret::generate(&mut krng);
-            certs.push(KeyperKeyCert::register(i as u8, kem_public, &signer));
+            certs.push(KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, kem_public, &signer));
             signers.push(signer);
             verifiers.push(verifier);
             kem_secrets.push(kem_secret);
@@ -311,14 +392,80 @@ mod tests {
     }
 
     #[test]
-    fn a_cert_round_trips_through_bytes() {
+    fn a_cert_round_trips_through_bytes_carrying_its_generation() {
         let (_s, _v, _k, registry) = cell(3);
         let cert = &registry.certs[0];
         let bytes = cert.to_bytes();
-        assert_eq!(bytes.len(), PUBLIC_LEN + HYBRID_SIG_LEN);
+        assert_eq!(bytes.len(), CERT_LEN, "generation(8) ‖ kem_public ‖ sig");
         let decoded = KeyperKeyCert::from_bytes(&bytes).expect("a full cert decodes");
         assert_eq!(decoded.to_bytes(), bytes, "the cert round-trips through its canonical bytes");
+        // The generation is the field this round-trip exists to protect: a codec that dropped it would
+        // still satisfy a byte-equality check on a registry dealt entirely at generation 0.
+        assert_eq!(
+            decoded.generation,
+            KeyperKeyCert::GENESIS_GENERATION,
+            "the founding registry is dealt at the genesis generation"
+        );
+        let rotated = {
+            let (signers, _v, _k, _r) = cell(3);
+            let mut krng = SeedRng::from_seed(b"rotated-key");
+            let (_secret, fresh_public) = HybridKemSecret::generate(&mut krng);
+            KeyperKeyCert::register(7, 0, fresh_public, &signers[0])
+        };
+        let back = KeyperKeyCert::from_bytes(&rotated.to_bytes()).expect("a rotated cert decodes");
+        assert_eq!(back.generation, 7, "a non-zero generation survives the wire");
         assert!(KeyperKeyCert::from_bytes(&bytes[..bytes.len() - 1]).is_none(), "a truncated cert is rejected");
+    }
+
+    /// A fresh KEM public key, distinct from any the fixture deals.
+    fn fresh_key(tag: &[u8]) -> HybridKemPublic {
+        let mut krng = SeedRng::from_seed(tag);
+        HybridKemSecret::generate(&mut krng).1
+    }
+
+    /// **The rotation rule, in every direction it can be wrong.**
+    ///
+    /// The accepted direction is one assertion; the four refused ones are the reason the rule exists. The
+    /// equal-generation case is the sharpest: both certs are validly signed by the true validator, so no
+    /// signature check separates them — only the monotone counter does, and it does so by making the
+    /// identical-bytes branch the ONLY way an equal generation passes.
+    #[test]
+    fn a_successor_registry_must_advance_the_generation_and_may_not_equivocate() {
+        let (signers, verifiers, _k, founding) = cell(3);
+        assert!(founding.descends_from(&founding, &verifiers), "a registry descends from itself");
+
+        let rotate = |idx: usize, generation: u64, tag: &[u8], signer: &HybridSigSecret| {
+            let mut certs = founding.certs.clone();
+            certs[idx] = KeyperKeyCert::register(generation, u8::try_from(idx).unwrap_or(0), fresh_key(tag), signer);
+            KeyperRegistry::new(certs)
+        };
+
+        assert!(
+            rotate(1, 1, b"gen-1", &signers[1]).descends_from(&founding, &verifiers),
+            "validator 1 replacing its own key at a strictly greater generation is the whole point"
+        );
+        assert!(
+            !rotate(1, KeyperKeyCert::GENESIS_GENERATION, b"equivocation", &signers[1])
+                .descends_from(&founding, &verifiers),
+            "a SECOND key validly signed at the SAME generation is the validator equivocating — refused, \
+             and nothing but the counter could refuse it"
+        );
+        assert!(
+            !rotate(1, 1, b"impostor", &signers[2]).descends_from(&founding, &verifiers),
+            "a rotation signed by a different validator is refused — the single writer is the seat's own key"
+        );
+
+        // A rollback: start from a rotated registry and try to return to the founding one.
+        let rotated = rotate(1, 5, b"gen-5", &signers[1]);
+        assert!(rotated.descends_from(&founding, &verifiers), "the rotated registry is a valid successor");
+        assert!(
+            !founding.descends_from(&rotated, &verifiers),
+            "and the founding registry is NOT a successor of it — a revoked key cannot be reinstated, which \
+             is exactly what makes revocation mean anything"
+        );
+
+        let short = KeyperRegistry::new(founding.certs[..2].to_vec());
+        assert!(!short.descends_from(&founding, &verifiers), "a partial registry is not a valid authority");
     }
 
     #[test]

@@ -94,9 +94,9 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     let keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
 
     // Secret-leader sortition registration: each validator's Merkle-VRF root, agreed committee config (like
     // the verifiers). Enabling it here proves SSLE runs over REAL QUIC — round 0 is the all-propose min-ticket
@@ -113,7 +113,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
             signer: k.sig,
             kem_secret: k.kem,
             verifiers: verifiers.clone(),
-            keyper_commit,
+            keyper_founding: keyper_founding.clone(),
             seed: SEED,
             epoch: EPOCH,
             genesis_state: genesis(),
@@ -249,16 +249,16 @@ async fn a_validator_joining_late_reaches_the_cells_executed_state() {
     let keys = gen_keys();
     let verifiers: Vec<HybridVerifier> = keys.iter().map(|k| k.sig_pub.clone()).collect();
     let registry = KeyperRegistry::new(
-        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(i as u8, k.kem_pub.clone(), &k.sig)).collect(),
+        keys.iter().enumerate().map(|(i, k)| KeyperKeyCert::register(KeyperKeyCert::GENESIS_GENERATION, i as u8, k.kem_pub.clone(), &k.sig)).collect(),
     );
-    let keyper_commit = registry.commit();
+    let keyper_founding = registry.clone();
     let params_for = |i: usize, k: Keys| TaxisParams {
         cell: CellParams::FANO,
         me: i as u8,
         signer: k.sig,
         kem_secret: k.kem,
         verifiers: verifiers.clone(),
-        keyper_commit,
+        keyper_founding: keyper_founding.clone(),
         seed: SEED,
         epoch: EPOCH,
         genesis_state: genesis(),
