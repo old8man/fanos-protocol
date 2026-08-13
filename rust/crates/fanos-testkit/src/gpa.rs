@@ -4,7 +4,7 @@
 //! These three functions lived privately inside `fanos-sim/tests/traffic_analysis.rs`, which taps a
 //! `NyxNode`. The composed relay — what a `--relay` deployment actually runs — needs the same statistics
 //! over a different tape, and the only way to get them there was to copy them. A copied scan inherits none
-//! of the corrections the original has already paid for, and [`best_lag_score`] below carries one that cost
+//! of the corrections the original has already paid for, and `best_lag_score` below carries one that cost
 //! a whole investigation (#187): a zero-lag matcher scored **below chance**, which is not safety.
 //!
 //! Deliberately only the pure `&[f64] -> f64` half. Turning a frame tape into per-node rate series needs
