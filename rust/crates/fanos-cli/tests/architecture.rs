@@ -703,6 +703,67 @@ fn the_sybil_cap_still_has_no_producer_and_two_tasks_wait_on_that() {
     );
 }
 
+/// **Two tasks wait on one structure `fanos-pqcrypto` does not have. This is the alarm for the day it
+/// arrives.**
+///
+/// `sig.rs`'s header states the gap from the producer's side: a hybrid signature is an opaque 3373-byte
+/// blob, because **a hybrid is the intersection of its components' capabilities, not the union**. Ed25519
+/// supports key blinding in production elsewhere (Tor v3 onion services); ML-DSA-65 is Fiat–Shamir with
+/// aborts, whose rejection sampling destroys the linearity both aggregation and blinding need; so the
+/// pair supports neither.
+///
+/// Two open tasks are blocked on that single absence and on nothing else:
+///
+/// * **#66** — a `fanos_taxis::vote::Certificate` is `Q` signatures where an aggregate would be one, so
+///   TAXIS pays a whole consensus phase: 140.2 KiB per block at the Fano cell and 10.41 MiB at `q = 7`,
+///   derived from the real constants by `a_commit_certificate_is_q_signatures_and_that_is_the_whole_of_66`.
+/// * **#67** — a hidden service's registration carries its identity bundle in the clear beside the
+///   epoch-rotating tag, so every meeting combiner is a timestamped record of which services exist and
+///   when (`docs/design-anonymity-substrate.md` §T2). Per-epoch key blinding is what closes it.
+///
+/// Neither is FANOS's to close alone — which is exactly why nobody is working toward the day it clears,
+/// and so nothing would notice that it had. That is [[a-conditional-obligation-needs-a-tripwire]], the
+/// same shape as `the_sybil_cap_still_has_no_producer_and_two_tasks_wait_on_that` above; the two are the
+/// blocked-on-a-missing-subsystem family, and they should stay side by side.
+///
+/// The scan reads **code only** — `code_only` drops every `//`-prefixed line — so the prose in `sig.rs`
+/// that names the gap cannot trip its own alarm. `aggregat` and `blind` are each measured at zero
+/// occurrences in that crate today; `threshold` is deliberately not scanned, because it already appears
+/// and a stem that is not zero cannot report an arrival.
+#[test]
+fn two_field_wide_tasks_wait_on_one_absent_signature_structure() {
+    let sources = production_sources();
+    let pq: Vec<&String> =
+        sources.iter().filter(|(k, _)| k == "fanos-pqcrypto").map(|(_, text)| text).collect();
+
+    // Assert the scan before the finding: a corpus that cannot see the crate proves nothing about what
+    // the crate lacks.
+    assert!(
+        pq.iter().any(|t| t.contains("HYBRID_SIG_LEN")),
+        "the scan sees {} fanos-pqcrypto source files and none defines HYBRID_SIG_LEN, so its verdict \
+         about a missing signature structure is a claim about this scan and not about the crate",
+        pq.len()
+    );
+
+    let hits: Vec<&str> = pq
+        .iter()
+        .flat_map(|t| t.lines())
+        .filter(|l| {
+            let low = l.to_ascii_lowercase();
+            low.contains("aggregat") || low.contains("blind")
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "fanos-pqcrypto's CODE now mentions aggregation or key blinding ({hits:?}). If that is a real \
+         primitive rather than a name collision, TWO blocked tasks just became work: #66 (collapse \
+         TAXIS's third phase — `Certificate` becomes one constant-size object, saving a factor of Q: \
+         5x on Fano, 37x at q=7) and #67 (per-epoch blinding of a hidden service's registration key, \
+         which is what makes the meeting combiner stop being a service census). Read `sig.rs`'s header \
+         and `Certificate`'s, which state each side, then delete this test and open both."
+    );
+}
+
 /// The unwired public functions, by crate.
 fn unwired_by_crate() -> BTreeMap<String, BTreeSet<String>> {
     let sources = production_sources();

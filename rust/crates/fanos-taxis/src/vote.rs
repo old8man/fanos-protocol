@@ -156,6 +156,34 @@ impl SignedVote {
 
 /// A quorum certificate: `Q` distinct validators' signatures agreeing on one `(phase, height, round,
 /// block_hash)`. A `PREPARE` certificate locks a block; a `COMMIT` certificate finalizes it.
+///
+/// # Why this is a `Vec` and not one signature — the price of the third phase (#66)
+///
+/// A `SignedVote` on the wire is `VOTE_LEN + HYBRID_SIG_LEN` = `46 + 3373` = **3419 bytes**, and a
+/// certificate carries `Q` of them, so **it grows linearly in the cell** where an aggregate would not:
+///
+/// | `q` | `n` | `Q` | certificate | if aggregated | saving | COMMIT all-to-all, `n(n−1)` |
+/// |----:|----:|----:|------------:|--------------:|-------:|----------------------------:|
+/// | 2 (Fano) |  7 |  5 |  17 095 B |  3419 B |  `5×` |  140.2 KiB per block |
+/// | 4        | 21 | 14 |  47 866 B |  3421 B | `13×` |  1.37 MiB per block |
+/// | 7        | 57 | 38 | 129 922 B |  3426 B | `37×` | 10.41 MiB per block |
+///
+/// Every 2-phase BFT construction collapses the extra round by *aggregating* a quorum into one
+/// **constant-size** certificate: one signature plus a `⌈n/8⌉`-byte signer bitmap in place of the
+/// per-vote voter byte — the "if aggregated" column, which moves by 7 bytes across the range where the
+/// certificate moves by 112 827.
+///
+/// The reason FANOS does not take that saving is not a design choice made here: [`fanos_pqcrypto::sig`]
+/// has no aggregate or threshold signature, because ML-DSA-65 is Fiat–Shamir with aborts and the
+/// rejection sampling that makes it secure is what destroys the linearity an aggregate needs. That
+/// module's header states the gap and names the other task waiting on the same absence (#67).
+///
+/// **What is available without it**, and is not blocked: measure the round-trip against the block period
+/// before assuming the phase is what hurts, and look at overlapping the anti-MEV REVEAL with COMMIT,
+/// which no BFT result forbids (`docs/audit.md` §5).
+///
+/// Every figure above is computed from the real constants — never from this comment — by
+/// `a_commit_certificate_is_q_signatures_and_that_is_the_whole_of_66`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Certificate {
     /// The phase all votes belong to.
@@ -249,7 +277,7 @@ impl Certificate {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
@@ -318,6 +346,50 @@ mod tests {
             phase: Phase::Commit, height: 1, round: 0, block_hash: [3u8; 32], votes: vec![forged],
         };
         assert!(!cert.verify(1, &verifiers), "a signature under the wrong key is rejected");
+    }
+
+    /// **The price of the third phase, computed rather than quoted** (#66).
+    ///
+    /// The width is taken from a real signed vote's own `to_bytes()`, never from `VOTE_LEN +
+    /// HYBRID_SIG_LEN`. Those two are the *inputs* to the claim: a test that re-added them would agree
+    /// with the `Certificate` doc by construction while saying nothing about what the wire carries.
+    ///
+    /// **Every number the doc's table quotes is pinned here exactly, including the aggregate column.**
+    /// The first version of this test pinned only the certificate and checked the saving as
+    /// `ratio >= Q - 1`, which left the aggregate itself unpinned — a mis-derived aggregate up to a
+    /// quarter too large would have passed at `q = 2`. An inequality where an equality is available is
+    /// slack, and slack is where a wrong number lives.
+    ///
+    /// If this fails because a figure moved, the doc's table moved with it — update both, and check
+    /// `fanos_pqcrypto::sig`'s header, which states the same gap from the other side.
+    #[test]
+    fn a_commit_certificate_is_q_signatures_and_that_is_the_whole_of_66() {
+        let (secrets, _) = validators(1);
+        let vote = Vote { height: 1, round: 0, block_hash: [7u8; 32], phase: Phase::Commit, voter: 0 };
+        let on_wire = SignedVote::sign(vote, &secrets[0]).to_bytes().len();
+        assert_eq!(on_wire, 3419, "one signed vote on the wire — 46 B of content and a 3373 B hybrid signature");
+
+        // (q, certificate, aggregated, saving, all-to-all COMMIT) — exactly the `Certificate` doc's table.
+        for (q, cert_b, agg_b, saving, phase_b) in [
+            (2u32, 17_095usize, 3419usize, 5usize, 143_598usize),
+            (4, 47_866, 3421, 13, 1_435_980),
+            (7, 129_922, 3426, 37, 10_913_448),
+        ] {
+            let p = crate::CellParams::for_order(q).expect("a valid plane order");
+            let cert = p.quorum() * on_wire;
+            // What an aggregate would cost instead: one signature, one `⌈n/8⌉` signer bitmap, and no
+            // per-vote voter byte (the bitmap replaces it).
+            let aggregated = (VOTE_LEN - 1) + HYBRID_SIG_LEN + p.n().div_ceil(8);
+
+            assert_eq!(cert, cert_b, "the q={q} certificate the doc quotes");
+            assert_eq!(aggregated, agg_b, "the q={q} aggregated certificate the doc quotes");
+            assert_eq!(cert / aggregated, saving, "the q={q} saving the doc quotes as a factor");
+            assert_eq!(
+                p.n() * (p.n() - 1) * on_wire,
+                phase_b,
+                "the q={q} all-to-all COMMIT phase the doc quotes"
+            );
+        }
     }
 
     #[test]

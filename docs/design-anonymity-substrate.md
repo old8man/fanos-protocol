@@ -221,6 +221,16 @@ iff `δ=negl`), with the achieved rung *named* in the Kuhn et al. notions (*PoPE
   per-epoch key blinding to close (a field-wide PQ gap, #67). The correction was already written down; it was
   written *there*, where a reader who stopped at this line would never reach it — which is the same defect as
   a stale status line, one section over.
+
+  *Extended by #305, one turn of the same screw.* The blocker was written down here and **nowhere the code
+  could be read from**: `fanos-pqcrypto/src/sig.rs`, the crate that actually lacks the structure, mentioned
+  neither blinding nor the two subsystems paying for its absence. It now states both, and the condition has a
+  tripwire — `two_field_wide_tasks_wait_on_one_absent_signature_structure` fails the day that crate gains
+  aggregation or blinding, because #67 and #66 clear together and a field-wide gap is precisely the kind
+  nobody is watching for. The sharp fact worth carrying: **a hybrid signature is the intersection of its
+  components' capabilities, not the union.** Ed25519 alone *does* support key blinding — Tor v3 runs on it —
+  and the hybrid still gets none, because ML-DSA has no blinded variant. The same "both must verify" that
+  makes the hedge safe is what makes every structural feature unavailable.
 - **T3 (intersection resistance from rotation).** Prove per-epoch coordinate rotation *lowers* the long-term
   `α_RA`-advantage — the non-trivial direction — because the threshold hop's `P_break` (T4) attenuates each
   rotation's predecessor gain below the intersection-attack's sampling gain (§3a). The receiver-side

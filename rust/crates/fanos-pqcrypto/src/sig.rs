@@ -3,6 +3,43 @@
 //! Both signatures are produced over the same message and *both* must verify. Forgery
 //! therefore requires breaking Ed25519 **and** ML-DSA-65 — a classical + post-quantum hedge.
 //! This binds a FANOS node's long-term identity and its coordinate proofs (spec §L0, §7.3).
+//!
+//! # What this scheme does not provide, and who pays for it
+//!
+//! A signature here is an **opaque 3373-byte blob** ([`HYBRID_SIG_LEN`]) with no algebraic structure a
+//! caller can exploit. Two structures FANOS has architectural uses for are absent:
+//!
+//! * **Aggregation** — combining `k` signatures on the same message into one object of size independent
+//!   of `k`. ML-DSA-65 is Fiat–Shamir *with aborts*: rejection sampling is what keeps the response from
+//!   leaking the secret, and it is also what destroys the linearity aggregation needs. There is no known
+//!   constant-size aggregate for it.
+//! * **Key blinding** — deriving an unlinkable per-epoch public key from a long-term one, such that the
+//!   holder can still sign under it. Tor v3 onion services do exactly this with Ed25519, so the classical
+//!   half *could*; ML-DSA has no standardized blinded variant, so the hybrid cannot.
+//!
+//! **A hybrid is the intersection of its components' capabilities, not the union.** That is the same
+//! property that makes it safe — a forger must break both halves — read in the other direction: a
+//! structure is available only if *both* halves have it. Key blinding is the sharp case, because Ed25519
+//! ships it in production elsewhere and the hybrid still gets nothing.
+//!
+//! Two open tasks are blocked on this one absence, and neither is FANOS's to close alone:
+//!
+//! * **#66 — TAXIS pays a whole consensus phase.** Every 2-phase BFT construction collapses the round by
+//!   aggregating a quorum into one constant-size certificate; `fanos_taxis::vote::Certificate` instead
+//!   carries `votes: Vec<SignedVote>`, so a commit certificate is `Q` signatures and grows linearly in
+//!   the cell. The saving an aggregate would buy is exactly a factor of `Q`. The figures are derived and
+//!   pinned at the `Certificate` doc, not restated here — `fanos-pqcrypto` owns the 3373, `fanos-taxis`
+//!   owns the `Q` that multiplies it.
+//! * **#67 — a hidden service's registration is linkable.** Its identity bundle travels in the clear
+//!   beside the epoch-rotating tag so a meeting combiner can *recompute* the binding rather than believe
+//!   it, which makes every combiner a timestamped record of which services exist and when
+//!   (`docs/design-anonymity-substrate.md` §T2, measured over eight epochs by
+//!   `the_epoch_rotating_tag_is_defeated_by_the_preimage_travelling_beside_it`). Per-epoch key blinding
+//!   is what closes it.
+//!
+//! The day this module gains either structure, both tasks become unblocked with nothing to say so — so
+//! `fanos-cli`'s `two_field_wide_tasks_wait_on_one_absent_signature_structure` fails on that day and
+//! hands over. Do not delete it silently: it is the only thing watching.
 
 use alloc::vec::Vec;
 

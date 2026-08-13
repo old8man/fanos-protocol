@@ -3716,6 +3716,16 @@ It also hides the migration cost: swapping to `pqvss` changes the commitment, wh
   Blocked on the same field-wide gap as #67. What *is* available without it: measure the round-trip against
   the block period first, and look at overlapping the anti-MEV reveal with the commit phase, which no BFT
   result forbids.
+
+  *Amended by #305.* This paragraph was, for a long time, the **only** place the blocker was written: a
+  reader of `Certificate.votes` learned nothing about why it is a `Vec`, and a reader of
+  `fanos-pqcrypto/src/sig.rs` — the crate that *has* the gap — learned nothing about the two subsystems
+  paying for it. Both now state it at the code, the price is a number rather than a shape (a signed vote is
+  3419 B on the wire, so the phase costs 140.2 KiB per block on Fano and 10.41 MiB at `q = 7`, derived from
+  the real constants by `a_commit_certificate_is_q_signatures_and_that_is_the_whole_of_66`), and the
+  condition has a tripwire — `two_field_wide_tasks_wait_on_one_absent_signature_structure` fails the day
+  `fanos-pqcrypto` gains either structure. #65 was already the shape done right and was the template:
+  `ring_tx.rs` states its size asymmetry at the codec and pins it with a live assertion.
 - **#52** (verified resharing) — the opposite correction: **not** blocked on new cryptography. Equivocation
   across new members is catchable with the hash commitments already in the tree, and the dealer-side lie is
   answered by the per-epoch round `poros.rs` already designs — reconstruct once against the descriptor
