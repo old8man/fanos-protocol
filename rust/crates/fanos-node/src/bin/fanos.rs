@@ -1044,7 +1044,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         .parse()
         .map_err(|_| NodeError::Config("bad --forward (expected host:port)".to_owned()))?;
     let host_secret = match flag(args, "--host-key") {
-        Some(p) => std::fs::read(p)?,
+        Some(p) => read_seed_file(p, "a hidden service's secret seed")?,
         None => {
             return Err(NodeError::Config(
                 "fanos host requires --host-key <file> — the service's secret seed and stable .fanos \
@@ -1615,17 +1615,30 @@ fn write_dealt(path: &str, contents: impl AsRef<[u8]>, secret: bool) -> Result<(
 /// mode further still passes. The message names the fix (`chmod 600 <path>`) because a refusal an operator
 /// cannot act on is a refusal they will work around.
 ///
-/// It does **not** claim more than it checks: a file inside a group-traversable directory, an ACL, or a
-/// shared home on a network filesystem can still expose it, and the mode is a snapshot taken just before
-/// the read rather than a lock. It is a guard against the operator's own `umask`, which is the exposure
-/// that actually happens; an attacker who can swap the file between the two syscalls could already have
-/// replaced the secret before the node started.
+/// ## Reading is only half the authority (#314)
 ///
-/// **And it does not yet cover every secret file this binary reads.** `--host-key`, `--key`, `--service`,
-/// `--exit`, `--beacon-params`, `--ingress-params` and `fanos validator --config` all take key material by
-/// path and read it at whatever mode it has. Those are a different defect — an operator's permission choice,
-/// on files this tool's own ceremonies already write `0600` through [`write_dealt`] — where the PROTEUS
-/// secret's was the tool *forcing* the exposure with no private channel offered at all. Named here so a
+/// A `0600` key inside a directory another account can write cannot be *read* by them and can be
+/// **replaced**: renaming and unlinking need write permission on the DIRECTORY, never on the file. A
+/// substituted host key is a service identity the attacker now owns, so disclosure and substitution are
+/// different attacks with the same outcome — and the mode check answers only the first. Every directory the
+/// kernel will traverse on the way to the file is therefore checked as well, by
+/// [`require_unsubstitutable_path`].
+///
+/// It does **not** claim more than it checks: an ACL, a shared home on a network filesystem, or a mount
+/// point replaced underneath can still expose it, and the modes are a snapshot taken just before the read
+/// rather than a lock. Ownership is deliberately not asked about, and does not need to be for what this
+/// guard is for: a non-root process that passes the `0o077` test on a file it does **not** own cannot read
+/// that file at all, so the read fails by itself — and a root operator naming another account's file is an
+/// explicit act rather than an accident.
+///
+/// **And it does not cover every secret file this binary reads.** `--key`, `--service`, `--exit`,
+/// `--beacon-params`, `--ingress-params` and `fanos validator --config` all take key material by path and
+/// read it at whatever mode it has. Those are a different defect — an operator's permission choice, on files
+/// this tool's own ceremonies already write `0600` through [`write_dealt`] — where the PROTEUS secret's was
+/// the tool *forcing* the exposure with no private channel offered at all. **Six, not the seven this
+/// paragraph used to list**: `--host-key` was the one file of the seven the tool never produces, so its
+/// recipe was handed to the operator as prose (`umask 077; head -c 32 /dev/urandom`) and the justification
+/// above did not cover it. It now goes through [`read_seed_file`], which comes through here. Named so a
 /// reader does not take this guard for a property of the whole binary.
 fn require_private_file(path: &str, what: &str) -> Result<(), NodeError> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1638,6 +1651,88 @@ fn require_private_file(path: &str, what: &str) -> Result<(), NodeError> {
             "'{path}' holds {what} and is reachable by other accounts on this host (mode {mode:o}) — run \
              `chmod 600 {path}` and start again"
         )));
+    }
+    require_unsubstitutable_path(path, what)
+}
+
+/// Whether a directory at `mode` lets an account other than an entry's owner put a *different* file there.
+///
+/// **Both halves are POSIX semantics, so there is no chosen number here.** Write permission on a directory
+/// is the authority to create, rename and unlink entries within it — which is substitution. The sticky bit
+/// (`0o1000`) withdraws exactly that for entries somebody else owns, and it is what makes `1777` `/tmp`
+/// usable at all. A guard that ignored it would lie in both directions: refusing a perfectly safe secret in
+/// `/tmp`, and — read the other way round — implying that "not world-writable" was the whole question.
+const fn substitutable_by_others(mode: u32) -> bool {
+    mode & 0o022 != 0 && mode & 0o1000 == 0
+}
+
+/// Refuse if any directory the kernel will traverse on the way to `path` can be written by another account.
+///
+/// Two things the obvious one-line version (`stat` the parent) would miss, and both are reachable:
+///
+/// * **Symlinks are resolved at every step, not once at the end.** A link inside a writable directory can be
+///   re-pointed at another file, so the directory that *holds* each component matters as much as the one the
+///   path finally names. Canonicalising only the whole path would check the target's chain and never the
+///   link's.
+/// * **Each resolved directory's ancestors are checked too.** A writable *grand*parent can rename the
+///   directory itself and put its own in place, which substitutes everything beneath it.
+///
+/// The chains overlap heavily, so answered directories are remembered: the walk is one `stat` per distinct
+/// directory rather than one per (component, ancestor) pair.
+///
+/// # Errors
+///
+/// [`NodeError::Config`] naming the first directory that fails, or the component that could not be resolved.
+/// A directory that cannot be inspected is an error rather than a skip: `canonicalize` having succeeded
+/// means every ancestor exists and is traversable, so a `stat` that fails anyway is a fact about the path
+/// this guard must not swallow.
+fn require_unsubstitutable_path(path: &str, what: &str) -> Result<(), NodeError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let given = Path::new(path);
+    // Relative paths are resolved against the working directory, because that is what the kernel will do:
+    // a guard that reasoned about `secret.key` without knowing where it sits would answer a question
+    // nobody asked.
+    let absolute =
+        if given.is_absolute() { given.to_path_buf() } else { std::env::current_dir()?.join(given) };
+    let components: Vec<_> = absolute.components().collect();
+    let mut answered: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut prefix = PathBuf::new();
+    for (i, component) in components.iter().enumerate() {
+        prefix.push(component);
+        // The last component is the file itself; its own mode is `require_private_file`'s question.
+        if i + 1 == components.len() {
+            break;
+        }
+        let real = prefix.canonicalize().map_err(|e| {
+            NodeError::Config(format!(
+                "cannot resolve '{}' on the way to '{path}' ({what}): {e}",
+                prefix.display()
+            ))
+        })?;
+        for dir in real.ancestors() {
+            if !answered.insert(dir.to_path_buf()) {
+                continue;
+            }
+            let meta = std::fs::metadata(dir).map_err(|e| {
+                NodeError::Config(format!(
+                    "cannot inspect '{}', which holds the path to '{path}' ({what}): {e}",
+                    dir.display()
+                ))
+            })?;
+            let mode = meta.permissions().mode() & 0o7777;
+            if substitutable_by_others(mode) {
+                return Err(NodeError::Config(format!(
+                    "'{path}' holds {what} inside '{}', which other accounts on this host can write (mode \
+                     {mode:o}) — they cannot read the file, and they can REPLACE it, which for key material \
+                     is the same authority. Move it under a directory only you can write (`mkdir -m 700 \
+                     ~/.fanos` and keep it there). A shared directory carrying the sticky bit, such as \
+                     /tmp, is accepted: there only a file's own owner may replace it.",
+                    dir.display()
+                )));
+            }
+        }
+        prefix = real;
     }
     Ok(())
 }
@@ -1657,6 +1752,37 @@ fn require_private_file(path: &str, what: &str) -> Result<(), NodeError> {
 /// An empty file is refused rather than accepted as an empty secret: it is what a truncated copy, a failed
 /// `scp`, or a mistyped redirection leaves behind, and an empty shared secret shapes every frame identically
 /// for everyone — the exact opposite of what enabling PROTEUS asks for.
+/// Read a **raw seed** out of an owner-only file — the `--host-key` form of key material (#310).
+///
+/// Guarded exactly like [`read_secret_file`] and, deliberately, parsed unlike it: **nothing is stripped**.
+/// Folding the two into one function would be [`one constant, two quantities`](read_secret_file) in reader's
+/// clothing. `read_secret_file` takes a *shared, human-transcribed* PROTEUS secret, where one member's `echo`
+/// and another's `printf` must end up with identical bytes, so a trailing newline cannot be part of it. A
+/// host key is 32 bytes from `/dev/urandom`, where **every byte is the secret**: about one seed in 256 ends
+/// in `0x0a`, and stripping it would silently derive a different `.fanos` address for those — a service
+/// unreachable at the name its operator wrote down, with nothing saying why.
+///
+/// An empty file is refused for a sharper reason than the shared secret's: `SeedRng::from_seed(&[])` is a
+/// *fixed* seed, so a truncated copy or a failed `scp` would give every such service the **same** identity,
+/// publicly derivable by anyone who tries the empty seed.
+///
+/// Returns a plain `Vec<u8>` rather than a [`Zeroizing`](zeroize::Zeroizing) one, and that is not an
+/// oversight. The value is moved into `HostedService`, which holds it for the life of the process because
+/// every epoch's dead-drop line and reply key are derived from it; wrapping the local would wipe one copy
+/// while the long-lived one stayed — the appearance of the property without the property.
+fn read_seed_file(path: &str, what: &str) -> Result<Vec<u8>, NodeError> {
+    require_private_file(path, what)?;
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Err(NodeError::Config(format!(
+            "'{path}' is empty, so it holds no {what} — an empty seed is a FIXED seed, and every service \
+             started from one lands on the same publicly derivable identity. Generate one with \
+             `(umask 077; head -c 32 /dev/urandom > {path})`"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn read_secret_file(path: &str, what: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, NodeError> {
     require_private_file(path, what)?;
     let raw = zeroize::Zeroizing::new(std::fs::read(path)?);
@@ -2283,7 +2409,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
     }
     let rest = args.get(1..).unwrap_or(&[]);
     let host_secret = match flag(rest, "--host-key") {
-        Some(p) => std::fs::read(p)?,
+        Some(p) => read_seed_file(p, "the messenger's secret seed")?,
         None => {
             return Err(NodeError::Config(
                 "fanos message serve requires --host-key <file> — the messenger's secret seed and stable \
@@ -4416,6 +4542,196 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// **A secret in a directory other accounts can write is substitutable, and the guard now says so**
+    /// (#314).
+    ///
+    /// `require_private_file` asked one of the two questions. Renaming and unlinking need write permission
+    /// on the DIRECTORY, never on the file, so a `0600` key in a world-writable directory cannot be read by
+    /// another account and can be replaced by one — and a replaced host key is a service identity they own.
+    ///
+    /// **The sticky bit is the half that makes this a rule rather than a nuisance**, and it is asserted here
+    /// in both directions: `1777` is `/tmp`, where the kernel already forbids replacing somebody else's
+    /// entry, and refusing that would have made the guard something operators route around. Same mode bits,
+    /// opposite verdicts, one bit apart — which is what proves the check reads the sticky bit rather than
+    /// just `0o022`.
+    ///
+    /// Falsified by dropping the `&& mode & 0o1000 == 0` term (the sticky case starts failing) and again by
+    /// returning `Ok(())` from `require_unsubstitutable_path` (the world-writable case starts failing).
+    /// Neither falsification touches the other assertion, so the two halves are independently load-bearing.
+    #[test]
+    fn a_secret_in_a_directory_others_can_write_is_refused_unless_the_sticky_bit_forbids_replacing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // The predicate directly, on the three modes that decide it. Cheap, exhaustive over the axis, and
+        // it does not depend on what this host's /tmp happens to be.
+        assert!(substitutable_by_others(0o777), "a world-writable directory lets anyone swap the file in");
+        assert!(substitutable_by_others(0o770), "group-writable is the same authority, one audience smaller");
+        assert!(
+            !substitutable_by_others(0o1777),
+            "1777 is /tmp: writable by all, and only an entry's own owner may replace it — refusing this \
+             would make the guard a nuisance, and a nuisance is what gets removed"
+        );
+        assert!(!substitutable_by_others(0o755), "the ordinary case must pass, or every line above is vacuous");
+        assert!(!substitutable_by_others(0o700), "and the recommended one");
+
+        // And end to end, through the real walk, so the predicate is proved to be *reached*.
+        let root = std::env::temp_dir().join(format!("fanos-substitutable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        for (mode, must_refuse) in [(0o777, true), (0o1777, false), (0o700, false)] {
+            let dir = root.join(format!("d{mode:o}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let secret = dir.join("svc.key");
+            std::fs::write(&secret, b"0123456789abcdef0123456789abcdef").unwrap();
+            std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            let path = secret.to_string_lossy().into_owned();
+            let verdict = read_seed_file(&path, "a hidden service's secret seed");
+            assert_eq!(
+                verdict.is_err(),
+                must_refuse,
+                "a 0600 seed inside a mode-{mode:o} directory: expected refuse = {must_refuse}, got {verdict:?}"
+            );
+            if must_refuse {
+                let msg = verdict.unwrap_err().to_string();
+                assert!(
+                    msg.contains("REPLACE") && msg.contains(&dir.display().to_string()),
+                    "the refusal must name the directory and what can be done to the file, or an operator \
+                     cannot act on it: {msg}"
+                );
+            }
+            // 0700 again before the recursive removal, or a later run inherits an odd mode.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A raw seed is read raw, and its file must be private** (#310).
+    ///
+    /// Two properties that pull in opposite directions, which is why they are asserted together. The seed is
+    /// guarded exactly like the PROTEUS secret — `--host-key` was the one of seven secret-taking flags the
+    /// tool never produces a file for, so its whole recipe was prose in an error message two lines from a
+    /// guard that did not run. And it is parsed **unlike** it: `head -c 32 /dev/urandom` ends in `0x0a` for
+    /// about one seed in 256, and stripping that byte would derive a different `.fanos` address.
+    #[test]
+    fn a_host_key_seed_is_guarded_like_a_secret_and_read_byte_for_byte() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("fanos-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("svc.key");
+        let shown = path.to_string_lossy().into_owned();
+
+        // A seed whose last byte IS a newline — the case a strip would corrupt.
+        let seed: Vec<u8> = (0u8..31).chain(std::iter::once(b'\n')).collect();
+        std::fs::write(&path, &seed).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_seed_file(&shown, "a seed").unwrap(),
+            seed,
+            "every byte of a random seed is the secret — a trailing 0x0a is part of it, and dropping it \
+             would move the service's .fanos address for one seed in 256"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let msg = read_seed_file(&shown, "a seed")
+            .expect_err("a world-readable service seed is the identity itself, published")
+            .to_string();
+        assert!(msg.contains("chmod 600"), "the refusal must say how to fix it: {msg}");
+
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            read_seed_file(&shown, "a seed").is_err(),
+            "an empty seed file is a FIXED seed: every service started from one lands on the same \
+             publicly derivable identity"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Both `--host-key` verbs go through the guard** — asserted at the verb, not at the helper.
+    ///
+    /// A guarded reader nobody calls is the defect this task was about, one layer up: `require_private_file`
+    /// existed, was documented, and `--host-key` read the file with a bare `std::fs::read`. So this drives
+    /// the two real entry points, `cmd_host` and `cmd_message`, against a world-readable seed and requires
+    /// the permission refusal to come back.
+    ///
+    /// Both refuse **before** any network work: the seed is read, and the error returns — no socket, no
+    /// node. That is also the ordering an operator wants, since a mode mistake should not cost a
+    /// half-started service.
+    ///
+    /// **A deliberately malformed `--epoch` rides along, and it is what makes this falsifiable.** It fails
+    /// on the very next line after the seed is read, so the two states are two *messages* rather than a
+    /// message and a hang: with the guard wired the verb answers `chmod 600`, and with the call site put
+    /// back to a bare `std::fs::read` it answers `bad --epoch` and this test fails in milliseconds. Without
+    /// it, removing the mechanism would let the verb run on and start a real node, and a falsification that
+    /// hangs demonstrates nothing.
+    ///
+    /// That same argument, run backwards, is the control: at `0600` each verb must reach `bad --epoch`,
+    /// which proves the seed was **accepted** and execution moved past it — a guard that refused a correctly
+    /// protected file is the other way to be wrong, and it would be invisible to a test that only checked
+    /// for some error.
+    #[tokio::test]
+    async fn both_host_key_verbs_refuse_a_world_readable_seed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("fanos-hostkey-wiring-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("svc.key");
+        std::fs::write(&path, b"0123456789abcdef0123456789abcdef").unwrap();
+        let shown = path.to_string_lossy().into_owned();
+
+        let host = vec![
+            "--forward".to_owned(),
+            "127.0.0.1:1".to_owned(),
+            "--host-key".to_owned(),
+            shown.clone(),
+            "--epoch".to_owned(),
+            "not-a-number".to_owned(),
+        ];
+        let message = vec![
+            "serve".to_owned(),
+            "--host-key".to_owned(),
+            shown.clone(),
+            "--epoch".to_owned(),
+            "not-a-number".to_owned(),
+        ];
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let msg = cmd_host(&host).await.expect_err("fanos host must refuse an exposed seed").to_string();
+        assert!(
+            msg.contains("chmod 600"),
+            "fanos host must fail on the seed's mode, not on the malformed epoch two lines later — a \
+             `bad --epoch` here means the read went round the guard: {msg}"
+        );
+        let msg =
+            cmd_message(&message).await.expect_err("fanos message serve must refuse it too").to_string();
+        assert!(
+            msg.contains("chmod 600"),
+            "fanos message serve must fail on the seed's mode for the same reason: {msg}"
+        );
+
+        // CONTROL, at the verb rather than at the helper: a 0600 seed must be ACCEPTED, and the proof is
+        // that each verb now fails on the next thing instead.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let msg = cmd_host(&host).await.expect_err("the malformed epoch still stops it").to_string();
+        assert!(
+            msg.contains("--epoch"),
+            "a correctly protected seed must be accepted and execution must move past it: {msg}"
+        );
+        let msg = cmd_message(&message).await.expect_err("same, on the messenger").to_string();
+        assert!(msg.contains("--epoch"), "and the messenger must accept it too: {msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The config file is the same secret's other door** (#13).

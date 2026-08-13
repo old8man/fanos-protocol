@@ -1696,6 +1696,19 @@ fn no_key_material_is_built_from_a_literal() {
         examined += 1;
         let lines: Vec<&str> = ships.lines().collect();
         for (i, line) in lines.iter().enumerate() {
+            // **A `from_seed(` in PROSE builds nothing** (#310 found this the hard way: a doc comment
+            // explaining *why* an empty seed file is refused — by naming `SeedRng::from_seed(&[])` — was
+            // reported as key material built from a literal). It is #227's finding — a comment is not a call
+            // site — reaching the one guard #227 deliberately did **not** hand `code_only`, because the
+            // justification marker below IS a comment and the lookback must still see it. So the skip lives
+            // here, one line wide: the *match* reads code, the *marker* reads whatever is there.
+            //
+            // Whole-line comments only, matching `code_only`'s own rule — cutting at a trailing `//` would
+            // corrupt a string literal containing one, and a false NEGATIVE in this guard is worse than the
+            // false positive it removes.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
             if !line.contains("from_seed(") {
                 continue;
             }
