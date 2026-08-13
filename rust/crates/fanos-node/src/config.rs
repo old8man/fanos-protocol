@@ -1326,6 +1326,170 @@ pub struct NodeConfig {
     /// the environment's morph chain when the current morph starts failing (a connection-failure spike);
     /// `None` (the default) pins the fixed [`proteus_morph`](Self::proteus_morph). Only with a secret set.
     pub proteus_environment: Option<Environment>,
+    /// Community secrets this node **accepts on receive** without emitting under them — the rollover overlap
+    /// (#13). Repeat the key once per secret; empty (the default) means no rollover is in progress.
+    ///
+    /// **This is the operator's whole overlap control, and there is deliberately no window constant beside
+    /// it.** An epoch shape rotates on the beacon, so FANOS can derive how long two peers may disagree
+    /// ([`SHAPE_GRACE`](fanos_proteus::SHAPE_GRACE), a bound on flood spread). A community secret travels by
+    /// whatever channel the operator uses — nothing in the protocol carries it, so no protocol quantity
+    /// bounds adoption time and a number invented here would stand for a decision the code cannot see.
+    ///
+    /// The rollover is three deliberate steps, and step 2 is the one that has to wait:
+    ///
+    /// 1. add the new secret here, everywhere. Nothing changes on the wire.
+    /// 2. once every node has done step 1 — the operator's judgement, informed by the node's own report of
+    ///    which secret opened each datagram — move the new secret to
+    ///    [`proteus_secret`](Self::proteus_secret) and put the old one here.
+    /// 3. once every node has done step 2, drop the old one.
+    ///
+    /// Doing step 2 early is the failure this shape exists to prevent: a node emitting under a secret its
+    /// peers do not hold is unreadable to them, in exactly the deployments PROTEUS is for.
+    pub proteus_accept_secrets: Vec<Zeroizing<Vec<u8>>>,
+}
+
+/// Add one receive-only community secret to `config`, refusing the two ways the key can be wrong (#13).
+///
+/// A free function rather than a match arm so both refusals have somewhere to be read: `from_config_str` is
+/// a long dispatch, and a rule that matters is a rule that should not have to be found inside one.
+fn accept_rollover_secret(config: &mut NodeConfig, value: &str) -> Result<(), NodeError> {
+    if value.is_empty() {
+        return Err(NodeError::Config(
+            "proteus_accept_secrets must be non-empty (a community secret to accept during a rollover); \
+             omit the key entirely when no rollover is in progress"
+                .to_owned(),
+        ));
+    }
+    // Refused rather than silently deduplicated: the same secret in both keys means the operator believes a
+    // rollover is under way when it is not, and quietly agreeing would hide that from the one person who can
+    // fix it.
+    if config.proteus_secret.as_deref().map(Vec::as_slice) == Some(value.as_bytes()) {
+        return Err(NodeError::Config(
+            "proteus_accept_secrets repeats proteus_secret — a node already accepts what it emits under, so \
+             this says a rollover is in progress when none is"
+                .to_owned(),
+        ));
+    }
+    config.proteus_accept_secrets.push(Zeroizing::new(value.as_bytes().to_vec()));
+    Ok(())
+}
+
+/// Apply one `key = value` line to `config` — the config **vocabulary**, split from the file **format**.
+///
+/// Two different reasons to change, so two functions: [`NodeConfig::from_config_str`] changes when the file's
+/// syntax does (comments, sections, how a line is split), this one changes whenever the platform gains a
+/// setting. Keeping them together meant every new key made the parser longer for a reason that had nothing to
+/// do with parsing — which is how the dispatch reached its size limit while nothing about it got harder.
+///
+/// `line` is 0-based and reported as `line + 1`, matching the four sibling parsers.
+fn apply_config_key(
+    config: &mut NodeConfig,
+    key: &str,
+    value: &str,
+    line: usize,
+) -> Result<(), NodeError> {
+    match key {
+        "listen" => {
+            config.listen = value
+                .parse()
+                .map_err(|_| NodeError::Config(format!("bad listen '{value}'")))?;
+        }
+        "identity" => config.identity_path = Some(PathBuf::from(value)),
+        "state" => config.state_path = Some(PathBuf::from(value)),
+        "bootstrap" => {
+            for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                config.bootstrap.push(Peer::parse(part)?);
+            }
+        }
+        "role" => config.roles = RoleSet::parse(value)?,
+        "heartbeat" => {
+            config.start_heartbeat = value.parse().map_err(|_| {
+                NodeError::Config(format!("bad heartbeat '{value}' (expected true/false)"))
+            })?;
+        }
+        "proteus_secret" => {
+            if value.is_empty() {
+                return Err(NodeError::Config(
+                    "proteus_secret must be non-empty (a shared community secret)".to_owned(),
+                ));
+            }
+            config.proteus_secret = Some(Zeroizing::new(value.as_bytes().to_vec()));
+        }
+        "proteus_accept_secrets" => accept_rollover_secret(config, value)?,
+        "proteus_morph" => {
+            config.proteus_morph = Morph::from_name(value).ok_or_else(|| {
+                NodeError::Config(format!(
+                    "unknown proteus_morph '{value}' (expected one of: plain, polymorph, \
+                     tls-tunnel, masque-h3, fronted, webrtc, pluggable)"
+                ))
+            })?;
+        }
+        // Everything below is settable on the command line too, and *had* to be, which was the defect: a
+        // daemon started by an init system has no argv an operator later edits. A setting reachable only
+        // through a flag is a setting a service unit cannot express, so the file was the narrower surface
+        // of the two — exactly backwards for the deployment that matters.
+        "plane_order" => {
+            let q: u32 = value
+                .parse()
+                .map_err(|_| NodeError::Config(format!("bad plane_order '{value}'")))?;
+            if !matches!(q, 2 | 4 | 7 | 31) {
+                return Err(NodeError::Config(format!(
+                    "plane_order '{q}' is not a supported projective order (expected 2, 4, 7 or 31)"
+                )));
+            }
+            config.plane_order = q;
+        }
+        // Opt-in by construction: absent means no export, and a node does not begin emitting its coherence
+        // readings because it was upgraded. `0` is refused rather than silently meaning "no noise".
+        "telemetry_epsilon" => {
+            let eps: f64 = value
+                .parse()
+                .map_err(|_| NodeError::Config(format!("bad telemetry_epsilon '{value}'")))?;
+            if !(eps.is_finite() && eps > 0.0) {
+                return Err(NodeError::Config(format!(
+                    "telemetry_epsilon '{value}' must be a finite positive ε (omit the key to publish nothing)"
+                )));
+            }
+            config.telemetry_epsilon = Some(eps);
+        }
+        "epoch_period" => config.epoch_period = parse_duration_secs(value, "epoch_period")?,
+        "mix_mean_delay" => config.mix_mean_delay = parse_duration_millis(value, "mix_mean_delay")?,
+        "cover_interval" => config.cover_interval = parse_duration_millis(value, "cover_interval")?,
+        "admission_difficulty" => {
+            let bits: u32 = value
+                .parse()
+                .map_err(|_| NodeError::Config(format!("bad admission_difficulty '{value}'")))?;
+            config.admission_difficulty = Some(bits);
+        }
+        // A **path**, not the material. Beacon provisioning is genesis material with a secret share in it,
+        // and inlining it here would put a key into the file an operator copies between hosts. The daemon
+        // needs *some* way to be told, though: `--beacon-params` alone means a relay can never run under
+        // an init system, because a service unit's argv is not something an operator edits per host.
+        "beacon_params" => {
+            let text = std::fs::read_to_string(value).map_err(|e| {
+                NodeError::Config(format!("beacon_params '{value}': {e}"))
+            })?;
+            config.beacon = Some(BeaconParams::from_config_str(&text)?);
+        }
+        // The three role provisioning files (#90) — see [`role_key`] for why they are paths and
+        // why each implies its role.
+        "service" | "exit" | "ingress_params" => role_key(config, key, value)?,
+        "proteus_environment" => {
+            config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
+                NodeError::Config(format!(
+                    "unknown proteus_environment '{value}' (expected one of: open, \
+                     dpi-corporate, sni-filter, deep-censorship)"
+                ))
+            })?);
+        }
+        other => {
+            return Err(NodeError::Config(format!(
+                "config line {}: unknown key '{other}'",
+                line + 1
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Default for NodeConfig {
@@ -1353,6 +1517,7 @@ impl Default for NodeConfig {
             exit: None,
             ingress: None,
             proteus_secret: None,
+            proteus_accept_secrets: Vec::new(),
             proteus_morph: Morph::Polymorph,
             proteus_environment: None,
         }
@@ -1448,106 +1613,7 @@ impl NodeConfig {
                 NodeError::Config(format!("config line {}: expected `key = value`", n + 1))
             })?;
             let (key, value) = (key.trim(), value.trim());
-            match key {
-                "listen" => {
-                    config.listen = value
-                        .parse()
-                        .map_err(|_| NodeError::Config(format!("bad listen '{value}'")))?;
-                }
-                "identity" => config.identity_path = Some(PathBuf::from(value)),
-                "state" => config.state_path = Some(PathBuf::from(value)),
-                "bootstrap" => {
-                    for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                        config.bootstrap.push(Peer::parse(part)?);
-                    }
-                }
-                "role" => config.roles = RoleSet::parse(value)?,
-                "heartbeat" => {
-                    config.start_heartbeat = value.parse().map_err(|_| {
-                        NodeError::Config(format!("bad heartbeat '{value}' (expected true/false)"))
-                    })?;
-                }
-                "proteus_secret" => {
-                    if value.is_empty() {
-                        return Err(NodeError::Config(
-                            "proteus_secret must be non-empty (a shared community secret)".to_owned(),
-                        ));
-                    }
-                    config.proteus_secret = Some(Zeroizing::new(value.as_bytes().to_vec()));
-                }
-                "proteus_morph" => {
-                    config.proteus_morph = Morph::from_name(value).ok_or_else(|| {
-                        NodeError::Config(format!(
-                            "unknown proteus_morph '{value}' (expected one of: plain, polymorph, \
-                             tls-tunnel, masque-h3, fronted, webrtc, pluggable)"
-                        ))
-                    })?;
-                }
-                // Everything below is settable on the command line too, and *had* to be, which was the defect: a
-                // daemon started by an init system has no argv an operator later edits. A setting reachable only
-                // through a flag is a setting a service unit cannot express, so the file was the narrower surface
-                // of the two — exactly backwards for the deployment that matters.
-                "plane_order" => {
-                    let q: u32 = value
-                        .parse()
-                        .map_err(|_| NodeError::Config(format!("bad plane_order '{value}'")))?;
-                    if !matches!(q, 2 | 4 | 7 | 31) {
-                        return Err(NodeError::Config(format!(
-                            "plane_order '{q}' is not a supported projective order (expected 2, 4, 7 or 31)"
-                        )));
-                    }
-                    config.plane_order = q;
-                }
-                // Opt-in by construction: absent means no export, and a node does not begin emitting its coherence
-                // readings because it was upgraded. `0` is refused rather than silently meaning "no noise".
-                "telemetry_epsilon" => {
-                    let eps: f64 = value
-                        .parse()
-                        .map_err(|_| NodeError::Config(format!("bad telemetry_epsilon '{value}'")))?;
-                    if !(eps.is_finite() && eps > 0.0) {
-                        return Err(NodeError::Config(format!(
-                            "telemetry_epsilon '{value}' must be a finite positive ε (omit the key to publish nothing)"
-                        )));
-                    }
-                    config.telemetry_epsilon = Some(eps);
-                }
-                "epoch_period" => config.epoch_period = parse_duration_secs(value, "epoch_period")?,
-                "mix_mean_delay" => config.mix_mean_delay = parse_duration_millis(value, "mix_mean_delay")?,
-                "cover_interval" => config.cover_interval = parse_duration_millis(value, "cover_interval")?,
-                "admission_difficulty" => {
-                    let bits: u32 = value
-                        .parse()
-                        .map_err(|_| NodeError::Config(format!("bad admission_difficulty '{value}'")))?;
-                    config.admission_difficulty = Some(bits);
-                }
-                // A **path**, not the material. Beacon provisioning is genesis material with a secret share in it,
-                // and inlining it here would put a key into the file an operator copies between hosts. The daemon
-                // needs *some* way to be told, though: `--beacon-params` alone means a relay can never run under
-                // an init system, because a service unit's argv is not something an operator edits per host.
-                "beacon_params" => {
-                    let text = std::fs::read_to_string(value).map_err(|e| {
-                        NodeError::Config(format!("beacon_params '{value}': {e}"))
-                    })?;
-                    config.beacon = Some(BeaconParams::from_config_str(&text)?);
-                }
-                // The three role provisioning files (#90) — see [`role_key`] for why they are paths and
-                // why each implies its role.
-                "service" | "exit" | "ingress_params" => role_key(&mut config, key, value)?,
-                "proteus_environment" => {
-                    config.proteus_environment = Some(Environment::from_name(value).ok_or_else(|| {
-                        NodeError::Config(format!(
-                            "unknown proteus_environment '{value}' (expected one of: open, \
-                             dpi-corporate, sni-filter, deep-censorship)"
-                        ))
-                    })?);
-                }
-                other => {
-                    return Err(NodeError::Config(format!(
-                        "config line {}: unknown key '{other}'",
-                        n + 1
-                    )));
-                }
-            }
+                apply_config_key(&mut config, key, value, n)?;
         }
         Ok(config)
     }

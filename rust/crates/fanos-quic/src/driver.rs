@@ -171,6 +171,15 @@ pub struct ProteusConfig {
     /// `environment`/`morph`); an embedder sets it programmatically — it has no config-file/CLI surface,
     /// since a codec is code, not configuration.
     pub codec: Option<Arc<dyn MorphCodec>>,
+    /// Community secrets accepted on **receive only**, for a rollover in progress (#13). Empty on a node
+    /// that is not mid-rotation.
+    ///
+    /// Separate from [`secret`](Self::secret) rather than a list with the first entry privileged, because
+    /// the two are different powers: `secret` is what this node **emits** under and therefore what every
+    /// peer must already hold, while these are only what it will **read**. A rollover is exactly the period
+    /// when those two sets differ, and collapsing them into one list would make "add the new secret" and
+    /// "start emitting under it" the same edit — which is the change that takes a censored deployment dark.
+    pub accept_secrets: Vec<Vec<u8>>,
 }
 
 /// Redacted `Debug`: never render the community secret (secret hygiene, audit D) — the morph/env, and only
@@ -182,6 +191,7 @@ impl std::fmt::Debug for ProteusConfig {
             .field("morph", &self.morph)
             .field("environment", &self.environment)
             .field("codec", &self.codec.as_ref().map(|_| "<plugged>"))
+            .field("accept_secrets", &self.accept_secrets.len())
             .finish()
     }
 }
@@ -190,13 +200,19 @@ impl ProteusConfig {
     /// A config for the flagship [`Morph::Polymorph`] ("look like nothing") under `secret`, fixed morph.
     #[must_use]
     pub fn polymorph(secret: impl Into<Vec<u8>>) -> Self {
-        Self { secret: secret.into(), morph: Morph::Polymorph, environment: None, codec: None }
+        Self {
+            secret: secret.into(),
+            morph: Morph::Polymorph,
+            environment: None,
+            codec: None,
+            accept_secrets: Vec::new(),
+        }
     }
 
     /// A config under an explicit fixed `morph`.
     #[must_use]
     pub fn with_morph(secret: impl Into<Vec<u8>>, morph: Morph) -> Self {
-        Self { secret: secret.into(), morph, environment: None, codec: None }
+        Self { secret: secret.into(), morph, environment: None, codec: None, accept_secrets: Vec::new() }
     }
 
     /// A config with **auto-fallback** under `environment`: the morph starts at the environment's preferred
@@ -208,6 +224,7 @@ impl ProteusConfig {
             morph: environment.preferred_morph(),
             environment: Some(environment),
             codec: None,
+            accept_secrets: Vec::new(),
         }
     }
 
@@ -226,6 +243,7 @@ impl ProteusConfig {
             morph: Morph::Pluggable,
             environment: None,
             codec: Some(codec),
+            accept_secrets: Vec::new(),
         })
     }
 
@@ -233,12 +251,28 @@ impl ProteusConfig {
     /// pluggable codec wins; else an environment starts the shaper at its preferred morph with a controller;
     /// else the fixed `morph` with no controller.
     fn build(self, epoch: Epoch) -> (Arc<RwLock<ProteusShaper>>, MaybeController) {
+        // Installed in ONE place, on whichever shaper the branches below produce (#13). Installing per
+        // branch would leave the next branch someone adds silently deaf to a rollover — the family-moved-
+        // one-member-at-a-time shape this whole change exists to remove.
+        let accept = self.accept_secrets.clone();
+        let install = move |mut shaper: ProteusShaper| {
+            for secret in accept {
+                if !shaper.also_accept(secret) {
+                    tracing::warn!(
+                        max = fanos_proteus::shaper::MAX_ACCEPTED_SECRETS,
+                        "more accepted community secrets configured than a rollover needs; the extra ones \
+                         are IGNORED, so peers still on them cannot be read"
+                    );
+                }
+            }
+            shaper
+        };
         if let Some(codec) = self.codec {
             // `ProteusConfig::pluggable` already refused an over-growing codec, so this is `Some`. The
             // branch exists because the type cannot carry that proof — and it says so out loud rather
             // than falling through onto a wire the peer is not expecting.
             if let Some(shaper) = ProteusShaper::with_codec(self.secret.clone(), epoch, codec) {
-                return (Arc::new(RwLock::new(shaper)), None);
+                return (Arc::new(RwLock::new(install(shaper))), None);
             }
             tracing::error!(
                 max_wire_overhead = fanos_proteus::MAX_WIRE_OVERHEAD,
@@ -262,10 +296,10 @@ impl ProteusConfig {
                     );
                 }
                 let shaper = ProteusShaper::with_morph(self.secret, epoch, controller.current());
-                (Arc::new(RwLock::new(shaper)), Some(Arc::new(Mutex::new(controller))))
+                (Arc::new(RwLock::new(install(shaper))), Some(Arc::new(Mutex::new(controller))))
             }
             None => (
-                Arc::new(RwLock::new(ProteusShaper::with_morph(self.secret, epoch, self.morph))),
+                Arc::new(RwLock::new(install(ProteusShaper::with_morph(self.secret, epoch, self.morph)))),
                 None,
             ),
         }
@@ -356,49 +390,57 @@ fn shape_out(shaper: &Shaper, frame: &[u8]) -> Vec<u8> {
 /// data path waits before transmitting (`ZERO` when no shaper is set or the morph does not time-shape). The
 /// clock stays in the driver — the shaper only computes the delay — keeping PROTEUS below the sans-I/O
 /// boundary. Used on the data path (`send_uni`); control frames keep the untimed [`shape_out`].
-fn shape_out_timed(shaper: &Shaper, joining: bool, frame: &[u8]) -> (Vec<u8>, std::time::Duration) {
-    match shaper {
-        // A joining peer reads only the genesis shape, and that is true of *data* frames as well as
-        // handshake ones (#234). The pin found this: the handshake completed and the first payload was
+fn shape_out_timed(
+    shaper: &Shaper,
+    under: Option<OpenedUnder>,
+    frame: &[u8],
+) -> (Vec<u8>, std::time::Duration) {
+    match (shaper, under) {
+        // A peer that is behind reads only the shape it reached us with, and that is true of *data* frames as
+        // well as handshake ones (#234). The pin found this: the handshake completed and the first payload was
         // unreadable, because the data path has its own shaping call and it was not on the list. Pacing is
         // unaffected — the delay is a property of the morph, not of which shape sealed the bytes.
-        Some(s) if joining => {
-            let wire = s.read().unwrap_or_else(PoisonError::into_inner).outbound_at_genesis(frame);
+        (Some(s), Some(under)) => {
+            let wire = s.read().unwrap_or_else(PoisonError::into_inner).outbound_under(frame, under);
             (wire, std::time::Duration::ZERO)
         }
-        Some(s) => {
+        (Some(s), None) => {
             let shaped = s.read().unwrap_or_else(PoisonError::into_inner).shape(frame);
             (shaped.wire, shaped.delay)
         }
-        None => (frame.to_vec(), std::time::Duration::ZERO),
+        (None, _) => (frame.to_vec(), std::time::Duration::ZERO),
     }
 }
 
 /// Recover an inbound frame from the wire with the shape that opened it, or `None` if it wasn't shaped by
 /// our secret+epoch.
 ///
-/// The second value is [`OpenedUnder::Genesis`] exactly when the sender does not know the live epoch yet
-/// (#234), and a caller that will *reply* must carry it to the reply — see [`shape_out_to`]. With no shaper
-/// configured there is one shape and it is the current one, which is what `Current` means here.
+/// The second value says which secret and which epoch opened it — [`OpenedEpoch::Genesis`] exactly when the
+/// sender does not know the live epoch yet (#234), and an [`OpenedSecret::Accepted`] when the sender is on a
+/// community secret this node accepts but does not emit under (#13). A caller that will *reply* must carry it
+/// to the reply. With no shaper configured there is one shape and it is the current one, which is what
+/// [`OpenedUnder::CURRENT`] means here.
 fn shape_in(shaper: &Shaper, wire: Vec<u8>) -> Option<(Vec<u8>, OpenedUnder)> {
     match shaper {
         Some(s) => s.read().unwrap_or_else(PoisonError::into_inner).inbound(&wire),
-        None => Some((wire, OpenedUnder::Current)),
+        None => Some((wire, OpenedUnder::CURRENT)),
     }
 }
 
 
-/// Shape an outbound frame **for a peer that may not know the live epoch yet** (#234).
+/// Shape an outbound frame **for a peer that may be behind on the epoch, the secret, or both** (#234, #13).
 ///
 /// A joining node's accept window is `{0, 0, 1}`, so a frame shaped at the cell's live epoch is one it
-/// cannot open. This is asked at SEND time — not derived from a frame we have read — because both sides
-/// emit their HELLO before reading one, and by the time the arm is visible in an inbound frame the
-/// outbound one has already gone. The answer comes from the datagram envelope, which saw the peer's shape
-/// one layer down and one round earlier.
-fn shape_out_joining(shaper: &Shaper, joining: bool, frame: &[u8]) -> Vec<u8> {
-    match (shaper, joining) {
-        (Some(s), true) => s.read().unwrap_or_else(PoisonError::into_inner).outbound_at_genesis(frame),
-        (Some(s), false) => s.read().unwrap_or_else(PoisonError::into_inner).outbound(frame),
+/// cannot open; a node mid-secret-rollover holds a different secret entirely. This is asked at SEND time —
+/// not derived from a frame we have read — because both sides emit their HELLO before reading one, and by
+/// the time the arm is visible in an inbound frame the outbound one has already gone. The answer comes from
+/// the datagram envelope, which saw the peer's shape one layer down and one round earlier.
+fn shape_out_joining(shaper: &Shaper, under: Option<OpenedUnder>, frame: &[u8]) -> Vec<u8> {
+    match (shaper, under) {
+        (Some(s), Some(under)) => {
+            s.read().unwrap_or_else(PoisonError::into_inner).outbound_under(frame, under)
+        }
+        (Some(s), None) => s.read().unwrap_or_else(PoisonError::into_inner).outbound(frame),
         (None, _) => frame.to_vec(),
     }
 }
@@ -674,7 +716,7 @@ struct Transport {
     /// Which peers reached us under the genesis shape, shared with the datagram envelope that learns it.
     /// Read at SEND time by [`Transport::joining`] — see `proteus_socket::GenesisSpeakers` for why the
     /// answer has to arrive from one layer down (#234).
-    joining: crate::proteus_socket::GenesisSpeakers,
+    joining: crate::proteus_socket::ReplyAddressing,
     endpoint: Endpoint,
     conns: ConnMap,
     input_tx: mpsc::Sender<Input>,
@@ -2441,7 +2483,7 @@ fn spawn_inner(
     let stations = Arc::new(Mutex::new(Stations::new()));
     // Learned by the envelope, acted on by the frame layer — see `proteus_socket::GenesisSpeakers` for why
     // it cannot live in either alone (#234).
-    let joining = crate::proteus_socket::genesis_speakers();
+    let joining = crate::proteus_socket::reply_addressing();
     let carrier = match &shaper {
         Some(s) => crate::proteus_socket::ProteusSocket::wrap(carrier, s, &stations, &joining),
         None => carrier,
@@ -2819,7 +2861,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
 /// Write one frame as a single shaped uni-stream on `conn` (the shared send primitive). When the active
 /// morph time-shapes (§13.3), the frame is paced by the shaper's per-packet delay first — the traffic-shaper
 /// applied at the one point every data frame passes through.
-async fn send_uni(conn: &Connection, shaper: &Shaper, joining: bool, frame: &[u8]) {
+async fn send_uni(conn: &Connection, shaper: &Shaper, joining: Option<OpenedUnder>, frame: &[u8]) {
     let (wire, delay) = shape_out_timed(shaper, joining, frame);
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
@@ -3269,7 +3311,7 @@ async fn accept_loop(t: Transport) {
 
 /// Announce our HELLO (a pre-built [`FrameType::Hello`] frame: negotiation parameters ‖ `epoch` ‖
 /// `coord` ‖ proof-of-coordinate) as a uni-stream, shaped like any frame.
-async fn send_hello(conn: &Connection, shaper: &Shaper, joining: bool, hello: &[u8]) {
+async fn send_hello(conn: &Connection, shaper: &Shaper, joining: Option<OpenedUnder>, hello: &[u8]) {
     if let Ok(mut stream) = conn.open_uni().await {
         let _ = stream.write_all(&shape_out_joining(shaper, joining, hello)).await;
         let _ = stream.finish();
@@ -3279,7 +3321,7 @@ async fn send_hello(conn: &Connection, shaper: &Shaper, joining: bool, hello: &[
 /// Fire-and-forget a reflexive-address report to `conn`'s peer (the source address we observe it at,
 /// #119) on a spawned task, so this side-channel never blocks the connection's critical path — reading
 /// the peer's frames or completing setup. A blocking send here can stall a busy cell (worsening #129).
-fn spawn_observed_addr(conn: Connection, shaper: Shaper, joining: bool) {
+fn spawn_observed_addr(conn: Connection, shaper: Shaper, joining: Option<OpenedUnder>) {
     let observed = conn.remote_address();
     tokio::spawn(async move {
         send_framed(&conn, &shaper, joining, FrameType::ObservedAddr, &encode_addr(observed)).await;
@@ -3288,7 +3330,7 @@ fn spawn_observed_addr(conn: Connection, shaper: Shaper, joining: bool) {
 
 /// Write one framed message as a fresh uni-stream, shaped like any frame — the shared send
 /// primitive [`send_hello_ack`] and [`send_error`] build on (spec §7.2 framing).
-async fn send_framed(conn: &Connection, shaper: &Shaper, joining: bool, ty: FrameType, body: &[u8]) {
+async fn send_framed(conn: &Connection, shaper: &Shaper, joining: Option<OpenedUnder>, ty: FrameType, body: &[u8]) {
     let mut frame = Vec::new();
     encode_frame(ty.code(), body, &mut frame);
     if let Ok(mut stream) = conn.open_uni().await {
@@ -3305,7 +3347,7 @@ async fn send_framed(conn: &Connection, shaper: &Shaper, joining: bool, ty: Fram
 async fn send_hello_ack(
     conn: &Connection,
     shaper: &Shaper,
-    joining: bool,
+    joining: Option<OpenedUnder>,
     version: u16,
     capabilities: Capabilities,
 ) {
@@ -3318,7 +3360,7 @@ async fn send_hello_ack(
 /// Send an `ERROR` frame (spec §7.5) reporting `err` with no reason text — the handshake's
 /// incompatibility path (state diagram: `HELLO_SENT → CLOSED`). Best-effort: the connection is
 /// being abandoned regardless of whether this write lands.
-async fn send_error(conn: &Connection, shaper: &Shaper, joining: bool, err: ProtocolError) {
+async fn send_error(conn: &Connection, shaper: &Shaper, joining: Option<OpenedUnder>, err: ProtocolError) {
     let body = encode_error(err, b"");
     send_framed(conn, shaper, joining, FrameType::Error, &body).await;
 }
@@ -3692,8 +3734,8 @@ async fn read_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
 impl Transport {
     /// Whether frames to this peer must go out under the genesis shape: it reached us not knowing the live
     /// epoch, and until the handshake ends it cannot read anything else (#234).
-    fn joining(&self, conn: &Connection) -> bool {
-        crate::proteus_socket::speaks_genesis(&self.joining, conn.remote_address())
+    fn joining(&self, conn: &Connection) -> Option<OpenedUnder> {
+        crate::proteus_socket::addressing_for(&self.joining, conn.remote_address())
     }
 
     /// Record one driver-side discard on this node's data-path plane — the same plane `Client` records on
@@ -4982,7 +5024,7 @@ mod tests {
             carrier,
             &shaper,
             &stations,
-            &crate::proteus_socket::genesis_speakers(),
+            &crate::proteus_socket::reply_addressing(),
         );
         let endpoint = Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),

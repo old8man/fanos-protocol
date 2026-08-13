@@ -47,34 +47,173 @@ pub struct ProteusShaper {
     /// transform in [`shape`](Self::shape)/[`inbound`](Self::inbound).
     codec: Option<Arc<dyn MorphCodec>>,
     epoch: Epoch,
-    /// The current epoch's shape — the **only** one this node emits with.
-    shape: ShapeParams,
-    /// The neighbouring epochs' shapes, accepted on receive only: `[previous, next]`. See
-    /// [`SHAPE_GRACE`] for why both, and why the pair is cached rather than derived per frame.
+    /// The shapes derived from [`secret`](Self::secret) — the **emitting** set. Everything this node puts on
+    /// the wire uses `shapes.current`; the rest of the set is receive-only.
+    shapes: ShapeSet,
+    /// Additional community secrets accepted on **receive only**, each with its own full [`ShapeSet`]
+    /// (#13). Empty on a node that is not mid-rotation, which is almost every node almost always.
+    ///
+    /// The secret is kept beside its shapes because [`rotate`](Self::rotate) has to re-derive them: a shape
+    /// is `PRF(secret, epoch)`, so an accepted secret whose shapes were computed once would go dark at the
+    /// very next epoch turn while looking perfectly configured.
+    accepted: Vec<(Vec<u8>, ShapeSet)>,
+    counter: AtomicU64,
+}
+
+/// The three shapes one community secret yields at one epoch: what this node emits with, the
+/// [`SHAPE_GRACE`] neighbours it also accepts, and the immobile genesis rendezvous shape.
+///
+/// Extracted so the **secret** axis and the **epoch** axis compose instead of multiplying (#13). Before this
+/// the three lived as three fields of the shaper, which made "one more secret" mean "three more fields, and
+/// remember all three in `rotate`" — the shape of defect where a family gets moved one member at a time.
+struct ShapeSet {
+    /// This secret's shape at the current epoch.
+    current: ShapeParams,
+    /// The neighbouring epochs' shapes, accepted on receive only: `[previous, next]`. See [`SHAPE_GRACE`]
+    /// for why both, and why the pair is cached rather than derived per frame.
     grace: [ShapeParams; 2],
     /// The **genesis** shape, accepted on receive only, and only once the epoch has moved far enough that
-    /// [`grace`](Self::grace) no longer covers it. See [`OpenedUnder::Genesis`] for the deadlock it breaks.
+    /// [`grace`](Self::grace) no longer covers it. See [`OpenedEpoch::Genesis`] for the deadlock it breaks.
     ///
     /// Cached like the grace pair and for the same reason: it must cost one `deobfuscate` on a frame nobody
     /// recognises, never a hash, or an attacker sending garbage chooses this node's CPU bill.
     genesis: ShapeParams,
-    counter: AtomicU64,
 }
 
-/// Which of a shaper's accepted shapes opened an inbound datagram.
+impl ShapeSet {
+    /// Every shape `secret` yields at `epoch`.
+    fn for_secret(secret: &[u8], epoch: Epoch) -> Self {
+        Self {
+            current: epoch_shape(secret, epoch),
+            grace: grace_shapes(secret, epoch),
+            genesis: epoch_shape(secret, Epoch::ZERO),
+        }
+    }
+
+    /// Move the set to `epoch`.
+    ///
+    /// `genesis` is deliberately NOT re-derived: it is `epoch_shape(secret, 0)` by definition and does not
+    /// move. That immobility is the whole reason it can serve as a rendezvous shape for a node that knows no
+    /// epoch, and it is also its only cost — see [`OpenedEpoch::Genesis`].
+    fn rotate(&mut self, secret: &[u8], epoch: Epoch) {
+        self.current = epoch_shape(secret, epoch);
+        self.grace = grace_shapes(secret, epoch);
+    }
+
+    /// Which arm of this set opens `wire` as a **frame**, if any. `beyond_grace` comes from the shaper
+    /// because it is a property of the epoch, not of the secret.
+    fn open_frame(&self, wire: &[u8], beyond_grace: bool) -> Option<(Vec<u8>, OpenedEpoch)> {
+        // Current epoch first: in steady state — which is almost all of the time — the first attempt
+        // succeeds and the grace shapes are never touched. See [`SHAPE_GRACE`] for why the other two exist
+        // and why both sides are needed rather than only the past.
+        if let Some(frame) = deobfuscate(&self.current, wire) {
+            return Some((frame, OpenedEpoch::Current));
+        }
+        if let Some(frame) = deobfuscate(&self.grace[0], wire).or_else(|| deobfuscate(&self.grace[1], wire)) {
+            return Some((frame, OpenedEpoch::Grace));
+        }
+        // Last, and only past the grace window: a peer that has not yet learned the epoch. Fourth in the
+        // chain because it is the rarest, so the steady state never pays for it beyond the miss it was
+        // already paying.
+        if beyond_grace
+            && let Some(frame) = deobfuscate(&self.genesis, wire)
+        {
+            return Some((frame, OpenedEpoch::Genesis));
+        }
+        None
+    }
+
+    /// The datagram twin of [`open_frame`](Self::open_frame), opening `buf` in place.
+    ///
+    /// A failed attempt leaves the buffer untouched (`open_in_place` verifies the tag before it writes),
+    /// which is what makes trying the arms in sequence safe.
+    fn open_datagram(&self, buf: &mut [u8], beyond_grace: bool) -> Option<(usize, OpenedEpoch)> {
+        if let Some(len) = open_in_place(&self.current, buf) {
+            return Some((len, OpenedEpoch::Current));
+        }
+        if let Some(len) = open_in_place(&self.grace[0], buf).or_else(|| open_in_place(&self.grace[1], buf)) {
+            return Some((len, OpenedEpoch::Grace));
+        }
+        if beyond_grace
+            && let Some(len) = open_in_place(&self.genesis, buf)
+        {
+            return Some((len, OpenedEpoch::Genesis));
+        }
+        None
+    }
+
+    /// The shape a reply addressed to `epoch` must use.
+    fn shape_for(&self, epoch: OpenedEpoch) -> &ShapeParams {
+        match epoch {
+            // `Grace` replies in the CURRENT shape on purpose: the peer accepts its own grace window, and
+            // the disagreement is self-correcting within the beacon's spread. Only `Genesis` is a shape the
+            // peer cannot compute any other way.
+            OpenedEpoch::Current | OpenedEpoch::Grace => &self.current,
+            OpenedEpoch::Genesis => &self.genesis,
+        }
+    }
+}
+
+/// Which of a shaper's accepted shapes opened an inbound datagram: **which secret, and which epoch**.
+///
+/// **A pair rather than a flat enum, because the two lags are independent** (#13). A peer can be behind on
+/// the epoch, behind on the community secret, or — a node joining during a rotation — both at once. Flattening
+/// them would need one variant per combination and would make every caller enumerate a product it does not
+/// reason about; the caller's actual question is "how do I address the reply", and that has two coordinates.
 ///
 /// **Returned because a reply has to be readable by whoever asked**, and at the join that is not decidable
-/// from the receiver's own epoch. The epoch shape is `PRF(community secret, epoch)`, so a node holding the
-/// secret can compute any epoch's shape and simply does not know which is current — a *search* problem, not
-/// a cryptographic one. The two ends share exactly one epoch they can both name without talking, **zero**,
-/// and that is what makes the deadlock breakable at constant cost.
+/// from the receiver's own state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OpenedUnder {
+    /// Which epoch's shape opened it.
+    pub epoch: OpenedEpoch,
+    /// Which community secret opened it.
+    pub secret: OpenedSecret,
+}
+
+impl OpenedUnder {
+    /// The steady state: this node's own secret, at this node's own epoch.
+    pub const CURRENT: Self = Self { epoch: OpenedEpoch::Current, secret: OpenedSecret::Emitting };
+
+    /// Whether the reply may go out the ordinary way — the emitting secret at the current epoch.
+    ///
+    /// Stated as one predicate so a caller cannot satisfy half of it. Answering a peer in the right epoch
+    /// under the wrong secret is exactly as unreadable as the reverse, and a caller checking only the arm it
+    /// happened to hear about is how the second axis would go dark unnoticed.
+    #[must_use]
+    pub fn needs_addressing(self) -> bool {
+        self.epoch == OpenedEpoch::Genesis || self.secret != OpenedSecret::Emitting
+    }
+}
+
+/// Which community secret opened an inbound datagram.
+///
+/// The **secret** axis of [`OpenedUnder`], and it exists so that a rotation's lag is *visible*: a cell part-way
+/// through a secret rollover would otherwise look exactly like a cell that has finished one, and an operator
+/// would have no way to know when it is safe to move to the next phase.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenedSecret {
+    /// This node's own secret — the one it emits under, and the steady state.
+    Emitting,
+    /// One of the receive-only secrets, by index into the accepted list. **A reply MUST go out under the
+    /// same one** ([`ProteusShaper::outbound_under`]): the peer that sent this does not hold the emitting
+    /// secret yet, or no longer holds it, and either way cannot read anything shaped with it.
+    Accepted(usize),
+}
+
+/// Which epoch's shape opened an inbound datagram.
+///
+/// The **epoch** axis of [`OpenedUnder`]. The epoch shape is `PRF(community secret, epoch)`, so a node holding
+/// the secret can compute any epoch's shape and simply does not know which is current — a *search* problem,
+/// not a cryptographic one. The two ends share exactly one epoch they can both name without talking, **zero**,
+/// and that is what makes the join deadlock breakable at constant cost.
 ///
 /// The deadlock, on `SHAPE_GRACE = 1`: a node joining a cell at epoch `N ≥ 2` emits the epoch-0 shape, which
 /// is outside the cell's `{N−1, N, N+1}` window, and its own `{0, 1}` window rejects the cell's replies. Both
 /// directions are dark, and nothing can teach either side the epoch because teaching requires a frame to
 /// cross. To speak you must know the epoch; to learn it you must speak.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OpenedUnder {
+pub enum OpenedEpoch {
     /// This node's current epoch — the steady state, and the first attempt, so it is what almost every
     /// datagram costs.
     Current,
@@ -86,7 +225,7 @@ pub enum OpenedUnder {
     /// genesis shape is then already `Current` or `Grace`).
     ///
     /// A reply in the current shape would be unreadable, so the caller MUST seal it under
-    /// [`seal_datagram_at_genesis`](ProteusShaper::seal_datagram_at_genesis) — the whole point of returning
+    /// [`seal_datagram_under`](ProteusShaper::seal_datagram_under) — the whole point of returning
     /// which shape opened the datagram.
     ///
     /// **The cost, stated where it is paid.** The genesis shape does not rotate, so for an observer who has
@@ -130,6 +269,19 @@ pub enum OpenedUnder {
 /// on a cached window is constant work with nothing attacker-scaled in it.
 pub const SHAPE_GRACE: u64 = 1;
 
+/// How many receive-only community secrets a shaper will hold beside the one it emits under (#13).
+///
+/// **Derived from what a rollover needs, not chosen for comfort.** The three-phase rollover in
+/// [`ProteusShaper::also_accept`] needs exactly one extra secret at a time: the incoming one during phase 1,
+/// the outgoing one during phase 2. Two allows a second rollover to begin before the first has been tidied
+/// away — an operator's realistic mistake rather than a design — and that is the whole justification.
+///
+/// It is a **bound**, not a target, and the reason it exists at all is the receive path: a frame nobody
+/// recognises costs up to four `deobfuscate` attempts per installed secret, so an unbounded list would let a
+/// configuration mistake multiply the CPU an attacker's garbage buys. The multiplier stays the operator's,
+/// and it stays small.
+pub const MAX_ACCEPTED_SECRETS: usize = 2;
+
 /// Redacted `Debug`: never render the community secret (which now lives in a production node once PROTEUS is
 /// enabled) — a `{:?}` on the driver's transport state must not leak it (secret hygiene, audit D).
 impl core::fmt::Debug for ProteusShaper {
@@ -138,6 +290,7 @@ impl core::fmt::Debug for ProteusShaper {
             .field("secret", &"<redacted>")
             .field("morph", &self.morph)
             .field("epoch", &self.epoch)
+            .field("accepted_secrets", &self.accepted.len())
             .finish_non_exhaustive()
     }
 }
@@ -156,20 +309,57 @@ impl ProteusShaper {
     #[must_use]
     pub fn with_morph(community_secret: impl Into<Vec<u8>>, epoch: Epoch, morph: Morph) -> Self {
         let secret = community_secret.into();
-        let shape = epoch_shape(&secret, epoch);
-        let grace = grace_shapes(&secret, epoch);
-        let genesis = epoch_shape(&secret, Epoch::ZERO);
+        let shapes = ShapeSet::for_secret(&secret, epoch);
         Self {
             secret,
             morph,
             profile: ShapingProfile::for_morph(morph),
             codec: None,
             epoch,
-            shape,
-            grace,
-            genesis,
+            shapes,
+            accepted: Vec::new(),
             counter: AtomicU64::new(0),
         }
+    }
+
+    /// Also accept `secret` on **receive**, without emitting under it — the phase-1 half of a community-secret
+    /// rotation (#13). Returns `false`, changing nothing, past [`MAX_ACCEPTED_SECRETS`].
+    ///
+    /// # Why emission is not a parameter here
+    ///
+    /// A secret rotation is not an epoch rotation, and the difference decides the whole design. An epoch is
+    /// driven by the beacon, so both ends converge on their own within the flood's spread and
+    /// [`SHAPE_GRACE`] is a *derived* bound on that disagreement. A community secret is distributed **outside
+    /// the protocol** — by whatever channel the operator uses — so the two ends never converge by themselves,
+    /// and nothing in FANOS can bound how long the disagreement lasts.
+    ///
+    /// A node that switched emission to a new secret the moment it learned one would be unreadable to every
+    /// peer that had not learned it yet, which in a censored deployment is the failure PROTEUS exists to
+    /// prevent. So emission moves only when the operator says so, and a rollover is three deliberate phases:
+    ///
+    /// 1. every node **accepts** the new secret (this call). Nothing changes on the wire.
+    /// 2. every node **emits** under the new one and accepts the old (swap the config's two keys).
+    /// 3. every node **drops** the old.
+    ///
+    /// **There is therefore no overlap-window constant in this crate, and that absence is the derivation.**
+    /// The window is the operator's pause between phases; no protocol quantity bounds it, so inventing a
+    /// number here would be a constant standing for a decision the code cannot see. What the code owes
+    /// instead is the *observable* that tells the operator a phase is complete: [`OpenedSecret`], reported by
+    /// [`inbound`](Self::inbound) and [`open_datagram`](Self::open_datagram) on every datagram.
+    pub fn also_accept(&mut self, secret: impl Into<Vec<u8>>) -> bool {
+        if self.accepted.len() >= MAX_ACCEPTED_SECRETS {
+            return false;
+        }
+        let secret = secret.into();
+        let shapes = ShapeSet::for_secret(&secret, self.epoch);
+        self.accepted.push((secret, shapes));
+        true
+    }
+
+    /// How many receive-only secrets are installed — zero on a node that is not mid-rotation.
+    #[must_use]
+    pub fn accepted_secrets(&self) -> usize {
+        self.accepted.len()
     }
 
     /// A shaper driven by a **pluggable** [`MorphCodec`] (§13.3 SPI) instead of the built-in codec — the
@@ -194,18 +384,15 @@ impl ProteusShaper {
             return None;
         }
         let secret = community_secret.into();
-        let shape = epoch_shape(&secret, epoch);
-        let grace = grace_shapes(&secret, epoch);
-        let genesis = epoch_shape(&secret, Epoch::ZERO);
+        let shapes = ShapeSet::for_secret(&secret, epoch);
         Some(Self {
             secret,
             morph: Morph::Pluggable,
             profile: ShapingProfile::for_morph(Morph::Pluggable),
             codec: Some(codec),
             epoch,
-            shape,
-            grace,
-            genesis,
+            shapes,
+            accepted: Vec::new(),
             counter: AtomicU64::new(0),
         })
     }
@@ -246,13 +433,17 @@ impl ProteusShaper {
     ///
     /// The [`SHAPE_GRACE`] window moves with it, so a peer that has not yet turned — or has already turned —
     /// still un-shapes for the length of the beacon's spread.
+    ///
+    /// **Every accepted secret rotates too, and that is not housekeeping** (#13). A shape is
+    /// `PRF(secret, epoch)`, so an accepted secret left at the epoch it was installed at would keep matching
+    /// nothing from the very next turn onward — configured, listed, and deaf. The loop is what makes the
+    /// secret axis and the epoch axis independent instead of accidentally coupled.
     pub fn rotate(&mut self, epoch: Epoch) {
         self.epoch = epoch;
-        self.shape = epoch_shape(&self.secret, epoch);
-        self.grace = grace_shapes(&self.secret, epoch);
-        // `genesis` is deliberately NOT re-derived: it is `epoch_shape(secret, 0)` by definition and does not
-        // move. That immobility is the whole reason it can serve as a rendezvous shape for a node that knows
-        // no epoch, and it is also its only cost — see [`OpenedUnder::Genesis`].
+        self.shapes.rotate(&self.secret, epoch);
+        for (secret, shapes) in &mut self.accepted {
+            shapes.rotate(secret, epoch);
+        }
     }
 
     /// The current epoch.
@@ -277,10 +468,10 @@ impl ProteusShaper {
             None if self.morph == Morph::Plain => {
                 return Shaped { wire: frame.to_vec(), delay: Duration::ZERO };
             }
-            None => obfuscate(&self.shape, frame, &self.packet_nonce(seq)),
+            None => obfuscate(&self.shapes.current, frame, &self.packet_nonce(seq)),
         };
-        self.profile.pad_to_target(&mut wire, &self.shape.scramble_seed, seq);
-        let delay = self.profile.packet_delay(&self.shape.scramble_seed, seq);
+        self.profile.pad_to_target(&mut wire, &self.shapes.current.scramble_seed, seq);
+        let delay = self.profile.packet_delay(&self.shapes.current.scramble_seed, seq);
         Shaped { wire, delay }
     }
 
@@ -294,7 +485,7 @@ impl ProteusShaper {
     /// Derive a random-looking per-packet nonce from the sequence counter — so the cleartext front
     /// of the wire is not an incrementing (fingerprintable) counter but PRF output.
     fn packet_nonce(&self, seq: u64) -> [u8; NONCE_LEN] {
-        let mut material = self.shape.scramble_seed.to_vec();
+        let mut material = self.shapes.current.scramble_seed.to_vec();
         material.extend_from_slice(&seq.to_be_bytes());
         let mut nonce = [0u8; NONCE_LEN];
         hash_xof(NONCE_LABEL, &material, &mut nonce);
@@ -314,27 +505,22 @@ impl ProteusShaper {
     #[must_use]
     pub fn inbound(&self, wire: &[u8]) -> Option<(Vec<u8>, OpenedUnder)> {
         if let Some(codec) = &self.codec {
-            return codec.decode(wire).map(|f| (f, OpenedUnder::Current));
+            return codec.decode(wire).map(|f| (f, OpenedUnder::CURRENT));
         }
         if self.morph == Morph::Plain {
-            return Some((wire.to_vec(), OpenedUnder::Current));
+            return Some((wire.to_vec(), OpenedUnder::CURRENT));
         }
-        // Current epoch first: in steady state — which is almost all of the time — the first attempt
-        // succeeds and the grace shapes are never touched. See [`SHAPE_GRACE`] for why the other two exist
-        // and why both sides are needed rather than only the past.
-        if let Some(frame) = deobfuscate(&self.shape, wire) {
-            return Some((frame, OpenedUnder::Current));
+        let beyond = self.beyond_grace();
+        // The emitting secret first, and its own current epoch first inside that: in steady state — which is
+        // almost all of the time — the first attempt succeeds and nothing else is touched. Accepted secrets
+        // come after for the same reason the genesis shape comes last: a cost paid only on a miss.
+        if let Some((frame, epoch)) = self.shapes.open_frame(wire, beyond) {
+            return Some((frame, OpenedUnder { epoch, secret: OpenedSecret::Emitting }));
         }
-        if let Some(frame) = deobfuscate(&self.grace[0], wire).or_else(|| deobfuscate(&self.grace[1], wire)) {
-            return Some((frame, OpenedUnder::Grace));
-        }
-        // Last, and only past the grace window: a peer that has not yet learned the epoch. Fourth in the
-        // chain because it is the rarest, so the steady state never pays for it beyond the miss it was
-        // already paying.
-        if self.beyond_grace()
-            && let Some(frame) = deobfuscate(&self.genesis, wire)
-        {
-            return Some((frame, OpenedUnder::Genesis));
+        for (i, (_, shapes)) in self.accepted.iter().enumerate() {
+            if let Some((frame, epoch)) = shapes.open_frame(wire, beyond) {
+                return Some((frame, OpenedUnder { epoch, secret: OpenedSecret::Accepted(i) }));
+            }
         }
         None
     }
@@ -358,7 +544,7 @@ impl ProteusShaper {
     /// which epoch they are in.
     #[must_use]
     pub fn seal_datagram(&self, payload: &[u8], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
-        seal(&self.shape, payload, nonce)
+        seal(&self.shapes.current, payload, nonce)
     }
 
     /// Open one datagram in place, returning the plaintext length; `None` means "not from this
@@ -372,52 +558,65 @@ impl ProteusShaper {
     /// which is what makes trying three shapes in sequence safe.
     #[must_use]
     pub fn open_datagram(&self, buf: &mut [u8]) -> Option<(usize, OpenedUnder)> {
-        if let Some(len) = open_in_place(&self.shape, buf) {
-            return Some((len, OpenedUnder::Current));
+        let beyond = self.beyond_grace();
+        if let Some((len, epoch)) = self.shapes.open_datagram(buf, beyond) {
+            return Some((len, OpenedUnder { epoch, secret: OpenedSecret::Emitting }));
         }
-        if let Some(len) = open_in_place(&self.grace[0], buf).or_else(|| open_in_place(&self.grace[1], buf)) {
-            return Some((len, OpenedUnder::Grace));
-        }
-        if self.beyond_grace()
-            && let Some(len) = open_in_place(&self.genesis, buf)
-        {
-            return Some((len, OpenedUnder::Genesis));
+        for (i, (_, shapes)) in self.accepted.iter().enumerate() {
+            if let Some((len, epoch)) = shapes.open_datagram(buf, beyond) {
+                return Some((len, OpenedUnder { epoch, secret: OpenedSecret::Accepted(i) }));
+            }
         }
         None
     }
 
-    /// Seal one datagram under the **genesis** shape rather than this node's current one — the reply half of
-    /// [`OpenedUnder::Genesis`], and the only way an established node can answer a peer that has not yet
-    /// learned the epoch.
+    /// Seal one datagram addressed the way `under` says — the reply half of
+    /// [`open_datagram`](Self::open_datagram), and the only way an established node can answer a peer that is
+    /// behind on the epoch, on the community secret, or (a node joining mid-rotation) on both.
     ///
     /// Separate from [`seal_datagram`](Self::seal_datagram) instead of a parameter on it, because the default
-    /// must stay "the current epoch": a shape argument on the hot path is a shape argument someone eventually
-    /// passes `Epoch::ZERO` to by accident, and that is the static wire signature §13.4 exists to remove.
-    /// Use it only for a peer this node has just *observed* speaking genesis, never speculatively.
+    /// must stay "my secret, my epoch": a shape argument on the hot path is a shape argument someone
+    /// eventually passes `Epoch::ZERO` to by accident, and that is the static wire signature §13.4 exists to
+    /// remove. Use it only for a peer this node has just *observed* on that shape, never speculatively.
+    ///
+    /// An `under` naming an accepted secret that has since been dropped falls back to the emitting set — the
+    /// only safe answer, since the alternative is inventing a shape. The peer then cannot read the reply,
+    /// which is the correct outcome: the operator ended the rollover phase, and this peer did not follow.
     #[must_use]
-    pub fn seal_datagram_at_genesis(&self, payload: &[u8], nonce: &[u8; NONCE_LEN]) -> Vec<u8> {
-        seal(&self.genesis, payload, nonce)
+    pub fn seal_datagram_under(&self, payload: &[u8], nonce: &[u8; NONCE_LEN], under: OpenedUnder) -> Vec<u8> {
+        seal(self.reply_shape(under), payload, nonce)
     }
 
-    /// Wrap an outbound **frame** under the genesis shape — the frame-layer twin of
-    /// [`seal_datagram_at_genesis`](Self::seal_datagram_at_genesis), for the same peer and the same reason.
+    /// Wrap an outbound **frame** addressed the way `under` says — the frame-layer twin of
+    /// [`seal_datagram_under`](Self::seal_datagram_under), for the same peer and the same reason.
     ///
     /// Both layers are needed, and that is not redundancy: the datagram envelope carries the QUIC packet and
-    /// the frame codec carries what is inside it, each keyed independently on the epoch. Fixing only the
+    /// the frame codec carries what is inside it, each keyed independently on the shape. Fixing only the
     /// envelope gets a joining node's handshake through and then loses its first HELLO.
     #[must_use]
-    pub fn outbound_at_genesis(&self, frame: &[u8]) -> Vec<u8> {
+    pub fn outbound_under(&self, frame: &[u8], under: OpenedUnder) -> Vec<u8> {
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
         if self.morph == Morph::Plain {
             return frame.to_vec();
         }
+        let shape = self.reply_shape(under);
         let mut nonce = [0u8; NONCE_LEN];
-        let mut material = self.genesis.scramble_seed.to_vec();
+        let mut material = shape.scramble_seed.to_vec();
         material.extend_from_slice(&seq.to_be_bytes());
         hash_xof(NONCE_LABEL, &material, &mut nonce);
-        let mut wire = obfuscate(&self.genesis, frame, &nonce);
-        self.profile.pad_to_target(&mut wire, &self.genesis.scramble_seed, seq);
+        let mut wire = obfuscate(shape, frame, &nonce);
+        self.profile.pad_to_target(&mut wire, &shape.scramble_seed, seq);
         wire
+    }
+
+    /// The one shape both reply paths address with — resolved in a single place so the frame layer and the
+    /// datagram layer can never disagree about which peer they are talking to.
+    fn reply_shape(&self, under: OpenedUnder) -> &ShapeParams {
+        let set = match under.secret {
+            OpenedSecret::Emitting => &self.shapes,
+            OpenedSecret::Accepted(i) => self.accepted.get(i).map_or(&self.shapes, |(_, s)| s),
+        };
+        set.shape_for(under.epoch)
     }
 }
 
@@ -440,7 +639,10 @@ fn grace_shapes(secret: &[u8], epoch: Epoch) -> [ShapeParams; 2] {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+// `expect_used` joins `unwrap_used` for the reason the sibling crates carry the pair: in a test the message
+// IS the assertion — "an accepted secret must open" says what went wrong at the moment it does, where a bare
+// `unwrap` would report a line number and nothing else.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     /// The bytes alone. Every assertion below predates [`ProteusShaper::inbound`] reporting its arm and is
     /// about *reachability*; the arm has its own tests, and folding it into each of these would add noise
@@ -470,6 +672,142 @@ mod tests {
         let bob = ProteusShaper::new(b"s".to_vec(), Epoch::new(9));
         let wire = alice.outbound(b"hi bob");
         assert_eq!(opened(&bob, &wire).unwrap(), b"hi bob");
+    }
+
+    /// **A community-secret rollover is reachable in BOTH directions, and a dropped secret in neither** (#13).
+    ///
+    /// The epoch-axis twin below is the model, and both of its obligations transfer:
+    ///
+    /// * **both directions**, because the two ends fail differently and a test of one certifies half a fix.
+    ///   Here the asymmetry is sharper than the epoch's: the node that has *moved* emits under the new secret
+    ///   and would be unreadable to everyone still on the old, which is why emission is not allowed to move
+    ///   until every peer accepts. Phase 1 is asserted as the state where nothing on the wire has changed
+    ///   yet — that is the property that makes the rollover safe, not an incidental one.
+    /// * **the negative half**, because a window that accepts everything is not a window. A secret the
+    ///   operator has dropped must stop opening, or phase 3 does nothing and the rotation is not one.
+    ///
+    /// The third assertion has no epoch-axis counterpart and is the reason [`OpenedSecret`] exists: the
+    /// receiver must be able to *say* which secret opened a datagram. Without it a cell part-way through a
+    /// rollover is indistinguishable from a cell that has finished one, and the operator has no signal for
+    /// when phase 2 is safe — the rollover would be a leap in the dark rather than a procedure.
+    #[test]
+    fn a_secret_rollover_is_readable_both_ways_and_a_dropped_secret_is_not() {
+        const OLD: &[u8] = b"the community secret in use";
+        const NEW: &[u8] = b"the one being rolled out";
+
+        // PHASE 1: this node accepts the new secret and still emits under the old.
+        let mut moving = ProteusShaper::new(OLD.to_vec(), Epoch::new(4));
+        assert!(moving.also_accept(NEW.to_vec()));
+        let unmoved = ProteusShaper::new(OLD.to_vec(), Epoch::new(4));
+
+        // Nothing on the wire changed: a peer that has heard nothing about the rollover still reads it.
+        let out = moving.outbound(b"phase 1 emits under the old secret");
+        assert_eq!(
+            opened(&unmoved, &out).as_deref(),
+            Some(b"phase 1 emits under the old secret".as_slice()),
+            "accepting a secret must not move emission — a node that switched on learning a new secret \
+             would go dark to every peer that had not learned it yet, which is the failure PROTEUS exists \
+             to prevent"
+        );
+
+        // And the other direction: a peer already emitting under the NEW secret is readable here. This is
+        // the leg that makes phase 2 survivable, and it is the one a naive "keep the old shape" misses.
+        let ahead = ProteusShaper::new(NEW.to_vec(), Epoch::new(4));
+        let from_ahead = ahead.outbound(b"phase 2 emits under the new secret");
+        let (frame, under) = moving.inbound(&from_ahead).expect("an accepted secret must open");
+        assert_eq!(frame, b"phase 2 emits under the new secret");
+
+        // The observable, which is what tells an operator a phase is complete.
+        assert_eq!(under.secret, OpenedSecret::Accepted(0), "the arm names WHICH secret opened it");
+        assert_eq!(under.epoch, OpenedEpoch::Current, "and the two axes are read independently");
+        assert!(under.needs_addressing(), "so the reply is addressed rather than sent the default way");
+
+        // The reply goes back under that same secret, and the peer can read it. Without this the handshake
+        // connects and then dies in one direction — the #235 asymmetry, one axis over.
+        let reply = moving.outbound_under(b"answered under the secret that asked", under);
+        assert_eq!(
+            opened(&ahead, &reply).as_deref(),
+            Some(b"answered under the secret that asked".as_slice()),
+            "a reply must be readable by whoever asked, or the rollover breaks exactly the peers it is for"
+        );
+
+        // PHASE 3, the negative half: a shaper that never accepted NEW does not open its frames.
+        assert!(
+            opened(&unmoved, &from_ahead).is_none(),
+            "a secret that was never accepted must not open — otherwise 'accepted' means nothing and \
+             dropping one at the end of a rollover would change nothing"
+        );
+    }
+
+    /// **An accepted secret rotates with the epoch, or it is deaf from the next turn onward** (#13).
+    ///
+    /// The trap the [`ShapeSet`] extraction exists to remove. A shape is `PRF(secret, epoch)`, so an accepted
+    /// secret whose shapes were derived once at install time keeps matching nothing the moment the beacon
+    /// advances — while remaining listed, configured, and reported as present. The failure is silent on every
+    /// surface, which is why it is asserted rather than argued.
+    ///
+    /// **It takes TWO turns to see, and that is the finding** — my first version of this test rotated once
+    /// and stayed green with the fix removed. A frozen set still holds `grace = [install − 1, install + 1]`,
+    /// and `SHAPE_GRACE` is exactly 1, so the first turn lands inside the stale window and is absorbed. The
+    /// defect is invisible for one epoch and total from the second: the worst possible shape, because a
+    /// deployment would test a rollover across one turn, see it work, and lose the peer on the next.
+    ///
+    /// Falsified by dropping the `for (secret, shapes) in &mut self.accepted` loop from `rotate`: the
+    /// TWO-turn assertion goes red while the one-turn assertion above it and the emitting secret both stay
+    /// green — which is the discrimination, not merely a failure.
+    #[test]
+    fn rotating_the_epoch_moves_the_accepted_secrets_too() {
+        const OLD: &[u8] = b"retiring";
+        const NEW: &[u8] = b"incoming";
+        let mut node = ProteusShaper::new(NEW.to_vec(), Epoch::new(7));
+        assert!(node.also_accept(OLD.to_vec()));
+
+        // Before any turn, the accepted peer is readable — the control, so what follows is about the turn
+        // and not about the setup.
+        let peer_old = ProteusShaper::new(OLD.to_vec(), Epoch::new(7));
+        assert!(opened(&node, &peer_old.outbound(b"before")).is_some(), "the setup itself must work");
+
+        // One turn: absorbed either way. Asserted so the two-turn assertion below cannot be mistaken for
+        // "rotation breaks accepted secrets" — it is specifically the SECOND turn that escapes the window.
+        node.rotate(Epoch::new(8));
+        let peer_at_8 = ProteusShaper::new(OLD.to_vec(), Epoch::new(8));
+        assert!(
+            opened(&node, &peer_at_8.outbound(b"one turn")).is_some(),
+            "one turn is inside a stale set's own grace window — this must hold with or without the fix"
+        );
+
+        // Two turns: outside every arm a frozen set has, including its immobile genesis shape.
+        node.rotate(Epoch::new(9));
+        let peer_at_9 = ProteusShaper::new(OLD.to_vec(), Epoch::new(9));
+        assert!(
+            opened(&node, &peer_at_9.outbound(b"two turns")).is_some(),
+            "an accepted secret must follow the epoch — left where it was installed it goes deaf two turns \
+             later while still looking perfectly configured, and nothing reports it"
+        );
+
+        // And the emitting secret is unaffected throughout, so the failure above is about the accepted one.
+        let peer_new = ProteusShaper::new(NEW.to_vec(), Epoch::new(9));
+        assert!(opened(&node, &peer_new.outbound(b"emitting")).is_some(), "the emitting secret still works");
+        assert_eq!(node.accepted_secrets(), 1, "and the rollover state is reportable");
+    }
+
+    /// The bound is a bound: past [`MAX_ACCEPTED_SECRETS`] the shaper refuses and changes nothing.
+    ///
+    /// Refusing rather than evicting, because an evicted secret is a peer that silently stops being readable
+    /// — the operator would see a successful call and a broken cell.
+    #[test]
+    fn accepting_more_secrets_than_a_rollover_needs_is_refused_not_evicted() {
+        let mut node = ProteusShaper::new(b"emitting".to_vec(), Epoch::new(1));
+        for i in 0..MAX_ACCEPTED_SECRETS {
+            assert!(node.also_accept(alloc::format!("extra-{i}").into_bytes()), "up to the bound, accepted");
+        }
+        let first = ProteusShaper::new(b"extra-0".to_vec(), Epoch::new(1));
+        assert!(!node.also_accept(b"one too many".to_vec()), "past the bound, refused");
+        assert_eq!(node.accepted_secrets(), MAX_ACCEPTED_SECRETS, "and nothing was added");
+        assert!(
+            opened(&node, &first.outbound(b"still here")).is_some(),
+            "nor evicted — an eviction would silently unreachable a peer the operator still expects to work"
+        );
     }
 
     /// **A peer mid-rotation is reachable in BOTH directions, and two epochs apart in neither** (#196).

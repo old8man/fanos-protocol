@@ -256,6 +256,26 @@ struct RecoveryWatcher {
     confirmations: u32,
 }
 
+/// The transport-shaping config a node starts with, or `None` for plaintext QUIC (§13.4).
+///
+/// Extracted from `start_over` so the three decisions it makes are nameable rather than buried in an
+/// argument list: whether shaping is on at all, which morph selects it, and which secrets are accepted
+/// beside the one emitted under.
+///
+/// **`to_vec` and not a move, at both halves.** The config's copies are `Zeroizing` and stay that way, so
+/// they are wiped when the config drops even though PROTEUS needs plain buffers to derive shapes from.
+fn proteus_config(config: &NodeConfig) -> Option<ProteusConfig> {
+    let secret = config.proteus_secret.as_ref()?;
+    let mut proteus = match config.proteus_environment {
+        Some(env) => ProteusConfig::auto(secret.to_vec(), env),
+        None => ProteusConfig::with_morph(secret.to_vec(), config.proteus_morph),
+    };
+    // The rollover's receive-only half (#13): accepted, never emitted under, so phase 1 of a community-secret
+    // rotation changes nothing on the wire.
+    proteus.accept_secrets = config.proteus_accept_secrets.iter().map(|s| s.to_vec()).collect();
+    Some(proteus)
+}
+
 impl RecoveryWatcher {
     fn new(threshold: usize) -> Self {
         Self {
@@ -954,6 +974,23 @@ pub struct Node {
 }
 
 /// A point-in-time health snapshot of a node.
+///
+/// # Why there is no coherence number here, and why adding one would be a regression (#277/#278)
+///
+/// Every field below is something this node **knows first-hand**. Φ, purity and the correlation radius are
+/// not: the only reading a node has of its own cell's coherence is its **ε-noised telemetry export**, and
+/// #278 measured what happens when a node consults it — **100 invented alarms out of 3636 samples, 0
+/// hidden ones**, every one of them `Healthy → Structure`. The noise is there so the export can leave the
+/// node; reading it back locally pays the privacy cost twice and buys a worse answer than silence.
+///
+/// The absence is therefore a **decision with a measurement behind it**, not a gap someone forgot to fill —
+/// stated here because the reason lives in a different crate, and an unexplained absence beside
+/// [`reflexive`](Self::reflexive)'s carefully explained one reads as an oversight to the next person.
+///
+/// What would make coherence belong here is a reader of the **un-noised** frame, which is a different
+/// object with a different owner (`fanos_telemetry::snapshot` — and its own doc records why the canonical
+/// summary must sit at the frame layer rather than below it: readiness is a question about provenance as
+/// much as about magnitudes, and provenance is a property of the frame).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Health {
     /// The node's overlay coordinate.
@@ -1297,12 +1334,7 @@ impl Node {
             // rotates each epoch (driven by the same beacon that reshuffles the coordinate). An environment
             // policy enables morph auto-fallback (§13.7); otherwise the fixed morph is used. No secret ⇒
             // plaintext QUIC.
-            config.proteus_secret.clone().map(|secret| match config.proteus_environment {
-                // `to_vec` and not a move: the config's copy is `Zeroizing` and stays that way, so it is
-                // wiped when the config drops even though PROTEUS needs a plain buffer to shape with (#13).
-                Some(env) => ProteusConfig::auto(secret.to_vec(), env),
-                None => ProteusConfig::with_morph(secret.to_vec(), config.proteus_morph),
-            }),
+            proteus_config(&config),
         )?;
 
         let address = handle.address();

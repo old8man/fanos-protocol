@@ -705,6 +705,17 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
         let _ = writeln!(s, "#   (umask 077; printf %s 'YOUR-COMMUNITY-SECRET' > proteus.secret)");
         let _ = writeln!(s, "#   fanos node --proteus-secret-file proteus.secret");
     }
+    // **Mentioned in EVERY fresh config, set or not** (#13), and for the reason the block above records one
+    // field over: a mechanism an operator cannot discover from the file they edit does not exist to them. This
+    // one has to be discovered BEFORE it is needed — a community secret is rotated by a procedure, and an
+    // operator who learns of the procedure only when the rotation has already gone wrong has learnt it too
+    // late. The value is never written for the same reason `proteus_secret`'s never is.
+    let _ = writeln!(s, "# proteus_accept_secrets = <a secret to ACCEPT but not emit under>  (repeat per secret)");
+    let _ = writeln!(s, "#   Rotating the community secret has no flag day, and this key is how. Phase 1: every");
+    let _ = writeln!(s, "#   node ACCEPTS the new secret here — nothing on the wire changes. Phase 2, once every");
+    let _ = writeln!(s, "#   node has done phase 1: move the new one to proteus_secret and put the old one here.");
+    let _ = writeln!(s, "#   Phase 3: drop the old one. Doing phase 2 early makes this node unreadable to every");
+    let _ = writeln!(s, "#   peer still on the old secret."); 
     s
 }
 
@@ -884,6 +895,7 @@ mod tests {
             proteus_secret,
             proteus_morph,
             proteus_environment,
+            proteus_accept_secrets,
         } = &c;
 
         assert_eq!(&back.listen, listen, "listen");
@@ -939,6 +951,21 @@ mod tests {
         assert!(
             text.contains("does NOTHING until a shared community secret is set"),
             "a config with no secret must say that the morph it displays is inert:\n{text}"
+        );
+
+        // The rollover's receive-only secrets are secrets, so the same rule as `proteus_secret` applies and
+        // the same OPPOSITE property is what is worth asserting: the rendered comment must not parse back as
+        // a setting. What is NOT the same is discoverability — this key is mentioned in every fresh config,
+        // set or not, because a rotation procedure has to be known before the rotation, and the branch that
+        // only speaks once the key is configured would tell an operator about it exactly too late.
+        assert!(proteus_accept_secrets.is_empty(), "the fixture sets no rollover");
+        assert!(
+            back.proteus_accept_secrets.is_empty(),
+            "a rendered `# proteus_accept_secrets` comment must stay a comment"
+        );
+        assert!(
+            text.contains("Rotating the community secret has no flag day"),
+            "every fresh config must name the rollover procedure, set or not:\n{text}"
         );
 
         // The four provisioning bundles are loaded from FILES the config names. Rendering writes the paths;
