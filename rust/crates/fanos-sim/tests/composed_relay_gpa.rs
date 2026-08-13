@@ -27,17 +27,22 @@
 //! The adversary is the lag-scanning one (#187), through `fanos_testkit::gpa`, because a zero-lag matcher
 //! reads mixing as absence of signal and scores *below chance*.
 //!
-//! # SCOPE, and it is narrower than the title
+//! # What it drives, and the two ways this file first measured nothing
 //!
-//! **This drives overlay `Send`s, which never enter `ThresholdRouter::forward_send`** — see
-//! `a_plain_overlay_send_never_reaches_the_relays_mixing_branch`, which asserts exactly that after the first
-//! version of this file nearly reported a mixing figure the mixing branch had not produced. What is
-//! measured here is therefore the GPA's read on a composed relay cell's **overlay** traffic: real, never
-//! measured before, and not the forwarding path.
+//! The probe is a **sealed two-hop onion** through `ThresholdRouter::forward_send`, built the way
+//! `composed_relay.rs` builds one, with a separate seal per send — one frame re-injected would be a replay
+//! and #296 taught the router to refuse those.
 //!
-//! Finishing #181 step 2 needs the probe to be a sealed onion — `seal_forward` over a `meeting_line`, the
-//! way `composed_relay.rs` builds one — so the cells actually traverse the router. Until then the
-//! `delay-only` column below is a control that reads zero for a known reason, not a verdict on the delay.
+//! It did not start that way, and both wrong turns are asserted against below rather than merely fixed:
+//!
+//! 1. It first drove `Command::Send`, an overlay send that never enters `forward_send`. The tape came back
+//!    byte-identical with and without a 120 ms delay, and `delay buys 0.000` would have shipped as a
+//!    property of the relay. #134's shape, one subsystem over.
+//! 2. The control that caught it then used `(frame count, last timestamp)` — a proxy that cannot see ten
+//!    frames displaced by 120 ms among 4972. Summing every timestamp can: `29 630 002 -> 29 635 851`.
+//!
+//! `the_mix_delay_engages_and_displaces_the_tape_without_dropping_a_frame` now pins all of it, so a future
+//! change that silently detaches this harness from the forwarding path fails loudly instead of reading zero.
 #![allow(
     clippy::indexing_slicing,
     clippy::unwrap_used,
@@ -111,6 +116,26 @@ fn tape_and_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> ((usize,
     sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
     sim.observe_frames(); // the GPA starts tapping
 
+    drive(&mut sim);
+
+    let tape = sim.observed_frames();
+    let bins = (WINDOW_MS / bin_ms) as usize;
+    let lag = max_lag_bins(bin_ms);
+    let r = cell
+        .iter()
+        .map(|&n| {
+            let ins = recv_series(tape, n, bin_ms, bins);
+            let outs = emit_series(tape, n, bin_ms, bins);
+            best_lag_score(&ins, &outs, lag)
+        })
+        .fold(0.0, f64::max);
+    let shape = (tape.len(), tape.iter().map(|o| o.t_ms).sum::<u64>());
+    (shape, r)
+}
+
+/// The traffic every arm and every extra test drives — one definition, so no two of them can differ in the
+/// load while claiming to differ only in the defence.
+fn drive(sim: &mut Sim) {
     // **Sealed onions through the router, not overlay sends.** The first version of this harness drove
     // `Command::Send`, which never enters `ThresholdRouter::forward_send` — the control below caught it.
     // This is the shape `composed_relay.rs` uses: an epoch-0 `MixDirectory` over the seeds
@@ -149,22 +174,6 @@ fn tape_and_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> ((usize,
         sim.run_for(Duration::from_millis(STEP_MS));
         now += STEP_MS;
     }
-
-    let tape = sim.observed_frames();
-    let bins = (WINDOW_MS / bin_ms) as usize;
-    let lag = max_lag_bins(bin_ms);
-    let r = cell
-        .iter()
-        .map(|&n| {
-            let ins = recv_series(tape, n, bin_ms, bins);
-            let outs = emit_series(tape, n, bin_ms, bins);
-            best_lag_score(&ins, &outs, lag)
-        })
-        .fold(0.0, f64::max);
-    // The SUM of every timestamp, not the count and the last one: a proxy that cannot see ten frames
-    // displaced by 120 ms among 4882 would report "the branch did not run" for a branch that did.
-    let shape = (tape.len(), tape.iter().map(|o| o.t_ms).sum::<u64>());
-    (shape, r)
 }
 
 /// **The mixing branch engages, and it DISPLACES rather than drops** — asserted before any figure below is
@@ -204,6 +213,50 @@ fn the_mix_delay_engages_and_displaces_the_tape_without_dropping_a_frame() {
         "the delay changed how many frames exist ({count_plain} -> {count_mixed}); it is meant to hold \
          cells, not to lose or duplicate them, and a count that moves makes the correlation figures \
          incomparable between arms"
+    );
+}
+
+/// **Why the delay buys nothing, measured rather than argued.**
+///
+/// `DEFAULT_COVER_INTERVAL`'s log now carries an explanation for the zero: the relay emits one cell out per
+/// cell in, so the two rate series meet at *some* displacement however the send times are jittered, and a
+/// lag-scanning adversary is invariant to jitter by construction. That was reasoning. This measures it.
+///
+/// If the claim holds, a relay carrying the flow moves the same TOTAL either way — the delay changes when
+/// cells leave, never how many — and the per-bin series are a permutation in time of one another rather
+/// than two different signals. If instead the totals differ, the explanation in that doc is wrong and the
+/// zero has some other cause, which would be worth more than the measurement that produced it.
+#[test]
+fn the_relay_emits_what_it_receives_which_is_why_jitter_cannot_help() {
+    let bin = 100u64;
+    let bins = (WINDOW_MS / bin) as usize;
+
+    let totals = |mix: Duration| -> (f64, f64) {
+        let mut sim = Sim::new(SEED);
+        let cell = spawn_composed_relay_cell::<F2>(&mut sim, Config::default(), Duration(0), mix, true);
+        drive(&mut sim);
+        let tape = sim.observed_frames();
+        cell.iter()
+            .map(|&n| {
+                let i: f64 = recv_series(tape, n, bin, bins).iter().sum();
+                let o: f64 = emit_series(tape, n, bin, bins).iter().sum();
+                (i, o)
+            })
+            .fold((0.0, 0.0), |(a, b), (i, o)| (a + i, b + o))
+    };
+
+    let (in_plain, out_plain) = totals(Duration(0));
+    let (in_mixed, out_mixed) = totals(span(DEFAULT_MIX_DELAY));
+
+    assert!(
+        (in_plain - in_mixed).abs() < f64::EPSILON && (out_plain - out_mixed).abs() < f64::EPSILON,
+        "the mixing delay changed the TOTALS ({in_plain}/{out_plain} -> {in_mixed}/{out_mixed}), so it does \
+         more than displace and the explanation written into DEFAULT_COVER_INTERVAL's log is wrong"
+    );
+    assert!(
+        (in_plain - out_plain).abs() / in_plain.max(1.0) < 0.05,
+        "a relay cell emits {out_plain} for {in_plain} received — if those diverge, the output rate is NOT \
+         a permutation of the input rate and something other than one-in-one-out explains the correlation"
     );
 }
 
