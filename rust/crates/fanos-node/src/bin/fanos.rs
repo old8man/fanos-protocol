@@ -140,7 +140,7 @@ fn provision_error(kind: &str, fmt: fanos_node::ProvisionFormat) -> NodeError {
 /// (`PROTOCOL_VERSION`), its C ABI (`FANOS_ABI_VERSION`) and its telemetry snapshot (`FTS1`); the files
 /// carrying every constant a cell agrees on were the outlier.
 fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
-    if let Some(s) = flag(args, "--threshold") {
+    if let Some(s) = flag(args, "--threshold")? {
         return s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")));
     }
     u8::try_from(fanos_node::node::mix_threshold(line_size_arg(args)?))
@@ -154,7 +154,7 @@ fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
 /// for a plane the node was not running, and admitted a depth the onion header there cannot carry — the exact
 /// silent failure the check exists to prevent, and its comment says so.
 fn line_size_arg(args: &[String]) -> Result<usize, NodeError> {
-    let plane_order: usize = match flag(args, "--plane-order") {
+    let plane_order: usize = match flag(args, "--plane-order")? {
         Some(s) => s
             .parse()
             .map_err(|_| NodeError::Config(format!("bad --plane-order '{s}' (expected 2, 4, 7 or 31)")))?,
@@ -216,7 +216,7 @@ fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
 }
 
 fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
-    let mut config = match flag(args, "--config") {
+    let mut config = match flag(args, "--config")? {
         Some(path) => {
             let config = NodeConfig::from_config_str(&std::fs::read_to_string(path)?)?;
             // **The config file is the other door the same secret comes through** (#13). Refusing
@@ -232,45 +232,45 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
         }
         None => NodeConfig::default(),
     };
-    if let Some(s) = flag(args, "--listen") {
+    if let Some(s) = flag(args, "--listen")? {
         config.listen = s
             .parse::<SocketAddr>()
             .map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?;
     }
-    if let Some(p) = flag(args, "--identity") {
+    if let Some(p) = flag(args, "--identity")? {
         config.identity_path = Some(PathBuf::from(p));
     }
     // `--data DIR` names where this node's state lives, so it names where the **store** lives too (#77).
     // Without this the flag moved only the control socket and the store silently kept nothing — the operator
     // would have said exactly the thing that asks for persistence and not got it.
-    if let Some(p) = flag(args, "--data") {
+    if let Some(p) = flag(args, "--data")? {
         config.state_path = Some(PathBuf::from(p));
     }
     // The cell's projective plane order. Exposed because it is the parameter that BOUNDS anonymity — an adversary's
     // flow-matching floor is `1/K` for `K` concurrent circuits, and `K` comes from the plane, not the mix schedule
     // (`fanos_node::config::plane_order`). Every node of a cell must agree on it, so it belongs in the same
     // out-of-band configuration as the bootstrap set rather than being negotiated.
-    if let Some(s) = flag(args, "--plane-order") {
+    if let Some(s) = flag(args, "--plane-order")? {
         config.plane_order = s
             .parse::<u32>()
             .map_err(|_| NodeError::Config(format!("bad --plane-order '{s}' (expected 2, 4, 7 or 31)")))?;
     }
-    for value in flag_all(args, "--bootstrap") {
+    for value in flag_all(args, "--bootstrap")? {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             config.bootstrap.push(Peer::parse(part)?);
         }
     }
-    if let Some(s) = flag(args, "--role") {
+    if let Some(s) = flag(args, "--role")? {
         config.roles = RoleSet::parse(s)?;
     }
-    if let Some(path) = flag(args, "--service") {
+    if let Some(path) = flag(args, "--service")? {
         // Provision the threshold-hosting line (seed, roster, threshold) from an out-of-band file, and
         // imply the `service` role — providing service parameters is the operator asking to host it.
         config.service = Some(ServiceParams::from_config_str(&std::fs::read_to_string(path)?)?);
         config.service_path = Some(PathBuf::from(path));
         config.roles.service = true;
     }
-    if let Some(path) = flag(args, "--exit") {
+    if let Some(path) = flag(args, "--exit")? {
         // Provision the clearnet exit (service-key seed + optional port policy) and imply the `exit` role.
         config.exit = Some(ExitParams::from_config_str(&std::fs::read_to_string(path)?)?);
         config.exit_path = Some(PathBuf::from(path));
@@ -295,9 +295,11 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     // and the node would start UNSHAPED while the operator believed they had turned PROTEUS on. Hence an
     // explicit refusal that names its replacement and prints the command that makes the file.
     //
-    // Matched with `has_flag`, not `flag`: `flag` needs a following value, so a trailing `--proteus-secret`
-    // (or one whose value is another flag) would slip past a `flag`-based check — and that is precisely the
-    // invocation whose secret is in argv. The refusal is about the flag's presence.
+    // Matched with `has_flag`, not `flag`, and it still is after #313 closed the general hole this used to
+    // work around. `flag` no longer lets a valueless flag slip past — it refuses — but the refusal it
+    // produces would be "`--proteus-secret` needs a value", which is the wrong sentence for an argument whose
+    // whole problem is that giving it a value is the exposure. The refusal here is about the flag's
+    // PRESENCE, so presence is what it matches on.
     if has_flag(args, "--proteus-secret") {
         return Err(NodeError::Config(
             "--proteus-secret is refused: its value becomes this process's command line, which every \
@@ -310,14 +312,14 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
                 .to_owned(),
         ));
     }
-    if let Some(path) = flag(args, "--proteus-secret-file") {
+    if let Some(path) = flag(args, "--proteus-secret-file")? {
         // Enable PROTEUS: shape every frame with this shared community secret, rotating per epoch (§13.4).
         // The secret arrives by the one channel that can be made unreadable to other accounts, and
         // `read_secret_file` checks that it actually was — see its doc for why the mode is verified rather
         // than assumed.
         config.proteus_secret = Some(read_secret_file(path, "a shared PROTEUS community secret")?);
     }
-    if let Some(m) = flag(args, "--proteus-morph") {
+    if let Some(m) = flag(args, "--proteus-morph")? {
         // The morph selecting the codec + traffic-shaper (§13.3): plain, polymorph (default), tls-tunnel,
         // masque-h3, fronted, webrtc, pluggable. Only takes effect with a --proteus-secret-file.
         config.proteus_morph = Morph::from_name(m).ok_or_else(|| {
@@ -327,7 +329,7 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
             ))
         })?;
     }
-    if let Some(e) = flag(args, "--proteus-environment") {
+    if let Some(e) = flag(args, "--proteus-environment")? {
         // Enable morph auto-fallback (§13.7) under this environment policy: open, dpi-corporate,
         // sni-filter, deep-censorship. Overrides --proteus-morph (the environment picks the morph).
         config.proteus_environment = Some(Environment::from_name(e).ok_or_else(|| {
@@ -337,23 +339,23 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
             ))
         })?);
     }
-    if let Some(s) = flag(args, "--mix-delay-ms") {
+    if let Some(s) = flag(args, "--mix-delay-ms")? {
         // A relay's mean Poisson mixing delay in ms (spec §L5/V7, audit S1-H1); 0 disables mixing.
         let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --mix-delay-ms '{s}'")))?;
         config.mix_mean_delay = Duration::from_millis(ms);
     }
-    if let Some(s) = flag(args, "--cover-interval-ms") {
+    if let Some(s) = flag(args, "--cover-interval-ms")? {
         // A relay's mean cover-cell interval in ms (spec §L5/V8, audit S1-H1/E1); 0 disables cover traffic.
         let ms = s.parse().map_err(|_| NodeError::Config(format!("bad --cover-interval-ms '{s}'")))?;
         config.cover_interval = Duration::from_millis(ms);
     }
-    if let Some(path) = flag(args, "--beacon-params") {
+    if let Some(path) = flag(args, "--beacon-params")? {
         // Provision the threshold-DVRF beacon so this node runs the live epoch clock (§7.6, audit S1-H2):
         // its DKG output — group commitment, threshold, and (if an anchor) its share. Generate with
         // `fanos beacon-deal`.
         config.beacon = Some(BeaconParams::from_config_str(&std::fs::read_to_string(path)?)?);
     }
-    if let Some(path) = flag(args, "--ingress-params") {
+    if let Some(path) = flag(args, "--ingress-params")? {
         // Provision this node as one member of a community's POROS ingress line (§6): its dealt descriptor
         // share, the dealing's public binding, the line roster and the community secret. Generate the whole
         // set with `fanos ingress-deal`, and hand each member exactly one file.
@@ -870,7 +872,7 @@ fn answer_control<N: Controllable>(
 ///
 /// [`NodeError::Config`] when `--data` is absent and the layout cannot be determined.
 fn data_dir_for(args: &[String]) -> Result<PathBuf, NodeError> {
-    match flag(args, "--data") {
+    match flag(args, "--data")? {
         Some(d) => Ok(PathBuf::from(d)),
         None => Ok(fanos_node::setup::Paths::detect()?.data),
     }
@@ -896,27 +898,27 @@ fn data_dir_for(args: &[String]) -> Result<PathBuf, NodeError> {
 async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
 
-    let socks_listen: SocketAddr = match flag(args, "--socks-listen") {
+    let socks_listen: SocketAddr = match flag(args, "--socks-listen")? {
         Some(s) => s
             .parse()
             .map_err(|_| NodeError::Config(format!("bad --socks-listen '{s}'")))?,
         None => SocketAddr::from(([127, 0, 0, 1], 1080)),
     };
-    let http_listen: Option<SocketAddr> = match flag(args, "--http-listen") {
+    let http_listen: Option<SocketAddr> = match flag(args, "--http-listen")? {
         Some(s) => Some(
             s.parse()
                 .map_err(|_| NodeError::Config(format!("bad --http-listen '{s}'")))?,
         ),
         None => None,
     };
-    let epoch = match flag(args, "--epoch") {
+    let epoch = match flag(args, "--epoch")? {
         Some(s) => Epoch::new(
             s.parse()
                 .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
         ),
         None => Epoch::ZERO,
     };
-    let min_pow = match flag(args, "--min-pow") {
+    let min_pow = match flag(args, "--min-pow")? {
         Some(s) => s
             .parse()
             .map_err(|_| NodeError::Config(format!("bad --min-pow '{s}'")))?,
@@ -925,7 +927,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     // Routing profile: `direct` (default) reaches services by coordinate; `anonymous` draws a fresh,
     // unlinkable threshold-onion rendezvous route per dial from the live cell mix directory (spec §L5,
     // #54). Parse its knobs up front so bad arguments fail before we join the overlay.
-    let anon = match flag(args, "--profile").unwrap_or("direct") {
+    let anon = match flag(args, "--profile")?.unwrap_or("direct") {
         "direct" => None,
         "anonymous" => Some(parse_anon_config(args)?),
         other => {
@@ -1039,11 +1041,11 @@ fn hidden_service_identity(host_secret: &[u8]) -> (StaticKeypair, HybridSigSecre
 
 async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
-    let forward: SocketAddr = flag(args, "--forward")
+    let forward: SocketAddr = flag(args, "--forward")?
         .ok_or_else(|| NodeError::Config("fanos host requires --forward <host:port>".to_owned()))?
         .parse()
         .map_err(|_| NodeError::Config("bad --forward (expected host:port)".to_owned()))?;
-    let host_secret = match flag(args, "--host-key") {
+    let host_secret = match flag(args, "--host-key")? {
         Some(p) => read_seed_file(p, "a hidden service's secret seed")?,
         None => {
             return Err(NodeError::Config(
@@ -1054,7 +1056,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
             ));
         }
     };
-    let epoch = match flag(args, "--epoch") {
+    let epoch = match flag(args, "--epoch")? {
         Some(s) => {
             Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?)
         }
@@ -1065,7 +1067,7 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     if threshold == 0 {
         return Err(NodeError::Config("--threshold must be at least 1".to_owned()));
     }
-    let descriptor_pow: u32 = match flag(args, "--descriptor-pow") {
+    let descriptor_pow: u32 = match flag(args, "--descriptor-pow")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --descriptor-pow '{s}'")))?,
         None => 0,
     };
@@ -1142,8 +1144,8 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
 async fn cmd_vpn(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
 
-    let tun_name = flag(args, "--tun").unwrap_or("").to_owned();
-    let epoch = match flag(args, "--epoch") {
+    let tun_name = flag(args, "--tun")?.unwrap_or("").to_owned();
+    let epoch = match flag(args, "--epoch")? {
         Some(s) => Epoch::new(
             s.parse()
                 .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
@@ -1326,7 +1328,7 @@ struct AnonConfig {
 /// and `--beacon` the epoch's public randomness (defaults to genesis).
 fn parse_anon_config(args: &[String]) -> Result<AnonConfig, NodeError> {
     let usize_flag = |name: &str, default: usize| -> Result<usize, NodeError> {
-        match flag(args, name) {
+        match flag(args, name)? {
             Some(s) => s
                 .parse()
                 .map_err(|_| NodeError::Config(format!("bad {name} '{s}'"))),
@@ -1505,7 +1507,7 @@ fn parse_beacon_hex(s: &str) -> Result<BeaconSeed, NodeError> {
 /// The value comes from the very configuration the same command line already names (`--config`,
 /// `--beacon-params`); with neither, there is no beacon and the constant is the honest answer.
 fn beacon_arg(args: &[String]) -> Result<BeaconSeed, NodeError> {
-    match flag(args, "--beacon") {
+    match flag(args, "--beacon")? {
         Some(s) => parse_beacon_hex(s),
         None => Ok(node_config_from_args(args)?.genesis_seed()),
     }
@@ -1807,7 +1809,7 @@ fn read_secret_file(path: &str, what: &str) -> Result<zeroize::Zeroizing<Vec<u8>
 fn choose_listen(args: &[String]) -> Result<SocketAddr, NodeError> {
     /// How many consecutive ports to try before giving up and asking the operator.
     const WINDOW: u16 = 64;
-    if let Some(s) = flag(args, "--listen") {
+    if let Some(s) = flag(args, "--listen")? {
         return s.parse().map_err(|_| NodeError::Config(format!("bad --listen '{s}'")));
     }
     let default_port = fanos_node::setup::DEFAULT_PORT;
@@ -1856,7 +1858,7 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
         roles: fanos_node::setup::default_roles(),
         ..NodeConfig::default()
     };
-    if let Some(r) = flag(args, "--role") {
+    if let Some(r) = flag(args, "--role")? {
         config.roles = RoleSet::parse(r)?;
     } else if !assume_yes {
         eprintln!("\nWhat should this node offer the network?");
@@ -1878,7 +1880,7 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     config.listen = choose_listen(args)?;
 
     // --- joining, or starting a new cell ---
-    for value in flag_all(args, "--bootstrap") {
+    for value in flag_all(args, "--bootstrap")? {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             config.bootstrap.push(Peer::parse(part)?);
         }
@@ -1893,7 +1895,7 @@ fn cmd_init(args: &[String]) -> Result<(), NodeError> {
     }
 
     // --- health telemetry: opt-in, and it stays opt-in ---
-    match flag(args, "--telemetry") {
+    match flag(args, "--telemetry")? {
         Some(s) => {
             let eps: f64 =
                 s.parse().map_err(|_| NodeError::Config(format!("bad --telemetry '{s}'")))?;
@@ -2254,7 +2256,7 @@ fn manager_reload(manager: fanos_node::setup::ServiceManager) -> Vec<String> {
 /// "configured and down" — which are opposite problems.
 async fn cmd_status(args: &[String]) -> Result<(), NodeError> {
     // `--config` first, so an operator who names the file is never refused for want of a layout (#312).
-    let config_path = match flag(args, "--config") {
+    let config_path = match flag(args, "--config")? {
         Some(p) => PathBuf::from(p),
         None => fanos_node::setup::Paths::detect()?.config,
     };
@@ -2408,7 +2410,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
         )));
     }
     let rest = args.get(1..).unwrap_or(&[]);
-    let host_secret = match flag(rest, "--host-key") {
+    let host_secret = match flag(rest, "--host-key")? {
         Some(p) => read_seed_file(p, "the messenger's secret seed")?,
         None => {
             return Err(NodeError::Config(
@@ -2419,7 +2421,7 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
             ));
         }
     };
-    let epoch = match flag(rest, "--epoch") {
+    let epoch = match flag(rest, "--epoch")? {
         Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
         None => Epoch::ZERO,
     };
@@ -2480,14 +2482,14 @@ async fn cmd_message(args: &[String]) -> Result<(), NodeError> {
 
 /// Print (and optionally persist) a node's self-certifying coordinate.
 fn cmd_id(args: &[String]) -> Result<(), NodeError> {
-    let path = flag(args, "--identity").map(PathBuf::from);
+    let path = flag(args, "--identity")?.map(PathBuf::from);
     let credentials = identity::load_or_generate(path.as_deref())?;
 
     // **Which network?** A coordinate is a function of the identity *and* the network's genesis seed
     // (`docs/design-genesis.md`), so printing one without the network is printing a placement the node will
     // not have — and this command's last line is a bootstrap address, which is coordinate-*pinned*. Read the
     // same configuration the daemon reads, from the same default location, so the two cannot disagree.
-    let config_path = match flag(args, "--config") {
+    let config_path = match flag(args, "--config")? {
         Some(p) => PathBuf::from(p),
         None => fanos_node::setup::Paths::detect()?.config,
     };
@@ -2560,14 +2562,14 @@ fn cmd_ingress_deal(args: &[String]) -> Result<(), NodeError> {
     if peers.is_empty() {
         return Err(usage());
     }
-    let out = flag(args, "--out").unwrap_or(".");
-    let difficulty: u32 = match flag(args, "--difficulty") {
+    let out = flag(args, "--out")?.unwrap_or(".");
+    let difficulty: u32 = match flag(args, "--difficulty")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --difficulty '{s}'")))?,
         None => DEFAULT_INGRESS_DIFFICULTY,
     };
     // The line: either an explicit roster, or the Fano cell's points 0..q — the same default the rest of the
     // single-operator tooling uses, so a first deployment needs one flag fewer.
-    let line: Vec<Triple> = match flag(args, "--line") {
+    let line: Vec<Triple> = match flag(args, "--line")? {
         Some(s) => s
             .split(',')
             .map(str::trim)
@@ -2579,7 +2581,7 @@ fn cmd_ingress_deal(args: &[String]) -> Result<(), NodeError> {
     // The threshold defaults to the plane's own mix threshold ⌈2(q+1)/3⌉ rather than a chosen number: an
     // ingress line is a line, and the reason a hop's threshold is that value — two corrupt members must not
     // own it however wide the line grows — applies here unchanged.
-    let threshold: usize = match flag(args, "--threshold") {
+    let threshold: usize = match flag(args, "--threshold")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
         None => mix_threshold(line.len()),
     };
@@ -2670,7 +2672,7 @@ fn cmd_beacon_deal(args: &[String]) -> Result<(), NodeError> {
     let usage = || NodeError::Config("usage: fanos beacon-deal <n> <t> [--out DIR]".to_owned());
     let n: usize = args.first().and_then(|s| s.parse().ok()).ok_or_else(usage)?;
     let t: usize = args.get(1).and_then(|s| s.parse().ok()).ok_or_else(usage)?;
-    let out = flag(args, "--out").unwrap_or(".");
+    let out = flag(args, "--out")?.unwrap_or(".");
 
     // The beacon secret and the polynomial RNG are both drawn from OS entropy — this tool holds the whole key
     // for the moment of dealing (unlike the DKG), so it exists only to bootstrap a single-operator network.
@@ -2766,7 +2768,7 @@ fn resolve_authority(
     args: &[String],
     n: usize,
 ) -> Result<(Vec<[u8; 32]>, fanos_keygen::recovery::RecoveryAuthoritySet), NodeError> {
-    let members = if let Some(path) = flag(args, "--authority-verifiers") {
+    let members = if let Some(path) = flag(args, "--authority-verifiers")? {
         let text = std::fs::read_to_string(path)?;
         let members = text
             .lines()
@@ -2846,11 +2848,11 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
     use fanos_keygen::DkgNode;
     use fanos_node::keygen::DkgCeremony;
 
-    let roster_path = flag(args, "--roster")
+    let roster_path = flag(args, "--roster")?
         .ok_or_else(|| NodeError::Config("usage: fanos keygen --roster FILE --threshold T --out FILE".to_owned()))?;
-    let out = flag(args, "--out")
+    let out = flag(args, "--out")?
         .ok_or_else(|| NodeError::Config("fanos keygen needs --out FILE (where to write this founder's beacon params)".to_owned()))?;
-    let threshold: usize = flag(args, "--threshold")
+    let threshold: usize = flag(args, "--threshold")?
         .ok_or_else(|| NodeError::Config("fanos keygen needs --threshold T".to_owned()))?
         .parse()
         .map_err(|_| NodeError::Config("bad --threshold".to_owned()))?;
@@ -2875,7 +2877,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
 
     // This founder's own long-term identity — the same one `fanos node` runs on, so the coordinate the DKG
     // seats it at is the coordinate it will hold afterwards.
-    let identity_path = flag(args, "--identity").map(PathBuf::from);
+    let identity_path = flag(args, "--identity")?.map(PathBuf::from);
     let creds = identity::load_or_generate(identity_path.as_deref())?;
 
     // The name every founder computes identically from the agreed roster. Sorted, so a file whose lines were
@@ -2893,7 +2895,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
 
     let directory = fanos_quic::Directory::new();
     fanos_node::config::seed_directory(&roster, &directory)?;
-    let listen: SocketAddr = match flag(args, "--listen") {
+    let listen: SocketAddr = match flag(args, "--listen")? {
         Some(a) => a.parse().map_err(|_| NodeError::Config(format!("bad --listen '{a}'")))?,
         None => "0.0.0.0:0".parse().map_err(|_| NodeError::Identity)?,
     };
@@ -2971,7 +2973,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
 
 /// secret material.
 fn cmd_authority_key(args: &[String]) -> Result<(), NodeError> {
-    let out = flag(args, "--out").unwrap_or("recovery-authority.key");
+    let out = flag(args, "--out")?.unwrap_or("recovery-authority.key");
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| NodeError::Config(format!("OS entropy: {e}")))?;
     let (_secret, verifier) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
@@ -3046,11 +3048,11 @@ fn cmd_service_deal(args: &[String]) -> Result<(), NodeError> {
     if line.is_empty() {
         return Err(usage());
     }
-    let out = flag(args, "--out").unwrap_or(".");
+    let out = flag(args, "--out")?.unwrap_or(".");
     // The default is the plane's own mix threshold ⌈2(q+1)/3⌉ rather than a chosen number, for the reason
     // that value exists: two corrupt members must not own a line however wide it grows. A `q+1`-member line
     // therefore gets the same threshold every other line on this plane gets.
-    let threshold: usize = match flag(args, "--threshold") {
+    let threshold: usize = match flag(args, "--threshold")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")))?,
         None => fanos_node::node::mix_threshold(line.len()),
     };
@@ -3179,13 +3181,13 @@ fn cmd_taxis_deal(args: &[String]) -> Result<(), NodeError> {
     use fanos_pqcrypto::rng::SeedRng;
     use fanos_taxis::params::CellParams;
 
-    let out = flag(args, "--out").unwrap_or(".");
-    let epoch = match flag(args, "--epoch") {
+    let out = flag(args, "--out")?.unwrap_or(".");
+    let epoch = match flag(args, "--epoch")? {
         Some(s) => Epoch::new(s.parse().map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?),
         None => Epoch::ZERO,
     };
     let beacon = beacon_arg(args)?;
-    let supply: u64 = match flag(args, "--supply") {
+    let supply: u64 = match flag(args, "--supply")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --supply '{s}'")))?,
         None => 1_000_000_000,
     };
@@ -3258,14 +3260,14 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
 
     // The public chain info (keyper registry + epoch + beacon + cell) — everything a client needs but a key.
-    let info_path = flag(args, "--chain-info")
+    let info_path = flag(args, "--chain-info")?
         .ok_or_else(|| NodeError::Config("fanos pay requires --chain-info chain-info.taxis".to_owned()))?;
     let info_bytes = std::fs::read(info_path)?;
     let info = ChainInfo::from_bytes(&info_bytes)
         .ok_or_else(|| provision_error("chain-info", ChainInfo::format_of(&info_bytes)))?;
 
     // The sender's 32-byte key seed (e.g. `founder.key`) → its signing keypair + account id.
-    let key_path = flag(args, "--key")
+    let key_path = flag(args, "--key")?
         .ok_or_else(|| NodeError::Config("fanos pay requires --key <32-byte seed file> (e.g. founder.key)".to_owned()))?;
     let seed: [u8; 32] = std::fs::read(key_path)?
         .as_slice()
@@ -3274,16 +3276,16 @@ async fn cmd_pay(args: &[String]) -> Result<(), NodeError> {
     let (signer, from_key) = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed));
     let from = account_id(&from_key);
 
-    let to_hex = flag(args, "--to")
+    let to_hex = flag(args, "--to")?
         .ok_or_else(|| NodeError::Config("fanos pay requires --to <32-byte hex account id>".to_owned()))?;
     let to: [u8; 32] = decode_hex(to_hex)
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| NodeError::Config("--to must be a 32-byte (64 hex char) account id".to_owned()))?;
-    let amount: u64 = flag(args, "--amount")
+    let amount: u64 = flag(args, "--amount")?
         .ok_or_else(|| NodeError::Config("fanos pay requires --amount N".to_owned()))?
         .parse()
         .map_err(|_| NodeError::Config("bad --amount".to_owned()))?;
-    let nonce: u64 = match flag(args, "--nonce") {
+    let nonce: u64 = match flag(args, "--nonce")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config("bad --nonce".to_owned()))?,
         None => 0,
     };
@@ -3384,7 +3386,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
 
     init_tracing();
 
-    let key_path = flag(args, "--key").ok_or_else(|| {
+    let key_path = flag(args, "--key")?.ok_or_else(|| {
         NodeError::Config("fanos term requires --key <32-byte seed file> (e.g. founder.key)".to_owned())
     })?;
     let seed: [u8; 32] = std::fs::read(key_path)?
@@ -3405,7 +3407,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     // the chain as the rule.
     let mut registrations: Vec<Term> = Vec::new();
     let mut register_display: Vec<String> = Vec::new();
-    for spec in flag_all(args, "--register-name") {
+    for spec in flag_all(args, "--register-name")? {
         let parts: Vec<&str> = spec.split(':').collect();
         let (name, target_hex, duration_s, fee_s) = match parts.as_slice() {
             [n, t, d] => (*n, *t, *d, None),
@@ -3432,8 +3434,8 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     // pairs immediately so a length mismatch is a usage error here, not a silently truncated payment. An amount is
     // a constant, `N%` of the sender's balance, or `all` of it — the computed forms are expressions evaluated at
     // execution, against the state as the previous legs left it.
-    let to_arg = flag(args, "--to");
-    let amount_arg = flag(args, "--amount");
+    let to_arg = flag(args, "--to")?;
+    let amount_arg = flag(args, "--amount")?;
     if to_arg.is_some() != amount_arg.is_some() {
         return Err(NodeError::Config("--to and --amount must be given together".to_owned()));
     }
@@ -3502,7 +3504,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
     // balance floors. The author imposes them on their own term — a declined guard is the identity, not a fault.
     let mut guards: Vec<Predicate> = Vec::new();
     let mut guard_display: Vec<String> = Vec::new();
-    for spec in flag_all(args, "--require-name") {
+    for spec in flag_all(args, "--require-name")? {
         let (name, owner_hex) = spec.split_once('=').ok_or_else(|| {
             NodeError::Config(format!("bad --require-name '{spec}' (expected NAME=OWNERHEX)"))
         })?;
@@ -3514,7 +3516,7 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
         ));
         guard_display.push(format!("require name '{name}' owned by {owner_hex}"));
     }
-    for spec in flag_all(args, "--require-min") {
+    for spec in flag_all(args, "--require-min")? {
         let (acct_hex, min_s) = spec.split_once(':').ok_or_else(|| {
             NodeError::Config(format!("bad --require-min '{spec}' (expected ACCTHEX:N)"))
         })?;
@@ -3554,12 +3556,12 @@ async fn cmd_term(args: &[String]) -> Result<(), NodeError> {
 
     // Sign, seal, submit — byte-for-byte the `fanos pay` path from here on; the seal operates on the
     // transaction's bytes and does not care which tag is inside them.
-    let info_path = flag(args, "--chain-info")
+    let info_path = flag(args, "--chain-info")?
         .ok_or_else(|| NodeError::Config("fanos term requires --chain-info chain-info.taxis".to_owned()))?;
     let info_bytes = std::fs::read(info_path)?;
     let info = ChainInfo::from_bytes(&info_bytes)
         .ok_or_else(|| provision_error("chain-info", ChainInfo::format_of(&info_bytes)))?;
-    let nonce: u64 = match flag(args, "--nonce") {
+    let nonce: u64 = match flag(args, "--nonce")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config("bad --nonce".to_owned()))?,
         None => 0,
     };
@@ -3609,13 +3611,13 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     use fanos_runtime::Config as OverlayConfig;
 
     init_tracing();
-    let config_path = flag(args, "--config")
+    let config_path = flag(args, "--config")?
         .ok_or_else(|| NodeError::Config("fanos validator requires --config validator-<i>.taxis".to_owned()))?;
     let config_bytes = std::fs::read(config_path)?;
     let config = ValidatorConfig::from_bytes(&config_bytes)
         .ok_or_else(|| provision_error("validator config", ValidatorConfig::format_of(&config_bytes)))?;
     let me = config.me;
-    let listen: SocketAddr = match flag(args, "--listen") {
+    let listen: SocketAddr = match flag(args, "--listen")? {
         Some(s) => s.parse().map_err(|_| NodeError::Config(format!("bad --listen '{s}'")))?,
         None => SocketAddr::from(([0, 0, 0, 0], 0)),
     };
@@ -3629,7 +3631,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     // Collected first, then seeded, because the check is on the whole list: two `--bootstrap` flags may each
     // be well-formed and contradict each other, and a per-flag check could not see that (#241).
     let mut peers: Vec<Peer> = Vec::new();
-    for value in flag_all(args, "--bootstrap") {
+    for value in flag_all(args, "--bootstrap")? {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             peers.push(Peer::parse(part)?);
         }
@@ -3745,21 +3747,21 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
         .iter()
         .find(|a| !a.starts_with("--"))
         .ok_or_else(|| NodeError::Config("`fanos resolve` needs a .fanos name".to_string()))?;
-    let epoch = match flag(args, "--epoch") {
+    let epoch = match flag(args, "--epoch")? {
         Some(s) => Epoch::new(
             s.parse::<u64>()
                 .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
         ),
         None => Epoch::ZERO,
     };
-    let min_pow = match flag(args, "--min-pow") {
+    let min_pow = match flag(args, "--min-pow")? {
         Some(s) => s
             .parse::<u32>()
             .map_err(|_| NodeError::Config(format!("bad --min-pow '{s}'")))?,
         None => 0,
     };
     let mut bootstrap = Vec::new();
-    for value in flag_all(args, "--bootstrap") {
+    for value in flag_all(args, "--bootstrap")? {
         for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             bootstrap.push(Peer::parse(part)?);
         }
@@ -3966,7 +3968,7 @@ async fn discover_exit(node: &Node, epoch: Epoch) -> Option<([u32; 3], HybridKem
 /// the hex of `HybridKemPublic::encode` — an exit logs this line at startup). `None` if the flag is absent,
 /// in which case the proxy stays `.fanos`-only.
 fn parse_exit_via(args: &[String]) -> Result<Option<([u32; 3], HybridKemPublic)>, NodeError> {
-    let Some(path) = flag(args, "--exit-via") else {
+    let Some(path) = flag(args, "--exit-via")? else {
         return Ok(None);
     };
     let text = std::fs::read_to_string(path)?;
@@ -4040,12 +4042,53 @@ fn init_tracing() {
         .try_init();
 }
 
-/// The value following the first occurrence of `name`.
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+/// The value following the first occurrence of `name`, or a refusal naming what went wrong (#313).
+///
+/// **A missing value used to become a value.** `args.get(i + 1)` takes whatever is there, so
+/// `fanos host --host-key --forward 127.0.0.1:80` bound the *string* `--forward` as the path to the
+/// service's secret seed. What the operator then saw was a complaint about a file called `--forward`, three
+/// steps away from the typo — and `--forward` itself still parsed, because `flag` searches by name rather
+/// than by position. The refusal arrived late and about the wrong thing.
+///
+/// **The rule is read off this tool's own grammar, not chosen.** Every flag here is spelled `--name`, so a
+/// leading `--` is the binary's own marker for "this is a flag, not a value"; an argument carrying it is not
+/// a value. Nothing this CLI takes can legitimately begin that way — the placeholders are addresses, paths,
+/// counts, hex digests, role lists and profile names — and a path that does can still be written `./--name`.
+///
+/// **And the vocabulary of "which flags take a value" needs no list**, which is the part worth keeping: it is
+/// the set of names passed to *this function*. Booleans go through [`has_flag`] and are unaffected. A
+/// hand-kept table of valued flags — derivable from the help text, tempting for exactly that reason — would
+/// be a second place to forget one; the call graph cannot drift from itself.
+///
+/// # Errors
+///
+/// [`NodeError::Config`] when `name` is present but the next argument is another flag, or there is no next
+/// argument at all. Absent is not an error: it is `Ok(None)`, and the caller decides whether it had to be
+/// there.
+fn flag<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, NodeError> {
+    let Some(i) = args.iter().position(|a| a == name) else { return Ok(None) };
+    value_after(args, name, i).map(Some)
+}
+
+/// The argument after position `i`, refused if it is missing or is itself a flag.
+///
+/// Shared by [`flag`] and [`flag_all`] so the two cannot disagree about what a value is — the repeatable
+/// form had the identical defect, and fixing one of them would have left the class half closed.
+fn value_after<'a>(args: &'a [String], name: &str, i: usize) -> Result<&'a str, NodeError> {
+    let Some(next) = args.get(i + 1) else {
+        return Err(NodeError::Config(format!(
+            "`{name}` needs a value and is the last argument — nothing followed it"
+        )));
+    };
+    if next.starts_with("--") {
+        return Err(NodeError::Config(format!(
+            "`{name}` needs a value, and the next argument is `{next}`, which is a flag name. Taking it as \
+             the value is how a missing value used to become one, with the refusal arriving later and about \
+             something else. If the value really does begin with two dashes, write it as a path that does \
+             not — `./{next}`"
+        )));
+    }
+    Ok(next.as_str())
 }
 
 /// The first **positional** argument: one that neither starts with `-` nor is a flag's value.
@@ -4065,16 +4108,19 @@ fn positional(args: &[String]) -> Option<&str> {
 }
 
 /// The values following every occurrence of `name` (repeatable flags).
-fn flag_all<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+///
+/// # Errors
+///
+/// As [`flag`], for the first occurrence that is missing its value — and per occurrence rather than for the
+/// set, because `--bootstrap A --bootstrap --listen …` must name *which* one was left empty.
+fn flag_all<'a>(args: &'a [String], name: &str) -> Result<Vec<&'a str>, NodeError> {
     let mut out = Vec::new();
     for (i, a) in args.iter().enumerate() {
-        if a == name
-            && let Some(v) = args.get(i + 1)
-        {
-            out.push(v.as_str());
+        if a == name {
+            out.push(value_after(args, name, i)?);
         }
     }
-    out
+    Ok(out)
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
@@ -4608,6 +4654,52 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A flag left without a value does not silently take the next flag's name** (#313).
+    ///
+    /// The invocation that produced this: `fanos host --host-key --forward 127.0.0.1:80`. `flag` took
+    /// `args.get(i + 1)` unconditionally, so the *string* `--forward` became the path to the service's
+    /// secret seed — and because `flag` searches by name rather than by position, `--forward` still parsed
+    /// too. The operator's typo surfaced as a complaint about a file called `--forward`, three steps away
+    /// from where it happened.
+    ///
+    /// Three cases, and the third is the one that keeps the rule honest: a path may legitimately begin with
+    /// dashes if it is written relative (`./--forward`), and refusing that would be a guard wider than its
+    /// defect. It must get past the argument parser and fail on the FILESYSTEM instead.
+    ///
+    /// Falsified by deleting the `starts_with("--")` arm: the first assertion goes red with `cannot open
+    /// '--forward'`, which is precisely the misdirected refusal this closes.
+    #[test]
+    fn a_flag_with_no_value_is_refused_and_does_not_swallow_the_next_flag() {
+        let swallowed =
+            vec!["--host-key".to_owned(), "--forward".to_owned(), "127.0.0.1:80".to_owned()];
+        let err = flag(&swallowed, "--host-key").expect_err("a flag name is not a value").to_string();
+        assert!(
+            err.contains("--host-key") && err.contains("--forward"),
+            "the refusal must name BOTH the flag left empty and what was about to be bound as its value, \
+             because the operator's mistake is the relationship between them: {err}"
+        );
+
+        let trailing = vec!["--forward".to_owned(), "1.2.3.4:9".to_owned(), "--host-key".to_owned()];
+        let err = flag(&trailing, "--host-key").expect_err("a trailing flag has no value either").to_string();
+        assert!(err.contains("last argument"), "and a trailing flag says so specifically: {err}");
+
+        // CONTROL, and the reason the rule is `--` rather than `-`: a relative path is still a value, so the
+        // parser must hand it on. A guard that refused this would be wider than the defect it removes.
+        let awkward = vec!["--host-key".to_owned(), "./--forward".to_owned()];
+        assert_eq!(
+            flag(&awkward, "--host-key").expect("a relative path is a value, whatever it is named"),
+            Some("./--forward"),
+        );
+
+        // And the repeatable form, which had the identical defect one function over.
+        let repeated =
+            vec!["--bootstrap".to_owned(), "1:2:3@h:1".to_owned(), "--bootstrap".to_owned(), "--listen".to_owned()];
+        assert!(
+            flag_all(&repeated, "--bootstrap").is_err(),
+            "`flag_all` must refuse the same way — a class closed in one of two functions is half closed"
+        );
     }
 
     /// **A raw seed is read raw, and its file must be private** (#310).
