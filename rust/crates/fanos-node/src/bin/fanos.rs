@@ -36,6 +36,10 @@ use tokio::io::{DuplexStream, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+/// The process entry point: run one verb and turn its `Result` into an exit code.
+///
+/// The only place a `NodeError` becomes a message and a status, so a verb that printed its own error
+/// would be a second decision about the exit code and the two would drift.
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -48,6 +52,10 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Dispatch one invocation to its verb.
+///
+/// Separate from `main` so every path returns a `Result` the caller renders once: a verb that printed its
+/// own error would be a second place for the exit code to be decided, and the two would drift.
 async fn run(args: &[String]) -> Result<(), NodeError> {
     // **`--help` anywhere means help, and this guard is why.** The dispatch below matches `--help` only in
     // verb position, so `fanos node --help` fell through to `cmd_node`, which ignores flags it does not know
@@ -97,19 +105,13 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
     }
 }
 
-/// Build a [`NodeConfig`] from a `--config <file>` base (if any) with individual CLI flags overriding it,
-/// so an operator can keep a config file and tweak one setting on the command line. Shared by `fanos node`
-/// and `fanos proxy` — both run a full node, they differ only in what they do with its `Client`.
-/// Warn when anonymity is requested on a plane that cannot provide it.
+/// Turn a provisioning file's **frame** into an operator-facing reason (#308).
 ///
-/// An adversary's flow-matching floor in a linkability measurement is `1/K` for `K` concurrent circuits, and `K` comes
-/// from the **plane**, not the mix schedule: `PG(2,2)` has only 4 lines with *distinct* combiners, so it supports 2
-/// circuits and the best any schedule achieves is a coin flip (`fanos_node::config::plane_order`).
-///
-/// Under-delivering an anonymity request in silence is the worse failure. An operator who is told can raise the order or
-/// accept the limit knowingly; one who is not told believes the profile's name.
-/// The mixnet hop threshold for this invocation: `--threshold` if given, else derived from `--plane-order`.
-///
+/// `Current` means the frame is ours and the *body* failed — a genuinely corrupt or truncated file. The
+/// other two are different mistakes with different fixes, and collapsing all three into "malformed" is
+/// what left an operator unable to tell an old file from a broken one. FANOS versions its wire
+/// (`PROTOCOL_VERSION`), its C ABI (`FANOS_ABI_VERSION`) and its telemetry snapshot (`FTS1`); the files
+/// carrying every constant a cell agrees on were the outlier.
 #[cfg(feature = "validator")]
 fn provision_error(kind: &str, fmt: fanos_node::ProvisionFormat) -> NodeError {
     NodeError::Config(match fmt {
@@ -127,18 +129,13 @@ fn provision_error(kind: &str, fmt: fanos_node::ProvisionFormat) -> NodeError {
     })
 }
 
+/// The mixnet hop threshold for this invocation: `--threshold` if given, else derived from `--plane-order`.
+///
 /// One helper rather than three copies, because the client and the relay must agree exactly — a client seals
 /// each onion layer for precisely this many members — and three `None => 2` defaults are three chances to
 /// diverge. The derivation is [`fanos_node::node::mix_threshold`]: a hop is a line of `q+1` points, and a
 /// threshold fixed at the Fano value lets any two corrupt members own a hop however wide the line is
 /// (`docs/audit.md` E7).
-/// Turn a provisioning file's **frame** into an operator-facing reason (#308).
-///
-/// `Current` means the frame is ours and the *body* failed — a genuinely corrupt or truncated file. The
-/// other two are different mistakes with different fixes, and collapsing all three into "malformed" is
-/// what left an operator unable to tell an old file from a broken one. FANOS versions its wire
-/// (`PROTOCOL_VERSION`), its C ABI (`FANOS_ABI_VERSION`) and its telemetry snapshot (`FTS1`); the files
-/// carrying every constant a cell agrees on were the outlier.
 fn mix_threshold_arg(args: &[String]) -> Result<u8, NodeError> {
     if let Some(s) = flag(args, "--threshold")? {
         return s.parse().map_err(|_| NodeError::Config(format!("bad --threshold '{s}'")));
@@ -174,6 +171,14 @@ fn line_size_arg(args: &[String]) -> Result<usize, NodeError> {
 ///
 /// The reconciliation is not a compromise between the two numbers. Cell width and onion width are *independent*
 /// deployment parameters, and the configuration the warning should point at raises both.
+///
+/// **Why the plane is the term that matters**, from this function's older doc and kept because the live one
+/// never restated it: an adversary's flow-matching floor in a linkability measurement is `1/K` for `K`
+/// concurrent circuits, and `K` comes from the **plane**, not the mix schedule. `PG(2,2)` has only 4 lines
+/// with *distinct* combiners, so it supports 2 circuits and the best any schedule achieves is a coin flip
+/// (`fanos_node::config::plane_order`). Under-delivering an anonymity request in silence is the worse
+/// failure: an operator who is told can raise the order or accept the limit knowingly; one who is not told
+/// believes the profile's name.
 fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
     let line_size = config.plane_order as usize + 1;
     if !fanos_aphantos::slots::plane_can_anonymize(line_size) {
@@ -215,6 +220,9 @@ fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
     );
 }
 
+/// Build a [`NodeConfig`] from a `--config <file>` base (if any) with individual CLI flags overriding it,
+/// so an operator can keep a config file and tweak one setting on the command line. Shared by `fanos node`
+/// and `fanos proxy` — both run a full node, they differ only in what they do with its `Client`.
 fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     let mut config = match flag(args, "--config")? {
         Some(path) => {
@@ -372,7 +380,6 @@ fn node_config_from_args(args: &[String]) -> Result<NodeConfig, NodeError> {
     Ok(config)
 }
 
-/// Run a node until Ctrl-C.
 /// Whether this node was given bootstrap peers and has verified **none** of them (#179).
 ///
 /// A pure function because it is the whole decision, and a decision buried in a `select!` arm cannot be
@@ -388,6 +395,7 @@ const fn is_isolated(verified: Option<usize>, configured: usize) -> bool {
     configured > 0 && matches!(verified, Some(0))
 }
 
+/// Run a node until Ctrl-C.
 async fn cmd_node(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let config = node_config_from_args(args)?;
@@ -1014,13 +1022,6 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
-/// Host a **hidden service** on the anonymous rendezvous (§3b, `design-anonymity-substrate.md`): run a node,
-/// publish the service's descriptor so clients resolve its `.fanos` name, and forward every incoming
-/// anonymous session to a local `--forward host:port` (the onion-service model). The service is reachable at
-/// its rotating meeting line though this node is never that line's combiner, and no party — not even the
-/// combiner — learns this node's coordinate. `--host-key <file>` is the service's secret seed, its **stable
-/// `.fanos` identity** (keep it secret; generate one with `head -c 32 /dev/urandom > svc.key`). The dial
-/// side is `fanos proxy --profile anonymous` with a matching `--epoch`/`--beacon`/`--threshold`.
 /// Derive a hidden service's full published identity from its secret seed.
 ///
 /// Both halves come from the one seed so a restart re-derives the same `.fanos` address, and they are
@@ -1039,6 +1040,14 @@ fn hidden_service_identity(host_secret: &[u8]) -> (StaticKeypair, HybridSigSecre
     (service, signer, bundle)
 }
 
+/// Host a **hidden service** on the anonymous rendezvous (§3b, `design-anonymity-substrate.md`): run a node,
+/// publish the service's descriptor so clients resolve its `.fanos` name, and forward every incoming
+/// anonymous session to a local `--forward host:port` (the onion-service model). The service is reachable at
+/// its rotating meeting line though this node is never that line's combiner, and no party — not even the
+/// combiner — learns this node's coordinate. `--host-key <file>` is the service's secret seed, its **stable
+/// `.fanos` identity** (keep it secret; generate one with `(umask 077; head -c 32 /dev/urandom > svc.key)` —
+/// the umask is part of the recipe, and #310 made the tool check it rather than only advise it). The dial
+/// side is `fanos proxy --profile anonymous` with a matching `--epoch`/`--beacon`/`--threshold`.
 async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
     init_tracing();
     let forward: SocketAddr = flag(args, "--forward")?
@@ -1739,21 +1748,6 @@ fn require_unsubstitutable_path(path: &str, what: &str) -> Result<(), NodeError>
     Ok(())
 }
 
-/// Read key material out of an owner-only file.
-///
-/// Wiped on drop ([`Zeroizing`](zeroize::Zeroizing)), matching the config field it fills.
-///
-/// **One trailing newline is stripped**, and that is a correctness requirement rather than a convenience: a
-/// PROTEUS secret is *shared*, so two members who write it two ways must end up with the same bytes.
-/// `echo s > f` appends a newline and `printf %s s > f` does not; without the strip those two members shape
-/// their frames with different keys, and PROTEUS's failure mode for a key mismatch is silence — the
-/// handshake simply does not complete, with nothing anywhere saying why. The price is that a secret whose
-/// last byte is a newline cannot be expressed; stated because it is a real restriction and not an oversight.
-/// `\r\n` is stripped too, for a file that has been through a Windows editor on its way between hosts.
-///
-/// An empty file is refused rather than accepted as an empty secret: it is what a truncated copy, a failed
-/// `scp`, or a mistyped redirection leaves behind, and an empty shared secret shapes every frame identically
-/// for everyone — the exact opposite of what enabling PROTEUS asks for.
 /// Read a **raw seed** out of an owner-only file — the `--host-key` form of key material (#310).
 ///
 /// Guarded exactly like [`read_secret_file`] and, deliberately, parsed unlike it: **nothing is stripped**.
@@ -1785,6 +1779,21 @@ fn read_seed_file(path: &str, what: &str) -> Result<Vec<u8>, NodeError> {
     Ok(bytes)
 }
 
+/// Read key material out of an owner-only file.
+///
+/// Wiped on drop ([`Zeroizing`](zeroize::Zeroizing)), matching the config field it fills.
+///
+/// **One trailing newline is stripped**, and that is a correctness requirement rather than a convenience: a
+/// PROTEUS secret is *shared*, so two members who write it two ways must end up with the same bytes.
+/// `echo s > f` appends a newline and `printf %s s > f` does not; without the strip those two members shape
+/// their frames with different keys, and PROTEUS's failure mode for a key mismatch is silence — the
+/// handshake simply does not complete, with nothing anywhere saying why. The price is that a secret whose
+/// last byte is a newline cannot be expressed; stated because it is a real restriction and not an oversight.
+/// `\r\n` is stripped too, for a file that has been through a Windows editor on its way between hosts.
+///
+/// An empty file is refused rather than accepted as an empty secret: it is what a truncated copy, a failed
+/// `scp`, or a mistyped redirection leaves behind, and an empty shared secret shapes every frame identically
+/// for everyone — the exact opposite of what enabling PROTEUS asks for.
 fn read_secret_file(path: &str, what: &str) -> Result<zeroize::Zeroizing<Vec<u8>>, NodeError> {
     require_private_file(path, what)?;
     let raw = zeroize::Zeroizing::new(std::fs::read(path)?);
@@ -3788,6 +3797,10 @@ async fn cmd_resolve(args: &[String]) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Log one engine notification at the level its cause deserves.
+///
+/// The thin wrapper; [`log_notification_against`] holds the decision so it can be tested against a stated
+/// configuration rather than against whatever the process happens to hold.
 fn log_notification(note: &Notification) {
     log_notification_against(note, None);
 }
@@ -4033,6 +4046,12 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Install the `tracing` subscriber, once per process.
+///
+/// `try_init` rather than `init`: every verb calls this, and a second call must not abort a running node
+/// over its logging. The default filter is `info` when `RUST_LOG` says nothing — the one environment
+/// variable this binary consults indirectly, and deliberately, because it configures observability and
+/// nothing else (#311).
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -4123,10 +4142,15 @@ fn flag_all<'a>(args: &'a [String], name: &str) -> Result<Vec<&'a str>, NodeErro
     Ok(out)
 }
 
+/// Whether `name` appears at all — the boolean flags, which take no value.
+///
+/// The counterpart to [`flag`], and the reason that one needs no list of which flags are valued: the two
+/// call graphs partition the vocabulary between them (#313).
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The whole `fanos help` listing — the first half, which is the verbs an operator meets on day one.
 fn help_text() -> String {
     let mut s = String::from(
         "fanos — the FANOS node\n\

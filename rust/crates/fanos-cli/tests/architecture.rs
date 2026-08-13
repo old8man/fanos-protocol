@@ -1413,6 +1413,68 @@ fn no_production_code_creates_a_directory_at_the_umask() {
     );
 }
 
+/// **Every free function in the node binary carries a doc comment — because that is what makes an
+/// ORPHANED doc detectable (#318).**
+///
+/// Not a tidiness rule. The defect it closes is mechanical and had **three** live instances in
+/// `bin/fanos.rs` at once: a new function inserted *between* an existing doc comment and the function it
+/// documented. Rust then attaches the old doc to the newcomer, and the displaced function is left bare —
+/// so `provision_error` was documented with the anonymity floor's derivation, `hidden_service_identity`
+/// carried `cmd_host`'s description of the hidden-service model, and `is_isolated` was headed "Run a node
+/// until Ctrl-C". Nothing catches it: both blocks are syntactically valid docs on the item that follows,
+/// `cargo doc` is silent, and `missing_docs` does not apply to private items in a binary.
+///
+/// **The undocumented function is the observable.** An insertion of this shape always leaves one, so
+/// requiring a doc on every function turns an invisible mis-attachment into a red test on the commit that
+/// makes it. Three of the eight bare functions found by this scan were exactly that; the other five were
+/// simply never documented, and documenting them is what lets the rule be *total* — an exemption list would
+/// have to name the very functions a future insertion would leave bare.
+///
+/// Scope is free functions in this one binary: it is the operator-facing surface, its docs carry
+/// derivations rather than descriptions, and it is where the class occurred. Methods inside `impl` blocks
+/// are indented and out of this scan's reach — stated rather than implied.
+#[test]
+fn every_function_in_the_node_binary_is_documented() {
+    let path = corpus::workspace_root().join("crates/fanos-node/src/bin/fanos.rs");
+    let text = std::fs::read_to_string(&path).expect("the node binary's source must be readable");
+    let production = production_part(&text);
+    let lines: Vec<&str> = production.lines().collect();
+    let (mut functions, mut bare) = (0usize, Vec::new());
+    for (i, line) in lines.iter().enumerate() {
+        // Column zero only: a free function. `    fn` is a method or a closure helper inside an item that
+        // has its own doc, and the insertion defect cannot reach it the same way.
+        if !line.starts_with("fn ") && !line.starts_with("async fn ") && !line.starts_with("const fn ") {
+            continue;
+        }
+        functions += 1;
+        // Attributes sit between the doc and the item, so walk back over them.
+        let mut j = i;
+        while j > 0 && (lines[j - 1].starts_with("#[") || lines[j - 1].starts_with("#![")) {
+            j -= 1;
+        }
+        if !lines.get(j.wrapping_sub(1)).is_some_and(|prev| prev.starts_with("///")) {
+            let name = line.split('(').next().unwrap_or(line);
+            bare.push(format!("{}:{}  {name}", "crates/fanos-node/src/bin/fanos.rs", i + 1));
+        }
+    }
+    // CONTROL: this is one file, so a wrong path yields zero functions and a vacuous pass — the failure
+    // mode the corpus module exists to remove, reproduced here because this guard reads a single file
+    // rather than the corpus.
+    assert!(
+        functions > 60,
+        "only {functions} free functions found in the node binary — the scan is reading the wrong file, so \
+         an empty result below means nothing"
+    );
+    assert!(
+        bare.is_empty(),
+        "these free functions in the node binary carry no doc comment:\n  {}\n\
+         Write one. A bare function is also how an ORPHANED doc looks from the outside: inserting a function \
+         between a doc and its owner silently re-points that doc at the newcomer and leaves the owner like \
+         this, which happened three times in this file before the rule existed (#318).",
+        bare.join("\n  "),
+    );
+}
+
 /// **`HOME` is read in exactly one place, and that place refuses rather than defaults (#312).**
 ///
 /// The defect this closes was four independent readers, each written
