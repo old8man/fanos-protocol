@@ -57,6 +57,19 @@ const MAX_SOCKET_PATH: usize = 100;
 /// The fallback is not hypothetical. It fires for a container mount a few levels deep, a long user name under an
 /// XDG home, or any of the paths a packaging system picks — and found here by running a node from a scratch
 /// directory, where it failed with nothing but `path must be shorter than SUN_LEN`.
+///
+/// **The fallback lands in a directory of the node's own, not loose in the temporary one** (#317). [`serve`]
+/// makes the socket's parent `0700` before binding, because a Unix socket's permission check happens at
+/// `connect()` and an unrestricted parent leaves a window in which any local account can reach it. That is
+/// correct for the state directory, which the node created; applied to `$TMPDIR` it is a guard pointed at
+/// something it was never written about, and it does one of two wrong things. As a non-root user on Linux the
+/// `chmod` of a root-owned `/tmp` fails, so a node with a long data path never gets a control socket at all
+/// and the reported reason is a permission error naming somebody else's directory. As root it **succeeds**,
+/// and `/tmp` becomes `0700` for every other program on the host. Nesting one level makes the fallback's
+/// parent a directory this node creates, so the `0700` means the same thing it means everywhere else.
+///
+/// The nesting also fails closed against a squatter: an attacker who pre-creates the derived directory owns
+/// it, `set_permissions` then fails, and [`serve`] returns an error rather than binding inside it.
 #[must_use]
 pub fn socket_path(data: &Path) -> PathBuf {
     let natural = data.join(SOCKET_FILE);
@@ -69,8 +82,7 @@ pub fn socket_path(data: &Path) -> PathBuf {
         use std::fmt::Write as _;
         let _ = write!(name, "{byte:02x}");
     }
-    name.push_str(".sock");
-    std::env::temp_dir().join(name)
+    std::env::temp_dir().join(name).join(SOCKET_FILE)
 }
 
 /// What an operator can ask a running node.
@@ -662,11 +674,26 @@ async fn serve_one(stream: UnixStream, tx: &mpsc::Sender<Envelope>) {
 ///
 /// # Errors
 /// Propagates the bind failure, which is the operator's to see: a node running without the socket it was asked
-/// for should say so rather than pretend.
+/// for should say so rather than pretend. Also refuses **before** binding a path longer than the kernel's
+/// `sun_path`, because that failure otherwise arrives as `SUN_LEN` and names nothing an operator can act on —
+/// the one thing [`socket_path`]'s fallback exists to prevent, and which it cannot prevent by itself if the
+/// temporary directory it lands in is long enough to blow the budget a second time.
 pub fn serve(path: &Path, tx: mpsc::Sender<Envelope>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let len = path.as_os_str().len();
+    if len > MAX_SOCKET_PATH {
+        return Err(std::io::Error::other(format!(
+            "the control socket's path is {len} bytes and a Unix socket address holds {MAX_SOCKET_PATH} — \
+             give the node a shorter --data directory, or a shorter TMPDIR if this path is under one: {}",
+            path.display()
+        )));
+    }
     // Owner-only, and it is what closes the bind→chmod window below rather than merely narrowing it: a Unix
     // socket's permission check happens at `connect()`, so an unrestricted parent lets a local account reach
     // the socket during the microseconds it exists at the umask. See `durable::create_private_dir`.
+    //
+    // The parent is always a directory this node owns — its state directory, or (on `socket_path`'s fallback)
+    // the one it derives inside the temporary directory. Never the temporary directory itself: this call is
+    // not best-effort, and pointing it at `/tmp` either fails as a user or succeeds as root (#317).
     if let Some(parent) = path.parent() {
         crate::durable::create_private_dir(parent)?;
     }
@@ -1259,6 +1286,27 @@ mod tests {
         assert_eq!(path, socket_path(&deep), "the derivation must be stable across calls");
         let other = PathBuf::from(format!("/tmp/{}x", "verylongsegment/".repeat(12)));
         assert_ne!(socket_path(&other), path, "two nodes must not be handed the same socket");
+
+        // **And the fallback's parent is the node's OWN directory, never the temporary one** (#317). `serve`
+        // makes the parent 0700 unconditionally, so a fallback sitting loose in `$TMPDIR` points that at a
+        // directory the node did not create: as a user the chmod of a root-owned `/tmp` fails and the socket
+        // never binds, and as root it succeeds and takes `/tmp` away from every other program on the host.
+        //
+        // Falsified by restoring `temp_dir().join(name)` — this assertion goes red naming the temp directory
+        // as the parent, which is exactly the argument `serve` would then be handed.
+        let temp = std::env::temp_dir();
+        assert_ne!(
+            path.parent(),
+            Some(temp.as_path()),
+            "the fallback socket must live one level down, in a directory this node creates — `serve` chmods \
+             the parent to 0700 and that must never be the operator's temporary directory"
+        );
+        assert!(
+            path.parent().is_some_and(|p| p.starts_with(&temp) && p != temp),
+            "and that directory must still be INSIDE the temporary one, or the fallback has not solved the \
+             length problem it exists for: {}",
+            path.display()
+        );
     }
 
     #[test]
