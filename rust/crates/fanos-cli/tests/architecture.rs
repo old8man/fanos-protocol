@@ -764,6 +764,88 @@ fn two_field_wide_tasks_wait_on_one_absent_signature_structure() {
     );
 }
 
+/// **A re-genesis certificate is only half the authorization. The other half lives one crate away, and
+/// nothing joined them.**
+///
+/// `BeaconNode::rebootstrap` verifies everything the *certificate* claims: the single-writer authority's
+/// signatures, a strictly-monotonic `generation`, this cell's `lineage_anchor`, a forward `epoch_fence`,
+/// the authorized threshold, and — through `recovery_decision` rather than a re-derivation, so the two
+/// cannot drift — that the survivor set is genuinely below threshold. What it **cannot** verify is
+/// whether the cell is *actually* frozen: liveness is invisible to a sans-I/O engine. That evidence lives
+/// in `fanos-node`'s `StallDetector` / `RecoveryWatcher`.
+///
+/// So `rebootstrap`'s doc states an obligation on a caller that does not exist yet — *"a driver that
+/// carries an RGC into a running node MUST additionally require its own confirmed stall before calling
+/// this"* — and records why it was written early: *"the neighbouring POROS reshare path was once wired by
+/// a driver that omitted the guard the engine was relying on it to apply."* **A prose obligation whose
+/// failure mode has already happened once is a defect waiting for its caller.**
+///
+/// What skipping it costs: re-genesis abandons a live key and installs one with no continuity to it, and
+/// every node's coordinate derives from the beacon — so an RGC accepted by a *healthy* cell is control
+/// over where the whole cell lands. `rebootstrap`'s own guard 6 catches the certificate that lies about
+/// the survivor count; it cannot catch the true certificate applied at the wrong moment.
+///
+/// **Not merely an alarm — it keeps working after the wiring.** With no production caller it passes on an
+/// empty set; the moment a file calls `rebootstrap`, that file must also reach the liveness evidence, or
+/// this fails and states the rule. Per **file**, not per crate: a driver is a file, and a crate that
+/// mentions `StallDetector` somewhere else proves nothing about the one that calls. `code_only` strips
+/// comments, so `beacon.rs`'s own prose about `StallDetector` cannot satisfy the requirement it states.
+///
+/// # Scope: this is the one open member of a class that was swept, not an isolated worry
+///
+/// Production docs state **25** obligations on a caller. The security-bearing ones were each read against
+/// their real callers, and all but this one are discharged — three of them by mechanisms stronger than a
+/// guard, which is why no further tests were added:
+///
+/// * `poros::verify_ingress_request` ("the caller MUST additionally check that `req.requester` matches the
+///   coordinate it arrived from") — discharged **in-engine**: `on_request`'s Gate 0 drops `from !=
+///   req.requester` and records `AdmissionIdentityUnbound`.
+/// * `StateMachine::restore` + `HybridChain::restore` + `finalize` ("verify the root against a
+///   quorum-signed certificate before adopting — this method installs, it does not verify") — discharged
+///   by `on_sync_resp`, which runs forward-only, `cert.verify(quorum)` and
+///   `state.state_root() == cert.state_root` *before* installing, each with its own reject counter.
+/// * `sealed::verify_delivery` ("the caller MUST reject the payload") returns a `Result`, and
+///   `ProteusShaper`'s genesis shape is an enum arm whose exhaustive destructure (#234) makes ignoring it
+///   a compile error. A type that cannot be ignored beats a guard that can be deleted.
+///
+/// The one left is the one with **no caller yet** — which is exactly why it needed writing down early,
+/// and exactly why nothing was watching it.
+#[test]
+fn a_driver_carrying_a_re_genesis_certificate_must_also_read_its_own_stall() {
+    let files: Vec<(String, String)> =
+        corpus().into_iter().filter(RustSource::is_crate_src).map(|s| (s.rel, code_only(&s.text))).collect();
+
+    // Assert the scan before the finding — on BOTH halves it reasons about, since a corpus blind to
+    // either would return an empty offender list for the wrong reason.
+    assert!(
+        files.iter().any(|(_, t)| t.contains("fn rebootstrap")),
+        "the scan cannot see `rebootstrap`'s definition, so its verdict about callers is a claim about \
+         this scan and not about the tree"
+    );
+    assert!(
+        files.iter().any(|(_, t)| t.contains("StallDetector")),
+        "the scan cannot see the liveness evidence it demands of callers, so any green verdict here \
+         would be vacuous"
+    );
+
+    let blind: Vec<&str> = files
+        .iter()
+        .filter(|(_, t)| calls(t, "rebootstrap"))
+        .filter(|(_, t)| !t.contains("StallDetector") && !calls(t, "recovery_decision"))
+        .map(|(rel, _)| rel.as_str())
+        .collect();
+    assert!(
+        blind.is_empty(),
+        "these files call `BeaconNode::rebootstrap` without reaching any liveness evidence ({blind:?}). \
+         The certificate proves the AUTHORITY authorized a re-genesis for a cell it believes is frozen; \
+         it cannot prove the cell IS frozen, and applying a true RGC at the wrong moment replaces a \
+         working beacon — which is control over every node's coordinate. Require this node's own \
+         confirmed stall (`StallDetector` / `recovery_decision`) before the call, exactly as \
+         `rebootstrap`'s doc demands and as the POROS reshare path once failed to do. If the driver \
+         reaches liveness by some other route, name it here rather than deleting the guard."
+    );
+}
+
 /// The unwired public functions, by crate.
 fn unwired_by_crate() -> BTreeMap<String, BTreeSet<String>> {
     let sources = production_sources();
