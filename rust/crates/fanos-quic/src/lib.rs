@@ -65,4 +65,4 @@ pub use identity::{
     coordinate_at_level, coordinate_from_cert, hierarchical_coordinate, verifiable_coordinate,
     verify_peer_coordinate, vrf_public_from_cert,
 };
-pub use tls::{NodeCredentials, TlsError};
+pub use tls::{IDENTITY_FORMAT_VERSION, IDENTITY_MAGIC, IdentityFormat, NodeCredentials, TlsError};

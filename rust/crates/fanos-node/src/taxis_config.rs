@@ -24,6 +24,7 @@ use fanos_taxis::keyper::{KeyperKeyCert, KeyperRegistry, seal_to_keyper_committe
 use fanos_taxis::params::CellParams;
 use fanos_taxis::tx::Transaction;
 use fanos_taxis::SlashEvidence;
+use fanos_wire::stored::{self, Magic, StoredFormat};
 use rand_core::CryptoRng;
 
 use crate::taxis_driver::{SlashSealer, TaxisParams};
@@ -157,8 +158,7 @@ impl ValidatorConfig {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&VALIDATOR_MAGIC);
-        out.push(PROVISION_FORMAT_VERSION);
+        stored::write_header(&mut out, VALIDATOR_MAGIC, PROVISION_FORMAT_VERSION);
         out.push(self.me);
         out.extend_from_slice(&self.node_seed);
         out.extend_from_slice(&(self.cell.q()).to_be_bytes());
@@ -275,49 +275,40 @@ impl ValidatorConfig {
 /// order or meaning — the keyper cert gaining its rotation `generation` (#307) is exactly such a change,
 /// and it is what made this framing necessary: without it, a file from before that change simply failed to
 /// parse and the operator was told "malformed", which is what a corrupt file is also called.
+///
+/// **This family's number, and only this family's** (#309). The framing machinery moved to
+/// [`fanos_wire::stored`] when a second format needed it, but the version stayed here: a node's identity
+/// layout and the TAXIS provisioning layout change for unrelated reasons, so one shared number would make
+/// every identity file "old" the day a validator config gained a field.
 pub const PROVISION_FORMAT_VERSION: u8 = 1;
 
 /// Magic for a [`ValidatorConfig`] file (`validator-<i>.taxis`).
-const VALIDATOR_MAGIC: [u8; 4] = *b"FVCF";
+const VALIDATOR_MAGIC: Magic = *b"FVCF";
 /// Magic for a [`ChainInfo`] file (`chain-info.taxis`).
-const CHAIN_INFO_MAGIC: [u8; 4] = *b"FCIN";
+const CHAIN_INFO_MAGIC: Magic = *b"FCIN";
 
 /// What a provisioning file's frame says about itself — the three answers an operator needs told apart.
 ///
 /// The **kind** lives in the magic and the **layout** in the version, deliberately: a chain-info file
 /// handed to `fanos validator --config` is a different mistake from a file written by an older build, and
-/// telling an operator "malformed" for both is the refusal-you-cannot-explain shape. Modelled on
-/// `fanos_telemetry`'s `FTS1` snapshot framing, which is the only other on-disk format here that carries
-/// one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ProvisionFormat {
-    /// This kind of file, at this build's layout version — decoding may still fail on the body.
-    Current,
-    /// This kind of file, written at a **different** layout version. The operator needs a new file from
-    /// the ceremony, not a bug report.
-    OtherVersion(u8),
-    /// Not this kind of file at all: the magic does not match, or the bytes are too short to carry one.
-    WrongKind,
-}
+/// telling an operator "malformed" for both is the refusal-you-cannot-explain shape.
+///
+/// The enum itself is [`fanos_wire::stored::StoredFormat`], re-exported rather than redeclared: #309 needed
+/// the same three answers for the node's identity file, and a second copy would be the guard becoming the
+/// defect one edit later. Its `Unframed` variant is what this module used to call `WrongKind` — the wider
+/// and more honest name, because at the framing layer "some other kind of file" and "this kind, written
+/// before framing existed" are byte-identical, and only the format's owner knows whether the second is
+/// possible. For these two it is not: both shipped framed.
+pub type ProvisionFormat = StoredFormat;
 
-/// Classify `bytes` against `magic` without decoding the body.
-fn classify(bytes: &[u8], magic: [u8; 4]) -> ProvisionFormat {
-    let Some(rest) = bytes.strip_prefix(&magic) else {
-        return ProvisionFormat::WrongKind;
-    };
-    match rest.split_first() {
-        Some((&v, _)) if v == PROVISION_FORMAT_VERSION => ProvisionFormat::Current,
-        Some((&v, _)) => ProvisionFormat::OtherVersion(v),
-        None => ProvisionFormat::WrongKind,
-    }
+/// Classify `bytes` against `magic` without decoding the body — this family's version, bound in.
+fn classify(bytes: &[u8], magic: Magic) -> ProvisionFormat {
+    stored::classify(bytes, magic, PROVISION_FORMAT_VERSION)
 }
 
 /// Strip a frame this build can decode, or `None` — the shared half of every `from_bytes` below.
-fn unframe(bytes: &[u8], magic: [u8; 4]) -> Option<&[u8]> {
-    match classify(bytes, magic) {
-        ProvisionFormat::Current => bytes.get(magic.len() + 1..),
-        _ => None,
-    }
+fn unframe(bytes: &[u8], magic: Magic) -> Option<&[u8]> {
+    stored::unframe(bytes, magic, PROVISION_FORMAT_VERSION)
 }
 
 /// The **public** chain parameters a client needs to build, seal, and submit a transaction to a running TAXIS
@@ -341,8 +332,7 @@ impl ChainInfo {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&CHAIN_INFO_MAGIC);
-        out.push(PROVISION_FORMAT_VERSION);
+        stored::write_header(&mut out, CHAIN_INFO_MAGIC, PROVISION_FORMAT_VERSION);
         out.extend_from_slice(&self.cell.q().to_be_bytes());
         out.extend_from_slice(&u32_of(self.cell.n()).to_be_bytes());
         out.extend_from_slice(&u32_of(self.cell.f()).to_be_bytes());
@@ -612,8 +602,8 @@ mod tests {
 
         // Each file is refused BY KIND when handed to the other reader — the property two distinct magics
         // buy, and the one a shared magic would have lost.
-        assert_eq!(ValidatorConfig::format_of(&info_bytes), ProvisionFormat::WrongKind);
-        assert_eq!(ChainInfo::format_of(&cfg_bytes), ProvisionFormat::WrongKind);
+        assert_eq!(ValidatorConfig::format_of(&info_bytes), ProvisionFormat::Unframed);
+        assert_eq!(ChainInfo::format_of(&cfg_bytes), ProvisionFormat::Unframed);
         assert!(ValidatorConfig::from_bytes(&info_bytes).is_none(), "and it does not decode either");
 
         // A file from another layout is named as such, not called corrupt.
@@ -626,8 +616,8 @@ mod tests {
         assert!(ChainInfo::from_bytes(&older).is_none(), "a foreign layout is refused, not guessed at");
 
         // Too short to carry a frame is the same answer as a foreign one: not this kind of file.
-        assert_eq!(ChainInfo::format_of(&[]), ProvisionFormat::WrongKind);
-        assert_eq!(ChainInfo::format_of(&CHAIN_INFO_MAGIC), ProvisionFormat::WrongKind, "magic without a version");
+        assert_eq!(ChainInfo::format_of(&[]), ProvisionFormat::Unframed);
+        assert_eq!(ChainInfo::format_of(&CHAIN_INFO_MAGIC), ProvisionFormat::Unframed, "magic without a version");
 
         // And the frame is not decoration: a body with the frame stripped must not decode.
         let unframed = &info_bytes[CHAIN_INFO_MAGIC.len() + 1..];

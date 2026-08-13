@@ -15,6 +15,8 @@
 //! * [`activation`] — **epoch-aligned activation for derivation changes**: the class of change a frame
 //!   registry cannot type, because it alters how a value is *computed* rather than how it is encoded
 //!   (`docs/design-upgrade.md`).
+//! * [`stored`] — the same discipline for artefacts that live on a **disk** rather than on a wire: a magic
+//!   that says which kind, a version that says which layout, and three verdicts an operator can act on.
 //!
 //! The `#[cfg]` gates keep it `#![no_std]` (with `alloc`).
 
@@ -34,6 +36,7 @@ pub mod capability;
 pub mod element;
 pub mod error;
 pub mod frame;
+pub mod stored;
 pub mod tessera;
 pub mod varint;
 pub mod wire;

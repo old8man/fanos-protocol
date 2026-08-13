@@ -123,9 +123,10 @@ fn provision_error(kind: &str, fmt: fanos_node::ProvisionFormat) -> NodeError {
              dealing ceremony with this build rather than reusing the old file.",
             fanos_node::PROVISION_FORMAT_VERSION
         ),
-        fanos_node::ProvisionFormat::WrongKind => {
-            format!("that is not a {kind} file at all (wrong magic) — check the path")
-        }
+        fanos_node::ProvisionFormat::Unframed => format!(
+            "that is not a {kind} file at all — it carries no frame this build recognises. Check the path; \
+             a file of the right kind always begins with its own four-byte magic."
+        ),
     })
 }
 

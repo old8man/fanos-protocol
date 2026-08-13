@@ -172,17 +172,81 @@ impl NodeCredentials {
         &self.cert_der
     }
 
-    /// Serialize for persistence (the canonical [`Wire`](fanos_wire::Wire) codec).
+    /// Serialize for persistence: a [`stored`](fanos_wire::stored) frame over the canonical
+    /// [`Wire`](fanos_wire::Wire) codec.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        fanos_wire::Wire::to_wire(self)
+        let mut out = Vec::new();
+        fanos_wire::stored::write_header(&mut out, IDENTITY_MAGIC, IDENTITY_FORMAT_VERSION);
+        out.extend_from_slice(&fanos_wire::Wire::to_wire(self));
+        out
     }
 
-    /// Reload persisted credentials, or `None` if the bytes are malformed or carry trailing data.
-    #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        fanos_wire::Wire::from_wire(bytes).ok()
+    /// Reload persisted credentials, saying **which** of four things the bytes are (#309).
+    ///
+    /// `from_bytes` used to answer `Option`, and its one production caller turned that into
+    /// `NodeError::Identity` — a single sentence for a truncated file, a file of the wrong kind (a mistyped
+    /// `--identity`), and a file from a build with a different layout. Those need different actions from an
+    /// operator, and the last one is why the layout could never change: add a field and every live node's
+    /// identity file becomes indistinguishable from a corrupt one — which for this file means the node's
+    /// coordinate.
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityFormat`] naming the case. `Legacy` is not an error the caller must refuse — see there.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IdentityFormat> {
+        match fanos_wire::stored::classify(bytes, IDENTITY_MAGIC, IDENTITY_FORMAT_VERSION) {
+            fanos_wire::stored::StoredFormat::Current => {
+                let body = bytes.get(fanos_wire::stored::HEADER_LEN..).unwrap_or_default();
+                fanos_wire::Wire::from_wire(body).map_err(|_| IdentityFormat::Corrupt)
+            }
+            fanos_wire::stored::StoredFormat::OtherVersion(v) => Err(IdentityFormat::OtherVersion(v)),
+            // **Unframed is read as legacy, and that decision is the whole migration** (#309). Every
+            // identity file written before this frame existed is unframed, and refusing them would not be
+            // strict — it would DELETE those nodes: the file is the coordinate, so a node that cannot load
+            // it comes back as a stranger and the cell sees the old one simply vanish. So the body is tried
+            // as-is, and a caller that wants to tell an operator "this file predates the frame" gets
+            // `Legacy` to say it with. A file that is not an identity at all fails the same decode and
+            // arrives as `Corrupt`, which is the honest limit: at this layer the two are the same bytes.
+            fanos_wire::stored::StoredFormat::Unframed => match fanos_wire::Wire::from_wire(bytes) {
+                Ok(creds) => Err(IdentityFormat::Legacy(Box::new(creds))),
+                Err(_) => Err(IdentityFormat::Corrupt),
+            },
+        }
     }
+}
+
+/// A stored identity's kind marker — `FNID`, in the four-byte shape every on-disk format here uses.
+pub const IDENTITY_MAGIC: fanos_wire::stored::Magic = *b"FNID";
+
+/// The identity file's **layout** version, and deliberately not the provisioning family's (#309).
+///
+/// `cert_der ‖ key_der` is written by `fanos-quic` and read by every node at start; a TAXIS validator config
+/// is written by a ceremony and read by one role. They change for unrelated reasons, so they count
+/// separately — sharing one number would declare every node's identity out of date the day a validator
+/// config gained a field.
+pub const IDENTITY_FORMAT_VERSION: u8 = 1;
+
+/// What a persisted identity's bytes turned out to be, when they are not simply this build's.
+///
+/// Four answers rather than `None`, because the operator's next action differs in each and the caller is the
+/// only one that can phrase it.
+#[derive(Debug)]
+pub enum IdentityFormat {
+    /// **Written before the frame existed** — and it decoded, so it is a real identity and the node keeps
+    /// its coordinate. Carried out rather than swallowed so a caller can say so once: an operator has no
+    /// other way to learn that this file is on the old layout and will stay readable only while this
+    /// build's legacy path exists.
+    ///
+    /// Boxed because the credentials are much larger than the other variants, and a `Result`'s error arm
+    /// sized by its largest member would make every `?` on this type carry the whole certificate.
+    Legacy(Box<NodeCredentials>),
+    /// This kind of file, at a **different** layout version. The node must not guess at a body it cannot
+    /// read: doing so would derive a coordinate from misparsed bytes and join the cell as somebody else.
+    OtherVersion(u8),
+    /// The frame is this build's (or absent) and the body did not decode: truncated, corrupt, or not an
+    /// identity file at all.
+    Corrupt,
 }
 
 /// Build a **mutual-TLS** `(server, client, cert)` triple from given credentials. Both ends present
