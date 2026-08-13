@@ -386,9 +386,19 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // spec §2.7/V15. Its caller is `examples/forecast.rs`, which `gate.sh` runs as a phase and which now
     // exits non-zero on a violation, so the capability is wired to a merge gate rather than to nothing.
     // This scan cannot see that: `production_sources` keeps only `RustSource::is_crate_src`, so `examples/`
-    // and `src/bin/` are invisible to it, and four of this tree's examples ARE gate phases. Worth knowing
-    // before the next raise — the same blindness would hide a genuinely dead function in fanos-sim, and
-    // deciding whether a gate-run example counts as a call site is a change to this guard, not to a budget.
+    // and `src/bin/` are invisible to it, and four of this tree's examples ARE gate phases. Deciding whether
+    // a gate-run example counts as a call site is a change to this guard, not to a budget.
+    //
+    // How much that blindness hides was then MEASURED across all 41, rather than left as a worry, and the
+    // answer is nothing: 20 are called from `#[cfg(test)]` modules inside `src/` (which `code_only` strips
+    // on purpose), 17 from `tests/`, 3 from `examples/` or `src/bin/`, and 1 — `spawn_as_drawn` — from an
+    // in-file test through a turbofish. Every one is exercised somewhere; this budget currently conceals no
+    // dead code, only four categories of caller this guard does not count as production.
+    //
+    // The turbofish is worth naming because it cost a false finding: an ad-hoc `\bname\s*\(` scan reported
+    // `spawn_as_drawn` as called NOWHERE in the tree, and the spelling that hid it was
+    // `NodeFleet::spawn_as_drawn::<F4>(…)`. #168 had already taught the composition seam guard to normalise
+    // exactly that. Re-deriving a scan that a shipped guard has already corrected re-earns its bugs.
     // (`verdict`, its sibling, is absent from the finding for an unrelated reason: the name is declared in
     // more than one crate, so the attribution step drops it rather than guess. Two different blind spots,
     // and only one of them is about examples.)
