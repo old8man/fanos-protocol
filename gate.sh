@@ -58,18 +58,26 @@ FAILED=0
 SUMMARY=()
 
 # run <name> <cargo args...> — one log, one status, no pipeline between cargo and `$?`.
+#
+# **Every phase is timed, because time is the cost that decides whether a phase is ever REACHED.** This
+# script already refuses to start under 44 GB and says so; it measured nothing about duration, and the
+# consequence was concrete: `doc` costs seconds and sat 22nd of 25, behind a `tests` group that runs for
+# hours. Six broken intra-doc links lived on main under a gate that owns a phase for exactly that check.
+# A cost nobody prints is a cost nobody orders by.
 run() {
   local name="$1"; shift
   local log="$LOGS/$name.log"
+  local t0=$SECONDS
   printf '  %-46s ' "$name"
   cargo "$@" >"$log" 2>&1
   local rc=$?
+  local secs=$((SECONDS - t0))
   if [ "$rc" -eq 0 ]; then
-    printf 'ok\n'
-    SUMMARY+=("ok    $name")
+    printf 'ok %6ds\n' "$secs"
+    SUMMARY+=("$(printf 'ok    %6ds  %s' "$secs" "$name")")
   else
-    printf 'FAILED (rc=%d)\n' "$rc"
-    SUMMARY+=("FAIL  $name  →  $log")
+    printf 'FAILED (rc=%d) %ds\n' "$rc" "$secs"
+    SUMMARY+=("$(printf 'FAIL  %6ds  %s  →  %s' "$secs" "$name" "$log")")
     FAILED=1
     # The first lines that say why, so a failure is actionable without opening the log.
     grep -E '^(error|warning: unused|test result: FAILED|failures:)' "$log" | head -8 | sed 's/^/        /'
@@ -196,6 +204,57 @@ if want guards ${SELECT[@]+"${SELECT[@]}"}; then
   run guards-crosscrate test -p fanos-cli --no-fail-fast
 fi
 
+# ---------------------------------------------------------------------------------------------------
+# **Cheap and deterministic before slow and load-sensitive.** These two groups used to sit LAST, after
+# `tests` and `run`, and that ordering is what let six broken intra-doc links live on main: a plain
+# `./gate.sh` reaches `doc` only after hours of tests, so in practice nobody reached it. Measured, with a
+# warm tree: `doc --workspace --no-deps` is ~3 s and the six `nostd` checks are seconds each, against a
+# `tests` group observed at 4 h 23 min and still running.
+#
+# The order is not aesthetic. Both groups here are `check`/`doc` — they compile and never execute, so they
+# cannot be load-sensitive and cannot flake; a failure is a fact about the source. `tests` is the opposite
+# on both counts. Putting the certain, cheap verdicts first means a run that is interrupted, or read only
+# at its head, still delivers everything it can decide in minutes.
+#
+# They stay AFTER `clippy`, which is deliberate: clippy warms the target directory these two then reuse.
+# Moving them ahead of it would make the first one pay a cold dependency build and destroy the very cost
+# advantage this ordering exists to spend.
+# ---------------------------------------------------------------------------------------------------
+if want docs ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
+  echo "docs"
+  # `-D warnings` makes an unresolved intra-doc link an ERROR, which is the whole point: a link that does
+  # not resolve is a doc that lies about where to look next. Six of them lived on main at once — one
+  # public item linking a `pub(crate)` one, two unqualified links needing a `Self::` path, and a doc
+  # comment carried between two files where its target was only in scope in the first.
+  RUSTDOCFLAGS="-D warnings" run doc doc --workspace --no-deps
+fi
+
+if want nostd ${SELECT[@]+"${SELECT[@]}"}; then
+  RAN_GROUP=1
+  echo "no_std on the HOST target"
+  # On the host, not wasm: wasm has native f64.ceil/f64.nearest, so a wasm-only check supplies the very
+  # facility `libm` exists to replace and cannot fail on a std call that slipped in.
+  # These verify the LIBRARY builds without std, and NOT its tests — `check` without `--all-targets` never
+  # compiles test code. That limit is worth stating because the six lines look uniform and are not:
+  # measured with `--list`, fanos-nyx (42) and fanos-runtime (65) keep every test std-free and would compile
+  # under this configuration, while fanos-diakrisis, fanos-telemetry and fanos-ports use `std`, `println!`
+  # and `String` in theirs and fail to build here. Neither is a defect — a no_std guarantee is about what
+  # ships, and a test harness needs a runner these targets do not have — but a reader must not take six
+  # identical-looking lines as identical coverage.
+  #
+  # Deliberately NOT upgraded to `check --all-targets` for the two that would pass it. That would enforce a
+  # property nobody in this tree has decided to hold, and the first std-using test added to fanos-nyx would
+  # redden the gate for something that is not a defect. If the tree ever decides test code stays std-free,
+  # this is the line to change and the measurement above is the evidence to change it against.
+  run nostd-diakrisis-libm  check -p fanos-diakrisis --no-default-features --features libm
+  run nostd-diakrisis-alloc check -p fanos-diakrisis --no-default-features --features "alloc libm"
+  run nostd-telemetry       check -p fanos-telemetry --no-default-features --features "alloc libm"
+  run nostd-ports           check -p fanos-ports     --no-default-features --features "alloc libm"
+  run nostd-nyx             check -p fanos-nyx       --no-default-features --features "alloc libm"
+  run nostd-runtime         check -p fanos-runtime   --no-default-features --features "alloc libm"
+fi
+
 if want tests ${SELECT[@]+"${SELECT[@]}"}; then
   RAN_GROUP=1
   echo "tests"
@@ -244,37 +303,6 @@ if want run ${SELECT[@]+"${SELECT[@]}"}; then
   # losses is a hyperoval, and every hyperoval fails) and exits 1 on disagreement.
   run minima           run -p fanos-sim --example minima
   run bench-compile    bench -p fanos-bench --no-run
-fi
-
-if want docs ${SELECT[@]+"${SELECT[@]}"}; then
-  RAN_GROUP=1
-  echo "docs"
-  RUSTDOCFLAGS="-D warnings" run doc doc --workspace --no-deps
-fi
-
-if want nostd ${SELECT[@]+"${SELECT[@]}"}; then
-  RAN_GROUP=1
-  echo "no_std on the HOST target"
-  # On the host, not wasm: wasm has native f64.ceil/f64.nearest, so a wasm-only check supplies the very
-  # facility `libm` exists to replace and cannot fail on a std call that slipped in.
-  # These verify the LIBRARY builds without std, and NOT its tests — `check` without `--all-targets` never
-  # compiles test code. That limit is worth stating because the six lines look uniform and are not:
-  # measured with `--list`, fanos-nyx (42) and fanos-runtime (65) keep every test std-free and would compile
-  # under this configuration, while fanos-diakrisis, fanos-telemetry and fanos-ports use `std`, `println!`
-  # and `String` in theirs and fail to build here. Neither is a defect — a no_std guarantee is about what
-  # ships, and a test harness needs a runner these targets do not have — but a reader must not take six
-  # identical-looking lines as identical coverage.
-  #
-  # Deliberately NOT upgraded to `check --all-targets` for the two that would pass it. That would enforce a
-  # property nobody in this tree has decided to hold, and the first std-using test added to fanos-nyx would
-  # redden the gate for something that is not a defect. If the tree ever decides test code stays std-free,
-  # this is the line to change and the measurement above is the evidence to change it against.
-  run nostd-diakrisis-libm  check -p fanos-diakrisis --no-default-features --features libm
-  run nostd-diakrisis-alloc check -p fanos-diakrisis --no-default-features --features "alloc libm"
-  run nostd-telemetry       check -p fanos-telemetry --no-default-features --features "alloc libm"
-  run nostd-ports           check -p fanos-ports     --no-default-features --features "alloc libm"
-  run nostd-nyx             check -p fanos-nyx       --no-default-features --features "alloc libm"
-  run nostd-runtime         check -p fanos-runtime   --no-default-features --features "alloc libm"
 fi
 
 echo
