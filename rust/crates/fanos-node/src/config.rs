@@ -155,6 +155,39 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 /// Re-measured since at the live mix delay (`e26dbc5`): exposure `0.546` at this default, and the curve is
 /// **non-monotone** — `300 ms` reads `0.475`, better than the shipping value. That is a live reason to
 /// re-derive, not merely a stale provenance.
+///
+/// # 2026-08-13 — measured on the COMPOSED relay, and it selects against the remedy named above
+///
+/// The `0.975` and the open design gap were both recorded against the `ThresholdRouter` in isolation.
+/// `fanos-sim/tests/composed_relay_gpa.rs` now runs the lag-scanning GPA (#187) against the cell
+/// `compose_engine` builds for `--relay`, driving sealed two-hop onions through `forward_send`, and sweeps
+/// the bin width so no figure is an artefact of a ruler wider than the thing it measures:
+///
+/// ```text
+///   bin    undefended   cover-only   delay-only   cover buys   delay buys
+///   20ms        1.000        0.993        1.000        0.007       0.000
+///   50ms        0.996        0.993        0.996        0.003      -0.000
+///  100ms        1.000        0.998        1.000        0.002       0.000
+///  250ms        1.000        0.997        1.000        0.003       0.000
+///  500ms        1.000        0.963        1.000        0.037       0.000
+/// ```
+///
+/// The mixing branch demonstrably runs — same frame count either way, and the tape's timestamp sum moves
+/// `29 630 002 → 29 635 851`, 5.8 s of aggregate displacement, asserted by a control in that file. The
+/// delay is applied and **buys nothing**, at a bin six times finer than its own 120 ms mean.
+///
+/// **That selects the second branch this entry's remedy offered, and against the first.** Closing the gap
+/// by making both halves Poisson — an independently-exponential per-cell delay composed with Poisson cover
+/// — cannot work, because both halves move only the *send time*, and a flow-correlation adversary that
+/// scans lags is by construction invariant to that. The relay emits one cell out per cell in, so the two
+/// rate series match at *some* displacement however the times are jittered.
+///
+/// The channel is therefore the **count**, not the moment. What would move it is an output process whose
+/// per-bin count does not depend on the input's: cover that fills every slot rather than yielding it to a
+/// real cell, or batching that changes cells-per-bin. `cover buys 0.002–0.007` says the current schedule
+/// does not do that, and the `0.037` at a 500 ms bin is the bin resonating with the interval, not a
+/// defence. Recorded as a measurement, not a prescription: the replacement is a design item and needs its
+/// own derivation before anything ships.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With

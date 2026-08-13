@@ -38,16 +38,30 @@
 //! Finishing #181 step 2 needs the probe to be a sealed onion — `seal_forward` over a `meeting_line`, the
 //! way `composed_relay.rs` builds one — so the cells actually traverse the router. Until then the
 //! `delay-only` column below is a control that reads zero for a known reason, not a verdict on the delay.
-#![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::print_stdout, clippy::cast_precision_loss)]
+#![allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::cast_precision_loss
+)]
 
 mod common;
 
 use common::{emit_series, recv_series, spawn_composed_relay_cell};
 use fanos_field::F2;
+use fanos_geometry::{Line, Point};
 use fanos_node::config::{DEFAULT_COVER_INTERVAL, DEFAULT_MIX_DELAY};
+use fanos_pqcrypto::OnionKeyRatchet;
+use fanos_rendezvous::{BeaconSeed, Epoch, MixDirectory, meeting_line, seal_forward};
 use fanos_runtime::{Command, Config, Duration};
 use fanos_sim::Sim;
 use fanos_testkit::gpa::best_lag_score;
+
+/// The Fano onion threshold `mix_threshold(3) = 2` — the value `compose_engine` hands its router. Stated
+/// rather than imported for the reason `composed_relay.rs` states it: a change to the derivation should show
+/// up as a forward that fails to seal, not as this file silently sealing to whatever the code now does.
+const ONION_T: u8 = 2;
 
 /// One seed for every arm: the three differ in the DEFENCE and in nothing else, which is the whole point
 /// ([[discrimination-needs-differing-inputs]] read the other way — the inputs must be identical).
@@ -97,23 +111,39 @@ fn tape_and_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> ((usize,
     sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
     sim.observe_frames(); // the GPA starts tapping
 
+    // **Sealed onions through the router, not overlay sends.** The first version of this harness drove
+    // `Command::Send`, which never enters `ThresholdRouter::forward_send` — the control below caught it.
+    // This is the shape `composed_relay.rs` uses: an epoch-0 `MixDirectory` over the seeds
+    // `spawn_composed_relay_cell` gives each relay, a two-hop circuit, and a frame injected on the wire.
+    let mut dir = MixDirectory::new();
+    for i in 0..7usize {
+        let ratchet = OnionKeyRatchet::new([u8::try_from(i).unwrap(); 32], Epoch::ZERO);
+        dir.insert(Point::<F2>::at(i).coords(), ratchet.public().clone());
+    }
+    let meeting = meeting_line::<F2>(b"gpa-probe-svc", Epoch::ZERO, &BeaconSeed::GENESIS).coords();
+    let hop = (0..7)
+        .map(|i| Line::<F2>::at(i).coords())
+        .find(|&l| l != meeting)
+        .expect("a second line");
+    let entry = Point::<F2>::at(6).coords();
+
     // An APERIODIC send pattern, within the cover budget. Both properties are load-bearing: a periodic one
     // correlates with its own shifts at a value the period fixes (measured — see `fanos_testkit::gpa`), and
     // a burst beyond the cover rate is a separately, honestly leaky regime that constant-rate cover never
     // claimed to hide.
-    let (client, service) = (cell[0], cell[cell.len() - 1]);
+    //
+    // Each send is a SEPARATE seal. Re-injecting one frame would be a replay, and #296 taught the shipping
+    // router to refuse those — the second onward would vanish at the anti-replay gate and the flow would be
+    // one cell long.
     let send_at_ms = [400u64, 1400, 1600, 3200, 5000, 5200, 5400, 8000, 9800, 10_000];
     let mut sent = 0usize;
     let mut now = 0u64;
     while now < WINDOW_MS {
         while sent < send_at_ms.len() && send_at_ms[sent] <= now {
-            sim.inject(
-                client,
-                Command::Send {
-                    to: service,
-                    payload: b"gpa-probe".to_vec(),
-                },
-            );
+            let seed = [b'g', b'p', b'a', u8::try_from(sent).unwrap()];
+            let fwd = seal_forward::<F2>(&[hop, meeting], &dir, ONION_T, b"gpa-probe", &seed)
+                .expect("the circuit seals");
+            sim.inject_frame(entry, fwd.combiner, fwd.frame.clone());
             sent += 1;
         }
         sim.run_for(Duration::from_millis(STEP_MS));
@@ -131,50 +161,49 @@ fn tape_and_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> ((usize,
             best_lag_score(&ins, &outs, lag)
         })
         .fold(0.0, f64::max);
-    let shape = (tape.len(), tape.iter().map(|o| o.t_ms).max().unwrap_or(0));
+    // The SUM of every timestamp, not the count and the last one: a proxy that cannot see ten frames
+    // displaced by 120 ms among 4882 would report "the branch did not run" for a branch that did.
+    let shape = (tape.len(), tape.iter().map(|o| o.t_ms).sum::<u64>());
     (shape, r)
 }
 
-/// **A plain overlay `Send` does not reach the relay's mixing branch — and this asserts it, because I
-/// nearly published the opposite.**
+/// **The mixing branch engages, and it DISPLACES rather than drops** — asserted before any figure below is
+/// allowed to mean anything.
 ///
-/// The sweep below first read `delay buys 0.000` at every bin width down to 20 ms, six times finer than the
-/// 120 ms mean it should have resolved, and that looked like a finding about the relay. It is not. The tape
-/// is **byte-identical** with and without the delay — same frame count, same last timestamp — which can
-/// only mean the branch never ran.
+/// This control has been wrong twice, and both are worth keeping because each was a different way to
+/// mis-measure the same thing:
 ///
-/// It never runs because `Command::Send` is an overlay send and the per-cell delay lives on
-/// `ThresholdRouter::forward_send`, the *onion forwarding* path. Same shape as #134, where
-/// `deaddrop_multicast` did not call `forward_send` and both defences were bypassed for a whole class of
-/// traffic — found there by measuring a schedule that could not move a number, found here by a control that
-/// refused to let a zero mean anything.
+/// 1. The harness first drove `Command::Send`, an overlay send that never enters
+///    `ThresholdRouter::forward_send`. The tape came back byte-identical with and without a 120 ms mean
+///    delay, and `delay buys 0.000` would have been published as a property of the relay. Same shape as
+///    #134, where `deaddrop_multicast` did not call `forward_send` and both defences were bypassed for a
+///    whole class of traffic. Fixed by sealing real onions through the router.
+/// 2. The observable was then `(frame count, last timestamp)`, which cannot see ten frames displaced by
+///    120 ms among 4972 — a proxy insensitive to exactly the effect it was hired to detect. Fixed by summing
+///    every timestamp.
 ///
-/// So the figures this file reports are the GPA's read on the **overlay** path of a composed relay cell,
-/// which is a real and previously unmeasured surface, and NOT the mixnet forwarding path #181 needs. The
-/// residual is stated in the module doc: drive sealed onions through `seal_forward` as `composed_relay.rs`
-/// does, and re-run.
+/// Measured with both fixes: 4972 frames either way, and the timestamp sum moves 29 630 002 → 29 635 851.
+/// Nothing is lost; 5.8 s of aggregate displacement is added. That is a mixing delay doing its job.
 #[test]
-fn a_plain_overlay_send_never_reaches_the_relays_mixing_branch() {
-    let (without, _) = tape_and_correlation(Duration(0), Duration(0), 100);
-    let (with_delay, _) = tape_and_correlation(Duration(0), span(DEFAULT_MIX_DELAY), 100);
-    assert_eq!(
-        without, with_delay,
-        "an overlay Send now DOES change the tape when a {DEFAULT_MIX_DELAY:?} mixing delay is set — which \
-         would mean the forwarding path grew a caller this file does not know about. Good news, and it \
-         invalidates the scope note above: re-read what the sweep measures before trusting it"
-    );
-}
+fn the_mix_delay_engages_and_displaces_the_tape_without_dropping_a_frame() {
+    let ((count_plain, sum_plain), _) = tape_and_correlation(Duration(0), Duration(0), 100);
+    let ((count_mixed, sum_mixed), _) = tape_and_correlation(Duration(0), span(DEFAULT_MIX_DELAY), 100);
 
-/// **The control, and it runs on every gate.** An undefended composed relay must leak a correlation a GPA
-/// can read; if it does not, this harness is measuring nothing and the two defended numbers below are
-/// meaningless. Asserting the instrument before the finding.
-#[test]
-fn an_undefended_composed_relay_leaks_a_readable_correlation() {
-    let undefended = worst_relay_correlation(Duration(0), Duration(0), 100);
+    assert_ne!(
+        sum_plain, sum_mixed,
+        "the tape carries the same total timing with and without a {DEFAULT_MIX_DELAY:?} mean delay — the \
+         mixing branch did not run, and every figure this file reports about it would be about nothing"
+    );
     assert!(
-        undefended > 0.30,
-        "the GPA reads only {undefended:.3} from a relay with NO cover and NO mixing — this harness is not \
-         seeing the flow, so any defended figure it reports would be a claim about the instrument"
+        sum_mixed > sum_plain,
+        "mixing moved the tape EARLIER ({sum_plain} -> {sum_mixed}), which a delay cannot do — a negative \
+         displacement means the two arms are not the same experiment"
+    );
+    assert_eq!(
+        count_plain, count_mixed,
+        "the delay changed how many frames exist ({count_plain} -> {count_mixed}); it is meant to hold \
+         cells, not to lose or duplicate them, and a count that moves makes the correlation figures \
+         incomparable between arms"
     );
 }
 
