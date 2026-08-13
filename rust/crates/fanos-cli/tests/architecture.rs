@@ -660,6 +660,49 @@ fn production_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// **The Sybil cap has a consumer, a composition and a refusal — and no producer. This is the alarm for
+/// the day that changes.**
+///
+/// `poros.rs` states the blocker precisely: per-request PoW is a *rate* limiter and never a Sybil bound
+/// (Boneh et al., CRYPTO'18), so a real bound needs a scarce-resource anchor — a fast-mixing trust graph or
+/// proof-of-personhood. The consumption half already ships and is proven: `Sybil::Capped` carries the
+/// admitted set, `on_request` serves only a requester that clears BOTH gates, and `set_admitted` replaces
+/// the set per epoch. What FANOS has no producer for is the set itself.
+///
+/// **Two open tasks share that one missing subsystem, and neither of them has to design consumption
+/// again**: #76 (the Sybil bound) and #298's residual (a per-epoch gather needs a rule for *whom to answer*
+/// — the same question, with the same seam ready for it).
+///
+/// The `UNWIRED_BUDGET` above records `set_admitted` as uncalled, but a budget is a ceiling: it fires when
+/// the count RISES and is silent when it falls. So the day a producer appears, the count drops, the guard
+/// stays green, and two tasks become unblocked with nothing to say so. That is
+/// [[a-conditional-obligation-needs-a-tripwire]] exactly — X became true unnoticed.
+///
+/// This test fails on that day, and its message is the handover.
+#[test]
+fn the_sybil_cap_still_has_no_producer_and_two_tasks_wait_on_that() {
+    let sources = production_sources();
+    // Assert the scan before the finding: a corpus that cannot see the CONSUMER proves nothing about the
+    // producer's absence.
+    assert!(
+        sources.iter().any(|(k, text)| k == "fanos-node" && text.contains("fn set_admitted")),
+        "the scan cannot find `set_admitted`'s definition in fanos-node's production sources, so its \
+         verdict about callers is a claim about this scan and not about the tree"
+    );
+
+    let callers: Vec<&str> =
+        sources.iter().filter(|(_, text)| calls(text, "set_admitted")).map(|(k, _)| k.as_str()).collect();
+    assert!(
+        callers.is_empty(),
+        "`set_admitted` now has production callers ({callers:?}) — something PRODUCES the Sybil-cap admitted \
+         set. That unblocks BOTH #76 (the Sybil bound: PoW limits the rate of identity creation, never the \
+         total, and `poros.rs` names the missing anchor) and #298's residual (a per-epoch gather needs a \
+         rule for whom to answer, which is the same question). Neither needs new consumption design — \
+         `Sybil::Capped` + `on_request` already compose and are tested. Read `poros.rs`'s header, then \
+         delete this test and close both."
+    );
+}
+
 /// The unwired public functions, by crate.
 fn unwired_by_crate() -> BTreeMap<String, BTreeSet<String>> {
     let sources = production_sources();
