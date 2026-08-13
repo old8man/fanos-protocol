@@ -11,6 +11,9 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+mod common;
+
+use common::{emit_series, recv_series};
 use fanos_aphantos::{Directory, NyxNode};
 use fanos_field::F7;
 use fanos_geometry::{Plane, Point, Triple};
@@ -422,28 +425,6 @@ fn measure_the_timing_channel_at_the_shipping_defaults() {
 struct Flow {
     client: Triple,
     service: Triple,
-}
-
-/// Rate series of frames emitted by `node`, in `bin_ms` bins.
-fn emit_series(obs: &[FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
-    let mut v = vec![0f64; bins];
-    for o in obs.iter().filter(|o| o.from == node) {
-        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
-            *slot += 1.0;
-        }
-    }
-    v
-}
-
-/// Rate series of frames *received* by `node`.
-fn recv_series(obs: &[FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
-    let mut v = vec![0f64; bins];
-    for o in obs.iter().filter(|o| o.to == node) {
-        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
-            *slot += 1.0;
-        }
-    }
-    v
 }
 
 /// The adversary's matching accuracy over `K` concurrent flows: the fraction it assigns correctly, against chance `1/K`.

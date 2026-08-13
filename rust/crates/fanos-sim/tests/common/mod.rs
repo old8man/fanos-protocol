@@ -153,3 +153,30 @@ pub fn spawn_composed_relay_cell<F: Field + 'static>(
 pub fn recovery_authority() -> (HybridSigSecret, HybridVerifier) {
     HybridSigSecret::generate(&mut SeedRng::from_seed(b"fanos-sim/recovery/authority"))
 }
+
+/// Rate series of frames **emitted** by `node`, in `bin_ms` bins — one half of what a GPA correlates.
+///
+/// Here rather than in either harness because two now need it: `traffic_analysis.rs` over a `NyxNode` and
+/// `composed_relay_gpa.rs` over the relay a `--relay` deployment actually runs. The statistics that consume
+/// these series live in `fanos_testkit::gpa`; these two stay here because they need `FrameObs` and `Triple`,
+/// which that leaf crate cannot see.
+pub fn emit_series(obs: &[fanos_sim::FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
+    let mut v = vec![0f64; bins];
+    for o in obs.iter().filter(|o| o.from == node) {
+        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
+            *slot += 1.0;
+        }
+    }
+    v
+}
+
+/// Rate series of frames **received** by `node` — the other half. See [`emit_series`].
+pub fn recv_series(obs: &[fanos_sim::FrameObs], node: Triple, bin_ms: u64, bins: usize) -> Vec<f64> {
+    let mut v = vec![0f64; bins];
+    for o in obs.iter().filter(|o| o.to == node) {
+        if let Some(slot) = v.get_mut((o.t_ms / bin_ms) as usize) {
+            *slot += 1.0;
+        }
+    }
+    v
+}
