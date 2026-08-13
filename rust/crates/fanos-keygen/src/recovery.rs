@@ -117,6 +117,21 @@ pub const fn authority_quorum(m: usize) -> usize {
 /// Every semantic field is bound by each of [`sigs`](Self::sigs), so none can be altered without invalidating
 /// them, and the `generation` fences the whole cell: a node rejects any beacon artifact from an older
 /// generation (`docs/design-recovery.md` §2).
+///
+/// # The one thing this framing does not give an operator (#308)
+///
+/// There is no format magic and no layout version. That is **not** a safety hole — every field is inside
+/// the signature, so a build that changed the layout produces a certificate the verifier refuses, which is
+/// fail-closed and self-fencing. What it costs is the operator's ability to tell *why*: a certificate from
+/// an older build and a forged one both surface as "the authority's signature did not verify", and those
+/// need different actions — re-issue versus investigate an attack.
+///
+/// The provisioning files were given a kind-and-layout frame for exactly this reason (`taxis_config`'s
+/// `ProvisionFormat`), and the same treatment belongs here. It is deliberately **not** done yet: this path
+/// has no production caller, and `fanos-cli`'s
+/// `a_driver_carrying_a_re_genesis_certificate_must_also_read_its_own_stall` already fails the day one
+/// appears. Add the frame with the driver, in one review, rather than shipping a version byte nobody has
+/// yet had a reason to bump.
 #[derive(Clone, PartialEq, Debug)]
 pub struct RecoveryAuthorization {
     /// The re-genesis generation — must be strictly greater than the cell's current `reshare_gen`. The fencing
