@@ -157,7 +157,7 @@ async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
     let dir_h = Directory::new();
     let mut a = node(0, &dir_a).await;
     let mut b = node(1, &dir_b).await;
-    let h = node(2, &dir_h).await;
+    let mut h = node(2, &dir_h).await;
 
     let _ = dir_a.insert(h.address(), h.local_addr());
     let _ = dir_h.insert(b.address(), b.local_addr());
@@ -169,9 +169,26 @@ async fn a_hub_relays_between_peers_it_cannot_broker_a_punch_for() {
         to: b.address(),
         payload: vec![0xBB],
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // **Wait for the two legs to be OBSERVED, not for a duration to elapse.** These two sends are the
+    // fixture: A must reach H and H must reach B, or the relay below has nothing to relay over. A fixed sleep
+    // stood here and it made the precondition weaker the shorter it was — "A and B do not know each other" is
+    // trivially true before anything has happened, so a sleep that under-ran turned an assertion about the
+    // *settled* system into one about a system that had not started. Awaiting the deliveries pins the moment
+    // instead: the precondition below is now read at an instant the warm-up is proved to have finished.
+    assert_eq!(
+        await_delivery(&mut h, a.address(), 5).await,
+        vec![0xAAu8],
+        "the hub must have A's frame, or A never reached H and there is no leg to relay over"
+    );
+    assert_eq!(
+        await_delivery(&mut b, h.address(), 5).await,
+        vec![0xBBu8],
+        "B must have the hub's frame, or H never reached B and the return leg does not exist"
+    );
 
-    // Precondition: A and B have no path to each other — only the relay can carry it.
+    // Precondition: A and B have no path to each other — only the relay can carry it. Meaningful *because*
+    // both legs above are established: this says the pair stayed unknown to each other while the hub learned
+    // them both, which is the condition the relay exists for.
     assert!(
         dir_a.resolve(b.address()).is_none() && dir_b.resolve(a.address()).is_none(),
         "A and B must not know each other's address"
