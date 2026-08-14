@@ -202,12 +202,17 @@ pub async fn exchange<S>(stream: &mut S, request: &[u8]) -> Vec<u8>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    within_span(async {
+    let beats_before = heartbeat();
+    let opened = Instant::now();
+    if within_span(async {
         stream.write_all(request).await.expect("the request is written to the stream");
         stream.shutdown().await.expect("the request half closes");
     })
     .await
-    .expect("REFUTED — the request neither wrote nor half-closed within one span of granted time");
+    .is_none()
+    {
+        drained_budget(beats_before, opened, "the request neither wrote nor half-closed in one span of granted time");
+    }
 
     let started = Instant::now();
     let mut response = Vec::new();
@@ -235,9 +240,13 @@ pub async fn echo<S>(stream: &mut S, sent: &[u8]) -> Vec<u8>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let beats_before = heartbeat();
+    let opened = Instant::now();
     within_span(stream.write_all(sent))
         .await
-        .expect("REFUTED — the payload did not write within one span of granted time")
+        .unwrap_or_else(|| {
+            drained_budget(beats_before, opened, "the payload did not write in one span of granted time")
+        })
         .expect("the payload is written to the stream");
 
     let started = Instant::now();
@@ -292,7 +301,7 @@ static DELIVERED: AtomicU64 = AtomicU64::new(0);
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 
 /// Start the heartbeat once per test binary, and return its current count. Idempotent.
-fn heartbeat() -> u64 {
+pub fn heartbeat() -> u64 {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         tokio::spawn(async {
@@ -305,6 +314,53 @@ fn heartbeat() -> u64 {
     HEARTBEAT.load(Ordering::Relaxed)
 }
 
+/// A wait whose budget drained: say **which** of the two things happened, and never invent the harsher one.
+///
+/// Split out of [`read_within_span`], where it was correct and reachable from one caller (#343). Its two
+/// siblings in this file — the write and half-close in [`exchange`], and the write in [`echo`] — reported a
+/// bare `REFUTED`, which is a claim about the CODE, on a host that may never have scheduled them at all. This
+/// module's own doc calls that direction the dangerous one: "reporting a wedge that is not there is worse
+/// than the 'too slow' verdict it replaced: it sends the reader hunting a defect the machine invented", and
+/// the verdict below records three real failures that wore the inconclusive label for weeks. A harness that
+/// can make that mistake on its read path and not on its write path is one mechanism implemented twice.
+///
+/// `what` names the wait in the caller's own words, so the two verdicts stay one sentence apart and a reader
+/// can tell the write half from the read half without a stack trace.
+///
+/// Diverges: a drained budget is a verdict, and there is nothing to return.
+pub fn drained_budget(beats_before: u64, opened: Instant, what: &str) -> ! {
+    let moved = DELIVERED.load(Ordering::Relaxed);
+    let beats = HEARTBEAT.load(Ordering::Relaxed).saturating_sub(beats_before);
+    let elapsed = opened.elapsed();
+    let expected = (elapsed.as_secs_f64() / POLL.as_secs_f64()).max(1.0);
+    #[allow(clippy::cast_precision_loss)]
+    let ran = beats as f64 / expected;
+    let evidence = format!(
+        "the runtime was polled {beats} times in {elapsed:?} against {expected:.0} expected ({:.0}% of what \
+         it should have been), and this process has delivered {moved} bytes on other flows",
+        ran * 100.0
+    );
+    // **`ran` decides, alone.** `moved` is the older proxy this heartbeat was introduced to replace — its doc
+    // above names the gap it leaves — and requiring *both* re-imported that gap in the other direction:
+    // `moved` counts bytes on OTHER flows, so a test run on its own has none by construction, and every solo
+    // failure was labelled INCONCLUSIVE even at 98% polling, where the runtime is demonstrably healthy and
+    // the honest verdict is a refutation.
+    //
+    // The message made that worse by advising "re-run it alone; if it passes, the host was the variable" —
+    // routing the reader into the single case the conjunction could not judge. Three real failures wore the
+    // inconclusive label for weeks because of it.
+    //
+    // `moved` stays in the evidence string, where it is informative, and out of the verdict, where it was
+    // only ever a weaker way of asking what `ran` answers directly.
+    assert!(
+        ran > 0.5,
+        "INCONCLUSIVE — {what}. {evidence}. This runtime was not scheduled enough to judge — so the run says \
+         nothing about the system. Re-run it on an idle host; if the poll ratio rises and it still fails, it \
+         is wedged."
+    );
+    panic!("REFUTED — {what}. {evidence} — so the runtime WAS running and this still made no progress: it is wedged.")
+}
+
 /// One read bounded by [`FROZEN_SPAN`] of granted time. Returns the byte count (0 at end of stream).
 async fn read_within_span<S>(stream: &mut S, into: &mut [u8], so_far: usize) -> usize
 where
@@ -315,39 +371,7 @@ where
     let read = within_span(stream.read(into))
         .await
         .unwrap_or_else(|| {
-            let moved = DELIVERED.load(Ordering::Relaxed);
-            let beats = HEARTBEAT.load(Ordering::Relaxed).saturating_sub(beats_before);
-            let elapsed = opened.elapsed();
-            let expected = (elapsed.as_secs_f64() / POLL.as_secs_f64()).max(1.0);
-            #[allow(clippy::cast_precision_loss)]
-            let ran = beats as f64 / expected;
-            let evidence = format!(
-                "the runtime was polled {beats} times in {elapsed:?} against {expected:.0} expected ({:.0}% of what \
-                 it should have been), and this process has delivered {moved} bytes on other flows",
-                ran * 100.0
-            );
-            // **`ran` decides, alone.** `moved` is the older proxy this heartbeat was introduced to replace —
-            // its doc above names the gap it leaves — and requiring *both* re-imported that gap in the other
-            // direction: `moved` counts bytes on OTHER flows, so a test run on its own has none by
-            // construction, and every solo failure was labelled INCONCLUSIVE even at 98% polling, where the
-            // runtime is demonstrably healthy and the honest verdict is a refutation.
-            //
-            // The message made that worse by advising "re-run it alone; if it passes, the host was the
-            // variable" — routing the reader into the single case the conjunction could not judge. Three real
-            // failures wore the inconclusive label for weeks because of it.
-            //
-            // `moved` stays in the evidence string, where it is informative, and out of the verdict, where it
-            // was only ever a weaker way of asking what `ran` answers directly.
-            assert!(
-                ran > 0.5,
-                "INCONCLUSIVE — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence}. \
-                 This runtime was not scheduled enough to judge — so the run says nothing about the system. \
-                 Re-run it on an idle host; if the poll ratio rises and it still moves nothing, it is wedged."
-            );
-            panic!(
-                "REFUTED — no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes. {evidence} — so \
-                 the runtime WAS running and this session still moved nothing: it is wedged."
-            )
+            drained_budget(beats_before, opened, &format!("no byte moved in {FROZEN_SPAN:?} of granted time after {so_far} bytes"))
         })
         .expect("the stream is readable");
     DELIVERED.fetch_add(read as u64, Ordering::Relaxed);
