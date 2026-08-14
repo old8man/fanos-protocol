@@ -167,6 +167,9 @@ fn note_desc(note: &Notification) -> String {
         Notification::Escalated(Escalation::UnsupportedCritical { type_code, from }) => {
             format!("Escalated unsupported-critical {type_code:#04x} from {}", fmt_coord(*from))
         }
+        Notification::Escalated(Escalation::BeaconShareMismatch) => {
+            "Escalated beacon-share-mismatch".to_owned()
+        }
         Notification::Decoupled => "Decoupled".to_owned(),
         Notification::Bound => "Bound".to_owned(),
         Notification::Stored(k) => format!("Stored {}", short_digest(k)),

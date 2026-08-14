@@ -3806,6 +3806,46 @@ fn log_notification(note: &Notification) {
     log_notification_against(note, None);
 }
 
+/// Log an [`Escalation`] — the four ways a cell says it needs something only a human can supply.
+///
+/// Split out of [`log_notification_against`] because it is a **different vocabulary**, not a longer list:
+/// `Notification` says what happened, `Escalation` says why the cell cannot fix it by itself, and the two
+/// grow for unrelated reasons. The mechanical trigger was clippy's 105/100 when the fourth arm landed, but
+/// the seam was already visible — the three original arms sat in *two separate places* in that match, split
+/// by the history of #204's catch-all removal rather than by anything a reader could see.
+fn log_escalation(esc: &Escalation) {
+    match esc {
+        Escalation::Faults(mask) => {
+            info!(nodes = format!("{mask:#09b}"), "escalated unrecoverable nodes to the parent cell");
+        }
+        Escalation::CoherenceCollapse => {
+            warn!("behavioural coherence collapsed (Phi <= 1) — the cell needs re-provisioning, not a reroute");
+        }
+
+        // Version skew, and the one escalation that names WHO sent WHAT — the actionable content of a
+        // rollout. It read as "engine event" before, which is the least useful possible rendering of it.
+        Escalation::UnsupportedCritical { type_code, from } => warn!(
+            type_code,
+            ?from,
+            "a peer sent a critical frame type this build does not implement — the cell is running mixed \
+             versions and this peer is ahead"
+        ),
+
+        // The other half of "this node cannot take part in fixing the epoch", and the only one an operator
+        // can fix alone. `warn` is the top of this file's scale (it uses no `error!` anywhere) and is where
+        // `CoherenceCollapse` sits for the same reason: nothing recovers it without a human.
+        //
+        // It repeats every epoch on purpose. The mismatch is a **level**, not an event — it was true when
+        // the files were written and stays true until one is replaced — and re-emitting is how a level stays
+        // visible on an event channel. An operator who joins mid-run must not have to have been watching.
+        Escalation::BeaconShareMismatch => warn!(
+            "this node's beacon share does not verify against its group commitment, so it is contributing \
+             NOTHING to the cell's epoch clock — the two files are from different dealings; re-provision \
+             the share from the DKG that produced this commitment"
+        ),
+    }
+}
+
 /// Log a notification, judging the epoch floor against `configured` when the caller knows it.
 ///
 /// The comparison is the whole point of the floor. A cell measures the shortest epoch period it can absorb;
@@ -3844,12 +3884,7 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
         Notification::Rerouted { around, via } => info!(?around, ?via, "rerouted (self-heal)"),
         Notification::Repaired(p) => info!(node = ?p, "shard repaired"),
         Notification::Quarantined(p) => info!(node = ?p, "member quarantined"),
-        Notification::Escalated(Escalation::Faults(mask)) => {
-            info!(nodes = format!("{mask:#09b}"), "escalated unrecoverable nodes to the parent cell");
-        }
-        Notification::Escalated(Escalation::CoherenceCollapse) => {
-            warn!("behavioural coherence collapsed (Phi <= 1) — the cell needs re-provisioning, not a reroute");
-        }
+        Notification::Escalated(esc) => log_escalation(esc),
         Notification::Decoupled => info!("cascade pre-empted (decoupled)"),
 
         // --- Everything below replaced one `other => info!(event = ?other, "engine event")` arm. ---
@@ -3864,15 +3899,6 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
         // handled. Being exhaustive makes "at what level, and with which fields?" a question the compiler
         // asks when a variant is added. Several arms below are deliberately quiet — the point is not to
         // print more, it is that staying quiet is now a decision on the record.
-
-        // Version skew, and the one escalation that names WHO sent WHAT — the actionable content of a
-        // rollout. It read as "engine event" before, which is the least useful possible rendering of it.
-        Notification::Escalated(Escalation::UnsupportedCritical { type_code, from }) => warn!(
-            type_code,
-            ?from,
-            "a peer sent a critical frame type this build does not implement — the cell is running mixed \
-             versions and this peer is ahead"
-        ),
 
         // Permanent loss. `warn`, not `info`: the shard is gone and no repair will bring it back.
         Notification::DataLost { key, epoch } => warn!(

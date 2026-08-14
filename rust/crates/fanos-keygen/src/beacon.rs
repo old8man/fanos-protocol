@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_field::Field;
 use fanos_geometry::{Plane, Point, Triple};
-use fanos_ports::{Command, Effect, Engine, Epoch, Input, Instant, Notification};
+use fanos_ports::{Command, Effect, Engine, Epoch, Escalation, Input, Instant, Notification};
 use fanos_pqcrypto::sig::HYBRID_SIG_LEN;
 use fanos_pqcrypto::{HybridSigSecret, HybridSignature};
 use fanos_primitives::hash_labeled;
@@ -147,10 +147,36 @@ pub struct BeaconRejects {
     /// This node reached threshold, assembled a round from its own buffered partials, and the **combined
     /// round failed to verify**.
     ///
-    /// The worst of the six, because the cell produces no seed and the clock stops. It means at least one
-    /// buffered partial was bad *and passed* `verify_partial`, or the threshold combination is wrong for this
-    /// commitment. Expected zero; nonzero is a cell that is stalling for a reason nothing else reports.
+    /// The worst of the six, because the cell produces no seed and the clock stops. Expected zero.
+    ///
+    /// **This doc used to enumerate two causes and miss the reachable one.** It said "at least one buffered
+    /// partial was bad *and passed* `verify_partial`, or the threshold combination is wrong for this
+    /// commitment" — both of which describe a bug in code that is exercised every epoch. The third cause was
+    /// the live one: `advance` buffered **this node's own partial**, from `partial_eval`, which is the one
+    /// partial in the bucket that never went through `verify_partial` at all. A node holding a share that does
+    /// not match its commitment therefore poisoned its own bucket permanently — `BeaconRound::assemble` takes
+    /// the first `threshold` distinct indices in insertion order, and its own is inserted first, so every
+    /// assembly failed while its peers' partials were all valid (measured: 4 failures in a single epoch on a
+    /// 7-node cell). That cause is now closed at the source — `advance` verifies its own partial before it
+    /// buffers or floods it, and reports [`Escalation::BeaconShareMismatch`] instead — which leaves this
+    /// counter guarding only the two cases above, both of which mean **this build is wrong**, not that the
+    /// cell is under attack.
     pub assembly_unverified: u64,
+
+    // --- Provisioning, not attack -------------------------------------------------------------------
+    /// This node's own **share does not match the group commitment**, so the partial it computed failed its
+    /// own DLEQ and was neither buffered nor flooded.
+    ///
+    /// Counted separately from [`partial_unverified`](Self::partial_unverified) although the algebraic test is
+    /// identical, because the two answer different questions and send an operator to different places: that one
+    /// is about a partial that **arrived**, this one about a partial this node **produced**. A cell where one
+    /// node reads `share_mismatched` and every other node reads `partial_unverified` is not under attack — it
+    /// is one stale share file, and without this counter the only visible evidence was `n − 1` forgery reports
+    /// naming an honest peer.
+    ///
+    /// Rises once per epoch for as long as the file is wrong, because the fault is permanent and the check is
+    /// at the point of use; the *rate* is the epoch clock and carries no information beyond "still wrong".
+    pub share_mismatched: u64,
 }
 
 /// A node running the distributed randomness beacon over its cell.
@@ -413,6 +439,32 @@ impl<F: Field> BeaconNode<F> {
             Some(share) => partial_eval(share, target),
             None => return Vec::new(),
         };
+        // **Verify your own partial before you put your name on it.** Every partial that reaches the buffer
+        // from a peer has passed `verify_partial` in `on_partial`; this one is the sole exception, and it was
+        // the one nothing checked. A share that does not match this node's commitment (a stale or swapped
+        // file) then costs the cell twice over: the flood makes every peer count an honest node as a forger,
+        // and the buffered copy is picked first by `assemble`, so this node's every assembly fails for ever.
+        //
+        // **Why at the point of use and not once at construction.** The relation is epoch-independent — a
+        // mismatched share fails at every epoch — so hoisting the check to `new` would be cheaper and would
+        // answer the same question. It is deliberately here instead, because the share is installed at three
+        // places (`new`, `install` for a reshare, `rebootstrap`) and a check on the value at the moment it is
+        // *used* covers all three, and any fourth, without anyone remembering to add it. The price is one
+        // extra DLEQ verification per epoch against the `threshold` this node already runs on arriving
+        // partials — under one part in `threshold`, on a clock that ticks in minutes.
+        //
+        // **And the argument has a second half this comment first left out.** "The point of use" is not one
+        // place: the share is used twice — here, through `partial_eval`, and in `deal_reshare`, through
+        // `reshare`. Closing only this one left the reshare path flooding a contribution no peer can bind,
+        // which is why `deal_reshare` now carries the matching check. Covering every *install* site is not the
+        // same claim as covering every *use*, and writing the first while meaning the second is how a fix
+        // reads complete while being half of one.
+        if !verify_partial(&partial, target, &self.commitment) {
+            self.rejects.share_mismatched = self.rejects.share_mismatched.saturating_add(1);
+            return vec![Effect::Notify(Notification::Escalated(
+                Escalation::BeaconShareMismatch,
+            ))];
+        }
         let mut effects = self.broadcast(&partial_frame(target, &partial));
         self.buffer(target, partial);
         effects.extend(self.try_assemble(target));
@@ -654,6 +706,29 @@ impl<F: Field> BeaconNode<F> {
         let Some(dealing) = reshare(&share, new_threshold, &new_indices, &mut rng) else {
             return Vec::new();
         };
+        // **The check `on_reshare_commit` runs on a peer's contribution, run on our own.** This is the second
+        // member of the class `advance` opened, found by walking the class after the first was closed — and
+        // finding it corrected the first fix's own reasoning, which claimed a check at the point of use covers
+        // every install site. It covers every *install* site and only one of the two *uses*: `partial_eval`
+        // here, `reshare` there.
+        //
+        // A share that does not match the group commitment produces a dealing binding to nothing: every peer
+        // refuses it at `verify_reshare_commit`, and recording it here would leave this generation's
+        // `pending_reshare` holding a commitment that can never complete — the same poisoning an unverified
+        // partial did to the beacon's bucket.
+        //
+        // `dealt` is deliberately still false when this fires, and the reason is exact rather than hopeful.
+        // `deal_reshare` has one caller, so refusing does not by itself schedule a retry — but the trigger is
+        // re-flooded by every peer that accepts it, and `on_reshare_trigger`'s guard is `generation <=
+        // self.reshare_gen`, the generation this node has ADOPTED. A generation still in progress is therefore
+        // not stale, so a re-flood reaches here again. Leaving `dealt` false is what lets that second arrival
+        // deal for real once the share is corrected; marking it would close the door for the whole generation.
+        if !verify_reshare_commit(old_index, dealing.commitment(), &self.commitment) {
+            self.rejects.share_mismatched = self.rejects.share_mismatched.saturating_add(1);
+            return vec![Effect::Notify(Notification::Escalated(
+                Escalation::BeaconShareMismatch,
+            ))];
+        }
         if let Some(round) = self.pending_reshare.get_mut(&generation) {
             round.dealt = true;
         }
@@ -1415,9 +1490,15 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_partial_is_not_adopted() {
+    fn a_forged_partial_is_refused_at_the_arrival_gate_and_its_honest_twin_is_adopted() {
         // With t = 1 a single valid partial would form the beacon; a forged one (failing its DLEQ) must
         // not — so a Byzantine anchor cannot inject a bogus contribution.
+        //
+        // **This test used to assert only that the effects were empty, and that was not enough.** Removing
+        // the DLEQ gate in `on_partial` left it green, because `try_assemble` verifies the assembled round
+        // as well: two gates in series, and emptiness cannot say which refused. It now names the gate by its
+        // counter, and pairs the forgery with its uncorrupted twin — without the twin, "no effects" is also
+        // what a scenario that could never have adopted anything looks like.
         let (shares, commitment) = deal(
             &[0xF0; 32],
             1,
@@ -1425,28 +1506,49 @@ mod tests {
             &mut DeterministicRng::new(b"beacon-forge"),
         )
         .unwrap();
-        let mut node = BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment, 1, BeaconSeed::GENESIS);
+        let mut node =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment, 1, BeaconSeed::GENESIS);
 
         // A valid partial from anchor 2 (index 3), with a flipped response byte.
         let honest = partial_eval(&shares[2], Epoch::new(1));
         let mut bytes = honest.to_bytes();
         bytes[65] ^= 0x01;
-        // A non-canonical corruption is rejected at decode (also a rejection); a canonical one fails DLEQ.
-        if let Some(forged) = BeaconPartial::from_bytes(&bytes) {
-            let frame = partial_frame(Epoch::new(1), &forged);
-            let effects = node.step(
-                Instant(1),
-                Input::Message {
-                    from: [9, 9, 9],
-                    frame,
-                },
-            );
-            assert!(
-                effects.is_empty(),
-                "a forged partial (t=1) yields no beacon"
-            );
-        }
+        // A non-canonical corruption would be refused at *decode* — also a rejection, but a different one, and
+        // it would skip everything below. Requiring `Some` keeps the test on the DLEQ path it is named for.
+        let forged = BeaconPartial::from_bytes(&bytes)
+            .expect("the flipped response byte must stay canonical, or this test measures the decoder instead");
+
+        let effects = node.step(
+            Instant(1),
+            Input::Message {
+                from: [9, 9, 9],
+                frame: partial_frame(Epoch::new(1), &forged),
+            },
+        );
+        assert!(effects.is_empty(), "a forged partial (t=1) yields no beacon");
+        assert_eq!(
+            node.rejects().partial_unverified,
+            1,
+            "and it is refused at the ARRIVAL gate — its DLEQ fails against the group commitment"
+        );
+        assert_eq!(
+            node.rejects().assembly_unverified,
+            0,
+            "so it never entered the buffer, and the assembly gate behind it never had to see it"
+        );
         assert_eq!(node.epoch(), Epoch::ZERO, "the node stays at genesis");
+
+        // The twin: same node, same anchor, same epoch, one byte less corruption. It MUST adopt — otherwise
+        // the emptiness above is emptiness for a reason that has nothing to do with the forgery.
+        let effects = node.step(
+            Instant(2),
+            Input::Message {
+                from: [9, 9, 9],
+                frame: partial_frame(Epoch::new(1), &honest),
+            },
+        );
+        assert!(!effects.is_empty(), "the uncorrupted partial forms the round at t = 1");
+        assert_eq!(node.epoch(), Epoch::new(1), "and the node adopts the epoch it refused a moment ago");
     }
 
     /// **The steady state counts, and a stale re-flood is not a forgery** (#161).
@@ -1830,4 +1932,210 @@ mod tests {
              that can assemble next"
         );
     }
+
+    /// Step `AdvanceEpoch` on every node, keeping the partial bus **and** counting the nodes that refused to
+    /// contribute. Separate from [`kickoff`] because that one keeps only `Send`s, and the whole question here
+    /// is what a node does *instead of* sending.
+    fn kickoff_counting_refusals(nodes: &mut [BeaconNode<F2>]) -> (Vec<(usize, Vec<u8>)>, Vec<usize>) {
+        let mut bus = Vec::new();
+        let mut refused = Vec::new();
+        for (k, node) in nodes.iter_mut().enumerate() {
+            for e in node.step(Instant(0), Input::Command(Command::AdvanceEpoch)) {
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(j) = node_at(to) {
+                            bus.push((j, frame));
+                        }
+                    }
+                    Effect::Notify(Notification::Escalated(Escalation::BeaconShareMismatch)) => {
+                        refused.push(k);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (bus, refused)
+    }
+
+    /// A cell of `N` anchors at threshold `t`, where node 0 holds a share from a **different** dealing — the
+    /// operator error this whole path defends against (a share file restored from a previous DKG, or copied
+    /// from the wrong node). Returns the nodes, the refusal list, and the adoptions.
+    #[allow(clippy::type_complexity)]
+    fn cell_with_one_stale_share(
+        t: usize,
+    ) -> (
+        Vec<BeaconNode<F2>>,
+        Vec<usize>,
+        Vec<(Triple, Epoch, [u8; 32])>,
+    ) {
+        let (good, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"beacon-match")).unwrap();
+        let (stale, _elsewhere) = deal(&[0xAD; 32], t, N, &mut DeterministicRng::new(b"beacon-stale")).unwrap();
+        let mut nodes: Vec<BeaconNode<F2>> = (0..N)
+            .map(|k| {
+                let share = if k == 0 { stale[0].clone() } else { good[k].clone() };
+                BeaconNode::new(Point::at(k), Some(share), commitment.clone(), t, BeaconSeed::GENESIS)
+            })
+            .collect();
+        let (bus, refused) = kickoff_counting_refusals(&mut nodes);
+        let ready = run(&mut nodes, bus);
+        (nodes, refused, ready)
+    }
+
+    #[test]
+    fn a_share_that_does_not_match_its_commitment_never_reaches_the_cell_as_a_forgery() {
+        // `advance` used to flood and buffer its own partial without ever verifying it — the one partial in
+        // the bucket that skipped `verify_partial`. The cost was paid on both sides: every peer counted an
+        // honest node as a forger (measured 1 each, on all six), and the node's own bucket was poisoned
+        // permanently, because `assemble` takes the first `threshold` distinct indices in insertion order and
+        // its own is inserted first (measured 4 failed assemblies in one epoch).
+        let (nodes, refused, ready) = cell_with_one_stale_share(4);
+
+        assert_eq!(refused, vec![0], "exactly the node holding the stale share refuses to contribute — and it says so");
+        assert_eq!(nodes[0].rejects().share_mismatched, 1, "the refusal is counted where an operator reads it");
+
+        for (k, n) in nodes.iter().enumerate().skip(1) {
+            assert_eq!(
+                n.rejects().partial_unverified,
+                0,
+                "node {k} must not see a forgery: the only badly-keyed node never put a partial on the wire"
+            );
+        }
+        assert_eq!(
+            nodes[0].rejects().assembly_unverified,
+            0,
+            "and the bad partial never entered its own bucket, so its assemblies stop failing"
+        );
+
+        // The setup has to have produced a working cell, or the two zeros above are zeros for the wrong
+        // reason: six good anchors at t = 4 are a quorum, and everyone — including the badly-keyed node,
+        // which stays a live *consumer* — must adopt epoch 1.
+        assert_eq!(ready.len(), N, "all {N} nodes adopt the epoch-1 seed");
+        for (k, n) in nodes.iter().enumerate() {
+            assert_eq!(n.epoch(), Epoch::new(1), "node {k} adopted");
+        }
+    }
+
+    #[test]
+    fn a_cell_at_exactly_its_threshold_halts_and_exactly_one_node_can_name_the_reason() {
+        // The same fault where it costs most. At `t = N` every anchor is load-bearing, so one unusable share
+        // stops the cell's clock outright — measured on the unfixed code as 0 of 7 adopting, every node stuck
+        // at epoch 0. The halt is honest (an anchor really is missing) and is NOT what this fixes; what it
+        // fixes is that the only instrument reading anything used to be `partial_unverified` on the six
+        // innocent nodes, sending an operator to hunt an attacker that does not exist.
+        let (nodes, refused, ready) = cell_with_one_stale_share(N);
+
+        assert!(ready.is_empty(), "no seed can be assembled: t = {N} needs every anchor and one cannot contribute");
+        for (k, n) in nodes.iter().enumerate() {
+            assert_eq!(n.epoch(), Epoch::ZERO, "node {k} is still at genesis, which is the honest outcome");
+        }
+
+        assert_eq!(refused, vec![0], "and exactly one node names the cause — the one whose file is wrong");
+        assert_eq!(nodes[0].rejects().share_mismatched, 1, "counted, once, on the node that can act on it");
+        let blamed: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.rejects().partial_unverified > 0)
+            .map(|(k, _)| k)
+            .collect();
+        assert!(blamed.is_empty(), "and NO node reports a forgery: a stalled cell must not read as an attack (saw {blamed:?})");
+    }
+
+    #[test]
+    fn the_assembly_gate_refuses_a_partial_that_reached_the_buffer_unverified() {
+        // The second of the beacon's two verification gates, pinned on its own. It is unreachable through
+        // `on_partial` (which verifies first) and, since `advance` verifies too, unreachable in production —
+        // which is exactly why it needed a test: removing it left the whole `fanos-keygen` suite green
+        // (24 passed, 0 failed), so nothing was holding it. It is reached here the only way it can be: a
+        // partial placed in the buffer without passing a gate, which is what a future second buffering path
+        // would look like.
+        let (shares, commitment) = deal(&[0xF0; 32], 1, N, &mut DeterministicRng::new(b"beacon-assembly")).unwrap();
+        let mut node =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), 1, BeaconSeed::GENESIS);
+
+        let honest = partial_eval(&shares[2], Epoch::new(1));
+        let mut bytes = honest.to_bytes();
+        bytes[65] ^= 0x01;
+        let forged = BeaconPartial::from_bytes(&bytes)
+            .expect("the flipped response byte must stay canonical, or this test verifies nothing");
+        assert!(
+            !verify_partial(&forged, Epoch::new(1), &commitment),
+            "and it must actually fail its DLEQ — otherwise the gate below has nothing to refuse"
+        );
+
+        node.buffer(Epoch::new(1), forged);
+        let effects = node.try_assemble(Epoch::new(1));
+        assert!(effects.is_empty(), "a round assembled from an unverified partial is not adopted");
+        assert_eq!(node.rejects().assembly_unverified, 1, "and the refusal is counted at the assembly gate, not the arrival gate");
+        assert_eq!(node.epoch(), Epoch::ZERO, "the node stays at genesis");
+    }
+
+
+    #[test]
+    fn a_reshare_contribution_this_node_cannot_bind_is_neither_recorded_nor_flooded() {
+        // The second member of the class `advance` opened, one door over. `on_reshare_commit` refuses a
+        // PEER's contribution that does not bind to the group commitment; `deal_reshare` built OUR OWN and
+        // recorded + flooded it without running the same check. A stale share file therefore made this node
+        // deal a contribution every peer refuses, while its own `pending_reshare` kept the useless commitment
+        // and the generation could never complete from here.
+        //
+        // The trigger itself is re-flooded either way (that is the monotone authenticated frame travelling
+        // on), so "no effects" is the wrong observable — the question is whether a COMMIT frame goes out.
+        use fanos_pqcrypto::{HybridSigSecret, SeedRng};
+        let t = 4usize;
+        let (good, commitment) = deal(&[0xBE; 32], t, N, &mut DeterministicRng::new(b"reshare-match")).unwrap();
+        let (stale, _elsewhere) = deal(&[0xAD; 32], t, N, &mut DeterministicRng::new(b"reshare-stale")).unwrap();
+
+        // Generated twice from the same seed rather than cloned: the key type need not be `Clone` for a test
+        // to hand the same authority to two nodes, and a deterministic seed says so without a helper.
+        let (authority_sk, authority_vk) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"reshare-authority"));
+        let trigger = || {
+            reshare_trigger_frame(&[(0, &authority_sk)], 1, 3, &[1, 2, 3, 4], &[1, 2, 3, 4])
+                .expect("a test roster fits the frame")
+        };
+        let commits = |effects: &[Effect]| -> usize {
+            effects
+                .iter()
+                .filter(|e| match e {
+                    Effect::Send { frame, .. } => {
+                        decode_frame(frame)
+                            .is_ok_and(|(f, _)| f.frame_type() == Some(FrameType::BeaconReshareCommit))
+                    }
+                    _ => false,
+                })
+                .count()
+        };
+
+        // **The control first.** With the matching share the same trigger makes this node deal — without it,
+        // the silence below would be silence for a reason that has nothing to do with the share.
+        let mut honest = BeaconNode::<F2>::new(
+            Point::at(0), Some(good[0].clone()), commitment.clone(), t, BeaconSeed::GENESIS,
+        )
+        .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk]).unwrap());
+        let effects = honest.step(Instant(0), Input::Message { from: [0, 0, 0], frame: trigger() });
+        assert!(commits(&effects) > 0, "a matching share deals its contribution and floods the commitment");
+        assert_eq!(honest.rejects().share_mismatched, 0, "and nothing about it is refused");
+
+        // The same trigger, at a node whose share came from a different dealing.
+        let (_, authority_vk2) = HybridSigSecret::generate(&mut SeedRng::from_seed(b"reshare-authority"));
+        let mut stale_node = BeaconNode::<F2>::new(
+            Point::at(0), Some(stale[0].clone()), commitment, t, BeaconSeed::GENESIS,
+        )
+        .with_recovery_authority(RecoveryAuthoritySet::new(vec![authority_vk2]).unwrap());
+        let effects = stale_node.step(Instant(0), Input::Message { from: [0, 0, 0], frame: trigger() });
+        assert_eq!(
+            commits(&effects),
+            0,
+            "a contribution that binds to nothing never reaches the wire — every peer would refuse it, and \
+             the node would have poisoned its own generation with it"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::Escalated(Escalation::BeaconShareMismatch))
+            )),
+            "and the node says why, with the same escalation the beacon path raises — one cause, one name"
+        );
+        assert_eq!(stale_node.rejects().share_mismatched, 1, "counted once, on the node that can act on it");
+    }
+
 }

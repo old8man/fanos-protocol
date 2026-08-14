@@ -372,7 +372,7 @@ pub const ROLE_COUNT: usize = 6;
 
 /// **Why** a cell escalated (see [`Notification::Escalated`]).
 ///
-/// The two causes are unrelated and want opposite responses, and they used to travel as one `u8` whose only
+/// The causes are unrelated and want different responses. The first two used to travel as one `u8` whose only
 /// distinguishing feature was that the coherence case passed a literal `0`. That is a convention a reader
 /// has to reverse-engineer — and the CLI, reading the field as a count, logged the mask as one.
 ///
@@ -417,6 +417,22 @@ pub enum Escalation {
         /// The peer that sent it — which release is ahead, and where.
         from: Triple,
     },
+    /// This node's **beacon share does not match the group commitment** it was provisioned with, so the
+    /// partial it would contribute fails its own DLEQ. A stale or swapped share file — provisioning, not
+    /// attack.
+    ///
+    /// It sits beside [`UnsupportedCritical`](Self::UnsupportedCritical) because it is the same failure
+    /// *shape* one layer down: a node that cannot participate in fixing the cell's epoch, while remaining
+    /// indistinguishable from a healthy anchor. Left unsaid it is worse than a silent node, because the
+    /// partials it floods are counted as **forgeries** by every peer that verifies them — so the whole cell's
+    /// instrument points at an attacker while the cause is one file, and on a cell running at exactly its
+    /// threshold the beacon stops outright (measured: 0 of 7 nodes adopted, every node stuck at epoch 0).
+    ///
+    /// **Carries nothing, and the absence is the point.** The relation `σᵢ = sᵢ·M(epoch)` verifies against
+    /// `Cᵢ` independently of `epoch`, so a share that mismatches mismatches at every epoch, for ever. There
+    /// is no "when" worth reporting — carrying one would invite a reader to treat a permanent provisioning
+    /// fault as a transient round failure and wait for it to clear.
+    BeaconShareMismatch,
 }
 
 /// An application-level notification (the engine → app direction).
