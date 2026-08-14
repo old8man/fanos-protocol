@@ -7,7 +7,7 @@
 //! same code runs under the simulator and a real transport.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use fanos_code::erasure;
@@ -605,6 +605,21 @@ pub struct OverlayNode<F: Field> {
     /// Dedup for the grey diagnosis: the grey node currently reported, so `Notification::Grey` fires once on
     /// onset (and again only if a *different* node goes grey), cleared when the cell reads grey-free.
     grey_reported: Option<Triple>,
+    /// Dedup for the version-skew escalation: the `(unknown critical type, sender)` pairs already reported,
+    /// so `Escalation::UnsupportedCritical` fires **once per pair** rather than once per frame (#341).
+    ///
+    /// **Bounded by two finite vocabularies, neither of them attacker-chosen.** The escalation fires only
+    /// when [`FrameType::group_is_critical`] holds — `code >> 4 == 0x1`, so codes `0x10`–`0x1F` and nothing
+    /// else — and this build names `0x11`–`0x1C`, leaving exactly **four** codes that can reach here. The
+    /// other axis is a plane point, so `4 × (q² + q + 1)`: 28 entries on Fano. A peer cycling type codes
+    /// buys itself no growth, which is why this needs no cap of its own (contrast `MAX_SKEW_TAG`, whose
+    /// station IS tagged by any code and therefore does need one).
+    ///
+    /// **Never cleared, and that is the design rather than an omission.** "Which release is this peer on"
+    /// is a LEVEL, and the level already has its own always-current channel one line down —
+    /// [`Station::FrameTypeUnknown`], which an operator polls. The event channel's job is to say it happened,
+    /// once. (`BeaconShareMismatch` re-emits every epoch for the opposite reason: it has no station.)
+    skew_reported: BTreeSet<(u64, Triple)>,
     /// The DHT-storage concern — this node's local store slice + read-repair bookkeeping (spec §L4). A
     /// value lives on its responsible content point and is cell-replicated for LRC availability, so any
     /// survivor answers a lookup (a lookup to a *down* primary reroutes through the self-healing table,
@@ -741,6 +756,7 @@ impl<F: Field> OverlayNode<F> {
             healer: Healer::new(observer, config.behavior_window(), config.control_confidence()),
             witnessed: BTreeMap::new(),
             loss_reports: BTreeMap::new(),
+            skew_reported: BTreeSet::new(),
             grey_reported: None,
             store: Store::default(),
             epoch: Epoch::ZERO,
@@ -977,7 +993,13 @@ impl<F: Field> OverlayNode<F> {
                 // group and only it — a node that quietly drops a beacon round or a reshare keeps serving on
                 // a retired epoch, indistinguishable from a healthy one. The rule was stated in three places
                 // and implemented in none: `WireError::UnknownCriticalFrame` had no site that could build it.
-                if FrameType::group_is_critical(frame.type_code) {
+                // ONCE PER (code, sender), not once per frame (#341). The station above counts every one;
+                // this channel ends at `warn!` with no dedup on the path, so emitting per frame let a peer
+                // mint an operator-visible line per frame it chose to send — measured at exactly 1:1 before
+                // this guard existed, by `a_peer_mints_one_escalation_per_unknown_critical_frame_it_sends`.
+                if FrameType::group_is_critical(frame.type_code)
+                    && self.skew_reported.insert((frame.type_code, from))
+                {
                     alloc::vec![Effect::Notify(Notification::Escalated(crate::ports::Escalation::UnsupportedCritical {
                         type_code: frame.type_code,
                         from,
@@ -2093,6 +2115,86 @@ mod tests {
         assert_eq!(skew.len(), 1, "the unclaimed type is counted once");
         assert_eq!(skew[0].line, Some(peer), "localized to the sender, so a LINE can be judged against `t`");
         assert_eq!(skew[0].tag, Some(0x7E), "carrying the code the peer used — the evidence of its release");
+    }
+
+    /// **A peer mints one version-skew report per (code, sender) pair — not one per frame** (#341).
+    ///
+    /// THE NUMBER THIS REPLACED WAS MEASURED, not argued. Before the dedup, ten frames from one peer produced
+    /// **ten** escalations, and each is one `warn!` at the top of `fanos.rs`'s scale (it uses no `error!`),
+    /// reached with no throttle anywhere on the path. So a peer set the rate of this node's loudest channel
+    /// by choosing how many frames to send: an amplifier the node ran against itself.
+    ///
+    /// **This is also the first test to reach the branch at all.** Its neighbour above uses `0x7E`, which
+    /// `group_is_critical` answers *no* to, so it exercises the station and walks past the escalation. The
+    /// predicate has tests in `fanos-wire`; the escalation it gates had none.
+    ///
+    /// Three properties, and the third is what stops the fix from being a silencer:
+    /// 1. repetition of the SAME (code, sender) reports once — the rate is no longer the peer's to set;
+    /// 2. a DIFFERENT code from the same peer reports again — the dedup key is the pair, because "which
+    ///    release" and "which line" are both the evidence `design-upgrade.md` §4 asks for, and collapsing to
+    ///    the sender alone would answer only half;
+    /// 3. the STATION still counts every frame. The aggregate is the level channel an operator polls, and it
+    ///    is bounded against this same flood already (`MAX_SKEW_TAG`); if the fix had quieted it too, the
+    ///    node would have gone from too loud to blind.
+    #[test]
+    fn a_peer_mints_one_escalation_per_pair_and_the_station_still_counts_every_frame() {
+        let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        let mut node =
+            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+        let peer = Point::<F2>::at(1).coords();
+
+        // `0x1F` and `0x1D`: the predicate's own test names `0x10`/`0x1F` as membership-group codes, and this
+        // build knows `0x11`–`0x1C` — so exactly four codes are unknown-and-critical, which is what bounds
+        // the dedup set to `4 × (q²+q+1)` without a cap of its own.
+        let mut escalations = |node: &mut OverlayNode<F2>, code: u64, frames: usize, t0: u64| {
+            (0..frames)
+                .map(|i| {
+                    let mut frame = Vec::new();
+                    fanos_wire::encode_frame(code, &[i as u8], &mut frame);
+                    node.step(Instant(t0 + i as u64), Input::Message { from: peer, frame })
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Effect::Notify(Notification::Escalated(
+                                    crate::ports::Escalation::UnsupportedCritical { .. }
+                                ))
+                            )
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+
+        const FRAMES: usize = 10;
+        assert_eq!(
+            escalations(&mut node, 0x1F, FRAMES, 0),
+            1,
+            "{FRAMES} frames of ONE unknown critical code from one peer must report once, not {FRAMES} times              — the pre-#341 code produced {FRAMES}, measured"
+        );
+        assert_eq!(
+            escalations(&mut node, 0x1D, FRAMES, 100),
+            1,
+            "a DIFFERENT unknown critical code is a different release claim and reports on its own"
+        );
+
+        let counted = node
+            .step(Instant(200), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane")
+            .iter()
+            .filter(|o| o.station == Station::FrameTypeUnknown)
+            .map(|o| o.count)
+            .sum::<u64>();
+        assert_eq!(
+            counted,
+            (FRAMES * 2) as u64,
+            "the aggregate must still see every frame: quieting the log is right, quieting the count would              trade too loud for blind"
+        );
     }
 
     /// **Every reason a peer refuses us is counted, and by reason** (#198).
