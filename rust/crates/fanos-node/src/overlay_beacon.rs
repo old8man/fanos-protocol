@@ -288,14 +288,19 @@ mod tests {
             Input::Message { from: Point::<F2>::at(2).coords(), frame: alloc_vec_garbage() },
         );
 
-        let stations = node
+        // `let .. else` rather than `expect`: this module allows `unwrap_used` and NOT `expect_used`, and
+        // `unwrap` would drop the sentence that says what the missing answer would mean. The panic keeps it
+        // and needs no new allowance.
+        let Some(stations) = node
             .step(Instant(2), Input::Command(Command::Observe))
             .into_iter()
             .find_map(|e| match e {
                 Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations),
                 _ => None,
             })
-            .expect("Observe answers with the data-path plane");
+        else {
+            panic!("Observe answers with the data-path plane, or the composite stopped forwarding it")
+        };
 
         let refusals: Vec<_> =
             stations.iter().filter(|o| o.station == Station::BeaconRefused && o.count > 0).collect();
