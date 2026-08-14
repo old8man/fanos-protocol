@@ -668,6 +668,9 @@ async fn await_every_meeting_member_binds(
     points: &[Triple],
     expect: [u8; 32],
 ) {
+    // Cloned before the loop, which then mutably borrows `host` whenever a member IS the host. The REFUTED
+    // path needs the sender's own stations to tell "never emitted" from "emitted and lost" (#182).
+    let sender = host.client();
     for &point in points {
         for member in line_member_coords::<F2>(point) {
             let mi = Point::<F2>::new(member).unwrap().index();
@@ -677,7 +680,7 @@ async fn await_every_meeting_member_binds(
                 nodes[mi].as_mut().unwrap_or_else(|| panic!("meeting-line member node {mi} is held"))
             };
             assert_eq!(
-                common::host_registered(node).await,
+                common::host_registered(node, &sender).await,
                 expect,
                 "meeting-line member {member:?} must bind this service's forward route"
             );
@@ -933,35 +936,11 @@ impl OffCombiner {
         probes.push(("host".to_owned(), self.host_node.client()));
         probes.push(("client".to_owned(), self.client_node.client()));
         for (name, client) in probes {
-            // **Subscribe BEFORE asking.** `NodeHandle::next_notification` reads a receiver created at spawn
-            // and never drained, so the answer to a question asked now sits behind every notification the node
-            // has emitted since. Reading forward through that backlog is a race the busy nodes win and the
-            // quiet ones lose — exactly the pattern the first two runs showed, a different single node
-            // answering each time. A fresh subscription has no backlog, so the next `DataPath` on it is the
-            // reply to this `Observe`.
-            let mut events = client.subscribe();
-            client.command(Command::Observe);
-            let wait = std::time::Duration::from_secs(4);
-            let mut seen = String::from("(no DataPath answer)");
-            loop {
-                match tokio::time::timeout(wait, events.recv()).await {
-                    Ok(Ok(Notification::DataPath { stations, gather })) => {
-                        let counts: Vec<String> = stations
-                            .iter()
-                            .filter(|o| o.count > 0)
-                            .map(|o| match o.line {
-                                Some(l) => format!("{:?}@{l:?}={}", o.station, o.count),
-                                None => format!("{:?}={}", o.station, o.count),
-                            })
-                            .collect();
-                        seen = format!("gather={gather:?} {}", counts.join(" "));
-                        break;
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) | Err(_) => break,
-                }
-            }
-            out.push_str(&format!("{name:>10}: {seen}\n"));
+            // The probe itself now lives in `common`, because the path that actually fails in a suite people
+            // run — `host_registered`'s REFUTED — needed the same instrument and could not reach a private
+            // method of this struct (#182). Its doc carries the "subscribe before asking" reason that was
+            // learned here.
+            out.push_str(&format!("{name:>10}: {}\n", common::data_path_report(&client).await));
         }
         out
     }
@@ -1385,7 +1364,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         } },
     );
     // Same observable as the manual case: the driver's registration has actually bound at the combiner.
-    common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held")).await;
+    common::host_registered(nodes[m_index].as_mut().expect("the combiner node is still held"), &host.client()).await;
 
     let client_index = (0..7).find(|&i| i != m_index && i != host_index).unwrap();
     let client_node = nodes[client_index].take().unwrap();

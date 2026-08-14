@@ -50,8 +50,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use fanos_quic::NodeHandle;
-use fanos_runtime::Notification;
+use fanos_quic::{Client, NodeHandle};
+use fanos_runtime::{Command, Notification};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::Instant;
@@ -424,6 +424,69 @@ async fn within_span<F: Future>(work: F) -> Option<F::Output> {
 #[allow(unused_imports)] // each test target uses a different subset of this module
 pub use fanos_testkit::{QUIET_ENOUGH, cpu_share, host_cpu_share, require_quiet_host, share_at};
 
+/// Ask one node for its data-path stations and render what it says — the answer to *"is this node being
+/// scheduled, and what did it see?"*.
+///
+/// **Lifted out of `anonymous_quic`'s private `OffCombiner::autopsy`, whose only caller is `#[ignore]`d**
+/// (#182). The instrument was already correct — including the subtlety below, learned the hard way — but it
+/// could not be reached from the path that actually fails in a suite people run. [`host_registered`] panics
+/// `REFUTED` on a real wedge and had nothing to say beyond "nothing arrived", so the diagnosis lived in the
+/// twin nobody runs. One implementation now, in the module both callers already share.
+///
+/// **Subscribe BEFORE asking.** [`NodeHandle::next_notification`] reads a receiver created at spawn and never
+/// drained, so the answer to a question asked now sits behind every notification the node has emitted since.
+/// Reading forward through that backlog is a race the busy nodes win and the quiet ones lose — the pattern
+/// that showed up as a different single node answering on each run. A fresh subscription has no backlog, so
+/// the next `DataPath` on it is the reply to *this* `Observe`.
+///
+/// **Bounded by [`within_span`], and the wait is REPORTED rather than thresholded.** The version this replaces
+/// used a flat 4 s, which is a chosen number doing a discriminator's job: below it "busy" and "wedged" print
+/// the same, above it the diagnostic is slower than the failure it explains. Granted time already divides out
+/// contention, and printing the elapsed figure hands the reader a measurement — `answered in 0.03 s` and
+/// `no DataPath answer` are different sentences, and so is `answered in 31 s`.
+///
+/// Four readings, and the first three are what the REFUTED path could not tell apart:
+/// * `(the engine is gone …)` — `Command::Observe` was not even accepted. [`Client::command`] answers
+///   whether the input channel took it, so a node whose engine has ended is known **immediately** rather
+///   than after a whole span of silence. This reading was added by the falsification: the first version
+///   waited out the budget to say what one `bool` already knew.
+/// * `(no DataPath answer …)` — the command was delivered and nothing came back, so the node is not being
+///   scheduled. Wedged, not merely empty-handed.
+/// * `… (every station zero)` — it answers, and nothing has reached it. The frame never arrived.
+/// * `… Station=n …` — it answers and it *did* see traffic. Then the counts name which gate stopped it.
+pub async fn data_path_report(client: &Client) -> String {
+    let mut events = client.subscribe();
+    if !client.command(Command::Observe) {
+        return "(the engine is gone — `Observe` was refused by a closed input channel)".to_owned();
+    }
+    let started = Instant::now();
+    loop {
+        let Some(next) = within_span(events.recv()).await else {
+            return format!("(no DataPath answer in {:?} of granted time — this node is not scheduling)", started.elapsed());
+        };
+        match next {
+            Ok(Notification::DataPath { stations, gather }) => {
+                let counts: Vec<String> = stations
+                    .iter()
+                    .filter(|o| o.count > 0)
+                    .map(|o| match o.line {
+                        Some(l) => format!("{:?}@{l:?}={}", o.station, o.count),
+                        None => format!("{:?}={}", o.station, o.count),
+                    })
+                    .collect();
+                // An empty list is a READING — "nothing has reached this node" — and printing it as a bare
+                // `gather=..` with an empty tail read as truncated output instead. That confusion is this
+                // task's own defect class one layer down.
+                let counts =
+                    if counts.is_empty() { "(every station zero)".to_owned() } else { counts.join(" ") };
+                return format!("answered in {:?}: gather={gather:?} {counts}", started.elapsed());
+            }
+            Ok(_) => {}
+            Err(e) => return format!("(the notification stream ended after {:?}: {e})", started.elapsed()),
+        }
+    }
+}
+
 /// Wait until `node`'s rendezvous relay binds a §3b host registration, and return the tag it bound.
 ///
 /// The observable that replaced a 500 ms sleep captioned "let the registration reach and bind at the combiner". A
@@ -433,12 +496,25 @@ pub use fanos_testkit::{QUIET_ENOUGH, cpu_share, host_cpu_share, require_quiet_h
 /// combiner-forwarded ones, both were the only tests carrying a fixed sleep, and the three without one never failed.
 ///
 /// Bounded the same way as the other waits here: by whether notifications keep arriving, not by wall clock.
-pub async fn host_registered(node: &mut NodeHandle) -> [u8; 32] {
+///
+/// **`host` is the registration's sender, and it is a parameter because one side cannot answer the question**
+/// (#182). Silence at the member has three causes that this panic used to print identically: the frame never
+/// left the host, it left and was lost, or it arrived and was refused. The first is only visible from the
+/// host's own stations, so the REFUTED path interrogates BOTH ends through [`data_path_report`]. A
+/// [`Client`] rather than a `&NodeHandle` deliberately: it is `Clone`, so the sweep that walks the members
+/// can hold one while a member *is* the host and is already mutably borrowed.
+pub async fn host_registered(node: &mut NodeHandle, host: &Client) -> [u8; 32] {
     loop {
         let Some(note) = within_span(node.next_notification()).await else {
+            let member = data_path_report(&node.client()).await;
+            let sender = data_path_report(host).await;
             panic!(
                 "REFUTED — no notification of any kind in {FROZEN_SPAN:?} of granted time while waiting for a host \
-                 registration to bind"
+                 registration to bind.\n  this member: {member}\n  the host:    {sender}\n  Read them in this \
+                 order: a member that does not answer `Observe` is WEDGED and the host's counters are beside the \
+                 point; a member that answers with every station zero saw NOTHING, so the question moves to \
+                 whether the host emitted at all; a member with non-zero counts DID receive, and the station that \
+                 rose names the gate that refused it."
             )
         };
         match note {
