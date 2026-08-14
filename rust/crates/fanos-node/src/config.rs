@@ -1331,7 +1331,8 @@ pub struct NodeConfig {
     ///
     /// **This is the operator's whole overlap control, and there is deliberately no window constant beside
     /// it.** An epoch shape rotates on the beacon, so FANOS can derive how long two peers may disagree
-    /// ([`SHAPE_GRACE`](fanos_proteus::SHAPE_GRACE), a bound on flood spread). A community secret travels by
+    /// (`fanos_proteus::SHAPE_GRACE`, a bound on flood spread — named, not linked: this crate does not
+    /// depend on `fanos-proteus`, so rustdoc has nothing to resolve the path against). A community secret travels by
     /// whatever channel the operator uses — nothing in the protocol carries it, so no protocol quantity
     /// bounds adoption time and a number invented here would stand for a decision the code cannot see.
     ///

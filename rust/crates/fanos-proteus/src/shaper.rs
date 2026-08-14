@@ -497,7 +497,7 @@ impl ProteusShaper {
     /// is identity (the frame passed through unshaped). Size-shaping padding on the wire is transparent here:
     /// the codec's length field bounds the payload, so trailing pad is ignored.
     /// **Returns the arm as well as the bytes, and the caller must act on it** (#234). A frame that opened
-    /// under [`OpenedUnder::Genesis`] came from a peer that does not yet know the live epoch, so a reply
+    /// under [`OpenedEpoch::Genesis`] came from a peer that does not yet know the live epoch, so a reply
     /// shaped at the live epoch is one it cannot read — the handshake would connect and then go silent in
     /// one direction. `Current` and `Grace` are the same instruction to the caller (reply normally) and are
     /// kept distinct anyway, because "we are inside the grace window" is a different thing for an operator
@@ -529,7 +529,7 @@ impl ProteusShaper {
     /// `{epoch − 1, epoch, epoch + 1}` window.
     ///
     /// Below this threshold the genesis shape is `Current` or `Grace` and trying it again would be a wasted
-    /// `deobfuscate` — and, worse, would report [`OpenedUnder::Genesis`] for an ordinary peer, so a node at
+    /// `deobfuscate` — and, worse, would report [`OpenedEpoch::Genesis`] for an ordinary peer, so a node at
     /// epoch 1 would answer the whole cell in the genesis shape and pin itself there.
     fn beyond_grace(&self) -> bool {
         self.epoch.get() > SHAPE_GRACE
