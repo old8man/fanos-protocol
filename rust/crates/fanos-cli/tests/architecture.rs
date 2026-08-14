@@ -136,15 +136,21 @@ fn closure(deps: &BTreeMap<String, BTreeSet<String>>, roots: &BTreeSet<String>) 
     seen
 }
 
+/// The shipping-code slice, shared (#252). Seven copies of it existed; each cut at the FIRST
+/// `#[cfg(test)]` and so examined only the head of any file with a test module in the middle.
+use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, production_part};
+
 /// Every crate is reachable from something this project ships, except the ones [`UNLINKED`] names.
 ///
 /// Failing this test means one of two things, and the message says which to check: a new crate was added
 /// and nothing wires it up (write the wiring, or add it to the list with its reason), or an orphan was
 /// finally wired (delete its row — the list is the record of what remains unwired).
-/// The shipping-code slice, shared (#252). Seven copies of it existed; each cut at the FIRST
-/// `#[cfg(test)]` and so examined only the head of any file with a test module in the middle.
-use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, production_part};
-
+///
+/// **This doc used to belong to the `use` above it (#318).** The import sat between these lines and the
+/// test, and `///` binds to the next item, so both docs landed on the import and this guard had none. It
+/// stayed silent because #318's rule — every function in the binary carries a doc — does not reach a test
+/// file, `cargo doc` never renders test targets, and `[`UNLINKED`]` resolves from either scope. A test file
+/// is the class's second habitat, and nothing watches it.
 #[test]
 fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
     let (deps, binaries) = workspace();

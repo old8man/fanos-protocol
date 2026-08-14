@@ -264,12 +264,21 @@ pub mod source {
     ///
     /// **This used to cut the file at the first `#[cfg(test)]` and keep the head (#252).** That reading assumes a
     /// test module is the last thing in a file, which is a convention this tree does not actually hold: thirteen
-    /// files declare something at top level below one, and in four of them it is shipping code —
-    /// `fanos-field`'s `pub trait Field` and `pub type F2`, `fanos-node`'s `pub struct NodeResolver` and its
-    /// `pub struct Census`. Every guard here reads through this function, so all of them had been silently
-    /// examining a subset. Worse, the blindness was **placement-dependent**: a guard could be disarmed by moving
-    /// a test module above the code it guards, which is how #245's `open_uni` ratchet came to pass while
-    /// counting zero openers.
+    /// files declare something at top level below one, and in some of them it is shipping code.
+    ///
+    /// **Which ones, and how many, is stated once — in the corpus test that checks it**, not here:
+    /// `fanos-cli/tests/architecture.rs`'s `the_slice_reaches_the_shipping_code_that_sits_below_a_test_module`
+    /// names each file together with the declaration to look for in it, so restoring the cut-at-first form fails
+    /// with the NAME of what it would blind. A number in prose cannot do that, and this sentence proved the point
+    /// by being wrong: it said "four", counting DECLARATIONS while saying "of them" about FILES — `pub trait
+    /// Field` and `pub type F2` share one file (`fanos-field/src/lib.rs`, marker at 61, declarations at 101 and
+    /// 177), and `pub type F256` below them made even the declaration count wrong. The module doc above and the
+    /// corpus test both said three; only this copy disagreed, which is the whole argument for not keeping a
+    /// second copy.
+    ///
+    /// Every guard here reads through this function, so all of them had been silently examining a subset. Worse,
+    /// the blindness was **placement-dependent**: a guard could be disarmed by moving a test module above the
+    /// code it guards, which is how #245's `open_uni` ratchet came to pass while counting zero openers.
     ///
     /// So it now removes each attributed block by brace balance and keeps everything else. Braces inside string
     /// literals, char literals and comments are skipped, because a `"{"` in a test's assertion message would
