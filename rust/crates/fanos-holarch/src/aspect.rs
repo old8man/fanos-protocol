@@ -5,6 +5,25 @@ pub const N: usize = 7;
 /// The number of system-wide flows (the T-262 control/data/supply trichotomy).
 pub const FLOWS: usize = 3;
 
+/// **The alphabet must match the theory, and the theory is what says how many.**
+///
+/// Deliberately an assertion and *not* a derivation. Writing `N = variant_count::<Aspect>()` would read
+/// the same today and invert the authority: an eighth variant would silently redefine `κ_bootstrap`
+/// instead of failing. Two quantities that happen to be equal are still two quantities — the septicity is
+/// an input from the UHM corpus, the variant count is a fact about this file, and this is where they are
+/// required to agree.
+///
+/// It also makes `ALL` complete for free: `[Aspect; N]` cannot hold six entries, and `N` cannot drift
+/// from the enum, so the list and the alphabet are pinned to each other from both ends.
+const _: () = assert!(
+    N == core::mem::variant_count::<Aspect>(),
+    "the UHM septicity is seven; Aspect has a different number of variants"
+);
+const _: () = assert!(
+    FLOWS == core::mem::variant_count::<Flow>(),
+    "T-262 gives three flows; Flow has a different number of variants"
+);
+
 /// One of the seven aspects every holon is read through (`core/structure/dimension-*`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Aspect {

@@ -1,6 +1,6 @@
 //! The coherence matrix `Γ` — its flow-form constructor and the pure (unthresholded) measures.
 
-use crate::aspect::{Aspect, FLOWS, N};
+use crate::aspect::{Aspect, FLOWS, Flow, N};
 
 /// How much one aspect carries of each of the three flows — its column in the participation table.
 /// A [`Gamma`] is built from one `Budget` per aspect; the numbers are relative weights (only their
@@ -22,13 +22,18 @@ impl Budget {
         Self { control, data, supply }
     }
 
-    /// This budget's weight in flow / mode `m` (`0=control, 1=data, 2=supply`).
+    /// This budget's weight in one [`Flow`].
+    ///
+    /// Keyed by the type, not by an index. The previous signature took a `usize` and ended in
+    /// `_ => self.supply`, so a fourth flow would have read as supply with nothing to say otherwise — and
+    /// the `0=control, 1=data, 2=supply` mapping lived in this doc, a second copy of an order [`Flow`]
+    /// already defines. Now there is one copy, and it is the one the compiler checks.
     #[must_use]
-    fn mode(&self, m: usize) -> f64 {
-        match m {
-            0 => self.control,
-            1 => self.data,
-            _ => self.supply,
+    fn mode(&self, f: Flow) -> f64 {
+        match f {
+            Flow::Control => self.control,
+            Flow::Data => self.data,
+            Flow::Supply => self.supply,
         }
     }
 }
@@ -41,7 +46,7 @@ pub struct Gamma {
 
 impl Gamma {
     /// The **flow-form constructor** (`holarch_lab.make_gamma_modes`): build `Γ` from a participation
-    /// table, the flow weights `λ` (control, data, supply), and the background `ε`.
+    /// table, the flow weights `λ` in [`Flow::ALL`] order, and the background `ε`.
     ///
     /// Each flow `m` becomes a coherent mode `|ψ_m⟩` — its participation column, L2-normalised — and
     ///
@@ -55,12 +60,12 @@ impl Gamma {
     pub fn from_modes(budgets: &[Budget; N], lambdas: [f64; FLOWS], eps: f64) -> Self {
         let lam_sum: f64 = lambdas.iter().sum();
         let mut m = [[0.0f64; N]; N];
-        for (mode, &lam_raw) in lambdas.iter().enumerate() {
+        for (flow, &lam_raw) in Flow::ALL.iter().zip(lambdas.iter()) {
             let lam = lam_raw / lam_sum;
-            // ψ = participation column `mode`, L2-normalised.
+            // ψ = participation column for this flow, L2-normalised.
             let mut psi = [0.0f64; N];
             for (p, b) in psi.iter_mut().zip(budgets.iter()) {
-                *p = b.mode(mode);
+                *p = b.mode(*flow);
             }
             let norm = psi.iter().map(|x| x * x).sum::<f64>().sqrt();
             if norm > 0.0 {
