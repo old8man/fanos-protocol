@@ -208,7 +208,11 @@ a separate chain that must be secured and becomes a bottleneck.
   `RoleController`**; what remains is the thin driver that feeds it each beacon round inside `fanos-node`: a
   signed capability-descriptor advertisement (a wire type over the overlay store, like the mix directory) and
   per-role **load metering** in `fanos-telemetry` to derive the setpoint. The performance-slash reputation
-  feedback (a non-performing assignee's `weight` decays) is specified, not yet closed in code.
+  feedback (a non-performing assignee's `weight` decays) **is closed in code and has left this bullet**: the
+  role loop rebuilds `Reputation` from published diagnosis records each epoch and applies it to the members'
+  weights, so a non-performer's weight decays without any node trusting another's word for it. It is named
+  here rather than deleted because this list is what a reader consults for what is *outstanding*, and an item
+  that silently vanishes reads as forgotten rather than finished. The two items above it are the residual.
 - **L0 frontier** — a live *multi-cell* driver that runs cross-cell relay and parent attestation end-to-end
   across real cells (the primitives are built and unit-proven; the multi-cell orchestration is the residual),
   and folding an executed `state_root` history into the block header so a light client can follow finality

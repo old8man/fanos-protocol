@@ -8,11 +8,20 @@
 //! * §13.5 — "without the correct `community_secret` the endpoint returns nothing decodable — the
 //!   handshake is keyed, so **a prober sees an unresponsive UDP port** (obfs4-class)."
 //!
-//! What ships instead: `spawn_shaped` builds an ordinary `quinn` endpoint from `node_configs()` and
-//! applies the polymorph codec at `shape_out`/`shape_in`, which are called only on QUIC **streams** —
-//! strictly after the handshake. So the shaped envelope starts one layer too late: every FANOS
-//! connection opens with a plaintext QUIC Initial carrying `alpn = fanos/1` and `sni = fanos.node`,
-//! identical under every morph, and the endpoint answers strangers.
+//! **What this file measures now, and what it was written to measure.** It was written to demonstrate the
+//! gap: `spawn_shaped` built an ordinary `quinn` endpoint and applied the polymorph codec at
+//! `shape_out`/`shape_in`, which are called only on QUIC **streams** — strictly after the handshake. The
+//! shaped envelope therefore started one layer too late: every FANOS connection opened with a plaintext
+//! QUIC Initial carrying `alpn = fanos/1` and `sni = fanos.node`, identical under every morph, and the
+//! endpoint answered strangers (#232).
+//!
+//! `44d2c84` closed that by sealing the datagram itself — `fanos_proteus::datagram` under
+//! `ProteusSocket`, an `AsyncUdpSocket` decorator the driver installs whenever a shaper exists. **The past
+//! tense above is the correction**: this header used to state the defect as shipping, twelve lines above a
+//! test that now asserts the opposite, so a reader who trusted it would re-file a closed CRITICAL.
+//!
+//! The history stays because it is what explains the shape of the test: three arms exist to tell a sealed
+//! build from an unsealed one, and that design only reads as deliberate if you know the unsealed one shipped.
 //!
 //! This file measures the second claim, because it needs no crypto to falsify. An RFC 9000 server must
 //! answer a long-header packet bearing an unsupported version with a **Version Negotiation** packet

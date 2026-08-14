@@ -83,17 +83,31 @@ use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 ///   ⌈Σ (keys held + frames originated) / 1⌉   nodes
 /// ```
 ///
-/// which reads an event count as a node count. A cell holding a hundred keys asks for a hundred storage
-/// nodes. On any active cell the demand therefore exceeds the eligible supply permanently, `assign_report`
-/// fills `min(demand, eligible)` so **every offering node receives every role it offered**, and the
-/// controller can no longer express anything: the assignment it produces is the one a node would reach with
-/// no controller at all. Measured on a fleet: `transitions = 0` across a whole observation window, which is
-/// what made role-assignment churn undetectable (`c77120a`).
+/// which reads an event count as a node count. Where it still applies, demand exceeds the eligible supply
+/// permanently, `assign_report` fills `min(demand, eligible)` so **every offering node receives every role it
+/// offered**, and the controller can no longer express anything about that role: the assignment it produces
+/// is the one a node would reach with no controller at all. Measured on a fleet when it applied to all six:
+/// `transitions = 0` across a whole observation window, which is what made role-assignment churn
+/// undetectable (`c77120a`).
 ///
-/// The permanent deficit that saturation implies is harmless **only because nothing reads it** —
-/// `AssignReport::deficit` has no production caller, so the escalation to the parent cell that
-/// `docs/design-roles.md` describes is not wired. If it were, it would be escalating a fabricated shortfall
-/// on every epoch.
+/// **"Where it still applies" is now two roles, not six, and this paragraph used to illustrate it with the
+/// first one to leave.** Storage — "a cell holding a hundred keys asks for a hundred storage nodes" — was the
+/// first capacity derived from a real admission bound, and Rendezvous, Service and Exit followed. Relay and
+/// Ingress are what remain, for reasons that are not the same: Relay's sensor is a rate measured against a
+/// level, and Ingress has an admission bound with no sensor to divide into it. An example drawn from a role
+/// that has since been fixed is worse than no example, because it reads as evidence that nothing has moved.
+///
+/// The permanent deficit that saturation implies **is read now, and only half of what reads it exists**.
+/// `note_deficit` is called from the epoch step and records `Station::RoleUnderProvisioned`, so a shortfall
+/// reaches this node's operator. What `docs/design-roles.md` describes and the tree still lacks is the
+/// **parent-cell escalation**: `Escalation` has no `Deficit` variant, so a cell that cannot staff a role
+/// tells its operator and no other cell.
+///
+/// This paragraph used to say the deficit had no production caller at all, and used that as the reason the
+/// escalation was safe to leave unwired. Both halves of that have moved: four of the six roles now have a
+/// derived capacity, so their deficits are real rather than artefacts of a placeholder denominator — see
+/// `the_last_two_capacities_and_the_parent_escalation_are_still_open`, which fires when the last two get
+/// theirs.
 ///
 /// Correcting it is a **measurement**, not a new constant: capacity must be in the load's own units — how
 /// many keys, or frames, one node absorbs per observation window — which is a throughput figure
@@ -1645,17 +1659,22 @@ mod tests {
     ///
     /// `ROLE_CAPACITY_PER_NODE` is `1`, which reads an *event* count as a *node* count. **Storage is out of
     /// its scope as of 2026-08-04** — its capacity is now derived from `MAX_STORE_ENTRIES`, the bound the
-    /// node's own admission rule enforces on the very number it reports — but the other five roles still
-    /// carry it, and for four of them there is not even a sensor to divide. Demand therefore exceeds eligible supply on any active
-    /// cell, `assign_report` fills `min(demand, eligible)`, every offering node gets every role it offered,
-    /// and the controller expresses nothing — measured on a fleet as `transitions = 0` across a whole window.
+    /// node's own admission rule enforces on the very number it reports — and **Rendezvous, Service and Exit
+    /// followed it**, each from its own admission bound. Two roles still carry the placeholder, Relay and
+    /// Ingress, for different reasons: Relay's sensor is a rate against a level, and Ingress has a bound with
+    /// no sensor to divide. For those two, demand exceeds eligible supply on any active cell, `assign_report`
+    /// fills `min(demand, eligible)`, every offering node gets the role it offered, and the controller
+    /// expresses nothing about them.
     ///
-    /// That saturation is **harmless only by accident**: `AssignReport::deficit` has no production caller, so
-    /// the escalation to the parent cell that `docs/design-roles.md` describes is not wired. Wire it today and
-    /// it escalates a fabricated shortfall every epoch.
+    /// That residual saturation is **no longer harmless by accident, because the deficit is read**:
+    /// `note_deficit` records `Station::RoleUnderProvisioned` from the epoch step, so for Relay and Ingress it
+    /// reports a shortfall that is still an artefact of the denominator. What remains absent is the
+    /// **parent-cell escalation** — `Escalation` has no `Deficit` variant — which is a hierarchy-transport
+    /// gap, not an oversight.
     ///
-    /// So the two must move together, and until now only a doc comment said so. This fails the moment capacity
-    /// stops being the placeholder — which is exactly when someone needs to be told about the other half.
+    /// So the two must move together, and this test is one half of saying so; the other is
+    /// `the_last_two_capacities_and_the_parent_escalation_are_still_open`, which fires when Relay and Ingress
+    /// stop being placeholders — exactly when someone needs to be told about the escalation.
     #[test]
     fn storage_capacity_is_the_bound_the_node_actually_enforces() {
         // The one role whose capacity is derived rather than placed. Its load is `store.entries.len()`, so

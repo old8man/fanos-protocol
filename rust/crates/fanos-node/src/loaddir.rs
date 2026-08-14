@@ -10,9 +10,13 @@
 //!
 //! Trust: the load report is a self-observation, and "never another's" is what the **coordinate binding**
 //! buys. A node can inflate its *own* reported load — over-provisioning a role it serves, bounded, one node's
-//! contribution to a sum, and the performance-reputation loop is *specified* to price sustained
-//! mis-reporting — but is not yet wired (`Reputation::observe_reachable` has no production caller), so today
-//! the coordinate binding is the whole defence and this line must not be read as a second one.
+//! contribution to a sum. The performance-reputation loop **is** wired now (the role loop rebuilds
+//! `Reputation` from published diagnosis each epoch), but it does not help here and must not be counted as
+//! if it did: what it observes is a member's **reachability and performance** as the cell's coherence
+//! diagnosis sees them, not whether a load report told the truth. Nothing prices sustained mis-reporting of
+//! one's own load. So the coordinate binding is still the whole defence on this path, and this line must not
+//! be read as a second one — the same conclusion as before, now resting on what the loop measures rather
+//! than on it being absent.
 //!
 //! **It could inflate anyone's until this was bound, and the doc said otherwise.** The store is
 //! content-addressed: a slot key embeds a coordinate, but nothing made the publisher own it, so one member

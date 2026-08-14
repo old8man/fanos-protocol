@@ -52,12 +52,49 @@
 //! So the class has two members and both are now limit-checked. The shed was safe by a derivation someone
 //! did on purpose (#91, #92); the lift was not, until its limit was measured.
 //!
-//! # What this module is not
+//! # What this module is not, and what actually blocks the actuator
 //!
-//! It **decides**; it does not act. There is no protocol message here and no caller in a running node. That
-//! is deliberate and is the honest state: the actuator has to carry a pair and a weight across the cell, and
-//! that is a wire change with its own agreement problem. What was missing before was not the wire — it was
-//! *the answer*, and an answer that is a cell-wide broadcast is measurably the wrong one.
+//! It **decides**; it does not act. There is no protocol message here and no caller in a running node. What
+//! was missing before was not the wire — it was *the answer*, and an answer that is a cell-wide broadcast is
+//! measurably the wrong one.
+//!
+//! The blocker on the actuator is **not the wire either**, and this doc first said it was — "a wire change
+//! with its own agreement problem" — which points the next implementer at the wrong repair. Carrying
+//! `(recipient, donor, lambda)` in a signed frame settles nothing, because the open question is not how the
+//! pair travels but *who computes it*. [`prescribe`] reads a [`CoherenceMatrix`], and in a running node that
+//! matrix is the healer's `attested_pairwise_rates`, assembled from three inputs that are every one of them
+//! **local**: what has arrived in this node's `attested` map, whether it is fresh by this node's clock, and
+//! the `mediator_attestation` fallback, which is keyed on this node's *own* liveness sensing. That last
+//! argument, `degraded`, differs between honest members by construction — each senses its own neighbours. So
+//! two members routinely hold different matrices, and a locally-computed prescription is a cell-wide
+//! decision taken on a local input: the shape #130 measured disagreeing in 100% of epochs, and the one #97
+//! shipped as a first-to-arrive subset.
+//!
+//! **The platform has already written this rule down, twice, from two directions.** `fanos-core`'s
+//! `cell_setpoint` carries it after #130 — "a decision that must agree cell-wide has to be computed from
+//! closed published epochs, never from this node's live read" — and records that `Reputation::from_published`
+//! reached the same conclusion independently. Naming the wire as this module's blocker put the lifter
+//! *outside* a rule the rest of the platform already obeys, which is the more useful way to see what is
+//! missing: not a message type, but the closed epoch the prescription would have to be computed against.
+//!
+//! `CoherenceMatrix`'s axis search already breaks ties by lowest index so the answer survives a seat
+//! rotation. That determinism was bought deliberately and, until the input is shared, it buys nothing: a
+//! deterministic function of a per-node input is still per-node.
+//!
+//! The three reads do not need the *same* amount of agreement, which is where an implementer should start
+//! rather than at a frame layout:
+//!
+//! - the **donor** is `specialised_donor` (private, so named rather than linked), and it reads only the
+//!   recipient's own row — the row a node has the most first-hand evidence for;
+//! - the **recipient** is [`CoherenceMatrix::starved_axis`], the diagonal, which is every member's activity
+//!   share and so the least local of the three;
+//! - the **dose** re-evaluates the whole matrix once per halving, so it is exactly as agreed as the matrix.
+//!
+//! An actuator therefore needs one of: an attestation set committed and closed per epoch, so that every
+//! member prescribes from the same matrix; or a designated prescriber per epoch whose [`Lift`] the others
+//! *check* against their own reading before accepting — which in turn requires a derived bound on how far
+//! two honest local matrices may differ, and that bound has to be measured before it can be written down.
+//! Neither is a wire-format question.
 
 use alloc::vec;
 
