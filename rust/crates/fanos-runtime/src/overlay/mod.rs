@@ -488,6 +488,33 @@ impl Config {
         // The base cell's point count — the `n` the band and the estimator are both stated for.
         fanos_diakrisis::window::resolving_window(7, self.control_confidence()).max(2)
     }
+
+    /// The shortest epoch under which a directory slot's **grace window still buys what it exists for**.
+    ///
+    /// A `(coordinate, epoch)`-keyed slot outlives its own epoch by one, so a reader that has not yet seen
+    /// the new beacon still finds what it is looking for. Reaching that grace slot costs a *failed* read of
+    /// the current one first: [`read_timeout`](Self::read_timeout) to give up, concluded on the next
+    /// [`heartbeat`](Self::heartbeat) because the sweep that concludes absence is paced by the beat. If that
+    /// whole cost does not fit inside the epoch the reader started in, the grace slot is reclaimed while the
+    /// miss is still timing out and the retention buys **nothing**: the lookup fails, the rotation keeps its
+    /// cost and loses its defence, and nothing anywhere says why.
+    ///
+    /// So the requirement is `read_timeout + heartbeat < epoch_period`, and this is its left side. It is
+    /// **necessary and not sufficient** — the publisher's own write costs the descriptor proof-of-work plus a
+    /// store round trip, and an operator sets that (`--descriptor-pow`), so no constant can bound it here.
+    ///
+    /// Here rather than at the comparison because both quantities it reads are fields of *this* struct, and a
+    /// derivation kept away from its inputs is one that drifts from them. The comparison itself belongs where
+    /// an operator names the number, which is `fanos_node`'s config parser (#348).
+    ///
+    /// **Not** `fanos_diakrisis::regeneration::min_epoch_period`, which is this knob's *other* floor: that one
+    /// is measured from the cell's live stability, so it can only ever be reported after the fact (the
+    /// `Notification::EpochFloor` an operator sees), where this one is static and can be refused before the
+    /// node starts. Two floors, two answers, and only one of them could ever have been a refusal.
+    #[must_use]
+    pub fn minimum_epoch_period(&self) -> Duration {
+        Duration(self.read_timeout.0.saturating_add(self.heartbeat.0))
+    }
 }
 
 impl Default for Config {

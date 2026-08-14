@@ -806,6 +806,35 @@ fn parse_duration_secs(value: &str, key: &str) -> Result<Duration, NodeError> {
     Ok(Duration::from_secs(n))
 }
 
+/// An `epoch_period`, refused when it is too short for a directory slot's grace window to work at all.
+///
+/// **The knob has two independent floors and only one of them was ever compared** (#348). The other —
+/// `fanos_diakrisis::regeneration::min_epoch_period` — is measured from the cell's live stability and reaches
+/// an operator as a warning (`Notification::EpochFloor`, rendered in `bin/fanos.rs`), which is all a *measured*
+/// floor can do. This one is arithmetic on two shipped constants, so it can be answered before the node starts,
+/// and refusing is then strictly better than running a deployment whose rotation has quietly lost its defence.
+///
+/// The bound is imported from [`fanos_runtime::Config::minimum_epoch_period`], never restated: it is the sum
+/// of the fields it is about, and this file must not be able to drift from them.
+///
+/// Deliberately **not** enforced in `Node::start`. Test fixtures compress the clock on purpose (the live epoch
+/// clock runs at 120 ms, the descriptor-rotation end-to-end at a derived 4.2 s) and they are not the party who
+/// can make this mistake. The operator writing a number into a config file is.
+fn parse_epoch_period(value: &str) -> Result<Duration, NodeError> {
+    let period = parse_duration_secs(value, "epoch_period")?;
+    let floor = Duration::from_nanos(fanos_runtime::Config::default().minimum_epoch_period().0);
+    if period <= floor {
+        return Err(NodeError::Config(format!(
+            "epoch_period {period:?} is not longer than {floor:?}. A directory slot outlives its epoch by one \
+             so a reader one epoch behind still finds it — but reaching that grace slot costs a failed read of \
+             the current one, and a failed read takes {floor:?} to give up and conclude. At this period the \
+             grace slot is reclaimed while that read is still timing out, so the retention buys nothing: \
+             services intermittently fail to resolve and no counter anywhere says why."
+        )));
+    }
+    Ok(period)
+}
+
 /// A millisecond duration from a config value. Zero **is** meaningful here (no mixing delay, no cover traffic),
 /// so it is accepted — the operator is turning the mechanism off, which is a legitimate choice with a cost.
 fn parse_duration_millis(value: &str, key: &str) -> Result<Duration, NodeError> {
@@ -1453,7 +1482,7 @@ fn apply_config_key(
             }
             config.telemetry_epsilon = Some(eps);
         }
-        "epoch_period" => config.epoch_period = parse_duration_secs(value, "epoch_period")?,
+        "epoch_period" => config.epoch_period = parse_epoch_period(value)?,
         "mix_mean_delay" => config.mix_mean_delay = parse_duration_millis(value, "mix_mean_delay")?,
         "cover_interval" => config.cover_interval = parse_duration_millis(value, "cover_interval")?,
         "admission_difficulty" => {
@@ -2051,6 +2080,33 @@ mod tests {
         assert!(NodeConfig::from_config_str("listen 127.0.0.1:9000").is_err()); // no '='
         assert!(NodeConfig::from_config_str("listen = not-an-addr").is_err());
         assert!(NodeConfig::from_config_str("heartbeat = maybe").is_err());
+    }
+
+    /// **An epoch too short for the grace window is refused, and one long enough is not** (#348).
+    ///
+    /// Both directions, because a check asserted only where it fires is indistinguishable from one that
+    /// refuses everything — and this one sits on a key every deployment sets.
+    ///
+    /// The two values are one second apart on purpose: the floor is `read_timeout + heartbeat` = 2.1 s and
+    /// the config grammar is whole seconds, so 2 is the largest refused value and 3 the smallest accepted
+    /// one. Testing 1 against 600 would pass on a check with almost any threshold in it.
+    #[test]
+    fn an_epoch_period_below_the_grace_window_is_refused_and_the_next_second_is_not() {
+        let floor = Duration::from_nanos(fanos_runtime::Config::default().minimum_epoch_period().0);
+        let refused = floor.as_secs(); // 2 s — truncation puts this at or below the floor
+        let allowed = refused + 1; // 3 s — the first whole second strictly above it
+
+        let err = NodeConfig::from_config_str(&format!("epoch_period = {refused}\n"))
+            .expect_err("an epoch shorter than a failed read must be refused");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("grace slot"),
+            "the refusal must say what stops working, not merely that the number is wrong: {text}"
+        );
+
+        let cfg = NodeConfig::from_config_str(&format!("epoch_period = {allowed}\n"))
+            .expect("one second above the floor is a legitimate deployment and must be accepted");
+        assert_eq!(cfg.epoch_period, Duration::from_secs(allowed));
     }
 
     #[test]

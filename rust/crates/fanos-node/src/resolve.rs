@@ -209,6 +209,42 @@ mod timeout_ordering {
             "even rounded up to the next heartbeat ({beat:?}) the engine concludes first"
         );
     }
+
+    /// **The fourth element — and this module's own doc says why it had to be found** (#348).
+    ///
+    /// "Three bounds, not two — and the one this file used to ignore is the one that fires first… A
+    /// two-element comparison in a three-element chain is what let that sit." The same sentence applies one
+    /// element further out: the chain above relates three timeouts to each other and none of them to the
+    /// **epoch**, which is what decides whether the grace slot is still alive when a failed read finally
+    /// concludes. `epoch_period` and `read_timeout` are fields of the same `fanos_runtime::Config`, and
+    /// nothing compared them.
+    ///
+    /// What breaks below the floor is quiet, which is why it is a refusal rather than a warning: the reader
+    /// misses the current slot, spends `read_timeout + heartbeat` finding that out, and by then the slot it
+    /// would have fallen back to has been swept. The lookup fails, the service is published, and no counter
+    /// fires. Measured on a live node in `tests/descriptor_rotation.rs`, whose fixture period is derived from
+    /// this same sum for exactly this reason.
+    #[test]
+    fn the_epoch_must_outlast_a_failed_read_or_the_grace_slot_buys_nothing() {
+        let cfg = fanos_runtime::Config::default();
+        let floor = std::time::Duration::from_nanos(cfg.minimum_epoch_period().0);
+        assert!(
+            crate::config::DEFAULT_EPOCH_PERIOD > floor,
+            "the shipped epoch ({:?}) is not longer than a failed read ({floor:?}), so a reader that misses \
+             the current slot cannot reach the grace slot before it is reclaimed",
+            crate::config::DEFAULT_EPOCH_PERIOD
+        );
+        // The control, without which the assertion above passes for any floor smaller than ten minutes and is
+        // therefore a claim about nothing: the floor must be the SUM it says it is.
+        let engine = std::time::Duration::from_nanos(cfg.read_timeout.0);
+        let beat = std::time::Duration::from_nanos(cfg.heartbeat.0);
+        assert_eq!(
+            floor,
+            engine + beat,
+            "the floor stopped being `read_timeout + heartbeat` ({engine:?} + {beat:?}), so the assertion \
+             above is comparing the epoch against something else"
+        );
+    }
 }
 
 /// Keep this node's hidden-service descriptor at the **current** epoch's slot, for as long as the node runs.
