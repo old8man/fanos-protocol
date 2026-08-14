@@ -70,8 +70,9 @@ impl CellParams {
         let q64 = u64::from(q);
         let n = q64.checked_mul(q64)?.checked_add(q64)?.checked_add(1)?;
         let n = usize::try_from(n).ok()?;
-        // f = ⌊(n−1)/3⌋; Q = ⌈(n+f+1)/2⌉ = (n+f+2)/2 in integer arithmetic.
-        let f = (n - 1) / 3;
+        // Q = ⌈(n+f+1)/2⌉ = (n+f+2)/2 in integer arithmetic; `f` is the platform's one Byzantine
+        // budget rather than a local restatement of it (#337).
+        let f = fanos_geometry::fault_budget(n);
         let quorum = (n + f + 2) / 2;
         Some(Self { q, n, f, quorum })
     }

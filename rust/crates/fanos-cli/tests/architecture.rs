@@ -151,6 +151,72 @@ use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, produ
 /// stayed silent because #318's rule — every function in the binary carries a doc — does not reach a test
 /// file, `cargo doc` never renders test targets, and `[`UNLINKED`]` resolves from either scope. A test file
 /// is the class's second habitat, and nothing watches it.
+/// **The Byzantine fault budget is spelled once in shipping code** — `fanos_geometry::fault_budget` (#337).
+///
+/// `f = ⌊(n − 1)/3⌋` is two tokens long, and that is what makes it dangerous: it reads as harmless at every
+/// site that writes it. Two production sites restated it and **could not import the canon** — `rendezvous`'s
+/// meeting point count and `taxis`'s plane parameters — because neither crate depends on `fanos-runtime`,
+/// where it used to live, and neither should: that is a higher layer. The duplication was a *layering* fact,
+/// so the fix was a move to `fanos-geometry` (the one crate every consumer already reaches, and the one that
+/// owns `n = q² + q + 1` itself) rather than an import. This guard is what keeps a third copy from appearing.
+///
+/// **The positive control is inside the test, not beside it.** A scan that matched nothing would satisfy
+/// "nobody spells the formula" for ever, so the assertions run in order: the corpus is non-empty, the scan
+/// can *see* the shape (it finds the canon's own definition), and only then that nobody else has it. Skip the
+/// middle one and this becomes a guard whose firing has never been observed.
+///
+/// **Doc prose is not a violation and does not need excluding.** Every doc in the tree writes the bound with
+/// U+2212 MINUS (`n − 1`); the needle here is ASCII. That is luck rather than design, so the scan also strips
+/// line comments the way its neighbour does — belt and braces, stated rather than relied on silently.
+///
+/// The `#[cfg(test)]` sites that legitimately keep the arithmetic are excluded by [`production_part`], the
+/// shared shipping-code slice (#252). Their inlining is deliberate: a test that imports the function under
+/// test to compute its own expectation is the formula grading itself.
+#[test]
+fn the_byzantine_fault_budget_is_spelled_in_exactly_one_shipping_file() {
+    // Assembled, so this file holds no literal copy for itself to find.
+    let needle = format!("(n-1){}3", "/");
+    let canon = format!("n.saturating_sub(1){}3", " / ");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut examined = 0usize;
+    let mut control_seen = false;
+
+    for file in corpus() {
+        // Shipping crates only: `tests/` and `benches/` are not production, and this very file is a test.
+        if !file.rel.contains("/src/") {
+            continue;
+        }
+        examined += 1;
+        let shipping = production_part(&file.text);
+        if file.rel.ends_with("fanos-geometry/src/tolerance.rs") {
+            control_seen = shipping.contains(&canon);
+            continue;
+        }
+        for (n, line) in shipping.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            let squashed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+            if squashed.contains(&needle) {
+                offenders.push(format!("{}:{}", file.rel, n + 1));
+            }
+        }
+    }
+
+    assert!(examined > 0, "the scan examined no shipping file — the failure it exists to catch, in itself");
+    assert!(
+        control_seen,
+        "the scan found no `{canon}` in fanos-geometry/src/tolerance.rs. Either the canon moved — then move \
+         this control with it — or the scan matches nothing at all, in which case the assertion below has \
+         been passing vacuously"
+    );
+    assert!(
+        offenders.is_empty(),
+        "the Byzantine fault budget is restated in shipping code at {offenders:?}. Call \
+         `fanos_geometry::fault_budget(n)`: every crate here can reach it, which is exactly why it was \
+         moved there (#337)"
+    );
+}
+
 #[test]
 fn every_crate_is_reachable_from_a_shipped_binary_or_declared_unlinked() {
     let (deps, binaries) = workspace();

@@ -130,7 +130,7 @@ pub const CENSORSHIP_HORIZON_EPOCHS: u64 = 1 << 23;
 #[must_use]
 pub fn meeting_point_count(q: usize) -> usize {
     let n = q * q + q + 1;
-    let f = (n - 1) / 3;
+    let f = fanos_geometry::fault_budget(n);
     let pigeonhole = f + 1;
     if f == 0 {
         return pigeonhole; // No adversary is tolerable on such a plane; one meeting point is the whole bound.

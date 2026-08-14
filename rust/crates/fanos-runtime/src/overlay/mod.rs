@@ -71,18 +71,19 @@ pub(super) const HEARTBEAT: TimerToken = TimerToken(0);
 /// module is stated for.
 pub(crate) const CELL_POINTS: usize = 7;
 
-/// The Byzantine fault budget of a cell of `n` nodes: `f = ⌊(n − 1)/3⌋`.
+/// The Byzantine fault budget of a cell of `n` nodes — **re-exported, no longer defined here** (#337).
 ///
-/// Public because a cross-crate reader needs the budget itself and not only [`corroboration_quorum`]'s
-/// `f + 1` view of it. `fanos-sim`'s beacon flood-spread measurement (#288) sizes its reconstruction
-/// threshold `2f + 1` from this, and it must do so at **both** plane orders it compares: a Fano anchor and a
-/// `q = 7` anchor sized by different rules would differ in when `BeaconReady` fires for reasons that have
-/// nothing to do with the flood, and the comparison would measure the rule instead of the plane.
+/// Re-exported rather than moved-and-forgotten because this crate's own callers ([`corroboration_quorum`],
+/// and `fanos-sim`'s flood-spread measurement from #288, which sizes `2f + 1` from it at *both* compared
+/// plane orders) name it through this path, and a rename would be churn with no reader benefit.
 ///
-/// Restating `(n − 1)/3` over there would work and is exactly the copy that drifts.
-pub const fn fault_budget(n: usize) -> usize {
-    n.saturating_sub(1) / 3
-}
+/// **Why it left.** The doc that used to sit here warned that *"restating `(n − 1)/3` over there would work
+/// and is exactly the copy that drifts"* — while two production sites did exactly that, in `fanos-rendezvous`
+/// and `fanos-taxis`. Neither could import it: neither depends on `fanos-runtime`, and neither should, because
+/// this is a higher layer. So the duplication was a *layering* fact, not carelessness, and the only fix that
+/// removes it is a move to the one crate every consumer already reaches — see
+/// [`fanos_geometry::tolerance`] for the enumeration that picked it and for the category tension it carries.
+pub use fanos_geometry::fault_budget;
 
 /// The **corroboration quorum** for a cell of `n` nodes — see [`Config::corroboration_quorum`] for the
 /// two-sided derivation. `f + 1`, which at Fano is simultaneously the safety floor and the liveness ceiling.

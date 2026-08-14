@@ -35,6 +35,11 @@ mod flag;
 #[cfg(feature = "alloc")]
 pub mod hierarchy;
 mod plane;
+/// The cell's Byzantine fault tolerance — see the module doc for why a consensus
+/// quantity is hosted by the crate that owns the cell size.
+pub mod tolerance;
+
+pub use tolerance::fault_budget;
 
 pub use element::{
     TRIPLE_WIRE_LEN, Triple, canonicalize, cross, decode_triple, dot, encode_triple,
