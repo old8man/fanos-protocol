@@ -100,7 +100,21 @@ impl Connection {
             return None;
         }
         let id = self.next_local_id;
-        self.next_local_id = self.next_local_id.wrapping_add(2);
+        // **The id space is finite, and this is where it ends.** `wrapping_add` restarted it: the ids handed
+        // out after a wrap are ones live streams still own — `insert` displaces the old value and this
+        // function drops it, so the previous owner's handle silently names someone else's stream — and ones
+        // retired streams owned, whose stragglers this end deliberately does not fence (`peer_closed_below`
+        // guards *peer* ids; the doc justifies the asymmetry by "a straggler for a retired local id is
+        // dropped by the parity guard or the unknown-ack no-op", which holds *because ids are never reused*).
+        //
+        // Unreachable while nothing calls `retire_stream`, since the cap above fires first and never
+        // releases — but that is a hazard held back by a blocker, and the blocker has to go: 256 streams for
+        // the whole life of a connection is a limit, not a design. Wiring retirement is what makes this
+        // reachable, so the refusal belongs here now rather than in that change.
+        //
+        // The last id is spent proving there is no next one. One id out of 2^31, for never wrapping.
+        let next = id.checked_add(2)?;
+        self.next_local_id = next;
         self.streams.insert(id, Stream::new(id));
         Some(id)
     }
@@ -839,6 +853,35 @@ mod tests {
         assert!(
             client.open_stream().is_some(),
             "a slot freed by `reset_stream` must be usable by the local open path (#273)"
+        );
+    }
+
+    /// **`open_stream` refuses at the end of the id space rather than wrapping.**
+    ///
+    /// The twin of the nonce-exhaustion test below, one counter over: there the value is the AEAD nonce,
+    /// here it is the stream id, and both must refuse rather than re-issue. Re-issuing is the worse failure
+    /// of the two to detect, because it is silent — `BTreeMap::insert` returns the displaced `Stream` and
+    /// `open_stream` drops it, so the previous owner's handle simply starts naming someone else's stream.
+    ///
+    /// This test exists because its absence was MEASURED, not suspected: with `checked_add(2)?` replaced by
+    /// `wrapping_add(2)`, all 49 tests of this crate stayed green. A refusal nothing asserts is a refusal
+    /// that can be deleted by accident.
+    #[test]
+    fn open_stream_refuses_at_the_end_of_the_id_space_rather_than_wrapping() {
+        let mut c = Connection::new([1u8; 32], [2u8; 32], true);
+        // Initiator ids are even and step by 2 (`next_local_id` starts at `!initiator`), so `u32::MAX - 3`
+        // is the last id that still has a successor inside the space.
+        c.next_local_id = u32::MAX - 3;
+        assert_eq!(
+            c.open_stream(),
+            Some(u32::MAX - 3),
+            "the last id with a successor is still handed out"
+        );
+        // Spent: the next id has no successor, and proving that costs it. One id out of 2^31, stated in the
+        // code that pays it. Wrapping would instead have re-issued 0 — an id a live stream may still own.
+        assert!(
+            c.open_stream().is_none(),
+            "no id is handed out once the space cannot advance"
         );
     }
 

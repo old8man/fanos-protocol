@@ -3,7 +3,9 @@
 //! It drives the shipped selective-repeat + SACK core of `fanos_stream` end-to-end, sealing
 //! its outbound segments and acks into constant-size cells ([`crate::cell`]) and opening inbound
 //! cells back into segments and acks. Each direction has its own key and its own monotone nonce
-//! counter, so the two directions never share nonce space. Reliability, ordering, and flow control
+//! counter, so the two directions never share nonce space. The counter is monotone *and finite*: at the
+//! top of the 2⁶⁴ space the endpoint stops minting cells rather than wrap, because a reused nonce would
+//! break the AEAD's confidentiality and integrity at once ([`StreamEndpoint::outbound`]). Reliability, ordering, and flow control
 //! are entirely between the two endpoints — every relay in between sees only opaque, constant-size,
 //! authenticated cells.
 
@@ -61,10 +63,19 @@ impl StreamEndpoint {
         self.sender.is_complete() && self.receiver.is_finished()
     }
 
-    fn next_nonce(&mut self) -> u64 {
+    /// The next per-cell AEAD nonce, or `None` once the 2⁶⁴ nonce space is exhausted.
+    ///
+    /// Identical to [`Connection::next_nonce`](crate::Connection), and for its reason: nonce reuse is
+    /// catastrophic for the AEAD — it breaks confidentiality and integrity together — so at the limit this
+    /// endpoint refuses to mint any further cell rather than wrap. 2⁶⁴ constant-size cells is astronomically
+    /// unreachable, so this only ever guards the invariant; the twin guards it anyway, and an invariant
+    /// guarded on one of two identical paths is worse than one guarded on neither, because a reader cannot
+    /// tell which was intended. This used to be `wrapping_add`, which would have handed out nonce 0 again
+    /// under the same key — and made the module doc's word "monotone" false.
+    fn next_nonce(&mut self) -> Option<u64> {
         let n = self.nonce_tx;
-        self.nonce_tx = self.nonce_tx.wrapping_add(1);
-        n
+        self.nonce_tx = self.nonce_tx.checked_add(1)?;
+        Some(n)
     }
 
     /// The cells to (re)send now: one `DATA` cell per outbound segment (selective repeat within the
@@ -72,7 +83,8 @@ impl StreamEndpoint {
     pub fn outbound(&mut self) -> Vec<Vec<u8>> {
         let mut cells = Vec::new();
         for seg in self.sender.outbound() {
-            let nonce = self.next_nonce();
+            // Exhausted: mint nothing further, on this path or the ACK path below.
+            let Some(nonce) = self.next_nonce() else { return cells };
             if let Some(cell) = seal(&self.key_tx, nonce, &Frame::Data(seg).encode()) {
                 cells.push(cell);
             }
@@ -82,7 +94,7 @@ impl StreamEndpoint {
             ack: self.receiver.ack(),
         }
         .encode();
-        let nonce = self.next_nonce();
+        let Some(nonce) = self.next_nonce() else { return cells };
         if let Some(cell) = seal(&self.key_tx, nonce, &ack) {
             cells.push(cell);
         }
@@ -122,6 +134,34 @@ impl ZeroizeOnDrop for StreamEndpoint {}
 mod tests {
     use super::*;
     use crate::cell::CELL_LEN;
+
+    /// **The endpoint stops minting at nonce exhaustion rather than wrapping** — the mirror of
+    /// `Connection`'s `the_connection_hard_kills_at_nonce_exhaustion_rather_than_reusing_a_nonce`.
+    ///
+    /// Same field, same job, same catastrophe: a reused AEAD nonce under the same key breaks confidentiality
+    /// and integrity together. The twin refused; this one used to wrap to 0, and its own module doc called
+    /// the counter "monotone" while it did.
+    ///
+    /// Written because the absence was MEASURED: with `checked_add(1)?` replaced by `wrapping_add(1)`, all
+    /// 49 tests of this crate stayed green, so the refusal shipped with nothing asserting it.
+    ///
+    /// `outbound()` mints one ACK cell per call even with no data queued, which is what makes the boundary
+    /// reachable in three lines instead of 2^64.
+    #[test]
+    fn the_endpoint_stops_minting_at_nonce_exhaustion_rather_than_reusing_a_nonce() {
+        let mut e = StreamEndpoint::new(1, [3u8; 32], [4u8; 32]);
+        // `u64::MAX - 2`, copied from the twin rather than retyped: at `MAX - 1` only ONE nonce is
+        // usable, because the last value is spent proving there is no successor. The first draft of
+        // this line said `MAX - 1` under a comment saying "two", and the test caught the mismatch.
+        e.nonce_tx = u64::MAX - 2; // two nonces from the top
+        assert_eq!(e.outbound().len(), 1, "the first remaining nonce is minted");
+        assert_eq!(e.outbound().len(), 1, "the last remaining nonce is minted");
+        assert!(
+            e.outbound().is_empty(),
+            "no cell is minted once the nonce space is spent — wrapping would seal under nonce 0 again, \
+             with the same key that already sealed this endpoint's first cell"
+        );
+    }
 
     /// Drive two endpoints to completion over a (possibly lossy/tampering) cell relay, accumulating
     /// each side's received bytes. Returns `(client_got, service_got)`.
