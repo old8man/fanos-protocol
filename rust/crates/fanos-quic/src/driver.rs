@@ -695,7 +695,14 @@ type PeerAddrs = Arc<Mutex<HashMap<Triple, SocketAddr>>>;
 #[must_use]
 pub const fn reflexive_quorum(q: u32) -> usize {
     let n = (q as usize) * (q as usize) + (q as usize) + 1;
-    (n - 1) / 3 + 1
+    // `f + 1`, where `f` is the platform's Byzantine budget — IMPORTED, not restated. `fault_budget`'s own
+    // doc says it best: "restating `(n − 1)/3` over there would work and is exactly the copy that drifts."
+    // Both are `const fn`, so `REFLEXIVE_QUORUM_FANO` below stays a const item.
+    //
+    // This does not touch the layering argument above, which is about where `n` comes from (the plane
+    // order, never the peer directory) and remains exactly as it was. That argument is about the INPUT;
+    // this line is about the FORMULA, and only the formula had two homes.
+    fanos_runtime::fault_budget(n) + 1
 }
 
 /// The base cell's reflexive quorum — what [`spawn`] uses, having no `F` to derive from.

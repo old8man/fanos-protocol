@@ -153,11 +153,18 @@ pub const fn mix_threshold(line_size: usize) -> usize {
 /// nothing told it so until this existed.
 #[must_use]
 pub const fn correlation_within_budget(line_size: usize) -> bool {
-    // `q + 1 = line_size`, so `n = q² + q + 1` and the Byzantine budget is `⌊(n−1)/3⌋` — the same `f` every
-    // quorum in the platform is sized against.
+    // `q + 1 = line_size`, so `n = q² + q + 1`. The budget itself is IMPORTED rather than re-derived.
+    //
+    // This comment used to assert the identity — "the same `f` every quorum in the platform is sized
+    // against" — while restating the formula on the very next line, which is the worst of both: move the
+    // canon and the copy keeps computing the old value while the comment keeps asserting the new one, and
+    // nothing fails. `fault_budget`'s own doc names this outcome: "exactly the copy that drifts."
+    //
+    // The bodies were byte-identical (`n.saturating_sub(1) / 3` on both sides), so this changes no value
+    // today — only who owns the formula. Both are `const fn`, so this stays a `const fn`.
     let q = line_size.saturating_sub(1);
     let n = q * q + q + 1;
-    let f = n.saturating_sub(1) / 3;
+    let f = fanos_runtime::fault_budget(n);
     f >= 2 * mix_threshold(line_size) - 1
 }
 
