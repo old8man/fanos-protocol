@@ -111,7 +111,7 @@ fn call_signal_kat_matches_angelos_json() {
     // Invite → accept seeds interoperable media sessions.
     let (offer, mut caller) = CallSignal::invite(CallId::new([1; 16]), [2; 32], media_flags::AUDIO);
     let (_accept, mut callee) = CallSignal::from_bytes(&offer.to_bytes()).unwrap().accept().expect("accept");
-    let frame = caller.seal_frame(MediaKind::Audio, b"hi");
+    let frame = caller.seal_frame(MediaKind::Audio, b"hi").expect("a bounded plaintext always seals");
     assert_eq!(callee.open_frame(&frame), Some((0, MediaKind::Audio, b"hi".to_vec())), "media interoperates");
 }
 
@@ -119,13 +119,13 @@ fn call_signal_kat_matches_angelos_json() {
 fn session_ratchet_kat_matches_angelos_json() {
     // The 1:1 symmetric ratchet over a fixed shared secret; the same plaintext seals differently as it ratchets.
     let mut init = Session::from_shared_secret(&[0x01; 32], Role::Initiator);
-    assert_eq!(hex(&init.seal(b"gm")), "0000000000000000c0cb8122c87945ea433bed88baaa74687cdf");
-    assert_eq!(hex(&init.seal(b"gm")), "0100000000000000d863f3c43e5e65ca6e3310e3123d6b4866ae");
+    assert_eq!(hex(&init.seal(b"gm").expect("a bounded plaintext always seals")), "0000000000000000c0cb8122c87945ea433bed88baaa74687cdf");
+    assert_eq!(hex(&init.seal(b"gm").expect("a bounded plaintext always seals")), "0100000000000000d863f3c43e5e65ca6e3310e3123d6b4866ae");
 
     // A responder over the same secret opens what the initiator sealed (the b2a chain is the mirror).
     let mut init2 = Session::from_shared_secret(&[0x01; 32], Role::Initiator);
     let mut resp = Session::from_shared_secret(&[0x01; 32], Role::Responder);
-    let sealed = init2.seal(b"gm");
+    let sealed = init2.seal(b"gm").expect("a bounded plaintext always seals");
     assert_eq!(resp.open(&sealed).as_deref(), Some(&b"gm"[..]), "the mirror session opens it");
 }
 
@@ -142,8 +142,8 @@ fn group_post_kat_matches_angelos_json() {
 
     // Member 1 posting over a fixed group key: the ciphertext prefix is pinned.
     let mut g = GroupSession::new(&[0x42; 32], 1, sk1, &roster);
-    let post0 = g.send(b"hello channel");
-    let post1 = g.send(b"hello channel");
+    let post0 = g.send(b"hello channel").expect("a bounded plaintext always seals");
+    let post1 = g.send(b"hello channel").expect("a bounded plaintext always seals");
     assert!(hex(&post0).starts_with("00000000000000004b13f534da5fb2ab8458a032166e303c289ebb9616fb8da3310a18bc58"));
     assert!(hex(&post1).starts_with("010000000000000070d8f717394e162e5e08f5dc84ea4d3437f5f2d8288537f9cfb568dfc3"));
 
@@ -158,12 +158,12 @@ fn media_frame_kat_matches_angelos_json() {
     use fanos_angelos::MediaRole;
     // Epoch-0 caller-direction frames over a fixed call secret.
     let mut tx = MediaSession::new(&[0x33; 32], MediaRole::Caller);
-    assert_eq!(hex(&tx.seal_frame(MediaKind::Audio, b"audio0")), "000000000000000000000000fa2b86644730e4c9a651251600c5f018509ec40c813691");
-    assert_eq!(hex(&tx.seal_frame(MediaKind::Video, b"video1")), "00000000010000000000000095ea39401655376b71218f34f5c85e6cfb4e137222aa2c");
+    assert_eq!(hex(&tx.seal_frame(MediaKind::Audio, b"audio0").expect("a bounded plaintext always seals")), "000000000000000000000000fa2b86644730e4c9a651251600c5f018509ec40c813691");
+    assert_eq!(hex(&tx.seal_frame(MediaKind::Video, b"video1").expect("a bounded plaintext always seals")), "00000000010000000000000095ea39401655376b71218f34f5c85e6cfb4e137222aa2c");
 
     // The callee opens the caller's frame (cross-direction, loss-tolerant, order-independent).
     let mut caller = MediaSession::new(&[0x33; 32], MediaRole::Caller);
     let mut callee = MediaSession::new(&[0x33; 32], MediaRole::Callee);
-    let a = caller.seal_frame(MediaKind::Audio, b"audio0");
+    let a = caller.seal_frame(MediaKind::Audio, b"audio0").expect("a bounded plaintext always seals");
     assert_eq!(callee.open_frame(&a), Some((0, MediaKind::Audio, b"audio0".to_vec())));
 }

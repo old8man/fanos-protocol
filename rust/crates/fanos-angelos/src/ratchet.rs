@@ -159,8 +159,10 @@ impl DoubleRatchet {
         let pub_enc = new_pub.encode();
 
         let mut send = SendChain::new(chain_key, CHAIN_KDF);
-        let (n, mk) = send.pop(); // n == 0
-        let body = fanos_primitives::aead::seal(&mk, &crate::nonce(n), plaintext)?;
+        // n == 0 on a fresh chain; carried out of the closure because the header repeats it on the wire.
+        let (n, body) = send.seal_with(|n, mk| {
+            fanos_primitives::aead::seal(mk, &crate::nonce(n), plaintext).map(|body| (n, body))
+        })?;
 
         // Commit only once the message is built.
         self.root = new_root;
@@ -182,18 +184,19 @@ impl DoubleRatchet {
     /// Advance the current sending chain and seal the next message on it.
     #[must_use]
     fn seal_in_chain(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
-        let send = self.send.as_mut()?;
+        // `self_pub_id` first: it is `Copy`, so reading it here holds no borrow across the chain's.
         let pub_id = self.self_pub_id?;
-        let (n, mk) = send.pop();
-        let body = fanos_primitives::aead::seal(&mk, &crate::nonce(n), plaintext)?;
-
-        let mut out = Vec::with_capacity(1 + 32 + 16 + body.len());
-        out.push(0);
-        out.extend_from_slice(&pub_id);
-        out.extend_from_slice(&0u64.to_le_bytes()); // pn (only meaningful on a ratchet message)
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&body);
-        Some(out)
+        let send = self.send.as_mut()?;
+        send.seal_with(|n, mk| {
+            let body = fanos_primitives::aead::seal(mk, &crate::nonce(n), plaintext)?;
+            let mut out = Vec::with_capacity(1 + 32 + 16 + body.len());
+            out.push(0);
+            out.extend_from_slice(&pub_id);
+            out.extend_from_slice(&0u64.to_le_bytes()); // pn (only meaningful on a ratchet message)
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&body);
+            Some(out)
+        })
     }
 
     /// Open an incoming message ([`seal`](Self::seal) output). Performs a KEM ratchet if the message begins a new

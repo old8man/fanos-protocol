@@ -82,16 +82,23 @@ impl GroupSession {
     /// **Post** to the channel: seal `plaintext` under our own sender chain, advance it, and **sign** the post.
     /// Returns `message_number(8) ‖ ciphertext ‖ signature(HYBRID_SIG_LEN)` — the same object every other member
     /// opens with [`recv`](Self::recv), tagged (out of band) with our [`my_id`](Self::my_id).
+    /// `None` on the AEAD-setup error, which no plaintext this build can produce reaches. Worth a return
+    /// value rather than a default because of what the default was: an empty ciphertext **carrying a valid
+    /// signature over it** (#338). Every other member would have authenticated the post and opened nothing.
+    /// The sender chain is not advanced in that case — see [`SendChain::seal_with`].
     #[must_use]
-    pub fn send(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        let (n, mk) = self.send.pop();
-        let ciphertext = aead::seal(&mk, &nonce(n), plaintext).unwrap_or_default();
-        let signature = self.sign_secret.sign(&signed_bytes(self.my_id, n, &ciphertext));
-        let mut out = Vec::with_capacity(8 + ciphertext.len() + HYBRID_SIG_LEN);
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&ciphertext);
-        out.extend_from_slice(&signature.to_bytes());
-        out
+    pub fn send(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        let my_id = self.my_id;
+        let sign_secret = &self.sign_secret;
+        self.send.seal_with(|n, mk| {
+            let ciphertext = aead::seal(mk, &nonce(n), plaintext)?;
+            let signature = sign_secret.sign(&signed_bytes(my_id, n, &ciphertext));
+            let mut out = Vec::with_capacity(8 + ciphertext.len() + HYBRID_SIG_LEN);
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&ciphertext);
+            out.extend_from_slice(&signature.to_bytes());
+            Some(out)
+        })
     }
 
     /// **Receive** a post from `sender_id`. `None` if the sender is not a tracked member, the **signature does
@@ -166,10 +173,10 @@ mod tests {
     #[test]
     fn every_member_reads_every_others_posts() {
         let (mut a, mut b, mut c) = channel();
-        let post = a.send(b"hello channel");
+        let post = a.send(b"hello channel").expect("a bounded plaintext always seals");
         assert_eq!(b.recv(1, &post).as_deref(), Some(&b"hello channel"[..]));
         assert_eq!(c.recv(1, &post).as_deref(), Some(&b"hello channel"[..]));
-        let post2 = b.send(b"hi from bob");
+        let post2 = b.send(b"hi from bob").expect("a bounded plaintext always seals");
         assert_eq!(a.recv(2, &post2).as_deref(), Some(&b"hi from bob"[..]));
         assert_eq!(c.recv(2, &post2).as_deref(), Some(&b"hi from bob"[..]));
     }
@@ -177,8 +184,8 @@ mod tests {
     #[test]
     fn posts_from_one_sender_open_in_order() {
         let (mut a, mut b, _c) = channel();
-        let m0 = a.send(b"zero");
-        let m1 = a.send(b"one");
+        let m0 = a.send(b"zero").expect("a bounded plaintext always seals");
+        let m1 = a.send(b"one").expect("a bounded plaintext always seals");
         assert_eq!(b.recv(1, &m0).as_deref(), Some(&b"zero"[..]));
         assert_eq!(b.recv(1, &m1).as_deref(), Some(&b"one"[..]));
     }
@@ -189,9 +196,9 @@ mod tests {
         // must open (banking the skipped keys) and the earlier one must still open when it arrives — not be
         // silently lost, as the old drop-on-mismatch did.
         let (mut a, mut b, _c) = channel();
-        let m0 = a.send(b"zero");
-        let m1 = a.send(b"one");
-        let m2 = a.send(b"two");
+        let m0 = a.send(b"zero").expect("a bounded plaintext always seals");
+        let m1 = a.send(b"one").expect("a bounded plaintext always seals");
+        let m2 = a.send(b"two").expect("a bounded plaintext always seals");
         // m2 arrives FIRST: it opens, and m0/m1's keys are banked.
         assert_eq!(b.recv(1, &m2).as_deref(), Some(&b"two"[..]), "the ahead post opens (skip-ahead)");
         // The earlier posts then open from the banked keys, in either order.
@@ -223,7 +230,7 @@ mod tests {
     fn a_post_cannot_be_relabeled_to_a_different_sender() {
         // A genuine post from member 1, delivered as if from member 2, fails (the signature is over sender 1).
         let (mut a, _b, mut c) = channel();
-        let post = a.send(b"members only");
+        let post = a.send(b"members only").expect("a bounded plaintext always seals");
         assert!(c.recv(2, &post).is_none(), "a genuine post cannot be re-attributed to another sender");
         assert_eq!(c.recv(1, &post).as_deref(), Some(&b"members only"[..]), "it still opens for its true sender");
     }
@@ -231,7 +238,7 @@ mod tests {
     #[test]
     fn a_non_member_sender_or_a_tampered_post_is_refused() {
         let (mut a, mut b, _c) = channel();
-        let post = a.send(b"data");
+        let post = a.send(b"data").expect("a bounded plaintext always seals");
         assert!(b.recv(99, &post).is_none(), "a post attributed to a non-member is refused");
         let mut bad = post.clone();
         let last = bad.len() - 1;

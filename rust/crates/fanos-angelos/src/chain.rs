@@ -74,14 +74,32 @@ impl SendChain {
         self.n
     }
 
-    /// Take the next `(number, message_key)` and advance the chain.
+    /// Build the next message with `f`, and advance the chain **only if `f` succeeds**.
+    ///
+    /// `f` receives `(message_number, message_key)`. On `None` the chain is untouched, so the same number
+    /// and key are handed out again by the next call.
+    ///
+    /// # Why the atomicity lives here rather than at each call site
+    ///
+    /// A message key is one-use. Burning one on a seal that produced nothing leaves this chain a step
+    /// ahead of the peer's, and the receiver banks a skipped key for a message that will never arrive.
+    /// [`RecvChain::open`] already promises the mirror of this rule in so many words — *"in those cases no
+    /// state is advanced, so the genuine message still opens"* — so a sending chain that did not hold it
+    /// would make the two halves of one pair promise different things (#338).
+    ///
+    /// This **replaces** `pop` rather than sitting beside it. A door that hands out a message key and
+    /// advances unconditionally is exactly as easy to call as this one and wrong by default, which is the
+    /// shape #105 removed from the chain crate.
     #[must_use]
-    pub(crate) fn pop(&mut self) -> (u64, [u8; 32]) {
+    pub(crate) fn seal_with<T>(&mut self, f: impl FnOnce(u64, &[u8; 32]) -> Option<T>) -> Option<T> {
         let n = self.n;
         let (mk, next) = self.kdf.step(&self.key);
+        let sealed = f(n, &mk)?;
+        // Commit only once the message is built — the rule `Ratchet::seal_ratchet` states in a comment,
+        // hoisted here so that every sending path keeps it by construction rather than by remembering.
         self.key = next;
         self.n = self.n.saturating_add(1);
-        (n, mk)
+        Some(sealed)
     }
 }
 
@@ -207,8 +225,31 @@ mod tests {
 
     /// Seal `plaintext` at the send chain's next number, returning `(number, ciphertext)`.
     fn seal(send: &mut SendChain, plaintext: &[u8]) -> (u64, Vec<u8>) {
-        let (n, mk) = send.pop();
-        (n, aead::seal(&mk, &nonce(n), plaintext).unwrap())
+        send.seal_with(|n, mk| aead::seal(mk, &nonce(n), plaintext).map(|ct| (n, ct)))
+            .expect("the test KDF and a bounded plaintext always seal")
+    }
+
+    /// **A refused seal spends nothing** — the rule [`SendChain::seal_with`] exists to hold (#338).
+    ///
+    /// This is the one assertion in the family that can fire. `aead::seal` fails only on a plaintext longer
+    /// than the AEAD's maximum message, which no test can afford to build; but `seal_with` is generic over
+    /// its closure, so refusing *without* the AEAD reaches the same branch the unreachable failure would.
+    /// The second half is what makes it a test of the pair rather than of a counter: the message that does
+    /// get built must still open as number 0, i.e. the receiver never had to skip a message that never was.
+    #[test]
+    fn a_refused_seal_does_not_burn_a_message_key() {
+        let (mut send, mut recv) = pair();
+
+        assert!(send.seal_with(|_, _| None::<Vec<u8>>).is_none(), "the closure refused, so the call must");
+        assert_eq!(send.count(), 0, "a refused seal must not spend a message number");
+
+        let (n, ct) = seal(&mut send, b"the real one");
+        assert_eq!(n, 0, "the refused attempt must not have moved the chain past 0");
+        assert_eq!(
+            recv.open(n, &ct).as_deref(),
+            Some(&b"the real one"[..]),
+            "the receiver must not have had to bank a skipped key for a message that never existed"
+        );
     }
 
     #[test]

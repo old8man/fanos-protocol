@@ -37,16 +37,24 @@ fn nonce(index: usize) -> [u8; aead::NONCE_LEN] {
 /// Seal `object` under `key`: split the plaintext into [`CHUNK`]-sized pieces, AEAD-seal each, address the
 /// ciphertext, and build the manifest. The returned [`SealedObject`] is what a client stores (each chunk under
 /// its cid, then the manifest under its own cid). An empty object seals to an empty manifest.
+/// `None` if any chunk fails to seal — unreachable for a [`CHUNK`]-bounded piece, and the loudest of the
+/// four sites this rule was applied to (#338). `unwrap_or_default()` did not merely lose the failure: it
+/// committed the **empty** ciphertext to the manifest under a perfectly valid `chunk_cid`, with `len = 0`.
+/// The object then stored, addressed and verified as intact, and only a later `open_object` discovered that
+/// a chunk had never existed — a write that failed, reported to its caller as a write that succeeded.
+///
+/// Partial success is meaningless here, so the whole object fails rather than a manifest being returned with
+/// a hole in it.
 #[must_use]
-pub fn seal_object(object: &[u8], key: &[u8; aead::KEY_LEN]) -> SealedObject {
+pub fn seal_object(object: &[u8], key: &[u8; aead::KEY_LEN]) -> Option<SealedObject> {
     let mut chunks = Vec::new();
     let mut refs = Vec::new();
     for (i, plain) in object.chunks(CHUNK).enumerate() {
-        let sealed = aead::seal(key, &nonce(i), plain).unwrap_or_default();
+        let sealed = aead::seal(key, &nonce(i), plain)?;
         refs.push(ChunkRef { cid: chunk_cid(&sealed), len: u32::try_from(sealed.len()).unwrap_or(u32::MAX) });
         chunks.push(sealed);
     }
-    SealedObject { manifest: Manifest { chunks: refs }, chunks }
+    Some(SealedObject { manifest: Manifest { chunks: refs }, chunks })
 }
 
 /// Open a sealed object: for each manifest entry, check the supplied sealed chunk addresses to the committed cid
@@ -80,7 +88,7 @@ mod tests {
     fn an_object_seals_and_opens_round_trip() {
         // A multi-chunk object.
         let object: Vec<u8> = (0..CHUNK * 2 + 777).map(|i| (i * 5 + 1) as u8).collect();
-        let sealed = seal_object(&object, &KEY);
+        let sealed = seal_object(&object, &KEY).expect("a CHUNK-bounded plaintext always seals; the AEAD refuses only a plaintext larger than its maximum message");
         assert_eq!(sealed.chunks.len(), 3, "two full chunks + a partial one");
         assert_eq!(sealed.manifest.chunks.len(), 3);
         // The store holds ciphertext, not plaintext.
@@ -92,7 +100,7 @@ mod tests {
     #[test]
     fn the_wrong_key_or_a_tampered_chunk_cannot_open() {
         let object: Vec<u8> = (0..5000).map(|i| i as u8).collect();
-        let sealed = seal_object(&object, &KEY);
+        let sealed = seal_object(&object, &KEY).expect("a CHUNK-bounded plaintext always seals; the AEAD refuses only a plaintext larger than its maximum message");
         // The wrong key fails authentication.
         assert!(open_object(&sealed.manifest, &sealed.chunks, &[0x99; 32]).is_none(), "wrong key refused");
         // A tampered chunk no longer matches its cid.
@@ -107,7 +115,7 @@ mod tests {
 
     #[test]
     fn an_empty_object_seals_to_an_empty_manifest() {
-        let sealed = seal_object(&[], &KEY);
+        let sealed = seal_object(&[], &KEY).expect("a CHUNK-bounded plaintext always seals; the AEAD refuses only a plaintext larger than its maximum message");
         assert!(sealed.chunks.is_empty());
         assert!(sealed.manifest.chunks.is_empty());
         assert_eq!(open_object(&sealed.manifest, &sealed.chunks, &KEY), Some(Vec::new()));
@@ -115,8 +123,8 @@ mod tests {
 
     #[test]
     fn distinct_objects_seal_to_distinct_content_ids() {
-        let a = seal_object(b"the first object", &KEY);
-        let b = seal_object(b"a different object", &KEY);
+        let a = seal_object(b"the first object", &KEY).expect("a CHUNK-bounded plaintext always seals; the AEAD refuses only a plaintext larger than its maximum message");
+        let b = seal_object(b"a different object", &KEY).expect("a CHUNK-bounded plaintext always seals; the AEAD refuses only a plaintext larger than its maximum message");
         assert_ne!(a.manifest.cid(), b.manifest.cid(), "different content addresses differently");
     }
 }

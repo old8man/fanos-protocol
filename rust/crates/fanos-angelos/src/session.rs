@@ -91,14 +91,20 @@ impl Session {
 
     /// Seal `plaintext` as the next outgoing message: take a fresh message key, advance the send chain, and
     /// AEAD-encrypt. Returns `message_number(8) ‖ ciphertext`.
+    ///
+    /// `None` on the AEAD-setup error — unreachable for any plaintext this build can produce, and said out
+    /// loud anyway because this is a *public* API: `unwrap_or_default()` used to hand the caller an 8-byte
+    /// frame carrying no ciphertext at all, which the peer then reports as a diverged ratchet rather than as
+    /// a failed send (#338). The send chain is not advanced in that case — see [`SendChain::seal_with`].
     #[must_use]
-    pub fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
-        let (n, mk) = self.send.pop();
-        let ciphertext = aead::seal(&mk, &nonce(n), plaintext).unwrap_or_default();
-        let mut out = Vec::with_capacity(8 + ciphertext.len());
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&ciphertext);
-        out
+    pub fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        self.send.seal_with(|n, mk| {
+            let ciphertext = aead::seal(mk, &nonce(n), plaintext)?;
+            let mut out = Vec::with_capacity(8 + ciphertext.len());
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&ciphertext);
+            Some(out)
+        })
     }
 
     /// Open an incoming message ([`seal`](Self::seal) output), in order, ahead of skipped messages, or behind
@@ -135,15 +141,15 @@ mod tests {
         let (sk, pk) = keypair(1);
         let (mut alice, mut bob) = establish(&sk, &pk);
         // Alice → Bob.
-        let m1 = alice.seal(b"hello bob");
+        let m1 = alice.seal(b"hello bob").expect("a bounded plaintext always seals");
         assert_eq!(bob.open(&m1).as_deref(), Some(&b"hello bob"[..]));
         // Bob → Alice.
-        let r1 = bob.seal(b"hi alice");
+        let r1 = bob.seal(b"hi alice").expect("a bounded plaintext always seals");
         assert_eq!(alice.open(&r1).as_deref(), Some(&b"hi alice"[..]));
         // A stream of messages one way stays in order.
         for i in 0..5u8 {
             let msg = alloc::vec![i; 40];
-            let sealed = alice.seal(&msg);
+            let sealed = alice.seal(&msg).expect("a bounded plaintext always seals");
             assert_eq!(bob.open(&sealed).as_deref(), Some(msg.as_slice()), "message {i} opens in order");
         }
     }
@@ -153,8 +159,8 @@ mod tests {
         let (sk, pk) = keypair(1);
         // The same plaintext seals differently at each step — the send chain ratchets forward per message.
         let (mut alice, _bob) = establish(&sk, &pk);
-        let c0 = alice.seal(b"same");
-        let c1 = alice.seal(b"same");
+        let c0 = alice.seal(b"same").expect("a bounded plaintext always seals");
+        let c1 = alice.seal(b"same").expect("a bounded plaintext always seals");
         assert_ne!(c0, c1, "the same plaintext seals differently at each ratchet step");
     }
 
@@ -166,7 +172,7 @@ mod tests {
         let (eve_sk, _eve_pk) = keypair(2);
         let (_i, handshake) = Session::initiate(&pk, b"handshake-seed").unwrap();
         let mut eve = Session::respond(&eve_sk, &handshake).expect("eve decapsulates (to the wrong key)");
-        let m = alice.seal(b"secret");
+        let m = alice.seal(b"secret").expect("a bounded plaintext always seals");
         assert!(eve.open(&m).is_none(), "the wrong recipient's session cannot open the message");
     }
 
@@ -174,8 +180,8 @@ mod tests {
     fn a_tampered_message_fails_to_open_without_desyncing() {
         let (sk, pk) = keypair(1);
         let (mut alice, mut bob) = establish(&sk, &pk);
-        let m0 = alice.seal(b"first");
-        let m1 = alice.seal(b"second");
+        let m0 = alice.seal(b"first").expect("a bounded plaintext always seals");
+        let m1 = alice.seal(b"second").expect("a bounded plaintext always seals");
         // A tampered copy of message 0 does not open and does not disturb the chain.
         let mut bad = m0.clone();
         let last = bad.len() - 1;
@@ -191,9 +197,9 @@ mod tests {
     fn out_of_order_is_tolerated_and_replays_refused() {
         let (sk, pk) = keypair(1);
         let (mut alice, mut bob) = establish(&sk, &pk);
-        let m0 = alice.seal(b"zero");
-        let m1 = alice.seal(b"one");
-        let m2 = alice.seal(b"two");
+        let m0 = alice.seal(b"zero").expect("a bounded plaintext always seals");
+        let m1 = alice.seal(b"one").expect("a bounded plaintext always seals");
+        let m2 = alice.seal(b"two").expect("a bounded plaintext always seals");
         // Deliver out of order: 2, then 0, then 1 — all open.
         assert_eq!(bob.open(&m2).as_deref(), Some(&b"two"[..]), "a message opens ahead of the ones it skips");
         assert_eq!(bob.open(&m0).as_deref(), Some(&b"zero"[..]), "a skipped message opens from its banked key");

@@ -203,19 +203,24 @@ impl MediaSession {
 
     /// Seal one media frame under this party's *send* key: `epoch(4) ‖ seq(8) ‖ AEAD(kind ‖ payload)`. Frames are
     /// independently openable and loss-tolerant.
+    /// `None` on the AEAD-setup error, unreachable for any payload this build produces. The sequence number
+    /// is spent only once the frame exists (#338): a media session has no [`SendChain`] to hold that rule for
+    /// it, so it is kept here by hand, and the reason is the same one — a number spent on nothing steps the
+    /// peer's replay window past a frame that never existed.
     #[must_use]
-    pub fn seal_frame(&mut self, kind: MediaKind, payload: &[u8]) -> Vec<u8> {
+    pub fn seal_frame(&mut self, kind: MediaKind, payload: &[u8]) -> Option<Vec<u8>> {
         let seq = self.send_seq;
-        self.send_seq = self.send_seq.saturating_add(1);
         let mut inner = Vec::with_capacity(1 + payload.len());
         inner.push(kind.tag());
         inner.extend_from_slice(payload);
-        let ciphertext = aead::seal(&self.send_key, &nonce(seq), &inner).unwrap_or_default();
+        let ciphertext = aead::seal(&self.send_key, &nonce(seq), &inner)?;
+        // Commit only once the frame is built.
+        self.send_seq = self.send_seq.saturating_add(1);
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&seq.to_le_bytes());
         out.extend_from_slice(&ciphertext);
-        out
+        Some(out)
     }
 
     /// Open one media frame under the peer's send key (this party's *receive* key), returning
@@ -328,7 +333,7 @@ mod tests {
     fn a_captured_frame_cannot_be_replayed_but_reordering_still_works() {
         let (mut caller, mut callee) = pair();
         let frames: Vec<Vec<u8>> =
-            (0..8).map(|i| caller.seal_frame(MediaKind::Audio, &[i as u8])).collect();
+            (0..8).map(|i| caller.seal_frame(MediaKind::Audio, &[i as u8]).expect("a bounded plaintext always seals")).collect();
 
         // Out of order, with a gap: 3, 1, 0, 5 — all fresh, all open.
         for i in [3usize, 1, 0, 5] {
@@ -349,9 +354,9 @@ mod tests {
         // window being too narrow for the path, not the network losing a packet, and the two ask for
         // different responses.
         let (mut far, mut rx) = pair();
-        let ancient = far.seal_frame(MediaKind::Audio, b"first");
+        let ancient = far.seal_frame(MediaKind::Audio, b"first").expect("a bounded plaintext always seals");
         for _ in 0..(REPLAY_WINDOW + 8) {
-            let f = far.seal_frame(MediaKind::Audio, b"filler");
+            let f = far.seal_frame(MediaKind::Audio, b"filler").expect("a bounded plaintext always seals");
             assert!(rx.open_frame(&f).is_some(), "the live stream keeps opening");
         }
         assert!(rx.open_frame(&ancient).is_none(), "a frame off the back of the window is refused");
@@ -359,10 +364,10 @@ mod tests {
 
         // A rekey resets the window, or the new epoch's frame 0 would look like an ancient replay.
         let (mut a, mut b) = pair();
-        let _ = b.open_frame(&a.seal_frame(MediaKind::Audio, b"pre"));
+        let _ = b.open_frame(&a.seal_frame(MediaKind::Audio, b"pre").expect("a bounded plaintext always seals"));
         a.rekey();
         b.rekey();
-        assert!(b.open_frame(&a.seal_frame(MediaKind::Audio, b"post")).is_some(), "epoch 1 starts clean");
+        assert!(b.open_frame(&a.seal_frame(MediaKind::Audio, b"post").expect("a bounded plaintext always seals")).is_some(), "epoch 1 starts clean");
     }
 
 
@@ -371,12 +376,24 @@ mod tests {
         (MediaSession::new(&CALL_SECRET, MediaRole::Caller), MediaSession::new(&CALL_SECRET, MediaRole::Callee))
     }
 
+    /// **Every public sealer reports its failure** — a compile-time pin, and only that (#338).
+    ///
+    /// Coercing each to a function pointer makes the return type part of the crate's build: putting
+    /// `-> Vec<u8>` back on any of the three stops compilation here. It exercises no failure path and is not
+    /// evidence that one works — `chain::tests::a_refused_seal_does_not_burn_a_message_key` is.
+    #[test]
+    fn the_three_public_sealers_all_return_option() {
+        let _: fn(&mut crate::session::Session, &[u8]) -> Option<Vec<u8>> = crate::session::Session::seal;
+        let _: fn(&mut crate::group::GroupSession, &[u8]) -> Option<Vec<u8>> = crate::group::GroupSession::send;
+        let _: fn(&mut MediaSession, MediaKind, &[u8]) -> Option<Vec<u8>> = MediaSession::seal_frame;
+    }
+
     #[test]
     fn frames_seal_and_open_across_directions_and_are_loss_tolerant() {
         let (mut caller, mut callee) = pair();
-        let f0 = caller.seal_frame(MediaKind::Audio, b"audio0");
-        let f1 = caller.seal_frame(MediaKind::Video, b"video1");
-        let f2 = caller.seal_frame(MediaKind::Audio, b"audio2");
+        let f0 = caller.seal_frame(MediaKind::Audio, b"audio0").expect("a bounded plaintext always seals");
+        let f1 = caller.seal_frame(MediaKind::Video, b"video1").expect("a bounded plaintext always seals");
+        let f2 = caller.seal_frame(MediaKind::Audio, b"audio2").expect("a bounded plaintext always seals");
         // The callee opens the caller's frames out of order and with a gap (frame 1 "lost").
         assert_eq!(callee.open_frame(&f2), Some((2, MediaKind::Audio, b"audio2".to_vec())));
         assert_eq!(callee.open_frame(&f0), Some((0, MediaKind::Audio, b"audio0".to_vec())));
@@ -388,8 +405,8 @@ mod tests {
         // Both parties seal their own seq=0 frame; the ciphertexts differ (distinct keys) and neither opens
         // under its own send key — the whole point of the direction split (no two-time pad).
         let (mut caller, mut callee) = pair();
-        let c0 = caller.seal_frame(MediaKind::Audio, b"same");
-        let d0 = callee.seal_frame(MediaKind::Audio, b"same");
+        let c0 = caller.seal_frame(MediaKind::Audio, b"same").expect("a bounded plaintext always seals");
+        let d0 = callee.seal_frame(MediaKind::Audio, b"same").expect("a bounded plaintext always seals");
         assert_ne!(c0, d0, "the same plaintext at seq 0 seals differently in each direction");
         // The callee opens the caller's frame (cross-direction), and cannot open its own (wrong key).
         assert_eq!(callee.open_frame(&c0).map(|(_, _, p)| p), Some(b"same".to_vec()));
@@ -399,13 +416,13 @@ mod tests {
     #[test]
     fn a_rekey_gives_forward_secrecy_across_epochs() {
         let (mut caller, mut callee) = pair();
-        let old = caller.seal_frame(MediaKind::Audio, b"epoch0");
+        let old = caller.seal_frame(MediaKind::Audio, b"epoch0").expect("a bounded plaintext always seals");
         assert_eq!(callee.open_frame(&old).map(|(_, _, p)| p), Some(b"epoch0".to_vec()));
         // Both rekey in lock-step.
         caller.rekey();
         callee.rekey();
         assert_eq!(caller.epoch(), 1);
-        let new = caller.seal_frame(MediaKind::Audio, b"epoch1");
+        let new = caller.seal_frame(MediaKind::Audio, b"epoch1").expect("a bounded plaintext always seals");
         assert_eq!(callee.open_frame(&new).map(|(_, _, p)| p), Some(b"epoch1".to_vec()));
         // A stale epoch-0 frame no longer opens (the old key is gone → forward secrecy).
         assert!(callee.open_frame(&old).is_none(), "a pre-rekey frame is dropped after the rekey");
@@ -415,7 +432,7 @@ mod tests {
     fn a_wrong_call_secret_or_tamper_cannot_open() {
         let mut caller = MediaSession::new(&CALL_SECRET, MediaRole::Caller);
         let mut eve = MediaSession::new(&[0x99; 32], MediaRole::Callee);
-        let frame = caller.seal_frame(MediaKind::Video, b"secret call");
+        let frame = caller.seal_frame(MediaKind::Video, b"secret call").expect("a bounded plaintext always seals");
         assert!(eve.open_frame(&frame).is_none(), "the wrong call secret cannot open a frame");
         let mut callee = MediaSession::new(&CALL_SECRET, MediaRole::Callee);
         let mut bad = frame.clone();

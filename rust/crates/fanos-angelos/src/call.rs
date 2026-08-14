@@ -172,7 +172,7 @@ mod tests {
         let (accept, mut callee_media) = received.accept().expect("accept an invite");
         assert_eq!(accept, CallSignal::Accept { call: CALL });
         // Both media sessions match: a frame sealed by the caller opens for the callee.
-        let frame = caller_media.seal_frame(MediaKind::Audio, b"hello call");
+        let frame = caller_media.seal_frame(MediaKind::Audio, b"hello call").expect("a bounded plaintext always seals");
         assert_eq!(
             callee_media.open_frame(&frame),
             Some((0, MediaKind::Audio, b"hello call".to_vec())),
