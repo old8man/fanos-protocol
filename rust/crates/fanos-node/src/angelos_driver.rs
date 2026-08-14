@@ -326,8 +326,9 @@ mod tests {
         let (s_secret, s_public) = keypair(b"angelos-driver-pcs-session-halfx");
         let (mut a, hs) = fanos_angelos::session::Session::initiate(&s_public, b"seed-for-the-old-half").unwrap();
         let mut b = fanos_angelos::session::Session::respond(&s_secret, &hs).unwrap();
-        let _ = b.open(&a.seal(b"hello"));
-        let session_frame = b.seal(&Message::text([3u8; 32], [4u8; 32], 1, "reply").to_bytes());
+        let _ = b.open(&a.seal(b"hello").expect("a bounded plaintext always seals"));
+        let session_frame =
+            b.seal(&Message::text([3u8; 32], [4u8; 32], 1, "reply").to_bytes()).expect("a bounded plaintext always seals");
         println!("session frame: {} bytes, leading byte {}", session_frame.len(), session_frame.first().copied().unwrap_or(255));
         assert!(
             session_frame.len() < 1024,
