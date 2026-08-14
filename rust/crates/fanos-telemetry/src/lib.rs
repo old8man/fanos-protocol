@@ -33,6 +33,12 @@
 //! distributed collection, and the monitor WebSocket) build on these.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// `variant_count` pins two widths that nothing else holds: this crate's wire vocabularies against
+// `fanos-diakrisis`'s computed ones, and each vocabulary against the bit-field that has to carry it. Both
+// are silent failures otherwise — a drifted vocabulary decodes as the wrong state, an outgrown one gets
+// masked into an existing state. Nightly is pinned deliberately; `fanos-wire` and `fanos-ports` use the
+// same feature for the same reason.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;

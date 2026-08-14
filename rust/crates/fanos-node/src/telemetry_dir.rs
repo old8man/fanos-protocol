@@ -528,6 +528,19 @@ pub struct Census {
     silent: usize,
     /// Coordinates whose read did not conclude. **Not** a negative and not evidence of anything — a timeout.
     unreachable: usize,
+    /// Coordinates that answered with a frame whose **alarm encoding this build does not know** (#333).
+    ///
+    /// A third kind of non-reading, and it belongs beside the other two rather than among the levels. The
+    /// alarm field is two bits and the vocabulary has three values, so encoding `3` is reserved: a peer
+    /// running a build with a fourth level publishes it honestly and this census cannot name it. Folding
+    /// that into `Structure` would let a peer that is merely *newer* count as a sick cell and, at scale,
+    /// carry the network-wide verdict — a majority manufactured out of a version skew.
+    ///
+    /// **A subset of [`answering_coordinates`](Self::answering_coordinates), not a sibling of it**: the
+    /// coordinate did answer, which is a fact about reachability and stays counted as one. What it did not
+    /// do is contribute a level, so it never reaches `cells`. That is why [`Census::asked`] does not add it
+    /// — doing so would count one coordinate twice.
+    unintelligible: usize,
     /// The observer's own cell, read **exactly** from its own reflexive loop rather than through the export.
     own: Option<OwnReading>,
 }
@@ -611,6 +624,11 @@ impl core::fmt::Display for Census {
         writeln!(f, "cells_whose_members_disagreed: {}", self.disagreed())?;
         writeln!(f, "coordinates_silent: {}", self.silent)?;
         writeln!(f, "coordinates_unreachable: {}", self.unreachable)?;
+        // The third non-reading, printed with the other two rather than among the cell counts: these
+        // coordinates ARE inside `coordinates_answering` above (they answered), and are absent from every
+        // `*_cells` line (they contributed no level). A non-zero value here on a network that is otherwise
+        // healthy means peers are running a build ahead of this one — an upgrade signal, not an alarm.
+        writeln!(f, "coordinates_unintelligible: {}", self.unintelligible)?;
         // The two lines that say which epistemology the own-cell level came from. `unknown` is not "healthy"
         // and not "alarmed" — it is this node having no observation window of its own yet, in which case
         // every level above is a model's.
@@ -657,10 +675,15 @@ impl Census {
             answering_coordinates: 0,
             silent: 0,
             unreachable: 0,
-            own: own.map(|f| OwnReading {
-                id: f.cell_id,
-                level: f.alarm(),
-                export_disagreed: false,
+            unintelligible: 0,
+            // A local frame whose own alarm encoding this build cannot read is not a peer running ahead —
+            // it is this build failing to read what it just wrote, so there is no "newer vocabulary" story
+            // to tell about it. It therefore collapses to the state that already exists and already renders:
+            // no local reading, printed as `own_cell_local_level: unknown`. `and_then` rather than an
+            // `unwrap_or` because inventing a level for the observer's own cell is exactly the substitution
+            // #278 removed.
+            own: own.and_then(|f| {
+                f.alarm().map(|level| OwnReading { id: f.cell_id, level, export_disagreed: false })
             }),
         }
     }
@@ -778,7 +801,14 @@ impl Census {
         match read {
             Read::Found(frame) => {
                 self.answering_coordinates += 1;
-                let level = frame.alarm();
+                // The gate is the ALARM, not `fully_understood()`, and the narrower question is the right
+                // one: this census reads exactly one field, so refusing a frame because its *regime*
+                // encoding is unknown would discard a level it can read perfectly well. A guard wider than
+                // what it guards throws away good readings to look thorough.
+                let Some(level) = frame.alarm() else {
+                    self.unintelligible += 1;
+                    return;
+                };
                 if let Some(own) = self.own.as_mut()
                     && own.id == frame.cell_id
                 {
@@ -895,6 +925,67 @@ mod census_tests {
             Verdict::SingleCell(AlarmLevel::Healthy),
             "twenty unreachable coordinates must not vote — and one healthy answer is not a network reading"
         );
+    }
+
+    /// **A peer whose alarm encoding this build cannot read is not a sick cell** (#333).
+    ///
+    /// This is the assertion the whole change exists for. The alarm field is two bits and the vocabulary has
+    /// three values, so encoding `3` is reserved for a fourth level. Before the fix the decoder's catch-all
+    /// arm read it as `Structure` — the most severe value it can name — so three peers running a build one
+    /// version ahead would have carried this census to `NetworkWide`: **a network-wide alarm manufactured
+    /// out of a version skew, with every input honest.**
+    ///
+    /// The fixture is deliberately at the majority: three unreadable against one healthy. Two would leave
+    /// the verdict `NotNetworkWide` either way and the test could not tell the fix from its absence
+    /// (a discrimination that needs the inputs to differ in the outcome, not merely in the reading).
+    #[test]
+    fn a_peer_speaking_an_alarm_this_build_cannot_read_is_counted_apart_from_the_alarmed() {
+        let mut c = Census::new(None);
+        for i in 0..3u8 {
+            // `frame_of` packs `alarm << ALARM_SHIFT`; 3 is the reserved encoding.
+            c.observe(&Read::Found(frame_of(CellId([i; 16]), 3)));
+        }
+        c.observe(&Read::Found(frame_of(CellId([9u8; 16]), 0)));
+
+        assert_eq!(c.unintelligible, 3, "each unreadable frame is counted, once, as its own kind");
+        assert_eq!(
+            c.answering_coordinates, 4,
+            "they ANSWERED — an unreadable verdict is a fact about vocabulary, not about reachability, and \
+             folding it into silence would make an upgraded peer look like a dead one"
+        );
+        assert_eq!(c.asked(), 4, "and they are not double-counted: `asked` does not add `unintelligible`");
+        assert_eq!(
+            c.answering_cells(),
+            1,
+            "only the readable frame names a cell this census can state a level for"
+        );
+        assert_eq!(
+            c.verdict(),
+            Verdict::SingleCell(AlarmLevel::Healthy),
+            "the three unreadable frames contribute NO level, so one cell answered — before the fix they \
+             decoded as `Structure` and this same fixture returned `NetworkWide`"
+        );
+        assert!(
+            format!("{c}").contains("coordinates_unintelligible: 3"),
+            "and the count reaches an operator, or it is a number nothing reads"
+        );
+    }
+
+    /// The negative control for the test above: an ordinary census reports zero unintelligible frames.
+    ///
+    /// Without it, `unintelligible` could be incremented on every frame and both tests would still pass —
+    /// the counter has to be able to stay at zero to mean anything when it is not.
+    #[test]
+    fn a_census_of_readable_frames_reports_nothing_unintelligible() {
+        let mut c = Census::new(None);
+        for i in 0..3u8 {
+            c.observe(&Read::Found(frame_of(CellId([i; 16]), 2)));
+        }
+        c.observe(&Read::Absent);
+        c.observe(&Read::Unknown);
+        assert_eq!(c.unintelligible, 0, "every frame here uses an encoding this build knows");
+        assert_eq!(c.verdict(), Verdict::NetworkWide, "and the readable alarms still carry the verdict");
+        assert!(format!("{c}").contains("coordinates_unintelligible: 0"));
     }
 
     #[test]

@@ -167,14 +167,14 @@ fn the_export_substitutes_a_flat_cell_and_that_costs_a_whole_regime() {
     // whose pairwise couplings are not all equal reads differently", which is every real cell.
     assert_eq!(
         (exact.regime(), exported.regime()),
-        (Regime::OverCoupled, Regime::CollectiveSubject),
+        (Some(Regime::OverCoupled), Some(Regime::CollectiveSubject)),
         "the measured cost changed. The docs quote this exact flip — a cell the reflex calls over-coupled \
          exports as a healthy collective subject — and if the pair has moved, `privatize`'s doc, the dp \
          module header and docs/design-telemetry.md §DP are all now wrong (#222)"
     );
     assert_eq!(
         exported.alarm(),
-        AlarmLevel::Healthy,
+        Some(AlarmLevel::Healthy),
         "the exported alarm is Healthy here — worth pinning, because `Census` reads `alarm()`, not \
          `regime()`, so this is the field that decides the network-wide verdict"
     );
@@ -458,7 +458,15 @@ fn measure_whether_the_export_can_hide_a_real_alarm_or_only_invent_one() {
                 let g = cell_shaped(lambda, line_w, rest_w);
                 let exact = CoherenceFrame::observe(CellId([7; 16]), 3, &g, 0, 0.0, -1, 0, true);
                 let exported = exact.privatize(PrivacyBudget::new(1e9), &mut Still);
-                let (a, b) = (exact.alarm(), exported.alarm());
+                // Unwrapped, and legitimately: both frames were produced by THIS build — `observe` encodes
+                // the exact one and `privatize` re-encodes it — so an encoding neither can read back would
+                // be a defect in this crate rather than a peer speaking a newer dialect. The sweep is about
+                // the export's error direction, and swallowing an unreadable frame here would silently
+                // shrink the denominator it reports.
+                let (a, b) = (
+                    exact.alarm().expect("this build encoded the exact frame"),
+                    exported.alarm().expect("privatize re-encodes into the same vocabulary"),
+                );
                 if severity(a) > 0 {
                     alarmed_exact += 1;
                 }

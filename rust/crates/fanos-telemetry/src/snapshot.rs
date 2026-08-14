@@ -121,9 +121,27 @@ pub struct CoherenceSnapshot {
     /// approached); see `stability::stability_radius` for the derivation and the measured error table.
     pub stability_radius: f64,
     /// The collective-subject band classification.
+    ///
+    /// Not optional, deliberately, and [`verdict_understood`](Self::verdict_understood) is why: an encoding
+    /// this build does not know is coerced *here*, once, to the most severe value in the vocabulary, and the
+    /// coercion is reported beside the value rather than hidden inside it.
     pub regime: Regime,
-    /// The leading-indicator alarm level.
+    /// The leading-indicator alarm level. Same coercion rule as [`regime`](Self::regime).
     pub alarm: AlarmLevel,
+    /// **Whether every field of the source frame's verdict byte was an encoding this build knows.**
+    ///
+    /// `false` means the frame came from a peer whose vocabulary is ahead of this one's — a reserved regime
+    /// or alarm encoding, or a flag in the verdict byte's unused high bits. When it is `false`,
+    /// [`regime`](Self::regime) and [`alarm`](Self::alarm) still carry a value, and that value is the most
+    /// severe one this build can name. **That direction is chosen, not incidental**: #278 measured the two
+    /// ways this can go wrong and found silence to be the dangerous one, so an unrecognised frame errs
+    /// toward a false alarm an operator will investigate, never toward a quiet "healthy" it will not.
+    ///
+    /// It is a separate observable rather than an `Option` on the two fields for the reason
+    /// [`CoherenceFrame::correlation_is_measured`] already established (#154): making the *value* optional
+    /// pushes a fallback decision onto all fourteen of its readers, each free to invent a different one,
+    /// while a companion flag leaves the value's meaning intact and lets exactly the readers that care ask.
+    pub verdict_understood: bool,
     /// Whether a node fault is localized (`syndrome ≠ 0`).
     pub faulted: bool,
     /// The 3-bit fault syndrome (which points are degraded).
@@ -188,8 +206,13 @@ impl CoherenceSnapshot {
             mean_correlation,
             spectral_gap: f64::from(frame.gap),
             stability_radius: stability_radius_exact(purity, alive.max(1) as usize),
-            regime: frame.regime(),
-            alarm: frame.alarm(),
+            // The ONE place an unknown encoding is coerced, and it is written out rather than left to a
+            // catch-all arm in the decoder. `unwrap_or` here reads as an assertion about the direction of
+            // the error: toward the most severe value, never toward healthy (#278). Whether the coercion
+            // happened at all is `verdict_understood` below.
+            regime: frame.regime().unwrap_or(Regime::OverCoupled),
+            alarm: frame.alarm().unwrap_or(AlarmLevel::Structure),
+            verdict_understood: frame.fully_understood(),
             faulted,
             syndrome: frame.syndrome,
             cascade_lead: frame.forecast,
@@ -286,6 +309,11 @@ impl CoherenceSnapshot {
         push_num(&mut s, "stability_radius", self.stability_radius);
         let _ = write!(s, "\"regime\":\"{}\",", self.regime.as_str());
         let _ = write!(s, "\"alarm\":\"{}\",", self.alarm.as_str());
+        // Emitted next to the two values it qualifies, so an agent reading this object cannot take
+        // `regime`/`alarm` at face value without also being told whether they were understood. A monitor
+        // that ignores it reads exactly what it read before the field existed — the coerced value — which
+        // is why adding it is compatible rather than breaking.
+        let _ = write!(s, "\"verdict_understood\":{},", self.verdict_understood);
         let _ = write!(s, "\"faulted\":{},", self.faulted);
         let _ = write!(s, "\"syndrome\":{},", self.syndrome);
         let _ = write!(s, "\"cascade_lead\":{},", self.cascade_lead);
@@ -482,6 +510,41 @@ mod tests {
             "R floor = 1/3"
         );
         // The band ordering `r* < 1/√3` is now a compile-time `const _` assertion above.
+    }
+
+    /// **An encoding this build cannot read errs toward alarm, and the snapshot says that it did** (#333).
+    ///
+    /// Two claims in one test because they are one decision: keeping `regime`/`alarm` non-optional is only
+    /// defensible *because* the coercion is reported beside them. Assert either alone and the pair can drift
+    /// — a fallback that quietly flips to `Healthy` would still satisfy "the field is always populated".
+    ///
+    /// The direction is not a preference. #278 measured the two ways a telemetry verdict can be wrong and
+    /// found silence to be the dangerous one: an invented alarm gets investigated, a hidden one does not. So
+    /// an unrecognised frame reads as the most severe value in each vocabulary — and `verdict_understood`
+    /// is what stops that from being indistinguishable from a genuinely alarmed cell.
+    #[test]
+    fn an_unreadable_verdict_errs_toward_alarm_and_says_that_it_did() {
+        let mut f = frame(0.5);
+        // Both fields carry the reserved encoding 3 — a peer whose vocabulary is ahead of this build's.
+        f.verdict = (f.verdict & !0b0000_1111) | 0b0000_1111;
+        let snap = CoherenceSnapshot::from_frame(&f);
+
+        assert_eq!(snap.regime, Regime::OverCoupled, "toward the most severe regime, never toward healthy");
+        assert_eq!(snap.alarm, AlarmLevel::Structure, "and toward the most severe alarm, for the same reason");
+        assert!(
+            !snap.verdict_understood,
+            "and the snapshot reports that both values are coercions rather than readings — without this \
+             the two assertions above are indistinguishable from a cell that really is collapsing"
+        );
+        assert!(
+            snap.to_json().contains("\"verdict_understood\":false"),
+            "the flag reaches an agent through the canonical export, not only through the struct"
+        );
+
+        // The control: an ordinary frame is understood, and the SAME two fields then mean what they say.
+        let ok = CoherenceSnapshot::from_frame(&frame(0.5));
+        assert!(ok.verdict_understood);
+        assert!(ok.to_json().contains("\"verdict_understood\":true"));
     }
 
     #[test]

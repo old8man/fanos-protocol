@@ -74,6 +74,38 @@ const REGIME_MASK: u8 = 0b0000_0011;
 const ALARM_SHIFT: u8 = 2;
 const ALARM_MASK: u8 = 0b0000_1100;
 const INTEGRATED_BIT: u8 = 1 << 4;
+/// The verdict byte's unused high bits. Named so that "this build does not understand the frame" can be
+/// ONE question ([`CoherenceFrame::fully_understood`]) rather than a bit-twiddle repeated at each reader —
+/// and so that a future flag placed here is a deliberate act with a name, not a silent widening.
+const UNUSED_VERDICT_BITS: u8 = 0b1100_0000;
+
+/// **The wire vocabulary and the computed one are the same size, and each fits its field.**
+///
+/// `Regime` mirrors [`CollectiveState`] and `AlarmLevel` mirrors [`Alarm`]; `observe`'s exhaustive matches
+/// force a new *computed* state to be noticed here, but what they force the author to write is a NUMBER —
+/// and a number has to fit two bits. These four assertions say the rest out loud:
+///
+/// * a state added in `fanos-diakrisis` and not mirrored here fails the build, rather than being folded
+///   into whichever wire value the new match arm happened to pick;
+/// * a vocabulary that outgrows its field fails the build, rather than being masked into an existing
+///   value — `REGIME_MASK` cannot say "this did not fit", it can only truncate.
+const _: () = assert!(
+    core::mem::variant_count::<Regime>() == core::mem::variant_count::<CollectiveState>(),
+    "the wire's regime vocabulary and the computed one have drifted apart"
+);
+const _: () = assert!(
+    core::mem::variant_count::<AlarmLevel>() == core::mem::variant_count::<Alarm>(),
+    "the wire's alarm vocabulary and the computed one have drifted apart"
+);
+const _: () = assert!(
+    core::mem::variant_count::<Regime>() <= REGIME_MASK as usize + 1,
+    "the regime field is too narrow for its own vocabulary"
+);
+const _: () = assert!(
+    core::mem::variant_count::<AlarmLevel>() <= (ALARM_MASK >> ALARM_SHIFT) as usize + 1,
+    "the alarm field is too narrow for its own vocabulary"
+);
+
 /// Whether the correlation the scalars were computed at was **measured** rather than assumed (#154).
 ///
 /// Absent-bit means *assumed*, which is the fail-safe direction: a producer that does not set it is read as
@@ -184,24 +216,52 @@ impl CoherenceFrame {
         }
     }
 
-    /// The collective-subject regime.
+    /// The collective-subject regime, or `None` if this build does not know the encoding.
+    ///
+    /// **The field is two bits wide and the vocabulary has three values**, so encoding `3` is reserved —
+    /// the natural home for a fourth regime. It used to be folded into `OverCoupled` by a catch-all arm,
+    /// which reports a *newer peer* as *the most alarming state this build can name*, confidently and
+    /// wrongly. Same shape as [`fanos_wire::FrameType::from_code`], which has always answered `None` for a
+    /// code it does not know; the raw byte stays available in [`verdict`](Self::verdict) for a caller that
+    /// wants to report it through `Escalation::UnsupportedCritical`.
+    ///
+    /// `None` is **not** a synonym for healthy. It is not a reading at all, and a caller that folds it
+    /// into the healthy side hides the very thing the encoding was reserved to carry.
     #[must_use]
-    pub fn regime(&self) -> Regime {
-        match self.verdict & REGIME_MASK {
+    pub fn regime(&self) -> Option<Regime> {
+        Some(match self.verdict & REGIME_MASK {
             0 => Regime::Aggregate,
             1 => Regime::CollectiveSubject,
-            _ => Regime::OverCoupled,
-        }
+            2 => Regime::OverCoupled,
+            _ => return None,
+        })
     }
 
-    /// The leading-indicator alarm level.
+    /// The leading-indicator alarm level, or `None` if this build does not know the encoding.
+    ///
+    /// Two bits, three values, encoding `3` reserved — see [`regime`](Self::regime) for the whole reasoning;
+    /// this field carries it with a sharper consequence, because the alarm level is what the cell census
+    /// counts. An unknown level must be counted **beside** `silent` and `unreachable`, never among the
+    /// alarmed: counting it as sickness lets one peer that is merely newer speak for the network, which is
+    /// the rule `Census::verdict` already states for silence.
     #[must_use]
-    pub fn alarm(&self) -> AlarmLevel {
-        match (self.verdict & ALARM_MASK) >> ALARM_SHIFT {
+    pub fn alarm(&self) -> Option<AlarmLevel> {
+        Some(match (self.verdict & ALARM_MASK) >> ALARM_SHIFT {
             0 => AlarmLevel::Healthy,
             1 => AlarmLevel::Integration,
-            _ => AlarmLevel::Structure,
-        }
+            2 => AlarmLevel::Structure,
+            _ => return None,
+        })
+    }
+
+    /// Whether every field of the verdict byte is an encoding this build knows.
+    ///
+    /// The two vocabularies plus the two **unused high bits** (6-7), which `decode` does not inspect: a
+    /// future flag set there is invisible today, and a reader that wants to know whether it is looking at
+    /// a frame from a build ahead of it needs one answer, not three separate `is_none()` checks.
+    #[must_use]
+    pub fn fully_understood(&self) -> bool {
+        self.regime().is_some() && self.alarm().is_some() && self.verdict & UNUSED_VERDICT_BITS == 0
     }
 
     /// Whether the cell is integrated (`Φ ≥ 1`).
@@ -393,7 +453,7 @@ mod tests {
         assert!((f64::from(f.phi) - m.phi).abs() < 1e-6);
         assert!((f64::from(f.purity) - m.purity).abs() < 1e-6);
         assert!((f64::from(f.reflection) - m.reflection).abs() < 1e-6);
-        assert_eq!(f.regime(), Regime::CollectiveSubject);
+        assert_eq!(f.regime(), Some(Regime::CollectiveSubject));
         assert!(!f.is_faulted(), "syndrome 0 for a healthy mask");
     }
 
@@ -441,16 +501,86 @@ mod tests {
         assert_eq!(CoherenceFrame::decode(&f.encode()), Some(f));
     }
 
+    /// **A reserved encoding reads as "I do not know", not as the worst value in the vocabulary.**
+    ///
+    /// The whole point of #333: the regime field is two bits wide and the vocabulary has three values, so
+    /// encoding `3` is the natural home for a fourth regime. Before this, the catch-all arm reported it as
+    /// `OverCoupled` — a *newer* peer described as the most alarming state this build can name, with full
+    /// confidence and no way for any reader to tell.
+    ///
+    /// The two per-field assertions are deliberately separate from `fully_understood()`: a reader that
+    /// needs only the alarm must still get it, so the unknown regime must NOT poison the alarm beside it.
+    #[test]
+    fn a_reserved_regime_encoding_is_unknown_rather_than_the_worst_known_value() {
+        let mut f = sample_frame();
+        f.verdict = (f.verdict & !REGIME_MASK) | 3;
+        assert_eq!(f.regime(), None, "encoding 3 is not a regime this build knows");
+        assert!(
+            f.alarm().is_some(),
+            "the alarm field is independent and must survive an unknown regime — a reader that needs only \
+             the alarm is not blocked by a vocabulary it does not use"
+        );
+        assert!(!f.fully_understood(), "and the frame as a whole is not fully understood");
+    }
+
+    /// The same, one field over — and it matters more, because the cell census reads the alarm and nothing
+    /// else. (`fanos_node::telemetry_dir::Census`, named rather than linked: that crate depends on this one,
+    /// not the reverse, so rustdoc has nothing here to resolve the path against.)
+    #[test]
+    fn a_reserved_alarm_encoding_is_unknown_rather_than_the_worst_known_value() {
+        let mut f = sample_frame();
+        f.verdict = (f.verdict & !ALARM_MASK) | (3 << ALARM_SHIFT);
+        assert_eq!(f.alarm(), None, "encoding 3 is not an alarm level this build knows");
+        assert!(f.regime().is_some(), "the regime field is independent and survives");
+        assert!(!f.fully_understood(), "and the frame as a whole is not fully understood");
+    }
+
+    /// **The unused high bits are part of the question, and this is the half no per-field check can give.**
+    ///
+    /// Both vocabularies read cleanly here, so `regime()` and `alarm()` are both `Some` and every
+    /// field-level check passes — yet the frame carries a flag in bits 6-7 that this build does not know
+    /// exists. That is precisely the case `fully_understood()` was added for: a reader asking "am I looking
+    /// at a frame from a build ahead of mine" cannot answer it by testing the two values.
+    #[test]
+    fn a_flag_in_the_unused_high_bits_makes_a_frame_not_fully_understood() {
+        let mut f = sample_frame();
+        f.verdict |= UNUSED_VERDICT_BITS & 0b0100_0000;
+        assert!(f.regime().is_some(), "the regime still reads — this is the control");
+        assert!(f.alarm().is_some(), "and so does the alarm — also the control");
+        assert!(
+            !f.fully_understood(),
+            "but a bit this build does not know is set, so the frame is not fully understood; without \
+             this the predicate would be nothing more than `regime().is_some() && alarm().is_some()`"
+        );
+    }
+
+    /// The negative control for the three above: an ordinary frame this build produced is fully understood.
+    ///
+    /// Without it the three assertions prove only that `fully_understood()` can return `false`, which a
+    /// function returning a constant `false` would also satisfy.
+    #[test]
+    fn a_frame_this_build_produced_is_fully_understood() {
+        let f = sample_frame();
+        assert!(f.fully_understood());
+        assert!(f.regime().is_some() && f.alarm().is_some());
+    }
+
     #[test]
     fn verdict_packing_round_trips_through_accessors() {
         let f = sample_frame();
         // Reconstruct the packed byte from the accessors and compare.
-        let regime = match f.regime() {
+        //
+        // The two matches stay EXHAUSTIVE on purpose — that is what makes a fourth variant fail the build
+        // here rather than pick up a number silently. Unwrapping is legitimate at exactly this site and
+        // nowhere else: the frame was produced by this build's own encoder, so an encoding it cannot read
+        // back would mean `observe` and the accessors disagree, which is a defect and should panic loudly
+        // rather than be absorbed by a fallback.
+        let regime = match f.regime().expect("this build encoded the frame, so it can read its regime") {
             Regime::Aggregate => 0u8,
             Regime::CollectiveSubject => 1,
             Regime::OverCoupled => 2,
         };
-        let alarm = match f.alarm() {
+        let alarm = match f.alarm().expect("this build encoded the frame, so it can read its alarm") {
             AlarmLevel::Healthy => 0u8,
             AlarmLevel::Integration => 1,
             AlarmLevel::Structure => 2,
