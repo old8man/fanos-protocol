@@ -2165,6 +2165,7 @@ mod tests {
     ///    node would have gone from too loud to blind.
     #[test]
     fn a_peer_mints_one_escalation_per_pair_and_the_station_still_counts_every_frame() {
+        const FRAMES: usize = 10;
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
             OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
@@ -2173,7 +2174,7 @@ mod tests {
         // `0x1F` and `0x1D`: the predicate's own test names `0x10`/`0x1F` as membership-group codes, and this
         // build knows `0x11`–`0x1C` — so exactly four codes are unknown-and-critical, which is what bounds
         // the dedup set to `4 × (q²+q+1)` without a cap of its own.
-        let mut escalations = |node: &mut OverlayNode<F2>, code: u64, frames: usize, t0: u64| {
+        let escalations = |node: &mut OverlayNode<F2>, code: u64, frames: usize, t0: u64| {
             (0..frames)
                 .map(|i| {
                     let mut frame = Vec::new();
@@ -2193,7 +2194,6 @@ mod tests {
                 .sum::<usize>()
         };
 
-        const FRAMES: usize = 10;
         assert_eq!(
             escalations(&mut node, 0x1F, FRAMES, 0),
             1,
@@ -4306,8 +4306,8 @@ mod tests {
         // The honest reply: a full-size shard, this epoch's version, first contribution.
         assert_eq!(ReadRefusal::of(MAX_VALUE_LEN, 9, 9, quota - 1), None);
         // Distinct tags and distinct names, or the operator reads two rules as one.
-        let tags: alloc::collections::BTreeSet<u64> = ReadRefusal::ALL.iter().map(|r| r.tag()).collect();
-        let names: alloc::collections::BTreeSet<&str> = ReadRefusal::ALL.iter().map(|r| r.name()).collect();
+        let tags: BTreeSet<u64> = ReadRefusal::ALL.iter().map(|r| r.tag()).collect();
+        let names: BTreeSet<&str> = ReadRefusal::ALL.iter().map(|r| r.name()).collect();
         assert_eq!(tags.len(), ReadRefusal::ALL.len(), "tags collide");
         assert_eq!(names.len(), ReadRefusal::ALL.len(), "names collide");
     }
