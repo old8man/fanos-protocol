@@ -29,7 +29,8 @@
 use fanos_core::roles::Role;
 use fanos_field::Field;
 use fanos_geometry::Triple;
-use fanos_keygen::BeaconNode;
+use fanos_keygen::{BeaconNode, BeaconRefusal};
+use fanos_runtime::ports::stations::{Observation, Station};
 use fanos_runtime::{Command, Effect, Engine, Epoch, Input, Instant, Notification, OverlayNode};
 use fanos_wire::{FrameType, decode_frame};
 
@@ -170,7 +171,39 @@ impl<F: Field> Engine for OverlayBeaconNode<F> {
             }
             // Only the overlay arms timers (the beacon is frame/tick-driven).
             Input::Timer(_) => self.overlay.step(now, input),
-            // Send, Put, Get, Join, Diagnose, Observe, ... are all the overlay's.
+            // **`Observe` is the composite's, not the overlay's alone** (#327). The overlay answers it with
+            // its own `DataPath`, and the beacon's twelve refusal counters were not in it — they were read by
+            // nothing in production at all, so a cell drowning in forged reshare triggers looked exactly like
+            // a healthy one on every instrument an operator has.
+            //
+            // An aggregate rather than a per-refusal `Effect`, deliberately: most of these rise on frames a
+            // peer chooses to send, and a per-event report would hand a remote party the rate of the node's
+            // loudest channel — the amplification #341 measured at 1:1 and removed. Here the operator pulls,
+            // so no tick and no liveness requirement arise; the earlier plan for this task wanted a periodic
+            // tick and was wrong about needing one.
+            //
+            // No delta bookkeeping: `Observe` is a LEVEL read and these counters are monotone, so the total
+            // *is* the answer. A driver diffing against a remembered snapshot would report "since I last
+            // looked", which is a different question and one nobody asked.
+            Input::Command(Command::Observe) => {
+                let mut effects = self.overlay.step(now, Input::Command(Command::Observe));
+                let rejects = self.beacon.rejects();
+                for effect in &mut effects {
+                    if let Effect::Notify(Notification::DataPath { stations, .. }) = effect {
+                        stations.extend(BeaconRefusal::ALL.iter().filter_map(|&class| {
+                            let count = rejects.count(class);
+                            (count > 0).then_some(Observation {
+                                station: Station::BeaconRefused,
+                                line: None,
+                                tag: Some(class.index()),
+                                count,
+                            })
+                        }));
+                    }
+                }
+                effects
+            }
+            // Send, Put, Get, Join, Diagnose, ... are the overlay's.
             Input::Command(cmd) => self.overlay.step(now, Input::Command(cmd)),
         }
     }
@@ -195,6 +228,11 @@ mod tests {
     use fanos_runtime::Config as OverlayConfig;
     use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare, deal};
 
+    // A frame that decodes as nothing: the overlay's `FrameDecodeFailed` gate.
+    fn alloc_vec_garbage() -> Vec<u8> {
+        vec![0xFF, 0xFF, 0xFF]
+    }
+
     const T: usize = 4; // 4-of-7 beacon threshold (a full Fano cell of anchors, stands for a done DKG)
 
     // Deal the beacon key across the 7-node cell. A fixed secret + deterministic RNG keeps the test
@@ -206,6 +244,72 @@ mod tests {
     // The test's router: map a flooded frame's destination coordinate back to its Fano-cell index.
     fn node_at(to: Triple) -> Option<usize> {
         (0..7).find(|&i| Point::<F2>::at(i).coords() == to)
+    }
+
+    /// **The beacon's refusals reach an operator, tagged by class** (#327).
+    ///
+    /// Twelve counters existed and `.rejects()` had **zero non-test callers** — a cell being flooded with
+    /// unparseable beacon frames and a cell running perfectly produced identical output on every instrument
+    /// a deployment has. The channel was never missing; the beacon simply was not on it. `Observe` already
+    /// reached this composite and fell straight through to the overlay, which answered with its own stations
+    /// and nothing else.
+    ///
+    /// Three assertions, and the second is the one that makes the counter worth printing:
+    /// 1. the refusal appears at all, under `Station::BeaconRefused`;
+    /// 2. it carries the CLASS as its tag — `partial_malformed` and `round_malformed` are different
+    ///    problems, and an untagged total would put them in one bucket;
+    /// 3. the overlay's own stations are still there. Appending must not replace: a fix that reported the
+    ///    beacon by losing the overlay would trade one blindness for another.
+    #[test]
+    fn a_beacon_refusal_reaches_the_operator_tagged_with_its_class() {
+        let (shares, commitment) = beacon_key();
+        let overlay = OverlayNode::<F2>::new(Point::at(0), OverlayConfig::default());
+        let beacon = BeaconNode::<F2>::new(
+            Point::at(0),
+            Some(shares[0].clone()),
+            commitment.clone(),
+            T,
+            BeaconSeed::GENESIS,
+        );
+        let mut node = OverlayBeaconNode::new(overlay, beacon);
+
+        // A BEACON_PARTIAL frame whose body does not parse: the engine's `partial_malformed` gate, reached
+        // through the composite's real routing rather than by poking the engine directly.
+        let mut frame = Vec::new();
+        fanos_wire::encode_frame(FrameType::BeaconPartial.code(), &[0xFF, 0xFF], &mut frame);
+        node.step(Instant(0), Input::Message { from: Point::<F2>::at(1).coords(), frame });
+
+        // And one frame the OVERLAY refuses, so the third assertion has something to be about. Without it
+        // that control passes vacuously on a fresh node — which is how this test first failed: the overlay
+        // had no non-zero station of its own, so "appending, not replacing" was unfalsifiable rather than
+        // false. A control whose precondition is not established checks nothing.
+        node.step(
+            Instant(1),
+            Input::Message { from: Point::<F2>::at(2).coords(), frame: alloc_vec_garbage() },
+        );
+
+        let stations = node
+            .step(Instant(2), Input::Command(Command::Observe))
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations),
+                _ => None,
+            })
+            .expect("Observe answers with the data-path plane");
+
+        let refusals: Vec<_> =
+            stations.iter().filter(|o| o.station == Station::BeaconRefused && o.count > 0).collect();
+        assert_eq!(refusals.len(), 1, "exactly one refusal class fired: {stations:?}");
+        assert_eq!(
+            refusals[0].tag,
+            Some(BeaconRefusal::PartialMalformed.index()),
+            "and it names WHICH class — an untagged total cannot tell a malformed partial from a malformed \
+             round, which are different problems"
+        );
+        assert!(
+            stations.iter().any(|o| o.station != Station::BeaconRefused),
+            "the overlay's own stations must survive: appending, not replacing"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@
 pub mod beacon;
 pub mod recovery;
 pub use beacon::BeaconNode;
+pub use beacon::BeaconRefusal;
 pub use recovery::{RecoveryAuthorization, RgcFormat};
 
 use std::collections::{BTreeMap, BTreeSet};

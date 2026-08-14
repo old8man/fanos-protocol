@@ -95,6 +95,88 @@ const MIN_RESHARE_THRESHOLD: usize = 2;
 /// coordinate VRF, activation heights, mix-key rotation and rendezvous meeting lines all derive from it, so a
 /// beacon that stalls stalls everything and the cause has to be readable.
 ///
+/// **The beacon's refusal vocabulary** — one variant per counter in [`BeaconRejects`], with a dense index
+/// so a station can carry *which* refusal rather than a bare total (#327).
+///
+/// It lives here, in the crate that owns the concept, for the same reason `fanos_wire::ProtocolError` and
+/// `fanos_diaulos::Ingest` live in theirs: `fanos-node`'s tag-name resolver imports every vocabulary it
+/// prints, and a copy in the resolver would be a second spelling of one fact. (`fanos-keygen` depends on
+/// `fanos-ports`, never the reverse — checked both `Cargo.toml`s — so the vocabulary could not live beside
+/// `Station` even if that looked tidier.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum BeaconRefusal {
+    /// A reshare trigger arrived and this cell has no recovery authority — a provisioning gap.
+    ReshareNoAuthority,
+    /// A reshare trigger whose authority signature did not verify: forged, foreign, or tampered.
+    ReshareForged,
+    /// A reshare trigger this build could not parse (the envelope decoded, the body did not).
+    ReshareMalformed,
+    /// A buffered future-epoch partial set discarded at `MAX_PENDING_EPOCHS`.
+    PartialEpochEvicted,
+    /// A frame that did not decode at all, so its type was never read.
+    FrameUndecodable,
+    /// A partial for an epoch this node has already adopted — benign, and expected to be nonzero.
+    PartialStale,
+    /// A partial whose DLEQ proof did not verify against the group commitment.
+    PartialUnverified,
+    /// A partial frame whose body did not parse.
+    PartialMalformed,
+    /// A round body that did not parse.
+    RoundMalformed,
+    /// A round that did not verify against the group commitment.
+    RoundUnverified,
+    /// An assembled round that failed its own verification at the assembly gate.
+    AssemblyUnverified,
+    /// This node's own share does not match the commitment it was provisioned with.
+    ShareMismatched,
+}
+
+impl BeaconRefusal {
+    /// Every variant, in dense-index order. Complete by construction: [`BeaconRejects::count`] destructures
+    /// its struct with **no `..`**, so a new counter is a compile error there, and the `const _` below pins
+    /// this list against that struct's own field count.
+    pub const ALL: [Self; 12] = [
+        Self::ReshareNoAuthority,
+        Self::ReshareForged,
+        Self::ReshareMalformed,
+        Self::PartialEpochEvicted,
+        Self::FrameUndecodable,
+        Self::PartialStale,
+        Self::PartialUnverified,
+        Self::PartialMalformed,
+        Self::RoundMalformed,
+        Self::RoundUnverified,
+        Self::AssemblyUnverified,
+        Self::ShareMismatched,
+    ];
+
+    /// The dense tag index — the station's tag, resolved back to [`name`](Self::name) by `fanos-node`.
+    #[must_use]
+    pub fn index(self) -> u64 {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as u64
+    }
+
+    /// The operator-facing name, matching the counter's field name so a reader can find it in the source.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ReshareNoAuthority => "reshare_no_authority",
+            Self::ReshareForged => "reshare_forged",
+            Self::ReshareMalformed => "reshare_malformed",
+            Self::PartialEpochEvicted => "partial_epoch_evicted",
+            Self::FrameUndecodable => "frame_undecodable",
+            Self::PartialStale => "partial_stale",
+            Self::PartialUnverified => "partial_unverified",
+            Self::PartialMalformed => "partial_malformed",
+            Self::RoundMalformed => "round_malformed",
+            Self::RoundUnverified => "round_unverified",
+            Self::AssemblyUnverified => "assembly_unverified",
+            Self::ShareMismatched => "share_mismatched",
+        }
+    }
+}
+
 /// Counters, not logs: this crate is `no_std` and sans-I/O, with nowhere to write.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BeaconRejects {
@@ -177,6 +259,46 @@ pub struct BeaconRejects {
     /// Rises once per epoch for as long as the file is wrong, because the fault is permanent and the check is
     /// at the point of use; the *rate* is the epoch clock and carries no information beyond "still wrong".
     pub share_mismatched: u64,
+}
+
+impl BeaconRejects {
+    /// The count for one refusal class.
+    ///
+    /// **The destructure carries no `..`, and that is the mechanism** (#193's shape). A thirteenth counter
+    /// added to the struct makes this function stop compiling, so it cannot be introduced and silently left
+    /// out of the operator's view — which is the failure this whole wiring exists to end, since every one of
+    /// these twelve was already counted and read by nothing in production before #327.
+    #[must_use]
+    pub fn count(&self, of: BeaconRefusal) -> u64 {
+        let Self {
+            reshare_no_authority,
+            reshare_forged,
+            reshare_malformed,
+            partial_epoch_evicted,
+            frame_undecodable,
+            partial_stale,
+            partial_unverified,
+            partial_malformed,
+            round_malformed,
+            round_unverified,
+            assembly_unverified,
+            share_mismatched,
+        } = self;
+        match of {
+            BeaconRefusal::ReshareNoAuthority => *reshare_no_authority,
+            BeaconRefusal::ReshareForged => *reshare_forged,
+            BeaconRefusal::ReshareMalformed => *reshare_malformed,
+            BeaconRefusal::PartialEpochEvicted => *partial_epoch_evicted,
+            BeaconRefusal::FrameUndecodable => *frame_undecodable,
+            BeaconRefusal::PartialStale => *partial_stale,
+            BeaconRefusal::PartialUnverified => *partial_unverified,
+            BeaconRefusal::PartialMalformed => *partial_malformed,
+            BeaconRefusal::RoundMalformed => *round_malformed,
+            BeaconRefusal::RoundUnverified => *round_unverified,
+            BeaconRefusal::AssemblyUnverified => *assembly_unverified,
+            BeaconRefusal::ShareMismatched => *share_mismatched,
+        }
+    }
 }
 
 /// A node running the distributed randomness beacon over its cell.

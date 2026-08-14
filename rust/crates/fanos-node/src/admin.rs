@@ -436,6 +436,13 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
             .ok()
             .and_then(|i| fanos_diaulos::Ingest::ALL.get(i))
             .map(|o| o.name()),
+        // A dense index into `BeaconRefusal::ALL` (#327), the same shape as the arm above and resolved the
+        // same way. Twelve refusal classes that the beacon engine had been counting all along and nothing in
+        // production read.
+        Station::BeaconRefused => usize::try_from(tag)
+            .ok()
+            .and_then(|i| fanos_keygen::BeaconRefusal::ALL.get(i))
+            .map(|r| r.name()),
         Station::ReadShardRefused => {
             fanos_runtime::ReadRefusal::ALL.iter().find(|r| r.tag() == tag).map(|r| r.name())
         }

@@ -840,6 +840,18 @@ pub enum Station {
     /// conformance vector, so a peer speaking the other one lands precisely here. A rise means the two ends
     /// disagree about the format of the message that explains disagreements.
     PeerRefusalUnreadable,
+    /// The **beacon engine refused a frame** — tagged with which of its twelve refusal classes
+    /// ([`fanos_keygen::BeaconRefusal`]).
+    ///
+    /// Every one of those twelve was already counted, and read by **nothing in production**: `.rejects()` had
+    /// zero non-test callers, so a cell being flooded with forged reshare triggers and a cell running
+    /// perfectly looked identical on every instrument an operator has (#327).
+    ///
+    /// It is an aggregate on purpose, not an `Escalation` per refusal. Most of these are driven by frames a
+    /// peer chooses to send — `reshare_forged` rises *exactly* when a signature fails to verify — so a
+    /// per-event report would let a remote party set the rate of the node's loudest channel, which is the
+    /// defect #341 measured at 1:1 and removed one layer up.
+    BeaconRefused,
 }
 
 /// What a station's [`Observation::tag`] *means* — declared where the station is, so a reader outside this
@@ -962,6 +974,7 @@ impl Station {
         Self::ExitSocketUnavailable,
         Self::PeerRefused,
         Self::PeerRefusalUnreadable,
+        Self::BeaconRefused,
     ];
 
     /// A short stable name, for a human-facing readout. Stable because an operator's saved query should
@@ -1042,6 +1055,7 @@ impl Station {
             Self::ExitSocketUnavailable => "exit.socket_unavailable",
             Self::PeerRefused => "peer.refused",
             Self::PeerRefusalUnreadable => "peer.refusal_unreadable",
+            Self::BeaconRefused => "beacon.refused",
         }
     }
 
@@ -1072,6 +1086,7 @@ impl Station {
             | Self::ActorDied                 // fanos_quic::DriverActor
             | Self::RestrictedFrameDropped    // fanos_wire::FrameType
             | Self::SessionIngestDropped      // fanos_diaulos::Ingest (dense index)
+            | Self::BeaconRefused             // fanos_keygen::BeaconRefusal (dense index)
             => TagKind::Vocabulary,
 
             // --- The tag is a number that means itself. ---
