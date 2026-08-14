@@ -40,6 +40,14 @@ pub enum Ablation {
     Blind,
 }
 
+/// `Ablation::ALL` is what the panel runs (`panel.rs`). An ablation missing from it is a hypothesis
+/// the gate never tested, and the panel reports the same pass either way — the worst shape for a
+/// list whose whole job is to try to break the thing that grades this platform.
+const _: () = assert!(
+    Ablation::ALL.len() == core::mem::variant_count::<Ablation>(),
+    "an Ablation variant is missing from Ablation::ALL, so the panel never runs it"
+);
+
 impl Ablation {
     /// All four ablations.
     pub const ALL: [Ablation; 4] =

@@ -58,6 +58,11 @@
 //! This is a **build/CI gate**, not a consensus path: `Γ` is evaluated once on the host to decide
 //! whether to ship. `f64` here reproduces the reference lab bit-for-bit and carries no determinism or
 //! DoS obligation — unlike the DIAKRISIS *runtime* diagnostics, which stay off `f64` on the hot path.
+// `variant_count` makes the alphabet's size a COMPILE-TIME cross-check against the theory: `N` and
+// `FLOWS` are the UHM's septicity and the T-262 trichotomy, and the enums must agree with them. The
+// direction matters — the theory owns the number, the enum answers to it. Nightly is pinned deliberately
+// (`rust-toolchain.toml`); `fanos-wire` and `fanos-ports` use the same feature for the same reason.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 // The whole crate is a 7×7 / 3-flow dense-matrix kernel: every index is an `Aspect`/`Flow` ordinal
 // (`0..7` / `0..3`) against a compile-time-fixed array, so slicing is provably in bounds, and the

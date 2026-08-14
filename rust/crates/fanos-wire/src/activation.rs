@@ -177,6 +177,22 @@ impl Status {
     }
 }
 
+/// **`ALL` is complete, proven by the compiler** — same device as [`FrameType::ALL`](crate::frame::FrameType)
+/// and `ProtocolError::ALL`. A derivation missing from the list is invisible to everything that enumerates
+/// the registry: the activation digest `fanos status` prints for cross-node comparison, and any sweep that
+/// asks which forms this build can still speak.
+///
+/// **A test cannot make this claim**, and the one that used to try is instructive. It iterated `ALL` and
+/// matched each element exhaustively, on the theory that a new variant would fail the build. It does — but
+/// the fix that silences it is an empty arm, which never touches `ALL`; and an arm copied from its
+/// neighbour can never run at all, because the loop visits `ALL` and the new variant is exactly what `ALL`
+/// lacks. A guard whose body for the missing case is unreachable *precisely when the case is missing*
+/// cannot be the guard. `variant_count` asks the enum instead of the list.
+const _: () = assert!(
+    Derivation::ALL.len() == core::mem::variant_count::<Derivation>(),
+    "a Derivation variant is missing from Derivation::ALL, so the activation digest cannot see it"
+);
+
 impl Derivation {
     /// Every registered derivation, for a reader that enumerates rather than guesses.
     pub const ALL: &'static [Self] = &[Self::OnionGatherMember];
@@ -414,17 +430,11 @@ mod tests {
         assert!(Derivation::OnionGatherMember.is_active_at(0));
     }
 
+    /// Completeness of `ALL` is NOT checked here — it is a compile-time fact (see the `const _` above the
+    /// `impl`). What a test can still add is that the listed entries are usable as labels: a duplicate or
+    /// empty name makes two derivations indistinguishable in the digest and in an operator's output.
     #[test]
-    fn every_derivation_is_listed_and_named_distinctly() {
-        // `ALL` is hand-maintained; the exhaustive match makes an omission a BUILD failure rather than a
-        // blind spot in whatever enumerates it.
-        for d in Derivation::ALL {
-            match *d {
-                Derivation::OnionGatherMember => {
-                    assert!(Derivation::ALL.contains(&Derivation::OnionGatherMember));
-                }
-            }
-        }
+    fn every_listed_derivation_is_named_distinctly_and_non_empty() {
         let mut names: Vec<&str> = Derivation::ALL.iter().map(|d| d.name()).collect();
         let before = names.len();
         names.sort_unstable();

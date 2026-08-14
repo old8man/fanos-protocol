@@ -138,6 +138,13 @@ pub enum Sector {
     U,
 }
 
+/// `Sector::ALL` must list every sector, or the conformance sweep that iterates it silently checks a
+/// subset and reports the same green it would for full coverage.
+const _: () = assert!(
+    Sector::ALL.len() == core::mem::variant_count::<Sector>(),
+    "a Sector variant is missing from Sector::ALL, so every reader that enumerates is blind to it"
+);
+
 impl Sector {
     /// All seven sectors in address order.
     pub const ALL: [Sector; 7] = [

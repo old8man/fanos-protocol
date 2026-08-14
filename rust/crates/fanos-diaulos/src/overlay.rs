@@ -67,6 +67,15 @@ pub enum Ingest {
     WrongSender,
 }
 
+/// `Ingest::ALL` is the drop tally's width and the tag vocabulary an operator reads. A variant missing
+/// from it has no slot to count in and no name to print, so its drops render as a bare number — or not at
+/// all. The destructure below catches the list growing past the code; this catches the enum growing past
+/// the list, which is the direction no test can see.
+const _: () = assert!(
+    Ingest::ALL.len() == core::mem::variant_count::<Ingest>(),
+    "an Ingest variant is missing from Ingest::ALL, so every reader that enumerates is blind to it"
+);
+
 impl Ingest {
     /// Every variant — the tally's width, and a tag vocabulary.
     pub const ALL: [Ingest; 5] = [

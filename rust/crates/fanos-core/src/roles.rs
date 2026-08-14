@@ -77,6 +77,16 @@ pub enum Role {
     Ingress,
 }
 
+/// **`Role::ALL` is a wire format, not just a list.** [`Role::COUNT`] is its length, and a load report is
+/// `COUNT` big-endian `u16`s in this order (`fanos_node::loaddir`). A role added to the enum and omitted
+/// here leaves the codec at its old width, so the new role never reaches the cell setpoint and nothing
+/// reports it. Deriving the width from `ALL` closed the *other* half of this hazard; this closes the one
+/// that was left.
+const _: () = assert!(
+    Role::ALL.len() == core::mem::variant_count::<Role>(),
+    "a Role variant is missing from Role::ALL, so every reader that enumerates is blind to it"
+);
+
 impl Role {
     /// Every role, in canonical order — the iteration order of an assignment.
     pub const ALL: [Role; 6] =
@@ -260,12 +270,16 @@ pub const MAX_WEIGHT: u16 = 64;
 /// node claims more than [`MAX_WEIGHT`] tickets). Only capabilities the node actually possesses should be
 /// declared — a node assigned a role it cannot serve fails to perform, which the cell's self-diagnosis detects.
 ///
-/// **The answer to that detection is not yet wired, and this said it was.** [`Reputation`] is built and
-/// unit-proven, and [`Reputation::observe_reachable`] has no production caller: `assign_epoch` steps the
-/// controller and never observes, so every score sits at [`REP_SCALE`] and [`Reputation::adjust`] is the
-/// identity. `docs/design-self-organization.md` §5 already lists this as outstanding ("the performance-slash
-/// reputation feedback ... is specified, not yet closed in code"); the sentence here claimed otherwise, which
-/// is the more dangerous direction for a record to disagree in.
+/// **The answer to that detection is wired, and this paragraph used to say it was not.** [`Reputation`] is
+/// recomputed each epoch from published evidence: `fanos-node`'s role loop calls
+/// [`Reputation::from_published`], which feeds [`Reputation::observe_reachable`] one observation per member
+/// from the cell's agreed diagnosis, and the epoch step then applies the result to the members' weights. So
+/// scores move, and [`Reputation::adjust`] is not the identity.
+///
+/// The superseded text said `observe_reachable` had no production caller and cited
+/// `docs/design-self-organization.md` §5 as agreeing — a doc→doc loop where both ends described the state
+/// before the feedback landed. **A record that under-claims what ships is the more dangerous direction**,
+/// because it invites someone to build a second copy of a mechanism that is already load-bearing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Capability {
     /// The roles this node offers to serve.

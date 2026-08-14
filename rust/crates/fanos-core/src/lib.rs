@@ -42,6 +42,11 @@
 //! CLI on the shipping engine, but it is not required for correctness and is not a source of divergence.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// `variant_count` proves `ALL` complete at COMPILE time. A test cannot: it can only visit the variants
+// the list already holds, so the one case that matters — a variant added to the enum and forgotten in the
+// list — is exactly the case a test never reaches. Nightly is pinned deliberately (`rust-toolchain.toml`);
+// `fanos-wire` and `fanos-ports` use the same feature for the same reason.
+#![feature(variant_count)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
