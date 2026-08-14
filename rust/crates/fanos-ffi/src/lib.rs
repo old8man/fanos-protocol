@@ -392,7 +392,9 @@ pub unsafe extern "C" fn fanos_service_connect(
     };
     // Resolve the `.fanos` name to the service coordinate + KEM key (min_pow 0 — the caller's descriptor
     // policy is a higher-level concern), then dial a DIAULOS session with fresh per-dial ephemeral keys.
-    let resolver = NodeResolver::new(handle.node.client(), Epoch::ZERO, 0);
+    // `None` ⇒ follow the cell's beacon (#344). A C caller has no way to name an epoch and no reason to:
+    // pinning genesis here would have made the FFI unable to reach any service that had rotated.
+    let resolver = NodeResolver::new(handle.node.client(), None, 0);
     let Some((coord, public)) = handle.rt.block_on(resolver.resolve(name)) else {
         return fail_null("fanos_service_connect: the name did not resolve — no descriptor for it in the store");
     };

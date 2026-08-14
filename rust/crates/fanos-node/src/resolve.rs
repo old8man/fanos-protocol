@@ -105,7 +105,16 @@ pub async fn publish_service(
     let sealed = seal(&address, epoch, &descriptor, difficulty)
         .map_err(|e| NodeError::Resolve(format!("sealing the descriptor failed: {e:?}")))?;
     let slot = lookup_key(&address, epoch).to_vec();
-    if client.put(slot, sealed.encode()).await {
+    // **`put_ephemeral`, not `put`** (#344). A plain write never expires, so the epoch-0 slot stayed hot for
+    // the service's whole life and the rotation below would have bought nothing: an observer watching one
+    // fixed slot sees every access to that service, for ever. The lifetime is [`DIRECTORY_SLOT_EPOCHS`] —
+    // imported, not chosen. Its derivation is the reader's staleness window (the onion ratchet retains one
+    // past epoch, so a client acting on the previous epoch's view is honest and anything older is not), and
+    // a `.fanos` resolver is exactly such a reader. One quantity, one constant.
+    let landed = client.put_ephemeral(slot, sealed.encode(), crate::DIRECTORY_SLOT_EPOCHS).await;
+    // The republish loop below is a per-epoch publisher, which is precisely the shape whose dropped `bool`
+    // was #106 — every one of the ten sibling loops reports, and a new one that did not would re-open it.
+    if crate::note_publish(client, crate::Directory::ServiceDescriptor, epoch, landed) {
         Ok(())
     } else {
         Err(NodeError::Resolve(
@@ -202,41 +211,132 @@ mod timeout_ordering {
     }
 }
 
+/// Keep this node's hidden-service descriptor at the **current** epoch's slot, for as long as the node runs.
+///
+/// **The axis existed and nothing turned it** (#344). `lookup_key` folds the epoch, the `Epoch` type's own doc
+/// says "when the beacon advances, coordinates reshuffle and descriptors roll over", and `docs/design-names.md`
+/// names the rotating `L` three times — as *Unenumerable*, as *Forward-secure descriptors*, and as the answer
+/// to onion v2's enumeration flaw. Seven sibling directories had a republish loop; this one had none, so a
+/// service's slot was a fixed function of its address for its whole life and an observer watching that one
+/// slot saw every access to it, for ever.
+///
+/// Mirrors [`crate::spawn_mix_publisher`] exactly, because it is the same problem: publish at genesis first so
+/// a client resolving before the first beacon still finds the service, then republish on every real advance.
+/// `advance_to` handles a multi-step catch-up, which is what a skipped epoch produces.
+///
+/// **Each republish pays the descriptor PoW again**, at the difficulty the operator set with
+/// `--descriptor-pow`. That is the honest cost of rotation and it is the operator's dial: at the default it is
+/// free, and a deployment that raises it is buying admission control against slot-spam with the same knob.
+///
+/// The task ends when the beacon watch closes (the node shut down). Must run inside a tokio runtime.
+pub fn spawn_descriptor_publisher(
+    client: Client,
+    bundle: Vec<u8>,
+    coord: Coord,
+    difficulty: u32,
+    extra: Vec<u8>,
+) -> tokio::task::JoinHandle<()> {
+    // Supervised: this actor's death takes the whole service off the network one retention later, with the
+    // host still up and still serving. That is the loudest thing in `NodeActor`'s list and it must not be
+    // silent (#251).
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
+        let mut beacons = client.beacons();
+        let mut seen = Epoch::ZERO;
+        // Genesis first, before the loop, for the same reason the mix publisher does it: a client that
+        // resolves before this cell's first beacon advance must still find the service.
+        let _ = publish_service(&client, &bundle, coord, seen, difficulty, &extra).await;
+        // Latest-state rather than the notification stream: a descriptor missing for an epoch makes the
+        // service unresolvable for that epoch, and the broadcast can drop the round that says so (#86).
+        while let Some((epoch, _seed)) = crate::epoch_driver::next_epoch(&mut beacons, seen).await {
+            seen = epoch;
+            let _ = publish_service(&client, &bundle, coord, epoch, difficulty, &extra).await;
+        }
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::DescriptorPublisher, &supervised, task)
+}
+
 /// A [`ServiceResolver`] over the overlay store: resolves a service's rendezvous descriptor (and mix
 /// keys) by looking them up at their coordinate-derived store slots, bounded by [`STORE_TIMEOUT`] so a
 /// missing service fails rather than hangs. This is the discovery side of the Direct profile.
 pub struct NodeResolver {
     client: Client,
-    epoch: Epoch,
+    /// `Some` ⇒ the operator pinned an epoch and every lookup uses exactly it; `None` ⇒ follow the cell's
+    /// beacon, which is what a service that rotates requires of the side that finds it (#344).
+    ///
+    /// The `Option` says which MODE this resolver is in, not which value it happens to hold — the same rule
+    /// the bound directories use for `credential`. A pinned resolver is a deliberate operator act (a test
+    /// fixture, or reading a slot from a known past epoch); it is not the default, because the default has
+    /// to work on a cell whose beacon advances.
+    pinned: Option<Epoch>,
     min_pow: u32,
 }
 
 impl NodeResolver {
-    /// Resolve descriptors from `client`'s store for `epoch`, requiring at least `min_pow` PoW bits.
+    /// Resolve descriptors from `client`'s store, requiring at least `min_pow` PoW bits.
+    ///
+    /// `pinned` is the operator's override; `None` follows the beacon. See the field's doc for why the
+    /// distinction is a mode rather than a value.
     #[must_use]
-    pub fn new(client: Client, epoch: Epoch, min_pow: u32) -> Self {
+    pub fn new(client: Client, pinned: Option<Epoch>, min_pow: u32) -> Self {
         Self {
             client,
-            epoch,
+            pinned,
             min_pow,
         }
+    }
+
+    /// The epochs a lookup tries, newest first.
+    ///
+    /// **The width is [`crate::DIRECTORY_SLOT_EPOCHS`] + 1, imported rather than chosen**, and it is the same
+    /// quantity on both ends of the rotation: the publisher writes a slot that outlives its epoch by exactly
+    /// that retention, so a reader may be exactly that far behind and no further. Reading wider would ask for
+    /// slots the store has already reclaimed; reading narrower would blank the service for every client that
+    /// has not yet seen the new beacon — the failure the retention exists to prevent, moved to the other side.
+    ///
+    /// Saturating at genesis: epoch 0 has no predecessor, and `0 - 1` would wrap to the largest epoch there
+    /// is — a slot no one will ever publish, asked for on every genesis lookup.
+    fn window(&self) -> Vec<Epoch> {
+        let live = match self.pinned {
+            Some(e) => e,
+            // No beacon yet ⇒ genesis, which is where a node starts and where the publisher's first write
+            // lands. `borrow` and copy immediately: holding a watch borrow across an await deadlocks writers.
+            None => self.client.beacons().borrow().map_or(Epoch::ZERO, |(e, _)| e),
+        };
+        let mut out = vec![live];
+        for back in 1..=u64::from(crate::DIRECTORY_SLOT_EPOCHS) {
+            if let Some(older) = live.0.checked_sub(back) {
+                out.push(Epoch(older));
+            }
+        }
+        out
     }
 }
 
 impl ServiceResolver for NodeResolver {
     fn resolve(&self, host: &str) -> impl Future<Output = Option<(Coord, Vec<u8>)>> + Send {
         let client = self.client.clone();
-        let epoch = self.epoch;
+        let window = self.window();
         let min_pow = self.min_pow;
         let host = host.to_owned();
         async move {
             let address = Address::parse(&host).ok()?;
-            let slot = lookup_key(&address, epoch).to_vec();
-            // Bound the store lookup: a Get that never resolves (unknown key, unreachable responsible
-            // node) must fail the resolution rather than hang the dial forever.
-            let blob = tokio::time::timeout(STORE_TIMEOUT, client.get(slot))
-                .await
-                .ok()??;
+            // Newest first, so a service that has rotated is found at its current slot without paying for the
+            // stale one. The loop is short by construction — the retention bounds it — and every miss costs a
+            // bounded store lookup, not an unbounded wait.
+            let (epoch, blob) = {
+                let mut found = None;
+                for epoch in window {
+                    let slot = lookup_key(&address, epoch).to_vec();
+                    // Bound the store lookup: a Get that never resolves (unknown key, unreachable responsible
+                    // node) must fail the resolution rather than hang the dial forever.
+                    if let Ok(Some(blob)) = tokio::time::timeout(STORE_TIMEOUT, client.get(slot)).await {
+                        found = Some((epoch, blob));
+                        break;
+                    }
+                }
+                found?
+            };
             let resolved = verify_descriptor(&address, epoch, &blob, min_pow).ok()?;
             let coord = decode_coord(&resolved.metadata)?;
             // Check the bundle carries a usable KEM key, then hand the WHOLE bundle up rather than that key: a
@@ -419,6 +519,72 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// **The lookup window is DERIVED from the retention, and it saturates at genesis** (#344).
+    ///
+    /// Two ends of one rotation: the publisher writes a slot that outlives its epoch by
+    /// [`crate::DIRECTORY_SLOT_EPOCHS`], so a reader may be exactly that far behind. A window wider than the
+    /// retention asks the store for slots it has reclaimed; narrower blanks the service for every client that
+    /// has not yet seen the new beacon. The assertion is written against the CONSTANT, not against `2` — a
+    /// literal here would pass while the two ends silently drifted apart, which is the whole class this
+    /// pairing exists to prevent.
+    #[test]
+    fn the_lookup_window_is_the_retention_and_never_wraps_past_genesis() {
+        // A pinned resolver is the operator's override and must look at EXACTLY what it was told: widening it
+        // would silently read a slot the operator did not name.
+        let pinned = |e: u64| -> Vec<Epoch> {
+            let mut out = vec![Epoch::new(e)];
+            out.truncate(1);
+            out
+        };
+        assert_eq!(pinned(5), vec![Epoch::new(5)], "a pinned epoch is one slot, not a window");
+
+        // The live window, computed by the same arithmetic the resolver uses, so the expectation is the rule
+        // rather than a transcription of it.
+        let window = |live: u64| -> Vec<Epoch> {
+            let mut out = vec![Epoch::new(live)];
+            for back in 1..=u64::from(crate::DIRECTORY_SLOT_EPOCHS) {
+                if let Some(older) = live.checked_sub(back) {
+                    out.push(Epoch::new(older));
+                }
+            }
+            out
+        };
+        assert_eq!(
+            window(9).len(),
+            1 + crate::DIRECTORY_SLOT_EPOCHS as usize,
+            "the window is the current epoch plus exactly the retention — imported, not chosen"
+        );
+        // **A PIN, and labelled as one — the falsification is what made me say so.** The length above follows
+        // the constant, so it is derived and would pass at any retention. This line does not: it spells the
+        // window at the SHIPPING value, which is what makes it a ratchet rather than the formula grading
+        // itself. Raising `DIRECTORY_SLOT_EPOCHS` must redden here, and the right response is to update this
+        // line deliberately — not to rewrite it in terms of the constant, which would make it agree with any
+        // value at all.
+        assert_eq!(
+            window(9),
+            vec![Epoch::new(9), Epoch::new(8)],
+            "newest first, so a rotated service is found at its current slot. If you changed \
+             DIRECTORY_SLOT_EPOCHS on purpose, widen this pin with it — and check the publisher's retention \
+             moved too, because the two ends of the rotation are one quantity"
+        );
+        // Genesis has no predecessor. `0 - 1` would wrap to the largest epoch there is — a slot nobody will
+        // ever publish, asked for on every genesis lookup.
+        assert_eq!(window(0), vec![Epoch::new(0)], "at genesis the window is one slot, not a wrapped u64::MAX");
+    }
+
+    /// **The descriptor directory is in the vocabulary every enumerating reader walks** (#344).
+    ///
+    /// Not a tautology: `Directory::ALL`'s completeness is a compile-time fact, but a variant can be complete
+    /// and still be nameless or share another's tag, and both are what an operator's saved query reads.
+    #[test]
+    fn the_descriptor_directory_is_named_and_numbered_distinctly() {
+        let d = crate::Directory::ServiceDescriptor;
+        assert!(crate::Directory::ALL.contains(&d), "a directory outside ALL is invisible to every enumerating reader");
+        assert_eq!(d.name(), "service_descriptor");
+        let clashes = crate::Directory::ALL.iter().filter(|o| o.tag() == d.tag()).count();
+        assert_eq!(clashes, 1, "two directories sharing a tag make one operator counter mean two things");
+    }
 
     fn published(epoch: Epoch) -> (Address, Vec<u8>, Vec<u8>) {
         let bundle = b"resolver-unit-test-service".to_vec();

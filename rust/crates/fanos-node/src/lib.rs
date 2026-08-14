@@ -79,6 +79,10 @@ pub enum Directory {
     Checkpoint,
     /// Cross-cell health report (`crosscell_dir`).
     Health,
+    /// Hidden-service descriptor (`resolve`) — the `.fanos` name's per-epoch lookup slot. A service
+    /// missing here cannot be resolved at all, which is the loudest failure in this list: the other
+    /// eight degrade a node, this one takes a whole service off the network.
+    ServiceDescriptor,
 }
 
 /// `Directory::ALL` is complete, proven by the compiler — not by the `ALL.len() == 9` assertion in
@@ -101,6 +105,7 @@ impl Directory {
         Self::Diagnosis,
         Self::Checkpoint,
         Self::Health,
+        Self::ServiceDescriptor,
     ];
 
     /// The discriminant carried in [`Observation::tag`](fanos_runtime::ports::stations::Observation::tag).
@@ -120,6 +125,7 @@ impl Directory {
             Self::Checkpoint => 6,
             Self::Health => 7,
             Self::Diagnosis => 8,
+            Self::ServiceDescriptor => 9,
         }
     }
 
@@ -136,6 +142,7 @@ impl Directory {
             Self::Diagnosis => "diagnosis",
             Self::Checkpoint => "checkpoint",
             Self::Health => "health",
+            Self::ServiceDescriptor => "service_descriptor",
         }
     }
 }
@@ -393,5 +400,6 @@ pub use fanos_session::dropped_payloads;
 // depending on `fanos-runtime` directly. Re-exported rather than duplicated: they are the same types.
 pub use fanos_runtime::{Command, Notification};
 pub use resolve::{
-    Coverage, NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service, verify_descriptor,
+    Coverage, NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service,
+    spawn_descriptor_publisher, verify_descriptor,
 };

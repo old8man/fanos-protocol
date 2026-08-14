@@ -920,13 +920,17 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         ),
         None => None,
     };
-    let epoch = match flag(args, "--epoch")? {
-        Some(s) => Epoch::new(
+    // **Absent means FOLLOW THE BEACON, not epoch zero** (#344). A descriptor now rotates, so a dialer that
+    // silently pinned genesis would look at a slot the service left behind. `--epoch` stays as the operator's
+    // override for reading a known past epoch; it is a deliberate act, not the default.
+    let pinned_epoch = match flag(args, "--epoch")? {
+        Some(s) => Some(Epoch::new(
             s.parse()
                 .map_err(|_| NodeError::Config(format!("bad --epoch '{s}'")))?,
-        ),
-        None => Epoch::ZERO,
+        )),
+        None => None,
     };
+    let epoch = pinned_epoch.unwrap_or(Epoch::ZERO);
     let min_pow = match flag(args, "--min-pow")? {
         Some(s) => s
             .parse()
@@ -962,7 +966,7 @@ async fn cmd_proxy(args: &[String]) -> Result<(), NodeError> {
         None => discover_exit(&node, epoch).await,
     };
     let exit_coord = exit.as_ref().map(|(coord, _)| *coord);
-    let resolver = NodeResolver::new(node.client(), epoch, min_pow);
+    let resolver = NodeResolver::new(node.client(), pinned_epoch, min_pow);
     // `FanosDialer` is not `Clone`, so `serve_proxy` shares it behind an `Arc` (per-connection handlers need
     // only `&D`). The dialer holds its own `Client`; the node stays owned here for notification draining + a
     // clean shutdown.
@@ -1100,6 +1104,18 @@ async fn cmd_host(args: &[String]) -> Result<(), NodeError> {
         node.shutdown().await;
         return Err(e);
     }
+    // **And keep it there** (#344). The first publish above stays because a startup failure must be an exit
+    // code rather than a supervised actor's counter — an operator running `serve-anonymous` needs to know
+    // immediately that the store refused. The loop then owns every later epoch: the slot the descriptor lives
+    // at is a function of the epoch, so without this the service is resolvable only until its current slot
+    // expires and then vanishes with the host still up and still serving.
+    let _descriptors = fanos_node::spawn_descriptor_publisher(
+        node.client(),
+        bundle.clone(),
+        [0, 0, 0],
+        descriptor_pow,
+        b"profile=anonymous".to_vec(),
+    );
 
     // Forward each accepted anonymous session to the local target (the onion-service model).
     let handler = move |mut stream: DuplexStream| async move {

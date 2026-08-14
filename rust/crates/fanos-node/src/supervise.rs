@@ -64,6 +64,10 @@ pub enum NodeActor {
     ExitPublisher,
     /// Publishes this node's cross-cell health record. Dead: the parent cell stops seeing it.
     HealthPublisher,
+    /// Republishes this node's hidden-service descriptor at each new epoch's slot. Dead: the service
+    /// stays resolvable only until its current slot expires, and then vanishes from the network with no
+    /// error anywhere — the host is still up and still serving, and nothing can find it.
+    DescriptorPublisher,
     /// Feeds the per-role load sensor from the engine's reports. Dead: every reading freezes at its last
     /// value and the role controller divides by a number that stopped moving — while looking measured.
     LoadSensor,
@@ -131,6 +135,7 @@ impl NodeActor {
         Self::EpochDriver,
         Self::MoveAnnouncer,
         Self::RecoveryTrigger,
+        Self::DescriptorPublisher,
     ];
 
     /// The discriminant carried in `Observation::tag`, written out so variant order never renumbers an
@@ -154,6 +159,7 @@ impl NodeActor {
                 Self::EpochDriver => 12,
                 Self::MoveAnnouncer => 13,
                 Self::RecoveryTrigger => 14,
+                Self::DescriptorPublisher => 15,
             }
     }
 
@@ -176,6 +182,7 @@ impl NodeActor {
             Self::EpochDriver => "epoch_driver",
             Self::MoveAnnouncer => "move_announcer",
             Self::RecoveryTrigger => "recovery_trigger",
+            Self::DescriptorPublisher => "descriptor_publisher",
         }
     }
 }

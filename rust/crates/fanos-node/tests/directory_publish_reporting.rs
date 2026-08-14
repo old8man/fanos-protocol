@@ -82,10 +82,15 @@ fn directory_tags_and_names_are_unique_and_pinned() {
     assert_eq!(Directory::MixKey.tag(), 0);
     assert_eq!(Directory::Health.tag(), 7);
     assert_eq!(Directory::Diagnosis.tag(), 8);
+    // The tenth, and the deliberation this pin exists to force actually happened: #344 gave the hidden-service
+    // descriptor a per-epoch republish loop, which made it a directory in the sense this list means — a slot
+    // a node keeps current and reports the outcome of. It reddened here on the first run, which is the guard
+    // working, not breaking.
+    assert_eq!(Directory::ServiceDescriptor.tag(), 9);
     // Completeness is the compiler's job now (`const _` beside `impl Directory`): a variant missing from
     // `ALL` does not build. What this count still buys is *deliberation* — adding a directory changes a
     // stated number, so it cannot happen as a side effect of an unrelated change.
-    assert_eq!(Directory::ALL.len(), 9, "the directory count changed; confirm the addition was intended");
+    assert_eq!(Directory::ALL.len(), 10, "the directory count changed; confirm the addition was intended");
 }
 
 /// The gate an operator reads is stable and unambiguous, for the same reason a directory's tag is (#109).
