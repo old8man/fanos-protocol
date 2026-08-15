@@ -1410,6 +1410,34 @@ fn is_numeric_const(line: &str) -> bool {
     })
 }
 
+/// **A sibling guard was measured and declined: "every test name a doc cites must exist" (2026-08-16).**
+///
+/// It looks like an obvious ratchet — a backticked identifier is a claim that it exists, and #322 had already
+/// fixed one doc that cited a test which was not in the tree. So the class had a second occurrence waiting,
+/// and the scan found it: `traffic_analysis.rs` cited
+/// `the_adversary_cannot_match_concurrent_flows_much_better_than_chance` in the present tense, for a reading
+/// that no longer holds, under a name that no longer exists (the test is now
+/// `the_defence_reduces_flow_matching_far_but_not_to_chance`). Fixed.
+///
+/// **The guard is still the wrong instrument, and the measurement says why.** Over 84 phrase-shaped
+/// identifiers cited in doc comments across every crate, five did not resolve to a function — and *four of
+/// the five were correct as written*:
+///
+/// * `fanos_coherence_over_coupling_alarm` — a Prometheus metric name (`fanos-observatory::metrics`);
+/// * `systemic_correlation_r_star_7` — a conformance vector key (`conformance/vectors/diakrisis.json`);
+/// * `host_a_service_and_serve_a_client` — a `--skip` **prefix**, which is what CI matches on, not a name;
+/// * `a_recorded_onion_is_unpeelable_past_the_grace_window` — a name deliberately quoted while *narrating*
+///   the #322 fix, i.e. the tree documenting that this very citation was once wrong.
+///
+/// The last is the fatal one. This tree's house style is to quote the superseded name when it records a
+/// correction — that practice is why a reader can follow #322 or #187 at all — and a scanner cannot tell a
+/// live citation from a narrated dead one, because the difference is tense and intent. A guard here would
+/// fire on the documentation habit that makes the codebase legible, and every exemption would be a judgment
+/// about prose. One misleading citation in 84 is not worth an instrument that argues with its own tree.
+///
+/// Recorded rather than dropped: the scan cost twenty minutes and the answer is not obvious from the outside,
+/// so the next person to have this idea should read the four false positives before writing it.
+///
 /// The audit's citation register must name every pass that numbers its sections `§N`, and must count them right.
 ///
 /// `docs/audit.md` grows by one appended pass per audit and **each pass restarts at §1**, so a bare "§3" names

@@ -635,8 +635,10 @@ fn the_defence_reduces_flow_matching_far_but_not_to_chance() {
 
 /// **#187 (c): the anomaly, attacked with the adversary the file itself named.**
 ///
-/// `the_adversary_cannot_match_concurrent_flows_much_better_than_chance` pins a matching accuracy of
-/// **0.00 against a chance of 0.20** at the shipping schedule, and its own comment says that is not safety:
+/// `the_defence_reduces_flow_matching_far_but_not_to_chance` — then named
+/// `the_adversary_cannot_match_concurrent_flows_much_better_than_chance`, and the rename is the whole story —
+/// pinned a matching accuracy of **0.00 against a chance of 0.20** at the shipping schedule, and its own
+/// comment said that is not safety:
 /// twelve seeds of zero has probability `(44/120)¹² ≈ 3e-6` under guessing, so the score matrix was still
 /// carrying information and the matcher was systematically *avoiding* the truth. The named suspect was the
 /// scorer: `pearson` correlates at **zero lag only**, while mixing displaces the exit series, and a real
