@@ -1229,8 +1229,15 @@ mod quarantine_experiment {
         wrap_raw(c, n)
     }
 
+    /// The `(seed, q)` pairs `300` seeds produce at `n = 3 + seed % 6` — measured, then written down, so the
+    /// sweep's size is a claim the test makes rather than a number nobody knows.
+    const PAIRS_300: usize = 1650;
+
     #[test]
     fn the_closed_form_equals_the_full_recompute() {
+        // Same reason as its sibling below: a sweep whose size is implicit can narrow without saying so, and
+        // fewer assertions is exactly what a silently narrowed sweep looks like from the outside.
+        let mut checked = 0usize;
         for seed in 0..300u64 {
             let n = 3 + (seed % 6) as usize; // 3..=8
             let m = random_matrix(seed, n);
@@ -1241,12 +1248,22 @@ mod quarantine_experiment {
                     (closed - recompute).abs() < 1e-9,
                     "seed {seed} q {q}: closed-form Φ' {closed} ≠ recompute {recompute}"
                 );
+                checked += 1;
             }
         }
+        assert_eq!(checked, PAIRS_300, "the identity must be checked on every drawn pair, not on however \
+             many the loop happens to reach: {checked}");
     }
 
     #[test]
     fn the_condition_predicts_the_sign_of_the_change_exactly() {
+        // **The sample is asserted, not assumed.** The boundary `continue` below reads as if it fires
+        // sometimes; measured, it fires **0 times in 2746 pairs** — the strict-inequality case is generic and
+        // the tie has measure zero, as the theorem says it should. That makes the skip invisible in both
+        // directions: nobody sees that it never happens, and nobody would see it start. Counting turns the
+        // sample into an observable that can go DOWN, which is the only kind worth guarding.
+        let mut checked = 0usize;
+        let mut skipped = 0usize;
         for seed in 0..500u64 {
             let n = 3 + (seed % 6) as usize;
             let m = random_matrix(seed ^ 0xABCD, n);
@@ -1254,8 +1271,10 @@ mod quarantine_experiment {
             for q in 0..n {
                 let phi_after = m.excise(q).unwrap().phi();
                 if (phi_after - phi).abs() < 1e-9 {
+                    skipped += 1;
                     continue; // the exact boundary s_q = Φ/2 — neither strictly wins
                 }
+                checked += 1;
                 assert_eq!(
                     m.quarantine_lowers_phi(q),
                     phi_after < phi,
@@ -1264,6 +1283,12 @@ mod quarantine_experiment {
                 );
             }
         }
+        assert_eq!(skipped, 0, "the s_q = Φ/2 tie has measure zero and has never been drawn; {skipped} draws \
+             hit it, so either the generator changed or the boundary is no longer generic — and every one of \
+             them is a pair this test did not check");
+        assert_eq!(checked, 2746, "the predicate must be exercised on every drawn pair: {checked} of the \
+             2746 the 500 seeds produce. A drop means seeds are being consumed differently and the sweep \
+             narrowed without saying so");
     }
 
     #[test]
