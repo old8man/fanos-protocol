@@ -1208,10 +1208,20 @@ pub struct OverlayChoices {
     /// Whether a peer's announced overlay address must be the descent chain of the identity it announces.
     ///
     /// Defends against routing-table poisoning (threat §79/B1): with it on, a peer cannot announce an address
-    /// it did not earn, so attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding. Whether
-    /// it should default ON is a separate question this does not answer — no measurement exists of what
-    /// fraction of legitimate announcements the check would reject, and this tree does not flip a security
-    /// default without one. Its counterpart is already wired: the main path sets `vrf_coordinates: true`
+    /// it did not earn, so attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding.
+    ///
+    /// **Turning this on today rejects every peer, and the measurement is in `fanos-sim`.** The check
+    /// verifies a signed descriptor that the engine cannot produce — it holds no signing key by construction
+    /// — so a deployment must install one through `OverlayNode::with_signed_descriptor`, whose doc says as
+    /// much ("a deployment signs once and installs the result here"). **Nothing in production calls it**: its
+    /// only caller in the tree is a simulator test. Measured on a live Fano cell,
+    /// `the_self_certified_check_measured_against_what_a_real_cell_actually_announces` reads 42 learned
+    /// membership edges ungated and **0** with the check on — 100 % of honest announcements refused.
+    ///
+    /// So this is not a trade-off awaiting a number; it is a consumer whose producer was never wired, and the
+    /// default is off for that reason rather than out of caution. Said here for the same reason
+    /// [`require_admission`](Self::require_admission) says it: a switch whose precondition is undocumented is
+    /// a switch that costs an operator their cell. Its counterpart is already wired: the main path sets `vrf_coordinates: true`
     /// precisely so that, with this on, level 0 is verified by the HELLO proof rather than the hash chain.
     pub require_self_certified_membership: bool,
     /// Whether an announcing peer must satisfy this node's Sybil admission policy.

@@ -95,3 +95,63 @@ fn the_epoch_beacon_reaches_monotone_consensus_from_a_quorum_of_triggers() {
         .count();
     assert_eq!(at_two, 7, "all seven nodes advanced to epoch 2");
 }
+
+/// **What fraction of LEGITIMATE announcements does the self-certified check reject?** (#352 residual)
+///
+/// `require_self_certified_membership` defends against routing-table poisoning and ships off. The reason
+/// recorded for leaving the default alone is that no measurement exists of what it would cost an honest
+/// deployment — and `hier_poisoning.rs` cannot answer it, because it feeds the check a **hand-built** signed
+/// descriptor. That proves the check accepts a correctly constructed announcement; it says nothing about
+/// whether the announcement a real engine EMITS is one. Two different questions, and the second is the one a
+/// default turns on.
+///
+/// So: the same cell, twice, differing only in the flag. The gap between the two rosters is the rejection
+/// rate on honest traffic, measured rather than argued.
+#[test]
+fn the_self_certified_check_measured_against_what_a_real_cell_actually_announces() {
+    // The observable is `MemberJoined`, the same one this file's other test reads: one per (node, peer) pair
+    // a node accepted. Summed over the cell it is the number of learned edges — which is exactly what the
+    // check can take away.
+    fn learned_edges(require: bool) -> usize {
+        let mut sim = Sim::new(7);
+        let cell = spawn_cell::<F2>(
+            &mut sim,
+            Config { require_self_certified_membership: require, ..Config::default() },
+        );
+        for &c in &cell {
+            sim.inject(c, Command::Join { info: b"key".to_vec() });
+        }
+        sim.run_for(Duration::from_millis(500));
+        sim.report()
+            .notifications
+            .iter()
+            .filter(|o| matches!(&o.note, Notification::MemberJoined { .. }))
+            .count()
+    }
+    let b = learned_edges(false);
+    let g = learned_edges(true);
+    assert!(b > 0, "the ungated cell learned nothing — the measurement has no baseline");
+    // Not `assert_eq!(g, b)`: this test's job is to REPORT the cost, and a number is only worth having if a
+    // reader can see it. The assertion is the floor the decision needs — a check that rejects honest
+    // announcements wholesale is not a default anyone would consider.
+    println!("self-certified membership: ungated {b} learned edges, guarded {g} — rejected {} ({:.0}%)",
+             b.saturating_sub(g), 100.0 * f64::from(u32::try_from(b.saturating_sub(g)).unwrap_or(0)) / f64::from(u32::try_from(b).unwrap_or(1)));
+    // **Pinning zero, which is a defect and not a property to preserve.** The measured answer is that the
+    // check refuses 100% of honest traffic, and the cause is known and narrow: the engine holds no signing
+    // key by construction, so a deployment must install a signed descriptor through
+    // `OverlayNode::with_signed_descriptor` — and in this whole tree that builder's only caller is a
+    // simulator test. `hier_poisoning::a_deployed_identity_node_self_certifies_end_to_end` proves the check
+    // ACCEPTS a properly signed announcement, so what is missing is the producer, not the check.
+    //
+    // Hence this reads `assert_eq!(g, 0)` rather than the `g > 0` a first draft asserted from the hypothesis.
+    // It is a tripwire: the day production learns to sign its descriptor this fails, and the failure is the
+    // notice to drop the "rejects EVERY peer today" warning from `NodeConfig::require_self_certified_membership`
+    // and its `setup.rs` hint — a warning that outlives its cause is a lie the operator acts on.
+    assert_eq!(
+        g, 0,
+        "the self-certified check no longer refuses every honest announcement (ungated {b} edges, guarded \
+         {g}). If production now installs a signed descriptor, this measurement is stale: re-run it, then \
+         remove the precondition warning from NodeConfig::require_self_certified_membership and \
+         render_overlay_choices, and revisit whether the default should now be ON."
+    );
+}
