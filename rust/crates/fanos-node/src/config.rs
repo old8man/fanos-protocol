@@ -224,6 +224,30 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 /// router already does**: `forward_send` queues to `outbox`, one cell leaves per tick whether or not a real
 /// one is waiting, and `covering` is set once and never cleared. There is no yielding to remove.
 ///
+/// **And the question this entry exists to answer is now answered, on a tape that is the relay's own.** With
+/// the heartbeat off, `on_its_own_traffic_the_mix_delay_buys_as_much_as_the_cover` sweeps the same bin
+/// widths:
+///
+/// ```text
+///   bin    undefended   cover-only   delay-only   cover buys   delay buys
+///    20ms      0.8868       0.5679       0.6605       0.3189       0.2263
+///    50ms      0.8308       0.6017       0.7865       0.2291       0.0443
+///   100ms      1.0000       0.7585       0.9411       0.2415       0.0589
+///   250ms      1.0000       0.7416       1.0000       0.2584       0.0000
+///   500ms      1.0000       0.8275       1.0000       0.1725       0.0000
+/// ```
+///
+/// **`delay buys 0.000` was the ruler, not the delay.** A `120 ms` mean displacement moves nothing across a
+/// `250 ms` bin boundary — and that is the figure the table above reported at *every* width, because on a
+/// heartbeat-dominated tape the displacement was invisible at any resolution. At `20 ms` the delay buys
+/// `0.2263`, within a hair of the cover's `0.3189`, and it holds across density: at 5× and 15× the drive the
+/// pair reads `(0.267, 0.252)` and `(0.226, 0.241)`.
+///
+/// So #181's criterion — *"composing two defences is worth its latency only if the second one does something
+/// on its own"* — **is met**, and the entry above decided against it on an instrument that could see
+/// neither defence. That does not settle whether to compose them: `forward_send` still cannot express
+/// cover+delay, and the latency the pair costs is its own measurement. It settles that the branch is live.
+///
 /// So the open item moves. It is not the cover schedule; it is that a cell-wide periodic broadcast lives
 /// outside the plane the relay defends, is visible to the same adversary, and no mixnet defence can touch it
 /// because it is membership liveness rather than relayed cargo. What a GPA infers from an *unsynchronised*

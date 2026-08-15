@@ -460,3 +460,74 @@ fn the_gpa_figure_does_not_move_when_the_relay_carries_nothing() {
         );
     }
 }
+
+/// **The measurement #181 actually asked for, on a tape that is the relay's own — and the mix delay is not
+/// the dead branch this file recorded.**
+///
+/// The two tests above establish that the figures in `DEFAULT_COVER_INTERVAL`'s entry describe the overlay
+/// heartbeat and are unchanged when the relay carries nothing. That leaves the question the entry exists to
+/// answer *open*: on its own traffic, does either defence do anything?
+///
+/// Measured with the heartbeat off, so the tape is cargo, at bins finer and coarser than the `120 ms` mean:
+///
+/// ```text
+///   bin    undefended   cover-only   delay-only   cover buys   delay buys
+///    20ms      0.8868       0.5679       0.6605       0.3189       0.2263
+///    50ms      0.8308       0.6017       0.7865       0.2291       0.0443
+///   100ms      1.0000       0.7585       0.9411       0.2415       0.0589
+///   250ms      1.0000       0.7416       1.0000       0.2584       0.0000
+///   500ms      1.0000       0.8275       1.0000       0.1725       0.0000
+/// ```
+///
+/// Every row is printed by the test below over this file's own `BIN_SWEEP_MS`, so the table cannot drift
+/// from what runs.
+///
+/// **`delay buys 0.000` was the ruler, not the delay.** At a `250 ms` bin a `120 ms` mean displacement moves
+/// nothing across bin boundaries and the column reads zero — which is exactly the figure the old table
+/// reported at *every* width, because on a heartbeat-dominated tape the relay's displacement was invisible
+/// at any resolution. At `20 ms` the delay buys `0.2263`, within a hair of what the cover buys, and the
+/// result is stable across traffic density: at 5× and 15× the same drive the pair reads
+/// `(0.267, 0.252)` and `(0.226, 0.241)`.
+///
+/// So #181's decision criterion — *"composing two defences is worth its latency only if the second one does
+/// something on its own"* — is met, and the conclusion recorded against it was drawn from an instrument that
+/// could not see either defence. This does not by itself say the two should be composed: `forward_send`
+/// still cannot express cover+delay, and what latency the pair costs is a separate measurement. It says the
+/// branch is live.
+#[test]
+fn on_its_own_traffic_the_mix_delay_buys_as_much_as_the_cover() {
+    // A bin finer than the mean displacement, or the ruler decides the answer — this file's own rule,
+    // applied to the arm it was never applied to.
+    const FINE: u64 = 20;
+    // The whole sweep is printed, not just the row the claim rests on: the same ruler discipline this file
+    // applies to the cover, and it is what shows `delay buys` decaying to zero as the bin passes the mean.
+    println!("clean tape (heartbeat off), by bin width:");
+    println!("  bin    undefended   cover-only   delay-only   cover buys   delay buys");
+    let mut fine = (0.0, 0.0, 0.0);
+    for bin in BIN_SWEEP_MS {
+        let p = tape_correlation_full(Duration(0), Duration(0), bin, false, true, 0).1;
+        let c = tape_correlation_full(span(DEFAULT_COVER_INTERVAL), Duration(0), bin, false, true, 0).1;
+        let d = tape_correlation_full(Duration(0), span(DEFAULT_MIX_DELAY), bin, false, true, 0).1;
+        println!("{bin:5}ms      {p:.4}       {c:.4}       {d:.4}       {:.4}       {:.4}", p - c, p - d);
+        if bin == FINE {
+            fine = (p, c, d);
+        }
+    }
+    let (plain, cover, delay) = fine;
+    assert!(plain > 0.8, "the undefended control must leak, or nothing below means anything: {plain:.4}");
+    assert!(
+        plain - delay > 0.15,
+        "the mix delay must do something ON ITS OWN at a bin finer than its mean — the old table's \
+         `delay buys 0.000` was measured on a tape the relay barely touched. Got {:.4}",
+        plain - delay
+    );
+    // Stated as a comparison rather than two pinned figures: the claim that overturns the record is that the
+    // delay is in the same class as the cover, not that it hits a particular number.
+    assert!(
+        (plain - delay) > 0.5 * (plain - cover),
+        "the delay must be in the same class as the cover, not an order below it: delay buys {:.4}, cover \
+         buys {:.4}",
+        plain - delay,
+        plain - cover
+    );
+}
