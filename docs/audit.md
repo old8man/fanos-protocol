@@ -5250,3 +5250,75 @@ across three runs. The hours are compilation, and compilation amortises while `t
 
 Nine sound choices did not add up to coverage, and no amount of care in choosing them would have: each answers
 its own question and none asks *what am I not checking*. Only the structure knows which surfaces exist.
+
+---
+
+# The recorded reason decays faster than the blocker (2026-08-16)
+
+Eight commits, and the through-line was not found by looking for defects. It was found by taking recorded
+reasons — the sentences that explain why some work is *not* done — and attempting the work anyway. Four of the
+five attempted named the wrong obstruction. That is a higher failure rate than any code path audited this
+year, and it is invisible to every instrument the tree has, because a reason is prose.
+
+## The four
+
+**`require_self_certified_membership` — "no measurement exists of what fraction of legitimate announcements
+the check would reject."** True when written, and it had hardened into a standing justification for not
+deciding a security default. The measurement cost one test: the same Fano cell twice, differing only in the
+flag, **42 learned membership edges ungated and 0 with the check on**. Not a fixture artefact — the engine
+holds no signing key by construction, so a deployment installs a signed descriptor through
+`OverlayNode::with_signed_descriptor`, and that builder's only caller in the tree is a simulator test. The
+switch is a consumer shipped without its producer, and no deployment could ever have turned it on safely.
+
+Then the second question, which is the one that mattered: *why* was the producer never wired? Because
+production nodes have no hierarchical depth (`hier_path` is `None` at every production site), so they keep the
+default depth-1 `root(coord)`, so the address-binding half of the defence — the half whose advertised price is
+`≈ N^k` identity grinding — filters away its only level and **accepts every identity**. The switch belongs to
+a naming regime that has not shipped. The missing producer is a correct consequence, not neglect.
+
+**The anonymity follow-up — "PG(2,7) has 57 coordinates and the ThresholdRouter harness has 7."** A count,
+and counts sound like measurements. Attempted: three flows need six coordinates and the plane has seven, so
+the transplant is arithmetically possible. It is not possible at all, and the reason does not improve with
+`q`: a rendezvous flow terminates on a meeting **line**, and any two lines of a projective plane meet in
+exactly one point, so per-flow exit observables can never be disjoint — measured as 1491 receptions
+attributed across three exits for 578 sends. The Lite metric escapes this only because its flows are
+point-to-point, and that shape never enters `ThresholdRouter::forward_send`. The follow-up needs a different
+instrument, not a bigger plane; the recorded reason would have sent the next attempt to buy one.
+
+**#66 — "ML-DSA-65 has no known constant-size aggregate."** True, and it reads as *the classical half would
+collapse the certificate if only the post-quantum half let it*. It would not. FANOS already computes a
+threshold unique signature — `fanos_vrf::beacon` Lagrange-combines partials in the exponent to `σ = x·M`, the
+same ristretto255 point for every `t`-subset — and it still yields no constant-size certificate, because
+verifying `σ` against the group key is exactly what a pairing buys and this beacon is deliberately
+pairing-free. `BeaconRound` carries the `t` partials. So #66 is blocked twice and the second reason is a
+**choice**. Naming only the first hides the trade actually on the table: keep `Q` signatures, adopt a pairing
+and lose post-quantum unforgeability for commit certificates, or carry a proof system over the verifications —
+which is constant-size, hash-based, and the reason "no aggregate" is a statement about *algebraic* aggregation
+only.
+
+**`fanos-hermes` — "reusing the built DKG + threshold signing."** The DKG is built. Threshold signing is not:
+no `partial_sign`, no signature combine, nothing of the kind anywhere in the tree. A planned consumer of a
+capability that does not exist, which no compiler catches because it lives in prose — the mirror image of the
+defect class the tree already hunts, and the harder one to see, because the *consuming* end reads as finished.
+
+## What the fifth says, and why it is not an exception
+
+The fifth attempt was `attachment`, recorded as "the cheapest of the five to close: its dependency is already
+there." That reason was **correct**, and closing it took one composition of four shipped pieces. But closing
+it surfaced a check none of the pieces implied — `open_object` verifies each chunk against *the manifest it is
+handed*, so a substituted manifest opens cleanly and only the descriptor, which travelled inside the ratcheted
+message, can refuse it — and it dissolved a distinction the same note drew: attachments and `call` turn out to
+wait on the same missing node-side kind router. Two of five separate reasons were one reason.
+
+So even the accurate reason was incomplete about its neighbours. A reason is a snapshot of what was known when
+it was written, and nothing in the tree ages it.
+
+## The remedy, stated as a rule rather than as a resolution
+
+**When accepting a blocker, record what would falsify it, not only what it is.** "No measurement exists" names
+its own remedy and is the most falsifiable kind — it dissolved in one test. "57 points against 7" names a
+quantity that was never the obstruction. The difference is whether the sentence can be attacked.
+
+And the corollary that cost the most to learn: attempting blocked work pays **whether or not the blocker is
+real**. Two of the four blockers here were genuine and two were not, but all four had a wrong reason on
+record, and a wrong reason misdirects the next attempt exactly as much when the blocker is real.
