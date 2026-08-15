@@ -1208,7 +1208,14 @@ pub struct OverlayChoices {
     /// Whether a peer's announced overlay address must be the descent chain of the identity it announces.
     ///
     /// Defends against routing-table poisoning (threat §79/B1): with it on, a peer cannot announce an address
-    /// it did not earn, so attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding.
+    /// it did not earn, so attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding — **in a
+    /// deployment with hierarchical depth, which this is not yet.** Nodes here keep the default depth-1
+    /// `root(coord)` address, and the check skips level 0 under VRF coordinates, so the address-binding half
+    /// filters away its only level and accepts every identity. Pinned by
+    /// `fanos_primitives::address::tests::at_depth_one_the_vrf_skip_makes_the_binding_vacuous_for_any_identity`.
+    /// Correct for a single cell — there is no descent chain to bind and no `RouteHier` traffic to attract —
+    /// but it means the `N^k` price above is what the switch buys LATER, not today. Today it would buy only
+    /// the descriptor-signature half (threat §80, transport hijack), and only if that half had a producer:
     ///
     /// **Turning this on today rejects every peer, and the measurement is in `fanos-sim`.** The check
     /// verifies a signed descriptor that the engine cannot produce — it holds no signing key by construction

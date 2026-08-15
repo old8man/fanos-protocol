@@ -121,6 +121,43 @@ mod tests {
     use fanos_field::F2;
 
     #[test]
+    fn at_depth_one_the_vrf_skip_makes_the_binding_vacuous_for_any_identity() {
+        // **The shipping configuration verifies nothing here, and this pins it so.**
+        //
+        // Under VRF coordinates (spec §A7) level 0 is the beacon-seated transport coordinate rather than
+        // the hash `address_point(id, 0)`, so `require_self_certified_membership` calls this with
+        // `min_level = 1` — level 0's authenticity comes from the proof-of-coordinate HELLO instead
+        // (audit C3, `overlay/membership_ops.rs`). A production node meanwhile keeps the default
+        // `root(coord)` address: `with_hier_address` is never called outside the simulator
+        // (`hier_path` is `None` at every production composition site), and its doc says as much —
+        // "A depth-1 node keeps the default `root(coord)`".
+        //
+        // Depth 1 means the only level present is level 0, `min_level = 1` filters it away, and `.all()`
+        // over nothing is true. So in the regime that ships, the address-binding half of the
+        // routing-table-poisoning defence — the half whose advertised price is `≈ N^k` identity grinding
+        // — accepts EVERY identity, and the whole defence rests on the descriptor signature alone.
+        //
+        // Not a bug to fix here: it is correct for a single-cell deployment, where there is no descent
+        // chain to bind and no `RouteHier` traffic to attract. It is pinned because the `N^k` claim reads
+        // as active protection, and the day nodes gain real depth this test's `min_level = 1` arm starts
+        // doing work — at which point the two arms below stop agreeing for a reason worth noticing.
+        let id = b"node-identity-alpha";
+        let unrelated = HierAddr::from_path(alloc::vec![Point::<F2>::at(3)]).unwrap();
+        assert!(
+            address_matches_identity_from::<F2>(id, &unrelated, 1),
+            "depth-1 under the VRF skip must be vacuously true — if this fails the skip or the default \
+             address changed, and the self-certified check now binds something at level 0",
+        );
+        // The discrimination: the SAME identity and the SAME address, differing only in where the check
+        // starts. Without this arm the assertion above would also pass if the address happened to match.
+        assert!(
+            !address_matches_identity_from::<F2>(id, &unrelated, 0),
+            "the address must genuinely NOT be this identity's own — otherwise the arm above proves \
+             nothing about the skip",
+        );
+    }
+
+    #[test]
     fn an_identitys_own_chain_verifies() {
         // The address derived from an identity is exactly the one that verifies against it.
         let id = b"node-identity-alpha";
