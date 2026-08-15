@@ -2837,13 +2837,18 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
         // timer wearing a derivation's clothes, and it re-creates a smaller copy of the amplification this
         // change exists to remove.
         let direct = match t.directory.resolve(to) {
-            Some(addr) if dead_addr != Some(addr) => {
-                let conn = get_or_connect(&t, to, addr).await;
-                if conn.is_none() {
+            Some(addr) if dead_addr != Some(addr) => match get_or_connect(&t, to, addr).await {
+                Dialed::Peer(conn) => Some(conn),
+                Dialed::Unreachable => {
                     dead_addr = Some(addr);
+                    None
                 }
-                conn
-            }
+                // **Deliberately not struck out** — see [`Dialed::Ourself`]. The address answers; it is the
+                // directory ENTRY that is stale, and nothing in this refusal can correct it, so the next
+                // frame must be free to re-consult the directory. Striking it here would turn one transient
+                // mis-binding into a live peer being unreachable for the whole epoch.
+                Dialed::Ourself => None,
+            },
             // Known-dead address, or none at all: whatever is already live, and no waiting.
             _ => cached(&t, to),
         };
@@ -2962,9 +2967,37 @@ fn decode_relay(body: &[u8]) -> Option<(Triple, Triple, &[u8])> {
 
 /// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
 /// cert check), and start reading frames the peer sends back on it.
-async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<Connection> {
+/// What a dial produced — **three** answers, because the two failures demand opposite handling of the ADDRESS.
+///
+/// This was `Option<Connection>` until a loop-back became a third outcome (#350), and [`dial_and_send`] reads a
+/// bare `None` as "this address does not answer" and strikes it out for the rest of the epoch. That reading
+/// rests on the premise its own comment states — *"re-trying the same thing cannot yield a different answer
+/// **while the mappings hold**"* — and a loop-back is precisely the case where the **mapping** is what is
+/// wrong: the address answers, and it answers as us.
+///
+/// This is the category #240 already carved out of this same function (*"this address hosts `actual` and does
+/// not host `to`, so our directory entry is stale"*), with the one difference that decides the handling:
+/// #240's rejection **carries its own correction** — the peer proved where it is, the directory is repaired,
+/// and the next dial resolves a *different* address, so striking the old one out costs nothing. A loop-back
+/// carries no correction, the entry stays exactly as it was, and the strike is then the thing that removes a
+/// live peer for a whole epoch.
+///
+/// A negative fact is deliberately **not** written back to the directory. #240 records a positive one (a peer
+/// proved where it is), which the rank arbitration can weigh; "`to` is not here" is negative, the arbitration
+/// has no rule for it, and inventing one is out of scope for a refusal.
+enum Dialed {
+    /// A peer answered and proved the coordinate we dialed.
+    Peer(Connection),
+    /// Nothing usable answered here — an impostor, an epoch we cannot judge, a dead socket. Worth not
+    /// retrying while the mapping stands, which is what [`dial_and_send`] does with it.
+    Unreachable,
+    /// **We** answered: the coordinate we dialed resolves to this node's own endpoint (#350).
+    Ourself,
+}
+
+async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
     if let Some(conn) = cached(t, to) {
-        return Some(conn);
+        return Dialed::Peer(conn);
     }
     // Bound the dial: a peer that has gone away (shut down, NAT-dropped) must fail FAST, not hang the send
     // loop for the full QUIC handshake timeout. That stall is the #129 availability bug — a `get`'s
@@ -2981,7 +3014,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     };
     let Some(conn) = established else {
         apply_outcome(&t.shaper, &t.controller, false);
-        return None;
+        return Dialed::Unreachable;
     };
 
     match &t.identity {
@@ -3019,7 +3052,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             if matches!(handshake.peer, PeerIdentity::Ourself) {
                 t.record_station(Station::TransportSelfConnection, Some(to), None);
                 tracing::debug!(?to, "dialed our own coordinate; another node holds the point we drew");
-                return None;
+                return Dialed::Ourself;
             }
             // **The breaker reads the shaped round trip, not the QUIC handshake** (#231). Shaping starts at
             // the stream, so the handshake completing says nothing about the morph — a censor that admits
@@ -3149,7 +3182,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     // dialed in *from*, and here we dialed out to a listen address the directory named. The
                     // binding worth recording was `actual → addr`, and the write above already made it.
                     tracing::debug!(?to, ?actual, filed, "dialed coordinate has moved; directory corrected");
-                    return None;
+                    return Dialed::Unreachable;
                 }
                 // **We could not judge it, so we keep the connection and fail only the send** (#235). This
                 // dial was to `to`, and nothing here proved the peer is `to` — so no directory write, no
@@ -3160,17 +3193,17 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                 // connection, and this was the connection.
                 PeerIdentity::Unjudged(u) => {
                     spawn_restricted(conn, u, t.clone());
-                    return None;
+                    return Dialed::Unreachable;
                 }
                 PeerIdentity::Rejected => {
                     tracing::warn!(?to, "peer proved no coordinate (impostor or malformed claim); rejecting");
-                    return None;
+                    return Dialed::Unreachable;
                 }
                 // Unreachable: the loop-back is answered above, before `apply_outcome`, precisely so it never
                 // reaches the arms that write the directory and the connection map. Written out rather than
                 // folded into a wildcard because a wildcard here would silently absorb the NEXT variant too,
                 // and this match is where a mis-sorted identity costs a directory write.
-                PeerIdentity::Ourself => return None,
+                PeerIdentity::Ourself => return Dialed::Ourself,
             }
         }
     }
@@ -3183,7 +3216,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
     if let Ok(mut map) = t.conns.lock() {
         file_conn(&mut map, to, conn.clone());
     }
-    Some(conn)
+    Dialed::Peer(conn)
 }
 
 /// A cached, still-open connection to `peer`, if any.
@@ -4122,7 +4155,11 @@ fn accept_holepunch(t: &Transport, body: &[u8]) {
     }
     let t = t.clone();
     tokio::spawn(async move {
-        let reached = get_or_connect(&t, peer, addr).await.is_some();
+        // `Dialed::Peer` and nothing else: a loop-back (#350) reached no *peer*, so the directory write
+        // below must not happen — the same rule this function's doc derives ("no directory write until the
+        // identity is proven"). Spelled as a match on the variant rather than "not a failure", because the
+        // two failures mean opposite things about the address and only one of them is about reachability.
+        let reached = matches!(get_or_connect(&t, peer, addr).await, Dialed::Peer(_));
         if reached {
             // Proven: whoever answered at that address proved the dialed coordinate. Only now is the
             // address worth recording, so subsequent overlay sends resolve directly and stop needing the

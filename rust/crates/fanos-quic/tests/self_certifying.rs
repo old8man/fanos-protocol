@@ -386,6 +386,78 @@ fn entry_fallbacks(node: &NodeHandle) -> u64 {
         .sum()
 }
 
+/// **Refusing a loop-back must not strike the address out for the epoch** (#350).
+///
+/// The refusal was right and its price was not. `dial_and_send` marks an address dead on any `None` from
+/// `get_or_connect`, and the comment justifying that rests on *"re-trying the same thing cannot yield a
+/// different answer **while the mappings hold**"*. A loop-back is the case where the mapping is exactly what
+/// is wrong: the address answers, and it answers as us. Striking it turns one transient directory
+/// mis-binding into a live peer being unreachable until the epoch turns — and before #350 the loop-back
+/// "succeeded", so nothing was struck and the next frame simply re-consulted the directory.
+///
+/// **The observable is the consequence, not the effect.** Nothing counts "this address was blacklisted", and
+/// inventing a counter for it would measure the implementation rather than the behaviour. But a struck
+/// address is never dialed again this epoch — so a SECOND send to the same point asks the system whether the
+/// address survived, and the existing station answers: one means it was struck, two means it was not.
+///
+/// Both halves are asserted because either alone is satisfiable by a broken node: the second dial happened
+/// (the count reaches two) AND the refusal still holds (nothing was delivered to us).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_self_connection_does_not_strike_the_address_out_for_the_epoch() {
+    let dir = Directory::new();
+    let mut node = spawn_self_certifying::<F7>(make_node, dir.clone())
+        .await
+        .expect("spawn");
+    assert_eq!(
+        dir.resolve(node.address()),
+        Some(node.local_addr()),
+        "our own coordinate must resolve to our own socket, or this test is not exercising a self-dial",
+    );
+
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(20);
+    let mut delivered_to_self = false;
+    for attempt in 0..2u32 {
+        node.command(Command::Send {
+            to: node.address(),
+            payload: format!("addressed at our own point, attempt {attempt}").into_bytes(),
+        });
+        // Wait for THIS attempt to be recorded before sending the next, so the two sends cannot be folded
+        // into one dial by racing — which would make the count-of-two assertion pass for the wrong reason.
+        while self_connections(&node) <= u64::from(attempt)
+            && !delivered_to_self
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::select! {
+                n = node.next_notification() => {
+                    if matches!(n, Some(Notification::Delivered { .. })) {
+                        delivered_to_self = true;
+                    }
+                    if n.is_none() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(StdDuration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    assert!(
+        !delivered_to_self,
+        "the frame was delivered to the sender: the loop-back refusal itself stopped working, so this \
+         test's subject — the PRICE of that refusal — cannot be read from the count below",
+    );
+    assert_eq!(
+        self_connections(&node),
+        2,
+        "the second send never reached `hello_exchange`, which means the first refusal struck the address \
+         out of the directory for the rest of the epoch. That address is not dead — it answered — and the \
+         entry pointing at it is what is stale, so a frame sent after the directory corrects itself must \
+         still be able to dial. One here is the defect; two is the address surviving its own refusal",
+    );
+
+    node.shutdown();
+}
+
 /// Count of `transport.self_connection` on a node's transport driver.
 fn self_connections(node: &NodeHandle) -> u64 {
     node.client()
