@@ -769,6 +769,23 @@ impl<F: Field> ThresholdRouter<F> {
         effects
     }
 
+    /// A **decoy share** — correctly shaped, secret-keyed, and useless — for a request this node cannot
+    /// answer. Same `x` a genuine share of this member would carry (`shamir::split` numbers members from
+    /// `1`) and the same `SHARE_LEN − 1` bytes of `y`, so it is indistinguishable on the wire from the real
+    /// thing: `encode_rep` produces one constant width either way.
+    ///
+    /// Keyed on the node's mixing secret and bound to `(req_id, line)` so it is deterministic per request —
+    /// two decoys for one request are identical, which a retransmission needs, and decoys across requests
+    /// are unlinkable without the secret.
+    fn decoy_share(&self, member_index: usize, req_id: u64, line: Triple) -> Share {
+        let mut material = self.mix_seed.to_vec();
+        material.extend_from_slice(&req_id.to_be_bytes());
+        material.extend_from_slice(&fanos_geometry::encode_triple(line));
+        let mut y = alloc::vec![0u8; fanos_threshold::SHARE_LEN - 1];
+        fanos_primitives::hash::hash_xof("FANOS-v1/threshold-decoy-share", &material, &mut y);
+        Share::new(u8::try_from(member_index + 1).unwrap_or(u8::MAX), y)
+    }
+
     /// Handle a share-request from a combiner: compute our partial for `line` and reply.
     fn on_request(&mut self, req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<Effect> {
         let Some(i) = self.my_index(line) else {
@@ -786,7 +803,22 @@ impl<F: Field> ThresholdRouter<F> {
             // this node no longer holds — **epoch/key skew between members**, otherwise invisible, and
             // exactly the per-line signal an upgrade needs (docs/design-upgrade.md §4).
             self.stations.record(Station::SharePartialFailed, Some(line));
-            return Vec::new();
+            // **Reply anyway, with a decoy — silence here is a traffic channel (#354).** A cover cell is a
+            // block of keystream, so `member_share`'s AEAD authentication fails on it and this arm is the
+            // one every cover cell takes. Returning nothing therefore made the reply stream a pure function
+            // of *cargo*: measured on the shipping schedule, `TAG_REP` frames came to `4 + 4·cells` while
+            // the onion and request streams stayed on the slot rate. A GPA counting the smallest of the
+            // three size classes read the relay's cargo volume directly, through a defence whose whole
+            // claim is that it does not.
+            //
+            // A decoy is safe because the combiner already treats every reply as a *candidate* and trusts
+            // none until a `t`-subset actually peels — the mechanism built for up to `t − 1` forged shares
+            // (`MAX_SUBSETS`). A cover cell's gather cannot peel with or without this reply; what changes is
+            // that it now costs the same frames on the wire as a real one.
+            return alloc::vec![Effect::Send {
+                to: combiner,
+                frame: encode_rep(req_id, &self.decoy_share(i, req_id, line)),
+            }];
         };
         alloc::vec![Effect::Send {
             to: combiner,
@@ -1428,6 +1460,65 @@ mod tests {
             seq_a, seq_a2,
             "the schedule is deterministic for a given secret"
         );
+    }
+
+    /// **A share request this node cannot answer must still cost one reply on the wire (#354).**
+    ///
+    /// A cover cell is a block of keystream, so `member_share`'s AEAD authentication fails on it and every
+    /// cover cell takes the failure arm of `on_request`. While that arm returned nothing, the reply stream
+    /// was a pure function of *cargo* — measured on the shipping schedule over a composed relay cell,
+    /// `TAG_REP` frames came to `4 + 4·cells` while the onion and request streams stayed on the slot rate.
+    /// Since a reply is `1 + 8 + SHARE_LEN = 42` bytes and an onion or a request is `THRESHOLD_ONION_LEN`
+    /// plus a header, the three are separable by size alone, and a GPA counting the smallest class read the
+    /// relay's cargo volume through a defence whose whole claim is that it does not.
+    ///
+    /// With the decoy the same run reads `replies == requests` in every arm, at every cargo level.
+    #[test]
+    fn a_share_request_this_node_cannot_answer_still_costs_one_reply_on_the_wire() {
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"decoy-reply"));
+        let me = Point::<F2>::at(0);
+        let mut r = ThresholdRouter::<F2>::new(me, &s, 2, [0x11; 32]);
+        // A line this node is on, so the request is answerable in principle and only the peel fails.
+        let line = Plane::<F2>::lines()
+            .find(|&l| Plane::<F2>::points_on(l).any(|p| p == me))
+            .expect("every point lies on a line");
+        let combiner = Point::<F2>::at(3).coords();
+        // Keystream where an onion should be — byte-for-byte what `emit_cover` puts on the wire.
+        let mut garbage = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        fanos_primitives::hash::hash_xof("test/cover-body", b"decoy", &mut garbage);
+
+        let out = r.step(
+            Instant(0),
+            Input::Message {
+                from: combiner,
+                frame: encode_req(7, combiner, line.coords(), &garbage),
+            },
+        );
+
+        // The setup took effect: we are on the line and the PEEL is what failed, not membership.
+        assert_eq!(
+            r.stations().total(Station::SharePartialFailed),
+            1,
+            "the failure arm must be the one taken — otherwise this test pins the wrong path"
+        );
+        assert_eq!(
+            r.stations().total(Station::ShareRequestNotAMember),
+            0,
+            "a request for a line this node is not on would exercise a different early return"
+        );
+        // And it costs exactly one reply, of the width a genuine share reply has.
+        match out.as_slice() {
+            [Effect::Send { to, frame }] => {
+                assert_eq!(*to, combiner, "the decoy goes back to the asking combiner");
+                assert_eq!(
+                    frame.len(),
+                    1 + 8 + fanos_threshold::SHARE_LEN,
+                    "a decoy must be the same width as a real reply, or the size classes still separate"
+                );
+                assert_eq!(frame.first(), Some(&TAG_REP), "and must be a reply, not some other tag");
+            }
+            other => panic!("expected exactly one reply, got {} effects", other.len()),
+        }
     }
 
     #[test]
