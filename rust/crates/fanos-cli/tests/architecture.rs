@@ -732,6 +732,90 @@ fn production_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// **An invariant two subsystems wrote down independently, and nothing enforced.**
+///
+/// It is not this test's phrasing. `fanos-taxis/src/crosscell.rs` says of its own leaf label —
+/// *"Deliberately local: `merkle` owns the internal-node label, so a leaf of **this** tree can be neither an
+/// internal node nor a leaf of any other subsystem's tree"* — and `fanos-thesauros/src/content.rs` says the
+/// same of its own: *"keeping this one local is what stops a thesauros leaf from being read as any other
+/// subsystem's."* Two of the three current leaf domains state the property at their own constant. The third
+/// keeps it. Nothing checked it.
+///
+/// **Nothing could, from where the primitive sits.** `merkle::leaf(domain, bytes)` takes the domain as a
+/// parameter precisely so each subsystem brings its own, and its doc says as much: *"Nothing forces this — a
+/// caller can hash its leaves however it likes."* A primitive cannot see its callers; the corpus can, which
+/// is where this suite's other ratchets already live.
+///
+/// **Written while it is green, which is the only cheap time.** Three production labels today —
+/// `FANOS-v1/pqvrf-leaf`, `FANOS-v1/thesauros-leaf`, `FANOS-v1/taxis-crossmsg-leaf` — all distinct, beside the
+/// primitive's own `merkle-node` / `merkle-root` / `merkle-empty`. A guard written after a collision cannot
+/// tell whether it is catching the defect or its own mistake; one written now has today's green as its
+/// control, and the arrival of a fourth subsystem is exactly when a discipline three callers keep by hand
+/// erodes.
+///
+/// Both halves of the stated invariant are asserted, because a distinctness check alone covers only one:
+/// no two subsystems share a leaf domain, **and** no leaf domain is one of the primitive's internal labels.
+///
+/// Residual, stated rather than implied: this sees the `LEAF_LABEL` constant idiom every current caller uses.
+/// A caller passing a computed or inline domain is outside the scan by construction.
+#[test]
+fn every_merkle_leaf_label_is_unique_to_its_subsystem() {
+    let sources = production_sources();
+    // **Keyed on the ROLE, not on the spelling.** A label is a leaf domain because it is passed to
+    // `merkle::leaf`, not because it happens to end in `-leaf` — and the first version of this scan collected
+    // by suffix, which made the reserved-label assertion below **unreachable**: a caller that used
+    // `FANOS-v1/merkle-node` as its leaf domain, the exact thing that assertion is about, never entered the
+    // list. Found by falsifying this test rather than by reading it. Every current caller declares
+    // `const LEAF_LABEL: &str = "…"`, so that is the observable.
+    let mut labels: Vec<(String, String)> = Vec::new();
+    for (krate, text) in &sources {
+        for line in text.lines() {
+            let Some(pos) = line.find("LEAF_LABEL") else { continue };
+            let rest = &line[pos..];
+            let Some(open) = rest.find('"') else { continue };
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else { continue };
+            labels.push((after[..close].to_string(), krate.clone()));
+        }
+    }
+
+    // **Two controls, one per stage, because a control must test the stage it sits at.** The walk and the
+    // selection fail in different ways and a single check on the result conflates them — and a count-based
+    // control was worse still: it accused the SCAN whenever the tree legitimately gained or lost a Merkle
+    // user, and it fired ahead of the assertions it was meant to guard, which is how the defect above hid.
+    assert!(!sources.is_empty(), "the corpus contributed nothing — the filter, not the workspace, is empty");
+    assert!(
+        !labels.is_empty(),
+        "no `LEAF_LABEL` declaration was found in any production source. Either the walk is broken or no \
+         subsystem builds Merkle trees any more — and if it is the second, this guard has lost its subject \
+         and should be DELETED rather than weakened",
+    );
+
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for (label, krate) in &labels {
+        if let Some(first) = seen.insert(label, krate)
+            && first != krate
+        {
+            panic!(
+                "`{label}` is used as a Merkle leaf domain by BOTH `{first}` and `{krate}`. \
+                 `merkle::leaf`'s guarantee — a leaf is neither an internal node nor another subsystem's \
+                 leaf — holds only while these are unique, and the primitive cannot enforce it from where it \
+                 sits. Give the newer subsystem its own label rather than sharing one."
+            );
+        }
+    }
+
+    for reserved in ["FANOS-v1/merkle-node", "FANOS-v1/merkle-root", "FANOS-v1/merkle-empty"] {
+        if let Some((_, krate)) = labels.iter().find(|(l, _)| l == reserved) {
+            panic!(
+                "`{krate}` uses `{reserved}` as its leaf domain, and that is the primitive's own \
+                 internal-node label. This is the second half of the guarantee — *neither an internal node* \
+                 nor another subsystem's leaf — and a distinctness check between subsystems cannot see it."
+            );
+        }
+    }
+}
+
 /// **The Sybil cap has a consumer, a composition and a refusal — and no producer. This is the alarm for
 /// the day that changes.**
 ///
