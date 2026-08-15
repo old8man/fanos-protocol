@@ -147,6 +147,20 @@ fn tape_correlation_full(
     cargo: bool,
     stagger_ms: u64,
 ) -> ((usize, u64), f64) {
+    tape_correlation_dense(cover, mix, bin_ms, heartbeat, cargo, stagger_ms, 1)
+}
+
+/// …and with the traffic density as a parameter. See `drive_n`.
+#[allow(clippy::too_many_arguments)]
+fn tape_correlation_dense(
+    cover: Duration,
+    mix: Duration,
+    bin_ms: u64,
+    heartbeat: bool,
+    cargo: bool,
+    stagger_ms: u64,
+    repeats: usize,
+) -> ((usize, u64), f64) {
     let mut sim = Sim::new(SEED);
     let cell = spawn_composed_relay_cell::<F2>(&mut sim, Config::default(), cover, mix, true);
     if heartbeat {
@@ -164,7 +178,7 @@ fn tape_correlation_full(
     sim.observe_frames(); // the GPA starts tapping
 
     if cargo {
-        drive(&mut sim);
+        drive_n(&mut sim, repeats);
     } else {
         // The same simulated span with nothing forwarded, so the tape differs in exactly one thing.
         let mut now = 0u64;
@@ -192,6 +206,13 @@ fn tape_correlation_full(
 /// The traffic every arm and every extra test drives — one definition, so no two of them can differ in the
 /// load while claiming to differ only in the defence.
 fn drive(sim: &mut Sim) {
+    drive_n(sim, 1);
+}
+
+/// The same traffic repeated at `repeats` offsets — one definition still, so no two arms can differ in the
+/// load. Density matters because a Pearson over a series that is 95% zeros is measuring coincidence among a
+/// handful of events, not a rate relationship.
+fn drive_n(sim: &mut Sim, repeats: usize) {
     // **Sealed onions through the router, not overlay sends.** The first version of this harness drove
     // `Command::Send`, which never enters `ThresholdRouter::forward_send` — the control below caught it.
     // This is the shape `composed_relay.rs` uses: an epoch-0 `MixDirectory` over the seeds
@@ -216,12 +237,20 @@ fn drive(sim: &mut Sim) {
     // Each send is a SEPARATE seal. Re-injecting one frame would be a replay, and #296 taught the shipping
     // router to refuse those — the second onward would vanish at the anti-replay gate and the flow would be
     // one cell long.
-    let send_at_ms = [400u64, 1400, 1600, 3200, 5000, 5200, 5400, 8000, 9800, 10_000];
+    let base = [400u64, 1400, 1600, 3200, 5000, 5200, 5400, 8000, 9800, 10_000];
+    let mut send_at_ms: Vec<u64> = Vec::new();
+    for k in 0..repeats {
+        let k = k as u64;
+        for b in base {
+            send_at_ms.push(b + k * 130 + (k % 3) * 37);
+        }
+    }
+    send_at_ms.sort_unstable();
     let mut sent = 0usize;
     let mut now = 0u64;
     while now < WINDOW_MS {
         while sent < send_at_ms.len() && send_at_ms[sent] <= now {
-            let seed = [b'g', b'p', b'a', u8::try_from(sent).unwrap()];
+            let seed = [b'g', b'p', b'a', u8::try_from(sent & 0xFF).unwrap()];
             let fwd = seal_forward::<F2>(&[hop, meeting], &dir, ONION_T, b"gpa-probe", &seed)
                 .expect("the circuit seals");
             sim.inject_frame(entry, fwd.combiner, fwd.frame.clone());
@@ -472,15 +501,22 @@ fn the_gpa_figure_does_not_move_when_the_relay_carries_nothing() {
 ///
 /// ```text
 ///   bin    undefended   cover-only   delay-only   cover buys   delay buys
-///    20ms      0.8868       0.5679       0.6605       0.3189       0.2263
-///    50ms      0.8308       0.6017       0.7865       0.2291       0.0443
-///   100ms      1.0000       0.7585       0.9411       0.2415       0.0589
-///   250ms      1.0000       0.7416       1.0000       0.2584       0.0000
-///   500ms      1.0000       0.8275       1.0000       0.1725       0.0000
+///    20ms      0.8518       0.6256       0.6110       0.2262       0.2408
+///    50ms      0.8243       0.7381       0.7109       0.0862       0.1135
+///   100ms      0.8789       0.8186       0.8519       0.0603       0.0270
+///   250ms      0.9592       0.9414       0.9523       0.0178       0.0069
+///   500ms      0.9742       0.9664       0.9876       0.0079      −0.0134
 /// ```
 ///
 /// Every row is printed by the test below over this file's own `BIN_SWEEP_MS`, so the table cannot drift
 /// from what runs.
+///
+/// **At fifteen repeats of the drive, and that is a correction of this test's own first version.** It read
+/// its figures off the single-pass drive: 100 frames across seven nodes and twelve seconds, five non-empty
+/// bins per node, and one node reporting `r = 1.0000` from three aligned events. A Pearson over a series
+/// that is 95% zeros measures coincidence. The conclusion survived the denser sample — at 20 ms the delay
+/// buys `0.2408` against the cover's `0.2262`, slightly *more* rather than less — but the first sample could
+/// not have supported it, which is why the tape size is now asserted.
 ///
 /// **`delay buys 0.000` was the ruler, not the delay.** At a `250 ms` bin a `120 ms` mean displacement moves
 /// nothing across bin boundaries and the column reads zero — which is exactly the figure the old table
@@ -499,21 +535,34 @@ fn on_its_own_traffic_the_mix_delay_buys_as_much_as_the_cover() {
     // A bin finer than the mean displacement, or the ruler decides the answer — this file's own rule,
     // applied to the arm it was never applied to.
     const FINE: u64 = 20;
+    // **Density, because a Pearson over a series that is 95% zeros measures coincidence.** The file's own
+    // drive puts 100 frames on a heartbeat-free tape across seven nodes and twelve seconds — five non-empty
+    // bins per node, and one of them read `r = 1.0000` off three aligned events. Fifteen repeats of the same
+    // aperiodic pattern is ~1500 frames, and the figures below are stable against 5 repeats (see the doc).
+    const REPEATS: usize = 15;
     // The whole sweep is printed, not just the row the claim rests on: the same ruler discipline this file
     // applies to the cover, and it is what shows `delay buys` decaying to zero as the bin passes the mean.
     println!("clean tape (heartbeat off), by bin width:");
     println!("  bin    undefended   cover-only   delay-only   cover buys   delay buys");
     let mut fine = (0.0, 0.0, 0.0);
+    let mut frames = 0usize;
     for bin in BIN_SWEEP_MS {
-        let p = tape_correlation_full(Duration(0), Duration(0), bin, false, true, 0).1;
-        let c = tape_correlation_full(span(DEFAULT_COVER_INTERVAL), Duration(0), bin, false, true, 0).1;
-        let d = tape_correlation_full(Duration(0), span(DEFAULT_MIX_DELAY), bin, false, true, 0).1;
+        let ((f, _), p) = tape_correlation_dense(Duration(0), Duration(0), bin, false, true, 0, REPEATS);
+        let c = tape_correlation_dense(span(DEFAULT_COVER_INTERVAL), Duration(0), bin, false, true, 0, REPEATS).1;
+        let d = tape_correlation_dense(Duration(0), span(DEFAULT_MIX_DELAY), bin, false, true, 0, REPEATS).1;
         println!("{bin:5}ms      {p:.4}       {c:.4}       {d:.4}       {:.4}       {:.4}", p - c, p - d);
         if bin == FINE {
             fine = (p, c, d);
+            frames = f;
         }
     }
     let (plain, cover, delay) = fine;
+    // The sample, asserted before the statistic: the thin version of this test computed its figures over a
+    // tape of 100 frames and would have kept doing so silently.
+    assert!(
+        frames > 1_000,
+        "a Pearson needs a series that is not mostly zeros: the undefended tape carried {frames} frames"
+    );
     assert!(plain > 0.8, "the undefended control must leak, or nothing below means anything: {plain:.4}");
     assert!(
         plain - delay > 0.15,
