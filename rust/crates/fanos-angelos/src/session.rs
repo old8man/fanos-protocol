@@ -95,7 +95,8 @@ impl Session {
     /// `None` on the AEAD-setup error — unreachable for any plaintext this build can produce, and said out
     /// loud anyway because this is a *public* API: `unwrap_or_default()` used to hand the caller an 8-byte
     /// frame carrying no ciphertext at all, which the peer then reports as a diverged ratchet rather than as
-    /// a failed send (#338). The send chain is not advanced in that case — see [`SendChain::seal_with`].
+    /// a failed send (#338). The send chain is not advanced in that case: the message key is taken only once
+    /// the ciphertext exists, so a refused seal spends nothing and the next call reuses the same number.
     #[must_use]
     pub fn seal(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
         self.send.seal_with(|n, mk| {

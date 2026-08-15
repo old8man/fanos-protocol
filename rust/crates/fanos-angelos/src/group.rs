@@ -85,7 +85,8 @@ impl GroupSession {
     /// `None` on the AEAD-setup error, which no plaintext this build can produce reaches. Worth a return
     /// value rather than a default because of what the default was: an empty ciphertext **carrying a valid
     /// signature over it** (#338). Every other member would have authenticated the post and opened nothing.
-    /// The sender chain is not advanced in that case — see [`SendChain::seal_with`].
+    /// The sender chain is not advanced in that case: the message key is taken only once the ciphertext
+    /// exists, so a refused seal spends nothing.
     #[must_use]
     pub fn send(&mut self, plaintext: &[u8]) -> Option<Vec<u8>> {
         let my_id = self.my_id;

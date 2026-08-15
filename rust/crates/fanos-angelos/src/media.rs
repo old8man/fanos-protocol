@@ -204,7 +204,7 @@ impl MediaSession {
     /// Seal one media frame under this party's *send* key: `epoch(4) ‖ seq(8) ‖ AEAD(kind ‖ payload)`. Frames are
     /// independently openable and loss-tolerant.
     /// `None` on the AEAD-setup error, unreachable for any payload this build produces. The sequence number
-    /// is spent only once the frame exists (#338): a media session has no [`SendChain`] to hold that rule for
+    /// is spent only once the frame exists (#338): a media session has no sender chain to hold that rule for
     /// it, so it is kept here by hand, and the reason is the same one — a number spent on nothing steps the
     /// peer's replay window past a frame that never existed.
     #[must_use]

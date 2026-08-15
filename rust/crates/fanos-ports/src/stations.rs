@@ -892,7 +892,7 @@ pub enum Station {
     /// disagree about the format of the message that explains disagreements.
     PeerRefusalUnreadable,
     /// The **beacon engine refused a frame** — tagged with which of its twelve refusal classes
-    /// ([`fanos_keygen::BeaconRefusal`]).
+    /// (`fanos_keygen::BeaconRefusal`, a crate this one does not depend on — named, not linked).
     ///
     /// Every one of those twelve was already counted, and read by **nothing in production**: `.rejects()` had
     /// zero non-test callers, so a cell being flooded with forged reshare triggers and a cell running
