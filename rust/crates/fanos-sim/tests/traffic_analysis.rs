@@ -417,9 +417,16 @@ fn measure_the_timing_channel_at_the_shipping_defaults() {
 // entry and each flow's exit, scores every (entry, exit) pair by correlation, and takes the best assignment. Its accuracy
 // against chance `1/K` is the anonymity loss.
 //
-// ⚠️ Engine: this uses `NyxNode` (the **Lite** profile), because `PG(2,7)`'s 57 points give room for several
-// simultaneous flows while the `ThresholdRouter` harness has 7. Running the same metric on the shipping engine is the
-// named follow-up — and after the 18fce2e retraction, the engine is stated rather than assumed.
+// ⚠️ Engine: this uses `NyxNode` (the **Lite** profile), and its flows are point-to-point `Command::Send`s. Running
+// the same metric on the shipping engine was recorded here as the named follow-up, blocked on `PG(2,7)`'s 57 points
+// against the `ThresholdRouter` harness's 7 — and after the 18fce2e retraction, the engine is stated rather than
+// assumed.
+//
+// **That follow-up was attempted, and the point count is not the obstruction.** A rendezvous flow through the
+// shipping relay terminates on a meeting LINE, and any two lines of a projective plane meet in exactly one point, so
+// per-flow exit observables cannot be disjoint at any `q` — the exits measured 1491 receptions for 578 sends. This
+// metric survives here only because a point-to-point flow has a single-point exit, and that shape never enters
+// `ThresholdRouter::forward_send`. See `shipping_linkability.rs`, which pins the precondition that fails.
 
 /// One flow's entry and exit coordinates.
 struct Flow {
