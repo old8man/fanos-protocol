@@ -9,7 +9,9 @@
 //!    secure — a hash preimage has no quantum shortcut), so two parties swap value across chains with atomicity
 //!    guaranteed by the shared hashlock and the timelock, and no trusted intermediary.
 //! 2. **Threshold-attested custody** — for chains without hashlocks, a FANOS cell's BFT quorum jointly controls
-//!    a foreign address (reusing the built DKG + threshold signing), and a cross-chain transfer becomes a
+//!    a foreign address (reusing the built DKG — threshold *signing* is NOT built: the tree has threshold
+//!    decryption and a threshold VRF, and no `partial_sign`/`combine` for signatures anywhere. It will also be
+//!    chain-dictated and classical, so it cannot double as the aggregate #66 wants), and a cross-chain transfer becomes a
 //!    TAXIS-attested event — an instance of cross-*cell* where the far cell is another chain. (Follows on top.)
 //!
 //! This first increment is the atomic-swap primitive, exact and unit-tested; the ledger settlement (a DROMOS

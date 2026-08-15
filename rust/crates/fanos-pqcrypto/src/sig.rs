@@ -37,6 +37,33 @@
 //!   `the_epoch_rotating_tag_is_defeated_by_the_preimage_travelling_beside_it`). Per-epoch key blinding
 //!   is what closes it.
 //!
+//! # Two things #66 is ALSO blocked on, which "no aggregate for ML-DSA" hides
+//!
+//! Read alone, the bullet above suggests the classical half would collapse the certificate if only the
+//! post-quantum half let it. It would not, and the second obstruction is a choice this tree made rather than
+//! an absence it suffers:
+//!
+//! * **Pairing-free verification is itself incompatible with a constant-size certificate.** FANOS's own
+//!   threshold construction already produces a subset-independent *value*: `fanos_vrf::beacon` Lagrange-
+//!   combines partials in the exponent to `σ = x·M`, the same ristretto255 point for every `t`-subset. But
+//!   verifying `σ` against the group public key is exactly what a pairing buys, and this beacon is
+//!   deliberately pairing-free — so `BeaconRound` carries the `t` partials with their Chaum–Pedersen DLEQ
+//!   proofs and `verify_and_seed` refuses below `threshold`. The certificate is linear in the quorum on the
+//!   *classical* side too, for a reason that has nothing to do with ML-DSA. A pairing-based threshold
+//!   signature would give #66 its factor of `Q` today, classically, and the tree has declined pairings.
+//!
+//! * **"No constant-size aggregate" is a statement about *algebraic* aggregation.** A proof system over the
+//!   verifications — proving "`Q` valid signatures on this block exist" rather than combining them — yields a
+//!   constant-size certificate and, with a hash-based system, a post-quantum one. That route is open and
+//!   expensive. Naming it matters because it changes what #66 is waiting for: not a cryptographic discovery,
+//!   but a decision about whether to carry a proof system.
+//!
+//! So the honest shape of #66 is a three-way trade — keep `Q` signatures, adopt a pairing and lose the
+//! post-quantum property for commit certificates, or carry a proof system — and only the first is free.
+//! Whether a commit certificate needs post-quantum unforgeability at all is the question underneath, and it
+//! is not the same question as for confidentiality: harvest-now-decrypt-later has no authentication analogue
+//! except against a node validating history from scratch.
+//!
 //! The day this module gains either structure, both tasks become unblocked with nothing to say so — so
 //! `fanos-cli`'s `two_field_wide_tasks_wait_on_one_absent_signature_structure` fails on that day and
 //! hands over. Do not delete it silently: it is the only thing watching.
