@@ -289,9 +289,21 @@ fn a_reshuffled_joiner_re_solves_its_proof_and_stays_admitted() {
     assert!(joined_at_genesis >= 1, "the genesis join is admitted");
     assert_eq!(sybil_rejected.load(Ordering::Relaxed), 0, "the genesis proof is not rejected");
 
-    // Advance the receiver to epoch 1; its EpochAgree flood carries the joiner to epoch 1 too, so both
-    // solve/check the admission challenge at the same epoch.
+    // Advance BOTH to epoch 1, so they solve/check the admission challenge at the same epoch.
+    //
+    // **This used to tick only the receiver and let its `EpochAgree` flood carry the joiner** — which stopped
+    // working when gossip stopped being adopted on one member's say-so (#351): a pair is two nodes and the
+    // corroboration quorum is three, so no claim in this fixture can ever be corroborated. That is the rule
+    // working, not a limitation to route around: a cell that cannot muster a quorum must not take cell-wide
+    // decisions on one member's number.
+    //
+    // Ticking both is also what production does, not a workaround for the test. Every node runs its own
+    // wall-clock epoch driver (`fanos_node::spawn_epoch_driver` — "the root tick that periodically issues
+    // `Command::AdvanceEpoch`"), so no node depends on a peer's trigger to move its own clock; `EpochAgree`
+    // exists for *agreement* and catch-up. The epoch here is this test's setup, never its subject — what it
+    // pins is that a reshuffled joiner re-solves its proof and stays admitted.
     sim.inject(receiver_coord, Command::AdvanceEpoch);
+    sim.inject(joiner_coord, Command::AdvanceEpoch);
     sim.run_for(Duration::from_millis(500));
 
     // Reshuffle the joiner to a new coordinate: `on_reseat` re-solves its proof for `(new coord, epoch 1)`

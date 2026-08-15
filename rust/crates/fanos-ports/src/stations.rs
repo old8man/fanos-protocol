@@ -327,6 +327,20 @@ pub enum Station {
     /// reporting that its authoritative source and its fallback disagree about who is driving.
     EpochAgreeBelowQuorum,
 
+    /// An inbound `EpochAgree` was dropped because this node is **beacon-driven** (#351).
+    ///
+    /// The frame's own doc states the rule — under a live beacon the DVRF round is authoritative and the
+    /// composite suppresses this flood — and the composite used to implement half of it, filtering the
+    /// outbound `Effect::Send` while leaving the receive side open. So a cell that pays for a threshold DVRF,
+    /// whose entire point is that no single party sets the epoch, could still have its overlay epoch set by
+    /// one member's four-byte frame — permanently, since the overlay is only ever stepped forward.
+    ///
+    /// **Zero is the healthy reading**, which is what makes this worth counting. A rising count says peers are
+    /// still driving this node's epoch by gossip while a beacon is running: either they have no beacon and
+    /// this cell is mixed, or something is flooding the fallback. Untagged, because the interesting fact is
+    /// that it happens at all and the sender is deliberately not attributed — this is not an accusation.
+    EpochAgreeSuperseded,
+
     /// A peer's HELLO decoded and its coordinate proof did **not** verify against a beacon this node holds
     /// — a forgery or an impostor (#236). Actionable as an attack.
     ///
@@ -987,6 +1001,7 @@ impl Station {
         Self::TransportRoundTripLost,
         Self::TransportSelfConnection,
         Self::EpochAgreeBelowQuorum,
+        Self::EpochAgreeSuperseded,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::PeerUnjudged,
@@ -1052,6 +1067,7 @@ impl Station {
             Self::TransportRoundTripLost => "transport.round_trip_lost",
             Self::TransportSelfConnection => "transport.self_connection",
             Self::EpochAgreeBelowQuorum => "epoch.agree_below_quorum",
+            Self::EpochAgreeSuperseded => "epoch.agree_superseded",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::PeerUnjudged => "hello.peer_unjudged",
@@ -1189,6 +1205,7 @@ impl Station {
             | Self::WireForeignDatagram
             | Self::TransportRoundTripLost
             | Self::TransportSelfConnection
+            | Self::EpochAgreeSuperseded
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
             | Self::PeerUnjudged

@@ -40,6 +40,13 @@ use fanos_wire::{FrameType, decode_frame};
 pub struct OverlayBeaconNode<F: Field> {
     overlay: OverlayNode<F>,
     beacon: BeaconNode<F>,
+    /// Inbound `EpochAgree` frames dropped because this node is beacon-driven (#351).
+    ///
+    /// Monotone and read at `Observe`, like the beacon's own refusal counters beside it — a refusal nobody
+    /// can see is not a refusal, and this one is the composite asserting that its authoritative source
+    /// outranks its fallback. It should stay at zero on a healthy beacon cell: a rising count says peers are
+    /// still driving the overlay's epoch by gossip, which is the condition this drop exists to end.
+    epoch_agree_superseded: u64,
 }
 
 impl<F: Field> OverlayBeaconNode<F> {
@@ -48,7 +55,7 @@ impl<F: Field> OverlayBeaconNode<F> {
     /// run as a pure consumer that only adopts the rounds anchors flood.
     #[must_use]
     pub fn new(overlay: OverlayNode<F>, beacon: BeaconNode<F>) -> Self {
-        Self { overlay, beacon }
+        Self { overlay, beacon, epoch_agree_superseded: 0 }
     }
 
     /// The current beacon epoch — the authoritative epoch clock both sub-engines track.
@@ -148,10 +155,27 @@ impl<F: Field> Engine for OverlayBeaconNode<F> {
                 let is_beacon = matches!(&input, Input::Message { frame, .. } if Self::is_beacon_frame(frame));
                 if is_beacon {
                     let effects = self.beacon.step(now, input);
-                    self.drive_overlay(now, effects)
-                } else {
-                    self.overlay.step(now, input)
+                    return self.drive_overlay(now, effects);
                 }
+                // **The fallback is inert in BOTH directions here, and until now it was inert in one.**
+                // `FrameType::EpochAgree`'s own doc states the rule — "under a live beacon the DVRF round is
+                // authoritative and the composite suppresses this flood" — and the composite implemented half
+                // of it: `strip_overlay_epoch_floods` filters `Effect::Send`, and nothing filtered receive.
+                // So a deployment that pays for a threshold DVRF, whose whole point is that no single party
+                // sets the epoch, could still have its overlay epoch set by one member's four-byte frame.
+                //
+                // Dropping rather than forwarding, because `drive_overlay` only ever steps the overlay
+                // FORWARD (`while self.overlay.epoch() < epoch`): an overlay pushed past the beacon by gossip
+                // can never be pulled back, so this is not a transient disagreement but a permanent one.
+                //
+                // Note the comment this replaces enumerated "membership, storage, liveness, healing" — four
+                // categories, none of which is `EpochAgree`. The fallback was not in the list because nobody
+                // asked which list it belonged to.
+                if matches!(&input, Input::Message { frame, .. } if Self::is_epoch_agree_frame(frame)) {
+                    self.epoch_agree_superseded = self.epoch_agree_superseded.saturating_add(1);
+                    return Vec::new();
+                }
+                self.overlay.step(now, input)
             }
             // The external epoch tick drives the BEACON (an anchor emits partials; a consumer is inert);
             // the beacon adopting an epoch drives the overlay.
@@ -199,6 +223,14 @@ impl<F: Field> Engine for OverlayBeaconNode<F> {
                                 count,
                             })
                         }));
+                        if self.epoch_agree_superseded > 0 {
+                            stations.push(Observation {
+                                station: Station::EpochAgreeSuperseded,
+                                line: None,
+                                tag: None,
+                                count: self.epoch_agree_superseded,
+                            });
+                        }
                     }
                 }
                 effects
@@ -244,6 +276,77 @@ mod tests {
     // The test's router: map a flooded frame's destination coordinate back to its Fano-cell index.
     fn node_at(to: Triple) -> Option<usize> {
         (0..7).find(|&i| Point::<F2>::at(i).coords() == to)
+    }
+
+    /// **A beacon-driven node does not let a four-byte gossip frame set its epoch** (#351).
+    ///
+    /// `FrameType::EpochAgree`'s own doc states the rule — under a live beacon the DVRF round is
+    /// authoritative and the composite suppresses this flood — and the composite implemented half of it:
+    /// `strip_overlay_epoch_floods` filters the OUTBOUND `Effect::Send`, and nothing filtered receive. So a
+    /// cell that pays for a threshold DVRF, whose whole point is that no single party sets the epoch, could
+    /// have its overlay epoch set by one member's frame. Permanently, at that: `drive_overlay` only ever
+    /// steps the overlay forward, so an overlay pushed past the beacon can never be pulled back and every
+    /// subsequent publish lands in slots of an epoch no honest reader consults.
+    ///
+    /// A quorum's worth of claims is delivered, not one, so this test cannot pass merely because the
+    /// overlay's own corroboration refused them — it is the composite's drop that must do it, and the
+    /// station is the evidence of which one acted.
+    ///
+    /// Both halves are asserted: the epoch did not move AND the drop is counted. Either alone is satisfiable
+    /// by a broken node — an engine that ignores the frames silently, or one that counts them and adopts.
+    #[test]
+    fn a_beacon_driven_node_ignores_the_epoch_agree_fallback_entirely() {
+        let (shares, commitment) = beacon_key();
+        let overlay = OverlayNode::<F2>::new(Point::at(0), OverlayConfig::default());
+        let beacon = BeaconNode::<F2>::new(
+            Point::at(0),
+            Some(shares[0].clone()),
+            commitment.clone(),
+            T,
+            BeaconSeed::GENESIS,
+        );
+        let mut node = OverlayBeaconNode::new(overlay, beacon);
+        let start = node.overlay.epoch();
+
+        // More claimants than the overlay's own quorum needs, so a green here cannot be the engine's
+        // corroboration doing the work — the composite must never have handed them over at all.
+        let claimed = start.saturating_add(2);
+        for claimant in 1..=OverlayConfig::default().corroboration_quorum + 1 {
+            let mut frame = Vec::new();
+            fanos_wire::encode_frame(FrameType::EpochAgree.code(), &claimed.low32_be_bytes(), &mut frame);
+            node.step(
+                Instant(0),
+                Input::Message { from: Point::<F2>::at(claimant).coords(), frame },
+            );
+        }
+
+        assert_eq!(
+            node.overlay.epoch(),
+            start,
+            "a beacon-driven node adopted an epoch from `EpochAgree` gossip; the DVRF round is the authority \
+             here and `drive_overlay` only steps forward, so this desynchronisation would be permanent",
+        );
+        let Some(stations) = node
+            .step(Instant(1), Input::Command(Command::Observe))
+            .into_iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations),
+                _ => None,
+            })
+        else {
+            panic!("the composite answered `Observe` without a `DataPath`, so no station can be read");
+        };
+        let dropped: u64 = stations
+            .iter()
+            .filter(|o| o.station == Station::EpochAgreeSuperseded)
+            .map(|o| o.count)
+            .sum();
+        assert!(
+            dropped > 0,
+            "the drop must be visible: a beacon cell whose peers keep driving its epoch by gossip is \
+             reporting that its authoritative source and its fallback disagree about who is driving, and \
+             silence here is indistinguishable from nobody sending",
+        );
     }
 
     /// **The beacon's refusals reach an operator, tagged by class** (#327).

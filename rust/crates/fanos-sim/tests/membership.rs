@@ -45,12 +45,30 @@ fn a_joining_nodes_key_propagates_to_every_member() {
 }
 
 #[test]
-fn the_epoch_beacon_reaches_monotone_consensus_from_one_trigger() {
+fn the_epoch_beacon_reaches_monotone_consensus_from_a_quorum_of_triggers() {
     let mut sim = Sim::new(2);
     let cell = spawn_cell::<F2>(&mut sim, Config::default());
 
-    // Advance the beacon at a single node; it floods and every node adopts epoch 1 (adopt-max).
-    sim.inject(cell[0], Command::AdvanceEpoch);
+    // **This test used to say `from_one_trigger`, and that contract is deliberately gone** (#351).
+    //
+    // `EpochAgree` carries a bare four-byte ordinal and used to be adopted `adopt-max`, so one node's
+    // advance dragged the whole cell — which is precisely the defect: every other decision in FANOS
+    // tolerates `f` faulty members and this one tolerated zero, at a price of `current + 2` expiring every
+    // directory slot on every node it reached. The epoch a node adopts from gossip now needs
+    // `corroboration_quorum` distinct members to have reached it.
+    //
+    // **Nothing in production depended on the old contract.** Each node runs its own wall-clock epoch driver
+    // (`fanos_node::spawn_epoch_driver` — "the root tick that periodically issues `Command::AdvanceEpoch`"),
+    // so no node needs another's trigger to move its own clock; gossip exists for *agreement* and catch-up,
+    // not to drive time. Convergence on the newest epoch is unchanged — it now waits for `q` members to get
+    // there first, which is the calibration, not a delay bolted on.
+    //
+    // The subject of this test is untouched: monotone cell-wide consensus, and epoch 1 never re-emitted.
+    // Only its setup is raised to the rule it is testing under.
+    let quorum = Config::default().corroboration_quorum;
+    for &trigger in cell.iter().take(quorum) {
+        sim.inject(trigger, Command::AdvanceEpoch);
+    }
     sim.run_for(Duration::from_millis(500));
 
     let adopted = sim
@@ -61,8 +79,13 @@ fn the_epoch_beacon_reaches_monotone_consensus_from_one_trigger() {
         .count();
     assert_eq!(adopted, 7, "all seven nodes adopted epoch 1");
 
-    // A second advance moves the whole cell to epoch 2; epoch 1 is never re-emitted (monotone).
-    sim.inject(cell[3], Command::AdvanceEpoch);
+    // A second advance moves the whole cell to epoch 2; epoch 1 is never re-emitted (monotone). A quorum
+    // again, for the same reason — and deliberately a DIFFERENT set of members, so a green here cannot come
+    // from the first round's claimants still being counted: `on_epoch_changed` prunes claims the cell has
+    // reached, and if it did not, this second advance would ride on spent votes.
+    for &trigger in cell.iter().skip(3).take(quorum) {
+        sim.inject(trigger, Command::AdvanceEpoch);
+    }
     sim.run_for(Duration::from_millis(500));
     let at_two = sim
         .report()
