@@ -210,8 +210,27 @@ pub struct ThresholdRouter<F: Field> {
     /// Real forwards awaiting a constant-rate send slot when cover is on (audit E6). Each slot emits one
     /// cell — a queued real forward (which *displaces* a cover cell) if any, else cover — so the router's
     /// emitted volume is its slot count, independent of the real traffic it carries: a flow-correlation
-    /// adversary counting cells on the Full profile sees no signal. Bounded by [`MAX_OUTBOX`]
-    /// (drop-oldest) so a flood cannot grow it. Empty in the cover-off path, where forwards leave at once.
+    /// adversary counting cells on the Full profile sees no signal.
+    ///
+    /// **The exact scope of that sentence, measured (#354).** It is true of what this router *emits* on its
+    /// own initiative, and the two ways it was quietly false have been closed and bounded:
+    ///
+    /// * A share **reply** used to be sent only when the peel succeeded, so the reply stream was a pure
+    ///   function of cargo — `4 + 4·cells` on a composed cell — while onions and requests stayed on the slot
+    ///   rate, and a reply is 42 bytes against an onion's `THRESHOLD_ONION_LEN`, so the classes separate by
+    ///   size alone. `on_request` now answers with a decoy and the measured streams read `replies ==
+    ///   requests` at every cargo level.
+    /// * **Cover displaces emissions, not receptions.** A cell entering the plane from outside is a
+    ///   reception nobody's slot stream displaced, and it draws its own gather. Measured at the shipping
+    ///   schedule with cover armed everywhere, each injected cargo cell costs **≈5 observable frames** —
+    ///   its own, plus the ~4 of the gather it draws — spread over the line it addresses, while two
+    ///   uninvolved nodes *lost* frames. That is a bound on what constant-rate cover can hide rather than a
+    ///   defect in it: the entering frame was always visible, and no emission schedule can displace a
+    ///   reception. What it does mean is that a client's visible footprint is amplified about fivefold, and
+    ///   that the amplification points at the line the cargo addressed.
+    ///
+    /// Bounded by [`MAX_OUTBOX`] (drop-oldest) so a flood cannot grow it. Empty in the cover-off path, where
+    /// forwards leave at once.
     outbox: VecDeque<(Triple, Vec<u8>)>,
     /// The intended circuit (`hop lines`, build `seed`) when this router **owns the endpoint** of a
     /// circuit it agreed on — a rendezvous loopback or a reply circuit it built. Set, it verifies the
