@@ -2995,6 +2995,11 @@ enum Dialed {
     Ourself,
 }
 
+/// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
+/// cert check), and start reading frames the peer sends back on it.
+///
+/// Returns [`Dialed`], not an `Option`: the two failures demand opposite handling of the address, and that
+/// distinction only survives the function boundary if it is in the type.
 async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
     if let Some(conn) = cached(t, to) {
         return Dialed::Peer(conn);

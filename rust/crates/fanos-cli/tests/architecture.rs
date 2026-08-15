@@ -1572,6 +1572,92 @@ fn no_production_code_creates_a_directory_at_the_umask() {
 /// **Every free function in the node binary carries a doc comment — because that is what makes an
 /// ORPHANED doc detectable (#318).**
 ///
+/// **The same defect, one crate wider, priced as a number instead of a rewrite** (#353).
+///
+/// `every_function_in_the_node_binary_is_documented` closes this class *totally* in `bin/fanos.rs`, and its
+/// scope note says why that file: *"it is where the class occurred"*. It has now occurred elsewhere —
+/// **four times in one day**, in `fanos-quic/src/driver.rs` and `fanos-node/src/setup.rs`, none of them in
+/// the guarded file, and one of them in the very commit whose message described the class. Knowing the class
+/// prevents it when READING someone else's code and does not prevent it when writing one's own.
+///
+/// Making the rule total here is not available: the tree has **151** undocumented free functions, so the
+/// price of totality is a documentation project rather than a guard. What is available is the defect's exact
+/// observable — **an insertion between a doc and its function leaves the displaced one bare, so the count
+/// rises by one.** Pinning the count catches that on the commit that makes it, at the cost of two numbers.
+///
+/// **Equality, not a ceiling**, and that is the whole design. A ceiling is silent when the count falls, so a
+/// crate that documents one function quietly buys room for a future theft to hide in — the stale-pin failure
+/// this tree has already paid for once (`UNWIRED_BUDGET`, and the reference verifier's split `19 + 7`). An
+/// exact pin fails upward on a theft and downward on an improvement, and the downward failure is the message
+/// asking for the pin to be lowered.
+///
+/// Scope is the two crates where the class has occurred and whose docs carry derivations. Widening further is
+/// a matter of pinning more crates, each at its own number — deliberately per-crate, so an improvement in one
+/// cannot mask a theft in another.
+#[test]
+fn no_crate_gains_an_undocumented_free_function() {
+    // (crate, pinned count of undocumented free functions in `src`, production code only)
+    const PINNED: [(&str, usize); 2] = [("fanos-quic", 4), ("fanos-node", 8)];
+    for (krate, pin) in PINNED {
+        let root = corpus::workspace_root().join("crates").join(krate).join("src");
+        let mut bare = Vec::new();
+        let mut seen_files = 0usize;
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).expect("the crate's src must be readable");
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    seen_files += 1;
+                    let text = std::fs::read_to_string(&path).expect("a source file must be readable");
+                    let production = production_part(&text);
+                    let lines: Vec<&str> = production.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        // Column zero only — a free function. An indented `fn` is a method, and methods are
+                        // out of this scan's reach exactly as they are out of the binary guard's.
+                        let is_fn = line.starts_with("fn ")
+                            || line.starts_with("pub fn ")
+                            || line.starts_with("async fn ")
+                            || line.starts_with("pub async fn ")
+                            || line.starts_with("pub(crate) fn ")
+                            || line.starts_with("pub(super) fn ")
+                            || line.starts_with("pub(crate) async fn ")
+                            || line.starts_with("const fn ")
+                            || line.starts_with("pub const fn ");
+                        if !is_fn {
+                            continue;
+                        }
+                        // Skip back over attributes: a doc separated from its item by `#[must_use]` is still
+                        // that item's doc, and reading otherwise would count every attributed function bare.
+                        let mut j = i;
+                        while j > 0 && lines[j - 1].starts_with("#[") {
+                            j -= 1;
+                        }
+                        if j == 0 || !lines[j - 1].trim_start().starts_with("///") {
+                            bare.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        // Control before the count: a walk that reached nothing would report zero bare functions and read as
+        // an improvement. It tests the walk, not the selection, because those fail differently.
+        assert!(seen_files > 0, "the walk reached no source files under {}", root.display());
+        assert_eq!(
+            bare.len(),
+            pin,
+            "`{krate}` has {} undocumented free functions, pinned at {pin}. UP means a doc was orphaned — an \
+             insertion between an existing doc and the function it documented leaves the displaced one bare, \
+             and Rust attaches the old doc to the newcomer silently. DOWN means one was documented: lower the \
+             pin in the same commit. Sites:\n  {}",
+            bare.len(),
+            bare.join("\n  "),
+        );
+    }
+}
+
 /// Not a tidiness rule. The defect it closes is mechanical and had **three** live instances in
 /// `bin/fanos.rs` at once: a new function inserted *between* an existing doc comment and the function it
 /// documented. Rust then attaches the old doc to the newcomer, and the displaced function is left bare —
