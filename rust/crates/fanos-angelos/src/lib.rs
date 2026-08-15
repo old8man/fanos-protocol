@@ -58,9 +58,15 @@
 //!   handler that deliberately does no I/O; the SDK runtime is supposed to encrypt, transport and decrypt around
 //!   it, reached through the C ABI. `fanos-ffi` has no bot surface at all — my scan first reported two hits and
 //!   both were the substring `bot` inside the English word "both" in comments.
-//! * [`attachment`] — **its dependency is already there.** `fanos_quic::Client::put`/`get` exist, so the content
-//!   store this module needs is live. What is missing is only the edge seal and the descriptor round-trip. The
-//!   cheapest of the five to close.
+//! * [`attachment`] — **closed (2026-08-16).** It was right that the dependency was already there: the edge
+//!   seal and the descriptor round-trip are now `fanos_node::angelos_driver::{seal_attachment,
+//!   open_attachment, store_attachment, fetch_attachment}`, composing `seal_object`/`open_object`,
+//!   `Manifest::{encode, decode, cid}` and `Client::put`/`get` — every piece had shipped and nothing joined
+//!   them. Closing it surfaced a check the pieces did not imply: `open_object` verifies each chunk against
+//!   *the manifest it is handed*, so a substituted manifest opens cleanly and only the descriptor — which
+//!   travelled inside the ratcheted message — can refuse it. What remains is not this module's: fetching on
+//!   receipt is a UX decision, and it needs the same **node-side kind router** the [`call`] bullet names, so
+//!   two of these five reasons have converged into one.
 //! * `chain` — private, and the same zero. It is the symmetric ratchet's chain, used by [`session`].
 //!
 //! [`message`], [`session`] and [`ratchet`] are wired; `ratchet` only became so when #282 found that the driver

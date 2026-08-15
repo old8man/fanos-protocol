@@ -35,11 +35,15 @@
 //! reading "whatever arrived" would split one ciphertext across two `open` calls and desynchronize the ratchet
 //! permanently. A bound on the length is enforced, because the count is read from the wire before the body is.
 
+use fanos_angelos::attachment::Attachment;
 use fanos_angelos::message::Message;
 use fanos_angelos::ratchet::DoubleRatchet;
 use fanos_pqcrypto::kem::{HybridKemPublic, HybridKemSecret};
 use fanos_pqcrypto::rng::SeedRng;
+use fanos_quic::Client;
+use fanos_thesauros::{Manifest, chunk_cid, open_object, seal_object};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use zeroize::Zeroize as _;
 
 /// The largest frame this driver will read, in bytes.
 ///
@@ -337,5 +341,180 @@ mod tests {
         );
 
         let _ = responder.await.unwrap();
+    }
+}
+
+// ── Attachments: the edge seal and the descriptor round-trip ─────────────────────────────────────────────
+//
+// `fanos_angelos::attachment` is a descriptor codec and deliberately nothing more — its doc says the
+// application glues the store, so the messenger layer carries no storage dependency. Nothing was that
+// application, which is why the crate note called this module "the cheapest of the five to close": every
+// piece already shipped (`seal_object`/`open_object`, `Manifest::{encode,decode,cid}`, `Client::put`/`get`)
+// and no composition existed.
+//
+// The seal is kept **pure** and the I/O thin, the same split ANGELOS itself lives by: what can go wrong
+// cryptographically is then reachable by a unit test, and what is left over is moving bytes.
+
+/// The objects a sealed attachment produces, as `(content id, bytes)` pairs ready for [`Client::put`] — the
+/// chunks in manifest order, then the manifest under its own cid. Named because the ORDER is part of the
+/// contract: the last pair is the manifest, and it is the one the descriptor addresses.
+pub type StoredObjects = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Seal `plaintext` under `key` at the edge: returns the descriptor to send inside an ordinary (already
+/// end-to-end encrypted) message, and every object to store, as `(content id, bytes)` pairs.
+///
+/// The chunks go under their own cids and the manifest under its, which is the storage model
+/// [`seal_object`] documents — so [`Attachment::cid`] is the **manifest's** cid and one fetch resolves the
+/// rest. `None` only if a chunk fails to seal, which `seal_object` treats as fatal rather than partial for
+/// the reason its doc gives: a manifest with a hole verifies as intact.
+#[must_use]
+pub fn seal_attachment(
+    plaintext: &[u8],
+    media_type: &str,
+    key: [u8; 32],
+) -> Option<(Attachment, StoredObjects)> {
+    let sealed = seal_object(plaintext, &key)?;
+    let manifest_bytes = sealed.manifest.encode();
+    let cid = *sealed.manifest.cid().as_bytes();
+    let mut objects: StoredObjects = sealed
+        .manifest
+        .chunks
+        .iter()
+        .zip(&sealed.chunks)
+        .map(|(r, c)| (r.cid.as_bytes().to_vec(), c.clone()))
+        .collect();
+    objects.push((cid.to_vec(), manifest_bytes));
+    Some((Attachment::new(cid, key, plaintext.len() as u64, media_type), objects))
+}
+
+/// Reassemble a file from the bytes a fetch returned. `None` if anything fails to line up.
+///
+/// **The manifest is checked against the descriptor's cid before it is trusted.** Without that the store
+/// decides which manifest a descriptor names: `open_object` verifies each chunk against *the manifest it is
+/// given*, so a substituted manifest is internally consistent and would hand back a different file under the
+/// sender's descriptor. The descriptor travels inside the E2E-encrypted message and the store does not, so
+/// the descriptor is the authority — this is where that is enforced.
+#[must_use]
+pub fn open_attachment(a: &Attachment, manifest_bytes: &[u8], chunks: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if chunk_cid(manifest_bytes).as_bytes() != &a.cid {
+        return None; // the store returned a manifest this descriptor never committed to
+    }
+    let manifest = Manifest::decode(manifest_bytes)?;
+    let plain = open_object(&manifest, chunks, &a.key)?;
+    // The size is carried for display; checking it here makes it a second binding rather than a hint, and
+    // costs one comparison.
+    (u64::try_from(plain.len()).unwrap_or(u64::MAX) == a.size).then_some(plain)
+}
+
+/// Seal a file under a fresh OS key and store every object, returning the descriptor to send.
+///
+/// The key is generated here and never leaves: it rides to the recipient inside the descriptor, which rides
+/// inside the ratcheted message. `None` if the OS has no entropy or any object fails to store — a partially
+/// stored attachment is a descriptor whose fetch fails, so it is not reported as a success.
+pub async fn store_attachment(client: &Client, plaintext: &[u8], media_type: &str) -> Option<Attachment> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).ok()?;
+    let sealed = seal_attachment(plaintext, media_type, key);
+    key.zeroize(); // the copy in the descriptor is the only one that should survive this call
+    let (descriptor, objects) = sealed?;
+    for (cid, bytes) in objects {
+        if !client.put(cid, bytes).await {
+            return None;
+        }
+    }
+    Some(descriptor)
+}
+
+/// Resolve a descriptor: fetch the manifest by its cid, then each chunk, then open under the carried key.
+pub async fn fetch_attachment(client: &Client, a: &Attachment) -> Option<Vec<u8>> {
+    let manifest_bytes = client.get(a.cid.to_vec()).await?;
+    let manifest = Manifest::decode(&manifest_bytes)?;
+    let mut chunks = Vec::with_capacity(manifest.chunks.len());
+    for r in &manifest.chunks {
+        chunks.push(client.get(r.cid.as_bytes().to_vec()).await?);
+    }
+    open_attachment(a, &manifest_bytes, &chunks)
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+mod attachment_tests {
+    use fanos_thesauros::content::CHUNK;
+
+    use super::{open_attachment, seal_attachment};
+
+    const KEY: [u8; 32] = [7u8; 32];
+
+    /// A file spanning several chunks, so the manifest has something to ORDER and the round trip is not a
+    /// single-chunk special case that would hide a mis-ordering. Sized from `CHUNK` rather than from a
+    /// literal: at 200 kB the first draft of this test fitted in one chunk and asserted nothing about order,
+    /// and it took the assertion below to say so.
+    fn file() -> Vec<u8> {
+        (0..u32::try_from(CHUNK * 2 + 1234).unwrap()).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_sealed_file_survives_the_descriptor_round_trip() {
+        let plain = file();
+        let (a, objects) = seal_attachment(&plain, "application/octet-stream", KEY).unwrap();
+        assert_eq!(objects.len(), 4, "three chunks plus the manifest — the file is sized from CHUNK to guarantee it");
+        assert_eq!(a.size, plain.len() as u64);
+        // The store's view: the last object is the manifest (its cid is the descriptor's), the rest are chunks
+        // in manifest order — exactly what `fetch_attachment` reassembles.
+        let manifest_bytes = objects.last().unwrap().1.clone();
+        assert_eq!(objects.last().unwrap().0, a.cid.to_vec(), "the descriptor must name the manifest");
+        let chunks: Vec<Vec<u8>> = objects[..objects.len() - 1].iter().map(|(_, b)| b.clone()).collect();
+        assert_eq!(open_attachment(&a, &manifest_bytes, &chunks).as_ref(), Some(&plain));
+    }
+
+    /// **The store must not get to choose which file a descriptor names.**
+    ///
+    /// `open_object` verifies each chunk against the manifest it is handed, so a substituted manifest is
+    /// internally consistent and opens cleanly — the substitution is invisible one layer down. Only the
+    /// descriptor, which travelled inside the ratcheted message, can refuse it. This is that refusal, and it
+    /// is the reason `open_attachment` checks the manifest's cid before decoding it.
+    #[test]
+    fn a_substituted_manifest_is_refused_even_though_it_opens_cleanly() {
+        // **The same LENGTH and the same KEY, different bytes.** The first version of this test substituted a
+        // 25-byte file, and removing the cid check left it green: the size binding was refusing it, so the
+        // test named one mechanism and exercised another. Only a substitution the other checks cannot see
+        // isolates this one.
+        let plain = file();
+        let mut other = plain.clone();
+        other.reverse();
+        assert_ne!(other, plain, "the substitute must differ, or nothing is being substituted");
+        let (a, _mine) = seal_attachment(&plain, "text/plain", KEY).unwrap();
+        let (b, theirs) = seal_attachment(&other, "text/plain", KEY).unwrap();
+        assert_eq!(a.size, b.size, "equal sizes, so the size binding cannot be what refuses below");
+        let their_manifest = theirs.last().unwrap().1.clone();
+        let their_chunks: Vec<Vec<u8>> = theirs[..theirs.len() - 1].iter().map(|(_, c)| c.clone()).collect();
+
+        // The substituted pair is genuinely coherent — under ITS OWN descriptor it opens.
+        assert!(
+            open_attachment(&b, &their_manifest, &their_chunks).is_some(),
+            "the control must open, or this test proves nothing about the check"
+        );
+        assert_eq!(
+            open_attachment(&a, &their_manifest, &their_chunks),
+            None,
+            "a manifest the descriptor never committed to must be refused"
+        );
+    }
+
+    #[test]
+    fn a_wrong_key_and_a_tampered_chunk_are_both_refused() {
+        let plain = file();
+        let (a, objects) = seal_attachment(&plain, "image/png", KEY).unwrap();
+        let manifest_bytes = objects.last().unwrap().1.clone();
+        let chunks: Vec<Vec<u8>> = objects[..objects.len() - 1].iter().map(|(_, b)| b.clone()).collect();
+
+        let mut wrong = super::Attachment::new(a.cid, [9u8; 32], a.size, "image/png");
+        assert_eq!(open_attachment(&wrong, &manifest_bytes, &chunks), None, "AEAD must refuse a wrong key");
+        wrong.key = a.key; // and the same descriptor with the right key opens — the discrimination
+        assert!(open_attachment(&wrong, &manifest_bytes, &chunks).is_some());
+
+        let mut tampered = chunks.clone();
+        tampered[0][0] ^= 1;
+        assert_eq!(open_attachment(&a, &manifest_bytes, &tampered), None, "a chunk that does not address to its cid must be refused");
     }
 }

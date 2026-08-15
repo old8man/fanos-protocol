@@ -2399,10 +2399,32 @@ async fn converse(stream: DuplexStream, identity: &[u8; 32]) {
     loop {
         match talk.recv().await {
             Ok(Some(message)) => {
-                if let Some(text) = message.as_text() {
-                    println!("[{}] {text}", message.seq);
-                } else {
-                    info!(seq = message.seq, "non-text message");
+                // **Dispatch on the declared kind, not on the shape of the bytes.** `as_text` is only a UTF-8
+                // attempt, so the previous form printed a reaction, a join or an in-chat payment as if it were
+                // a human message whenever its content happened to decode — and dropped everything else as
+                // "non-text" without naming it. `as_attachment` was already kind-checked and already exported;
+                // nothing here reached for it.
+                match message.kind {
+                    fanos_angelos::message::MessageKind::Text => {
+                        if let Some(text) = message.as_text() {
+                            println!("[{}] {text}", message.seq);
+                        } else {
+                            // Declared text that is not UTF-8 is a peer bug or a probe, and saying so is more
+                            // use than printing nothing.
+                            info!(seq = message.seq, "text message with invalid UTF-8");
+                        }
+                    }
+                    fanos_angelos::message::MessageKind::Attachment => {
+                        if let Some(a) = message.as_attachment() {
+                            println!(
+                                "[{}] attachment: {} bytes, {} — the object key travels in this message",
+                                message.seq, a.size, a.media_type
+                            );
+                        } else {
+                            info!(seq = message.seq, "attachment descriptor did not decode");
+                        }
+                    }
+                    kind => info!(seq = message.seq, ?kind, "message kind this door does not handle yet"),
                 }
             }
             Ok(None) => break,

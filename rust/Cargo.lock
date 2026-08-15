@@ -1117,6 +1117,7 @@ dependencies = [
  "fanos-taxis",
  "fanos-telemetry",
  "fanos-testkit",
+ "fanos-thesauros",
  "fanos-vpn",
  "fanos-vrf",
  "fanos-wire",

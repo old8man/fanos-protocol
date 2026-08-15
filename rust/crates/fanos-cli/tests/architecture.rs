@@ -421,7 +421,17 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-geometry", 2),
     ("fanos-holarch", 1),
     ("fanos-keygen", 7),
-    ("fanos-node", 42),
+    // 42 → 44 (2026-08-16), with the reason the rule requires, and NOT by inventing a caller — which this
+    // ratchet's own note says it must never reward. `store_attachment`/`fetch_attachment` close the half
+    // `fanos-angelos`'s crate doc named missing for [`attachment`]: the edge seal and the descriptor round
+    // trip, composing `seal_object`/`open_object`, `Manifest::{encode,decode,cid}` and `Client::put`/`get`,
+    // which had all shipped with nothing joining them. The receiving door now recognises an attachment
+    // descriptor and names it (`fanos message serve` dispatches on `MessageKind`, which it previously did
+    // not do at all). What it deliberately does NOT do is fetch on receipt: auto-resolving an unsolicited
+    // descriptor spends a stranger's bandwidth and touches the store on their schedule, and that is a
+    // product decision for whoever designs the messenger's UX — not something to settle so a counter goes
+    // down. The pure core is exercised by three tests including a manifest-substitution refusal.
+    ("fanos-node", 44),
     ("fanos-nyx", 21),
     ("fanos-obolos", 11),
     ("fanos-observatory", 2),
