@@ -624,6 +624,21 @@ pub struct OverlayNode<F: Field> {
     /// cannot forge a false liveness either — a peer is believed alive on gossip only when a
     /// **quorum** of distinct witnesses vouch for it, so `quorum − 1` liars are outvoted.
     witnessed: BTreeMap<Triple, BTreeMap<Triple, Instant>>,
+    /// Epoch ordinals gossiped by each cell member (`FrameType::EpochAgree`), keyed by the **claimant's**
+    /// proven coordinate so each member overwrites only its own (#351).
+    ///
+    /// Deliberately the shape of [`witnessed`](Self::witnessed), because it answers the same question that
+    /// map answers — *a quorum of distinct members must vouch* — asked about the epoch ordinal rather than
+    /// about liveness. The spec's `adopt-max` (see [`epoch`](Self::epoch)) is sound for the object it was
+    /// written about, a threshold-DVRF round that cannot be forged; this frame carries a bare four-byte
+    /// ordinal with none of that authentication, and inherited the rule without its premise.
+    ///
+    /// **Pruned when the epoch advances, not on a timer.** A claim is worthless once the cell has reached it,
+    /// and `on_epoch_changed` is exactly that moment — so the map needs no window and no chosen constant.
+    /// Reusing `liveness_timeout` would have been wrong on the merits, not merely on de-duplication grounds:
+    /// liveness gossip arrives every heartbeat and epoch gossip only on an epoch turn, so a window sized for
+    /// the first expires the second long before its successor arrives and the quorum becomes unreachable.
+    epoch_claims: BTreeMap<Triple, Epoch>,
     /// §6.3 grey detection: the freshest `DiagLoss` row each cell member gossiped — its measured per-neighbour
     /// loss vector (`[u8; 7]`, `loss × 255`) and when it arrived. Assembled with this node's own row into the
     /// symmetric channel-rate matrix `polar::grey_endpoint` localizes a grey node from (a lossy node lifts
@@ -782,6 +797,7 @@ impl<F: Field> OverlayNode<F> {
             parent_cell: None,
             healer: Healer::new(observer, config.behavior_window(), config.control_confidence()),
             witnessed: BTreeMap::new(),
+            epoch_claims: BTreeMap::new(),
             loss_reports: BTreeMap::new(),
             skew_reported: BTreeSet::new(),
             grey_reported: None,
@@ -982,7 +998,7 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::Value) => self.on_value(now, from, frame.body),
             Some(FrameType::Ack) => Self::on_ack(frame.body),
             Some(FrameType::Announce) => self.on_announce(frame.body),
-            Some(FrameType::EpochAgree) => self.on_epoch_agree(frame.body),
+            Some(FrameType::EpochAgree) => self.on_epoch_agree(from, frame.body),
             Some(FrameType::RdvReply) => {
                 // A rendezvous relay forwarded a peeled anonymous reply to us (audit #54, item 3): this
                 // node is the registered client for the session cookie the reply carries. Surface it as an
@@ -3073,6 +3089,126 @@ mod tests {
     /// perfectly coherent cell as *anti*-correlated — measured deterministically one crate down, in
     /// `monitor::tests::a_window_spanning_a_seat_permutation_reads_a_coherent_cell_as_anti_correlated`.
     ///
+    /// Deliver `claimed` as an `EpochAgree` from `n` distinct cell members, starting at point 1.
+    fn claim_epoch(node: &mut OverlayNode<F2>, claimed: Epoch, claimants: impl IntoIterator<Item = usize>) {
+        for c in claimants {
+            node.step(
+                Instant(0),
+                Input::Message {
+                    from: Point::<F2>::at(c).coords(),
+                    frame: encode(FrameType::EpochAgree, &claimed.low32_be_bytes()),
+                },
+            );
+        }
+    }
+
+    /// **One member cannot set the cell's clock** (#351).
+    ///
+    /// `EpochAgree` carries a bare four-byte ordinal and inherited `adopt-max`, a rule whose safety came from
+    /// the beacon round proving itself. Every other decision in FANOS tolerates `f` faulty members; this one
+    /// tolerated zero. The stall is counted, and tagged with how many vouched, because a node that cannot
+    /// corroborate must escalate rather than decide — and a stall nobody can see is not an escalation.
+    #[test]
+    fn a_single_witness_cannot_move_the_cells_epoch() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let start = node.epoch();
+        claim_epoch(&mut node, start.saturating_add(2), 1..2);
+        assert_eq!(node.epoch(), start, "one claimant is not a quorum, so the epoch must not move");
+        let stalled: u64 = node
+            .stations
+            .observations()
+            .iter()
+            .filter(|o| o.station == Station::EpochAgreeBelowQuorum)
+            .map(|o| o.count)
+            .sum();
+        assert_eq!(stalled, 1, "the refusal must be counted — a stall nobody can see is not an escalation");
+    }
+
+    /// **A quorum moves it, and in one round** (#351) — the other half, without which the fix is
+    /// indistinguishable from a node that simply stopped agreeing epochs at all.
+    #[test]
+    fn a_quorum_of_witnesses_moves_the_epoch_in_one_round() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let start = node.epoch();
+        let target = start.saturating_add(2);
+        let quorum = Config::default().corroboration_quorum;
+        claim_epoch(&mut node, target, 1..=quorum);
+        assert_eq!(node.epoch(), target, "a quorum of distinct claimants must be adopted immediately");
+    }
+
+    /// **`f` liars cannot outvote an honest claim** (#351) — the ORDER-STATISTIC property, which a plain
+    /// threshold test cannot see.
+    ///
+    /// A count of claimants says "enough members said something". What a quorum means is "enough members
+    /// reached at least THIS", and only reading the `q`-th largest claim expresses it. With `f` liars shouting
+    /// a far epoch and a quorum vouching a near one, the near one is what a quorum has actually reached.
+    #[test]
+    fn f_liars_cannot_outvote_an_honest_claim() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let start = node.epoch();
+        let honest = start.saturating_add(1);
+        let lie = start.saturating_add(9);
+        let f = fault_budget(CELL_POINTS);
+        let quorum = Config::default().corroboration_quorum;
+        // The liars claim first and loudest; the honest majority claims a nearer epoch after them.
+        claim_epoch(&mut node, lie, 1..=f);
+        claim_epoch(&mut node, honest, (f + 1)..=(f + quorum));
+        assert_eq!(
+            node.epoch(),
+            honest,
+            "the adopted epoch must be the one a QUORUM has reached, not the largest any minority shouted",
+        );
+    }
+
+    /// **One forged claim must not expire the directory** (#351) — the only test here about the DAMAGE, and
+    /// every mechanism test above can pass while this one still fires.
+    ///
+    /// `DIRECTORY_SLOT_EPOCHS = 1`, so a slot written at `E` is reclaimed once `now ≥ E+2`. The attack is
+    /// therefore `current + 2` and **not** `u32::MAX`: a two-epoch jump is indistinguishable from a node whose
+    /// beacon ran two rounds while it was busy, which is exactly why no bound on the magnitude of a jump can
+    /// work and only corroboration can.
+    #[test]
+    fn a_single_forged_claim_does_not_expire_the_directory() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        node.step(
+            Instant(0),
+            Input::Command(Command::PutEphemeral {
+                key: b"a directory slot".to_vec(),
+                value: b"a published record".to_vec(),
+                epochs: 1,
+            }),
+        );
+        let held = node.store.entries.len();
+        assert_eq!(held, 1, "the setup must actually have stored something, or nothing below can fail");
+        let forged = node.epoch().saturating_add(2);
+        claim_epoch(&mut node, forged, 1..2);
+        assert_eq!(
+            node.store.entries.len(),
+            held,
+            "one member's unverified claim of `current + 2` reclaimed the directory slice — the epoch it \
+             names is plausible, unlogged, and two epochs is all it takes",
+        );
+    }
+
+    /// **A claim the cell has reached stops counting** (#351).
+    ///
+    /// The claims map needs no freshness window and no chosen constant, because a claim is worthless once the
+    /// cell reaches it — and `on_epoch_changed` is exactly that moment. Without the prune the map would keep
+    /// spent claims and a later quorum could be assembled out of votes that were already honoured.
+    #[test]
+    fn claims_the_cell_has_reached_stop_counting() {
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+        let quorum = Config::default().corroboration_quorum;
+        let target = node.epoch().saturating_add(2);
+        claim_epoch(&mut node, target, 1..=quorum);
+        assert_eq!(node.epoch(), target, "the setup must have advanced, or the prune below is untested");
+        assert!(
+            node.epoch_claims.is_empty(),
+            "claims at or below the epoch the cell reached must be dropped; {} survived",
+            node.epoch_claims.len(),
+        );
+    }
+
     /// What *this* pins is the wiring, and specifically that both paths do it. A node reaches a new epoch
     /// either by its own `AdvanceEpoch` or by adopting a peer's `EpochAgree` gossip, and a fix applied to one
     /// of them would make whether a cell's self-model is spliced depend on which node happened to drive the
@@ -3150,13 +3286,22 @@ mod tests {
                 node.step(Instant(t), Input::Command(Command::AdvanceEpoch));
             } else {
                 let next = node.epoch().next();
-                node.step(
-                    Instant(t),
-                    Input::Message {
-                        from: Point::<F2>::at(1).coords(),
-                        frame: encode(FrameType::EpochAgree, &next.low32_be_bytes()),
-                    },
-                );
+                // **A quorum of distinct claimants, not one** (#351). The gossip path no longer adopts on a
+                // single member's say-so: `EpochAgree` carries a bare ordinal that proves nothing, so the
+                // epoch it names is adopted only once `corroboration_quorum` distinct members have reached
+                // it. That is this test's setup requirement and not its subject — what it pins is still that
+                // BOTH paths end the coherence observation, so the setup is brought up to the new rule rather
+                // than the rule relaxed for the test.
+                let quorum = Config::default().corroboration_quorum;
+                for claimant in 1..=quorum {
+                    node.step(
+                        Instant(t),
+                        Input::Message {
+                            from: Point::<F2>::at(claimant).coords(),
+                            frame: encode(FrameType::EpochAgree, &next.low32_be_bytes()),
+                        },
+                    );
+                }
                 assert_eq!(node.epoch(), next, "the gossip path must actually have advanced the epoch");
             }
             t += 1;

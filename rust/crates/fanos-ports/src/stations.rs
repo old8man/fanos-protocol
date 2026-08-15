@@ -310,6 +310,23 @@ pub enum Station {
     /// keeps `resolve_peer_hello` from feeding the morph breaker.
     TransportSelfConnection,
 
+    /// An `EpochAgree` claim arrived and the cell has **not** corroborated it: fewer distinct members vouch
+    /// for that epoch than the corroboration quorum, so it was not adopted (#351).
+    ///
+    /// **A refusal nobody can see is not a refusal, and the cell freezing is the thing to see.** FANOS's rule
+    /// for a node that cannot corroborate is to escalate, not to decide — but "do not decide alone" without
+    /// "say that you could not" is a different rule, and it produces a stall indistinguishable from healthy
+    /// operation. A beaconless cell whose members cannot agree an epoch is stuck, and stuck must have a voice.
+    ///
+    /// Tagged with **how many distinct members vouched**, because the two states an operator must separate
+    /// are "nobody is claiming" and "two of the three needed are claiming". The first is a quiet cell; the
+    /// second is a cell one member short of moving, and only the tag tells them apart.
+    ///
+    /// Not an attack signal on its own. Under a live beacon this station should never move, because the
+    /// composite drops the fallback on receive; a cell that shows both a live beacon and this rising is
+    /// reporting that its authoritative source and its fallback disagree about who is driving.
+    EpochAgreeBelowQuorum,
+
     /// A peer's HELLO decoded and its coordinate proof did **not** verify against a beacon this node holds
     /// — a forgery or an impostor (#236). Actionable as an attack.
     ///
@@ -969,6 +986,7 @@ impl Station {
         Self::WireForeignDatagram,
         Self::TransportRoundTripLost,
         Self::TransportSelfConnection,
+        Self::EpochAgreeBelowQuorum,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::PeerUnjudged,
@@ -1033,6 +1051,7 @@ impl Station {
             Self::WireForeignDatagram => "wire.foreign_datagram",
             Self::TransportRoundTripLost => "transport.round_trip_lost",
             Self::TransportSelfConnection => "transport.self_connection",
+            Self::EpochAgreeBelowQuorum => "epoch.agree_below_quorum",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::PeerUnjudged => "hello.peer_unjudged",
@@ -1121,7 +1140,15 @@ impl Station {
             // vocabulary. The two are not a contradiction and must not be merged: one carries a code the
             // registry has a name for, the other carries the codes it does not. Folding them would hand the
             // resolver an unresolvable tag and force it to invent a name or return a hole (#268).
-            Self::AssignmentWithheld | Self::FrameTypeUnknown | Self::ConnSurplusRead | Self::ConnMovedWithPeer => {
+            //
+            // `EpochAgreeBelowQuorum` carries the number of DISTINCT members that vouched — a count with no
+            // vocabulary behind it, and the one fact separating a quiet cell from a cell one member short of
+            // agreeing. A bare occurrence count cannot tell those apart, which is why it is tagged at all.
+            Self::AssignmentWithheld
+            | Self::FrameTypeUnknown
+            | Self::ConnSurplusRead
+            | Self::ConnMovedWithPeer
+            | Self::EpochAgreeBelowQuorum => {
                 TagKind::Quantity
             }
 

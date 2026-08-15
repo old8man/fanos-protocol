@@ -177,6 +177,12 @@ impl<F: Field> OverlayNode<F> {
         // grey". Left set, the next genuinely-grey node at that point is *not* reported, because the engine
         // believes it already said so about the node that used to be there.
         self.grey_reported = None;
+        // Claims the cell has now reached are worthless — they can never again be the newest thing a
+        // quorum vouches for — and dropping them here is what lets the map need no window and no chosen
+        // constant. What survives is exactly the claims still ahead of us, which is the population the
+        // quorum is about (#351).
+        let reached = self.epoch;
+        self.epoch_claims.retain(|_, claimed| *claimed > reached);
     }
 
     pub(super) fn on_advance_epoch(&mut self) -> Vec<Effect> {
@@ -187,15 +193,64 @@ impl<F: Field> OverlayNode<F> {
         effects
     }
 
-    /// A received epoch-agreement gossip: adopt it iff strictly newer (monotone), then re-flood and
-    /// notify. The 4-byte body is the epoch ordinal — see [`FrameType::EpochAgree`].
-    pub(super) fn on_epoch_agree(&mut self, body: &[u8]) -> Vec<Effect> {
+    /// A received epoch-agreement gossip: adopt the newest epoch a **quorum of distinct members** vouches
+    /// for, then re-flood and notify. The 4-byte body is the epoch ordinal — see [`FrameType::EpochAgree`].
+    ///
+    /// **Why one claimant is not enough, in the system's own units.** Every other decision in FANOS tolerates
+    /// `f` faulty members; this one used to tolerate **zero**. It took the spec's `adopt-max` — sound for a
+    /// threshold-DVRF round, which proves itself — and applied it to a bare ordinal that proves nothing, so a
+    /// single member inside the fault budget set the whole cell's clock. The cost was not theoretical:
+    /// `DIRECTORY_SLOT_EPOCHS = 1`, so a slot written at `E` is reclaimed once `now ≥ E+2`, and **a claim of
+    /// `current + 2` — indistinguishable from a node whose beacon ran two rounds while it was busy —
+    /// expired every directory slot on this node and on everyone it re-flooded to.**
+    ///
+    /// The rule is the one `coord_alive` already uses one file over, and the quantity is the one `Config`
+    /// already owns: adopt the epoch that at least [`corroboration_quorum`](super::Config::corroboration_quorum)
+    /// distinct claimants have reached. With `≤ f` liars they cannot occupy the whole of the top `q` claims,
+    /// so the adopted value is always vouched for by at least one honest member. Calibrated to the standing
+    /// assumption and no further: stronger than `q` buys nothing, because above `f` every other threshold in
+    /// this system has already fallen.
+    ///
+    /// **Materiality is checked before anything is recorded**, which is `note_certified_height`'s rule in
+    /// TAXIS and for its reason: a repeated or stale claim then costs nothing, and an attacker pays one frame
+    /// per counted claim rather than driving an unbounded loop.
+    ///
+    /// **The residual, stated rather than papered over.** Claims are keyed by the claimant's coordinate, and
+    /// this engine is crypto-free — it holds no stable identity for a peer (`Peer` carries liveness, not a
+    /// `NodeId`), so it cannot link a member that reseats mid-epoch to the coordinate it left. Such a member
+    /// leaves one stale claim behind, and an adversary that has legitimately held several cell points this
+    /// epoch can leave one at each. That reduces the attack from *one frame, unbounded* to *`q` distinct cell
+    /// points must be held*, which already means out-ranking incumbents beyond the fault budget — but it does
+    /// not eliminate it. Closing it needs the layer where identity is known: the driver's
+    /// `distrust.seat(from, identity_of(&cert))`.
+    pub(super) fn on_epoch_agree(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
         let Some(bytes) = body.get(..4).and_then(|b| <[u8; 4]>::try_from(b).ok()) else {
             return Vec::new();
         };
-        let epoch = Epoch::from_low32_be_bytes(bytes);
-        if epoch <= self.epoch {
+        let claimed = Epoch::from_low32_be_bytes(bytes);
+        if claimed <= self.epoch {
             return Vec::new(); // not newer — drop (terminates the flood)
+        }
+        self.epoch_claims.insert(from, claimed);
+        // The newest epoch at least `q` distinct claimants have reached: sort the claims descending and read
+        // the `q`-th. An order statistic rather than a threshold test, because "three members claimed
+        // something" and "three members claimed at least THIS" are different facts, and only the second is
+        // what a quorum means.
+        let quorum = self.config.corroboration_quorum;
+        let mut reached: Vec<Epoch> = self.epoch_claims.values().copied().collect();
+        reached.sort_unstable_by(|a, b| b.cmp(a));
+        let Some(&epoch) = reached.get(quorum.saturating_sub(1)) else {
+            // Fewer claimants than the quorum needs. Counted, tagged with how many vouched: FANOS's rule for
+            // a node that cannot corroborate is to escalate rather than decide, and a stall nobody can see is
+            // not an escalation — it is indistinguishable from a healthy quiet cell.
+            self.stations
+                .record_tagged(Station::EpochAgreeBelowQuorum, None, u64::try_from(reached.len()).ok(), 1);
+            return Vec::new();
+        };
+        if epoch <= self.epoch {
+            self.stations
+                .record_tagged(Station::EpochAgreeBelowQuorum, None, u64::try_from(reached.len()).ok(), 1);
+            return Vec::new();
         }
         self.epoch = epoch;
         // The gossip path advances the clock too, and a node that learns the epoch from a peer rather than
