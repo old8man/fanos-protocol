@@ -1269,6 +1269,22 @@ mod tests {
         use fanos_field::F4;
         use fanos_node::RoleSet;
 
+        // **A liveness assertion, so it declines rather than guesses** — and the price of not doing so is
+        // measured rather than argued. This test waits on convergence against `FROZEN_SPAN`, which is exactly
+        // what `require_quiet_host` exists for ("counts arrivals or waits on a deadline"). On 2026-08-15 it
+        // came back `Refuted { last: [5, 4, 3, 5, 4] }` inside a whole-workspace run that took 6 h 56 min
+        // against a recorded baseline of 3 h 14 min — a box under 2.14× contention. Bisected 3 runs per arm,
+        // it failed 1-in-3 identically at HEAD and HEAD~1: flaky, not a regression. Diagnosing that cost a
+        // bisect and several hours of wrong hypotheses, all of which one INCONCLUSIVE line would have
+        // replaced. The comment above already rejects the two alternatives — a window sized for a contended
+        // host makes every run pay for the worst case, and one sized for an idle host is a false red.
+        //
+        // Applied here and NOT swept across this file, following `self_certifying.rs`'s practice of guarding
+        // one test of three and saying why: the fleet's other assertions are structural (an isolated node
+        // reports solitary, a crash localizes) and a starved box cannot make those wrongly pass, so guarding
+        // them would weaken a test for no reason. The sibling fleet-convergence tests qualify by the same
+        // criterion and have no evidence of flaking yet; they are candidates, not oversights.
+        fanos_testkit::require_quiet_host("whether every node resolves every occupied coordinate");
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
         // Let the PLACEMENT settle before counting occupied points. This used to sample immediately after spawn, which was
