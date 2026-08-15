@@ -72,6 +72,31 @@ run() {
   cargo "$@" >"$log" 2>&1
   local rc=$?
   local secs=$((SECONDS - t0))
+  # **A test phase that executed nothing is not a pass**, and `rc` alone cannot say so. The header above
+  # settles where the status comes FROM — cargo, never a pipeline — and this settles what a zero status
+  # MEANS: `cargo test` exits 0 for a target with no tests and for a filter that matched none, so "the
+  # phase passed" and "the phase ran nothing" arrive as the same byte. That is the same one-carrier-two-facts
+  # shape this script already fixed for `want`'s argument count.
+  #
+  # Summed across the phase, not per target: a workspace run legitimately contains crates with no tests of
+  # their own, and requiring each target to be non-empty would fail on those. The phase as a whole is the
+  # unit that was asked to test something.
+  #
+  # Deliberately NOT a per-phase floor. That was the first design and verification killed it: the `tests`
+  # group already enumerates every surface `--workspace` skips (`test-quic`, `test-node`, `test-validator`,
+  # `test-vpn`, `test-sysinfo`), with the `--list` deltas measured in the comments beside them — 17 vs 18 for
+  # `fanos-vpn`, 45 vs 46 for `fanos-telemetry`. Silent shrinkage is answered by naming the missing surface,
+  # which is stronger than detecting its absence. What was left unanswered is only emptiness.
+  if [ "$rc" -eq 0 ] && [ "${1:-}" = "test" ]; then
+    local executed
+    executed=$(grep -Eo '^test result: [a-zA-Z]+\. [0-9]+ passed' "$log" | grep -Eo '[0-9]+ passed' | grep -Eo '^[0-9]+' | awk '{s+=$1} END {print s+0}')
+    if [ "$executed" -eq 0 ]; then
+      printf 'FAILED (ran no tests) %ds\n' "$secs"
+      SUMMARY+=("$(printf 'FAIL  %6ds  %s  →  ran no tests, %s' "$secs" "$name" "$log")")
+      FAILED=1
+      return
+    fi
+  fi
   if [ "$rc" -eq 0 ]; then
     printf 'ok %6ds\n' "$secs"
     SUMMARY+=("$(printf 'ok    %6ds  %s' "$secs" "$name")")
