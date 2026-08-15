@@ -207,6 +207,16 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 ///   without             1.0000       0.7585       0.2415
 /// ```
 ///
+/// **The control settles what "dominated" leaves open.** Running the identical span with the drive removed —
+/// nothing through `forward_send` at all — reads the same `r`: `1.000000` against `1.000000` at a
+/// synchronised start, and `0.767467` against `0.771255` staggered. Deleting the entire subject moves the
+/// figure by at most `0.007`, and *upward*: the relay's traffic is a small aperiodic perturbation on a
+/// periodic signal's self-correlation, so its only effect here is to decorrelate it slightly. Reading these
+/// numbers as "the relay leaks" has the sign backwards as well as the subject wrong. The residual `≈ 0.75`
+/// is the periodicity floor `fanos_testkit::gpa`'s own doc warns about — a lag-scanning adversary whose
+/// window spans the heartbeat period locks onto it — which is why `drive` was deliberately made aperiodic
+/// and why nobody noticed that the thing beside it was not.
+///
 /// **Operationally the old reading holds**: `start_heartbeat` defaults to `true`, so a deployed relay's tape
 /// really is heartbeat-dominated and a GPA really does see `r ≈ 1`. What does not hold is "the current
 /// schedule does not decouple the count". It does, by two orders of magnitude more than the table shows —

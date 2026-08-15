@@ -122,14 +122,57 @@ fn tape_and_correlation_with(
     bin_ms: u64,
     heartbeat: bool,
 ) -> ((usize, u64), f64) {
+    tape_correlation_cargo(cover, mix, bin_ms, heartbeat, true)
+}
+
+/// The same run with the relay's cargo as a parameter — the control that decides whether any of these
+/// figures are about the relay at all.
+fn tape_correlation_cargo(
+    cover: Duration,
+    mix: Duration,
+    bin_ms: u64,
+    heartbeat: bool,
+    cargo: bool,
+) -> ((usize, u64), f64) {
+    tape_correlation_full(cover, mix, bin_ms, heartbeat, cargo, 0)
+}
+
+/// …and with the heartbeat **stagger** as a parameter. `0` is `inject_all` — seven nodes on one clock, which
+/// no deployment does; anything else starts each node's liveness at its own offset.
+fn tape_correlation_full(
+    cover: Duration,
+    mix: Duration,
+    bin_ms: u64,
+    heartbeat: bool,
+    cargo: bool,
+    stagger_ms: u64,
+) -> ((usize, u64), f64) {
     let mut sim = Sim::new(SEED);
     let cell = spawn_composed_relay_cell::<F2>(&mut sim, Config::default(), cover, mix, true);
     if heartbeat {
-        sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
+        if stagger_ms == 0 {
+            sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
+        } else {
+            for (i, &n) in cell.iter().enumerate() {
+                sim.inject(n, Command::StartHeartbeat);
+                if i + 1 < cell.len() {
+                    sim.run_for(Duration::from_millis(stagger_ms));
+                }
+            }
+        }
     }
     sim.observe_frames(); // the GPA starts tapping
 
-    drive(&mut sim);
+    if cargo {
+        drive(&mut sim);
+    } else {
+        // The same simulated span with nothing forwarded, so the tape differs in exactly one thing.
+        let mut now = 0u64;
+        while now < WINDOW_MS {
+            sim.run_for(Duration::from_millis(STEP_MS));
+            now += STEP_MS;
+        }
+    }
 
     let tape = sim.observed_frames();
     let bins = (WINDOW_MS / bin_ms) as usize;
@@ -370,4 +413,50 @@ fn the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay() {
          these have converged the attribution above is stale and the entry at DEFAULT_COVER_INTERVAL needs \
          re-reading"
     );
+}
+
+/// **The control that settles it: the figure is unchanged when the relay carries nothing.**
+///
+/// The test above shows the heartbeat dominates the tape. Dominance still leaves room for the relay to
+/// contribute something, and "dominated by" is a weaker claim than the measurement supports. This runs the
+/// identical span with the drive removed — no sealed onions, no forwarding, nothing through
+/// `forward_send`:
+///
+/// ```text
+///                     with cargo   with NO cargo   the relay's whole contribution
+///   synchronised        1.000000        1.000000                          0.000000
+///   staggered  71 ms    0.767467        0.771255                         −0.003788
+///   staggered 149 ms    0.750058        0.756731                         −0.006673
+/// ```
+///
+/// So the number is not *mostly* about something else; deleting the entire subject moves it by at most
+/// `0.007`, and at a synchronised start by nothing at all. That is the strongest available statement that a
+/// measurement says nothing about its subject, and it is cheap, because removing the stimulus is always a
+/// legal experiment.
+///
+/// **Note the sign.** Without cargo `r` goes *up*. The relay's traffic is a small aperiodic perturbation on
+/// a periodic signal's self-correlation, so its only effect on this observable is to *decorrelate* it
+/// slightly — the opposite direction from a leak. Any reading of these figures as "the relay leaks" has the
+/// sign backwards as well as the subject wrong.
+///
+/// **What the residual is.** `fanos_testkit::gpa`'s own doc warns that a periodic signal correlates with its
+/// own shifts at a value the period fixes, which is why `drive` is deliberately aperiodic. The heartbeat is
+/// perfectly periodic and it is 98% of the tape, so a lag-scanning adversary whose window spans the period
+/// locks onto it. Synchronised starts push that to exactly `1.0000`; staggering the starts drops it to
+/// `≈ 0.75`, which is the periodicity floor rather than anything causal — and `0.75` is high enough that the
+/// residual would read as a leak to anyone who did not run this control.
+#[test]
+fn the_gpa_figure_does_not_move_when_the_relay_carries_nothing() {
+    const BIN: u64 = 100;
+    for (label, stagger) in [("synchronised", 0u64), ("staggered 71 ms", 71), ("staggered 149 ms", 149)] {
+        let (_, with_cargo) = tape_correlation_full(Duration(0), Duration(0), BIN, true, true, stagger);
+        let (_, no_cargo) = tape_correlation_full(Duration(0), Duration(0), BIN, true, false, stagger);
+        println!("{label}: r with cargo {with_cargo:.6}, with none {no_cargo:.6}");
+        assert!(
+            (with_cargo - no_cargo).abs() < 0.01,
+            "the whole point is that these are the same number: {with_cargo:.6} vs {no_cargo:.6}. If they \
+             have separated, the relay's traffic now reaches this observable and every figure in \
+             DEFAULT_COVER_INTERVAL's entry can be re-read as being about the relay."
+        );
+    }
 }
