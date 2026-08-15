@@ -742,13 +742,33 @@ fn render_transport_shaping(s: &mut String, config: &NodeConfig) {
 /// key, and a group of keys that move together should cost one call rather than three. `s` is the buffer the
 /// caller is building; each writes only on a difference, so a default-valued config renders none of them.
 fn render_overlay_choices(s: &mut String, c: crate::config::OverlayChoices, d: crate::config::OverlayChoices) {
-    if c.self_healing != d.self_healing {
+    // **Mentioned in every fresh config, set or not**, for the reason this file states one field over: a
+    // mechanism an operator cannot discover from the file they edit does not exist to them. #352 made these
+    // three choices expressible and that is only half the fix — a key nobody can find is barely better than
+    // a key that does not exist, and it is the same defect one step further out.
+    let _ = writeln!(s);
+    let _ = writeln!(s, "# --- overlay behaviour (defaults shown; each is a deployment choice) ---");
+    if c.self_healing == d.self_healing {
+        let _ = writeln!(s, "# self_healing = {}   (false: sense and diagnose, never act)", c.self_healing);
+    } else {
         let _ = writeln!(s, "self_healing = {}", c.self_healing);
     }
-    if c.require_self_certified_membership != d.require_self_certified_membership {
+    if c.require_self_certified_membership == d.require_self_certified_membership {
+        let _ = writeln!(
+            s,
+            "# require_self_certified_membership = {}   (true: a peer may not announce an address it did not earn)",
+            c.require_self_certified_membership
+        );
+    } else {
         let _ = writeln!(s, "require_self_certified_membership = {}", c.require_self_certified_membership);
     }
-    if c.require_admission != d.require_admission {
+    if c.require_admission == d.require_admission {
+        let _ = writeln!(
+            s,
+            "# require_admission = {}   (true needs an admission policy installed; without one it rejects every peer)",
+            c.require_admission
+        );
+    } else {
         let _ = writeln!(s, "require_admission = {}", c.require_admission);
     }
 }
@@ -827,6 +847,47 @@ mod tests {
         // And the arm with no unit at all answers without consulting the environment either.
         assert_eq!(ServiceManager::None.unit_path_here().expect("no manager, no question to ask"), None);
     }
+
+    /// **A fresh config names every deployment choice, set or not** (#352).
+    ///
+    /// This file already states the rule one field over — *"a mechanism an operator cannot discover from the
+    /// file they edit does not exist to them"* — and applies it to `state`, `bootstrap`,
+    /// `admission_difficulty`, `telemetry_epsilon`, `proteus_environment` and `proteus_accept_secrets`, each
+    /// written as a commented default when unset.
+    ///
+    /// The three overlay choices were first rendered only when they DIFFERED from the default, which meant a
+    /// wizard-written config never mentioned them. That is the same defect #352 set out to fix, one step
+    /// further out: making a choice expressible and leaving it undiscoverable is barely better than not
+    /// offering it. Asserted on a DEFAULT config, because that is the only case where the omission was
+    /// possible — a non-default value was always written.
+    #[test]
+    fn a_fresh_config_mentions_every_overlay_choice() {
+        let text = render_config(&NodeConfig::default(), Path::new("/etc/fanos/node.key"));
+        for key in ["self_healing", "require_self_certified_membership", "require_admission"] {
+            // **The COMMENTED form specifically**, and that is not pedantry. Asserting only that the key
+            // appears is satisfiable by writing it as a live setting, which is a different act: a default
+            // written as a setting is PINNED in the file, so the day the default changes every config the
+            // wizard ever wrote keeps the old value and nothing says so. Checking the `#` is what separates
+            // documenting a choice from making one.
+            //
+            // The first version of this asserted the parse instead — that reading the rendered text back
+            // yields the default overlay — and that assertion **could not fail**: hints are only written when
+            // the value already equals the default, so the comparison holds whether or not the `#` is there.
+            // Found by falsifying it, not by reading it.
+            let commented = format!("# {key} = ");
+            assert!(
+                text.contains(&commented),
+                "a config rendered from defaults does not carry `{commented}…`, so either the choice is \
+                 invisible to an operator reading the file the wizard wrote, or it is written as a live \
+                 setting and the default is pinned into every generated config.\n--- rendered ---\n{text}"
+            );
+        }
+        // The file the wizard writes must still parse, and the hints must leave the overlay at its default —
+        // weaker than the check above and kept as the round-trip half rather than as the discriminator.
+        let back = NodeConfig::from_config_str(&text).expect("the wizard's own output must parse");
+        assert_eq!(back.overlay, NodeConfig::default().overlay, "a hint changed the parsed configuration");
+    }
+
 
     #[test]
     fn the_rendered_config_reads_back_field_for_field() {
