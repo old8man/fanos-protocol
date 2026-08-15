@@ -188,6 +188,38 @@ pub const DEFAULT_MIX_DELAY: Duration = Duration::from_millis(120);
 /// does not do that, and the `0.037` at a 500 ms bin is the bin resonating with the interval, not a
 /// defence. Recorded as a measurement, not a prescription: the replacement is a design item and needs its
 /// own derivation before anything ships.
+///
+/// # 2026-08-16 — the table above measures the overlay heartbeat, and the remedy it selects is already built
+///
+/// The figures stand as an *operational* reading and fall as an *attribution*, which changes which design
+/// item is open.
+///
+/// `composed_relay_gpa.rs` arms the cover schedule with `Command::StartHeartbeat`, which also starts overlay
+/// liveness. That traffic is not a contribution to the tape — it **is** the tape: **4972 frames with it, 100
+/// without**, on identical relay load. A GPA correlating a relay's in-rate against its out-rate over that
+/// series is correlating the heartbeat with itself, and the relay's cargo is ~2% of what it sees. Separating
+/// them (`the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay`), same drive, 100 ms
+/// bins:
+///
+/// ```text
+///                  undefended   cover-only   cover buys
+///   with heartbeat      1.0000       0.9976       0.0024
+///   without             1.0000       0.7585       0.2415
+/// ```
+///
+/// **Operationally the old reading holds**: `start_heartbeat` defaults to `true`, so a deployed relay's tape
+/// really is heartbeat-dominated and a GPA really does see `r ≈ 1`. What does not hold is "the current
+/// schedule does not decouple the count". It does, by two orders of magnitude more than the table shows —
+/// and the remedy that table selects, *cover that fills every slot rather than yielding it*, is **what the
+/// router already does**: `forward_send` queues to `outbox`, one cell leaves per tick whether or not a real
+/// one is waiting, and `covering` is set once and never cleared. There is no yielding to remove.
+///
+/// So the open item moves. It is not the cover schedule; it is that a cell-wide periodic broadcast lives
+/// outside the plane the relay defends, is visible to the same adversary, and no mixnet defence can touch it
+/// because it is membership liveness rather than relayed cargo. What a GPA infers from an *unsynchronised*
+/// deployment's heartbeats is its own experiment and is not answered here — the perfect periodicity in that
+/// harness is partly `inject_all` starting seven nodes on one clock, which production does not do. Recorded
+/// as a measurement and a redirection, not a prescription, for the same reason as the entry above.
 pub const DEFAULT_COVER_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The distributed-beacon parameters a node needs to run the live epoch clock (§7.6, #108). With

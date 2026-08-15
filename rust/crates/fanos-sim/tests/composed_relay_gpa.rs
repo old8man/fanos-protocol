@@ -111,9 +111,22 @@ fn worst_relay_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> f64 {
 
 /// The same run, also returning the tape's shape so a caller can check the setting ENGAGED.
 fn tape_and_correlation(cover: Duration, mix: Duration, bin_ms: u64) -> ((usize, u64), f64) {
+    tape_and_correlation_with(cover, mix, bin_ms, true)
+}
+
+/// The same run with the overlay heartbeat as a parameter — see
+/// `the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay`.
+fn tape_and_correlation_with(
+    cover: Duration,
+    mix: Duration,
+    bin_ms: u64,
+    heartbeat: bool,
+) -> ((usize, u64), f64) {
     let mut sim = Sim::new(SEED);
     let cell = spawn_composed_relay_cell::<F2>(&mut sim, Config::default(), cover, mix, true);
-    sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
+    if heartbeat {
+        sim.inject_all(&Command::StartHeartbeat); // arms the cover schedule where there is one
+    }
     sim.observe_frames(); // the GPA starts tapping
 
     drive(&mut sim);
@@ -287,4 +300,74 @@ fn measure_the_gpa_correlation_on_the_composed_relay() {
         );
     }
     println!();
+}
+
+/// **The figures this file records are dominated by the overlay heartbeat, and the cover's own contribution
+/// is ~50× larger than they say.**
+///
+/// This file's header names two ways it once measured nothing — driving a command that never entered
+/// `forward_send`, and an observable blind to a 120 ms displacement. This is a third, and it survived both
+/// fixes because it is not about the *mechanism* being driven but about what else is on the tape.
+///
+/// `Command::StartHeartbeat` is injected to arm the cover schedule. It also starts overlay liveness, and
+/// that traffic is not a rounding error: **4972 frames with it, 100 without**, on identical relay load. A
+/// GPA correlating a relay's in-rate against its out-rate over that tape is correlating the heartbeat with
+/// itself, and the relay's cargo is ~7% of what it sees.
+///
+/// Measured on the same drive, `bin = 100 ms`:
+///
+/// ```text
+///                  undefended   cover-only   cover buys
+///   with heartbeat      1.0000       0.9976       0.0024
+///   without             1.0000       0.7585       0.2415
+/// ```
+///
+/// The gap is what matters, not the second column's exact value: at five times this drive's density the
+/// same pair reads `0.0019` and `0.1093`, because a busier relay leaves the cover less idle to fill. Both
+/// densities put the ratio near two orders of magnitude, which is why the assertion below is a ratio and
+/// not a pinned figure.
+///
+/// **This does not overturn the operational reading**, and that matters: `start_heartbeat` defaults to
+/// `true`, so a deployed relay's tape really is heartbeat-dominated and a GPA really does see `r ≈ 1`. What
+/// it overturns is the **attribution**, and the design item that was selected from it. `DEFAULT_COVER_INTERVAL`'s
+/// entry concludes from `cover buys 0.002–0.007` that "the current schedule does not" decouple the output
+/// count from the input, and proposes replacing it with cover that fills every slot. The schedule already
+/// fills every slot — `forward_send` queues to `outbox` and one cell leaves per tick, real or keystream, and
+/// `covering` is never cleared once set. On the traffic it governs it buys `0.24` here and `0.11` at five
+/// times the density, not `0.002`. What re-correlates the
+/// relay is a mechanism no mixnet defence touches, because it is membership liveness rather than relayed
+/// cargo.
+///
+/// So the open item is not "replace the cover schedule". It is that a cell-wide periodic broadcast is
+/// visible to the same adversary, and it is outside the plane the relay defends. Left as a measurement and
+/// not a prescription, in this file's own tradition: what a GPA infers from an unsynchronised deployment's
+/// heartbeats is a separate experiment — the perfect periodicity here is partly `inject_all` starting seven
+/// nodes on one clock, which production does not do.
+#[test]
+fn the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay() {
+    const BIN: u64 = 100;
+    let ((frames_hb, _), plain_hb) = tape_and_correlation_with(Duration(0), Duration(0), BIN, true);
+    let ((frames_no, _), plain_no) = tape_and_correlation_with(Duration(0), Duration(0), BIN, false);
+    let ((_, _), cover_hb) = tape_and_correlation_with(span(DEFAULT_COVER_INTERVAL), Duration(0), BIN, true);
+    let ((_, _), cover_no) = tape_and_correlation_with(span(DEFAULT_COVER_INTERVAL), Duration(0), BIN, false);
+    let buys_hb = plain_hb - cover_hb;
+    let buys_no = plain_no - cover_no;
+    println!(
+        "tape: {frames_hb} frames with heartbeat, {frames_no} without\n  \
+         with heartbeat: undefended {plain_hb:.4} cover-only {cover_hb:.4} buys {buys_hb:.4}\n  \
+         without:        undefended {plain_no:.4} cover-only {cover_no:.4} buys {buys_no:.4}"
+    );
+    // The attribution itself: the heartbeat is the tape, not a contribution to it.
+    assert!(
+        frames_hb > 5 * frames_no,
+        "the claim is that the heartbeat DOMINATES; it carried {frames_hb} against {frames_no}"
+    );
+    // And the consequence: the cover's measured effect is an order of magnitude larger once the series is
+    // not something else's. A `>` on the difference rather than a pinned figure — the point is the gap.
+    assert!(
+        buys_no > 10.0 * buys_hb,
+        "cover buys {buys_no:.4} on relay traffic against {buys_hb:.4} on the heartbeat-dominated tape; if \
+         these have converged the attribution above is stale and the entry at DEFAULT_COVER_INTERVAL needs \
+         re-reading"
+    );
 }
