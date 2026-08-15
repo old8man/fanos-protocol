@@ -373,6 +373,20 @@ pub struct Config {
     /// named itself, and it reproduces the pre-#210 identifier exactly.
     pub genesis: BeaconSeed,
     /// A peer unheard-from for longer than this is considered degraded.
+    ///
+    /// **It is coupled to [`heartbeat`](Self::heartbeat) and the coupling is not expressed here.** The
+    /// default is the literal `1600 ms` against a `500 ms` heartbeat; `fanos-observatory` builds the same
+    /// quantity as `HEARTBEAT_MS * 3` (1500 ms), so the tree computes one thing two ways and the two
+    /// disagree by 100 ms. Neither number is derived — `storage.rs`'s note ("at 1600 ms swept on the 500 ms
+    /// heartbeat, a read settles at ~2 s — measured") takes 1600 as given and reports the consequence — and
+    /// `ENDPOINT_WINDOW` (crate-internal, so named and not linked) is justified *against* this value
+    /// — "≈ 2.5 s > `liveness_timeout`" — which holds at both 1500 and 1600.
+    ///
+    /// **Nothing can drift today**, because the heartbeat period is not operator-settable: the `heartbeat`
+    /// config key sets `start_heartbeat`, a boolean. That is the whole reason this is a note and not a fix —
+    /// deriving it would move a value that measurement is quoted against, for a gain that is hypothetical
+    /// while the period is a constant. **Whoever makes the period tunable owes this line a second look**: the
+    /// observatory's value will follow the heartbeat and this one will not.
     pub liveness_timeout: Duration,
     /// The healthy mean inter-node correlation `r` used to estimate the cell's integration `Φ`
     /// for the healing budget (`Φ_net = (N−1)·r²`, spec §2.7). The default `0.45` sits in the
