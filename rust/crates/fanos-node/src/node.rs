@@ -1312,6 +1312,13 @@ impl Node {
                         // deployments report one cell (#210). Same derivation as the address space uses
                         // (`Directory::for_network`, node.rs:1128) — one network name, one seed, both places.
                         genesis,
+                        // The three the operator can now express (#352). Without this line the keys would be
+                        // decoration: `NodeConfig` would carry the wish and the overlay would keep its own
+                        // default, which is a worse state than having no key at all — a setting that reports
+                        // itself accepted and does nothing.
+                        self_healing: config.overlay.self_healing,
+                        require_self_certified_membership: config.overlay.require_self_certified_membership,
+                        require_admission: config.overlay.require_admission,
                         ..OverlayConfig::default()
                     },
                     admission,

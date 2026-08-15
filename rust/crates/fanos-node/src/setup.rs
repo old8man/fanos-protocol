@@ -644,6 +644,7 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     let _ = writeln!(s, "# mix_mean_delay is the anonymity/latency trade itself: lower is faster AND less mixed.");
     let _ = writeln!(s, "mix_mean_delay = {}", config.mix_mean_delay.as_millis());
     let _ = writeln!(s, "cover_interval = {}", config.cover_interval.as_millis());
+    render_overlay_choices(&mut s, config.overlay, d.overlay);
     if config.start_heartbeat != d.start_heartbeat {
         let _ = writeln!(s, "heartbeat = {}", config.start_heartbeat);
     }
@@ -674,6 +675,18 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
         }
     }
     let _ = writeln!(s);
+    render_transport_shaping(&mut s, config);
+    s
+}
+
+/// Write the **transport shaping** section — the PROTEUS morph, its environment, and the community
+/// secret's absence (#352 extraction).
+///
+/// A section of the rendered file and therefore a seam of the renderer, not a cut to satisfy a line count:
+/// this block is the one whose comments carry an operator PROCEDURE — the umask recipe and why the secret is
+/// never written here — and it changes when §13.4 changes, while the keys above it change with the node's
+/// own configuration. `render_config` names the sections; this owns one of them.
+fn render_transport_shaping(s: &mut String, config: &NodeConfig) {
     let _ = writeln!(s, "# --- transport shaping ---");
     let _ = writeln!(s, "proteus_morph = {}", config.proteus_morph.name());
     if let Some(env) = config.proteus_environment {
@@ -716,7 +729,28 @@ pub fn render_config(config: &NodeConfig, identity: &Path) -> String {
     let _ = writeln!(s, "#   node has done phase 1: move the new one to proteus_secret and put the old one here.");
     let _ = writeln!(s, "#   Phase 3: drop the old one. Doing phase 2 early makes this node unreadable to every");
     let _ = writeln!(s, "#   peer still on the old secret."); 
-    s
+}
+
+/// Write the overlay choices that differ from their defaults (#352).
+///
+/// Called as one line from [`render_config`] rather than three blocks inline, because they are one group and
+/// that function sits at its line bound — a renderer grows one block per key, so a group of keys that move
+/// together should cost one call. Written only on a difference, like every key there: a rendered config that
+/// restates every default is a config whose diff stops meaning anything.
+///
+/// Split from [`render_config`] for the same reason its own arms are split: a renderer grows one block per
+/// key, and a group of keys that move together should cost one call rather than three. `s` is the buffer the
+/// caller is building; each writes only on a difference, so a default-valued config renders none of them.
+fn render_overlay_choices(s: &mut String, c: crate::config::OverlayChoices, d: crate::config::OverlayChoices) {
+    if c.self_healing != d.self_healing {
+        let _ = writeln!(s, "self_healing = {}", c.self_healing);
+    }
+    if c.require_self_certified_membership != d.require_self_certified_membership {
+        let _ = writeln!(s, "require_self_certified_membership = {}", c.require_self_certified_membership);
+    }
+    if c.require_admission != d.require_admission {
+        let _ = writeln!(s, "require_admission = {}", c.require_admission);
+    }
 }
 
 /// The file a node's beacon provisioning is written to inside its config directory.
@@ -824,6 +858,7 @@ mod tests {
         assert_eq!(back.mix_mean_delay, c.mix_mean_delay, "mix_mean_delay");
         assert_eq!(back.cover_interval, c.cover_interval, "cover_interval");
         assert_eq!(back.start_heartbeat, c.start_heartbeat, "heartbeat");
+        assert_eq!(back.overlay, c.overlay, "overlay choices");
         assert_eq!(back.identity_path.as_deref(), Some(Path::new("/etc/fanos/identity.key")), "identity");
         assert_eq!(back.state_path, c.state_path, "state");
         assert_eq!(back.service_path, c.service_path, "service");
@@ -860,6 +895,13 @@ mod tests {
             mix_mean_delay: std::time::Duration::from_millis(31),
             cover_interval: std::time::Duration::from_millis(777),
             start_heartbeat: false,
+            // All three flipped away from their defaults, so a writer that skips one is caught by the
+            // comparison below rather than by the destructure alone.
+            overlay: crate::config::OverlayChoices {
+                self_healing: false,
+                require_self_certified_membership: true,
+                require_admission: true,
+            },
             epoch_period: std::time::Duration::from_secs(301),
             admission_difficulty: Some(11),
             // The two the hand-written list never reached, set to something no default would produce.
@@ -886,6 +928,7 @@ mod tests {
             mix_mean_delay,
             cover_interval,
             start_heartbeat,
+            overlay,
             beacon,
             epoch_period,
             admission_difficulty,
@@ -907,6 +950,7 @@ mod tests {
         assert_eq!(&back.mix_mean_delay, mix_mean_delay, "mix_mean_delay");
         assert_eq!(&back.cover_interval, cover_interval, "cover_interval");
         assert_eq!(&back.start_heartbeat, start_heartbeat, "start_heartbeat");
+        assert_eq!(&back.overlay, overlay, "overlay choices");
         assert_eq!(&back.epoch_period, epoch_period, "epoch_period");
         assert_eq!(&back.admission_difficulty, admission_difficulty, "admission_difficulty");
         assert_eq!(&back.proteus_morph, proteus_morph, "proteus_morph — the censorship transform (#113)");

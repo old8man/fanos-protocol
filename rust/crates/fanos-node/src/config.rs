@@ -1194,6 +1194,41 @@ const _: () = {
     assert!(CoreRoleSet::BIT_INGRESS == 1 << 5, "JOIN bit 5 is ingress");
 };
 
+/// The overlay settings an operator may express, carried together into `OverlayConfig` (#352).
+///
+/// Each mirrors a `fanos_runtime::Config` field whose own doc offers a deployment a choice — and until this
+/// existed, none of the three could be made: the overlay config was built from `..OverlayConfig::default()`
+/// and nothing carried the wish across. **The defaults here are that struct's defaults, unchanged**: exposing
+/// a choice and altering it are separate acts, and only the first is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayChoices {
+    /// Whether this node **acts** on its own diagnosis — reroute, repair, escalate — or only senses.
+    /// `fanos_runtime::Config::self_healing` has always offered this ("Set `false` for a sense-only node").
+    pub self_healing: bool,
+    /// Whether a peer's announced overlay address must be the descent chain of the identity it announces.
+    ///
+    /// Defends against routing-table poisoning (threat §79/B1): with it on, a peer cannot announce an address
+    /// it did not earn, so attracting a target's `RouteHier` traffic costs `≈ N^k` identity grinding. Whether
+    /// it should default ON is a separate question this does not answer — no measurement exists of what
+    /// fraction of legitimate announcements the check would reject, and this tree does not flip a security
+    /// default without one. Its counterpart is already wired: the main path sets `vrf_coordinates: true`
+    /// precisely so that, with this on, level 0 is verified by the HELLO proof rather than the hash chain.
+    pub require_self_certified_membership: bool,
+    /// Whether an announcing peer must satisfy this node's Sybil admission policy.
+    ///
+    /// Off by default with a reason beyond caution: there is **no producer** for the admitted set (#76), so
+    /// turning it on rejects every peer — the honest failure, since the guard **fails closed** rather than
+    /// silently admitting. Exposed anyway, because a deployment that installs its own policy must be able to
+    /// say so, and because leaving it unreachable is what let the question go unasked.
+    pub require_admission: bool,
+}
+
+impl Default for OverlayChoices {
+    fn default() -> Self {
+        Self { self_healing: true, require_self_certified_membership: false, require_admission: false }
+    }
+}
+
 /// A node's runtime configuration.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -1281,6 +1316,13 @@ pub struct NodeConfig {
     pub cover_interval: Duration,
     /// Whether to begin liveness heartbeats on start.
     pub start_heartbeat: bool,
+    /// The overlay settings a deployment may express (#352).
+    ///
+    /// Grouped rather than three loose flags, and the grouping is the point: these are exactly the
+    /// `fanos_runtime::Config` fields whose docs offer a deployment a choice, and they travel together into
+    /// the one place that builds the overlay config. A loose flag on `NodeConfig` says nothing about where it
+    /// goes; a named group says what it is for and makes the round-trip one field instead of three.
+    pub overlay: OverlayChoices,
     /// The distributed-beacon parameters. `Some(..)` runs the live epoch clock (§7.6); `None` (the
     /// default) runs a bare overlay pinned at genesis — see [`BeaconParams`].
     pub beacon: Option<BeaconParams>,
@@ -1412,6 +1454,26 @@ fn accept_rollover_secret(config: &mut NodeConfig, value: &str) -> Result<(), No
 /// do with parsing — which is how the dispatch reached its size limit while nothing about it got harder.
 ///
 /// `line` is 0-based and reported as `line + 1`, matching the four sibling parsers.
+/// The three overlay choices, split out of [`apply_config_key`] (#352).
+///
+/// A seam and not a line-count cut, the same one that put `apply_config_key` here in the first place: the file
+/// FORMAT and the key VOCABULARY change for different reasons, and these three change for a third — they move
+/// with `fanos_runtime::Config`, one crate down. Grouping the parse beside the group they set keeps that
+/// coupling in one place.
+fn apply_overlay_key(overlay: &mut OverlayChoices, key: &str, value: &str) -> Result<(), NodeError> {
+    let flag = value
+        .parse::<bool>()
+        .map_err(|_| NodeError::Config(format!("bad {key} '{value}' (expected true/false)")))?;
+    match key {
+        "self_healing" => overlay.self_healing = flag,
+        "require_self_certified_membership" => overlay.require_self_certified_membership = flag,
+        // The caller's match already restricts the key set; an unreachable arm here would be a second place
+        // to keep in step, so the last one takes the remainder.
+        _ => overlay.require_admission = flag,
+    }
+    Ok(())
+}
+
 fn apply_config_key(
     config: &mut NodeConfig,
     key: &str,
@@ -1436,6 +1498,9 @@ fn apply_config_key(
             config.start_heartbeat = value.parse().map_err(|_| {
                 NodeError::Config(format!("bad heartbeat '{value}' (expected true/false)"))
             })?;
+        }
+        "self_healing" | "require_self_certified_membership" | "require_admission" => {
+            apply_overlay_key(&mut config.overlay, key, value)?;
         }
         "proteus_secret" => {
             if value.is_empty() {
@@ -1526,6 +1591,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            overlay: OverlayChoices::default(),
             // `q = 2` for continuity — see the field's note on why that is a fixture and not a recommendation.
             plane_order: 2,
             telemetry_epsilon: None, // silence by default: publishing a cell's coherence readings is an operator's decision
@@ -1652,6 +1718,61 @@ impl NodeConfig {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **A documented deployment choice must be expressible AND must arrive** (#352).
+    ///
+    /// `fanos_runtime::Config` offers three choices in prose — `self_healing` ("Set `false` for a sense-only
+    /// node"), `require_self_certified_membership` ("on for a deployment that wants routing-table poisoning
+    /// resistance") and `require_admission` — and until now none could be made: the overlay config was built
+    /// from `..OverlayConfig::default()` and no key carried the wish across. A doc that promises a choice the
+    /// operator cannot express is the doc lying about what a deployment can do.
+    ///
+    /// **Two failure modes, and the second is the worse one**, so both are asserted. A key that does not parse
+    /// is loud. A key that parses, sets its `NodeConfig` field, and never reaches the overlay is silent — the
+    /// setting reports itself accepted and does nothing, which is a worse state than having no key at all.
+    /// The second half is a source check because the wiring lives in `Node::start`'s construction, which no
+    /// unit test can reach: it asserts each field is READ where the `OverlayConfig` is built.
+    #[test]
+    fn each_exposed_overlay_choice_parses_and_reaches_the_overlay() {
+        for (key, field) in [
+            ("self_healing", "self_healing"),
+            ("require_self_certified_membership", "require_self_certified_membership"),
+            ("require_admission", "require_admission"),
+        ] {
+            // Parsed, and to the NON-default value in each case, so a key that silently ignores its argument
+            // cannot pass: `self_healing` defaults true and the other two default false.
+            let want = key != "self_healing";
+            let mut config = NodeConfig::default();
+            apply_config_key(&mut config, key, &want.to_string(), 1).expect("the key is accepted");
+            let got = match key {
+                "self_healing" => config.overlay.self_healing,
+                "require_self_certified_membership" => config.overlay.require_self_certified_membership,
+                _ => config.overlay.require_admission,
+            };
+            assert_eq!(got, want, "`{key}` parsed but did not change `NodeConfig::{field}`");
+
+            // A bad value is refused rather than defaulted — a setting that silently becomes `false` on a
+            // typo is the same silence this test exists to remove, arriving one layer earlier.
+            let mut config = NodeConfig::default();
+            assert!(
+                apply_config_key(&mut config, key, "yes-please", 1).is_err(),
+                "`{key}` accepted a non-boolean value instead of refusing it"
+            );
+
+            // And it must ARRIVE. `node.rs` builds the overlay config with `..OverlayConfig::default()`, so a
+            // field absent from that construction keeps the default however the operator sets the key.
+            let node_rs = include_str!("node.rs");
+            let start = node_rs.find("overlay: OverlayConfig {").expect("the overlay config construction");
+            let end = node_rs[start..].find("..OverlayConfig::default()").expect("the struct-update tail");
+            let built = &node_rs[start..start + end];
+            assert!(
+                built.contains(field),
+                "`{field}` is exposed as the `{key}` config key but is not read where the `OverlayConfig` is \
+                 built, so setting it changes nothing. The key would report itself accepted and do nothing, \
+                 which is worse than not offering it"
+            );
+        }
+    }
+
     /// **The announced set follows the wired modules, bit by bit** (#284).
     ///
     /// Each arm flips exactly one role and reads exactly one bit, so a derivation that stopped consulting a
