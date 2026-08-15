@@ -5078,3 +5078,175 @@ meeting points and take the address over. Wiring it is not a flag: the shares ne
 `fanos keygen` than to a config key), and `reconstruct_identity` needs `≥ threshold` live members every epoch
 the registration is renewed — a liveness floor that owes an observable and a bound of its own, which is the
 lesson the two queues above were teaching.
+
+
+# One carrier, two facts — a pass where half the defects were in the instruments (2026-08-15)
+
+Thirteen commits, `GATE GREEN — 26 steps` twice at the end. What ties the findings together is a single shape:
+**none of them is a missing mechanism.** Every one is a distinction that existed, was written down, and was
+lost crossing a carrier that had no room for it — a return value, a four-byte ordinal, a phase's exit status,
+a config key, a line in a handover message. The knowledge was always present, one layer down or in the comment
+beside the code; that is exactly why the defects were invisible, because a reader sees the correct thought and
+a caller receives the value with the thought subtracted.
+
+**Half the pass is about the tools.** Five of the thirteen commits fix the things that verify the system rather
+than the system: a test that returned a verdict where measurement was impossible, a gate that called an empty
+phase passed, a guard covering its class in one file of the tree, a tripwire that hands over one of the two
+facts it should, and a guard of my own with an assertion that could not fail. Their failure mode is the
+inverse of the program's: a broken program behaves wrongly, a broken instrument stays silent and reads as
+confirmation.
+
+## `EpochAgree` inherited `adopt-max` without the premise that made it safe
+
+`overlay/mod.rs` states the rule — "driven by the flooded beacon (**adopt-max**, spec §L3)". Adopt-max is sound
+for the object it was written about: a threshold-DVRF round, which cannot be forged. `FrameType::EpochAgree` is
+the fallback for cells with no beacon and carries a bare **four-byte ordinal** with none of that
+authentication. The rule was carried across; its premise was not.
+
+In this system's own units: **every other decision here tolerates `f` faulty members and this one tolerated
+zero.**
+
+The cost is not a large number. `DIRECTORY_SLOT_EPOCHS = 1`, so a slot written at `E` is reclaimed once
+`now ≥ E+2`, and every `(coordinate, epoch)`-keyed directory publisher writes through `put_ephemeral` —
+`mixdir`, `capdir`, `ingressdir`, `exit`, `loaddir`, `crosscell_dir`, `telemetry_dir`, `diagdir`, `resolve`. So
+one member claiming `current + 2` expired the entire directory slice on the receiving node and on everyone it
+re-flooded to. **That value is the point**: `current + 2` is indistinguishable from a node whose beacon ran two
+rounds while it was busy, which is why no bound on the magnitude of a jump can work and only corroboration can.
+
+Two further properties made it terminal rather than transient. The `loss_ledger` — the record of what became
+unrecoverable — is dropped by the same sweep, so the evidence dies with the damage. And `drive_overlay` steps
+the overlay only *forward*, so an overlay pushed past the beacon can never be pulled back: the node publishes
+healthily into slots of an epoch no honest reader consults. Alive, publishing, answering telemetry, invisible.
+
+**Fixed in `5b3c724` (engine) and `9fcb088` (composite), and nothing in the cure was invented.** The rule is
+the one `coord_alive` already uses one file over — *a quorum of distinct witnesses must vouch* — the quantity
+is `Config::corroboration_quorum`, bracketed by its own test at `q > f && q ≤ n − 2 − f`, and the materiality
+gate that must precede the counting is `note_certified_height`'s, taken from TAXIS along with its reason.
+Adoption is an ORDER STATISTIC, not a threshold test: "q members claimed something" and "q members reached at
+least THIS" are different facts and only the second is what a quorum means.
+
+`9fcb088` also **retires a contract**: `the_epoch_beacon_reaches_monotone_consensus_from_one_trigger` was a
+green, named, tested statement of exactly this defect. Renamed and its setup raised, with the reason written at
+the test — nothing in production depended on it, because every node runs its own wall-clock epoch driver and
+gossip exists for agreement, never to drive time.
+
+## The signature was the fingerprint
+
+Every neighbouring arm of the same dispatch passes the sender — `on_publish(now, from, ..)`,
+`on_lookup(from, ..)`, `on_value(now, from, ..)` — and `EpochAgree` alone did not. The handler could not count
+witnesses because it was never given anyone to count. Max-wins was welded into the signature, the same way this
+tree already records elsewhere: *"the previous signature was `&self`, which is precisely the type-level
+statement that no such check was happening."*
+
+## A loop-back is "the mapping is stale", not "the address is dead"
+
+`4f2530c` refused a self-connection (a coordinate collision resolves both claimants to one address, and the
+incumbent addressing the other dials itself — measured 20 of 20 payloads delivered to the sender). `015405f`
+fixes a defect **in that same commit**: `dial_and_send` strikes an address out of the epoch on any `None`, and
+the comment justifying that strike rests on a premise it states itself — *"re-trying the same thing cannot
+yield a different answer **while the mappings hold**"*. A loop-back is precisely the case where the mapping is
+what is wrong, so one stale directory entry removed a live peer for a whole epoch.
+
+This is the category #240 had already carved out of the very same function, with the one difference that
+decides the handling: #240's rejection **carries its own correction**, so striking the stale address costs
+nothing; a loop-back carries none, and the strike is then the thing that removes the peer.
+
+**Note what this defect has no diff for.** `4f2530c` changed no line of `dial_and_send`; it added a new *cause*
+for a value that site already handled. A review reading `+`/`-` could not have seen it, which is the argument
+for enumerating consumers whenever a new cause joins an existing value — exactly one of the three read it
+wrongly.
+
+## Three deployment choices the docs offered and no operator could make
+
+`fanos_runtime::Config` documents `self_healing`, `require_self_certified_membership` and `require_admission`
+as choices a deployment makes. None could be made: the overlay config is built from `..OverlayConfig::default()`
+and no key carried the wish across — zero mentions across `config.rs`, `bin/fanos.rs` and `fanos-cli/src`, with
+the only `true` in the tree in a simulator test.
+
+Sharper than "opt-in security defaults off", because the main path already **prepares** for the state it cannot
+enter: it sets `vrf_coordinates: true` with a comment saying *"so **if a deployment turns on self-certified
+membership** the check verifies level 0 by the proof-of-coordinate HELLO"*. Code executing for an unreachable
+condition.
+
+Fixed in `7718556` (expressible) and `0a8b5e1` (discoverable) — and the second is the same defect one step out:
+rendering the keys only when they differ from the default meant a wizard-written config never mentioned them,
+against this file's own rule that *a mechanism an operator cannot discover from the file they edit does not
+exist to them*. **Defaults are untouched**; whether `require_self_certified_membership` should default ON is a
+real question left open, because no measurement exists of what fraction of legitimate announcements the check
+would reject and this tree does not flip a security default without one.
+
+## A cell's health report is a bare byte where its sibling checkpoint carries a certificate — LATENT
+
+Twenty lines apart in `crosscell_dir.rs`: `publish_checkpoint` is a world-claim that carries its own proof (an
+`ExecCertificate`, and `attest_children` refuses a child whose certificate fails to verify), while
+`publish_health` writes **one unauthenticated byte** at a `(cell, epoch)` slot that `resolve_health` parses with
+no signature, no envelope and no publisher binding. Its consumer runs the Turyn federated covering and localizes
+up to three faults to `(child, axis)` — and a covering designed to localize confidently will mislocalize
+confidently on forged input.
+
+**Not exploitable today** — `diagnose_children` has no callers and there is never a second cell — which is why
+the interesting half is the tripwire. `one_cell_premise` fires the day cross-cell publishing becomes reachable
+and its handover carried only the **reachability** fact; the missing envelope is an **evidence** fact. A full
+answer to the wrong question on that day reads as "the area was reviewed", which is worse than silence.
+`ac0c5be` completes the handover; the envelope itself is still owed.
+
+## The gate called a phase that ran nothing "ok"
+
+The script's header settles where a status comes *from* — cargo, never a pipeline, after an "exit 0" that was
+`head`'s once cost a false all-clear. It did not settle what a zero status *means*: `cargo test` exits 0 for a
+target with no tests and for a filter that matched none. Fixed in `95d9756`, summed across the phase rather
+than per target.
+
+**Deliberately not the per-phase floor it started as.** Verification killed that design: the `tests` group
+already enumerates every surface `--workspace` skips, with the `--list` deltas measured in the comments beside
+them (17 vs 18 for `fanos-vpn`, 45 vs 46 for `fanos-telemetry`). Naming the missing surface is stronger than
+detecting its absence; only emptiness was unanswered.
+
+## An invariant two subsystems wrote down and nothing checked
+
+`crosscell.rs` and `content.rs` each state, at their own leaf label, that a leaf of their tree can be neither an
+internal node nor another subsystem's leaf — and `merkle::leaf`'s doc says outright that it cannot enforce this
+("Nothing forces this"). `defd878` adds the corpus ratchet, written **while green**, which is the only cheap
+time: a guard added after a collision cannot tell whether it is catching the defect or its own mistake.
+
+Three defects in that guard were found by falsifying it and none by reading it: a control that preempted the
+assertions it guarded (making the guard unfalsifiable in its own subject); a scan keyed on the value's
+*spelling* where the property is about its *role*, which made the reserved-label assertion unreachable; and one
+control for two stages that fail differently.
+
+## Negative results, recorded so they are not re-derived
+
+**One-way doors are not the defect; an unauthenticated hand on one is.** What made `EpochAgree` terminal was
+`drive_overlay` stepping only forward. A sweep for that shape found 44 monotone state transitions, six of them
+behaviour-gating rather than counters — and the two of the same form as `drive_overlay` (`cell_node.rs:158`,
+`mix_relay.rs:106`, both advancing the forward-secure onion epoch) are driven **only** by
+`Notification::BeaconReady`, which only the beacon emits. Three sites of one shape; the source decided which
+was dangerous.
+
+**The version-boundary class is clean**, owed to this register since 2026-08-13 and written here now: seven
+versioned boundaries, each refusing a mismatch at a line that was read, with `sealed.rs`'s
+`const VERSION = tessera::VERSION` refuted as a two-quantity defect — it is an implementation of the canonical
+layout, one quantity correctly imported.
+
+**The doc-theft class extends past the one file that guards it.** `every_function_in_the_node_binary_is_
+documented` closes it totally in `bin/fanos.rs`, scoped there because that is where it had occurred. It
+occurred four times in one day elsewhere, including once in the commit whose message described the class.
+Totality is unavailable — the tree has 151 undocumented free functions — so `338d44d` pins the per-crate count
+**exactly**, not as a ceiling: an insertion between a doc and its function leaves the displaced one bare, so
+the count rises by one, and a ceiling would be silent when the count falls and thereby buy room for a future
+theft to hide in.
+
+## What this pass says about the gate
+
+Nine targeted verdicts were produced during this work — `cargo test --workspace`, the two load-sensitive crates
+alone, per-crate clippy, the cross-crate guards, a falsification per commit — and **none of them ran `cargo
+doc` or clippy under any feature combination**. The first `./gate.sh` of the session failed at **31 seconds**
+on a `doc` red that had been on main since 2026-08-13, fixed in `c1b5517`.
+
+The measured price of the omission: **the gate's whole deterministic half costs 97 seconds warm** — six clippy
+phases across every feature surface (45 s), the cross-crate guards (15 s), `docs` (31 s), six `no_std` (6 s).
+And the full gate warm is **~24 minutes**, not the 5 h 42 min on record; `test-workspace` alone is 453–485 s
+across three runs. The hours are compilation, and compilation amortises while `target` stays warm.
+
+Nine sound choices did not add up to coverage, and no amount of care in choosing them would have: each answers
+its own question and none asks *what am I not checking*. Only the structure knows which surfaces exist.
