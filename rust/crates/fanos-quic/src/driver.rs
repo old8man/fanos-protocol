@@ -361,6 +361,20 @@ struct SelfCert {
     /// connection then proves the node's *current* coordinate, not a stale genesis one. Read-cloned per
     /// connection (an `Arc` swap, no copy under the lock).
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
+    /// This node's own certificate DER — the identity a peer authenticates it by, and therefore the exact test
+    /// for "is the party on the other end of this connection *us*?" (#350).
+    ///
+    /// **Not the address and not the coordinate**, and both alternatives were tried on paper first. The address
+    /// is wrong because a node behind NAT is reached at one address and bound to another, so comparing them
+    /// misses the very deployments that matter. The coordinate is wrong for a sharper reason: `reshuffle_loop`
+    /// *deliberately* sends to this node's own point to resolve a contested one, and its own comment says why —
+    /// "sending to our own point reaches whoever the directory says holds it, which is exactly the incumbent".
+    /// A coordinate-keyed guard would refuse the one message that mechanism exists to send. The certificate has
+    /// neither problem: it is unforgeable, NAT-independent, and it distinguishes *us* from *whoever else holds
+    /// our point*, which is the distinction the collision actually turns on.
+    ///
+    /// Not behind a lock, unlike `hello`: the reshuffle rewrites where this node sits, never who it is.
+    own_cert: Arc<Vec<u8>>,
     verify: HelloVerifier,
     /// Prove this node's coordinate for an arbitrary `(epoch, beacon)`: identity bytes, VRF public, and proof.
     ///
@@ -1746,50 +1760,13 @@ where
         capabilities,
     ))));
     let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis(genesis_seed)));
-    let verify_beacon = beacon_cell.clone();
     // Every peer whose claim this node verifies is remembered for the epoch, because coordinate resolution needs exactly
     // that: the best claim on each point of this node's own walk, and a witness for every step it advances
-    // (`crate::claims`). The verifier closure is the only place holding a peer's certificate DER — the identity the
-    // coordinate VRF binds to — so it is where the recording happens.
+    // (`crate::claims`). Owned here rather than inside the identity, because the reshuffle loop and `with_claims` read
+    // the same book the verifier writes.
     let book = ClaimBook::new();
-    let verify_book = book.clone();
-    let prover_creds = creds.clone();
-    let identity: Identity = Some(SelfCert {
-        hello: hello_cell.clone(),
-        prove: Arc::new(move |epoch, beacon| {
-            let (_, proof) = crate::identity::verifiable_coordinate::<F>(&prover_creds, epoch, beacon);
-            (prover_creds.cert_der().to_vec(), prover_creds.vrf_secret().public(), proof)
-        }),
-        verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
-            // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
-            // within the accepted window (safe-stall, R-C1). **Outside the window is not a bad proof**: it is
-            // this node admitting it cannot judge, and the two are reported apart (#236).
-            let Some(epoch) = hello_epoch(peer_hello) else {
-                return HelloVerdict::BadProof;
-            };
-            let beacon = match verify_beacon.read() {
-                Ok(window) => window.beacon_for(epoch),
-                // A poisoned window is a local fault, and a local fault is not the peer's forgery. Reported
-                // as "cannot judge" for the same reason.
-                Err(_) => None,
-            };
-            let Some(beacon) = beacon else {
-                return HelloVerdict::EpochUnknown;
-            };
-            let Some(result) = verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities) else {
-                return HelloVerdict::BadProof;
-            };
-            if let HelloResult::Established { peer, .. } = result {
-                // Recorded only on success, so the book holds nothing a remote verifier would reject. A peer proving a
-                // *past* epoch within the safe-stall window is deliberately not recorded: its claim is evidence about that
-                // epoch's placement, and admitting it here would let a retired placement justify a displacement now.
-                if epoch == verify_book.epoch() {
-                    verify_book.record::<F>(peer_cert, peer.public, peer.proof, &peer.output);
-                }
-            }
-            HelloVerdict::Ok(Box::new(result))
-        }),
-    });
+    let identity: Identity =
+        Some(self_certifying_identity::<F>(creds, &hello_cell, &beacon_cell, &book, capabilities));
     let dir_for_reshuffle = directory.clone();
     // Snapshot who holds our point **before** `spawn_inner` runs, because `spawn_inner` binds our coordinate to our own
     // address unranked — which overwrites the bootstrap seed. Reading it afterwards always answers "us", which is precisely
@@ -1872,6 +1849,69 @@ where
         contender_at_our_point,
     )));
     Ok(handle)
+}
+
+/// Build this node's self-certifying identity: what it proves about itself, what it accepts from a peer, and
+/// the one byte-string that says the peer *is* this node.
+///
+/// **A seam, not a slice taken to satisfy a line count.** `self_certifying_inner` answers "how does a node come
+/// up and take a seat"; this answers "how does a node prove and judge an identity". They change for different
+/// reasons — a seating rule moves with the placement design, these three closures move with §7.3 — and only the
+/// second half needs `creds`, which is why the credentials stop travelling past this call.
+///
+/// The verifier closure is the only place holding a peer's certificate DER — the identity the coordinate VRF
+/// binds to — so it is where a claim is recorded into `book`.
+///
+/// Returns the [`SelfCert`] itself and not an [`Identity`]: the `Option` in that alias carries a *different*
+/// question — self-certifying, or directory-trust — which is settled by the caller's choice of constructor and
+/// never by anything here. Wrapping inside would have this function answer a question it is never asked.
+fn self_certifying_identity<F: Field + 'static>(
+    creds: &NodeCredentials,
+    hello: &Arc<RwLock<Arc<Vec<u8>>>>,
+    beacons: &Arc<RwLock<BeaconWindow>>,
+    book: &ClaimBook,
+    capabilities: Capabilities,
+) -> SelfCert {
+    let verify_beacon = beacons.clone();
+    let verify_book = book.clone();
+    let prover_creds = creds.clone();
+    SelfCert {
+        hello: hello.clone(),
+        own_cert: Arc::new(creds.cert_der().to_vec()),
+        prove: Arc::new(move |epoch, beacon| {
+            let (_, proof) = crate::identity::verifiable_coordinate::<F>(&prover_creds, epoch, beacon);
+            (prover_creds.cert_der().to_vec(), prover_creds.vrf_secret().public(), proof)
+        }),
+        verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
+            // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
+            // within the accepted window (safe-stall, R-C1). **Outside the window is not a bad proof**: it is
+            // this node admitting it cannot judge, and the two are reported apart (#236).
+            let Some(epoch) = hello_epoch(peer_hello) else {
+                return HelloVerdict::BadProof;
+            };
+            let beacon = match verify_beacon.read() {
+                Ok(window) => window.beacon_for(epoch),
+                // A poisoned window is a local fault, and a local fault is not the peer's forgery. Reported
+                // as "cannot judge" for the same reason.
+                Err(_) => None,
+            };
+            let Some(beacon) = beacon else {
+                return HelloVerdict::EpochUnknown;
+            };
+            let Some(result) = verify_hello::<F>(peer_cert, peer_hello, &beacon, capabilities) else {
+                return HelloVerdict::BadProof;
+            };
+            if let HelloResult::Established { peer, .. } = result {
+                // Recorded only on success, so the book holds nothing a remote verifier would reject. A peer proving a
+                // *past* epoch within the safe-stall window is deliberately not recorded: its claim is evidence about that
+                // epoch's placement, and admitting it here would let a retired placement justify a displacement now.
+                if epoch == verify_book.epoch() {
+                    verify_book.record::<F>(peer_cert, peer.public, peer.proof, &peer.output);
+                }
+            }
+            HelloVerdict::Ok(Box::new(result))
+        }),
+    }
 }
 
 /// A bounded window of recent epoch beacons behind the HELLO verifier. The coordinate proof binds to a
@@ -2970,6 +3010,17 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
             let handshake = tokio::time::timeout(HELLO_DEADLINE, hello_exchange(&conn, t, id))
                 .await
                 .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None });
+            // Nothing crossed the network, so nothing downstream may treat this as evidence about the network
+            // (#350). Returning here — before `apply_outcome` — is the whole point: the breaker must not read a
+            // loop-back as a cut morph. The frame is dropped rather than delivered, which is the honest outcome:
+            // the addressee is a different node that currently shares our point, and it is unreachable BY
+            // COORDINATE until one of us reseats. `reshuffle_loop` is already doing exactly that, driven by the
+            // claim this connection would have recorded had it been a peer's.
+            if matches!(handshake.peer, PeerIdentity::Ourself) {
+                t.record_station(Station::TransportSelfConnection, Some(to), None);
+                tracing::debug!(?to, "dialed our own coordinate; another node holds the point we drew");
+                return None;
+            }
             // **The breaker reads the shaped round trip, not the QUIC handshake** (#231). Shaping starts at
             // the stream, so the handshake completing says nothing about the morph — a censor that admits
             // the handshake and kills the data phase used to be recorded as a success, resetting the breaker
@@ -3115,6 +3166,11 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Option<C
                     tracing::warn!(?to, "peer proved no coordinate (impostor or malformed claim); rejecting");
                     return None;
                 }
+                // Unreachable: the loop-back is answered above, before `apply_outcome`, precisely so it never
+                // reaches the arms that write the directory and the connection map. Written out rather than
+                // folded into a wildcard because a wildcard here would silently absorb the NEXT variant too,
+                // and this match is where a mis-sorted identity costs a directory write.
+                PeerIdentity::Ourself => return None,
             }
         }
     }
@@ -3242,6 +3298,18 @@ async fn accept_loop(t: Transport) {
                     // outlive one.
                     PeerIdentity::Unjudged(u) => return Some((conn, PeerIdentity::Unjudged(u))),
                     PeerIdentity::Rejected => return None,
+                    // Our own dial, arriving back at us (#350). Dropped rather than served: every table below is
+                    // a statement about a *peer*, and this is not one. Deliberately not counted here — the dial
+                    // side already recorded the same event at `transport.self_connection`, and counting both
+                    // ends would double every occurrence of a single collision.
+                    //
+                    // **It says so itself rather than falling through to the arm below**, which announces "bad
+                    // proof or negotiation incompatible" — true of a forgery and false of this. An operator
+                    // reading that line for a placement collision is sent looking for an attacker.
+                    PeerIdentity::Ourself => {
+                        tracing::debug!("inbound connection is this node's own dial arriving back; dropping");
+                        return None;
+                    }
                 };
                 // Audit R-M1: the HELLO exchange just proved this peer's coordinate against its certificate, so this is
                 // the one moment the identity↔coordinate binding is known. Seat it, and issue whatever the engine needs
@@ -3257,6 +3325,10 @@ async fn accept_loop(t: Transport) {
             .await;
             let (conn, from) = match established {
                 Ok(Some((conn, PeerIdentity::Proven(from)))) => (conn, from),
+                // Unreachable for the same reason as its dial-side twin: the closure above answers `Ourself`
+                // with `None`, so it never reaches here. Spelled out rather than wildcarded so that a future
+                // identity variant has to be sorted deliberately instead of inheriting "drop it".
+                Ok(Some((_, PeerIdentity::Ourself))) => return,
                 // The restricted state runs **here**, inside the handler, so the inbound permit and the
                 // per-source guard are held for its whole life — exactly as they are for `read_frames`.
                 // Spawning it instead would free both the moment the handshake ended, and an unjudgeable
@@ -3267,7 +3339,8 @@ async fn accept_loop(t: Transport) {
                     return;
                 }
                 // Unreachable by construction: the block above returns `None` rather than a `Rejected`.
-                // Matched rather than `_`-ed so that adding a fourth identity state is a compile error here.
+                // Matched rather than `_`-ed so that adding a further identity state is a compile error here —
+                // which is exactly what happened when `Ourself` arrived, and the arm above it is the answer.
                 Ok(Some((_, PeerIdentity::Rejected)) | None) => {
                     tracing::debug!(
                         "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
@@ -3466,6 +3539,19 @@ async fn read_verified_hello(
 /// each announces its own HELLO immediately (never waiting on the peer first), so there is no
 /// ordering dependency between the two sides — symmetric, and it cannot deadlock.
 async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Handshake {
+    // **Asked before the first byte, because after it there is nothing left to prevent** (#350). A peer
+    // authenticated with our own certificate is us: the coordinate we dialed resolved to our own endpoint, which
+    // happens exactly when another node has drawn the same point and the directory serves it to us. Everything
+    // downstream would then be correct in isolation and wrong together — the HELLO verifies (it is ours), the
+    // proven coordinate equals the one we dialed (it is ours), and the frame is handed to our own engine as
+    // though a peer had sent it. Measured on forced collisions: 20 of 20 payloads delivered to the sender.
+    //
+    // Placed in `hello_exchange` rather than at either call site because BOTH sides need it and they need it for
+    // the same reason — the dial side to stop a misdelivery, the accept side to stop serving a stranger that is
+    // itself. One check, two paths; a per-site copy is the divergence this file has been bitten by before.
+    if peer_cert_der(conn).is_some_and(|peer_cert| peer_cert.as_slice() == id.own_cert.as_slice()) {
+        return Handshake { peer: PeerIdentity::Ourself, round_trip: false, rank: None };
+    }
     // Snapshot the current-epoch HELLO (an `Arc` clone) and drop the lock before awaiting, so a concurrent
     // reshuffle can rewrite it without blocking on this connection's I/O. A poisoned lock rejects the
     // handshake, matching the connection-map convention elsewhere in this driver — and it is a *local*
@@ -3544,6 +3630,15 @@ enum PeerIdentity {
     Unjudged(Triple),
     /// Nothing was established: a forged proof, an incompatible negotiation, a local fault, or silence.
     Rejected,
+    /// The peer authenticated with **this node's own certificate**: the connection loops back to us (#350).
+    ///
+    /// A fourth answer rather than a fold into [`Rejected`](Self::Rejected), because the two demand opposite
+    /// handling one line later. `Rejected` means the shaped path carried bytes and we disliked them, so it feeds
+    /// `apply_outcome` and therefore the morph auto-fallback breaker. This means no bytes left the host at all,
+    /// so feeding the breaker would manufacture evidence of censorship out of a placement collision — the
+    /// "alarm that cannot know what normal is" this platform has paid for before. It is also the only refusal
+    /// here that is not about a peer, which is why it is counted at its own station and not with the forgeries.
+    Ourself,
 }
 
 /// Tell every live peer when this node moves, by re-sending its (already updated) `HELLO` on each open connection.

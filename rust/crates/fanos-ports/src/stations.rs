@@ -290,6 +290,26 @@ pub enum Station {
     /// the censor.
     TransportRoundTripLost,
 
+    /// A connection whose peer authenticated with **this node's own certificate** — we reached ourselves (#350).
+    ///
+    /// Not a contrivance and not a test artefact: a self-certifying node's coordinate is `MapToPoint(H(cert))`,
+    /// drawn independently of every other node's, so on a plane of `q² + q + 1` points two nodes share a point
+    /// about once in that many draws. The directory serves the point as one address — the incumbent's — and the
+    /// incumbent addressing the *other* claimant therefore dials itself. Measured on forced collisions before
+    /// this station existed: 20 of 20 frames were delivered to the sender and 0 to the addressee, silently.
+    ///
+    /// **The operator needs this separate from a dial failure**, because the two call for opposite readings: a
+    /// dial failure says the network did not carry the frame, this says the frame was carried perfectly and the
+    /// *addressing* was ambiguous. A rise here is the placement layer failing to converge, not a transport fault.
+    ///
+    /// Keyed by the coordinate that was dialed — which is this node's own — because that is the point whose
+    /// occupancy is contested, and it is what an operator correlates against the reseat that follows.
+    ///
+    /// Counted on the DIAL side only. The accept side sees the same event from the other end and refuses it too,
+    /// but counting both would double every occurrence; the same asymmetry, for the same reason, that already
+    /// keeps `resolve_peer_hello` from feeding the morph breaker.
+    TransportSelfConnection,
+
     /// A peer's HELLO decoded and its coordinate proof did **not** verify against a beacon this node holds
     /// — a forgery or an impostor (#236). Actionable as an attack.
     ///
@@ -948,6 +968,7 @@ impl Station {
         Self::WireUnshaped,
         Self::WireForeignDatagram,
         Self::TransportRoundTripLost,
+        Self::TransportSelfConnection,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::PeerUnjudged,
@@ -1011,6 +1032,7 @@ impl Station {
             Self::WireUnshaped => "wire.unshaped",
             Self::WireForeignDatagram => "wire.foreign_datagram",
             Self::TransportRoundTripLost => "transport.round_trip_lost",
+            Self::TransportSelfConnection => "transport.self_connection",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::PeerUnjudged => "hello.peer_unjudged",
@@ -1139,6 +1161,7 @@ impl Station {
             | Self::WireUnshaped
             | Self::WireForeignDatagram
             | Self::TransportRoundTripLost
+            | Self::TransportSelfConnection
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
             | Self::PeerUnjudged

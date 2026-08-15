@@ -385,3 +385,97 @@ fn entry_fallbacks(node: &NodeHandle) -> u64 {
         .map(|o| o.count)
         .sum()
 }
+
+/// Count of `transport.self_connection` on a node's transport driver.
+fn self_connections(node: &NodeHandle) -> u64 {
+    node.client()
+        .driver_stations()
+        .iter()
+        .filter(|o| o.station.name() == "transport.self_connection")
+        .map(|o| o.count)
+        .sum()
+}
+
+/// **A node addressing its own coordinate reaches itself, and that is refused and counted** (#350).
+///
+/// The production condition is a coordinate collision: `MapToPoint(H(cert))` is drawn independently per
+/// identity, so on `PG(2, q)` two nodes share a point about once in `q² + q + 1` draws — measured on this
+/// tree at 20 collisions in 966 pairs, against a derived 1 in 57. The directory then serves that point as
+/// one address, the incumbent's, so the incumbent addressing the *other* claimant dials itself. Measured
+/// before this refusal existed: **20 of 20** payloads were delivered to the sender and 0 to the addressee,
+/// with no counter anywhere — the symptom reaching a maintainer was an unrelated test hanging 1 run in 9.
+///
+/// Reproduced here **without the lottery**: one node, addressed at its own point, which is the same
+/// condition the collision produces and is reached deterministically. `spawn_distinct` (top of this file)
+/// exists precisely because the collision is real, and its doc has said so all along — "routing between the
+/// colliding pair breaks". It avoids the condition; this asserts what happens when a deployment meets it.
+///
+/// Asserts BOTH halves, because either alone is satisfiable by a broken node: nothing is delivered (the
+/// frame did not loop back into our own engine) AND the refusal is counted (we did not merely fail to dial).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_reaches_itself_refuses_the_connection_and_counts_it() {
+    let dir = Directory::new();
+    let mut node = spawn_self_certifying::<F7>(make_node, dir.clone())
+        .await
+        .expect("spawn");
+
+    // The setup took effect: our own point really does resolve to our own socket, so the send below is a
+    // dial at ourselves and not a dial into the void. Without this the test passes on a node that never
+    // dialled at all, which is the vacuous form of every "nothing arrived" assertion.
+    assert_eq!(
+        dir.resolve(node.address()),
+        Some(node.local_addr()),
+        "our own coordinate must resolve to our own socket, or this test is not exercising a self-dial",
+    );
+    assert_eq!(self_connections(&node), 0, "no self-connection has happened yet");
+
+    node.command(Command::Send {
+        to: node.address(),
+        payload: b"addressed at the point we ourselves hold".to_vec(),
+    });
+
+    // Run until EITHER outcome shows itself, then let the assertions below speak. The loop exits early on
+    // the refusal (the correct world) and early on a delivery (the defect's world), so the full bound is
+    // paid only when neither happens — fast when right, bounded when wrong.
+    //
+    // **The deadline is deliberately NOT an assertion of its own.** It was one, and falsifying this test
+    // caught the mistake: folding "timed out" into a single message made that message lie in the world where
+    // the refusal fires but goes uncounted — it accused the dial path of never reaching the check, which was
+    // false. Each fact now carries its own verdict, so a run that reaches the bound fails at whichever
+    // property is actually unmet.
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(10);
+    let mut delivered_to_self = false;
+    while self_connections(&node) == 0 && !delivered_to_self && tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            n = node.next_notification() => {
+                if matches!(n, Some(Notification::Delivered { .. })) {
+                    delivered_to_self = true;
+                }
+                if n.is_none() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(StdDuration::from_millis(20)) => {}
+        }
+    }
+
+    assert!(
+        !delivered_to_self,
+        "the frame was delivered to the sender: a node completed a mutual-TLS handshake with itself and \
+         handed its own frame to its own engine as though a peer had sent it. This is the defect #350 \
+         measured 20 times out of 20, and the addressee — a different node holding the same point — got \
+         nothing",
+    );
+    assert_eq!(
+        self_connections(&node),
+        1,
+        "the loop-back must be counted exactly once at `transport.self_connection`. Zero here means the \
+         refusal happened silently — folded into an existing verdict, or dropped before the station — which \
+         is the state this whole task started from: an operator reading a dial failure and a self-connection \
+         the same way cannot tell a network fault from a placement collision, and only the second is fixed \
+         by reseating. (A zero can also mean the dial never reached `hello_exchange` within ten seconds; the \
+         delivery assertion above distinguishes them, since the defect's world delivers.)",
+    );
+
+    node.shutdown();
+}
