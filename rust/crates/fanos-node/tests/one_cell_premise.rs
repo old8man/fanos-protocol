@@ -102,7 +102,18 @@ fn a_cross_cell_publisher_may_not_be_wired_while_only_one_cell_can_exist() {
         one_cell_only || !callers.is_empty(),
         "`{CELL_FORMATION_PREMISE}` is gone from node.rs, so cells may now form above q=2 — the premise \
          behind leaving every cross-cell publisher unwired (#167) no longer holds. Wire them, and re-read \
-         `Census`'s single-cell verdict (#280), which refuses a network reading for the same reason."
+         `Census`'s single-cell verdict (#280), which refuses a network reading for the same reason.\n\n\
+         AND READ THIS BEFORE WIRING `publish_health`, because this tripwire watches REACHABILITY and the \
+         other half is EVIDENCE. `publish_checkpoint` carries an `ExecCertificate` and `attest_children` \
+         refuses a child whose certificate fails to verify. `publish_health` carries **one bare byte** \
+         (`alloc_vec(report.block())`) at a `(cell, epoch)` slot, and `resolve_health` parses it with no \
+         signature, no envelope and no publisher binding — while its consumer, `diagnose_children`, runs the \
+         Turyn federated covering and localizes up to three faults to `(child, axis)`. A covering designed \
+         to localize confidently will mislocalize confidently on forged input. The sibling directories \
+         already solved this and said why: `telemetry_dir.rs` — \"the slot key names a coordinate; nothing \
+         used to make that name true\" — and `ingressdir.rs` — \"why this directory needed the envelope and \
+         could not lean on the store\". `crosscell_dir`'s health record got neither, and its slot key is \
+         `(cell, epoch)` rather than a coordinate, so a coordinate-bound ownership rule would not cover it."
     );
     assert!(
         !one_cell_only || callers.is_empty(),
