@@ -295,9 +295,36 @@ pub fn member_partial<F: Field>(
     member_index: usize,
     secret: &HybridKemSecret,
 ) -> Option<Share> {
-    // Slot 0 is always this hop's — every hop shifts the header, so a member never searches for its slot.
-    let (_, sealed) = open_slot0::<F>(onion).ok()?;
-    sealed.member_share(member_index, secret)
+    member_partial_detailed::<F>(onion, member_index, secret).ok()
+}
+
+/// Why a member could not compute its partial. **The two causes are separable by construction, not by
+/// heuristic**, which is what lets the responder's counters mean different things (#354).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PartialFailure {
+    /// The bytes do not describe a sealed layer at all. This is the shape a constant-rate **cover cell**
+    /// has: `ThresholdSealed::from_bytes` reads a member count and a ciphertext length *out of the bytes*,
+    /// and keystream does not describe a slice that exists — measured, 2000 of 2000 cover cells stop here.
+    Malformed,
+    /// A **well-formed** layer whose share slot this member's key cannot open: the AEAD authenticates and
+    /// fails. That is epoch/key skew between line members, and it is the only thing this variant reports.
+    KeyMismatch,
+}
+
+/// [`member_partial`] with the reason. Slot 0 is always this hop's — every hop shifts the header, so a
+/// member never searches for its slot.
+///
+/// # Errors
+/// [`PartialFailure`] — see its variants; the distinction is the diagnosis.
+pub fn member_partial_detailed<F: Field>(
+    onion: &[u8],
+    member_index: usize,
+    secret: &HybridKemSecret,
+) -> Result<Share, PartialFailure> {
+    let (_, sealed) = open_slot0::<F>(onion).map_err(|_| PartialFailure::Malformed)?;
+    sealed
+        .member_share(member_index, secret)
+        .ok_or(PartialFailure::KeyMismatch)
 }
 
 #[cfg(test)]

@@ -794,15 +794,33 @@ impl<F: Field> ThresholdRouter<F> {
             self.stations.record(Station::ShareRequestNotAMember, Some(line));
             return Vec::new();
         };
-        let Some(share) = self
-            .onion
-            .secrets()
-            .find_map(|sk| threshold::member_partial::<F>(onion, i, sk))
-        else {
+        // Try every held epoch key, remembering WHY the last one failed: `Malformed` does not depend on the
+        // key (the bytes are not a sealed layer under any of them), so one look decides it.
+        let mut why = threshold::PartialFailure::Malformed;
+        let attempt = self.onion.secrets().find_map(|sk| {
+            match threshold::member_partial_detailed::<F>(onion, i, sk) {
+                Ok(share) => Some(share),
+                Err(e) => {
+                    why = e;
+                    None
+                }
+            }
+        });
+        let Some(share) = attempt else {
             // A member of the line that cannot compute its own share: the layer was sealed to a key
             // this node no longer holds — **epoch/key skew between members**, otherwise invisible, and
             // exactly the per-line signal an upgrade needs (docs/design-upgrade.md §4).
-            self.stations.record(Station::SharePartialFailed, Some(line));
+            // **Which counter, and the distinction is the whole point.** While both causes shared
+            // `SharePartialFailed`, its baseline was the cover schedule — every cover cell lands here at
+            // every member of the drawn line — so the epoch/key skew its doc promises was visible only as an
+            // excess over a rate nobody had written down.
+            self.stations.record(
+                match why {
+                    threshold::PartialFailure::Malformed => Station::SharePartialMalformed,
+                    threshold::PartialFailure::KeyMismatch => Station::SharePartialFailed,
+                },
+                Some(line),
+            );
             // **Reply anyway, with a decoy — silence here is a traffic channel (#354).** A cover cell is a
             // block of keystream, so `member_share`'s AEAD authentication fails on it and this arm is the
             // one every cover cell takes. Returning nothing therefore made the reply stream a pure function
@@ -1495,11 +1513,20 @@ mod tests {
             },
         );
 
-        // The setup took effect: we are on the line and the PEEL is what failed, not membership.
+        // The setup took effect, and the counter says WHICH failure: keystream is not a sealed layer under
+        // any key, so it stops at parsing. If this ever became `SharePartialFailed` the cover schedule would
+        // be feeding the epoch/key-skew alarm again, which is the defect #354 separated (`ThresholdSealed`
+        // reads its member count and ciphertext length out of the bytes; 2000 of 2000 cover cells are
+        // rejected there).
+        assert_eq!(
+            r.stations().total(Station::SharePartialMalformed),
+            1,
+            "a cover cell must be counted as malformed — it is the cover schedule's own baseline"
+        );
         assert_eq!(
             r.stations().total(Station::SharePartialFailed),
-            1,
-            "the failure arm must be the one taken — otherwise this test pins the wrong path"
+            0,
+            "and must NOT be counted as epoch/key skew, which is the signal that station exists for"
         );
         assert_eq!(
             r.stations().total(Station::ShareRequestNotAMember),

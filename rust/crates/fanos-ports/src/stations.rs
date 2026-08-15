@@ -196,7 +196,28 @@ pub enum Station {
     ShareRequestNotAMember,
     /// This node could not compute its own share for a layer sealed to it — epoch/key skew between
     /// members, which is otherwise silent.
+    ///
+    /// **It counts skew ONLY because the cover cells were split off into
+    /// [`SharePartialMalformed`](Self::SharePartialMalformed) (#354).** A constant-rate cover cell is a block
+    /// of keystream, and every one of them reaches this node as a share request it cannot answer — so while
+    /// both causes shared this counter, its baseline was set by the cover schedule and skew was visible only
+    /// as an excess over a rate nobody had written down. The loudest source of the alarm was ordinary
+    /// operation.
+    ///
+    /// They are separable, and by construction rather than by heuristic: keystream fails at *parsing*
+    /// (`ThresholdSealed::from_bytes` reads a member count and a ciphertext length out of the bytes, and
+    /// random ones do not describe a slice that exists — measured, 2000 of 2000 cover cells rejected there),
+    /// while a genuinely stale key produces a **well-formed** layer whose AEAD then fails. This station is
+    /// now the second case only, which is what its sentence above always claimed.
     SharePartialFailed,
+    /// A share request whose onion **does not parse** — the shape a constant-rate cover cell has, and the
+    /// baseline its schedule sets (#354).
+    ///
+    /// Expected and load-bearing rather than a fault: with cover on, a relay emits one cell per slot whether
+    /// or not it carries cargo, each draws a gather, and every member of the drawn line lands here. So this
+    /// counter tracks the *cover rate*, and a drop in it means the cover schedule stopped — which no other
+    /// observable on this path reports.
+    SharePartialMalformed,
     /// A share arrived for an unknown request: already peeled, foreign, or **past its deadline** — the
     /// last of which says the deadline is too tight rather than the line too slow.
     ShareForUnknownRequest,
@@ -970,6 +991,7 @@ impl Station {
         Self::ReplayDropped,
         Self::ShareRequestNotAMember,
         Self::SharePartialFailed,
+        Self::SharePartialMalformed,
         Self::ShareForUnknownRequest,
         Self::ShareIndexOutOfRange,
         Self::ShareFloodCapped,
@@ -1055,6 +1077,7 @@ impl Station {
             Self::GatherOpenFailed => "gather.open_failed",
             Self::ShareRequestNotAMember => "share.not_a_member",
             Self::SharePartialFailed => "share.partial_failed",
+            Self::SharePartialMalformed => "share.partial_malformed",
             Self::ShareForUnknownRequest => "share.unknown_request",
             Self::ShareIndexOutOfRange => "share.index_out_of_range",
             Self::ShareFloodCapped => "share.flood_capped",
@@ -1195,6 +1218,7 @@ impl Station {
             | Self::GatherOpenFailed
             | Self::ShareRequestNotAMember
             | Self::SharePartialFailed
+            | Self::SharePartialMalformed
             | Self::ShareForUnknownRequest
             | Self::ShareIndexOutOfRange
             | Self::ShareFloodCapped
