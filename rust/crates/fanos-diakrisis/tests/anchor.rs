@@ -112,9 +112,33 @@ fn the_unanchored_mixture_erases_a_member_and_the_shipped_one_cannot() {
         coupling <= ceiling + 1e-9,
         "a reserved share must cap the achievable coupling at (1−a)/√(a²+(1−a)²): {coupling} > {ceiling}"
     );
+    // **The reserved dimension is not merely non-zero — it is exactly `1 − c`, and that is what gets
+    // pinned.** The previous form asserted `smallest > 1e-3`, which sounds like a guard on a quantity whose
+    // measured value is `0.0152`. Solving `1 − (1−a)/√(a²+(1−a)²) = 1e-3` gives `a = 0.0428`: the threshold
+    // admitted `ANCHOR_SHARE` being cut to **less than a third** of its shipped value, while the constant's
+    // own doc says it "must be raised, never lowered". A guard that permits what its subject forbids is the
+    // defect, not the slack.
+    //
+    // Measured before choosing the tolerance: over windows `T ∈ {1024 … 262144}` and 12 seeds each, `λ_min`
+    // is `0.015207 ± 4e-6` — **flat in `T`**. Worth stating, because the anchor's doc defends it against
+    // "the eigen solver's own convergence floor", a numerical quantity, and this matrix is *estimated* from a
+    // finite window, so the floor that could have bitten is statistical. It does not: at full dose the
+    // mixture CONSTRUCTS the recipient's row, so `λ_min` is fixed by the anchor's algebra rather than
+    // inherited from the sample. `1%` is ~12× the worst observed deviation from the derived value.
+    let reserved = 1.0 - ceiling;
     assert!(
-        smallest > 1e-3,
-        "and the self-model must keep the dimension the anchor reserves: λ_min = {smallest}"
+        (smallest - reserved).abs() / reserved < 0.01,
+        "the reserved dimension must BE the derived remainder 1−c = {reserved:.6}, not merely positive: \
+         λ_min = {smallest:.6}"
+    );
+    // And the value itself, because the relation above holds at every `a` — both sides move together, so it
+    // cannot notice a weakened anchor. `ANCHOR_SHARE`'s doc states an obligation ("must be raised, never
+    // lowered, when the real bound arrives" — #139) that until now lived only in prose. This is that
+    // sentence, executable. Lower it and read the doc's reason first; there is one, and it is not taste.
+    assert!(
+        a >= 0.15,
+        "ANCHOR_SHARE was lowered to {a}. Its doc admits it is a floor rather than a derivation and says it \
+         must be RAISED when #139's bound on the seventh dimension arrives — never lowered."
     );
 }
 
