@@ -1399,6 +1399,18 @@ pub struct NodeConfig {
     /// cover. Inert on a non-relay. Default [`DEFAULT_COVER_INTERVAL`].
     pub cover_interval: Duration,
     /// Whether to begin liveness heartbeats on start.
+    ///
+    /// **It also arms the relay's cover schedule, and that coupling lives nowhere else.**
+    /// `Command::StartHeartbeat` is one of exactly two callers of `ThresholdRouter::start_cover`; the other
+    /// is the router's first `forward_send`. So on a relay with this off, cover does not run until the node
+    /// carries its first cell — and a router that has never forwarded emits **nothing at all**, while the
+    /// moment its cover begins is itself the signal that it just carried one. An operator turning heartbeats
+    /// off to reduce chatter would be turning off a traffic-analysis defence for exactly the period in which
+    /// the node is most identifiable: before it has any traffic to hide behind.
+    ///
+    /// Default `true`, so a deployment gets cover from boot. Written here because this key's name says
+    /// "liveness" and its second effect is anonymity — the reader who needs the warning is looking at this
+    /// line, not at `start_cover`.
     pub start_heartbeat: bool,
     /// The overlay settings a deployment may express (#352).
     ///
@@ -1815,6 +1827,24 @@ mod tests {
     /// setting reports itself accepted and does nothing, which is a worse state than having no key at all.
     /// The second half is a source check because the wiring lives in `Node::start`'s construction, which no
     /// unit test can reach: it asserts each field is READ where the `OverlayConfig` is built.
+    /// **`start_heartbeat` defaults ON because it arms the cover schedule, not because of liveness.**
+    ///
+    /// The key's name says liveness and its second effect is anonymity: `Command::StartHeartbeat` is one of
+    /// exactly two callers of `ThresholdRouter::start_cover`, the other being the first `forward_send`. Flip
+    /// this default and a relay runs with no cover until it carries its first cell — emitting nothing at all
+    /// until then, and announcing that first cell by the moment its cover begins.
+    ///
+    /// Asserted rather than left to the doc, because a default that quietly protects a *different*
+    /// subsystem is exactly the kind that gets flipped for the reason its own name suggests.
+    #[test]
+    fn the_heartbeat_default_stays_on_because_it_arms_the_cover_schedule() {
+        assert!(
+            NodeConfig::default().start_heartbeat,
+            "turning this off delays a relay's cover schedule to its first forward — see the key's doc, and \
+             `ThresholdRouter::start_cover`, before changing it for liveness reasons"
+        );
+    }
+
     #[test]
     fn each_exposed_overlay_choice_parses_and_reaches_the_overlay() {
         for (key, field) in [

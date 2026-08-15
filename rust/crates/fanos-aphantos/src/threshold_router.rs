@@ -478,6 +478,15 @@ impl<F: Field> ThresholdRouter<F> {
     }
 
     /// Begin the cover schedule (arm the first tick) if cover is enabled and not already running.
+    ///
+    /// **Two callers, and the other one is a liveness command.** `Command::StartHeartbeat` arms this, and so
+    /// does the first `forward_send`. A deployment that turns heartbeats off therefore has no cover until its
+    /// relay carries its first cell: the router emits nothing at all until then, and the moment cover starts
+    /// announces that it just carried one. `NodeConfig::start_heartbeat` defaults to `true` and now says so
+    /// at the key, which is where an operator reads.
+    ///
+    /// `covering` is never cleared once set — deliberately, since a schedule that stopped when the queue
+    /// drained would make idleness visible, which is the whole thing cover exists to prevent.
     fn start_cover(&mut self) -> Vec<Effect> {
         if self.cover_interval.as_nanos() == 0 || self.covering {
             return Vec::new();
