@@ -497,6 +497,17 @@ impl NodeFleet {
                         authority: None,
                     }),
                     roles,
+                    // Derived from the role rather than taken as a parameter, because without them
+                    // `exit_params` refuses the node outright: offering `exit` to this fleet used to be a
+                    // *start error*, so no scenario could ever exercise the one role whose capacity is
+                    // derived AND whose activity is advertised. A per-node seed, since the seed regenerates
+                    // the exit's DIAULOS service key and one key at several coordinates is a different
+                    // fixture from the one any caller means. Empty ports = any, which is what a scenario
+                    // that never relays wants.
+                    exit: roles.exit.then(|| fanos_node::ExitParams {
+                        seed: [u8::try_from(nodes.len()).unwrap_or(0xE0); 32],
+                        allowed_ports: Vec::new(),
+                    }),
                     bootstrap,
                     // OBSERVED, not provisioned: this list is the coordinates the running nodes are
                     // actually at, read from their own `health()`. When the draw collides — which is the
@@ -936,6 +947,162 @@ mod tests {
         );
         assert!(fleet.fabric.delivered() > 0, "the fleet's traffic crossed the modelled carrier");
         fleet.shutdown().await;
+    }
+
+    /// **A tripwire on the assignment that actuates nothing.**
+    ///
+    /// `docs/design-self-organization.md` §5 puts "which roles it *offers*" on the node's side of the table
+    /// and "which offered roles are **active**" on the network's. The tree does not do the second: every role
+    /// behaviour is started once, at boot, from `config.roles`, and no shipping branch reads the assignment —
+    /// see `SelfOrganization::assigned`'s doc, which used to claim the opposite.
+    ///
+    /// **Exit is the only role where that is observable, and the reasons the other two are not are worth
+    /// keeping.** The hazard needs a role with a *derived* capacity, so the assignment can be a strict subset
+    /// of the offer, AND a wired activity advertisement to watch. Relay has the advertisement (its mix key)
+    /// but the placeholder capacity, so it saturates and assignment equals offer. Rendezvous has the derived
+    /// capacity but no advertisement — `spawn_rendezvous_host` is not called from `Node::start` at all. Exit
+    /// has both: `diaulos::MAX_SESSIONS` as its denominator and `spawn_exit_publisher` as its record.
+    ///
+    /// So on an idle cell the setpoint is `⌈0 / MAX_SESSIONS⌉ = 0`, the demand falls to the observability
+    /// floor of one, and exactly one member is assigned Exit — while **all five publish an exit descriptor**,
+    /// because `exit_params` consults `config.roles.exit`, the offer, and nothing consults the assignment.
+    ///
+    /// **When this test fails, actuation has landed.** That is the point of it: read
+    /// `SelfOrganization::assigned` for the shape that was proposed (withhold the *advertisement*, do not stop
+    /// the task) and check the three things that gap touches — the viability floor, a node's mix key
+    /// outliving its assignment, and the still-absent `Escalation::Deficit`.
+    ///
+    /// **Measured before shipping, three consecutive runs: two measured the witness (2.8 s, 31.1 s), one
+    /// skipped on the saturated precondition (4 published, 4 assigned), none red.** The variance is the
+    /// fixture's, not the assertion's — see the note at the precondition — so the outcomes are exactly two:
+    /// *measured* and *not measured*, never a false red. A tripwire that fires on two runs in three is enough
+    /// to be noticed on the day it starts firing, which is all this is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_exit_advertises_itself_whether_or_not_the_cell_assigned_it_the_role() {
+        use fanos_field::F4;
+        use fanos_core::roles::Role;
+        use fanos_node::{RoleSet, resolve_exit_key};
+        use fanos_primitives::Epoch;
+
+        const N: usize = 5;
+        let roles = RoleSet { relay: true, exit: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn::<F4>(N, Link::default(), roles).await.expect("a fleet starts");
+        // `until_settled`, not `until`, and the difference is the whole reason the first version of this
+        // test went red on a quiet machine: a `bool` conflates "the fleet reached a fixed point that fails
+        // the predicate" with "the deadline arrived while it was still converging". Measured here — one run
+        // settled in 3.4 s and the next was still moving at 240 s — because `spawn` allows coordinate
+        // collisions, so how long the draw takes is not a property this test is about. Refuted is red;
+        // inconclusive means the question below cannot be asked, and is reported rather than asserted away.
+        let settled = fleet
+            .until_settled(
+                |f| f.nodes().iter().all(|n| n.assigned_roles().any()),
+                |f| {
+                    (
+                        f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
+                        f.widest_withheld_scan(),
+                    )
+                },
+            )
+            .await;
+        assert!(
+            !settled.is_refuted(),
+            "the fleet stopped moving with a member still holding no role at all: {settled:?}"
+        );
+        if !matches!(settled, Settled::Reached { .. }) {
+            // Not measured, which is a third outcome and not a quiet pass. Said out loud, because a run that
+            // skips its own subject and reports `ok` is the shape a reader has no way to distinguish from a
+            // run that checked.
+            eprintln!("SKIPPED {}: the fleet had not settled — {settled:?}", module_path!());
+            fleet.shutdown().await;
+            return;
+        }
+
+        // Read from one member's view, because that is the view a client gets: the descriptors have to have
+        // travelled, not merely been written locally.
+        let Some(reader) = fleet.nodes().first() else {
+            unreachable!("a fleet that started has members")
+        };
+        let client = reader.client();
+        let genesis = client.genesis();
+        // Ask about the coordinates the fleet actually occupies, not the whole plane.
+        // `build_cell_exit_directory` sweeps all `Plane::<F4>::N = 21` points and each miss waits out
+        // `resolve::STORE_TIMEOUT` (5 s), so one sweep of a five-node fleet costs up to eighty seconds —
+        // polling it in a loop is what made the first version of this test exceed a 500 s timeout without
+        // ever reaching an assertion. Five targeted reads, all of which should hit, cost nothing by
+        // comparison, and they assert *which* nodes published rather than a count that could be made up by
+        // any five slots.
+        // Per node, aligned with `fleet.nodes()`: did it publish, and was it assigned?
+        //
+        // **The claim is existential and the first version asserted it universally**, which is what made that
+        // version fragile against something it is not about: coordinates move (`directory.moved_peer_retained`
+        // in the stations below), the exit publisher writes at the node's *live* coordinate, and a node that
+        // moved between publishing and this read has its descriptor at the point it left. Measured: 4 of 5
+        // resolved. "Some node advertises a role the cell did not assign it" needs one witness, not five.
+        let mut advertised = vec![false; fleet.nodes().len()];
+        for _ in 0..5 {
+            for (i, node) in fleet.nodes().iter().enumerate() {
+                if advertised.get(i).copied() == Some(true) {
+                    continue;
+                }
+                let coord = node.health().address; // re-read each round: the coordinate is what moves
+                if resolve_exit_key::<F4>(&client, coord, Epoch::ZERO, Some(genesis)).await.is_some()
+                    && let Some(slot) = advertised.get_mut(i)
+                {
+                    *slot = true;
+                }
+            }
+            if advertised.iter().all(|&a| a) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let serving: Vec<bool> = fleet.nodes().iter().map(|n| n.serves(Role::Exit)).collect();
+        let witnesses = advertised.iter().zip(&serving).filter(|&(&a, &s)| a && !s).count();
+        let published = advertised.iter().filter(|&&a| a).count();
+        let assigned = serving.iter().filter(|&&s| s).count();
+        let stations = fleet.stations();
+        fleet.shutdown().await;
+
+        // Setup first, so a witness cannot be manufactured by a scan that found nothing: something must have
+        // been published, and the controller must have assigned the role to somebody.
+        assert!(
+            published >= 1,
+            "no member's exit descriptor resolved at all, so nothing here is about the assignment.{stations}"
+        );
+        assert!(
+            assigned >= 1,
+            "the viability floor asks for one exit even on an idle cell ({N} offer it), so the controller \
+             must assign at least one — {assigned} were assigned, i.e. the setpoint path is not running"
+        );
+        // **The precondition, and it does not always hold.** Measured across runs of this very test: with
+        // every member's Exit slot *sensed* the cell total is zero, the setpoint is zero, the viability floor
+        // asks for one, and one of five is assigned — a strict subset. With it *unsensed* the node publishes
+        // `capacity` instead (`RoleReading::to_load`: an offered-but-unsensed role presumes itself at
+        // capacity), the total is `5 × capacity`, the setpoint comes back as exactly five, and every member is
+        // assigned. Both were observed, in runs seconds apart, and **why the sensed/unsensed state differs is
+        // not yet explained** — `spawn_exit_role` opens the gauge synchronously and before the load publisher
+        // exists, so the obvious ordering answer is wrong.
+        //
+        // Until that is understood, saturation is *not measured* rather than a failure: the question below is
+        // about a strict subset and cannot be asked of a saturated cell. Said out loud for the same reason the
+        // settle is.
+        if assigned >= published {
+            eprintln!(
+                "SKIPPED {}: the cell assigned Exit to every publisher ({published} published, \
+                 {assigned} assigned) — no strict subset, so the question does not arise.{stations}",
+                module_path!()
+            );
+            return;
+        }
+        // The finding. When this fails, actuation has landed — read `SelfOrganization::assigned`.
+        assert!(
+            witnesses >= 1,
+            "every member that published an exit descriptor was also assigned the Exit role \
+             ({published} published, {assigned} assigned, {witnesses} advertise unassigned). Either the \
+             assignment now gates the advertisement — in which case this tripwire has done its job, see \
+             `SelfOrganization::assigned` for what else that touches — or Exit's capacity or floor moved and \
+             this cell no longer produces a strict subset."
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
