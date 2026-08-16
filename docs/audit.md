@@ -1241,6 +1241,18 @@ reconciliation tail (E→L / L→O / Ω2 / Ω9), which is design work rather tha
 
 **Headline:** the anonymous `.fanos` datapath is now genuinely live over real QUIC (`fanos-node/tests/anonymous_quic.rs:101,232` — forward + full request/response), a real advance over the prior audit's "sim-only (A5/#54)". The threshold-onion crypto is genuine (KEM-sealed Shamir shares, below-`t` zero-knowledge, forged/out-of-range shares neither block nor kill an honest peel). **But the anonymity *properties* the spec sells on top of that datapath are largely inert in the shipping node.** The meta-pattern again.
 
+> **RE-VERIFIED 2026-08-16, and it now reduces cleanly to R-C2.** The mechanism is unchanged and is not a
+> code defect: `max_reroute_depth(phi)` is `⌊log₉ Φ⌋` by construction, so a healthy cell at `Φ ∈ (1, 2]` can
+> afford zero coarse hops. That is arithmetic, not an oversight.
+>
+> **The secondary fix this finding asks for is done.** `HealingPlan` carries `budget_hops` and answers
+> `escalates()` — "whether the plan hands any residue to the parent cell" — so the depth-0 condition is an
+> explicit, readable property of the plan rather than an inference a caller has to make.
+>
+> **What is left is exactly the primary fix, which is R-C2**, and R-C2 is open: the detector is wired, and
+> what a confirmed stall reaches is a `tracing::warn!` with no notification and no station. So the handoff
+> this finding depends on exists as a *decision* and not as an *action*.
+
 ### [CRITICAL] S1-C1 — `--profile anonymous` does NOT anonymize clearnet/exit traffic
 *Anchors:* `fanos-node/src/diaulos.rs:414-433` (`FanosDialer::dial` handles a non-`.fanos` target in an early branch → `exit::dial_exit` → `dial_service`, the **Direct** by-coordinate transport `:104-112,424`, **never consulting `self.profile`**); `exit.rs:97-108` (exit demuxes clients by `Notification::Delivered{from}` = the client's real overlay coordinate); banner at `bin/fanos.rs:248-262`.
 
