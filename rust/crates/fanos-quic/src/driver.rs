@@ -3897,6 +3897,31 @@ async fn deliver_relayed(t: &Transport, body: &[u8], frame: &[u8]) -> bool {
 /// between the two predicates is the audience, not the principle: that one guards a connection whose peer
 /// could not be judged, this one guards a frame whose sender is asserted by a third party.
 ///
+/// # The audit, and why it does not end in an allow list
+///
+/// Every engine that receives `Input::Message` was read for what it does with `from`:
+///
+/// | engine | uses `from` for | verdict |
+/// |---|---|---|
+/// | `fanos_keygen::DkgNode` | **authorization** — `dealer_of(from) == Some(d)`, "a complaint only direct from its complainer" | refused |
+/// | `fanos_node::poros` | **authorization** — `from != req.requester` is audit §5.C's identity binding, and `line.contains(&from)` gates threshold shares | refused |
+/// | `fanos_keygen::BeaconNode` | cryptography — a partial's DLEQ and a round's proof verify against the group commitment; `from` is only a reply target | admitted |
+/// | `fanos_runtime::overlay` | **liveness and load attribution** — `peer.last_seen = now`, `healer.record_relay(from)` | admitted, see below |
+/// | `threshold_router`, `rendezvous_relay` | classification (`from == ANONYMOUS`), not authorization | admitted |
+///
+/// POROS is the sharper of the two refusals: its own gate says *"without this an attacker could relay or
+/// replay another identity's request/proof under its own transport"*, and a forged origin also lets a
+/// non-member inject a share into a threshold reconstruction.
+///
+/// **The overlay row is why this cannot be an allow list yet, and it is an honest residual rather than an
+/// oversight.** `Route` and `App` attribute *liveness* and *behavioural load* to `from` — a forged origin can
+/// keep a dead peer looking alive and can inflate another node's load in the healer's coherence model. Those
+/// are exactly the frames the symmetric-NAT fallback exists to carry, so refusing them would replace a
+/// forgery with an outage. Nothing short of authenticating the origin **end to end** fixes that row: the
+/// wrapper would carry the origin's coordinate proof and a signature over the inner bytes, which the
+/// self-certifying HELLO machinery already computes and which this path — the slow path by construction —
+/// can afford. That is the complete repair; this predicate is the part of it that costs nothing.
+///
 /// **It is a refusal list rather than an allow list, and that is stated because it is the weaker shape.** An
 /// allow list would need every engine's handler audited for its use of `from`, and the relay exists so peers
 /// behind symmetric NATs can exchange ordinary traffic at all (#119) — denying that by default would trade a
@@ -3912,6 +3937,11 @@ fn relayable(inner: &[u8]) -> bool {
                 | FrameType::DkgJustify
                 | FrameType::DkgDeal
                 | FrameType::DkgCommitReq
+                | FrameType::PorosRequest
+                | FrameType::PorosShareReq
+                | FrameType::PorosShare
+                | FrameType::PorosResponse
+                | FrameType::PorosReshare
         )
     )
 }
@@ -4926,6 +4956,11 @@ mod tests {
             FrameType::DkgJustify,
             FrameType::DkgDeal,
             FrameType::DkgCommitReq,
+            FrameType::PorosRequest,
+            FrameType::PorosShareReq,
+            FrameType::PorosShare,
+            FrameType::PorosResponse,
+            FrameType::PorosReshare,
         ] {
             assert!(
                 !relayable(&framed(forgeable, b"x")),
