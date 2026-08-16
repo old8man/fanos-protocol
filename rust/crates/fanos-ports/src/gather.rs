@@ -193,6 +193,41 @@ mod tests {
     /// cannot move, because the slow gathers produce no samples. `observe_late` is the missing evidence, and
     /// it is a real measurement rather than a fabricated one — the share carries its own `req_id`, so there
     /// is no ambiguity for Karn's rule to protect against.
+    /// **The smoothing law itself, because every other test here would accept a different one.**
+    ///
+    /// This clock's doc cites RFC 6298 §2.3 — `srtt ← ⅞·srtt + ⅛·sample`, `var ← ¾·var + ¼·|srtt − sample|`
+    /// — and a citation to a specification is a claim about the code. Measured what the suite depends on:
+    /// with the gain changed from `⅞/⅛` to `½/½`, **all eleven tests in this crate still pass**. They assert
+    /// where the estimate goes and how it behaves at the edges; none asserts how fast, and an EWMA converges
+    /// to the same mean at any gain. A convergence test cannot see a change that preserves the limit.
+    ///
+    /// So this one is arithmetic on one step, which is the only thing that separates two laws with the same
+    /// fixed point. First sample seeds `srtt = sample`, `var = sample/2`; the second then gives
+    /// `srtt = ⅞·800 + ⅛·80 = 710` and `var = ¾·400 + ¼·720 = 480`. At `½/½` the first would read `440`.
+    #[test]
+    fn the_smoothing_is_rfc6298s_gain_and_not_merely_something_convergent() {
+        let mut clock = GatherClock::new();
+        clock.observe(Duration::from_millis(800));
+        assert_eq!(
+            clock.srtt(),
+            Some(Duration::from_millis(800)),
+            "the first sample seeds the estimate outright — the control the step below is measured against"
+        );
+        assert_eq!(clock.var(), Duration::from_millis(400), "and seeds the variation at half the sample");
+
+        clock.observe(Duration::from_millis(80));
+        assert_eq!(
+            clock.srtt(),
+            Some(Duration::from_millis(710)),
+            "⅞·800 + ⅛·80 = 710; 440 means the gain became ½/½, which every other test in this crate accepts"
+        );
+        assert_eq!(
+            clock.var(),
+            Duration::from_millis(480),
+            "¾·400 + ¼·|800−80| = 480 — the variation half of the same law, and the term the deadline adds"
+        );
+    }
+
     #[test]
     fn a_deadline_trained_only_on_what_beat_it_never_widens() {
         let fast = Duration(1_000_000); // 1 ms
