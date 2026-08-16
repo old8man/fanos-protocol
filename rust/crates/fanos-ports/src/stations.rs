@@ -443,6 +443,21 @@ pub enum Station {
     /// had more than one connection: a miss on a coordinate that never appears there is a peer this node
     /// never filed, while a miss on one that does is a peer whose connections have all closed.
     ConnCacheMiss,
+    /// A relayed frame was refused because its inner type authenticates by `from`, and a `Relay` body's
+    /// `origin` is a **claim** rather than a proof (#119, DKG audit B1).
+    ///
+    /// **What a nonzero count means, and it is not "a peer behind a NAT".** The symmetric-NAT fallback wraps
+    /// an ordinary frame so a pair that cannot dial each other still communicates, and the target delivers
+    /// the inner frame attributed to the `origin` written in the wrapper. For every frame whose handler uses
+    /// `from` only to *route a reply*, that is harmless. For one whose handler uses it to decide
+    /// **authorization** it is an impersonation primitive: any authenticated cell member could speak as any
+    /// coordinate to anyone it can reach. So a nonzero count is either a genuine NAT'd participant trying to
+    /// run a key ceremony through a hub — which cannot be made safe this way and needs a direct path — or
+    /// someone attempting exactly the forgery the DKG's own audit rates CRITICAL.
+    ///
+    /// [`Observation::line`] carries the **claimed** origin, which is the useful field: it is what the
+    /// sender wanted this node to believe, not who sent it.
+    RelayOriginRefused,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1072,6 +1087,7 @@ impl Station {
         Self::RestrictedRoundServed,
         Self::RestrictedPullAsked,
         Self::ConnCacheMiss,
+        Self::RelayOriginRefused,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1142,6 +1158,7 @@ impl Station {
             Self::RestrictedRoundServed => "hello.restricted_round_served",
             Self::RestrictedPullAsked => "hello.restricted_pull_asked",
             Self::ConnCacheMiss => "conns.cache_miss",
+            Self::RelayOriginRefused => "transport.relay_origin_refused",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1284,6 +1301,7 @@ impl Station {
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed
             | Self::ConnCacheMiss
+            | Self::RelayOriginRefused
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

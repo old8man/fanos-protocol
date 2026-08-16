@@ -3849,6 +3849,73 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
     }
 }
 
+/// Whether a frame may be delivered **attributed to a `Relay` body's `origin`**, which is a claim rather than
+/// a proof.
+///
+/// Deliver or forward a `Relay` frame (#119). Returns `false` only when the engine actor has stopped.
+///
+/// If we are the target, the inner frame goes to the engine attributed to its **origin** rather than to the
+/// hop it arrived from, so a request's reply routes back the same way — and [`relayable`] decides whether
+/// that attribution is admissible at all. Otherwise we are the hub and pass the whole wrapper on, if we hold
+/// a live connection to the target: the inner is a plain overlay frame the target's engine validates, so a
+/// hub only ever reaches its own peers.
+async fn deliver_relayed(t: &Transport, body: &[u8], frame: &[u8]) -> bool {
+    let Some((target, origin, inner)) = decode_relay(body) else {
+        return true;
+    };
+    if target != t.me {
+        if let Some(hub_conn) = cached(t, target) {
+            send_uni(&hub_conn, &t.shaper, t.joining(&hub_conn), frame).await;
+        }
+        return true;
+    }
+    if !relayable(inner) {
+        // `origin` is a CLAIM, not a proof — see [`relayable`].
+        t.record_station(Station::RelayOriginRefused, Some(origin), None);
+        return true;
+    }
+    // The inner is a plain (unshaped) overlay frame — it rode inside the shaped `Relay` wrapper, so hand it
+    // to the engine as-is.
+    t.input_tx.send(Input::Message { from: origin, frame: inner.to_vec() }).await.is_ok()
+}
+
+/// **`origin` is a claim, and this is the one place the transport forgot it.** Everywhere else a coordinate
+/// is either proven (the HELLO's self-certifying proof) or explicitly untrusted (`PeerIdentity::Unjudged`,
+/// which files nothing and admits only self-proving frames). A `Relay` body's `origin` is written by whoever
+/// built the wrapper, so delivering the inner frame under it hands any authenticated cell member the ability
+/// to speak as **any** coordinate to anyone it can reach — transitive trust the rest of this file is careful
+/// never to grant.
+///
+/// The consequence is not hypothetical. `fanos_keygen` authenticates its whole broadcast class by `from`:
+/// `on_commit` refuses unless `dealer_of(from) == Some(d)`, and `on_complaint` is accepted "only direct from
+/// its complainer `c`" — *"without this, a Byzantine node forges `DkgComplaint{complainer = d, dealer = d}`
+/// against any honest dealer, which `d` cannot answer, so `d` is dropped from `QUAL` at finalize, evicting
+/// every honest dealer (audit B1, CRITICAL)"*. That is exactly what this path restored.
+///
+/// **The rule is read off the consumer, exactly as [`admitted_unjudged`] reads it** — a frame whose handler
+/// uses `from` to decide *authorization* cannot be admitted under a coordinate nobody proved. The difference
+/// between the two predicates is the audience, not the principle: that one guards a connection whose peer
+/// could not be judged, this one guards a frame whose sender is asserted by a third party.
+///
+/// **It is a refusal list rather than an allow list, and that is stated because it is the weaker shape.** An
+/// allow list would need every engine's handler audited for its use of `from`, and the relay exists so peers
+/// behind symmetric NATs can exchange ordinary traffic at all (#119) — denying that by default would trade a
+/// forgery for an outage. What is refused here is the class whose forgery the DKG audit rates CRITICAL and
+/// whose handlers do nothing but check `from`. Widening this to an allow list is the correct end state and
+/// wants the audit that goes with it.
+fn relayable(inner: &[u8]) -> bool {
+    !matches!(
+        decode_frame(inner).ok().and_then(|(f, _)| f.frame_type()),
+        Some(
+            FrameType::DkgCommit
+                | FrameType::DkgComplaint
+                | FrameType::DkgJustify
+                | FrameType::DkgDeal
+                | FrameType::DkgCommitReq
+        )
+    )
+}
+
 /// Whether a frame may cross from a peer whose coordinate is **unproven** (#235).
 ///
 /// **The rule is read off the consumer, not chosen:** a frame whose handler uses `from` cannot be admitted
@@ -4248,21 +4315,8 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                 // target if we hold a live connection to it (our own peer, reachable in reverse). The inner
                 // is a plain overlay frame the target's engine validates, so a hub only reaches its peers.
                 Some(FrameType::Relay) => {
-                    if let Some((target, origin, inner)) = decode_relay(decoded.body) {
-                        if target == t.me {
-                            // The inner is a plain (unshaped) overlay frame — it rode inside the shaped
-                            // Relay wrapper, so hand it to the engine as-is, attributed to its origin.
-                            if t.input_tx
-                                .send(Input::Message { from: origin, frame: inner.to_vec() })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        } else if let Some(hub_conn) = cached(&t, target) {
-                            // We are the hub: pass the whole Relay on to the target (re-shaped for that hop).
-                            send_uni(&hub_conn, &t.shaper, t.joining(&hub_conn), &frame).await;
-                        }
+                    if !deliver_relayed(&t, decoded.body, &frame).await {
+                        break; // engine actor gone
                     }
                     continue;
                 }
@@ -4848,6 +4902,47 @@ mod tests {
 
     /// **The restricted set admits exactly the frames whose handler ignores `from`** (#235).
     ///
+    /// A `Relay` body's `origin` is a **claim**, so a frame delivered under it must be one whose handler does
+    /// not use `from` to decide authorization.
+    ///
+    /// Both directions, because a predicate asserted only where it refuses is satisfied by one that refuses
+    /// everything — and that would take the symmetric-NAT fallback (#119) out with it, trading a forgery for
+    /// an outage. The ordinary traffic the relay exists for must still pass.
+    ///
+    /// The DKG class is the one refused: every frame in it is authenticated by `from` alone (`on_commit`
+    /// refuses unless `dealer_of(from) == Some(d)`; a complaint is accepted "only direct from its
+    /// complainer"), and the audit rates forging a complaint CRITICAL — a forged
+    /// `DkgComplaint{complainer = d, dealer = d}` cannot be answered by `d` and evicts it from `QUAL`.
+    #[test]
+    fn a_relayed_frame_may_not_carry_a_type_that_authenticates_by_its_sender() {
+        let framed = |ty: FrameType, body: &[u8]| {
+            let mut out = Vec::new();
+            encode_frame(ty.code(), body, &mut out);
+            out
+        };
+        for forgeable in [
+            FrameType::DkgCommit,
+            FrameType::DkgComplaint,
+            FrameType::DkgJustify,
+            FrameType::DkgDeal,
+            FrameType::DkgCommitReq,
+        ] {
+            assert!(
+                !relayable(&framed(forgeable, b"x")),
+                "{forgeable:?} is authenticated by `from` alone, so a claimed origin must not carry it"
+            );
+        }
+        for ordinary in [FrameType::Hello, FrameType::Ping, FrameType::Beacon, FrameType::ObservedAddr] {
+            assert!(
+                relayable(&framed(ordinary, b"x")),
+                "{ordinary:?} must still cross a relay — refusing everything would replace a forgery with an \
+                 outage for every pair behind a symmetric NAT"
+            );
+        }
+        assert!(relayable(b"not-a-frame"), "an undecodable inner frame is refused downstream, not here");
+    }
+
+
     /// Stated as the rule rather than as a list, because the list is a consequence: an unjudged peer's
     /// coordinate is a claim, so any handler that *uses* `from` would be acting on a stranger's choice.
     /// `Beacon` → `on_round(f.body)` does not read it; `BeaconReq` → `on_beacon_req(from)` uses it as the
