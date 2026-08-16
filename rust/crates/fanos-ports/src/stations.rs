@@ -482,8 +482,12 @@ pub enum Station {
     /// never reached the peer" and "it reached the peer and the claim still did not help" were the same
     /// silence, which is the fork any repair here has to be judged on.
     ///
-    /// [`Observation::tag`] carries the outcome: `0` the peer answered and proved a coordinate, `1`
-    /// unreachable, `2` the address answered as *this node* (a stale binding pointing at ourselves).
+    /// [`Observation::tag`] carries the outcome: `0` the peer answered and proved the coordinate dialled,
+    /// `1` the address is dead, `2` it answered as *this node* (a stale binding pointing at ourselves), and
+    /// `3` **the peer answered and proved a different coordinate** — which for an arbitration dial is the
+    /// success case, since it means the contest is over and the other party has walked on. Three and one
+    /// were the same value until `Dialed::Moved` was split out, and the first reading of this station said
+    /// `unreachable` for a dial that had in fact reached its peer.
     /// [`Observation::line`] is the contested point the arbitration was about.
     ArbitrationDial,
     /// How many members this node's view held **at the end of an epoch**, recorded once per boundary.

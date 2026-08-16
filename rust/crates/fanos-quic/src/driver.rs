@@ -2954,6 +2954,7 @@ async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendR
                         Dialed::Peer(_) => 0,
                         Dialed::Unreachable => 1,
                         Dialed::Ourself => 2,
+                        Dialed::Moved => 3,
                     };
                     dialing.record_station(Station::ArbitrationDial, Some(to), Some(outcome));
                 });
@@ -3023,6 +3024,11 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
         // first and deleted: at one dial per `DIAL_TIMEOUT` for as long as traffic flows it is a retry
         // timer wearing a derivation's clothes, and it re-creates a smaller copy of the amplification this
         // change exists to remove.
+        // **`Ourself` and `Moved` both yield `None` and are deliberately not merged.** They are refusals for
+        // opposite reasons — one says the entry points at us, the other says the entry was just corrected —
+        // and folding them would silently absorb the next variant too, which is the mistake `#260` records
+        // one match below. The lint asks for the merge; the comment is why it is refused.
+        #[allow(clippy::match_same_arms, reason = "opposite reasons, and a wildcard here absorbs the next variant")]
         let direct = match t.directory.resolve(to) {
             Some(addr) if dead_addr != Some(addr) => match get_or_connect(&t, to, addr).await {
                 Dialed::Peer(conn) => Some(conn),
@@ -3030,6 +3036,11 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
                     dead_addr = Some(addr);
                     None
                 }
+                // **Not struck out, and for the opposite reason to `Ourself`.** The address is live and has
+                // just corrected our directory to where the peer really is, so the entry this dial used is
+                // already gone; striking the *address* would refuse the peer at its new coordinate, which is
+                // the one place it can now be reached. The next frame re-resolves and finds the correction.
+                Dialed::Moved => None,
                 // **Deliberately not struck out** — see [`Dialed::Ourself`]. The address answers; it is the
                 // directory ENTRY that is stale, and nothing in this refusal can correct it, so the next
                 // frame must be free to re-consult the directory. Striking it here would turn one transient
@@ -3313,6 +3324,19 @@ enum Dialed {
     /// Nothing usable answered here — an impostor, an epoch we cannot judge, a dead socket. Worth not
     /// retrying while the mapping stands, which is what [`dial_and_send`] does with it.
     Unreachable,
+    /// **A peer answered and proved a DIFFERENT coordinate.** The address is live, the handshake completed,
+    /// this node's HELLO reached it and its claim reached this node's book — the directory has been
+    /// corrected and the connection filed under where the peer really is. The *caller's* frame is not
+    /// delivered, because the coordinate it named is not there, which is why this used to be folded into
+    /// [`Unreachable`](Self::Unreachable).
+    ///
+    /// **Splitting it out is what made the arbitration dial legible.** That dial spends the one address the
+    /// arbitration holds and asks nothing of the coordinate, so "the peer answered from somewhere else" is
+    /// its *success* case — the contest is over and the other party has walked on — while `Unreachable`
+    /// means the address itself is dead. Reported as one outcome, an instrument could not tell a repair
+    /// working from a repair doing nothing, and the first reading of `directory.arbitration_dial` said
+    /// exactly `unreachable` for a dial that had in fact reached its peer.
+    Moved,
     /// **We** answered: the coordinate we dialed resolves to this node's own endpoint (#350).
     Ourself,
 }
@@ -3509,7 +3533,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
                     // dialed in *from*, and here we dialed out to a listen address the directory named. The
                     // binding worth recording was `actual → addr`, and the write above already made it.
                     tracing::debug!(?to, ?actual, filed, "dialed coordinate has moved; directory corrected");
-                    return Dialed::Unreachable;
+                    return Dialed::Moved;
                 }
                 // **We could not judge it, so we keep the connection and fail only the send** (#235). This
                 // dial was to `to`, and nothing here proved the peer is `to` — so no directory write, no
