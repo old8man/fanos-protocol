@@ -1511,6 +1511,84 @@ fn every_section_numbering_pass_is_in_the_audits_citation_register() {
     );
 }
 
+/// Every design document a source file cites must **exist** — the same idea as the register above, one
+/// level up: that guard checks a cited *section* resolves, this one checks the cited *file* does.
+///
+/// It was written because a citation had rotted into a claim about a document that was not there. Four
+/// comments across two crates named one file as the authority describing the parent-cell deficit
+/// escalation — the very obligation those comments record the tree as *not yet meeting* — and no such file
+/// existed anywhere in the repository. The design it pointed at was real and had been renamed, so the cost
+/// was not a missing design but an unfollowable pointer, in the four places most likely to be read by
+/// someone about to implement the thing.
+///
+/// A path citation is the cheapest kind to break: renaming a doc leaves every comment compiling. Nothing
+/// else in the tree checks them, and there are enough to matter.
+///
+/// The coverage floor is not decoration. A scan that finds no citations reports "none missing" and reads
+/// exactly like a pass, which is the failure mode of every scan-shaped guard here — so the count is
+/// asserted before the emptiness is.
+#[test]
+fn every_design_doc_a_source_cites_exists() {
+    // `workspace_root()` is `rust/`; the documents live beside it at the repository root, which is the
+    // distinction that has produced three separate defects in this tree. Resolved once, and `canonicalize`
+    // is what turns a wrong assumption into a failure here rather than a silent "file not found" per path.
+    let docs = corpus::workspace_root()
+        .join("../docs")
+        .canonicalize()
+        .expect("the repository's docs/ directory must resolve from the workspace root");
+
+    let mut cited: BTreeSet<String> = BTreeSet::new();
+    let mut missing: Vec<String> = Vec::new();
+    for source in corpus() {
+        for name in cited_docs(&source.text) {
+            if !docs.join(&name).is_file() {
+                missing.push(format!("{} cites docs/{name}", source.rel));
+            }
+            cited.insert(name);
+        }
+    }
+
+    assert!(
+        cited.len() >= 30,
+        "only {} distinct documents were found cited across the tree — the extraction is broken, not the \
+         citations. It last saw 38.",
+        cited.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "these cite a document that does not exist under docs/ — rename the citation to the file that \
+         holds the material, or add the file:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Every `docs/<name>.md` mentioned in `text`, deduplicated by the caller.
+///
+/// Deliberately syntax-free: a citation is prose, so it appears inside comments, doc comments, string
+/// literals and panic messages alike, and any parse narrower than "these bytes" would miss the half that
+/// matters. The terminator set is what a filename may contain, so a trailing backtick, quote or full stop
+/// ends the match without being taken for part of the name.
+fn cited_docs(text: &str) -> Vec<String> {
+    const MARK: &str = "docs/";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(MARK) {
+        let after = &rest[at + MARK.len()..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            .unwrap_or(after.len());
+        let name = &after[..end];
+        // Case-insensitively, so a citation written `.MD` is still checked rather than silently skipped —
+        // it would resolve on this host's filesystem and break on a case-sensitive one.
+        if Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+            out.push(name.to_owned());
+        }
+        // Advance past the marker even when the match was empty, or this loops forever.
+        rest = &after[end.max(1).min(after.len())..];
+    }
+    out
+}
+
 /// The exit's loopback exemption must be reachable only from a test.
 ///
 /// `ExitPolicy::also_permitting_loopback_for_tests` exists because the exit end-to-end suite has to dial an

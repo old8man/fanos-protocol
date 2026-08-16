@@ -99,7 +99,7 @@ use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 ///
 /// The permanent deficit that saturation implies **is read now, and only half of what reads it exists**.
 /// `note_deficit` is called from the epoch step and records `Station::RoleUnderProvisioned`, so a shortfall
-/// reaches this node's operator. What `docs/design-roles.md` describes and the tree still lacks is the
+/// reaches this node's operator. What `docs/design-self-organization.md` §4 describes and the tree still lacks is the
 /// **parent-cell escalation**: `Escalation` has no `Deficit` variant, so a cell that cannot staff a role
 /// tells its operator and no other cell.
 ///
@@ -1397,7 +1397,7 @@ fn withhold(
 /// throughput matter, while one point short on a rendezvous line means the `t`-of-`(q+1)` guarantee that role
 /// exists to provide is not being met at all. One count cannot say which.
 ///
-/// This is the **local** signal. Escalating to the parent cell, which `docs/design-roles.md` describes, needs
+/// This is the **local** signal. Escalating to the parent cell, which `docs/design-self-organization.md` §4 describes, needs
 /// the hierarchy path and is deliberately not invented here: a half-wired escalation would be worse than a
 /// stated gap.
 fn note_deficit(client: &Client, epoch: Epoch, deficit: Demand) {
@@ -1767,7 +1767,7 @@ mod tests {
     /// The second half — the one this exists to hand on — is that a real capacity makes
     /// `AssignReport::deficit` mean something. That is now recorded locally (`note_deficit` →
     /// `Station::RoleUnderProvisioned`), so a shortfall is no longer silently dropped. What is still absent is
-    /// the **parent-cell escalation** `docs/design-roles.md` describes: a cell that cannot staff a role tells
+    /// the **parent-cell escalation** `docs/design-self-organization.md` §4 describes: a cell that cannot staff a role tells
     /// its operator and not its parent. That is a hierarchy-transport gap, deliberately not faked here.
     #[test]
     fn the_last_two_capacities_and_the_parent_escalation_are_still_open() {

@@ -686,7 +686,7 @@ pub enum Station {
     /// the worse of the two failure modes the tripwire in `role_loop` warned about.
     ///
     /// [`Observation::tag`] carries the role index. This is the *local* signal; escalating a shortfall to the
-    /// parent cell (`docs/design-roles.md`) needs the hierarchy path and is not this station.
+    /// parent cell (`docs/design-self-organization.md` §4) needs the hierarchy path and is not this station.
     RoleUnderProvisioned,
 
     /// This node's claim **took an occupied point from its holder** — arbitration went our way and a live
