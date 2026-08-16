@@ -1458,7 +1458,38 @@ pub struct SelfOrganization {
     pub load_publisher: JoinHandle<()>,
     /// Runs the assignment each epoch.
     pub role_loop: JoinHandle<()>,
-    /// This node's currently-assigned roles — the node subscribes and actuates its role behaviors from it.
+    /// This node's currently-assigned roles.
+    ///
+    /// **It said "the node subscribes and actuates its role behaviors from it", and that is not what
+    /// happens.** Every role behaviour is started once, at boot, from the node's *offer*:
+    /// `spawn_roles(.., config.roles, ..)`, `spawn_exit_role(.., exit, ..)` and `spawn_mix_export(.., relay,
+    /// ..)` where `relay` is `config.roles.relay`. `assign_epoch`'s only effects are `note_deficit` and the
+    /// send on this channel, and **no shipping branch reads it**: every caller of
+    /// [`Node::assigned_roles`](crate::Node::assigned_roles) / `serves` / `assignment` is a test, a sim
+    /// assertion, or the operator status string in `bin/fanos.rs`.
+    ///
+    /// So this is, today, a **report**. `docs/design-self-organization.md` §5 says it should be a decision —
+    /// its table puts "which roles it *offers*" on the node's side and "which offered roles are *active*" on
+    /// the network's, and calls the control side "enforced structurally, not by policy".
+    ///
+    /// **Why the gap is invisible, and what arms it.** `ROLE_CAPACITY_PER_NODE` is `1` for the two remaining
+    /// roles, so their demand exceeds eligible supply, `assign_report` fills `min(demand, eligible)`, and the
+    /// assignment comes out *numerically equal to the offer*. Actuating from the offer and actuating from the
+    /// assignment are the same function for them, which is why nothing can see the difference. The four roles
+    /// with a derived capacity are already past that: their assignment is a strict subset of the offer, and it
+    /// is already ignored.
+    ///
+    /// **What it costs is not tidiness.** §5's third bound on Sybil freedom is that capability is "declared
+    /// freely but *priced by performance*": a non-performing assignee shows as a coherence deficit, DIAKRISIS
+    /// attributes it, its weight is slashed, "a reputation the assignment reads next epoch". That chain is
+    /// built — `LiveRoleController::step` calls `self.reputation.adjust(members)` — and ends here. The price
+    /// is computed every epoch and never charged.
+    ///
+    /// **The shape to close it in, when it is closed:** actuate at the **advertisement**, not by stopping
+    /// tasks. A role is reachable only through its per-epoch directory record (the relay's mix key, the exit's
+    /// descriptor, the rendezvous' presence), those publishers already wake on the epoch advance, and
+    /// withholding a record drains a node gracefully instead of tearing down live sessions. The viability
+    /// floor is already inside the assignment, so a threshold line cannot be starved by it.
     pub assigned: watch::Receiver<Assignment>,
 }
 
