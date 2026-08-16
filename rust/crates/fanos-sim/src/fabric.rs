@@ -2208,6 +2208,16 @@ mod tests {
             // THIS node's point is in its book. `settle_index`'s order is total, so of a colliding pair
             // exactly one must be able to advance; when the index column is all-zero, the two answers here
             // separate "the mover never heard its rival" from "it heard and the rule declined".
+            //
+            // **Measured 2026-08-16, first run with this column: `true` almost everywhere in the unresolved
+            // trials** — all seven nodes in four of them — against an all-zero `index`. So the nodes held
+            // their rival's claim and still nobody advanced, which retires the propagation branch and leaves
+            // the rule itself: `settle_index` declining to move with a recorded contender in hand.
+            //
+            // **Read the resolution counts with care, and do not pool runs.** Three runs of this harness gave
+            // baselines of 7/8, 4/8 and 1/8 at unchanged host load with nothing in the executed path
+            // differing between them. A constant rate does not produce that, so the run-to-run swing is an
+            // unexplained variable of its own and no epoch comparison survives being averaged over it.
             let contended: Vec<_> =
                 fleet.nodes().iter().map(|n| n.handle().seat_contended::<F4>()).collect();
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
