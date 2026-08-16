@@ -47,7 +47,7 @@
 //! coordination — the deterministic self-organization proven in `fanos-core/tests/self_organization.rs`, now
 //! over the live directory.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -252,6 +252,30 @@ const fn saturating_cap(bound: usize) -> u16 {
 pub(crate) struct LoadSensor {
     /// Latest reading per role, indexed by `Role::index`, in the encoding above.
     latest: [AtomicU32; Role::COUNT],
+    /// Running sum of sampled occupancies per role, and how many samples it holds — the time average the
+    /// published figure is taken from. Drained by [`Self::load`], which is called once per publish.
+    ///
+    /// # Why an average, and why sampled rather than integrated
+    ///
+    /// A gauge slot counts **work in flight**, which is an infinite-server queue: its stationary occupancy is
+    /// `Poisson(λ·E[S])` whatever the service distribution, so the variance *equals* the mean and one sample
+    /// has relative noise `1/√m` at mean occupancy `m` — near 100 % at the `m = 1–2` a quiet cell sits at.
+    /// The controller's wanted quantity is that mean, and one instantaneous reading is its unbiased but
+    /// maximally noisy estimator. At `DEFAULT_EPOCH_PERIOD = 600 s` that single reading stood for ten minutes
+    /// of traffic and decided the assignment for the next ten.
+    ///
+    /// **And the sample instant was phase-locked**, which is worse than noise: every node publishes on the
+    /// epoch boundary, concurrently with the re-assignment, the directory write and the coordinate re-proof,
+    /// so the bias does not cancel when the cell sums the reports — only the variance falls as `1/n`.
+    ///
+    /// Sampling rather than integrating keeps the *work path* untouched: an exact time-weighted integral
+    /// needs the counter change and the area update to be one atomic step, which means a lock on the path
+    /// every unit of work crosses. Periodic sampling cuts the variance by the sample count and is bounded
+    /// above by the same `T / 2E[S]` an integral would reach, so it buys the same thing for nothing.
+    ///
+    /// **The interval is the node's existing tick, not a new constant** — see `spawn_load_sampler`.
+    sampled: [AtomicU64; Role::COUNT],
+    samples: AtomicU32,
     /// Bit `Role::index` set once a [`LoadGauge`] is opened for that role: its writer is the role's own task,
     /// not the feeder, so the feeder's death says nothing about it.
     gauged: AtomicU32,
@@ -269,7 +293,7 @@ impl LoadSensor {
     /// immediately is declaring it will never feed this sensor, which is the truth for a gauge-only node.
     fn new() -> (Self, watch::Sender<()>) {
         let (tx, feeding) = watch::channel(());
-        (Self { latest: core::array::from_fn(|_| AtomicU32::new(0)), gauged: AtomicU32::new(0), feeding }, tx)
+        (Self { latest: core::array::from_fn(|_| AtomicU32::new(0)), sampled: core::array::from_fn(|_| AtomicU64::new(0)), samples: AtomicU32::new(0), gauged: AtomicU32::new(0), feeding }, tx)
     }
 
     /// Record a load report from the engine: latest-wins for a role the engine **measured**, and no-op for one
@@ -317,6 +341,38 @@ impl LoadSensor {
         &self.latest[role.index()]
     }
 
+    /// Take one sample of every gauged role's occupancy into the running average. Called on the node's own
+    /// tick — see `spawn_load_sampler`.
+    pub(crate) fn sample(&self) {
+        for role in Role::ALL {
+            let raw = self.latest[role.index()].load(Ordering::Relaxed);
+            // The encoding is `Some(n) = n + 1`, `0 = absent`. An absent slot contributes nothing rather
+            // than a zero: "no sensor" and "sensor reading zero" are the distinction this whole encoding
+            // exists to keep, and averaging an absence in would quietly convert one into the other.
+            if let Some(v) = raw.checked_sub(1) {
+                self.sampled[role.index()].fetch_add(u64::from(v), Ordering::Relaxed);
+            }
+        }
+        self.samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The mean sampled occupancy of `role` since the last drain, or `None` if nothing was sampled.
+    fn averaged(&self, role: Role) -> Option<u16> {
+        let n = u64::from(self.samples.load(Ordering::Relaxed));
+        let sum = self.sampled[role.index()].load(Ordering::Relaxed);
+        // Rounded, not truncated: a role carrying one unit for half the window is `0.5`, and truncation
+        // would report an idle role — the reading that earns it *more* work, in the direction that hurts.
+        (n > 0).then(|| u16::try_from(sum.saturating_add(n / 2) / n).unwrap_or(u16::MAX))
+    }
+
+    /// Reset the window. Called by [`Self::load`] once the figure has been taken.
+    fn drain(&self) {
+        for role in Role::ALL {
+            self.sampled[role.index()].store(0, Ordering::Relaxed);
+        }
+        self.samples.store(0, Ordering::Relaxed);
+    }
+
     /// The most recent reading, as the role vocabulary the setpoint is derived in.
     pub(crate) fn reading(&self) -> RoleReading {
         // Asked once, not per role: `has_changed` is a load on the shared channel state, and every slot is
@@ -328,6 +384,18 @@ impl LoadSensor {
             // Engine-fed and nobody is feeding: absent, which is TRUE, where the last value merely looks it.
             if !feeding && gauged & (1u32 << role.index()) == 0 {
                 return None;
+            }
+            // **A gauged role reports its time average; an engine-fed one reports its latest.** The
+            // distinction is the measured quantity's own dynamics, not the sensor's kind: a gauge counts
+            // work *in flight*, whose correlation time is milliseconds to seconds against an epoch of
+            // minutes, so one sample says almost nothing about the period it stands for. `Role::Storage` is
+            // the opposite case — `store.entries.len()` is a *level* whose entries expire on the epoch
+            // scale, so `τ ≈ T` and averaging it would only add lag. Averaging by dynamics rather than by
+            // sensor is why this branches on `gauged` and not on `feeding`.
+            if gauged & (1u32 << role.index()) != 0
+                && let Some(mean) = self.averaged(role)
+            {
+                return Some(mean);
             }
             let raw = self.latest[role.index()].load(Ordering::Relaxed);
             // `0` is absent; anything else decodes to `raw - 1`, which fits `u16` because `record` is the only
@@ -345,7 +413,13 @@ impl LoadSensor {
     /// should have shrunk it. Standing supply in for demand is right for a role nobody can see and wrong for one
     /// that reported nothing to do.
     pub(crate) fn load(&self, offered: RoleSet, capacity: Demand) -> Demand {
-        self.reading().to_load(capacity, offered)
+        let load = self.reading().to_load(capacity, offered);
+        // **The window closes where the figure is taken, and only here.** Draining anywhere else would let
+        // two readers share one window and the second see an average of whatever the first left behind; and
+        // draining nowhere would make the average unbounded in time, so a busy hour would still be weighing
+        // on a quiet one an epoch later. One publish, one window.
+        self.drain();
+        load
     }
 }
 
@@ -417,9 +491,39 @@ impl Drop for LoadGuard {
 /// The task ends when the engine's notification stream closes, i.e. on node shutdown. A `Lagged` receiver is
 /// ignored rather than treated as an error: the sensor is a *latest-value* register, so dropped intermediate
 /// reports cost nothing — the next observation refreshes it in full.
+/// Sample every gauged role's occupancy on the node's own tick, so the published figure is a **time average**
+/// rather than one instant — see `LoadSensor::sampled`.
+///
+/// **The interval is not a new constant.** It is `fanos_runtime::Config::default().heartbeat`, the cadence
+/// this node already keeps for liveness, and the reason it is the right one is a ratio rather than a
+/// preference: the estimator's gain is bounded above by `T / 2E[S]` — the epoch over twice the correlation
+/// time of the measured quantity — and a sampling interval anywhere below that correlation time reaches the
+/// same bound. Work in flight has a correlation time of milliseconds to seconds; the heartbeat is 500 ms.
+/// Choosing a *smaller* interval would buy nothing but wake-ups.
+///
+/// Unsupervised on purpose, unlike its neighbours: a dead sampler leaves the average empty, `averaged`
+/// returns `None`, and `reading` falls back to the instantaneous slot — which is exactly the behaviour that
+/// shipped before this existed. Its death degrades the estimate and cannot corrupt it.
+fn spawn_load_sampler(sensor: &Arc<LoadSensor>) {
+    let sensor = Arc::clone(sensor);
+    let period = Duration::from_nanos(fanos_runtime::Config::default().heartbeat.0);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if Arc::strong_count(&sensor) == 1 {
+                break; // nothing holds the sensor but this task; the node is gone
+            }
+            sensor.sample();
+        }
+    });
+}
+
 pub(crate) fn spawn_load_sensor(client: &Client) -> Arc<LoadSensor> {
     let (sensor, feeding) = LoadSensor::new();
     let sensor = Arc::new(sensor);
+    spawn_load_sampler(&sensor);
     let sink = Arc::clone(&sensor);
     let mut reports = client.subscribe();
     // Supervised (#251): the sensor's readings are atomics with no channel behind them, so a dead feeder
@@ -1563,6 +1667,75 @@ pub fn spawn_self_organization<F: Field>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A gauged role reports the **mean** of its sampled occupancies; an engine-fed one still reports its
+    /// latest. Both directions, because averaging everything is as wrong as averaging nothing.
+    ///
+    /// The measured quantity's dynamics decide it, not the sensor's kind. A gauge counts work *in flight* —
+    /// an infinite-server queue whose occupancy has variance equal to its mean, correlated over milliseconds
+    /// to seconds against an epoch of minutes — so one instant says almost nothing about the period it
+    /// stands for. `Role::Storage` is `store.entries.len()`, a level whose entries expire on the epoch scale:
+    /// `τ ≈ T`, one sample is representative, and averaging would only add lag.
+    ///
+    /// The window closing is asserted too: two publishes must not share one average, or a busy hour weighs on
+    /// a quiet one an epoch later.
+    #[test]
+    fn a_gauged_role_publishes_the_average_of_its_window_and_a_level_publishes_its_latest() {
+        let (sensor, _feeding) = LoadSensor::new();
+        let sensor = Arc::new(sensor);
+
+        // A gauge open on Exit, carrying one unit for half the window and none for the other half.
+        let gauge = sensor.gauge(Role::Exit);
+        let held = gauge.in_flight();
+        for _ in 0..4 {
+            sensor.sample();
+        }
+        drop(held);
+        for _ in 0..4 {
+            sensor.sample();
+        }
+        // An engine-fed level, recorded once and never sampled as a gauge.
+        sensor.record(RoleReading::per_role(|r| (r == Role::Storage).then_some(40)));
+
+        let reading = sensor.reading();
+        assert_eq!(
+            reading.of(Role::Exit),
+            Some(1),
+            "a role carrying one unit for half the window averages to 0.5 and must ROUND UP — truncating \
+             reports an idle role, which is the reading that earns it more work"
+        );
+        assert_eq!(
+            reading.of(Role::Storage),
+            Some(40),
+            "a level is not averaged: its correlation time is the epoch, so one sample is representative and \
+             averaging would only add lag"
+        );
+
+        // **The window closes at the read, and the numbers are chosen to prove it.** A first window loaded
+        // heavily and a second left idle: with the drain the second reads `0`, and without it the blend
+        // reads `4`. An earlier version used a light first window, where blended and drained both rounded to
+        // zero — an assertion that cannot fail is not one, and removing the drain left it green.
+        // Close the first window before the second opens, or the two blend and the assertion below is
+        // measuring the sum of both.
+        let _ = sensor.load(RoleSet::of(&[Role::Exit]), Demand::per_role(|_| 64));
+        let busy: Vec<_> = (0..5).map(|_| gauge.in_flight()).collect();
+        for _ in 0..8 {
+            sensor.sample();
+        }
+        assert_eq!(sensor.reading().of(Role::Exit), Some(5), "the busy window averages to its five units");
+        let _ = sensor.load(RoleSet::of(&[Role::Exit]), Demand::per_role(|_| 64));
+        drop(busy);
+        for _ in 0..2 {
+            sensor.sample();
+        }
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(0),
+            "the window must close where the figure is taken; blended with the busy one this reads 4, which \
+             is a busy hour still weighing on a quiet one an epoch later"
+        );
+    }
+
     /// **A dead driver is not an idle driver (#258).**
     ///
     /// [`LoadGuard`]'s `Drop` releases each unit of work however the flow ends, which is right for a flow and
