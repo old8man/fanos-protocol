@@ -1861,6 +1861,7 @@ mod tests {
 
 
 
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_what_fraction_of_beacon_rounds_assemble() {
@@ -1937,14 +1938,41 @@ mod tests {
         // reaches the incumbent and never the co-located claimant. Measured live here — two of three nodes reporting
         // the same address is not rare.
         let addrs: Vec<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+        // **The load-robust observable, and the one that decides whether coordinate addressing is the defect.**
+        // `directory.entry_fallback` fires per coordinate on the send ladder's last rung, and *drops the frame*. Most
+        // of those are the plane's empty points — 21 points against 3 nodes leaves 18 that nobody occupies, and a
+        // broadcast to the cell dutifully tries every one. What matters is the intersection with the **occupied**
+        // points: each of those is a real peer this node could not address, so a partial aimed at it was thrown away.
+        // Unlike the assembly fraction above, this number does not move with host load — a coordinate either resolves
+        // or it does not — which is what makes it usable on a shared machine.
+        let occupied: HashSet<_> = addrs.iter().copied().collect();
+        let unreachable: Vec<usize> = fleet
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                n.client()
+                    .driver_stations()
+                    .iter()
+                    .filter(|o| o.station == fanos_runtime::ports::stations::Station::DirectoryEntryFallback)
+                    .filter_map(|o| o.line)
+                    .filter(|c| occupied.contains(c) && addrs.get(i).copied() != Some(*c))
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .collect();
         fleet.shutdown().await;
         let reached = epochs.iter().flatten().copied().max().unwrap_or(0);
         // The driver skips its first tick, so `periods` of wall clock offer `periods - 1` rounds.
+        // **Rounds per period, not a fraction of an exact offer.** The nodes are spawned in sequence, so their epoch
+        // drivers tick out of phase and the number of ticks inside the window is not `periods - 1` on the nose — an
+        // early draft divided by that and printed `1.11`, which is the denominator confessing. One is nominal; below
+        // one is rounds the cell failed to assemble.
         println!(
-            "MEASURED beacon rounds: cell reached epoch {reached} of {} on offer in {periods} periods of {floor:?} \
-             (fraction {:.2}), per node {epochs:?}, addresses {addrs:?}, refusals {refusals:?}",
-            periods - 1,
-            f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods - 1),
+            "MEASURED beacon rounds: cell reached epoch {reached} in {periods} periods of {floor:?} ({:.2} per \
+             period), per node {epochs:?}, addresses {addrs:?}, occupied points this node could NOT address \
+             {unreachable:?}, refusals {refusals:?}",
+            f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods),
         );
     }
 
