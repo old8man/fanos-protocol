@@ -974,26 +974,35 @@ impl NodeHandle {
         self.claims.as_ref().map(ClaimBook::len)
     }
 
-    /// Whether a **peer's** claim to the point this node currently occupies is recorded in its own book.
+    /// Whether a peer has proved a **better** claim to the point this node is seated on.
     ///
     /// **The pairwise question, which [`verified_claims`](Self::verified_claims) structurally cannot answer.**
     /// That one is a total — how many claims were verified, not whether the one contesting *this* seat was
-    /// among them — so two nodes stuck on one point can both report a healthy-looking count while neither has
-    /// heard of the other. The forced-collision harness reads exactly that ambiguity today: every unresolved
-    /// trial shows an all-zero probe index (nobody advanced) with claim counts of 3–7, and the guide reads a
-    /// high count as "heard and did not move" when it may equally be "heard six others and not this one".
+    /// among them — so two nodes stuck on one point can both report a healthy-looking count while neither
+    /// holds the claim that decides their contest.
     ///
-    /// `settle_index`'s order is **total**, so of any colliding pair exactly one must be able to advance. When
-    /// neither does, the remaining explanation is that the one that should move does not hold its rival's
-    /// claim — and this is the reading that says so, against `ClaimBook::contender`, the very oracle
-    /// `settle_index` consumes.
+    /// **"Is there a contender" is the wrong question, and measuring it taught that.** The first version of
+    /// this accessor returned `contender(seat).is_some()` and read `true` on all seven nodes of a seven-node
+    /// cell — because `contender` scores a peer by `probe_index_of(their_output, p)`, which is `Some` for
+    /// every point on that peer's probe walk, and a walk covers its whole line. Almost every node therefore
+    /// "has a claim" to almost every point, and the column was nearly vacuous. What decides a contest is
+    /// [`claim_beats`], and [`ClaimBook::outranked_at`] applies exactly it, against the very order
+    /// `settle_index` walks.
     ///
-    /// `None` without a self-certifying identity, or when this node's coordinate is not a plane point.
+    /// So a `true` here is load-bearing: `settle_index`'s order is **total**, so of a colliding pair exactly
+    /// one must be outranked and therefore able to advance. A node reading `true` while its probe index stays
+    /// at 0 is a node the rule should have moved and did not.
+    ///
+    /// Takes the directory rather than holding one, because that is where this node's own `(index, rank)`
+    /// lives — `claim_at(address)` — and the caller that asks this question already has it.
+    ///
+    /// `None` without a self-certifying identity, when the coordinate is not a plane point, or when this node
+    /// holds no ranked binding of its own to compare against.
     #[must_use]
-    pub fn seat_contended<F: Field>(&self) -> Option<bool> {
+    pub fn seat_outranked<F: Field>(&self, directory: &Directory) -> Option<bool> {
         let book = self.claims.as_ref()?;
-        let point = Point::<F>::new(self.address())?;
-        Some(book.contender::<F>(&point).is_some())
+        let (index, mine) = directory.claim_at(self.address())?;
+        Some(book.outranked_at::<F>(&mine, index).is_some())
     }
 
     /// The UDP socket address the node is actually bound to (its directory entry).
