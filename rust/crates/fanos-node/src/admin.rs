@@ -158,6 +158,21 @@ pub enum Request {
     Coherence,
     /// Ask the node to shut down cleanly.
     Shutdown,
+    /// Put an **authenticated beacon recovery trigger** on the cell — the operator's only affordance for a
+    /// stalled beacon, and the one request here that carries a payload.
+    ///
+    /// **Why a mutating verb is safe, and it is not because the socket is.** The frame is signed by the
+    /// beacon authority and every recipient verifies that signature itself (`BeaconNode::on_reshare_trigger`
+    /// rejects anything else), so reaching this verb grants nothing a valid frame does not already carry. A
+    /// caller who can open the socket but holds no authority key can send only bytes the cell will refuse.
+    /// `shutdown` — which the socket has always offered — is the far stronger power.
+    ///
+    /// **Why it exists at all.** `BeaconNode::reshare_trigger` builds the frame and had three callers, all
+    /// in one test file; nothing in a shipping binary could issue one, and the automatic path ends at a log
+    /// line. So a cell whose anchors fell below threshold could be diagnosed and not repaired (audit R-C1,
+    /// R-C2). The frame goes out as [`Command::Broadcast`](fanos_runtime::Command::Broadcast) because its
+    /// audience is the cell and its authority travels with it.
+    Reshare(Vec<u8>),
 }
 
 impl Request {
@@ -173,14 +188,20 @@ impl Request {
             "stations" => Some(Self::Stations),
             "coherence" => Some(Self::Coherence),
             "shutdown" => Some(Self::Shutdown),
-            _ => None,
+            // The one verb with an argument. Split rather than matched whole, because everything else here
+            // is a bare word and making them all parse arguments would widen a surface for one caller.
+            other => other
+                .strip_prefix("reshare ")
+                .and_then(|hex| crate::config::hex_decode(hex.trim()).ok())
+                .filter(|frame| !frame.is_empty())
+                .map(Self::Reshare),
         }
     }
 
     /// Every verb, for the error message a wrong one gets.
     #[must_use]
     pub const fn all() -> &'static str {
-        "ping | health | roles | census | consensus | stations | coherence | shutdown"
+        "ping | health | roles | census | consensus | stations | coherence | shutdown | reshare <hex>"
     }
 }
 
@@ -797,6 +818,9 @@ mod tests {
             send_drops: 43,
             collisions: 44,
             unresolved_drops: 45,
+            // A value that cannot occur by accident: this node IS outranked at its seat, which is the state
+            // a contested-coordinate diagnosis turns on.
+            seat_outranked: Some(true),
             verified_claims: Some(46),
             probe_index: Some(47),
             roles: crate::config::RoleSet::default(),
@@ -843,14 +867,34 @@ mod tests {
         }
     }
 
+    /// A help entry, turned into a line the parser can actually be handed.
+    ///
+    /// **A verb with an argument cannot be parsed from its help entry, and the guards below must not
+    /// therefore stop checking it.** `all()` advertises `reshare <hex>` because an operator needs to know the
+    /// verb takes something; the placeholder is filled with a value here so the round-trip stays a real
+    /// check rather than a skipped one. A verb that grew an argument and was quietly exempted from these
+    /// guards is exactly the drift they exist to catch.
+    fn help_entry_as_line(entry: &str) -> String {
+        match entry.split_once(" <") {
+            Some((verb, _)) => std::format!("{verb} {}", crate::config::hex_encode(&[0xA5, 0x5A])),
+            None => entry.to_owned(),
+        }
+    }
+
     #[test]
     fn every_documented_verb_parses_and_nothing_else_does() {
         // Derived from the help string rather than a hand-written list. The literal it used to iterate had
         // already drifted — `consensus` was documented, parsed, and silently unchecked — because a list that
         // must be edited alongside two other places gets edited in two.
         for word in Request::all().split('|').map(str::trim) {
-            assert!(Request::parse(word).is_some(), "`{word}` is offered in help but does not parse");
+            let line = help_entry_as_line(word);
+            assert!(Request::parse(&line).is_some(), "`{word}` is offered in help but does not parse");
         }
+        assert!(
+            Request::parse("reshare").is_none(),
+            "a payload verb with nothing after it names no frame and must not parse"
+        );
+        assert!(Request::parse("reshare zz").is_none(), "nor must one whose argument is not hex");
         assert!(Request::parse("PING").is_some(), "verbs are case-insensitive");
         assert!(Request::parse(" health \n").is_some(), "a line from a socket carries its newline");
         assert!(Request::parse("reconfigure").is_none(), "an unknown verb must not be silently accepted");
@@ -871,6 +915,8 @@ mod tests {
             Request::Stations,
             Request::Coherence,
             Request::Shutdown,
+            // Carries a payload, so its round-trip is the line rather than the bare word — see below.
+            Request::Reshare(std::vec![0xAA, 0xBB]),
         ];
         for request in &every {
             let word = match request {
@@ -882,9 +928,18 @@ mod tests {
                 Request::Stations => "stations",
                 Request::Coherence => "coherence",
                 Request::Shutdown => "shutdown",
+                // The only verb with an argument. Its help entry is `reshare <hex>`, so the word alone is
+                // what `all()` must offer, and the parse below is exercised on a real line.
+                Request::Reshare(_) => "reshare",
             };
             assert!(Request::all().contains(word), "`{word}` is a variant but is not offered in help");
-            let parsed = Request::parse(word).expect("a variant's own word must parse");
+            let line = match request {
+                // A payload verb does not parse from its word alone, and must not: `reshare` with nothing
+                // after it names no frame. The line carries hex, and the round-trip is checked on that.
+                Request::Reshare(bytes) => std::format!("reshare {}", crate::config::hex_encode(bytes)),
+                _ => word.to_owned(),
+            };
+            let parsed = Request::parse(&line).expect("a variant's own line must parse");
             assert_eq!(
                 core::mem::discriminant(&parsed),
                 core::mem::discriminant(request),
@@ -1366,7 +1421,8 @@ mod tests {
         // parsed but unlisted is a capability nobody can discover. Checked against each other rather than against
         // a hand-written list, so adding a verb cannot satisfy this test without wiring both sides.
         for verb in Request::all().split('|').map(str::trim) {
-            assert!(Request::parse(verb).is_some(), "`{verb}` is advertised by all() and the parser refuses it");
+            let line = help_entry_as_line(verb);
+            assert!(Request::parse(&line).is_some(), "`{verb}` is advertised by all() and the parser refuses it");
         }
         // …and the reverse direction, for the verbs this build knows about.
         for verb in ["ping", "health", "roles", "census", "consensus", "shutdown"] {

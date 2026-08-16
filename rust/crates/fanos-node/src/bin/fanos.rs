@@ -91,6 +91,7 @@ async fn run(args: &[String]) -> Result<(), NodeError> {
         Some("beacon-deal") => cmd_beacon_deal(args.get(2..).unwrap_or(&[])),
         Some("keygen") => cmd_keygen(args.get(2..).unwrap_or(&[])).await,
         Some("authority-key") => cmd_authority_key(args.get(2..).unwrap_or(&[])),
+        Some("beacon-reshare") => cmd_beacon_reshare(args.get(2..).unwrap_or(&[])).await,
         Some("ingress-deal") => cmd_ingress_deal(args.get(2..).unwrap_or(&[])),
         Some("service-deal") => cmd_service_deal(args.get(2..).unwrap_or(&[])),
         Some("taxis-deal") => cmd_taxis_deal(args.get(2..).unwrap_or(&[])),
@@ -780,6 +781,20 @@ fn answer_control<N: Controllable>(
         Request::Roles => node.roles_line(),
         Request::Consensus => consensus.to_owned(),
         Request::Shutdown => "shutting down\n".to_owned(),
+        // **The frame goes to the cell, not to a peer.** Its audience is every anchor and its authority
+        // travels with it — the signature is checked by each recipient — so `Broadcast` is the shape, and
+        // resolving q²+q+1 coordinates to deliver it would fail exactly when the cell is unwell enough to
+        // need it. This node's own beacon is reached the same way every peer's is: by the re-flood, which is
+        // why the operator may point this at any member rather than having to find an anchor.
+        Request::Reshare(ref frame) => {
+            let (client, _, _) = node.census_source();
+            let bytes = frame.len();
+            if client.command(fanos_runtime::Command::Broadcast { frame: frame.clone() }) {
+                format!("reshare trigger broadcast ({bytes} bytes)\n")
+            } else {
+                "the engine has stopped; nothing was sent\n".to_owned()
+            }
+        }
         Request::Coherence => {
             // Answered off the loop and bounded, for the same reasons as `stations` — it is the same
             // `Observe` round trip, and the node an operator asks this of may be the one that is stuck.
@@ -3020,6 +3035,75 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
 }
 
 /// secret material.
+/// `fanos beacon-reshare` — mint an **authenticated proactive-reshare trigger** and put it on the cell.
+///
+/// **The affordance a stalled beacon had none of.** When anchors fall below threshold the epoch clock stops,
+/// and with it the coordinate reshuffle, the onion ratchet and every per-epoch key rotation. A node *detects*
+/// that (`RECOVERY_PATIENCE` periods with no advance) and then escalates to a `tracing::warn!`, because the
+/// authority secret is deliberately not held by any node — audit §2.1, and correctly so. What was missing is
+/// the other half: a way for whoever *does* hold it to act. `BeaconNode::reshare_trigger` built the frame and
+/// had three callers, every one of them in a test file (audit R-C1).
+///
+/// **The authority key is read, never transmitted.** The frame is signed here and only the signature travels;
+/// the socket carries a frame every recipient verifies for itself, so reaching the verb grants nothing the
+/// frame does not already carry.
+///
+/// **Sent to any member, not to an anchor.** It goes out as `Command::Broadcast`, so the cell floods it —
+/// which is also why an operator does not have to know which nodes are anchors to repair one.
+async fn cmd_beacon_reshare(args: &[String]) -> Result<(), NodeError> {
+    let usage = || {
+        NodeError::Config(
+            "usage: fanos beacon-reshare --authority KEYFILE --generation N --threshold T \
+             --contributors 1,2,.. --holders 1,2,.. [--data DIR]"
+                .to_owned(),
+        )
+    };
+    let key_path = flag(args, "--authority")?.ok_or_else(usage)?;
+    let generation: u64 = flag(args, "--generation")?.and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+    let new_threshold: usize = flag(args, "--threshold")?.and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+    let indices = |name: &str| -> Result<Vec<u8>, NodeError> {
+        let raw = flag(args, name)?.ok_or_else(usage)?;
+        raw.split(',').map(|p| p.trim().parse::<u8>().map_err(|_| usage())).collect()
+    };
+    let contributors = indices("--contributors")?;
+    let holders = indices("--holders")?;
+
+    let seed_hex = std::fs::read_to_string(key_path)
+        .map_err(|e| NodeError::Config(format!("authority key '{key_path}': {e}")))?;
+    let seed = fanos_node::config::hex_decode(seed_hex.trim())?;
+    let seed: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| NodeError::Config("authority key must be 32 bytes of hex".to_owned()))?;
+    let secret = HybridSigSecret::generate(&mut SeedRng::from_seed(&seed)).0;
+
+    let frame = fanos_keygen::BeaconNode::<F2>::reshare_trigger(
+        &[(0, &secret)],
+        generation,
+        new_threshold,
+        &contributors,
+        &holders,
+    );
+    let socket = fanos_node::admin::socket_path(&data_dir_for(args)?);
+    let line = format!("reshare {}", fanos_node::config::hex_encode(&frame));
+    if let Ok(Some(answer)) = fanos_node::admin::ask(&socket, &line).await {
+        print!("{answer}");
+    } else {
+        // The frame is minted and the node is not there to take it. Printed rather than discarded, because a
+        // trigger an operator can re-send by hand is worth more than a clean error.
+        println!("no running node at {} — the signed trigger, to send by hand:", socket.display());
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `fanos authority-key` — mint a **recovery-authority** signing key for one founder.
+///
+/// The secret this writes is what `fanos beacon-reshare` signs a trigger with, and the verifier printed
+/// beside it is what every node is configured with. Split that way on purpose: a cell that cannot name its
+/// authority can never reshape its beacon, and a cell whose nodes hold the *secret* has an authority in name
+/// only. One file stays on the founder's machine; the other is public and goes into every node's beacon
+/// parameters.
 fn cmd_authority_key(args: &[String]) -> Result<(), NodeError> {
     let out = flag(args, "--out")?.unwrap_or("recovery-authority.key");
     let mut seed = [0u8; 32];
@@ -4277,6 +4361,12 @@ fn help_advanced() -> String {
          \x20              machine also generates the recovery committee, holding every authority secret for\n\
          \x20              the moment of dealing — fine for a private cell. For a public one, each founder\n\
          \x20              runs `fanos authority-key` and you pass their collected verifiers here)\n\
+         \x20 fanos beacon-reshare --authority KEYFILE --generation N --threshold T \\\n\
+         \x20                      --contributors 1,2,.. --holders 1,2,.. [--data DIR]\n\
+         \x20             (repair a beacon whose anchors fell below threshold: signs a proactive-reshare\n\
+         \x20              trigger with the recovery-authority key and hands it to the local node, which\n\
+         \x20              floods it to the cell. Send it to ANY member — anchors learn it from the flood.\n\
+         \x20              With no node running it prints the signed line instead, to send by hand)\n\
          \x20 fanos keygen --roster FILE --threshold T --out FILE [--identity PATH] [--listen ADDR]\n\
          \x20             (run the founding DKG with the other founders — each draws its own secret and no\n\
          \x20              party ever holds the whole beacon key, unlike `beacon-deal`. The roster is the\n\

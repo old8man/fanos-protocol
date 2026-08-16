@@ -4232,6 +4232,18 @@ fn relayable(inner: &[u8]) -> bool {
     )
 }
 
+/// Whether `frame` is an assembled beacon **round** — the one frame that authenticates itself against the
+/// group commitment and is therefore safe both to accept from a stranger and to hand one.
+fn is_beacon_round(frame: &[u8]) -> bool {
+    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::Beacon))
+}
+
+/// Whether `frame` is a beacon **pull request** — the one frame this node will push down a connection it
+/// could not authenticate, because it names nothing and asks for a value the cell broadcasts anyway.
+fn is_beacon_req(frame: &[u8]) -> bool {
+    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::BeaconReq))
+}
+
 /// Whether a frame may cross from a peer whose coordinate is **unproven** (#235).
 ///
 /// **The rule is read off the consumer, not chosen:** a frame whose handler uses `from` cannot be admitted
@@ -4278,18 +4290,6 @@ fn relayable(inner: &[u8]) -> bool {
 /// That is the shape of the repair, and it is deliberately not made here: it changes what an unproven peer
 /// may cause this node to do, which is the authentication path, and it wants its own pass with a test that
 /// a stranger cannot use it to reflect anything but a round it could have read from the flood.
-/// Whether `frame` is an assembled beacon **round** — the one frame that authenticates itself against the
-/// group commitment and is therefore safe both to accept from a stranger and to hand one.
-fn is_beacon_round(frame: &[u8]) -> bool {
-    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::Beacon))
-}
-
-/// Whether `frame` is a beacon **pull request** — the one frame this node will push down a connection it
-/// could not authenticate, because it names nothing and asks for a value the cell broadcasts anyway.
-fn is_beacon_req(frame: &[u8]) -> bool {
-    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::BeaconReq))
-}
-
 fn admitted_unjudged(frame: &[u8]) -> bool {
     matches!(
         decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),

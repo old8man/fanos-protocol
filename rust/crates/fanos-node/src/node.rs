@@ -972,8 +972,25 @@ fn spawn_roles<F: Field + 'static>(
     )
 }
 
+/// The plane-bound reading `Node` stores — a free function so `start_over` stays inside its line budget and
+/// so the one place `F` is captured is named rather than inlined.
+fn seat_contest<F: Field + 'static>() -> SeatContest {
+    Arc::new(|h: &NodeHandle, d: &Directory| h.seat_outranked::<F>(d))
+}
+
+/// Reads whether this node's seat is outranked, with the plane it needs already bound.
+///
+/// A closure rather than a generic method because `Node::health()` is not generic over the field and making
+/// it so would push `F` into every caller of a diagnostic — the same shape, for the same reason, as
+/// `fanos_quic::CoordinateProver`.
+type SeatContest = Arc<dyn Fn(&NodeHandle, &Directory) -> Option<bool> + Send + Sync>;
+
 /// A running FANOS node.
 pub struct Node {
+    /// Whether a peer has proved a **better** claim to the point this node sits on, captured at `start`
+    /// where the plane is known — `health()` is not generic over the field, and making it so would push `F`
+    /// into every caller of a diagnostic.
+    seat_outranked: SeatContest,
     handle: NodeHandle,
     directory: Directory,
     local_addr: SocketAddr,
@@ -1063,6 +1080,17 @@ pub struct Health {
     /// contested point with a low count failed to hear of its rival; one with a high count heard and did not move. Same
     /// symptom, different defect, and without this they are indistinguishable from outside.
     pub verified_claims: Option<usize>,
+    /// Whether a peer has proved a **better** claim to the point this node is seated on.
+    ///
+    /// **The pairwise fact the counters beside it cannot give.** `verified_claims` is a total — how many
+    /// claims were checked, not whether the one contesting *this* seat was among them — so two nodes stuck on
+    /// one point can both look healthy while neither holds the claim that decides their contest. This asks
+    /// `ClaimBook::outranked_at`, which applies `claim_beats` against the very order `settle_index` walks.
+    ///
+    /// `true` with a `probe_index` still at 0 is a node the rule should have moved and did not, which is the
+    /// state a contested-coordinate diagnosis turns on. `None` without a self-certifying identity, or when
+    /// this node holds no ranked binding to compare against.
+    pub seat_outranked: Option<bool>,
     /// The **probe index** of this node's own coordinate claim, if it is bound with one.
     ///
     /// The third observable this investigation needed, and it closes the last gap: `0` means the node is at the point its
@@ -1397,12 +1425,7 @@ impl Node {
             // The prover is what binds each published key to this node's coordinate (#262). `None` on a
             // deployment that cannot prove coordinates, which is the same condition every other bound
             // directory keys its envelope on.
-            crate::ingressdir::spawn_ingress_rotation::<F>(
-                handle.client(),
-                community,
-                kem_seed,
-                handle.coordinate_prover(),
-            )
+            crate::ingressdir::spawn_ingress_rotation::<F>(handle.client(), community, kem_seed, handle.coordinate_prover())
         });
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
@@ -1417,6 +1440,7 @@ impl Node {
         announce_node(&handle, &config);
 
         Ok(Self {
+            seat_outranked: seat_contest::<F>(),
             handle,
             directory,
             local_addr,
@@ -1507,6 +1531,7 @@ impl Node {
         Health {
             address,
             verified_claims: self.handle.verified_claims(),
+            seat_outranked: (self.seat_outranked)(&self.handle, &self.directory),
             probe_index: self.directory.claim_at(address).map(|(index, _)| index),
             local_addr: self.local_addr,
             known_peers: self.directory.len(),

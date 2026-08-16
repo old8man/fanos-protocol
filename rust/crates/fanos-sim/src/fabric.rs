@@ -2325,7 +2325,7 @@ mod tests {
             // its own control, so the epoch turn probably does help; run 1 contradicts it and nothing in the
             // executed path differed. Report the outlier rather than averaging it away.
             let contended: Vec<_> =
-                fleet.nodes().iter().map(|n| n.handle().seat_outranked::<F4>(n.directory())).collect();
+                fleet.nodes().iter().map(|n| n.health().seat_outranked).collect();
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
             // `None` = not bound at all (it lost the arbitration and holds no directory entry).
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
