@@ -405,6 +405,53 @@ mod tests {
     /// model at when a node has no observation window, and it lands inside the band on purpose. That is
     /// exactly why the deleted `VitalSigns` — which read a matrix, where the bit does not exist — reported
     /// a node that had observed *nothing* as ready.
+    /// **The upper edge of the collective-subject band is a triple point, and readiness holds there.**
+    ///
+    /// On an equicorrelated cell `purity = (1 + (N−1)r²)/N` and `R = 1/(N·purity) = 1/(1 + Φ)`, so `R = 1/3`
+    /// *is* `Φ = 2` *is* `purity = 3/7` — the reflection floor, the integration the band tops out at, and
+    /// **V2's dominance ceiling** at one correlation, `r = 1/√3`. Nothing pinned that the three coincide, or
+    /// that a cell sitting there is still self-observing.
+    ///
+    /// **What this deliberately does NOT claim, having tried to.** `ready` reads
+    /// `reflection >= REFLECTION_FLOOR`, and changing that to `>` leaves this crate green — which looks like
+    /// an unguarded boundary and is not one. The frame's scalars are `f32` and the floor is an `f64`
+    /// constant, so a widened `f32` can never equal `f64(1/3)`: the equality case is **unreachable**, and the
+    /// two comparisons are the same function on every input this plane can produce. A guard written for that
+    /// boundary would pass under either spelling — vacuous, and it took a falsification to see it. If the
+    /// pipeline ever carries `f64` end to end, the distinction becomes live and the spec's "R ≥ 1/3" decides
+    /// it.
+    #[test]
+    fn the_bands_upper_edge_is_one_point_for_three_invariants_and_is_still_ready() {
+        let on_edge = 1.0 / 3.0_f64.sqrt();
+        let snap = CoherenceSnapshot::from_frame(&CoherenceFrame::observe(
+            CellId([0xAB; 16]), 9, &CoherenceMatrix::equicorrelated(7, on_edge), 0, 0.5, -1, 3, true,
+        ));
+        // **To f32, which is a fact about this plane worth stating.** The frame's scalars are `f32` and the
+        // floor is an `f64` constant, so `reflection` comes back as `0.33333334…` — `1/3` rounded up in
+        // single precision — and the comparison at the boundary is decided by that rounding rather than by
+        // the spec. The displacement is ~1e-8 and harmless; what would not be harmless is an assertion
+        // written as exact `f64` equality, which fails for a reason that has nothing to do with the property.
+        let eps = f64::from(f32::EPSILON);
+        assert!(
+            (snap.reflection - REFLECTION_FLOOR).abs() < eps,
+            "r = 1/√3 must land on the floor to f32, or this pins nothing: {} vs {REFLECTION_FLOOR}",
+            snap.reflection
+        );
+        assert!((snap.purity - 3.0 / 7.0).abs() < eps, "and on V2's dominance ceiling — the same point");
+        assert!(
+            snap.ready,
+            "a cell exactly on the floor is self-observing (R ≥ 1/3); `>` here would exile it at the one \
+             correlation where three separate invariants meet"
+        );
+
+        // The other side, one step out, so the assertion above is about the boundary and not about `ready`
+        // being unable to say no.
+        let over = CoherenceSnapshot::from_frame(&CoherenceFrame::observe(
+            CellId([0xAB; 16]), 9, &CoherenceMatrix::equicorrelated(7, 0.578), 0, 0.5, -1, 3, true,
+        ));
+        assert!(over.reflection < REFLECTION_FLOOR && !over.ready, "just past it, the cell is not");
+    }
+
     #[test]
     fn two_frames_with_identical_scalars_disagree_on_readiness_when_one_measured_nothing() {
         let matrix = CoherenceMatrix::equicorrelated(7, 0.45); // the shipped `healthy_correlation`
