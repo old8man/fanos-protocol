@@ -226,6 +226,17 @@ mod tests {
             Duration::from_millis(480),
             "¾·400 + ¼·|800−80| = 480 — the variation half of the same law, and the term the deadline adds"
         );
+
+        // **And `K`, which is the third constant of the same citation and was equally unwatched.** RFC 6298
+        // computes `RTO = SRTT + K·RTTVAR` with `K = 4`; measured, changing it to 2 leaves all twelve tests
+        // in this crate green, because every one of them reads the deadline as "a number that adapts" rather
+        // than as this number. `710 + 4·480 = 2630`, comfortably inside the `[1 ms, 10 s]` clamp, so the
+        // assertion is about the formula and not about a bound.
+        assert_eq!(
+            clock.deadline(),
+            Duration::from_millis(2630),
+            "srtt + 4·var = 710 + 1920; 1670 means K became 2, and no other test here would say so"
+        );
     }
 
     #[test]
