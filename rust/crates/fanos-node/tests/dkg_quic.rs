@@ -16,7 +16,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use std::time::Duration;
 
 use fanos_field::F2;
 use fanos_geometry::{Plane, Point};
@@ -94,7 +93,7 @@ async fn seven_founders_run_a_dkg_over_real_quic_and_agree_on_one_joint_key() {
     // than hang it.
     let mut joint: Vec<[u8; 32]> = Vec::new();
     for stream in &mut streams {
-        let y = tokio::time::timeout(Duration::from_secs(60), async {
+        let y = tokio::time::timeout(common::HANG_CEILING, async {
             loop {
                 match stream.recv().await {
                     Ok(Notification::DkgComplete(y)) => return Some(y),
@@ -160,7 +159,7 @@ async fn a_founder_recovers_its_share_and_the_cell_agrees_on_one_commitment() {
         assert!(node.command(Command::StartHeartbeat), "every founder begins dealing");
     }
     for stream in &mut streams {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(common::HANG_CEILING, async {
             loop {
                 match stream.recv().await {
                     Ok(Notification::DkgComplete(_)) => return Some(()),

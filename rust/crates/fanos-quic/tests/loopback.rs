@@ -133,7 +133,7 @@ async fn a_node_learns_its_public_address_only_once_the_fault_budget_agrees() {
     // The last observer completes the quorum.
     let last = peers.last().expect("at least one peer");
     a.command(Command::Send { to: last.address(), payload: b"hi".to_vec() });
-    let confirmed = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let confirmed = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(addr) = a.public_addr() {
                 return addr;

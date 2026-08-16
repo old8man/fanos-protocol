@@ -377,6 +377,9 @@ async fn an_accepted_stream_taken_from_a_queue_receives_an_interactive_write() {
         .expect("a session arrived on the accept queue")
         .expect("the queue is open");
     let mut buf = vec![0u8; 64];
+    // **Not the backstop: the assertion below names the duration, so the duration is part of the claim.**
+    // A 240 s ceiling here keeps the test green while deleting "promptly"; the right value is derived
+    // from the mechanism, which is its own piece of work.
     let n = tokio::time::timeout(Duration::from_secs(5), accepted.read(&mut buf))
         .await
         .expect("the accepted stream received the client's write within five seconds")

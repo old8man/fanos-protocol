@@ -76,7 +76,10 @@ use tokio::time::Instant;
 /// look identical from outside, and only the re-run separates them.
 ///
 /// This is deliberately **not** a latency budget. Assert latency explicitly where it matters.
-pub const HANG_CEILING: Duration = Duration::from_secs(240);
+// **Imported, not restated (2026-08-16).** `fanos_testkit::LIVENESS_BACKSTOP` carries the derivation and
+// the discriminator between the three kinds of wait; this name stays because the node suites already read
+// by it, but the value has one owner. Two constants with one meaning are how they drift.
+pub const HANG_CEILING: Duration = fanos_testkit::LIVENESS_BACKSTOP;
 
 /// How long an observation must sit **unchanged** before it is a refutation rather than an unfinished wait.
 ///
