@@ -636,6 +636,11 @@ const MAX_PEER_SEND_QUEUE: usize = INPUT_CAP;
 /// whether a second connection is a doomed surplus or a migrated peer's only working path, so it keeps both
 /// and defers the question to the reader below. What it must *not* do is discard one, which is what the old
 /// single-slot map did — and discarding closed the route the answering peer had just filed (#264).
+/// The last beacon round this node emitted, shared so an unjudged peer can be answered on its own connection
+/// without a coordinate lookup — see [`serve_round_to_unjudged`]. Filled in `engine_loop`, which sees every
+/// frame the engine emits and is the one place both the assembling anchor and a re-flooding consumer meet.
+type LastRound = Arc<Mutex<Option<Vec<u8>>>>;
+
 type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
 
 /// The one place the liveness rule is applied: drop closed connections to `peer` and hand back the
@@ -740,6 +745,9 @@ struct Transport {
     joining: crate::proteus_socket::ReplyAddressing,
     endpoint: Endpoint,
     conns: ConnMap,
+    /// The last beacon round this node emitted — the one thing it can hand an unjudged peer, read by
+    /// [`read_restricted`] so the answer never touches the coordinate ladder.
+    last_round: LastRound,
     input_tx: mpsc::Sender<Input>,
     /// Transport-level events the layers above must see — currently a peer proving it moved. The driver publishes here
     /// rather than routing through the engine because the event is about the *transport's* view of who is where, which the
@@ -2580,6 +2588,7 @@ fn spawn_inner(
     // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
     // is seated where) — audit R-M1.
     let distrust: Arc<Distrust> = Arc::new(Distrust::default());
+    let last_round: LastRound = Arc::new(Mutex::new(None));
     // Shared with the handle, so `fanos status health` can report it (#89).
     let send_drops: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Shared with every supervisor, the handle and each `Client`: the one place that says whether an actor's
@@ -2600,6 +2609,7 @@ fn spawn_inner(
         joining: Arc::clone(&joining),
         endpoint: endpoint.clone(),
         conns,
+        last_round: Arc::clone(&last_round),
         input_tx: input_tx.clone(),
         events_tx: events_tx.clone(),
         shaper,
@@ -2619,12 +2629,7 @@ fn spawn_inner(
     supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(accept_loop(transport.clone())));
     supervise(DriverActor::Transport, &stations, &stopping, tokio::spawn(transport_loop(transport, send_rx)));
     supervise(DriverActor::Engine, &stations, &stopping, tokio::spawn(engine_loop(
-        engine,
-        input_rx,
-        input_tx.clone(),
-        send_tx,
-        notify_tx,
-        distrust,
+        engine, input_rx, input_tx.clone(), send_tx, notify_tx, distrust, Arc::clone(&last_round),
     )));
     // The router owns the notification stream: it correlates get/put replies and fans events out.
     supervise(
@@ -2662,6 +2667,7 @@ async fn engine_loop(
     send_tx: mpsc::UnboundedSender<SendRequest>,
     notify_tx: mpsc::UnboundedSender<Notification>,
     distrust: Arc<Distrust>,
+    last_round: LastRound,
 ) {
     let origin = StdInstant::now();
     while let Some(input) = input_rx.recv().await {
@@ -2669,6 +2675,16 @@ async fn engine_loop(
         for effect in engine.step(now, input) {
             match effect {
                 Effect::Send { to, frame } => {
+                    // **Kept before it goes out, because this is the only place both producers meet.** A node
+                    // holds the current round either by assembling it (`adopt_and_announce`) or by re-flooding
+                    // one it received (`on_round`) — and both leave the engine as an ordinary `Send`, so one
+                    // check here covers what two hooks in the beacon would. The frame is public: it is being
+                    // broadcast to every point of the plane on this very line.
+                    if is_beacon_round(&frame)
+                        && let Ok(mut held) = last_round.lock()
+                    {
+                        *held = Some(frame.clone());
+                    }
                     let _ = send_tx.send(SendRequest { to, frame });
                 }
                 Effect::ArmTimer { token, after } => {
@@ -3788,11 +3804,71 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 /// That is the shape of the repair, and it is deliberately not made here: it changes what an unproven peer
 /// may cause this node to do, which is the authentication path, and it wants its own pass with a test that
 /// a stranger cannot use it to reflect anything but a round it could have read from the flood.
+/// Whether `frame` is an assembled beacon **round** — the one frame that authenticates itself against the
+/// group commitment and is therefore safe both to accept from a stranger and to hand one.
+fn is_beacon_round(frame: &[u8]) -> bool {
+    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::Beacon))
+}
+
 fn admitted_unjudged(frame: &[u8]) -> bool {
     matches!(
         decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
         Some(FrameType::Beacon)
     )
+}
+
+/// Hand an **unjudged** peer this node's current beacon round, on the connection its `BeaconReq` arrived on.
+/// Returns whether a round was actually served.
+///
+/// **Why here and not through the engine.** [`admitted_unjudged`] refuses `BeaconReq` for the engine, and
+/// correctly: `on_beacon_req` replies with `Effect::Send { to: from }`, which sends to whoever really holds
+/// the point a stranger names — useless to the asker and a small reflection primitive. Both objections are
+/// about the *coordinate ladder*, and neither survives replying here: the asker is reachable **by
+/// construction**, since its frame came down this very connection, and the answer goes back the way it came
+/// rather than to a third party. No table is written and no unproven coordinate is trusted.
+///
+/// **What it discloses: nothing.** A round authenticates itself against the group commitment, and this node
+/// is broadcasting it to every one of the plane's `q² + q + 1` points anyway.
+///
+/// **What it costs, and why the bound is derived rather than chosen.** A request is small and a round is
+/// large, so the one real risk is amplification — closed by serving **at most once per connection**. One
+/// round is all a stalled node needs: adopting it makes `reshuffle_loop` rewrite this node's HELLO, so its
+/// very next send opens a connection both sides can judge. A second answer on the same connection could
+/// serve no honest purpose, which is why there is no number to pick.
+///
+/// **The case this exists for.** A *joining* node is judgeable for ever under #235's genesis pin, so the
+/// cell files it and its round arrives by the ordinary path. A node that fell **behind** names an epoch that
+/// is neither current, nor grace, nor genesis: nobody can judge it, nothing files it, its directory slot has
+/// expired at `now ≥ E+2`, and every frame aimed at it dies on the send ladder's last rung. Measured on a
+/// three-node fleet, that state is permanent — the coordinate it would re-publish under is derived from the
+/// epoch it lost. Its restricted connection could only read; now it can ask.
+///
+/// Silent when this node has adopted no round itself — the same silence `on_beacon_req` keeps, for the same
+/// reason: there is nothing to hand over.
+///
+/// # The loop is NOT closed yet, and the missing half is the ask, not the answer
+///
+/// This serves a `BeaconReq` that arrives here. A node that has fallen behind cannot yet make one arrive.
+/// Its `request_sync` is a `broadcast` down the coordinate ladder, and every rung fails for the same reason
+/// it fell out of the cell: no directory entry, no connection-map entry. It reaches the **last** rung, dials
+/// a configured entry address — and that dial ends in `PeerIdentity::Unjudged`, whose contract is explicit
+/// that "the caller's frame is not delivered". So the connection is opened and the request is dropped on it.
+///
+/// The symmetric repair is to hand a `BeaconReq` to the restricted connections this node already holds when
+/// the ladder is exhausted. That needs the connection kept rather than moved into the read task (`spawn_
+/// restricted` currently retains only the claimed coordinate, in a set), and it is a *set of connections we
+/// opened*, not an address book keyed by an unproven claim — so it does not reopen the rule this file is
+/// careful about. Until then the answering half stands ready and is exercised only when something else
+/// causes the request to arrive.
+async fn serve_round_to_unjudged(conn: &Connection, t: &Transport) -> bool {
+    let round = match t.last_round.lock() {
+        Ok(held) => held.clone(),
+        Err(_) => None,
+    };
+    let Some(round) = round else { return false };
+    t.record_station(Station::RestrictedRoundServed, None, None);
+    send_uni(conn, &t.shaper, t.joining(conn), &round).await;
+    true
 }
 
 /// Hold a connection whose peer this node **could not judge**, and read the one thing it can safely accept
@@ -3815,6 +3891,8 @@ fn admitted_unjudged(frame: &[u8]) -> bool {
 /// otherwise inert — the one frame admitted does not read it.
 async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
     t.record_station(Station::PeerUnjudged, None, None);
+    // At most one round per connection — see the `BeaconReq` arm below for why that is the whole bound.
+    let mut answered = false;
     while let Ok(mut stream) = conn.accept_uni().await {
         let Ok(raw) = stream.read_to_end(max_wire()).await else {
             t.record_station(Station::WireOverBound, None, None);
@@ -3824,6 +3902,13 @@ async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
             t.record_station(Station::WireUnshaped, None, None);
             continue;
         };
+        // The pull, answered on the connection it arrived on — see [`serve_round_to_unjudged`].
+        if decode_frame(&frame).ok().and_then(|(f, _)| f.frame_type()) == Some(FrameType::BeaconReq) {
+            if !answered {
+                answered = serve_round_to_unjudged(&conn, &t).await;
+            }
+            continue;
+        }
         if !admitted_unjudged(&frame) {
             // Counted, because "a peer we cannot judge is talking to us about something else" is the shape
             // an operator would want to see rising, and it is invisible everywhere else: this connection is
@@ -4687,6 +4772,10 @@ mod tests {
             "`on_beacon_req` sends the round TO `from`, so admitting this would let a stranger aim our \
              reply at a coordinate it merely named"
         );
+        // Refused **to the engine**, which is not the same as unanswered: `serve_round_to_unjudged` replies
+        // on the connection the request arrived on, where the coordinate is never consulted and so cannot be
+        // aimed. Kept as one assertion with a note rather than two predicates, because the distinction is
+        // about *where the reply goes*, not about which frames cross.
         for other in [FrameType::BeaconPartial, FrameType::Hello, FrameType::Relay, FrameType::ObservedAddr] {
             assert!(
                 !admitted_unjudged(&framed(other, b"x")),
@@ -4694,6 +4783,31 @@ mod tests {
             );
         }
         assert!(!admitted_unjudged(b"not-a-frame"), "an undecodable frame is not admitted by default");
+    }
+
+    /// The cache an unjudged peer is served from may hold **only** an assembled round.
+    ///
+    /// `serve_round_to_unjudged` writes whatever `last_round` holds onto a connection whose peer proved
+    /// nothing, so this predicate is the entire gate on what a stranger can ever be handed. A round carries
+    /// its own proof against the group commitment and is being broadcast to every point of the plane anyway;
+    /// anything else that reached this cache would be a frame the sender chose the audience for.
+    ///
+    /// Both directions, because a gate asserted only where it opens is satisfied by one that never closes —
+    /// and `BeaconPartial` is the near miss that matters: it is a beacon frame, it is not self-proving alone.
+    #[test]
+    fn only_an_assembled_round_may_enter_the_cache_a_stranger_is_served_from() {
+        let framed = |ty: FrameType, body: &[u8]| {
+            let mut out = Vec::new();
+            encode_frame(ty.code(), body, &mut out);
+            out
+        };
+        assert!(is_beacon_round(&framed(FrameType::Beacon, b"round-ish")), "an assembled round is the payload");
+        for other in
+            [FrameType::BeaconReq, FrameType::BeaconPartial, FrameType::Hello, FrameType::Relay, FrameType::ObservedAddr]
+        {
+            assert!(!is_beacon_round(&framed(other, b"x")), "{other:?} must never become what a stranger is handed");
+        }
+        assert!(!is_beacon_round(b"not-a-frame"), "and an undecodable frame is not a round by default");
     }
 
     #[test]

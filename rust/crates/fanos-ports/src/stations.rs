@@ -402,6 +402,21 @@ pub enum Station {
     ///
     /// Not keyed by line, like the rest of this group: the sender's coordinate is an unproven claim.
     RestrictedFrameAdmitted,
+    /// This node handed an **unjudged** peer the current beacon round, on the connection the peer's
+    /// `BeaconReq` arrived on (#235).
+    ///
+    /// **The one reply a stranger may cause, and the only one it needs.** A round authenticates itself
+    /// against the group commitment, so handing it over discloses nothing that is not already being
+    /// broadcast to every point of the plane. It is served **at most once per connection**, which is not a
+    /// chosen limit: adopting one round makes the reshuffle loop rewrite this node's HELLO, so the very next
+    /// send opens a connection both sides can judge, and a second answer here could serve no honest purpose.
+    ///
+    /// **What a nonzero count means.** Some peer was outside this node's `{N−1, N, N+1}` epoch window and
+    /// not at genesis — i.e. it had fallen behind rather than newly joined, since a joining node is
+    /// judgeable for ever under the genesis pin. Expect it to be small and to accompany
+    /// [`PeerUnjudged`](Self::PeerUnjudged); a rising count says rounds are being missed somewhere, which
+    /// the beacon's own assembly rate is the place to measure.
+    RestrictedRoundServed,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1028,6 +1043,7 @@ impl Station {
         Self::HelloEpochUnknown,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
+        Self::RestrictedRoundServed,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1095,6 +1111,7 @@ impl Station {
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
+            Self::RestrictedRoundServed => "hello.restricted_round_served",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1234,6 +1251,7 @@ impl Station {
             | Self::HelloEpochUnknown
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
+            | Self::RestrictedRoundServed
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld
