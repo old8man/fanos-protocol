@@ -486,6 +486,18 @@ pub enum Station {
     /// unreachable, `2` the address answered as *this node* (a stale binding pointing at ourselves).
     /// [`Observation::line`] is the contested point the arbitration was about.
     ArbitrationDial,
+    /// How many members this node's view held **at the end of an epoch**, recorded once per boundary.
+    ///
+    /// **A series, not a total, and that is the point.** `membership.repeat_ignored` cannot separate the two
+    /// things it counts — a benign repeat while a join flood drains, and a node locked out because
+    /// `members` is keyed by a coordinate whose occupant the beacon has just changed. This measures the
+    /// *consequence* instead: a view that refills to the cell's size after every boundary is healthy, one
+    /// that decays epoch by epoch is the lock-out, and no interpretation of a repeat count is needed to tell
+    /// them apart.
+    ///
+    /// [`Observation::tag`] carries the size. Recorded **before** the boundary clears the map, so it reports
+    /// what the epoch actually ended with rather than what the next one starts from.
+    MembershipSize,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1118,6 +1130,7 @@ impl Station {
         Self::RelayOriginRefused,
         Self::MembershipRepeatIgnored,
         Self::ArbitrationDial,
+        Self::MembershipSize,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1191,6 +1204,7 @@ impl Station {
             Self::RelayOriginRefused => "transport.relay_origin_refused",
             Self::MembershipRepeatIgnored => "membership.repeat_ignored",
             Self::ArbitrationDial => "directory.arbitration_dial",
+            Self::MembershipSize => "membership.size",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1285,6 +1299,7 @@ impl Station {
             | Self::ConnMovedWithPeer
             | Self::EpochAgreeBelowQuorum
             | Self::ArbitrationDial
+            | Self::MembershipSize
             | Self::RestrictedPullAsked => {
                 TagKind::Quantity
             }

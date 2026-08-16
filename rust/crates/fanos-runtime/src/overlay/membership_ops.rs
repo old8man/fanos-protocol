@@ -192,6 +192,14 @@ impl<F: Field> OverlayNode<F> {
         // refills from the re-announce every node emits when it reseats (`on_reseat` → `on_join`). A peer
         // whose re-announce is lost is missing for one epoch — against being locked out permanently, which is
         // what the measurement above shows the alternative to be.
+        // Recorded before the clear, so it reports what this epoch ended with — see `MembershipSize`. The
+        // pair (`size` per epoch, `repeat_ignored` total) is what separates a draining flood from a lock-out.
+        self.stations.record_tagged(
+            Station::MembershipSize,
+            None,
+            u64::try_from(self.membership.members.len()).ok(),
+            1,
+        );
         self.membership.members.clear();
         // The epoch re-draws every node's VRF coordinate, so every cell position keeps its name and changes
         // its occupant. State addressed by a position stops describing what its address says — see

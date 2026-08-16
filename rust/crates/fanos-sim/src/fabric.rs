@@ -1871,16 +1871,29 @@ mod tests {
         // each epoch while `members` is keyed by position and is **not** cleared at the boundary, so after a
         // turn an announcement can land on a point some *previous* occupant still holds and be dropped.
         //
-        // The station's own reading rule is what this measures: repeats cluster while a flood drains,
-        // lock-outs appear **after** a boundary and do not stop. So the count is read at two instants — once
-        // before any boundary and once several epochs later — and it is the *growth* that carries the claim,
-        // not the total. A total would be satisfied by an ordinary flood terminating.
+        // **The repeat counter turned out to be the wrong observable, and this measurement is what showed
+        // it.** It conflates a benign repeat while a join flood drains with a genuine lock-out, and after the
+        // boundary clear landed it went *up* (75–122 against 52–107) while the actual behaviour improved,
+        // because every node now re-announces every epoch. It is still printed, as the symptom it is.
+        //
+        // **What decides is `membership.size`** — one row per epoch end, tagged with the size the epoch
+        // closed with, which measures the *consequence* rather than the symptom. Measured on a five-node
+        // fleet at the derived floor epoch:
+        //
+        //   without the boundary clear:  0, 4, 5, 7, 8, 9, 10, 10   ← monotone, to TWICE the cell size
+        //   with it:                     0, 4, 4, 4, 4, 4,  5,  5   ← steady at the cell size
+        //
+        // Without clearing, every node re-announces at a *new* coordinate each epoch and nothing removes the
+        // old entry, so a five-node cell's view grows toward the plane's 21 points — and as it fills, more
+        // and more announcements land on an occupied coordinate and are refused. That is the lock-out, and
+        // the growth curve is the proof the repeat count could not give.
         use fanos_field::F4;
         use fanos_node::RoleSet;
         use fanos_runtime::ports::stations::Station;
 
-        async fn ignored(fleet: &NodeFleet) -> Vec<u64> {
+        async fn ignored(fleet: &NodeFleet) -> (Vec<u64>, Vec<Vec<(u64, u64)>>) {
             let mut out = Vec::new();
+            let mut sizes = Vec::new();
             for n in fleet.nodes() {
                 let mut events = n.client().subscribe();
                 if !n.client().command(fanos_runtime::Command::Observe) {
@@ -1903,8 +1916,17 @@ mod tests {
                 out.push(
                     seen.iter().filter(|o| o.station == Station::MembershipRepeatIgnored).map(|o| o.count).sum(),
                 );
+                // The series that decides it: one row per epoch end, tagged with the size the epoch closed
+                // with. A view refilling to the cell's size every boundary is healthy; one decaying epoch by
+                // epoch is the lock-out, and no reading of a repeat count is needed to tell them apart.
+                sizes.push(
+                    seen.iter()
+                        .filter(|o| o.station == Station::MembershipSize)
+                        .map(|o| (o.tag.unwrap_or(0), o.count))
+                        .collect::<Vec<_>>(),
+                );
             }
-            out
+            (out, sizes)
         }
 
         let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
@@ -1913,11 +1935,11 @@ mod tests {
             .expect("fleet starts");
         // Before any boundary: whatever the join flood produced, and nothing else.
         tokio::time::sleep(floor / 2).await;
-        let at_genesis = ignored(&fleet).await;
+        let (at_genesis, _) = ignored(&fleet).await;
         let epochs_before: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
         // Several boundaries later.
         tokio::time::sleep(8 * floor).await;
-        let after = ignored(&fleet).await;
+        let (after, sizes) = ignored(&fleet).await;
         let epochs_after: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
         let addrs: Vec<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
         fleet.shutdown().await;
@@ -1929,7 +1951,8 @@ mod tests {
             .collect();
         println!(
             "MEASURED membership.repeat_ignored: at genesis {at_genesis:?} (epochs {epochs_before:?}), after \
-             {after:?} (epochs {epochs_after:?}), growth {growth:?}, addresses {addrs:?}"
+             {after:?} (epochs {epochs_after:?}), growth {growth:?}; membership.size per node as \
+             (size, epochs-ending-at-that-size) {sizes:?}; addresses {addrs:?}"
         );
     }
 
