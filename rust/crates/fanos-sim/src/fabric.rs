@@ -2216,10 +2216,19 @@ mod tests {
             // outranked and therefore able to advance. A node reading `true` here while its index stays at 0
             // is one the rule should have moved and did not.
             //
-            // **And do not pool the resolution counts across runs.** Three runs of this harness gave
-            // baselines of 7/8, 4/8 and 1/8 at unchanged host load with nothing in the executed path
-            // differing between them. A constant rate does not produce that, so the run-to-run swing is an
-            // unexplained variable of its own and no epoch comparison survives being averaged over it.
+            // **Measured 2026-08-16 with this column: `false` almost everywhere, including every unresolved
+            // trial.** Two nodes share a point and *neither* considers itself outranked — impossible under a
+            // total order if both held the other's claim, since exactly one of a colliding pair must be
+            // beaten. So `contender` is not returning the rival at all: the best claim it finds there is a
+            // third node whose walk merely passes through, which loses to the incumbent. The rival's claim to
+            // the contested point is **absent from the book**, which closes the chain on the mechanism this
+            // harness already measured — `transport.self_connection`, the directory serving the contested
+            // point as one address, so the pair cannot reach each other to exchange claims.
+            //
+            // **Epoch arms, four runs, with the outlier kept.** Baseline 7/8, 4/8, 1/8, 3/8 against treatment
+            // 6/8, 8/8, 8/8, 8/8. Runs 2–4 are a paired within-run contrast of 8/24 vs 24/24 and each run is
+            // its own control, so the epoch turn probably does help; run 1 contradicts it and nothing in the
+            // executed path differed. Report the outlier rather than averaging it away.
             let contended: Vec<_> =
                 fleet.nodes().iter().map(|n| n.handle().seat_outranked::<F4>(n.directory())).collect();
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
