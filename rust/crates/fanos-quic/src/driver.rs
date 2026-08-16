@@ -771,6 +771,16 @@ enum SendRequest {
     To { to: Triple, frame: Vec<u8> },
     /// One frame to every connection this node holds, resolving nothing — see [`Effect::Flood`].
     Flood { frame: Vec<u8> },
+    /// **Reach a peer by ADDRESS, with no frame to deliver** — the arbitration's missing seam.
+    ///
+    /// Every other request here names a coordinate, which is exactly what a displaced or displacing node
+    /// cannot use: the two of them share a point, so each one's table resolves it to *itself*
+    /// (`transport.self_connection`, measured 20 of 20 frames delivered to the sender). The arbitration
+    /// outcomes are the one place an *address* for the other party is in hand — `Displaced { evicted }` and
+    /// `Superseded { keeping }` both carry one — and a dial is all that is needed, because the handshake
+    /// exchanges HELLOs and each side then holds the other's **verified** claim, which is the input
+    /// `settle_index` was missing.
+    Dial { to: Triple, addr: SocketAddr },
 }
 
 /// The transport's shared context: everything the send and receive paths need besides the destination.
@@ -874,6 +884,13 @@ pub struct NodeHandle {
     claims: Option<ClaimBook>,
     /// The self-certifying identity, for [`coordinate_prover`](Self::coordinate_prover). `None` under directory trust.
     identity: Identity,
+    /// The transport's request channel, kept so the *arbitration* can ask for a dial by **address**.
+    ///
+    /// Everything else reaches a peer by coordinate, and a node that has just displaced another — or been
+    /// refused by one — is precisely the case where a coordinate is useless: the two share a point, so each
+    /// table resolves it to *itself* (`transport.self_connection`, measured 20 of 20 frames delivered to the
+    /// sender). What the arbitration outcome holds is an address. See [`SendRequest::Dial`].
+    dials: mpsc::UnboundedSender<SendRequest>,
     /// The node's **live** overlay coordinate.
     ///
     /// Shared and mutable because a coordinate moves: every epoch by the beacon reshuffle (spec §L3), and within an epoch
@@ -1921,6 +1938,7 @@ where
             joining: true,
         },
         Reseater {
+            dials: handle.dials.clone(),
             capabilities,
             local_addr,
             directory: dir_for_reshuffle,
@@ -2120,6 +2138,8 @@ struct Placement {
 /// Grouped because they are never touched apart: a placement that reached the engine but not the directory, or the
 /// directory but not the published HELLO, is a node peers cannot dial at a point it believes it holds.
 struct Reseater {
+    /// See [`NodeHandle::dials`] — the one seam that reaches a peer by address rather than by coordinate.
+    dials: mpsc::UnboundedSender<SendRequest>,
     capabilities: Capabilities,
     local_addr: SocketAddr,
     directory: Directory,
@@ -2165,7 +2185,15 @@ impl Reseater {
         match self.directory.insert_claimed(point, self.local_addr, at.output, index) {
             WriteOutcome::Displaced { evicted } => {
                 self.client.record_station(Station::DirectoryPointTaken, Some(point), None);
-                tracing::debug!(?point, index, ?evicted, "settled seat taken from its holder; it must walk on");
+                tracing::debug!(?point, index, ?evicted, "settled seat taken from its holder; telling it so");
+                // **"It must walk on" was a log line, and the peer it is about could not hear it.** Having
+                // taken the point, this node's own table now resolves it to *itself*, so no
+                // coordinate-addressed frame can reach the evicted holder — and its table resolves the same
+                // point to *itself*, which is the `transport.self_connection` this harness measures. The
+                // eviction is the one moment an **address** for it is in hand, and a dial is enough: the
+                // handshake hands it this node's HELLO, so its book gains the very claim that outranks it and
+                // `settle_index` can finally move it along its walk.
+                let _ = self.dials.send(SendRequest::Dial { to: point, addr: evicted });
             }
             WriteOutcome::Bound | WriteOutcome::Unchanged => {}
             WriteOutcome::Superseded { keeping } => {
@@ -2184,18 +2212,15 @@ impl Reseater {
                 // the ordinary path. That is exactly the fact the book is missing, obtained the one way the
                 // claim book will accept it.
                 //
-                // **Why a ping and not a new mechanism.** `Reseater` holds no `Transport` and cannot dial, so
-                // for a long time this looked like it needed one; it needs a *send*, and `Command::Emit`
-                // already is one. The frame is a `Ping` because the point is the connection, not the payload.
+                // **A dial by address, not a frame by coordinate.** The first version emitted a `Ping` at
+                // `point`, which works only while the table still holds the incumbent's binding and self-
+                // connects the moment it does not. [`SendRequest::Dial`] carries the address the refusal
+                // itself handed over, so it cannot be confounded by whatever the table currently says.
                 //
-                // **Bounded by the connection cache, not by a timer.** The first emit dials and the
-                // connection is filed under the incumbent's coordinate, so a later refusal reuses it rather
-                // than dialling again. The measured failure this addresses is the one where the loser can
-                // never learn why it lost: `transport.self_connection` on the contested point, which is the
-                // incumbent dialling itself because the directory serves that point as one address.
-                let mut ping = Vec::new();
-                encode_frame(FrameType::Ping.code(), &[], &mut ping);
-                let _ = self.client.command(Command::Emit { to: point, frame: ping });
+                // **Bounded by the connection cache, not by a timer**: the dial files the connection under
+                // the incumbent's proven coordinate, so a later refusal reuses it rather than dialling
+                // again.
+                let _ = self.dials.send(SendRequest::Dial { to: point, addr: keeping });
                 return true;
             }
         }
@@ -2729,6 +2754,7 @@ fn spawn_inner(
     supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
     supervise(DriverActor::Accept, &stations, &stopping, tokio::spawn(accept_loop(transport.clone())));
     supervise(DriverActor::Transport, &stations, &stopping, tokio::spawn(transport_loop(transport, send_rx)));
+    let dial_tx = send_tx.clone();
     supervise(DriverActor::Engine, &stations, &stopping, tokio::spawn(engine_loop(
         engine, input_rx, input_tx.clone(), send_tx, notify_tx, distrust, Arc::clone(&last_round),
     )));
@@ -2741,6 +2767,7 @@ fn spawn_inner(
     );
 
     Ok(NodeHandle {
+        dials: dial_tx,
         addr: seat,
         stations,
         stopping,
@@ -2913,6 +2940,15 @@ async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendR
             SendRequest::Flood { frame } => {
                 let flooding = t.clone();
                 tokio::spawn(async move { flood_connections(&flooding, &frame).await });
+                continue;
+            }
+            // Spawned, never awaited: this dispatcher must not wait out a `DIAL_TIMEOUT` for a peer nobody
+            // is sending to. The dial's product is the handshake, not a delivery.
+            SendRequest::Dial { to, addr } => {
+                let dialing = t.clone();
+                tokio::spawn(async move {
+                    let _ = get_or_connect(&dialing, to, addr).await;
+                });
                 continue;
             }
         };
@@ -5524,6 +5560,9 @@ mod tests {
                 joining: true,
             },
             Reseater {
+                // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
+                // is what these cases want — they assert the directory outcome, not the transport's reaction.
+                dials: mpsc::unbounded_channel().0,
                 capabilities: Capabilities::CORE,
                 local_addr,
                 directory: directory.clone(),
@@ -5617,6 +5656,9 @@ mod tests {
                 joining: true,
             },
             Reseater {
+                // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
+                // is what these cases want — they assert the directory outcome, not the transport's reaction.
+                dials: mpsc::unbounded_channel().0,
                 capabilities: Capabilities::CORE,
                 local_addr,
                 directory,
