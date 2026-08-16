@@ -49,6 +49,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::StartHeartbeat => "StartHeartbeat",
         Command::Send { .. } => "Send",
         Command::Emit { .. } => "Emit",
+        Command::Broadcast { .. } => "Broadcast",
         Command::Diagnose => "Diagnose",
         Command::Control { .. } => "Control",
         Command::Observe => "Observe",

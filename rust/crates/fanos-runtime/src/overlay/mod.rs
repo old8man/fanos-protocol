@@ -1719,6 +1719,7 @@ impl<F: Field> Engine for OverlayNode<F> {
             // Raw-emit: put the frame on the wire verbatim (no `Route` wrapping) — an anonymous client
             // launching a threshold onion at a combiner or registering with a rendezvous relay (audit #54).
             Input::Command(Command::Emit { to, frame }) => alloc::vec![Effect::Send { to, frame }],
+            Input::Command(Command::Broadcast { frame }) => alloc::vec![Effect::Flood { frame }],
             Input::Command(Command::Diagnose) => self.on_diagnose(now),
             Input::Command(Command::Observe) => self.on_observe(now),
             // Sense-only, like `Observe` beside it: the store is read, nothing is armed, nothing moves.

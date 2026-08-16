@@ -76,7 +76,10 @@ fn emissions(cover_ms: u64, delay_ms: u64, real_cells: usize) -> usize {
         ($effects:expr) => {
             for e in $effects {
                 match e {
+                    // A mix relay emits no floods; counting them with sends would blur the one quantity this
+                    // test is about, which is how many addressed frames left the node.
                     Effect::Send { .. } => emitted += 1,
+                    Effect::Flood { .. } => {}
                     Effect::ArmTimer { token, after } => {
                         armed.push((now + after.as_nanos() as u64, token));
                     }

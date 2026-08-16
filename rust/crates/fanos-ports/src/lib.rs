@@ -166,6 +166,18 @@ pub enum Command {
         /// The exact frame bytes to put on the wire.
         frame: Vec<u8>,
     },
+    /// Put an exact frame on **every connection this node holds**, resolving nothing — the command-surface
+    /// counterpart of [`Effect::Flood`].
+    ///
+    /// **For a frame whose audience is the cell rather than a peer**, and whose authority travels with it.
+    /// The case it exists for is an authenticated recovery trigger: it is signed by the beacon authority, so
+    /// every recipient verifies it independently and the path it arrived by grants nothing. Emitting it to
+    /// each coordinate in turn would be the same frame `q² + q + 1` times through a resolution layer it does
+    /// not need, and would fail exactly when the cell is unwell enough to need it.
+    Broadcast {
+        /// The exact frame bytes to put on the wire.
+        frame: Vec<u8>,
+    },
     /// Run one round of local self-diagnosis and report the verdict (spec §6.9).
     Diagnose,
     /// Emit the cell's current coherence self-observation **without acting** — a sense-only read for

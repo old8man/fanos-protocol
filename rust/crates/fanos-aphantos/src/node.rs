@@ -507,6 +507,9 @@ impl<F: Field> Engine for NyxNode<F> {
             Input::Command(
                 Command::Diagnose
                 | Command::Control { .. }
+                // A mix relay has no cell-wide announcement to make: its whole vocabulary is per-circuit and
+                // addressed. A broadcast here would be traffic with no consumer.
+                | Command::Broadcast { .. }
                 | Command::Observe
                 // Nothing durable: a NYX relay's whole state is in-flight onions and cover timers, which a
                 // restart is *supposed* to drop — resurrecting them would replay traffic the network has
