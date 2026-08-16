@@ -338,6 +338,19 @@ impl<F: Field> DkgNode<F> {
             return Vec::new(); // a commitment may only come from its own dealer
         }
         self.note_commitment(d, commitment);
+        // **A commitment that arrives during the complaint phase still needs its complaint**, and this is
+        // the half the pull was useless without. `open_complaints` draws its candidates from the
+        // commitments held *at the deadline*, so a dealer answering a `DkgCommitReq` afterwards would be
+        // registered and then never complained about — leaving this node holding the commitment, holding no
+        // share, and dropping the dealer from `QUAL` exactly as if the frame had never arrived. Raising it
+        // here puts the late dealer back on the ordinary path: complain, be justified, qualify.
+        //
+        // The guard is the same one `open_complaints` uses, so a dealer that *is* qualifiable (its deal
+        // arrived, only the commitment was lost) is not accused of anything.
+        if self.phase == Phase::Complaint && d != self.index && !self.qualified.contains(&d) {
+            self.complaints.entry(d).or_default().insert(self.index);
+            return Self::broadcast_to_peers(&complaint_frame(self.index, d));
+        }
         Vec::new()
     }
 
@@ -422,6 +435,32 @@ impl<F: Field> DkgNode<F> {
         }
         self.phase = Phase::Complaint;
         let mut effects = Vec::new();
+        // **Ask the dealers we never heard from, before deciding anything about them.** A dealer whose
+        // commitment was lost in transit is not complained about below — `candidates` is drawn from
+        // `commitments`, so an absent one is silently absent from `QUAL` here and present in it everywhere
+        // the frame did arrive. That is the whole of the fork
+        // `one_censored_link_gives_the_dkg_two_different_qualified_sets` measures: one dropped frame, two
+        // different qualified sets, and a final share that verifies against neither the other's aggregate.
+        //
+        // **A pull to the dealer, not a relay through a peer**, and the difference is forced rather than
+        // chosen: every frame in this class is authenticated by the transport's `from` (`on_commit` refuses
+        // unless `dealer_of(from) == Some(d)`), so a commitment handed over by anyone else is refused by the
+        // rule that stops a bogus one being pre-registered for a silent dealer. The only participant that can
+        // answer for `d` is `d`, so the request goes there and the answer arrives with the authentication it
+        // needs. It is the same shape `BeaconNode::request_sync` uses and it needs no new trust: the request
+        // is contentless, and the answer is a commitment the dealer was already broadcasting to everyone.
+        //
+        // **Bounded by the participant set**, one request per missing dealer per ceremony, sent at the one
+        // instant the missing ones are known — so there is no retry timer to size and nothing to keep in
+        // step with the phase deadlines.
+        for d in 1..=self.n as u8 {
+            if d != self.index && !self.commitments.contains_key(&d) {
+                effects.push(Effect::Send {
+                    to: Self::coord_of(d),
+                    frame: frame(FrameType::DkgCommitReq, &[]),
+                });
+            }
+        }
         let candidates: Vec<u8> = self.commitments.keys().copied().collect();
         for d in candidates {
             if !self.qualified.contains(&d) {
@@ -490,6 +529,29 @@ impl<F: Field> DkgNode<F> {
         // share verifies against it. Every honest node folds the same QUAL, so all agree on this.
         self.aggregate = VssCommitment::aggregate(&refs);
         alloc_vec_notify(joint)
+    }
+
+    /// Answer a participant that reached the sharing deadline without this node's commitment.
+    ///
+    /// Silent unless this node has dealt — there is nothing to hand over before `start`, exactly as
+    /// `BeaconNode::on_beacon_req` is silent before its first round. The reply carries **only this node's
+    /// own** commitment, which is what makes the pull sound: the requester's `on_commit` will refuse
+    /// anything else, and this node cannot speak for another dealer even if asked to.
+    ///
+    /// The request is not authenticated beyond the transport, and does not need to be: it names nothing,
+    /// and the answer is a frame this node broadcast to the whole cell moments earlier. The cost of a
+    /// forged request is one re-send of public data to a peer that could have read it from the broadcast.
+    fn on_commit_req(&mut self, from: Triple) -> Vec<Effect> {
+        if self.done {
+            return Vec::new();
+        }
+        let Some(dealing) = self.dealing.as_ref() else {
+            return Vec::new();
+        };
+        std::vec![Effect::Send {
+            to: from,
+            frame: commit_frame(self.index, dealing.commitment()),
+        }]
     }
 
     /// Broadcast `frame` to every *other* cell member (the reliable-broadcast primitive).
@@ -612,6 +674,7 @@ impl<F: Field> Engine for DkgNode<F> {
                     Some(FrameType::DkgCommit) => self.on_commit(from, f.body),
                     Some(FrameType::DkgComplaint) => self.on_complaint(from, f.body),
                     Some(FrameType::DkgJustify) => self.on_justify(from, f.body),
+                    Some(FrameType::DkgCommitReq) => self.on_commit_req(from),
                     _ => Vec::new(),
                 },
                 Err(_) => Vec::new(),
@@ -918,6 +981,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The companion to the tripwire above, and the acceptance test for the commitment pull: when the loss
+    /// is **transient** rather than a permanently dark link, `QUAL` no longer forks.
+    ///
+    /// Dealer 0's frames to node 1 are dropped for the whole sharing phase and the link then opens — one
+    /// outage, which is what a real transport produces and what the tripwire deliberately does not model.
+    /// At the sharing deadline node 1 notices it holds no commitment from dealer 0 and **asks dealer 0 for
+    /// it**; the answer arrives with the authentication `on_commit` requires, because the only participant
+    /// that can answer for a dealer is that dealer. Node 1 then lacks only its *share*, complains through
+    /// the ordinary path, is justified, and finalizes on the same qualified set as everyone else.
+    ///
+    /// Both endpoints asserted: the aggregate commitments agree **and** the recovered node's final share
+    /// verifies against the group's, since agreeing on a commitment while holding an unusable share would be
+    /// the same defect wearing a different face.
+    #[test]
+    fn a_transient_outage_no_longer_forks_qual_because_the_dealer_is_asked_directly() {
+        let (n, t) = (7usize, 4usize);
+        let mut nodes: Vec<DkgNode<F2>> = (0..n)
+            .map(|i| {
+                DkgNode::<F2>::new(Point::at(i), t, [i as u8 + 1; 32], [(i as u8) ^ 0x5A; 32])
+                    .with_deadlines(Duration::from_millis(10), Duration::from_millis(10))
+            })
+            .collect();
+        let dark_from = Point::<F2>::at(0).coords();
+        let dark_to = 1usize;
+
+        let mut clock = 0u64;
+        let mut bus: Vec<(Triple, usize, Vec<u8>)> = Vec::new();
+        for (k, node) in nodes.iter_mut().enumerate() {
+            let origin = Point::<F2>::at(k).coords();
+            for e in node.step(Instant(0), Input::Command(Command::StartHeartbeat)) {
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(j) = node_at_f2(to)
+                            && !(origin == dark_from && j == dark_to)
+                        {
+                            bus.push((origin, j, frame));
+                        }
+                    }
+                    Effect::Flood { frame } => {
+                        for j in 0..n {
+                            if j != k && !(origin == dark_from && j == dark_to) {
+                                bus.push((origin, j, frame.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The outage lasts exactly as long as the sharing phase.
+        while !bus.is_empty() {
+            let (from, target, frame) = bus.remove(0);
+            clock += 1;
+            let origin = Point::<F2>::at(target).coords();
+            for e in nodes[target].step(Instant(clock), Input::Message { from, frame }) {
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(k) = node_at_f2(to)
+                            && !(origin == dark_from && k == dark_to)
+                        {
+                            bus.push((origin, k, frame));
+                        }
+                    }
+                    Effect::Flood { frame } => {
+                        for k in 0..n {
+                            if k != target && !(origin == dark_from && k == dark_to) {
+                                bus.push((origin, k, frame.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Sharing deadline: node 1 asks dealer 0 for the commitment it never received. From here the link is
+        // whole again, so the answer, the complaint and the justification all flow.
+        for (k, node) in nodes.iter_mut().enumerate() {
+            let origin = Point::<F2>::at(k).coords();
+            for e in node.step(Instant(100), Input::Timer(DKG_SHARE_DEADLINE)) {
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(j) = node_at_f2(to) {
+                            bus.push((origin, j, frame));
+                        }
+                    }
+                    Effect::Flood { frame } => {
+                        for j in 0..n {
+                            if j != k {
+                                bus.push((origin, j, frame.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drain(&mut nodes, &mut bus, &mut clock);
+        for node in &mut nodes {
+            let _ = node.step(Instant(200), Input::Timer(DKG_COMPLAINT_DEADLINE));
+        }
+        drain(&mut nodes, &mut bus, &mut clock);
+
+        let agg_majority = nodes[0].aggregate_commitment().expect("the unaffected nodes complete");
+        let agg_recovered = nodes[dark_to].aggregate_commitment().expect("the interrupted node completes");
+        assert_eq!(
+            agg_recovered.to_bytes(),
+            agg_majority.to_bytes(),
+            "a transient outage must not fork QUAL once the missing commitment can be asked for directly"
+        );
+        assert!(
+            vss::verify_share(&nodes[dark_to].final_share(), &agg_majority),
+            "and the recovered node's final share verifies against the group aggregate — it is beacon-ready, \
+             not merely in agreement about the commitment"
+        );
     }
 
     /// **A tripwire, and it asserts a defect rather than a property.** One node's inbox is censored — every

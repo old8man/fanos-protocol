@@ -65,6 +65,10 @@ pub enum FrameType {
     DkgJustify = 0x15,
     DkgCommit = 0x16,
     DkgComplaint = 0x17,
+    /// A request to a dealer for its own commitment, sent by a participant that reached the sharing
+    /// deadline without one (#DKG-QUAL). Contentless: it is addressed to the dealer, and the only
+    /// commitment that dealer may answer with is its own.
+    DkgCommitReq = 0x1D,
     /// One anchor's distributed-VRF **beacon partial** for an epoch (audit E5): flooded among the
     /// beacon group; a threshold of them assemble the epoch's [`Beacon`](Self::Beacon) round.
     BeaconPartial = 0x18,
@@ -216,6 +220,7 @@ impl FrameType {
             0x15 => Self::DkgJustify,
             0x16 => Self::DkgCommit,
             0x17 => Self::DkgComplaint,
+            0x1D => Self::DkgCommitReq,
             0x18 => Self::BeaconPartial,
             0x19 => Self::EpochAgree,
             0x1A => Self::BeaconReshareTrigger,
@@ -259,7 +264,7 @@ impl FrameType {
     /// Completeness is a compile-time fact, not a test: the assertion below compares this list's length to
     /// the variant count, so adding a type without listing it here fails the build. A test could only visit
     /// the variants the list already holds, which is exactly the one it would need to notice.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Hello,
         Self::HelloAck,
         Self::Ping,
@@ -276,6 +281,7 @@ impl FrameType {
         Self::DkgJustify,
         Self::DkgCommit,
         Self::DkgComplaint,
+        Self::DkgCommitReq,
         Self::BeaconPartial,
         Self::EpochAgree,
         Self::BeaconReshareTrigger,
@@ -331,6 +337,7 @@ impl FrameType {
             Self::DkgJustify => "dkg_justify",
             Self::DkgCommit => "dkg_commit",
             Self::DkgComplaint => "dkg_complaint",
+            Self::DkgCommitReq => "dkg_commit_req",
             Self::BeaconPartial => "beacon_partial",
             Self::EpochAgree => "epoch_agree",
             Self::BeaconReshareTrigger => "beacon_reshare_trigger",
