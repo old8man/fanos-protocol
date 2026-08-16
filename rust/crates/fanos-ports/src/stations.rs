@@ -502,6 +502,22 @@ pub enum Station {
     /// [`Observation::tag`] carries the size. Recorded **before** the boundary clears the map, so it reports
     /// what the epoch actually ended with rather than what the next one starts from.
     MembershipSize,
+    /// A beacon stall was confirmed and this node **escalated** for an authorized recovery (audit §4).
+    ///
+    /// **The half of R-C2 that was missing.** The detector is wired — `RECOVERY_PATIENCE` epoch-driver
+    /// periods with no beacon advance, with a rank-delayed election so the cell emits one action rather than
+    /// one per node — and a node correctly does *not* self-issue, because it holds no authority secret and
+    /// cannot sign the trigger (§2.1). But the decision reached only a `tracing::warn!`, so the recovery of
+    /// last resort was a log line: nothing an operator's tooling could see without scraping.
+    ///
+    /// [`Observation::tag`] carries the regime: `0` a proactive reshare (the anchor set thinned but a
+    /// threshold survives), `1` a re-genesis request (the beacon is frozen below threshold). The two want
+    /// different responses and the same authority key, which is why they are one station with a tag rather
+    /// than an undifferentiated alarm.
+    ///
+    /// **What a nonzero count obliges.** Someone must run `fanos beacon-reshare` with the recovery-authority
+    /// key; nothing else advances the epoch, and until it does every per-epoch rotation is stopped.
+    RecoveryEscalated,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1135,6 +1151,7 @@ impl Station {
         Self::MembershipRepeatIgnored,
         Self::ArbitrationDial,
         Self::MembershipSize,
+        Self::RecoveryEscalated,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1209,6 +1226,7 @@ impl Station {
             Self::MembershipRepeatIgnored => "membership.repeat_ignored",
             Self::ArbitrationDial => "directory.arbitration_dial",
             Self::MembershipSize => "membership.size",
+            Self::RecoveryEscalated => "recovery.escalated",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1304,6 +1322,7 @@ impl Station {
             | Self::EpochAgreeBelowQuorum
             | Self::ArbitrationDial
             | Self::MembershipSize
+            | Self::RecoveryEscalated
             | Self::RestrictedPullAsked => {
                 TagKind::Quantity
             }

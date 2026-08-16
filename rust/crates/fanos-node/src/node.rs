@@ -219,20 +219,23 @@ const RECOVERY_PATIENCE: usize = 4;
 /// condition and escalates; the operator / parent then issues the authenticated `BeaconNode::reshare_trigger`
 /// / `RecoveryAuthorization`. Returns `(generation, threshold)` unchanged — no state advances until the
 /// authority actually acts.
-fn actuate_recovery(live: &[u8], threshold: usize, generation: u64, epoch: Epoch) -> (u64, usize) {
+fn actuate_recovery(live: &[u8], threshold: usize, generation: u64, epoch: Epoch) -> (u64, usize, Option<u64>) {
     match recovery_decision(live, threshold) {
         RecoveryAction::ProactiveReshare { survivors, new_threshold } => {
             // A node cannot sign the authenticated reshare trigger (§2.1) — escalate for the authority to issue it.
             tracing::warn!(target: "fanos::recovery", new_threshold, survivors = survivors.len(),
                 "beacon thinning — escalating for an authorized proactive reshare (audit §4 Regime A / §2.1)");
-            (generation, threshold)
+            // **Recorded, not merely logged (audit R-C2).** A decision that reaches only a log line is a
+            // recovery of last resort nobody can see; this is the one an operator's tooling reads, and its
+            // obligation is concrete — run `fanos beacon-reshare` with the authority key.
+            (generation, threshold, Some(0))
         }
         RecoveryAction::RequestRegenesis { survivors } => {
             tracing::warn!(target: "fanos::recovery", epoch = epoch.get(), survivors = survivors.len(),
                 "beacon frozen below threshold — escalating for an authorized re-genesis (audit §4 R-C1)");
-            (generation, threshold)
+            (generation, threshold, Some(1))
         }
-        RecoveryAction::None => (generation, threshold),
+        RecoveryAction::None => (generation, threshold, None),
     }
 }
 
@@ -321,7 +324,7 @@ impl RecoveryWatcher {
     /// lowest-index live anchor), actuate the recovery decision, so the cell emits one action, not one per node.
     /// Returns whether this node **actuated** on this tick — the only observable the election has, and
     /// therefore the only thing a test of it can assert on.
-    fn on_tick(&mut self, me: Triple, anchors: &[Triple], live_epoch: Epoch) -> bool {
+    fn on_tick(&mut self, me: Triple, anchors: &[Triple], live_epoch: Epoch) -> (bool, Option<u64>) {
         // Progress, taken from latest-state: an advancing round proves the anchors that produced it are live.
         if live_epoch > self.last_epoch {
             self.last_epoch = live_epoch;
@@ -329,7 +332,7 @@ impl RecoveryWatcher {
             self.confirmations = 0;
         }
         if !self.detector.observe(self.last_epoch) {
-            return false;
+            return (false, None);
         }
         self.confirmations = self.confirmations.saturating_add(1);
 
@@ -351,14 +354,21 @@ impl RecoveryWatcher {
             .iter()
             .position(|&idx| anchors.get(usize::from(idx.saturating_sub(1))) == Some(&me))
         else {
-            return false; // this node is not an anchor, or believes itself down
+            return (false, None); // this node is not an anchor, or believes itself down
         };
         if u32::try_from(rank).unwrap_or(u32::MAX) >= self.confirmations {
-            return false; // not yet this node's turn
+            return (false, None); // not yet this node's turn
         }
-        (self.generation, self.threshold) =
+        let regime;
+        (self.generation, self.threshold, regime) =
             actuate_recovery(&live, self.threshold, self.generation, self.last_epoch);
-        true
+        // **Two different facts, and collapsing them cost a test.** The `bool` is the ELECTION's observable —
+        // "this node took its turn" — which is what a test of the rank-delayed election can assert on and is
+        // true even when the decision turns out to be `None`. The regime is what was decided, and it travels
+        // out rather than the client travelling in: recording the station here would put I/O inside the
+        // decision, and every unit test of the election would then have to build a transport to exercise
+        // arithmetic. The task at the edge records it; see `Station::RecoveryEscalated`.
+        (true, regime)
     }
 }
 
@@ -479,7 +489,13 @@ fn spawn_recovery_trigger(
                 },
                 _ = ticker.tick() => {
                     let live_epoch = beacons.borrow().map_or(Epoch::ZERO, |(e, _)| e);
-                    let _actuated = watcher.on_tick(me, &anchors, live_epoch);
+                    if let (_, Some(regime)) = watcher.on_tick(me, &anchors, live_epoch) {
+                        client.record_station(
+                            fanos_runtime::ports::stations::Station::RecoveryEscalated,
+                            None,
+                            Some(regime),
+                        );
+                    }
                 }
             }
         }
@@ -1781,7 +1797,7 @@ mod tests {
         // frozen epoch and counting how many ticks it takes this node to fire.
         let mut fired_at = None;
         for tick in 1..=(RECOVERY_PATIENCE * 4) {
-            if w.on_tick(me, &anchors, Epoch::ZERO) && fired_at.is_none() {
+            if w.on_tick(me, &anchors, Epoch::ZERO).0 && fired_at.is_none() {
                 fired_at = Some(tick);
             }
         }
@@ -1799,7 +1815,7 @@ mod tests {
         let mut first = RecoveryWatcher::new(4);
         let mut first_fired_at = None;
         for tick in 1..=(RECOVERY_PATIENCE * 4) {
-            if first.on_tick(anchor(&anchors, 0), &anchors, Epoch::ZERO) && first_fired_at.is_none() {
+            if first.on_tick(anchor(&anchors, 0), &anchors, Epoch::ZERO).0 && first_fired_at.is_none() {
                 first_fired_at = Some(tick);
             }
         }
