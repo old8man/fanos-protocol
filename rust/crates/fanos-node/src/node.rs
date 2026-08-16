@@ -746,24 +746,38 @@ const ROLE_CAPACITY_WEIGHT: u16 = 4;
 
 /// The assignment controller's loop gain `κ = ROLE_GAIN_SEVENTH/7`. `7` is `κ = 1`: track the setpoint in one step.
 ///
-/// **This must stay 1, and the reason is cell agreement rather than tracking speed.** The step is
-/// `D' = D + κ(setpoint − D)`, so at `κ = 1` it collapses to `D' = setpoint`: one step erases the history, and a
-/// node that joined this epoch derives the same demand as one that has run for fifty. Below 1 the demand is a
-/// function of how many times *this* node has stepped, and the assignment is derived from the demand — so two
-/// members holding the same agreed setpoint assign different roles, which is exactly the determinism the whole
-/// self-organizing design rests on (`role_loop`: "every node steps an identical controller over the same agreed
-/// inputs"). Measured in `fanos_core::roles`: at `κ = 1/7` a joining node and an incumbent disagree about who
-/// serves what for well over five epochs, each of them a `DEFAULT_EPOCH_PERIOD`.
+/// **This doc has said "must stay 1" and "should be lowered" in turn, and both were true of their moment.**
+/// It is kept as a history because the constant is exactly the kind that invites a change, and each reason
+/// died for a different cause.
 ///
-/// This doc used to say the opposite — "a telemetry-driven sensor should lower it so the Lyapunov descent
-/// smooths real load jitter" — written when the sensor was a placeholder and the setpoint could not move.
-/// With all five role sensors live (`role_loop::LoadSensor`) the jitter is real, so the advice would now be
-/// taken, and taking it would fork the cell's assignment on every join.
+/// * *"Lower it so the Lyapunov descent smooths load jitter"* — written when the sensor was a placeholder and
+///   the setpoint could not move. It died when the sensors went live and the advice became takeable.
+/// * *"It must stay 1, because below 1 the demand is a function of how many times **this** node stepped, so
+///   two members holding the same setpoint assign different roles"* — true of `RoleController::step`, which
+///   folds the setpoint into a **carried** demand. It died when the assignment path stopped calling it.
 ///
-/// Damping therefore belongs on the **setpoint**, not on the demand: the setpoint is a cell aggregate every
-/// member reads identically out of the load directory, so smoothing it over a bounded window of *published
-/// epochs* rejects noise while staying history-free — any node can fetch the same window and get the same
-/// number. Deriving that window is the open work; the wrong fix is the one this constant used to recommend.
+/// **What is true now: cell agreement no longer rests on this constant's value.**
+/// [`role_loop::LiveRoleController::step`] derives the demand with
+/// [`RoleController::demand_from_setpoints`](fanos_core::roles::RoleController::demand_from_setpoints) —
+/// the same law replayed from the shared `floor` rather than stepped from local history — so two nodes
+/// reading one setpoint reach one demand **at any gain**. `RoleController::step` itself is now reached only
+/// from `fanos-core`'s own tests. That doc records the change and its reason; this one must not contradict it.
+///
+/// So the gain is free, and `7` (κ = 1, `D' = setpoint`) is the *undamped* choice rather than a forced one.
+/// Two things to weigh before lowering it:
+///
+/// 1. **Damping here costs a time constant of `1/κ` epochs.** At [`DEFAULT_EPOCH_PERIOD`] κ = 1/7 is about
+///    seventy minutes of lag before the cell's role counts follow a real change in demand.
+/// 2. **The noise it would damp is born in the estimator, not in the aggregation.** A gauged role publishes
+///    [`role_loop::LoadGauge`]'s **instantaneous** in-flight count, sampled once per epoch by
+///    [`crate::loaddir`]'s publisher on the epoch advance. Averaging that occupancy *within* the epoch, before
+///    publication, attacks the same noise **locally and at no lag** — and, unlike smoothing the published
+///    setpoint across epochs, it needs no closed directory to read (`LiveRoleController::step`: a window of
+///    `W` closed setpoints is *"not a trade-off available here; it is unreadable"* at
+///    [`DIRECTORY_SLOT_EPOCHS`](crate::DIRECTORY_SLOT_EPOCHS)` = 1`).
+///
+/// The magnitude of that noise is **unmeasured** — the structure above is read off the code, the size is not.
+/// Measure before spending either cure.
 const ROLE_GAIN_SEVENTH: u8 = 7;
 
 
