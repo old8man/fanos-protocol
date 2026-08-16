@@ -233,6 +233,17 @@ fn line_size<F: Field>() -> usize {
 /// carrying a flow and one that is idle, so it is a different and much weaker thing than #134's burst — and it
 /// is out of this ticket's scope either way. Pinned here so the refutation is not re-derived, and so a change
 /// that stops cover from driving gathers fails at this assertion and gets read.
+/// **The third class in this family was NOT filled, and closing it took `c98b2d5` (#354).** The reasoning
+/// above follows the gather to its *request* and stops there. One step further, `member_share` ends in an
+/// AEAD open, which fails on keystream — so a cover cell drew its `q` requests and then drew **no replies at
+/// all**, while a cargo cell drew `q` of them. Measured on a composed relay cell, `TAG_REP` frames came to
+/// `4 + 4·cells` while this class and the cell class stayed on the slot rate, and a reply is 42 bytes against
+/// a cell's `THRESHOLD_ONION_LEN` — so it separates by size exactly as this one does. `on_request` now answers
+/// an unpeelable request with a decoy share, and the same run reads `replies == requests` at every cargo level.
+///
+/// With that, the family is complete: **cells** unified in width by `cf55ead`, **requests** filled by cover as
+/// argued here, **replies** filled by the decoy. The chain was worth walking one link past where it looked
+/// finished, and the reason it looked finished is that each link is filled by a *different* mechanism.
 #[test]
 fn cover_onions_fill_the_share_request_class_so_its_volume_is_not_a_real_traffic_signal() {
     let (tape, peeler) = run::<F2>(Arm::Reply, shipping(), 0x0D);
