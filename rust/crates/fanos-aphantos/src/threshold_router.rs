@@ -805,6 +805,26 @@ impl<F: Field> ThresholdRouter<F> {
     /// Keyed on the node's mixing secret and bound to `(req_id, line)` so it is deterministic per request —
     /// two decoys for one request are identical, which a retransmission needs, and decoys across requests
     /// are unlinkable without the secret.
+    ///
+    /// # The residual this does not close: the two paths cost different amounts of time
+    ///
+    /// Width is masked and *latency is not*. A cover cell fails at the parse and costs one XOF here; a cargo
+    /// cell costs a hybrid `X25519 ‖ ML-KEM-768` decapsulation plus an AEAD open. The reply goes out
+    /// **immediately**, not on the cover schedule, so request→reply latency carries the difference.
+    ///
+    /// **Who can use it is the whole of the assessment, and it is one party.** Not the combiner: a cover
+    /// cell's gather never converges — it collects `q` decoys and runs the subset search to exhaustion — so
+    /// the combiner learns cover-from-cargo by the deadline whatever the replies' timing. The decoys make
+    /// that costlier, not less certain. That leaves an **off-path network observer**, who sees the frames and
+    /// not their contents; for them the offset is tens of microseconds under millisecond-scale jitter per
+    /// sample, and turning it into a cargo-fraction estimate needs many gathers plus a path calibration to
+    /// the specific member.
+    ///
+    /// **The remedy is cheap and deliberately not applied:** decapsulate against a fixed dummy key on this
+    /// path so both arms pay the same. It is not applied because the channel is **unmeasured** — spending a
+    /// KEM operation per cover cell to close a channel nobody has put a number on is the reasoning this
+    /// module exists to refuse. Measure it on a quiet host first (the offset is a *timing* quantity, so a
+    /// contended box cannot answer it); if it is above the observer's per-sample noise, apply the dummy.
     fn decoy_share(&self, member_index: usize, req_id: u64, line: Triple) -> Share {
         let mut material = self.mix_seed.to_vec();
         material.extend_from_slice(&req_id.to_be_bytes());
