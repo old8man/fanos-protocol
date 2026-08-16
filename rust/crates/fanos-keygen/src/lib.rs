@@ -511,9 +511,27 @@ impl<F: Field> DkgNode<F> {
     ///
     /// **And this is exactly why it must NOT simply become [`Effect::Flood`].** Flooding fixes *reach under
     /// coordinate churn*, which is what the beacon round needed; it does not make a broadcast reliable, so
-    /// it would swap one silent partial-delivery mode for another. What this primitive actually wants is
-    /// either an echo/acknowledgement round, or a `QUAL` derived from a published transcript every
-    /// participant reads rather than from each node's own inbox. Neither is written; the exposure is bounded
+    /// it would swap one silent partial-delivery mode for another.
+    ///
+    /// # Which repair, decided by the tree's own law rather than by taste
+    ///
+    /// Two candidates: an echo/acknowledgement round, or a `QUAL` derived from a **published transcript**
+    /// every participant reads. The choice is already made elsewhere in this workspace —
+    /// `fanos_runtime::healer` states it and counts instances: *"a decision which must agree cell-wide is
+    /// computed from closed published epochs, never from a live local read"*, and names its own case the
+    /// **seventh**. `QUAL` is precisely that shape and is therefore the eighth — and the most severe of them,
+    /// because the others decide provisioning or quality while a divergent `QUAL` yields key shares that do
+    /// not interoperate at all. The healer's own prescription is *"publish, don't sense-and-act"*.
+    ///
+    /// The pieces exist. The ceremony already has the **closed phase** such a rule needs — the
+    /// complaint-phase deadline, after which a node finalizes — and the host (`DkgCeremony` in `fanos-node`)
+    /// already holds a `Client`, so the engine can stay sans-I/O: the host publishes each broadcast frame to
+    /// a slot keyed by `(dealer, phase)` and, at the deadline, **reads the set** before finalizing, instead
+    /// of finalizing on whatever its inbox happened to receive. Reads retry and the store is replicated,
+    /// which is the whole difference from `n − 1` unacknowledged sends.
+    ///
+    /// Not built here: it is a protocol change on the key-generation path and wants its own pass with a test
+    /// that two nodes given different inboxes still finalize on the same `QUAL`. The exposure is bounded
     /// today only by the ceremony running on a freshly-spawned cell whose directory is still fresh.
     fn broadcast_to_peers(&self, frame: &[u8]) -> Vec<Effect> {
         (1..=self.n as u8)
@@ -869,6 +887,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **A tripwire, and it asserts a defect rather than a property.** One node's inbox is censored — every
+    /// frame from dealer 0 is dropped on its way to node 1, which is one lossy link, not an attack — and the
+    /// two nodes then finalize on **different qualified sets**, so their aggregate commitments differ and
+    /// node 1's final share does not verify against the group's.
+    ///
+    /// That is the cost of computing `QUAL` from what each node happened to receive, over `n − 1`
+    /// point-addressed sends with no acknowledgement and no retransmission
+    /// ([`DkgNode::broadcast_to_peers`]). `fanos_runtime::healer` states the governing rule and counts its
+    /// own case as the seventh: *"a decision which must agree cell-wide is computed from closed published
+    /// epochs, never from a live local read"*. This is the eighth, and the most severe — elsewhere a
+    /// divergence costs provisioning quality, here it costs interoperable key material.
+    ///
+    /// **Invert this test when the published transcript lands.** The assertions below are `assert_ne!` and
+    /// a `!verify_share`; both become their opposites, and this doc becomes a note that the rule now holds
+    /// on the key-generation path too. Written this way so the repair cannot land silently and so nobody
+    /// re-derives the failure from the comment alone.
+    #[test]
+    fn one_censored_link_gives_the_dkg_two_different_qualified_sets() {
+        let (n, t) = (7usize, 4usize);
+        let mut nodes: Vec<DkgNode<F2>> = (0..n)
+            .map(|i| {
+                DkgNode::<F2>::new(Point::at(i), t, [i as u8 + 1; 32], [(i as u8) ^ 0x5A; 32])
+                    .with_deadlines(Duration::from_millis(10), Duration::from_millis(10))
+            })
+            .collect();
+        // One directed link, dark in one direction: everything dealer 0 says to node 1 is lost. Node 1 still
+        // hears every other dealer, and every other node still hears dealer 0 — so no participant is faulty
+        // and no frame is forged. This is the mildest failure a real transport produces.
+        let dark_from = Point::<F2>::at(0).coords();
+        let dark_to = 1usize;
+
+        let mut clock = 0u64;
+        let mut bus: Vec<(Triple, usize, Vec<u8>)> = Vec::new();
+        for (k, node) in nodes.iter_mut().enumerate() {
+            for e in node.step(Instant(0), Input::Command(Command::StartHeartbeat)) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(j) = node_at_f2(to)
+                {
+                    let from = Point::<F2>::at(k).coords();
+                    if !(from == dark_from && j == dark_to) {
+                        bus.push((from, j, frame));
+                    }
+                }
+            }
+        }
+        // The censoring drain, otherwise identical to `drain`.
+        while !bus.is_empty() {
+            let (from, target, frame) = bus.remove(0);
+            clock += 1;
+            for e in nodes[target].step(Instant(clock), Input::Message { from, frame }) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(k) = node_at_f2(to)
+                {
+                    let origin = Point::<F2>::at(target).coords();
+                    if !(origin == dark_from && k == dark_to) {
+                        bus.push((origin, k, frame));
+                    }
+                }
+            }
+        }
+        for node in &mut nodes {
+            let _ = node.step(Instant(100), Input::Timer(DKG_SHARE_DEADLINE));
+        }
+        for node in &mut nodes {
+            let _ = node.step(Instant(200), Input::Timer(DKG_COMPLAINT_DEADLINE));
+        }
+
+        let agg_majority = nodes[0].aggregate_commitment().expect("the unaffected nodes complete");
+        let agg_starved = nodes[dark_to].aggregate_commitment().expect("the starved node completes too — that is the point");
+        assert_ne!(
+            agg_starved.to_bytes(),
+            agg_majority.to_bytes(),
+            "one dropped link must be enough to fork QUAL while this is computed from each node's own inbox — \
+             if this now passes, the published-transcript repair has landed and this test should be inverted"
+        );
+        assert!(
+            !vss::verify_share(&nodes[dark_to].final_share(), &agg_majority),
+            "and the divergence is not cosmetic: the starved node's final share does not verify against the \
+             group's aggregate, so its beacon partials would be counted as forgeries for ever"
+        );
     }
 
     #[test]
