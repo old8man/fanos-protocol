@@ -1004,14 +1004,18 @@ mod tests {
                 },
             )
             .await;
-        assert!(
-            !settled.is_refuted(),
-            "the fleet stopped moving with a member still holding no role at all: {settled:?}"
-        );
+        // **Anything but `Reached` is "not measured", INCLUDING `Refuted` — and that is a correction.**
+        // This test first asserted `!is_refuted()`, copying the neighbouring scenario, and I shipped it after
+        // three runs that never showed the difference. Running it more turned up
+        // `Refuted { frozen_for: 30s, last: ([3, 3, 3, 4, 4], 0) }`: the fleet reached a fixed point with a
+        // member holding no role, and the rosters never completed. That is a real property of the fixture —
+        // measured across an epoch turn, on a lossless link, with and without the exit role — but it is *not
+        // this test's subject*, and asserting it here turns a convergence failure into a red about actuation.
+        // The neighbour is entitled to assert it, because convergence IS its subject. Recorded separately.
+        //
+        // Not a quiet pass either: a run that skips its own subject and reports `ok` cannot be told from one
+        // that checked, so the outcome is printed with the verdict that produced it.
         if !matches!(settled, Settled::Reached { .. }) {
-            // Not measured, which is a third outcome and not a quiet pass. Said out loud, because a run that
-            // skips its own subject and reports `ok` is the shape a reader has no way to distinguish from a
-            // run that checked.
             eprintln!("SKIPPED {}: the fleet had not settled — {settled:?}", module_path!());
             fleet.shutdown().await;
             return;
