@@ -1105,6 +1105,21 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 
 **Fix:** build the live `ParentCell` transport — route child `Notification::Escalated{mask}` and role `deficit` to a parent committee (the Maekawa bridge point is already computed geometrically), with a real re-provisioning action (recruit a capable sibling into the child roster, or authoritatively lower the child's advertised service level) and a **bounded, terminating** escalation contract. This is the keystone R-C1, R-C3, and H-3 all depend on for recovery.
 
+> **RE-VERIFIED OPEN, 2026-08-16, and narrower than "not wired".** The detector *is* wired:
+> `spawn_recovery_trigger` watches the live beacon epoch and `RECOVERY_PATIENCE = 4` epoch-driver periods with
+> no advance confirm a stall, with a rank-delayed election so the cell emits one action rather than one per
+> node. What the confirmed stall reaches is `actuate_recovery`, and both non-trivial regimes end at
+> `tracing::warn!(target: "fanos::recovery", …)` — **no `Notification::Escalated`, no station, nothing an
+> operator's tooling can see except by scraping logs.** `fanos-node/src/node.rs` emits no escalation at all.
+> Not self-issuing is correct (audit §2.1: a node holds no authority secret and cannot sign a reshare
+> trigger); having no *observable* is the open half.
+>
+> **And a second condition found today makes it worse.** `RecoveryWatcher::live_anchors` counts an anchor live
+> unless a `PeerDown` arrived. A node that has fallen out of the beacon keeps healthy *connections* — it is
+> deaf, not disconnected — so its `down` set stays empty, `recovery_decision` returns `None`, and not even the
+> log line fires. Measured on a three-node fleet: a node stops at the epoch it missed, permanently, while
+> reporting every anchor live. See the beacon-liveness work of the same day (`46b1aff`, `08d7533`).
+
 ### [CRITICAL] R-C3 — Erasure repair past the `[7,3,4]` bound is silent permanent data loss
 *Anchors:* `fanos-runtime/src/overlay.rs:32,1851` (one shard per Fano point); `fanos-code/src/erasure.rs:83` (`K=3`); `fanos-code/src/lrc.rs` (`is_recoverable_fano`/`is_hyperoval_fano`); `overlay.rs:250` (`reconstruct_highest` returns `None` if unrecoverable).
 
@@ -1209,6 +1224,20 @@ anonymity for latency/bandwidth. The snapshot below is retained for the record.
 
 ### [HIGH] S1-H2 — The distributed beacon is unreachable from the shipping binary → epoch never advances → E4 forward-secrecy and E5 rotation are both inert
 *Anchors:* `fanos-node/src/config.rs:392` (`NodeConfig::beacon` defaults `None`), `:410-411` (`from_config_str` has no key — "provisioned out-of-band"); `bin/fanos.rs` has no `--beacon-share`/anchor flag; `node.rs:310-314` (`epoch_driver`/`mix_publisher` gated off when `beacon=None`). Consequences (all CONFIRMED): the onion ratchet never advances (`threshold_router.rs:562` never invoked) → a relay uses one static onion key forever → **a later relay compromise decrypts every onion ever routed through it** (the exact threat E4/`OnionKeyRatchet` was built to stop); meeting lines and coordinates never rotate (fixed SEED) → long-term rendezvous surveillance and path targeting become possible; PROTEUS per-epoch shape rotation (§13.4) never fires. The engines are real and proven in `epoch_clock.rs` (which provisions `BeaconParams` programmatically) — a **library** embedder can set `config.beacon`, the **CLI** cannot. **Fix:** expose beacon genesis provisioning through the CLI/config (anchor share + group-commitment file) and a genesis tool; make `fanos node` advance epochs.
+
+> **CLOSED, verified 2026-08-16 by call chain rather than by name.** A shipping node is told about the beacon
+> through the config key `beacon_params = <path>` (`fanos-node/src/config.rs`), which reads the file and calls
+> `BeaconParams::from_config_str` — parsing `network_id`, `commitment`, `threshold`, `share` and the optional
+> `authority`. The set is minted by `fanos beacon-deal`. A **path** rather than inline material, deliberately:
+> "beacon provisioning is genesis material with a secret share in it, and inlining it here would put a key into
+> the file an operator copies between hosts", while `--beacon-params` alone would stop a relay running under an
+> init system at all.
+>
+> What remains true from this finding is narrower and worth keeping: `NodeConfig::beacon` still defaults to
+> `None`, so a node provisioned *without* the key runs pinned at genesis with no epoch advance and no E4/E5
+> rotation — and it says nothing about that. The related instance in the simulator was a live defect until
+> today (`46b1aff`): `NodeFleet` dealt a sharing and bound it to `_shares`, so every fleet node was a beacon
+> *consumer* of a group with no anchors and **no scenario had ever crossed an epoch boundary**.
 
 ### [HIGH] S1-H3 — The session cookie is a cleartext cross-correlator, and the reply-relay learns the client's real coordinate
 *Anchors:* `fanos-node/src/rendezvous.rs:111-118` (client sends `RdvRegister` **directly from its own coordinate** to the reply relay), `rendezvous_relay.rs:122` (relay records `cookie → client_coordinate`); the **same 16-byte cookie** is delivered in cleartext in the `Request` at the service's meeting-line combiner (`fanos-rendezvous/src/transport.rs:100-116,149`) and prefixes every reply (`:173`); the `Request` also carries the full `reply_circuit`, so the service learns the reply-relay's coordinate.
