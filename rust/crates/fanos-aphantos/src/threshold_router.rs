@@ -1740,13 +1740,13 @@ mod tests {
     /// emitted volume independent of cargo all move together.
     #[test]
     fn one_cover_tick_emits_exactly_one_cell_however_deep_the_queue_is() {
+        const QUEUED: usize = 40;
+        const TICKS: usize = 12;
+
         let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"one-per-tick"));
         let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
             .with_cover(Duration::from_millis(500));
         let dest = Point::<F2>::at(3).coords();
-
-        const QUEUED: usize = 40;
-        const TICKS: usize = 12;
         for _ in 0..QUEUED {
             r.forward_send(dest, alloc::vec![9u8; 4]);
         }
