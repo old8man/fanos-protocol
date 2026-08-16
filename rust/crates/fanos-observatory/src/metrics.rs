@@ -346,6 +346,43 @@ mod tests {
         assert!(text.contains("# TYPE fanos_healing_actions_total counter"));
     }
 
+    /// **The alarm and the health predicate must partition at the SAME point, including on it.**
+    ///
+    /// `snapshot.rs` calls a cell healthy at `phi >= PHI_THRESHOLD` and this plane raises the integration
+    /// alarm at `phi < PHI_THRESHOLD`. Those agree only if both use the threshold on the same side, and
+    /// nothing checked it: measured, changing the alarm to `<=` — so a cell sitting exactly on `Φ = 1` is
+    /// simultaneously *healthy* and *alarming* — leaves all 22 tests in this crate green. Inverting the
+    /// comparison outright IS caught (`leading_indicator_and_cascade_alarms_fire_past_their_thresholds`);
+    /// the boundary is what nobody owns.
+    ///
+    /// V3 puts the threshold on the healthy side — "Φ ≥ 1 must reach the integration floor" — so a cell at
+    /// exactly the floor is viable and must be silent. `Φ = (N−1)r²` on an equicorrelated cell, so `r = 1/√6`
+    /// lands on it; the assertion is written as **agreement** rather than as an exact float so it cannot pass
+    /// or fail on the last bit of a square root.
+    #[test]
+    fn the_integration_alarm_and_the_health_predicate_share_one_boundary() {
+        for r in [0.2, 1.0 / 6.0_f64.sqrt(), 0.5, 0.9] {
+            let snap = snapshot(r);
+            // **Written from the HEALTH side and negated, deliberately.** Clippy would rather see
+            // `i32::from(snap.phi < PHI_THRESHOLD)` — which is the alarm's own expression, and a test that
+            // recomputes the code under test asserts nothing. The point is that this plane must agree with
+            // `snapshot.rs`'s `phi >= PHI_THRESHOLD`, so that is the predicate written here.
+            let healthy = snap.phi >= PHI_THRESHOLD;
+            let expected = i32::from(!healthy);
+            let text = render_openmetrics(&snap);
+            let cell_id = cell_id_label(&snap);
+            assert!(
+                text.contains(&format!(
+                    "fanos_coherence_integration_alarm{{cell_id=\"{cell_id}\"}} {expected}"
+                )),
+                "at r = {r} the cell has Φ = {} — health says {}, so the alarm must read {expected} and the \
+                 rendered plane says otherwise",
+                snap.phi,
+                if expected == 0 { "viable" } else { "below the floor" }
+            );
+        }
+    }
+
     #[test]
     fn healthy_cell_gauges_carry_the_correct_values() {
         let snap = snapshot(0.5); // collective-subject band: Φ=1.5, R=0.4, r=0.5
