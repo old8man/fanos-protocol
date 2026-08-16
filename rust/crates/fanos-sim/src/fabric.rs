@@ -1859,6 +1859,7 @@ mod tests {
     }
 
 
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_node_of_a_fleet_leaves_the_genesis_epoch() {
         // **The premise underneath the premise.** The test below asserts that a boundary is what ends a node's freedom
@@ -1868,13 +1869,28 @@ mod tests {
         // pinned at genesis exercises no coordinate reshuffle, no onion ratchet, no per-epoch re-assignment and no
         // directory-slot expiry — and reports nothing, because nothing was watching this.
         //
-        // **Measured after the fix**, 3 nodes at a 2.1 s epoch, beacon epoch sampled every 4.2 s:
-        // `[1,1,1] → [1,3,3] → [1,5,5] → [1,7,8] → [1,10,10] → [1,12,12]`. Nodes 1 and 2 track the driver's period
-        // exactly. **Node 0 adopts epoch 1 and then stands still**, which this test deliberately does NOT assert away:
-        // it is the bootstrap node, the only one nobody dials *out* to, and that asymmetry is an open question with a
-        // known neighbourhood (`directory.entry_fallback`, and the driver's deliberate refusal to write a directory
-        // entry from an inbound connection's ephemeral source port). Asserting the floor — every node leaves genesis —
-        // pins what the fix bought without pinning the anomaly as if it were correct.
+        // **This asserts the floor only — every node leaves genesis — and the reason is a defect it must not hide.**
+        // Nine runs of three nodes at a 2.1 s epoch: `[9,9,1]`, `[1,12,12]`, `[9,1,9]`, `[5,5,4]`, `[6,5,7]`, `[4,3,4]`,
+        // `[3,5,4]`, `[4,4,3]`, `[4,9,9]`. In roughly two runs of five **one node adopts epoch 1 and then stands still
+        // for ever** while the cell advances — and it is a *different* node each time, so it is a property of the cell's
+        // reachability graph, not of any position in it.
+        //
+        // The mechanism is measured, not guessed. `BeaconNode::broadcast` addresses its partial to **every point of the
+        // plane** (`Point::at(i)`), so delivery rides the ordinary coordinate send ladder: directory binding → cached
+        // connection → hub → `directory.entry_fallback`, whose last rung *drops the frame*. Discovery, however, is
+        // one-directional by design — a node learns whom it dialled, and an inbound connection deliberately writes no
+        // directory entry (its source port is ephemeral). So a node that nobody can address receives no partials, never
+        // reaches the threshold of two, and freezes. Run `[9,9,1]` is exactly this: books `[1,2,3]`, so node 0 could
+        // resolve nobody, node 1 only node 0, and **nothing at all pointed at node 2**.
+        //
+        // Worse than the freeze is its silence: the frozen node records no `beacon.refused`, no `wire.*`, nothing. Its
+        // stations are a strict subset of a healthy node's — no `hello.epoch_unknown`, no `directory.stale_coordinate`,
+        // no `route_superseded` — i.e. no evidence the cell is moving at all. And the alarm that exists cannot fire:
+        // `RECOVERY_PATIENCE = 4` periods confirm the stall, but `RecoveryWatcher::live_anchors` counts an anchor live
+        // unless a `PeerDown` arrived, and this node's connections are *healthy* — it is deaf, not disconnected. So the
+        // detector confirms a stall and the decision classifies it as nothing wrong.
+        //
+        // Asserting the floor pins what dealing the anchors bought without pinning the freeze as if it were correct.
         use fanos_field::F4;
         use fanos_node::RoleSet;
 
