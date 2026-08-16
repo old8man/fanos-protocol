@@ -511,9 +511,18 @@ pub enum Station {
     /// last resort was a log line: nothing an operator's tooling could see without scraping.
     ///
     /// [`Observation::tag`] carries the regime: `0` a proactive reshare (the anchor set thinned but a
-    /// threshold survives), `1` a re-genesis request (the beacon is frozen below threshold). The two want
-    /// different responses and the same authority key, which is why they are one station with a tag rather
-    /// than an undifferentiated alarm.
+    /// threshold survives), `1` a re-genesis request (the beacon is frozen below threshold), and `2` **this
+    /// node is isolated** — the stall is confirmed and yet every anchor still reads live, so the fault is
+    /// here rather than in the cell. The three want different responses, which is why they are one station
+    /// with a tag rather than an undifferentiated alarm.
+    ///
+    /// **Regime `2` asks the cell for nothing, and that is the point.** A node that has fallen out of the
+    /// beacon is *deaf, not disconnected*: its connections are healthy, so no `PeerDown` arrives, the live
+    /// set stays full, and the recovery decision correctly finds nothing wrong with the anchors. Reporting
+    /// that as a cell-wide re-genesis request would ask an authority to re-mint a network key because one
+    /// member cannot hear — the most destructive action available, on the weakest possible evidence.
+    /// Measured on a three-node fleet: a node stops at the epoch it missed, permanently, while reporting
+    /// every anchor live.
     ///
     /// **What a nonzero count obliges.** Someone must run `fanos beacon-reshare` with the recovery-authority
     /// key; nothing else advances the epoch, and until it does every per-epoch rotation is stopped.

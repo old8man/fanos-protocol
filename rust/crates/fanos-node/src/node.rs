@@ -235,7 +235,16 @@ fn actuate_recovery(live: &[u8], threshold: usize, generation: u64, epoch: Epoch
                 "beacon frozen below threshold — escalating for an authorized re-genesis (audit §4 R-C1)");
             (generation, threshold, Some(1))
         }
-        RecoveryAction::None => (generation, threshold, None),
+        // **A confirmed stall with a full anchor set is not silence.** `recovery_decision` is right that
+        // nothing is wrong with the *anchors*; what that leaves is this node, which is deaf rather than
+        // disconnected — healthy connections, no `PeerDown`, and no beacon. Reported as its own regime so
+        // the operator sees an isolated member instead of nothing at all, and so nobody is tempted to read
+        // it as a reason to re-mint the network's key.
+        RecoveryAction::None => {
+            tracing::warn!(target: "fanos::recovery", epoch = epoch.get(), anchors = live.len(),
+                "beacon stalled while every anchor still reads live — this node is isolated, not the cell");
+            (generation, threshold, Some(2))
+        }
     }
 }
 
@@ -1774,6 +1783,58 @@ mod tests {
         w.on_tick(anchor(&anchors, 6), &anchors, Epoch::new(1));
         assert_eq!(w.live_anchors(&anchors), vec![1, 2, 4, 5, 6, 7], "a stale epoch keeps the down set");
     }
+
+    /// A confirmed stall with **every anchor still live** is this node's isolation, not the cell's failure —
+    /// and it must be reported as its own regime rather than as silence or as a re-genesis request.
+    ///
+    /// **The case is measured, not hypothetical.** A node that falls out of the beacon is *deaf, not
+    /// disconnected*: its connections stay healthy, so no `PeerDown` ever arrives, the live set stays full,
+    /// and `recovery_decision` correctly finds nothing wrong with the anchors. On a three-node fleet such a
+    /// node stops at the epoch it missed, permanently, while reporting every anchor live — and before this
+    /// regime existed it reported *nothing at all*.
+    ///
+    /// Both directions, because "reports something" would be satisfied by an alarm that fires on every
+    /// stall: a thinned anchor set must still choose a cell-wide regime, and only a **full** one may be read
+    /// as local.
+    #[test]
+    fn a_stall_with_every_anchor_live_is_reported_as_this_nodes_isolation() {
+        let anchors: Vec<Triple> = (0..Plane::<F2>::N as usize).map(|i| Point::<F2>::at(i).coords()).collect();
+
+        // Deaf: nothing is down, so the live set is whole, and the stall is confirmed by patience alone.
+        let mut deaf = RecoveryWatcher::new(4);
+        let mut regimes = Vec::new();
+        for _ in 0..=(RECOVERY_PATIENCE * 2) {
+            if let (true, Some(regime)) = deaf.on_tick(anchor(&anchors, 0), &anchors, Epoch::ZERO) {
+                regimes.push(regime);
+            }
+        }
+        assert!(
+            regimes.contains(&2),
+            "a stall with a full anchor set must be reported as isolation (regime 2), read {regimes:?}"
+        );
+        assert!(
+            !regimes.contains(&1),
+            "and must NOT ask for a re-genesis — that would re-mint the network key because one member \
+             cannot hear, which is the most destructive action available on the weakest evidence"
+        );
+
+        // Thinned: enough anchors down that the cell itself is the problem. The regime must be cell-wide.
+        let mut thinned = RecoveryWatcher::new(4);
+        for i in 0..5 {
+            thinned.on_note(&Notification::PeerDown(Point::<F2>::at(i).coords()));
+        }
+        let mut cell_regimes = Vec::new();
+        for _ in 0..=(RECOVERY_PATIENCE * 2) {
+            if let (true, Some(regime)) = thinned.on_tick(anchor(&anchors, 5), &anchors, Epoch::ZERO) {
+                cell_regimes.push(regime);
+            }
+        }
+        assert!(
+            cell_regimes.iter().any(|r| *r != 2),
+            "a thinned anchor set is the cell's failure and must choose a cell-wide regime, read {cell_regimes:?}"
+        );
+    }
+
 
     /// **A dead coordinator must not freeze the cell, and it used to.**
     ///
