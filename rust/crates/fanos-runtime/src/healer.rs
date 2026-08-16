@@ -980,6 +980,33 @@ impl Healer {
                         // the floor sits closer to a healthy cell's operating point than the ceiling does —
                         // and it used to be the one branch that fired on a single reading, publishing a
                         // cell-wide rebalance from one sample of a statistic whose error spans the band.
+                        // **What a sound consumer would have to be (#139), since the naive one is a known
+                        // defect.** Today production answers this notification with `info!`. Wiring
+                        // `balance_exact(loads)` to it directly would compute a cell-wide decision from ONE
+                        // node's sample — the seventh instance of the rule that a decision which must agree
+                        // cell-wide is computed from closed published epochs, never from a live local read.
+                        // It matters more here than for a stateless verdict: a rebalance is an integrator, so
+                        // a momentary divergence is written in and never washes out.
+                        //
+                        // The shape that works, from pieces that already exist:
+                        //
+                        // 1. **Publish, don't sense-and-act.** `fanos-node`'s `loaddir` already carries an
+                        //    epoch-keyed, coordinate-BOUND per-node record (`publish_load`/`resolve_load`, so
+                        //    no member can write another's slot). Note the quantity: it carries a `Demand` —
+                        //    *wanted nodes per role* — not an observed load, so the vector below is a new
+                        //    record beside it rather than a re-read of it. Mistaking the two is the first
+                        //    wrong turn available here.
+                        // 2. **Read a CLOSED epoch.** Every node then reads identical bytes, which is the
+                        //    whole of what makes the decision agree.
+                        // 3. **Combine by corroboration, not by trust.** A node's report of its own load is
+                        //    an interested claim. But every member's `q + 1` lines cover the plane, so each
+                        //    point has `N` independent observers — take the per-point order statistic at
+                        //    `config.corroboration_quorum`, exactly as `on_epoch_agree` does for the epoch.
+                        //    That also fixes the failure mode a naive fold has: a member whose record does
+                        //    not resolve must not contribute a silent zero, which is indistinguishable from a
+                        //    genuine idle point.
+                        //
+                        // Only then is `balance_exact` reading an input every node shares.
                         if band_ready && matches!(band, BandControl::Bind { .. }) {
                             if !self.rebalancing {
                                 self.rebalancing = true;
