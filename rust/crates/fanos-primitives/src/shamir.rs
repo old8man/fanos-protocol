@@ -22,6 +22,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// wipes them from memory when it is dropped ([`ZeroizeOnDrop`]). The evaluations are **private** with a
 /// borrowing accessor — a caller cannot `mem::take` or otherwise move the secret out of a `Share`, which
 /// would bypass that drop-wipe; it can only read it.
+///
+/// **That third rule is specific to a heap secret and does not generalise, which is worth saying because it
+/// invites the attempt.** It protects a `Vec<u8>` from `mem::take`. A secret held as `[u8; N]` is `Copy`, so
+/// `*keys.c2s()` copies it out through a borrowing accessor exactly as a public field would — the accessor
+/// buys nothing there. `fanos_diaulos::handshake::SessionKeys` is the case: it keeps both machine-checkable
+/// rules (no derived `Debug`, a redacting impl, a wiping `Drop`) and its `[u8; 32]` fields are public, which
+/// costs nothing it could otherwise have kept. So the enforceable invariant is the pair, guarded by
+/// `a_type_that_wipes_itself_on_drop_does_not_derive_debug`; this third one is a design note for `Vec`-shaped
+/// secrets and a false positive anywhere else.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Share {
     x: u8,
