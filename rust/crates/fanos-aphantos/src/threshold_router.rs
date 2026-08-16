@@ -1726,6 +1726,53 @@ mod tests {
         );
     }
 
+    /// **The relay's throughput ceiling, asserted rather than derived in a comment.**
+    ///
+    /// [`MAX_OUTBOX`]'s doc computes it: a real forward *displaces* a cover slot rather than adding a send,
+    /// and there is one slot stream per router, so a Full-profile relay sustains `1 / cover_interval` — ≈2
+    /// cells/s at the shipping default, **for the whole node**, and that figure is what #135 records as the
+    /// `Relay` role's capacity. It is a derived protocol bound and it had no executable check: the test below
+    /// pins the *queue* half (the cap and the shedding count) and says nothing about the rate.
+    ///
+    /// The premise is the one thing worth pinning, because every number above follows from it: **one tick,
+    /// one cell, however deep the queue.** If a tick ever emitted two, the ceiling doubles silently and the
+    /// role's capacity, the fill time `MAX_OUTBOX / (λ − 2)`, and the displacement invariant that makes
+    /// emitted volume independent of cargo all move together.
+    #[test]
+    fn one_cover_tick_emits_exactly_one_cell_however_deep_the_queue_is() {
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"one-per-tick"));
+        let mut r = ThresholdRouter::<F2>::new(Point::<F2>::at(0), &s, 2, [0x11; 32])
+            .with_cover(Duration::from_millis(500));
+        let dest = Point::<F2>::at(3).coords();
+
+        const QUEUED: usize = 40;
+        const TICKS: usize = 12;
+        for _ in 0..QUEUED {
+            r.forward_send(dest, alloc::vec![9u8; 4]);
+        }
+        assert_eq!(r.outbox.len(), QUEUED, "the queue must actually be deep, or one-per-tick is trivial");
+
+        let mut sent = 0usize;
+        for k in 0..TICKS {
+            let out = r.step(Instant(k as u64), Input::Timer(TimerToken(COVER_TOKEN)));
+            let this_tick = out.iter().filter(|e| matches!(e, Effect::Send { .. })).count();
+            assert_eq!(
+                this_tick, 1,
+                "tick {k} emitted {this_tick} cells: the ceiling is one per slot, and every figure derived \
+                 from it — the role's capacity, the fill time, the displacement invariant — moves with this"
+            );
+            sent += this_tick;
+        }
+
+        assert_eq!(sent, TICKS, "so {TICKS} slots carry {TICKS} cells, not the {QUEUED} that were offered");
+        assert_eq!(
+            r.outbox.len(),
+            QUEUED - TICKS,
+            "and the rest is still queued — the queue is a rate smoother, which is what makes the ceiling a \
+             ceiling rather than a burst limit"
+        );
+    }
+
     #[test]
     fn shedding_real_cargo_from_the_outbox_is_counted() {
         // #294. The cover-ON branch was bounded and silent: past `1 / cover_interval` the relay discards
