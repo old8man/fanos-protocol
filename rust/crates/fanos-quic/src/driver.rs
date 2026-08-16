@@ -383,10 +383,21 @@ struct SelfCert {
     /// coordinate-bound record (`fanos_node::mixdir`) can obtain the proof a reader will check. Handing out the VRF secret
     /// instead would put a signing key in every publisher and every fixture that spawns one.
     prove: CoordinateProver,
+    /// Prove **this node authored these bytes**, with the same key that earns its coordinate.
+    ///
+    /// A VRF is a deterministic signature: `prove(alpha)` yields a proof any holder of the public key can
+    /// check against `alpha`, and the public key is embedded in the certificate the coordinate is derived
+    /// from — so one closure authenticates a message *and* binds it to a point, with no second key to
+    /// provision. Kept as a closure for the reason [`prove`](Self::prove) is: the secret never leaves this
+    /// module.
+    attest: MessageAttester,
 }
 
 /// See `SelfCert::prove`: `(epoch, beacon) → (identity bytes, VRF public, proof)`.
 pub type CoordinateProver = Arc<dyn Fn(Epoch, &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof) + Send + Sync>;
+
+/// See `SelfCert::attest`: `alpha → proof`, verifiable under the certificate's embedded VRF public key.
+pub(crate) type MessageAttester = Arc<dyn Fn(&[u8]) -> VrfProof + Send + Sync>;
 
 /// The identity mode. `None` ⇒ HELLO + directory-trust (unauthenticated coordinate); `Some(_)` ⇒
 /// self-certifying, exchanging + verifying VRF proof-of-coordinate HELLOs.
@@ -1895,6 +1906,10 @@ fn self_certifying_identity<F: Field + 'static>(
     SelfCert {
         hello: hello.clone(),
         own_cert: Arc::new(creds.cert_der().to_vec()),
+        attest: {
+            let attest_creds = creds.clone();
+            Arc::new(move |alpha: &[u8]| attest_creds.vrf_secret().prove(alpha).0)
+        },
         prove: Arc::new(move |epoch, beacon| {
             let (_, proof) = crate::identity::verifiable_coordinate::<F>(&prover_creds, epoch, beacon);
             (prover_creds.cert_der().to_vec(), prover_creds.vrf_secret().public(), proof)
@@ -2922,7 +2937,20 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // peer it already holds a connection to, so this reaches `to` iff some common node connects both
             // ends — exactly the topology the overlay's cell membership creates. This frame relays either
             // way: a punch is asynchronous, and the traffic must not wait on it.
-            send_uni(&hub, &t.shaper, t.joining(&hub), &encode_relay(to, t.me, &frame)).await;
+            // **Attested when this node can attest, plain otherwise.** A self-certifying node holds the one
+            // key that both earns its coordinate and can sign, so it wraps the frame with its own HELLO and a
+            // proof over the bytes; the receiver then *derives* the origin instead of believing a field. A
+            // bare overlay (no identity) has nothing to prove with, so it falls back to the old wrapper — and
+            // the receiver applies `relayable` to that one, which is exactly the weaker guarantee it is.
+            let wrapped = match t.identity.as_ref() {
+                Some(id) => {
+                    let hello = Arc::clone(&id.hello.read().unwrap_or_else(PoisonError::into_inner));
+                    let proof = (id.attest)(&relay_alpha(to, &frame));
+                    encode_relay_attested(to, &id.own_cert, &hello, &proof, &frame)
+                }
+                None => encode_relay(to, t.me, &frame),
+            };
+            send_uni(&hub, &t.shaper, t.joining(&hub), &wrapped).await;
         } else if let Some(entry) = t.directory.entries().into_iter().find(|a| entries_tried.insert(*a)) {
             // **The last rung: a configured entry address** (#263). No direct path, no hub — which on a
             // small or freshly-partitioned cell is exactly where a node lands when its own lawful reseat
@@ -3062,6 +3090,61 @@ fn encode_relay(target: Triple, origin: Triple, inner: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
     encode_frame(FrameType::Relay.code(), &body, &mut frame);
     frame
+}
+
+/// The domain separator for a relay attestation, so a proof minted here can never be replayed as a
+/// coordinate proof or any other VRF use of the same key.
+const RELAY_ATTEST_DOMAIN: &[u8] = b"fanos/relay-attest/v1";
+
+/// What the origin signs: the destination and the exact inner bytes, under a domain of their own. `target` is
+/// included so a relayed frame cannot be re-aimed at a different peer by whoever carries it.
+fn relay_alpha(target: Triple, inner: &[u8]) -> Vec<u8> {
+    let mut alpha = Vec::with_capacity(RELAY_ATTEST_DOMAIN.len() + TRIPLE_WIRE_LEN + inner.len());
+    alpha.extend_from_slice(RELAY_ATTEST_DOMAIN);
+    alpha.extend_from_slice(&encode_triple(target));
+    alpha.extend_from_slice(inner);
+    alpha
+}
+
+/// Encode an [`attested relay`](FrameType::RelayAttested): `target ‖ cert ‖ hello ‖ proof ‖ inner`.
+///
+/// **The origin is not a field.** It is derived by the receiver from `hello`, verified against `cert` by the
+/// same `HelloVerifier` that judges a direct connection — so an attested relay inherits every rule that path
+/// already enforces (the epoch window, the genesis pin, a walked probe index) instead of restating any of
+/// them. What the wrapper adds is `proof`: a VRF proof over [`relay_alpha`], minted with the very key the
+/// certificate embeds and the coordinate is derived from, which binds *these bytes* to *that identity*.
+fn encode_relay_attested(target: Triple, cert: &[u8], hello: &[u8], proof: &VrfProof, inner: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(TRIPLE_WIRE_LEN + 4 + cert.len() + hello.len() + fanos_vrf::PROOF_LEN + inner.len());
+    body.extend_from_slice(&encode_triple(target));
+    body.extend_from_slice(&u16::try_from(cert.len()).unwrap_or(u16::MAX).to_le_bytes());
+    body.extend_from_slice(cert);
+    body.extend_from_slice(&u16::try_from(hello.len()).unwrap_or(u16::MAX).to_le_bytes());
+    body.extend_from_slice(hello);
+    body.extend_from_slice(&proof.to_bytes());
+    body.extend_from_slice(inner);
+    let mut out = Vec::new();
+    encode_frame(FrameType::RelayAttested.code(), &body, &mut out);
+    out
+}
+
+/// The parts of an attested relay: `(target, cert, hello, proof, inner)`.
+type AttestedRelay<'a> = (Triple, &'a [u8], &'a [u8], VrfProof, &'a [u8]);
+
+/// Decode an attested relay body.
+fn decode_relay_attested(body: &[u8]) -> Option<AttestedRelay<'_>> {
+    let target = decode_triple(body.get(..TRIPLE_WIRE_LEN)?)?;
+    let mut at = TRIPLE_WIRE_LEN;
+    let cert_len = usize::from(u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?));
+    at += 2;
+    let cert = body.get(at..at + cert_len)?;
+    at += cert_len;
+    let hello_len = usize::from(u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?));
+    at += 2;
+    let hello = body.get(at..at + hello_len)?;
+    at += hello_len;
+    let proof = VrfProof::from_bytes(body.get(at..at + fanos_vrf::PROOF_LEN)?.try_into().ok()?)?;
+    at += fanos_vrf::PROOF_LEN;
+    Some((target, cert, hello, proof, body.get(at..)?))
 }
 
 /// Decode a [`Relay`](FrameType::Relay) body into `(target, origin, inner frame)`.
@@ -3852,6 +3935,53 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 /// Whether a frame may be delivered **attributed to a `Relay` body's `origin`**, which is a claim rather than
 /// a proof.
 ///
+/// Deliver or forward an [`attested relay`](FrameType::RelayAttested). Returns `false` only when the engine
+/// actor has stopped.
+///
+/// **The origin is derived, not believed**, which is the whole difference from [`deliver_relayed`]. The
+/// wrapper carries the origin's certificate and its HELLO; this node runs them through the *same*
+/// `HelloVerifier` it uses on a direct connection, and takes the coordinate that verification establishes.
+/// Then it checks the VRF proof over [`relay_alpha`] under the public key that certificate embeds — the key
+/// the coordinate itself is derived from — so the bytes are bound to the identity and the identity to the
+/// point, with no field taken on trust and no second key to provision.
+///
+/// **Therefore no [`relayable`] filter here.** That predicate exists because a plain `Relay`'s origin is a
+/// claim; an attested one is a proof, so every frame may cross — including the DKG and POROS classes whose
+/// `from`-authentication the plain path had to refuse.
+///
+/// A node with no identity of its own cannot verify (it has no `HelloVerifier`), and refuses. That is the
+/// honest reading: a deployment that does not authenticate coordinates cannot be handed one to trust.
+async fn deliver_attested(t: &Transport, body: &[u8], frame: &[u8]) -> bool {
+    let Some((target, cert, hello, proof, inner)) = decode_relay_attested(body) else {
+        return true;
+    };
+    if target != t.me {
+        if let Some(hub_conn) = cached(t, target) {
+            send_uni(&hub_conn, &t.shaper, t.joining(&hub_conn), frame).await;
+        }
+        return true;
+    }
+    let Some(origin) = t.identity.as_ref().and_then(|id| match (id.verify)(cert, hello) {
+        HelloVerdict::Ok(result) => match *result {
+            HelloResult::Established { coord, .. } => Some(coord),
+            HelloResult::Incompatible(_) => None,
+        },
+        HelloVerdict::BadProof | HelloVerdict::EpochUnknown => None,
+    }) else {
+        t.record_station(Station::RelayOriginRefused, None, None);
+        return true;
+    };
+    let attested = crate::identity::vrf_public_from_cert(cert)
+        .is_some_and(|pk| pk.verify(&relay_alpha(target, inner), &proof).is_some());
+    if !attested {
+        // The certificate proves a coordinate and the HELLO proves it is current, but neither says this node
+        // wrote *these bytes* — that is what the proof is for, and a wrapper missing it is a replay.
+        t.record_station(Station::RelayOriginRefused, Some(origin), None);
+        return true;
+    }
+    t.input_tx.send(Input::Message { from: origin, frame: inner.to_vec() }).await.is_ok()
+}
+
 /// Deliver or forward a `Relay` frame (#119). Returns `false` only when the engine actor has stopped.
 ///
 /// If we are the target, the inner frame goes to the engine attributed to its **origin** rather than to the
@@ -4346,6 +4476,12 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                 // is a plain overlay frame the target's engine validates, so a hub only reaches its peers.
                 Some(FrameType::Relay) => {
                     if !deliver_relayed(&t, decoded.body, &frame).await {
+                        break; // engine actor gone
+                    }
+                    continue;
+                }
+                Some(FrameType::RelayAttested) => {
+                    if !deliver_attested(&t, decoded.body, &frame).await {
                         break; // engine actor gone
                     }
                     continue;
@@ -4932,6 +5068,47 @@ mod tests {
 
     /// **The restricted set admits exactly the frames whose handler ignores `from`** (#235).
     ///
+    /// An attested relay binds the inner bytes **and the destination** to the key that earns the origin's
+    /// coordinate, and the wrapper round-trips exactly.
+    ///
+    /// Three directions, because each failure the binding prevents is a different attack. Tamper with the
+    /// payload and a hub could rewrite what it carries; change the target and a hub could re-aim a frame at a
+    /// peer the origin never addressed — replaying an admission request or a threshold share at a second
+    /// combiner; use another key and anyone could speak as anyone, which is the whole defect this path exists
+    /// to close.
+    #[test]
+    fn an_attested_relay_binds_the_bytes_and_the_destination_to_the_origins_own_key() {
+        let sk = fanos_vrf::VrfSecret::from_seed([7u8; 32]);
+        let pk = sk.public();
+        let target: Triple = [1, 0, 2];
+        let inner = b"an inner overlay frame";
+
+        let alpha = relay_alpha(target, inner);
+        let proof = sk.prove(&alpha).0;
+        assert!(pk.verify(&alpha, &proof).is_some(), "the origin's own proof over its own bytes verifies");
+
+        assert!(
+            pk.verify(&relay_alpha(target, b"a different inner frame"), &proof).is_none(),
+            "a hub that rewrites the payload invalidates the attestation"
+        );
+        assert!(
+            pk.verify(&relay_alpha([2, 0, 1], inner), &proof).is_none(),
+            "and re-aiming the frame at another peer invalidates it too — the destination is signed"
+        );
+        assert!(
+            fanos_vrf::VrfSecret::from_seed([8u8; 32]).public().verify(&alpha, &proof).is_none(),
+            "another identity cannot vouch for these bytes, which is the impersonation this path closes"
+        );
+
+        let wrapped = encode_relay_attested(target, b"cert-der", b"hello-bytes", &proof, inner);
+        let (decoded, _) = decode_frame(&wrapped).expect("the wrapper is a well-formed frame");
+        let body = decoded.body;
+        let (t2, cert2, hello2, proof2, inner2) = decode_relay_attested(body).expect("and it round-trips");
+        assert_eq!((t2, cert2, hello2, inner2), (target, &b"cert-der"[..], &b"hello-bytes"[..], &inner[..]));
+        assert_eq!(proof2.to_bytes(), proof.to_bytes(), "including the proof, byte for byte");
+    }
+
+
     /// A `Relay` body's `origin` is a **claim**, so a frame delivered under it must be one whose handler does
     /// not use `from` to decide authorization.
     ///
