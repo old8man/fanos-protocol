@@ -373,7 +373,7 @@ impl<F: Field> DkgNode<F> {
                 let commitment = dealing.commitment().clone();
                 let share = share.clone();
                 self.justified.entry(d).or_default().insert(c);
-                effects.extend(self.broadcast_to_peers(&justify_frame(d, &share, &commitment)));
+                effects.extend(Self::broadcast_to_peers(&justify_frame(d, &share, &commitment)));
             }
         }
         effects
@@ -409,7 +409,7 @@ impl<F: Field> DkgNode<F> {
                 self.my_shares.entry(d).or_insert(share.clone());
                 self.try_verify(d);
             }
-            effects.extend(self.broadcast_to_peers(&justify_frame(d, &share, &commitment)));
+            effects.extend(Self::broadcast_to_peers(&justify_frame(d, &share, &commitment)));
         }
         effects
     }
@@ -427,7 +427,7 @@ impl<F: Field> DkgNode<F> {
             if !self.qualified.contains(&d) {
                 // We are missing/invalid a share from d → complain (recorded locally + broadcast).
                 self.complaints.entry(d).or_default().insert(self.index);
-                effects.extend(self.broadcast_to_peers(&complaint_frame(self.index, d)));
+                effects.extend(Self::broadcast_to_peers(&complaint_frame(self.index, d)));
             }
         }
         effects.push(Effect::ArmTimer {
@@ -513,34 +513,52 @@ impl<F: Field> DkgNode<F> {
     /// coordinate churn*, which is what the beacon round needed; it does not make a broadcast reliable, so
     /// it would swap one silent partial-delivery mode for another.
     ///
-    /// # Which repair, decided by the tree's own law rather than by taste
+    /// # Which repair — and the first answer was wrong for a reason worth keeping
     ///
-    /// Two candidates: an echo/acknowledgement round, or a `QUAL` derived from a **published transcript**
-    /// every participant reads. The choice is already made elsewhere in this workspace —
-    /// `fanos_runtime::healer` states it and counts instances: *"a decision which must agree cell-wide is
-    /// computed from closed published epochs, never from a live local read"*, and names its own case the
-    /// **seventh**. `QUAL` is precisely that shape and is therefore the eighth — and the most severe of them,
-    /// because the others decide provisioning or quality while a divergent `QUAL` yields key shares that do
-    /// not interoperate at all. The healer's own prescription is *"publish, don't sense-and-act"*.
+    /// `fanos_runtime::healer` states the governing rule and counts instances: *"a decision which must agree
+    /// cell-wide is computed from closed published epochs, never from a live local read"*, naming its own
+    /// case the **seventh**. `QUAL` is precisely that shape and is therefore the eighth — and the most
+    /// severe, because the others decide provisioning or quality while a divergent `QUAL` yields key shares
+    /// that do not interoperate at all.
     ///
-    /// The pieces exist. The ceremony already has the **closed phase** such a rule needs — the
-    /// complaint-phase deadline, after which a node finalizes — and the host (`DkgCeremony` in `fanos-node`)
-    /// already holds a `Client`, so the engine can stay sans-I/O: the host publishes each broadcast frame to
-    /// a slot keyed by `(dealer, phase)` and, at the deadline, **reads the set** before finalizing, instead
-    /// of finalizing on whatever its inbox happened to receive. Reads retry and the store is replicated,
-    /// which is the whole difference from `n − 1` unacknowledged sends.
+    /// That rule prescribes *"publish, don't sense-and-act"*, and the obvious reading — publish each
+    /// broadcast frame to a directory slot and read the set at the deadline — **cannot be built here.** The
+    /// ceremony **is** the engine: `spawn_cell` and the `fanos` binary both run `DkgCeremony` as the node's
+    /// whole engine, so during a ceremony there is no overlay, no store, and nothing to publish *to*. A law
+    /// about closed published epochs has no medium on this path. (It also holds no `Client`, so the host
+    /// could not read one either.)
     ///
-    /// Not built here: it is a protocol change on the key-generation path and wants its own pass with a test
-    /// that two nodes given different inboxes still finalize on the same `QUAL`. The exposure is bounded
-    /// today only by the ceremony running on a freshly-spawned cell whose directory is still fresh.
-    fn broadcast_to_peers(&self, frame: &[u8]) -> Vec<Effect> {
-        (1..=self.n as u8)
-            .filter(|&j| j != self.index)
-            .map(|j| Effect::Send {
-                to: Self::coord_of(j),
-                frame: frame.to_vec(),
-            })
-            .collect()
+    /// **The second answer was wrong too, and an existing test proved it — which is the useful part.** The
+    /// obvious remaining repair is to make the flood *epidemic*: relay each broadcast frame once on first
+    /// receipt, deduplicated, exactly as `BeaconNode::on_round` re-floods rounds. Built, it broke
+    /// `a_commitment_is_only_accepted_from_its_own_dealer` immediately, and the reason is structural rather
+    /// than a slip:
+    ///
+    /// > **Every frame in this class is authenticated by the transport's `from`.** `on_commit` refuses
+    /// > unless `dealer_of(from) == Some(d)` — "a commitment may only come from its own dealer", which is
+    /// > what stops a bogus commitment being pre-registered for a silent one — and `on_complaint` is
+    /// > accepted "only direct from its complainer `c`", without which a Byzantine node forges complaints in
+    /// > another's name.
+    ///
+    /// A relayed frame arrives from the **relayer**, so it is refused by exactly the rule that makes the
+    /// ceremony safe. **Epidemic delivery is therefore not available to this class at all**, and the
+    /// difference from the beacon round is now precise: a round carries its own proof against the group
+    /// commitment, so any relayer can hand it over; these frames carry none, so the only thing vouching for
+    /// them is the connection they arrived on.
+    ///
+    /// **What that leaves, stated so the next attempt does not re-derive it.** Reliable delivery here needs
+    /// the frames to authenticate themselves — a dealer/complainant signature over the body, after which
+    /// relaying is sound and the epidemic works — or an acknowledgement-and-retransmit layer under the
+    /// direct sends. The first is the tree's own pattern (self-authenticating frames are relayable,
+    /// transport-authenticated ones are not) and is the recommendation.
+    ///
+    /// The flood below **is** kept: it costs nothing, it preserves `from` (this node is the dealer of what
+    /// it broadcasts), and it removes the dependence on resolving `q² + q + 1` coordinates that a churning
+    /// cell cannot satisfy. It does not close the `QUAL` fork, and
+    /// `one_censored_link_gives_the_dkg_two_different_qualified_sets` still asserts that fork today.
+    ///
+    fn broadcast_to_peers(frame: &[u8]) -> Vec<Effect> {
+        std::vec![Effect::Flood { frame: frame.to_vec() }]
     }
 
     /// This node's final key share bytes (a point on the aggregate polynomial), once complete.
@@ -879,11 +897,24 @@ mod tests {
         while !bus.is_empty() {
             let (from, target, frame) = bus.remove(0);
             *clock += 1;
+            let origin = Point::<F2>::at(target).coords();
             for e in nodes[target].step(Instant(*clock), Input::Message { from, frame }) {
-                if let Effect::Send { to, frame } = e
-                    && let Some(k) = node_at_f2(to)
-                {
-                    bus.push((Point::<F2>::at(target).coords(), k, frame));
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(k) = node_at_f2(to) {
+                            bus.push((origin, k, frame));
+                        }
+                    }
+                    // A flood reaches every other node of this cell — the bus is the connection graph here,
+                    // and it is complete, which is what the driver's `flood_connections` approximates.
+                    Effect::Flood { frame } => {
+                        for k in 0..nodes.len() {
+                            if k != target {
+                                bus.push((origin, k, frame.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
