@@ -1310,6 +1310,45 @@ pub fn assign_report(
 }
 
 #[cfg(test)]
+mod gain_guard {
+    use super::{Demand, Role};
+
+    /// **The controller must step at its gain, not jump to the target — and the two arguments that decide
+    /// which are the same type.**
+    ///
+    /// `rebalance(setpoint, floor, gain)` places two semantically different `Demand`s adjacent, so swapping
+    /// them compiles. Measured: with them swapped in `RoleController::step`, **356 tests across `fanos-core`
+    /// and `fanos-node` stay green.** The destination survives the swap, which is why every convergence test
+    /// does: `step` moves toward the *floor* and is then raised by `.max(setpoint)`, so demand arrives at the
+    /// setpoint in ONE jump instead of a proportional approach. What is lost is the `κ ≤ 1 ⇒ no overshoot`
+    /// property the law is built on, and nothing was watching it.
+    ///
+    /// So the observable has to be the **step size**, not the endpoint. From `0` toward `70` at `κ = 1/7`:
+    /// `delta = 1·(70−0)/7 = 10`. Swapped, `step(0, floor = 0, fl = 70)` has `target == d`, so `delta = 0`
+    /// and `.max(70)` returns `70` — the two answers are `10` and `70`, which is as discriminating as an
+    /// assertion gets.
+    #[test]
+    fn the_controller_steps_at_its_gain_rather_than_jumping_to_the_setpoint() {
+        let floor = Demand::default();
+        let setpoint = Demand::per_role(|_| 70);
+        let after = Demand::default().rebalance(setpoint, floor, 1);
+        assert_eq!(
+            after.of(Role::Relay),
+            10,
+            "one step at κ = 1/7 from 0 toward 70 is 10; 70 means `setpoint` and `floor` are swapped and the \
+             proportional law has become a jump, which every convergence test in the tree accepts"
+        );
+        // The control: at κ = 1 the step IS the whole distance, so the assertion above is about the gain and
+        // not about `rebalance` being unable to arrive.
+        assert_eq!(
+            Demand::default().rebalance(setpoint, floor, 7).of(Role::Relay),
+            70,
+            "at κ = 1 one step covers the distance — otherwise the test above would pass for the wrong reason"
+        );
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     /// A weight every node shares does **not** cancel — it permutes. `ROLE_CAPACITY_WEIGHT` is therefore a
