@@ -1860,6 +1860,50 @@ mod tests {
 
 
 
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_what_fraction_of_beacon_rounds_assemble() {
+        // **The beacon's liveness is a delivery probability, and nothing had ever measured it.** A round needs
+        // `threshold` partials, and `BeaconNode::broadcast` addresses each one to a *plane point*, so every partial
+        // rides the coordinate send ladder and its last rung drops the frame. The epoch therefore advances at
+        // `tick rate x P(threshold partials arrive)`, not at the tick rate the operator configured.
+        //
+        // Measured 2026-08-16, 3 nodes on `Link::ideal()`, `epoch_period` at the derived floor, over a window of ten
+        // periods (the driver skips its first tick, so nine rounds are on offer). Cell-max epoch reached across five
+        // runs: **3, 3, 9, 5, 3** — an assembly fraction of about a third, with one run at nominal. On an ideal link,
+        // in a three-node cell, at a threshold of two.
+        //
+        // Two readings this cannot give, deliberately. It cannot say *why* a round failed: `Station::BeaconRefused`
+        // rides `Notification::DataPath`, which is emitted only in answer to `Command::Observe`, so `fleet.stations()`
+        // — the driver's map — cannot see refusals at all, and their absence there means nothing. And it cannot
+        // separate "the partial was dropped" from "it arrived and was refused" until that surface is reachable here.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+        let periods = 10;
+        let fleet = NodeFleet::spawn_with_epoch::<F4>(3, Link::ideal(), RoleSet::default(), floor)
+            .await
+            .expect("fleet starts");
+        tokio::time::sleep(u32::try_from(periods).map_or(floor, |p| p * floor)).await;
+        let epochs: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        // Printed beside the epochs because a coordinate collision is the mechanism most likely to explain a node
+        // that stops: the directory serves a contested point as ONE address, so a partial addressed to that point
+        // reaches the incumbent and never the co-located claimant. Measured live here — two of three nodes reporting
+        // the same address is not rare.
+        let addrs: Vec<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+        fleet.shutdown().await;
+        let reached = epochs.iter().flatten().copied().max().unwrap_or(0);
+        // The driver skips its first tick, so `periods` of wall clock offer `periods - 1` rounds.
+        println!(
+            "MEASURED beacon rounds: cell reached epoch {reached} of {} on offer in {periods} periods of {floor:?} \
+             (fraction {:.2}), per node {epochs:?}, addresses {addrs:?}",
+            periods - 1,
+            f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods - 1),
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_node_of_a_fleet_leaves_the_genesis_epoch() {
         // **The premise underneath the premise.** The test below asserts that a boundary is what ends a node's freedom
@@ -1875,20 +1919,40 @@ mod tests {
         // for ever** while the cell advances — and it is a *different* node each time, so it is a property of the cell's
         // reachability graph, not of any position in it.
         //
-        // The mechanism is measured, not guessed. `BeaconNode::broadcast` addresses its partial to **every point of the
-        // plane** (`Point::at(i)`), so delivery rides the ordinary coordinate send ladder: directory binding → cached
-        // connection → hub → `directory.entry_fallback`, whose last rung *drops the frame*. Discovery, however, is
-        // one-directional by design — a node learns whom it dialled, and an inbound connection deliberately writes no
-        // directory entry (its source port is ephemeral). So a node that nobody can address receives no partials, never
-        // reaches the threshold of two, and freezes. Run `[9,9,1]` is exactly this: books `[1,2,3]`, so node 0 could
-        // resolve nobody, node 1 only node 0, and **nothing at all pointed at node 2**.
+        // **And the freeze is the tail of something continuous, not a state of its own** — the correction that matters
+        // most here. `measure_what_fraction_of_beacon_rounds_assemble` puts the cell at epoch 3–9 of nine on offer,
+        // about a third to a half, on an ideal link. Rounds fail *routinely*; "stuck at 1" is simply the run where a
+        // node's share of them was zero. Read the freeze as the extreme of a distribution, not as a switch.
         //
-        // Worse than the freeze is its silence: the frozen node records no `beacon.refused`, no `wire.*`, nothing. Its
-        // stations are a strict subset of a healthy node's — no `hello.epoch_unknown`, no `directory.stale_coordinate`,
-        // no `route_superseded` — i.e. no evidence the cell is moving at all. And the alarm that exists cannot fire:
-        // `RECOVERY_PATIENCE = 4` periods confirm the stall, but `RecoveryWatcher::live_anchors` counts an anchor live
-        // unless a `PeerDown` arrived, and this node's connections are *healthy* — it is deaf, not disconnected. So the
-        // detector confirms a stall and the decision classifies it as nothing wrong.
+        // What is established about the mechanism: `BeaconNode::broadcast` addresses its partial to **every point of
+        // the plane** (`Point::at(i)`), so every partial rides the ordinary coordinate send ladder — directory binding
+        // → cached connection → hub → `directory.entry_fallback`, whose last rung *drops the frame*. The beacon's
+        // liveness is therefore a delivery probability over coordinate resolution, and the epoch advances at
+        // `tick rate × P(threshold partials arrive)` rather than at the configured rate.
+        //
+        // **Two explanations died, and one of them was mine, shipped in this doc.**
+        //
+        //   * *One-directional discovery* — refuted at the source: the accept path files an inbound connection under
+        //     the peer's **proven** coordinate (`file_conn(&mut map, from, conn)`), precisely so the transport can
+        //     originate back over it. Reverse reachability exists by design; what is deliberately withheld is only the
+        //     *directory* entry, because the source port is ephemeral. "Nobody can address it" was the right symptom
+        //     attached to the wrong cause.
+        //   * *Silence proves no refusals* — invalid evidence: `Station::BeaconRefused` rides
+        //     `Notification::DataPath`, emitted only in answer to `Command::Observe`, while `fleet.stations()` reads
+        //     the **driver's** map. That surface cannot carry a beacon refusal, so its absence there says nothing at
+        //     all. A diagnostic surface stops at its crate.
+        //
+        // The live candidate, observed rather than argued: two of three nodes reporting the **same address** is not
+        // rare here, and a contested point resolves to one holder, so a partial addressed to it reaches the incumbent
+        // and never the co-located claimant (`transport.self_connection`, 68 in one reading). If that is the mechanism
+        // it is circular and self-sealing — the collision costs the node the very epoch clock whose next draw would
+        // clear the collision — which would explain why forced collisions do not resolve and why the epoch length
+        // never mattered.
+        //
+        // What still stands, and is the reason for the assertion below: the alarm cannot fire. `RECOVERY_PATIENCE = 4`
+        // periods confirm the stall, but `RecoveryWatcher::live_anchors` counts an anchor live unless a `PeerDown`
+        // arrived, and a starved node's connections are *healthy* — it is deaf, not disconnected. The detector
+        // confirms a stall and the decision then classifies it as nothing wrong.
         //
         // Asserting the floor pins what dealing the anchors bought without pinning the freeze as if it were correct.
         use fanos_field::F4;
