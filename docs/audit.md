@@ -1098,6 +1098,26 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 
 **Fix (fundamental, painful, correct):** proactive **verifiable secret resharing** (periodic re-DKG / Herzberg-style proactive VSS) so a depleted anchor set below `t` is reconstituted from ≥`t` survivors without revealing the secret; plus a **beacon re-bootstrap protocol** (on `<t` live anchors for `D` epochs, run a fresh DKG among current members and publish a new commitment via the parent, or an operator-signed rollover at the genesis root); plus **safe-stall semantics** — when the beacon is down, freeze coordinates *and* freeze `EPOCH_STALE` rejection, so a lagging node can still attach to the last good epoch instead of deadlocking.
 
+> **RE-VERIFIED OPEN, 2026-08-16, and the missing piece is smaller and more concrete than "no re-DKG".** The
+> machinery exists and is exercised: `BeaconNode::reshare_trigger`, `deal_reshare`, `install`, `rebootstrap`,
+> with `fanos-sim/tests/recovery.rs` driving all three regimes end to end. What is missing is any way to
+> *issue* it from a shipping binary.
+>
+> Checked by call chain: `reshare_trigger` has **three callers, all in one test file**. Nothing in
+> `fanos-node`, `fanos-quic` or the CLI calls it. And `fanos --help` lists `beacon-deal`, `authority-key`,
+> `keygen`, `ingress-deal`, `service-deal`, `taxis-deal` — **no reshare or recovery command at all**. So an
+> operator holding the authority key has no affordance to unstick a stalled cell, and the automatic path ends
+> at a `tracing::warn!` (see R-C2).
+>
+> **A doc claim in the tree is false and is the reason this looked closed.** `spawn_recovery_trigger`'s own
+> doc says it is *"the production caller that turns a beacon freeze into action, closing the `reshare_trigger`
+> has zero production callers gap"*. It closes the *detection* half only; the trigger still has zero
+> production callers.
+>
+> **Smallest honest fix:** a `fanos beacon-reshare` command that builds the authenticated trigger from the
+> authority key (`authority-key` already exists) and injects the frame. That turns R-C1 from unreachable into
+> operator-reachable, and leaves R-C2's observable gap as the separate item it is.
+
 ### [CRITICAL] R-C2 — Escalation / parent-recovery is not wired: the recovery-of-last-resort is a log line
 *Anchors:* `fanos-node/src/bin/fanos.rs:543` (the **only** `Notification::Escalated` consumer — an `info!` log); `fanos-diakrisis/src/hierarchy.rs` (pure function, no live parent cell, "fed by hand" per `design-coordinates.md §4(d)`); `fanos-runtime/src/overlay.rs:911` (`HealingAction::Escalate`), `:813` (`BandControl::Escalate → Escalated(0)`); `fanos-core/src/roles.rs:620` (`assign_report` deficit — also no live parent).
 
