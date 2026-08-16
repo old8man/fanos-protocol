@@ -5,7 +5,7 @@
 
 use fanos_keygen::recovery::RecoveryAuthoritySet;
 use fanos_field::Field;
-use fanos_geometry::Plane;
+use fanos_geometry::{Line, Plane};
 use fanos_keygen::BeaconNode;
 use fanos_node::composition::{CellComposition, compose_engine};
 use fanos_node::{BeaconParams, OverlayBeaconNode};
@@ -122,6 +122,24 @@ pub fn spawn_composed_relay_cell<F: Field + 'static>(
     mix: fanos_runtime::Duration,
     relay: bool,
 ) -> Vec<Triple> {
+    spawn_composed_cell::<F>(sim, config, cover, mix, relay, false)
+}
+
+/// The same cell, with the **outer service layer** optionally composed over it.
+///
+/// `compose_engine` wraps five layers — overlay, beacon, `CellNode` (the router), `ServiceNode`,
+/// `IngressNode` — and each outer one namespaces *its own* timer tokens while passing the inner engine's
+/// through untouched. That pass-through is what keeps a relay's cover schedule alive on a node that also
+/// hosts a service, and the wizard's default role set turns both on. One parameter here rather than a second
+/// fixture, so the two arms cannot differ in anything but the layer under test.
+pub fn spawn_composed_cell<F: Field + 'static>(
+    sim: &mut Sim,
+    config: Config,
+    cover: fanos_runtime::Duration,
+    mix: fanos_runtime::Duration,
+    relay: bool,
+    service: bool,
+) -> Vec<Triple> {
     let n = Plane::<F>::N as usize;
     let (shares, commitment) =
         deal(&[0xB5; 32], 2, n, &mut DeterministicRng::new(b"fanos-sim/relay/beacon-cell")).unwrap();
@@ -140,6 +158,13 @@ pub fn spawn_composed_relay_cell<F: Field + 'static>(
         what.mix_mean_delay = mix;
         // Distinct per node: a relay's onion and router keys are its own, and seeding them identically would
         // make every hop of a circuit peelable by the same secret.
+        if service {
+            // Every node composes the layer; three of the seven are members of this line and four are not,
+            // which `ThresholdService::new` handles by `position` returning `None`. Membership is not the
+            // point — wrapping is.
+            let line: Vec<Triple> = Plane::<F>::points_on(Line::<F>::at(0)).map(|p| p.coords()).collect();
+            what.service = Some(([7u8; 32], line, 2, None));
+        }
         what.onion_seed = [i as u8; 32];
         what.kem_seed = [0x80 ^ i as u8; 32];
         coords.push(sim.add(compose_engine::<F>(point, &what)));

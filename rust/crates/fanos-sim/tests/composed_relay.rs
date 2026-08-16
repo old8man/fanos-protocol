@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::spawn_composed_relay_cell;
+use common::{spawn_composed_cell, spawn_composed_relay_cell};
 use fanos_field::{F2, F7};
 use fanos_geometry::{Line, Point};
 use fanos_pqcrypto::OnionKeyRatchet;
@@ -65,6 +65,53 @@ fn a_composed_relay_cell_arms_its_router_and_emits_cover() {
         with_cover > baseline,
         "the relay role must add traffic the same cell without it does not send — the router is either not \
          built or not armed (relay {with_cover} vs same-cell-no-relay {baseline})"
+    );
+}
+
+/// **Cover survives the outer composition layers a deployed node actually wraps.**
+///
+/// `compose_engine` builds five layers — overlay, beacon, `CellNode` (which holds the router), `ServiceNode`,
+/// `IngressNode` — and the cover schedule is armed at the third. Each outer layer namespaces *its own* timer
+/// tokens (`SERVICE_FLAG`, `INGRESS_FLAG`) and passes the inner engine's through untouched, which is what
+/// keeps the router's `COVER` tick reaching the clock. Read at every layer and correct at every layer; the
+/// test above stops at the third, so nothing asserted the composition.
+///
+/// That matters because the setup wizard's default role set turns on `service` **and** `ingress` beside
+/// `relay`. A node built the way the wizard builds it wraps two layers the cover property was never checked
+/// through, and the failure mode is silent: the relay simply stops emitting cover, which is exactly the
+/// observable an operator has no alarm for.
+///
+/// **Scope, stated rather than left to be discovered.** This composes the service layer and not the ingress
+/// one, because `IngressParams` needs a dealt descriptor with its commitments — a ceremony, not a fixture.
+/// The two layers apply the identical discipline (`tag_host_effects` is applied only to `self.host.*`, as
+/// `tag_service_effects` is only to `self.service.*`), and `ingress_node`'s own unit test pins that a host
+/// timer is ingress-tagged and disjoint from every inner-engine token. So the service arm is the one that
+/// needed an end-to-end check and the ingress arm has a unit-level one.
+#[test]
+fn cover_survives_the_service_layer_a_default_deployment_composes_over_it() {
+    let window = Duration::from_millis(4000);
+    let cover = Duration::from_millis(200);
+
+    // The control is the SAME composition without the relay role — the lesson the test above learned from a
+    // falsification, applied here: comparing against a cell without the service layer would measure the
+    // service's own traffic instead of the router's cover.
+    let mut quiet = Sim::new(0xC0FE);
+    let _no_relay = spawn_composed_cell::<F2>(&mut quiet, Config::default(), cover, NO_MIX, false, true);
+    quiet.inject_all(&Command::StartHeartbeat);
+    quiet.run_for(window);
+    let baseline = quiet.report().metrics.frames_sent;
+
+    let mut relayed = Sim::new(0xC0FE);
+    let _cell = spawn_composed_cell::<F2>(&mut relayed, Config::default(), cover, NO_MIX, true, true);
+    relayed.inject_all(&Command::StartHeartbeat);
+    relayed.run_for(window);
+    let with_cover = relayed.report().metrics.frames_sent;
+
+    assert!(
+        with_cover > baseline,
+        "with a service composed over it, the relay must still add the traffic the same cell without the \
+         relay role does not send — a wrapper is eating the router's cover tick (service+relay {with_cover} \
+         vs service-only {baseline})"
     );
 }
 
