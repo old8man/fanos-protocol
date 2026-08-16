@@ -55,7 +55,7 @@ async fn cert_bound_identity_delivers_and_authenticates_the_sender() {
         payload: payload.clone(),
     });
 
-    let (from, got) = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let (from, got) = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(Notification::Delivered { from, payload }) = b.next_notification().await {
                 return (from, payload);
@@ -88,7 +88,7 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
     // alike, which is exactly the distinction being waited on. A second accessor was written for it and
     // deleted: the architecture ratchet flagged it as public-and-uncalled, and it was right, because the
     // question already had an answer with a production caller (`Node::health`'s `probe_index`).
-    tokio::time::timeout(StdDuration::from_secs(5), async {
+    tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         while dir.claim_at(b.address()).is_none() {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
@@ -119,6 +119,10 @@ async fn an_impostor_at_the_resolved_address_is_rejected() {
         to: b.address(),
         payload: b"should not arrive".to_vec(),
     });
+    // **Short on purpose, and NOT `LIVENESS_BACKSTOP`:** the assertion below is `is_err()`, so the
+    // expiry IS the success condition. A backstop here would spend four minutes proving the same
+    // thing and still pass — damage that never shows as a failure. Six of this file's seven waits
+    // are the opposite kind; this one is why they cannot be converted in bulk.
     let delivered = tokio::time::timeout(StdDuration::from_secs(2), b.next_notification()).await;
     assert!(
         delivered.is_err(),
@@ -147,7 +151,7 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
     let b = spawn_distinct(&dir, &[a.address()]).await;
     let c = spawn_distinct(&dir, &[a.address(), b.address()]).await;
 
-    tokio::time::timeout(StdDuration::from_secs(5), async {
+    tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         while dir.claim_at(b.address()).is_none() {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
@@ -171,7 +175,7 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
         payload: b"addressed to a seat its occupant has left".to_vec(),
     });
 
-    let repairs = tokio::time::timeout(StdDuration::from_secs(10), async {
+    let repairs = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             let n = stale_repairs(&a);
             if n > 0 {
@@ -208,7 +212,7 @@ async fn a_dial_answered_by_a_different_proved_coordinate_repairs_the_stale_entr
     // A holds C's address in the shared directory, so a send to C would dial cleanly whether or not this
     // connection survived, and the test would pass against the defect. The counter fires on exactly the
     // branch under test.
-    let retained = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let retained = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             let n = moved_peers_retained(&a);
             if n > 0 {
@@ -359,7 +363,7 @@ async fn an_unroutable_coordinate_falls_back_to_a_configured_entry_address() {
 
     a.command(Command::Send { to: orphan, payload: b"nobody holds this point".to_vec() });
 
-    let fell_back = tokio::time::timeout(StdDuration::from_secs(10), async {
+    let fell_back = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             let n = entry_fallbacks(&a);
             if n > 0 {
