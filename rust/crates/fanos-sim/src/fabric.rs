@@ -1048,6 +1048,18 @@ mod tests {
     /// floor of one, and exactly one member is assigned Exit — while **all five publish an exit descriptor**,
     /// because `exit_params` consults `config.roles.exit`, the offer, and nothing consults the assignment.
     ///
+    /// ⚠️ **AND IT CANNOT CERTIFY THAT, which was found by landing the actuation and watching this stay
+    /// green.** The witness is `advertised && !serves(Exit)` read at one instant, and those two quantities
+    /// live on different clocks: a descriptor is written per **epoch** and stands for it, while the role
+    /// loop re-assigns on the much shorter `ROSTER_REFRESH` cadence. A node that published while assigned
+    /// and lost the role thirty seconds later is a witness by this definition and a *correct* publisher by
+    /// the design's — "withholding a record drains a node gracefully" says the record outlives the
+    /// assignment that produced it, on purpose.
+    ///
+    /// So the condition is satisfiable by ordinary churn, and green here means "not proven either way"
+    /// rather than "no actuation". The sharper observable is a node that was **never** assigned Exit and
+    /// advertises anyway — which needs the assignment sampled *at publication time*, not at read time.
+    ///
     /// **When this test fails, actuation has landed.** That is the point of it: read
     /// `SelfOrganization::assigned` for the shape that was proposed (withhold the *advertisement*, do not stop
     /// the task) and check the three things that gap touches — the viability floor, a node's mix key

@@ -701,6 +701,7 @@ pub fn spawn_exit_publisher(
     client: Client,
     public: HybridKemPublic,
     prover: Option<CoordinateProver>,
+    mut assigned: tokio::sync::watch::Receiver<crate::role_loop::Assignment>,
 ) -> JoinHandle<()> {
     // Supervised: this actor's death is a capability the node loses, and the counters that would
     // have shown it are written by the actor itself (#251).
@@ -718,13 +719,38 @@ pub fn spawn_exit_publisher(
             let (client, public) = (client.clone(), public.clone());
             async move { publish_exit_key(&client, client.address(), epoch, &public, credential.as_ref()).await }
         };
-        publish(epoch, seed, &public).await;
+        // **The genesis publication waits for the cell to speak, and does not skip on `NONE`.** At spawn the
+        // assignment is `Assignment::NONE` — nothing decided yet, which is not the same as "not assigned" —
+        // so testing it here would withhold the record of every exit until the first epoch boundary, and at
+        // a 600 s period that is an exit no proxy can discover for ten minutes. `awaited` blocks until the
+        // role loop's genesis assignment lands, after which the same rule as every later epoch applies.
+        //
+        // It is a wait and not a timeout: a node whose role loop never decides has nothing to advertise, and
+        // saying so by silence is the honest answer rather than advertising an unassigned role anyway.
+        while *assigned.borrow_and_update() == crate::role_loop::Assignment::NONE
+            && assigned.changed().await.is_ok()
+        {}
+        if assigned.borrow().roles.has(fanos_core::roles::Role::Exit) {
+            publish(epoch, seed, &public).await;
+        }
         // Latest-state, not the lossy notification stream: an exit missing from the directory for an epoch
         // is an exit no proxy can discover for that epoch, and the stream could drop the round (#86).
         while let Some((reached, s)) = crate::next_epoch(&mut beacons, epoch).await {
             epoch = reached;
             seed = s;
-            publish(epoch, seed, &public).await;
+            // **Withheld, not torn down — this is where the cell's assignment finally acts (audit R-H2).**
+            // The node keeps running its exit: live sessions are untouched, the listener stays up, and
+            // nothing is stopped. What changes is the *record*: a node the cell did not assign Exit this
+            // epoch does not advertise one, so it drains gracefully as clients stop discovering it and it
+            // resumes the moment the assignment includes it again.
+            //
+            // Read at the boundary rather than at spawn, because the assignment is a per-epoch decision and
+            // a value captured once would be an offer wearing an assignment's name — which is exactly the
+            // shape this closes: every activity advertisement was gated on `config.roles`, the OFFER, and
+            // nothing consulted what the cell decided.
+            if assigned.borrow().roles.has(fanos_core::roles::Role::Exit) {
+                publish(epoch, seed, &public).await;
+            }
         }
     });
     crate::supervise::supervise(crate::supervise::NodeActor::ExitPublisher, &supervised, task)

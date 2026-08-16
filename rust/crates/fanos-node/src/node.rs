@@ -22,7 +22,7 @@ use fanos_quic::{
 };
 use fanos_keygen::recovery::{RecoveryAction, StallDetector, recovery_decision};
 use fanos_runtime::{Command, Config as OverlayConfig, Engine, Notification};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::{ExitPolicy, serve_exit, spawn_exit_publisher, spawn_mix_directory_feeder, spawn_mix_publisher};
@@ -532,6 +532,7 @@ fn spawn_exit_role(
     address: Triple,
     exit: Option<([u8; 32], Vec<u16>)>,
     load: &Arc<LoadSensor>,
+    assigned: watch::Receiver<Assignment>,
 ) -> Result<(), NodeError> {
     let Some((seed, allowed_ports)) = exit else {
         return Ok(());
@@ -556,7 +557,7 @@ fn spawn_exit_role(
     // Advertise the exit through the overlay store so a proxy discovers it automatically (each epoch, so a
     // departed exit falls out of the live directory) — no hand-configured descriptor needed. The task runs
     // until the node stops; its handle is not retained, because retaining one does nothing (#251).
-    spawn_exit_publisher(handle.client(), public, handle.coordinate_prover());
+    spawn_exit_publisher(handle.client(), public, handle.coordinate_prover(), assigned);
     Ok(())
 }
 
@@ -963,6 +964,7 @@ fn spawn_roles<F: Field + 'static>(
     roles: RoleSet,
     directory: &Directory,
     load: Arc<LoadSensor>,
+    assigned: watch::Sender<Assignment>,
 ) -> SelfOrganization {
     let offered = roles.offered();
     let peers = directory.clone();
@@ -994,6 +996,7 @@ fn spawn_roles<F: Field + 'static>(
         // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
         // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
         move || peers.len(),
+        assigned,
     )
 }
 
@@ -1440,7 +1443,13 @@ impl Node {
         let load = spawn_load_sensor(&handle.client());
 
         // The exit role runs a clearnet relay on this node's client (see [`spawn_exit_role`]).
-        spawn_exit_role(&handle, address, exit, &load)?;
+        // **The assignment channel is created here, above both spawns.** The exit publisher starts before
+        // the role loop — it must, to open its load gauge before the load publisher reads it — so a channel
+        // created inside the loop would be unreachable to the one publisher that has a derived capacity and
+        // can therefore be assigned a strict subset of what it offers. Hoisting it is what lets an
+        // advertisement consult the assignment at all (audit R-H2).
+        let (assigned_tx, assigned_rx) = watch::channel(Assignment::NONE);
+        spawn_exit_role(&handle, address, exit, &load, assigned_rx)?;
 
         // The POROS ingress line's rotation. Spawned here rather than left to a caller for the reason this
         // whole subsystem keeps demonstrating: a driver nobody starts is a mechanism that does not exist,
@@ -1454,7 +1463,7 @@ impl Node {
         });
 
         // The self-organizing role subsystem (see [`spawn_roles`]).
-        let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory, load);
+        let self_org = spawn_roles::<F>(&handle, &credentials, config.roles, &directory, load, assigned_tx);
 
         // Keep the durable store current (#77). Present only when the config named a state directory — an
         // ephemeral node (a test, a proxy-only client) has nothing worth a file and should not make one.

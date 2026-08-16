@@ -736,6 +736,11 @@ struct AssignAt<'a> {
 /// assigns once immediately (the genesis epoch) and then on every real [`Notification::BeaconReady`]; it ends
 /// when the notification stream closes. Must run inside a tokio runtime.
 #[must_use]
+/// `roles_tx` is **created by the caller**, so a publisher that starts *before* this loop — the exit
+/// descriptor's, which must run early enough to open its load gauge — can still hold a receiver and consult
+/// the assignment each epoch. Creating the channel here made the assignment unreachable to anything spawned
+/// earlier, which is one reason "no production branch reads the assignment" survived as long as it did.
+#[allow(clippy::too_many_arguments, reason = "each is a distinct dependency; bundling them would hide one")]
 pub fn spawn_role_loop<F: Field>(
     client: Client,
     node_id: NodeId,
@@ -743,10 +748,11 @@ pub fn spawn_role_loop<F: Field>(
     capacity: Demand,
     ready: (oneshot::Receiver<()>, oneshot::Receiver<()>),
     peers: impl Fn() -> usize + Send + 'static,
+    roles_tx: watch::Sender<Assignment>,
     // See `assign_epoch`: `Some` exactly where a roster record must prove the coordinate it sits at.
     prover: Option<CoordinateProver>,
 ) -> (JoinHandle<()>, watch::Receiver<Assignment>) {
-    let (roles_tx, roles_rx) = watch::channel(Assignment::NONE);
+    let roles_rx = roles_tx.subscribe();
     // Supervised (#251): `Node::assigned` reads this watch, so a dead controller leaves the node reporting
     // roles it is no longer maintaining and the cell counting it as covering them.
     let supervised = client.clone();
@@ -1541,13 +1547,14 @@ pub fn spawn_self_organization<F: Field>(
     config: SelfOrgConfig,
     load_source: impl Fn() -> Demand + Send + 'static,
     peers: impl Fn() -> usize + Send + 'static,
+    assigned: watch::Sender<Assignment>,
 ) -> SelfOrganization {
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller, prover } = config;
     let (capability_publisher, capability_ready) =
         spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability, prover.clone());
     let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source, prover.clone());
     let (role_loop, assigned) =
-        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, prover);
+        spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, assigned, prover);
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
 }
 
