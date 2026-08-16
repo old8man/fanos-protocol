@@ -527,6 +527,23 @@ pub enum Station {
     /// **What a nonzero count obliges.** Someone must run `fanos beacon-reshare` with the recovery-authority
     /// key; nothing else advances the epoch, and until it does every per-epoch rotation is stopped.
     RecoveryEscalated,
+    /// This node **withheld** its exit descriptor for an epoch: it offers the role and the cell did not
+    /// assign it (`docs/design-self-organization.md` §5).
+    ///
+    /// **The observable that proves actuation, taken where the decision is made.** The neighbouring
+    /// question — "does a node advertise a role the cell did not assign?" — cannot be answered by reading
+    /// the directory and the assignment together, because they live on different clocks: a descriptor is
+    /// written per *epoch* and stands for it, while the role loop re-assigns on the much shorter roster
+    /// cadence, so a node that published while assigned and lost the role afterwards looks identical to one
+    /// that never had it. Recording the *withholding* has no such gap: it is sampled at publication time and
+    /// says exactly what the node did.
+    ///
+    /// **Zero means one of two things and they are far apart**: every offering node is assigned (a cell whose
+    /// demand meets its supply), or the assignment is not being read at all — which is the state this
+    /// station was added to end. Read it against the offer: a cell where more nodes offer Exit than the
+    /// setpoint needs must show this rising, and if it does not, the record is being written by the offer
+    /// rather than by the decision.
+    ExitAdvertisementWithheld,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1161,6 +1178,7 @@ impl Station {
         Self::ArbitrationDial,
         Self::MembershipSize,
         Self::RecoveryEscalated,
+        Self::ExitAdvertisementWithheld,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1236,6 +1254,7 @@ impl Station {
             Self::ArbitrationDial => "directory.arbitration_dial",
             Self::MembershipSize => "membership.size",
             Self::RecoveryEscalated => "recovery.escalated",
+            Self::ExitAdvertisementWithheld => "exit.advertisement_withheld",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1332,6 +1351,7 @@ impl Station {
             | Self::ArbitrationDial
             | Self::MembershipSize
             | Self::RecoveryEscalated
+            | Self::ExitAdvertisementWithheld
             | Self::RestrictedPullAsked => {
                 TagKind::Quantity
             }

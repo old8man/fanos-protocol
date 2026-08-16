@@ -1876,6 +1876,57 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_the_cell_withholds_an_unassigned_exit_advertisement() {
+        // **The direct evidence that the assignment actuates, sampled where the decision is made.** The
+        // neighbouring tripwire compares the directory against the assignment at one instant and cannot
+        // separate "never assigned" from "assigned, then not" — a descriptor stands for its epoch while the
+        // role loop re-assigns on the much shorter roster cadence. `exit.advertisement_withheld` has no such
+        // gap: it fires exactly when a node that OFFERS Exit is not assigned it and therefore publishes
+        // nothing for that epoch.
+        //
+        // Needs epoch boundaries to be observable at all, so the fleet runs at the derived floor rather than
+        // the shipped 600 s — at which the withholding branch is simply never reached inside a scenario.
+        //
+        // Read against the offer: five nodes offer Exit on an idle cell, the setpoint is `⌈0/capacity⌉ = 0`,
+        // and demand falls to the observability floor of one. A zero here would say the record is still
+        // being written by the OFFER rather than by the decision.
+        //
+        // **Measured 2026-08-16, first run after the actuation landed: `[9, 3, 6, 4, 8]` over nine epochs.**
+        // Every node withheld in some epochs and published in others, which is the assignment rotating —
+        // `priority_key` re-draws the holders against each beacon — and it is the direct evidence the
+        // neighbouring tripwire structurally cannot give. Before the change all five published every epoch,
+        // unconditionally.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+        let roles = RoleSet { relay: true, exit: true, ..RoleSet::default() };
+        let fleet = NodeFleet::spawn_with_epoch::<F4>(5, Link::ideal(), roles, floor).await.expect("fleet starts");
+        tokio::time::sleep(8 * floor).await;
+        let withheld: Vec<u64> = fleet
+            .nodes()
+            .iter()
+            .map(|n| {
+                n.client()
+                    .driver_stations()
+                    .iter()
+                    .filter(|o| o.station == fanos_runtime::ports::stations::Station::ExitAdvertisementWithheld)
+                    .map(|o| o.count)
+                    .sum()
+            })
+            .collect();
+        let assigned: Vec<bool> = fleet.nodes().iter().map(|n| n.serves(fanos_core::roles::Role::Exit)).collect();
+        let epochs: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        fleet.shutdown().await;
+        println!(
+            "MEASURED exit.advertisement_withheld per node {withheld:?}, assigned now {assigned:?}, epochs \
+             {epochs:?} — all five offer Exit, so a nonzero count is the assignment acting"
+        );
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_membership_locks_out_after_an_epoch_boundary() {
         // **The consequence of keying membership by a position whose occupant changes.** `on_announce` ends
         // at "first sight only" — `members.contains_key(&coord)` refuses a repeat, which protects a member's

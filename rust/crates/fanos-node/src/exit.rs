@@ -750,6 +750,10 @@ pub fn spawn_exit_publisher(
             // nothing consulted what the cell decided.
             if assigned.borrow().roles.has(fanos_core::roles::Role::Exit) {
                 publish(epoch, seed, &public).await;
+            } else {
+                // Sampled where the decision is, not where a reader later compares two clocks — see
+                // `Station::ExitAdvertisementWithheld`.
+                client.record_station(fanos_runtime::ports::stations::Station::ExitAdvertisementWithheld, None, None);
             }
         }
     });
