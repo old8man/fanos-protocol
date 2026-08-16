@@ -754,18 +754,23 @@ pub fn spawn_exit_publisher(
             // up would hang this publisher on any epoch the loop legitimately declines to decide, and a
             // chosen timeout would be a number nobody derived. It publishes on a decision that includes it,
             // withholds otherwise, and says which case it was.
+
+            // **Wait for the decision to reach this epoch, then act on it.** The publisher and the role
+            // loop both wake on the same beacon and the publisher always wins the race — measured: gating on
+            // `decided_for >= epoch` *without* waiting tagged every withholding on every node "stale", which
+            // is a functional silence, not a decision. Waiting is what that attempt was missing.
+            //
+            // **And the wait is bounded by the protocol, not by a timer.** Any later assignment satisfies
+            // `epoch(assignment) >= epoch`, so the loop skipping this epoch — which it may legitimately do
+            // when the roster is incomplete — releases this wait at its next decision, and the record is
+            // then written against a decision *newer* than the epoch it names, which is sound. The only
+            // unbounded case is a loop that never decides again, and a node with no assignment has nothing
+            // to advertise: silence is the honest answer there rather than a record backed by nothing.
+            while assigned.borrow_and_update().epoch < epoch && assigned.changed().await.is_ok() {}
             let (decided_for, serves) = {
                 let a = assigned.borrow();
                 (a.epoch, a.roles.has(fanos_core::roles::Role::Exit))
             };
-            // **The decision is used as it stands, and the epoch it names is a diagnosis rather than a
-            // gate.** Requiring `decided_for >= epoch` was tried and measured: every withholding on every
-            // node came back tagged "stale", because the publisher and the role loop both wake on the same
-            // beacon and the publisher always wins. Gating on it silences every exit, every epoch — a
-            // functional regression the tag caught before it shipped. What the tag now records is that the
-            // advertisement for epoch E is written against the decision for E−1, which is an ordering defect
-            // of its own and is a different repair (wake the publisher *after* the assignment, or have the
-            // loop decide before the publishers run).
             if serves {
                 publish(epoch, seed, &public).await;
             } else {

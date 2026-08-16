@@ -1891,7 +1891,14 @@ mod tests {
         // and demand falls to the observability floor of one. A zero here would say the record is still
         // being written by the OFFER rather than by the decision.
         //
-        // **Measured 2026-08-16, first run after the actuation landed: `[9, 3, 6, 4, 8]` over nine epochs.**
+        // **Measured 2026-08-16.** First run after the actuation landed, before the publisher waited for the
+        // decision to reach its epoch: `[9, 3, 6, 4, 8]` over nine epochs, every one tagged "stale" — the
+        // publisher and the role loop wake on the same beacon and the publisher always wins, so the record
+        // for epoch E was written against the decision for E−1. After the wait: `[0, 0, 1, 0, 0]`, the one
+        // withholding tagged "decided, not assigned", and no stale tag at all. Far fewer withholdings, which
+        // says the previous-epoch decision was systematically naming different holders.
+        //
+        // The older reading, kept because it is what the actuation itself proved: `[9, 3, 6, 4, 8]`.
         // Every node withheld in some epochs and published in others, which is the assignment rotating —
         // `priority_key` re-draws the holders against each beacon — and it is the direct evidence the
         // neighbouring tripwire structurally cannot give. Before the change all five published every epoch,
