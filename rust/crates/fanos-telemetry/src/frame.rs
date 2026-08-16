@@ -168,6 +168,24 @@ impl CoherenceFrame {
     /// that has observed **nothing** produces a frame that reads as a healthy collective subject, and
     /// [`CoherenceSnapshot::from_frame`](crate::CoherenceSnapshot::from_frame) called it *"bound and self-observing"* (#154).
     #[must_use]
+    // **The narrowing is deliberate for the wire, and it also fixes the comparison basis — which is the
+    // half worth saying, because it is the half a future shortcut would break.**
+    //
+    // Every threshold downstream (`PHI_THRESHOLD`, `REFLECTION_FLOOR`, `PURITY_FLOOR`) is an `f64` constant,
+    // and every value compared against one has passed through here: `CoherenceSnapshot::from_frame` is the
+    // only constructor, and the observatory's own `snapshot()` builds a frame first rather than reading its
+    // matrix directly. So all consumers compare the *same rounded number* and cannot disagree about
+    // readiness at a boundary.
+    //
+    // A local `f64` shortcut — computing a scalar straight from the matrix and testing it against the same
+    // constant, skipping the frame — would be a silent way to break that: two nodes, one reading a peer's
+    // frame and one reading its own matrix, would sit on opposite sides of a threshold for values within
+    // ~1e-7 of it. Cheap to introduce as an "optimisation", and invisible until a cell is on an edge.
+    //
+    // One consequence is already visible and recorded at
+    // `snapshot::the_bands_upper_edge_is_one_point_for_three_invariants_and_is_still_ready`: a widened `f32`
+    // can never equal an `f64` constant, so `>=` and `>` are the same function on every producible input and
+    // the spec's choice between them is unobservable here.
     #[allow(clippy::cast_possible_truncation)] // f64→f32 narrowing is deliberate for the wire frame.
     // Eight distinct inputs to one fold, same as `SelfObserver::observe_liveness`: a params struct would
     // add a type whose only job is to be destructured immediately, and would hide `measured` — the one
