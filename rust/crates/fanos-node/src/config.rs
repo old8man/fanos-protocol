@@ -1394,9 +1394,41 @@ pub struct NodeConfig {
     pub roles: RoleSet,
     /// Mean Poisson mixing delay a **relay** holds each forwarded onion for (spec §L5/V7, audit S1-H1). Zero
     /// forwards immediately (no mixing, no T2 defence). Inert on a non-relay. Default [`DEFAULT_MIX_DELAY`].
+    ///
+    /// **And inert on a stock relay too, because cover shadows it.** `ThresholdRouter::forward_send` queues to
+    /// its constant-rate outbox and *returns* whenever `cover_interval != 0`; the mixing branch is below that
+    /// return. `compose_engine` hands the router both values and this struct's `Default` makes both non-zero,
+    /// so on a deployment as shipped this delay never runs — which
+    /// `composed_relay::the_mix_delay_holds_a_hop_only_when_cover_is_off_which_is_never_in_production` measures
+    /// rather than assumes.
+    ///
+    /// That is **not** dead configuration, and the distinction matters to anyone tempted to delete it: the
+    /// delay is calibrated and it works when it is the only defence — measured at `0.24` of flow correlation
+    /// bought, at a bin finer than its own mean. It is a defence held **in reserve**, and what activates it is
+    /// setting [`cover_interval`](Self::cover_interval) to zero. Read that field's doc before doing so; the
+    /// exchange is not one-for-one.
     pub mix_mean_delay: Duration,
     /// Mean interval a **relay** emits constant-size cover cells at (spec §L5/V8, audit S1-H1/E1). Zero disables
     /// cover. Inert on a non-relay. Default [`DEFAULT_COVER_INTERVAL`].
+    ///
+    /// **"Disables cover" understates it: zero does four things, and only the second is the one it names.**
+    /// Nothing refuses the setting — `Node::start` checks that a relay has beacon parameters and does not
+    /// check this — so it is reachable, and a low-bandwidth deployment may want it. In descending severity:
+    ///
+    /// 1. **Emitted volume stops being independent of cargo (audit E6 is lost).** With cover, everything the
+    ///    router emits is paced by slot streams — its forwards, and the share-gathers that *received* onions
+    ///    draw, since those onions arrive on other nodes' slots. Without it, received onions are cargo only,
+    ///    so gathers and forwards both scale with traffic and the node's whole volume tracks it. This one is
+    ///    binary; the rest are quantitative.
+    /// 2. [`mix_mean_delay`](Self::mix_mean_delay) becomes live — the reserve defence activates, and it is a
+    ///    real one (`0.24` of flow correlation bought at a fine bin).
+    /// 3. **The `1 / cover_interval` throughput ceiling disappears**, because there is no slot stream to
+    ///    displace into. That ceiling is what #135 records as the `Relay` role's capacity.
+    /// 4. **The shedding discipline flips.** With cover the outbox is bounded and evicts the **oldest**
+    ///    (`Station::RelayCargoDropped`); without it the bound is on live mix timers and refuses the
+    ///    **newest** (`Station::RelayMixRefused`).
+    ///
+    /// So one value changes which defence runs, what the node's capacity is, and which cell dies under load.
     pub cover_interval: Duration,
     /// Whether to begin liveness heartbeats on start.
     ///
