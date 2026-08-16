@@ -608,13 +608,53 @@ magnitude of margin, so the choice is not delicate.
 * **Let two nodes share a point.** Harmless for shard placement (it reads as redundancy) but not for routing or committee
   identity, both of which need one holder per point. It is also the status quo, and it is what costs the `1 − e^{−ρ}` above.
 * **Settle only on join.** A strictly weaker version of the window that is safe *today*, because a node that has not yet
-  announced has no coordinate-keyed state depending on it. Worth having as the first increment: it fixes the joining case,
-  which is the whole of the cold-start and the whole of the simulator's fleet scenario, and it needs no new signal. It does
-  not fix an established node whose point becomes contested by a later arrival.
+  announced has no coordinate-keyed state depending on it. **Built** — see Status. It was expected to fix the joining case,
+  "which is the whole of the cold-start and the whole of the simulator's fleet scenario"; that second half is now **refuted
+  by execution** and the refutation is recorded below. It does not fix an established node whose point becomes contested by
+  a later arrival, and that half stands.
 
 ### Status
 
-Not implemented. The wire (`CoordinateClaim` on `HELLO`), the state (`ClaimBook`), and the decision procedure
-(`fanos_vrf::settle_index` + `claims::settle`) are all in place and unit-verified; what is missing is the phase boundary and
-the `PlacementCommitted` signal the layers above must respect. **Settle-on-join is the increment to build first** — safe
-under the invariant, and it is what the failing simulator measurement is actually blocked on.
+**Settle-on-join is built and shipping** — `c76f1a1` (2026-07-26), with the transition made observable in `48237d4`
+(2026-08-10). It lives in the reshuffle loop as `Wake::Resettle if at.joining`: a recorded peer claim re-seats a node that
+has not yet lived through an epoch boundary, and `Station::SeatCommitted` fires once per node lifetime at the moment that
+freedom ends. The wire (`CoordinateClaim` on `HELLO`), the state (`ClaimBook`) and the decision procedure
+(`fanos_vrf::settle_index` + `claims::settle`) were already in place and unit-verified.
+
+Still missing, unchanged: the **phase boundary** and the `PlacementCommitted` signal the layers above must respect — i.e.
+the full window, which is what the *established* case needs.
+
+#### The increment did not do what this document predicted, and the prediction is retired
+
+This section said settle-on-join "is what the failing simulator measurement is actually blocked on". **It is not**, and the
+reason is that the increment was already live for every trial of every collision measurement ever taken here:
+
+| link | fact |
+|---|---|
+| `at.joining` is cleared | only in the `Wake::Beacon` arm of the reshuffle loop |
+| that arm wakes on | `BeaconReady`, emitted only when the beacon **adopts a new epoch** |
+| a new epoch needs | a threshold round, which needs **anchors** — nodes configured with `share = Some(..)` |
+| the fleet's anchors | **none**: `NodeFleet` dealt the sharing into `_shares` and gave every node `share: None` |
+
+The last row is the whole of it, and it is worse than a long period. Measured directly before the fix — three nodes, a
+2.1 s epoch, beacon sampled every 4.2 s — `live_beacon()` read `[None, None, None]` through twelve periods. **No fleet
+node has ever crossed an epoch boundary, at any period.** So every node was free to re-seat for the entire scenario, and
+`measure_whether_a_collided_draw_now_resolves_itself` still resolved only 4/8 and 6/8 forced collisions.
+
+**And the same row voids the experiment that was run to test this.** The arm at a 30 s epoch was supposed to be the
+contrast; with no anchors it stood at genesis exactly like the baseline, so `4/8` vs `5/8` at `p = 1.0` compared two
+identical arms. That null result is now *unmeasured* rather than false — it says nothing about epochs either way. Fixed in
+`fanos_sim::fabric` by dealing the shares it was already computing; the fleet now advances (`[1,3,3] → [1,12,12]` over
+25 s), and `every_node_of_a_fleet_leaves_the_genesis_epoch` keeps it that way.
+
+**Conclusion, stated as a negative because that is what it is: freedom to re-seat is not the binding constraint on
+collision resolution.** The free state was measured at length and resolves about half; the committed state is now
+reachable for the first time and is the experiment to run next. The tree's own instrumentation already names a candidate
+for the band: on the unresolved trials `transport.self_connection` fires (the refused node's only route to the incumbent
+is the contested coordinate, which resolves to itself), while `claims::settle` returning `None` — "beaten on every point
+of the line" — is the designed `1 − e^{−ρ}` cost and not a defect at all. Neither is fixed by a phase.
+
+**What this does not weaken:** the settling window's own argument. The window exists so an *established* node may move
+without stranding the layers that derived from its seat, and no measurement above touches that case, because the fixture
+never produces one. It does mean the window should not be justified by the fleet's collision numbers — those are now
+evidence that the joining half is already free and still stuck.

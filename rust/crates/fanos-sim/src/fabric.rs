@@ -487,7 +487,17 @@ impl NodeFleet {
         epoch_period: Option<Duration>,
     ) -> Result<Self, fanos_node::NodeError> {
         let fabric = Fabric::new(link);
-        let (_shares, commitment) = fanos_vrf::vss::deal(
+        // **The shares are dealt and kept.** They used to be `_shares`, and that one underscore cost this tier every
+        // epoch-driven behaviour it has: `share = Some(..)` is what makes a node an *anchor* that contributes partials,
+        // `None` a pure consumer. Every fleet node was a consumer of a group whose anchors did not exist, so no
+        // threshold round could ever assemble, `BeaconReady` never fired, and the epoch stood at genesis for the life of
+        // every scenario — measured as `live beacons [None, None, None]` after twelve periods at a 2.1 s epoch.
+        //
+        // Two consequences worth stating because both were recorded as facts about the protocol: no fleet node ever
+        // reaches `Station::SeatCommitted`, so settle-on-join was silently at full strength in every collision
+        // measurement; and the experiment that varied `epoch_period` and found no effect was comparing two arms that
+        // both stood still. The sibling fixture one directory over (`tests/common/mod.rs`) always dealt them properly.
+        let (shares, commitment) = fanos_vrf::vss::deal(
             &[0xF1; 32],
             2,
             3,
@@ -540,7 +550,11 @@ impl NodeFleet {
                         network_id: fanos_node::NetworkId::from_seed(b"test-network"),
                         commitment: commitment.clone(),
                         threshold: 2,
-                        share: None,
+                        // The dealing is three wide against a threshold of two, so the first three nodes are the
+                        // cell's anchors and the rest are consumers — the production shape, where anchoring is a
+                        // subset rather than the whole cell. A one-node fleet therefore still stands at genesis, and
+                        // honestly so: two partials cannot come from one anchor.
+                        share: shares.get(nodes.len()).cloned(),
                         authority: None,
                     }),
                     roles,
@@ -1842,6 +1856,102 @@ mod tests {
         let counts: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
         fleet.shutdown().await;
         assert!(recorded, "a node that completes a handshake must record the peer's verified claim, saw {counts:?}");
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_node_of_a_fleet_leaves_the_genesis_epoch() {
+        // **The premise underneath the premise.** The test below asserts that a boundary is what ends a node's freedom
+        // to re-seat; this one asserts that a boundary happens at all. It did not: `NodeFleet` dealt a VSS sharing and
+        // bound it to `_shares`, so every node was a beacon *consumer* of a group with no anchors, no threshold round
+        // could assemble, and `live_beacon()` read `None` on every node for the whole life of every scenario. A fleet
+        // pinned at genesis exercises no coordinate reshuffle, no onion ratchet, no per-epoch re-assignment and no
+        // directory-slot expiry — and reports nothing, because nothing was watching this.
+        //
+        // **Measured after the fix**, 3 nodes at a 2.1 s epoch, beacon epoch sampled every 4.2 s:
+        // `[1,1,1] → [1,3,3] → [1,5,5] → [1,7,8] → [1,10,10] → [1,12,12]`. Nodes 1 and 2 track the driver's period
+        // exactly. **Node 0 adopts epoch 1 and then stands still**, which this test deliberately does NOT assert away:
+        // it is the bootstrap node, the only one nobody dials *out* to, and that asymmetry is an open question with a
+        // known neighbourhood (`directory.entry_fallback`, and the driver's deliberate refusal to write a directory
+        // entry from an inbound connection's ephemeral source port). Asserting the floor — every node leaves genesis —
+        // pins what the fix bought without pinning the anomaly as if it were correct.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+
+        let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+        let fleet =
+            NodeFleet::spawn_with_epoch::<F4>(3, Link::ideal(), RoleSet::default(), floor).await.expect("fleet starts");
+        let advanced = fleet
+            .until(|f| f.nodes().iter().all(|n| n.live_beacon().is_some_and(|(e, _)| e > fanos_primitives::Epoch::ZERO)))
+            .await;
+        let epochs: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        fleet.shutdown().await;
+        assert!(
+            advanced,
+            "a {floor:?} epoch and a dealt beacon must carry every node past genesis, read {epochs:?} — `None` means no \
+             threshold round ever assembled, which is the anchors being absent rather than the period being long"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_epoch_boundary_is_the_only_thing_that_ends_a_node_s_freedom_to_re_seat() {
+        // **The premise every collision measurement in this file is read through, and nothing pinned it.**
+        // Settle-on-join (`docs/design-coordinates.md`; `Wake::Resettle if at.joining`) lets a node re-seat on a
+        // peer's better claim only until it has lived through an epoch boundary. So whether a harness is observing
+        // free nodes or committed ones is not a detail — it decides which of the two designs is under test — and it
+        // is set by a constant three crates away: `at.joining` clears only in the `Wake::Beacon` arm, that arm wakes
+        // only on `BeaconReady`, and only `spawn_epoch_driver` produces one, whose **first tick is deliberately
+        // skipped** "so the node has a full period to connect and sync". At `DEFAULT_EPOCH_PERIOD = 600 s` against
+        // runs of 60–160 s, no fleet node has ever committed a seat, and the numbers those runs produced were
+        // therefore measuring settle-on-join at full strength rather than its absence.
+        //
+        // That inference cost this investigation three wrong explanations, so it is asserted here rather than
+        // re-derived. Both states are produced, one variable apart — the epoch period — because an absence with
+        // nothing to contrast it against cannot tell "never commits" from "the station never fires at all".
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+        use fanos_runtime::ports::stations::Station;
+
+        fn committed(fleet: &NodeFleet) -> usize {
+            fleet
+                .nodes()
+                .iter()
+                .filter(|n| n.client().driver_stations().iter().any(|o| o.station == Station::SeatCommitted))
+                .count()
+        }
+
+        // Derived, not chosen: the shortest epoch the runtime's own arithmetic admits, `read_timeout + heartbeat`.
+        // `Node::start` deliberately does not enforce it on fixtures ("test fixtures compress the clock on purpose"),
+        // and this is exactly that case — the quantity under test is the boundary, not the period.
+        let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+
+        let short =
+            NodeFleet::spawn_with_epoch::<F4>(3, Link::ideal(), RoleSet::default(), floor).await.expect("fleet starts");
+        let began = std::time::Instant::now();
+        let all_committed = short.until(|f| committed(f) == f.nodes().len()).await;
+        let took = began.elapsed();
+        let seen = committed(&short);
+        short.shutdown().await;
+        assert!(all_committed, "at a {floor:?} epoch every node must cross a boundary and commit its seat; {seen} of 3 did");
+        println!("MEASURED all three seats committed after {took:?} at a {floor:?} epoch (backstop, not a latency claim)");
+
+        // **The control's wait is the second kind of timeout — its expiry IS the success condition — so it must be
+        // derived or it proves nothing.** It is taken from the arm above: at least four short epochs, and at least
+        // twice as long as commitment actually took *on this host, under this load*. A loaded machine stretches
+        // `took` and stretches this window with it, which is the property a fixed sleep here would not have.
+        let window = (4 * floor).max(2 * took);
+        let dflt = NodeFleet::spawn::<F4>(3, Link::ideal(), RoleSet::default()).await.expect("fleet starts");
+        tokio::time::sleep(window).await;
+        let late = committed(&dflt);
+        let stations = dflt.stations();
+        dflt.shutdown().await;
+        assert_eq!(
+            late, 0,
+            "at the default {:?} epoch a node cannot reach a boundary in {window:?}, so every node must still be free \
+             to re-seat — {late} of 3 committed, which changes what every collision measurement in this file means. \
+             Stations:{stations}",
+            fanos_node::NodeConfig::default().epoch_period,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
