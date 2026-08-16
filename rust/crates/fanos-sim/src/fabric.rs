@@ -416,7 +416,53 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, None).await
+    }
+
+    /// As [`spawn`](Self::spawn), with an explicit **epoch period** — the one thing a fleet could not say.
+    ///
+    /// Every scenario here has run against `DEFAULT_EPOCH_PERIOD` (600 s) while lasting tens of seconds, so
+    /// the whole of what an epoch drives — the coordinate reshuffle, the onion-key ratchet, per-epoch
+    /// re-assignment, directory-slot expiry — has never been exercised at the multi-node tier. The node tier
+    /// has always been able to say it (`cell_diagnosis.rs`, `role_roster.rs` pass `ROSTER_REFRESH * 2`); this
+    /// one could not, and two `#[ignore]`d probes ask questions about later epochs they cannot reach.
+    ///
+    /// Additive on purpose: the existing constructors pass `None` and keep their behaviour exactly, so a
+    /// scenario that changes is one that asked to.
+    ///
+    /// # Errors
+    /// Propagates the first node-start failure.
+    /// Test-only, and the declaration says so: its callers are this file's own measurement
+    /// harnesses, exactly as `widest_withheld_scan` is.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_epoch<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+        epoch_period: Duration,
+    ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period)).await
+    }
+
+    /// [`spawn_as_drawn`](Self::spawn_as_drawn) with an explicit epoch period — the collision half of
+    /// [`spawn_with_epoch`](Self::spawn_with_epoch).
+    ///
+    /// Both halves exist because a collision scenario and an epoch-crossing scenario are different questions
+    /// and a constructor that changed the draw *and* the clock would make any comparison between them
+    /// uninterpretable.
+    ///
+    /// # Errors
+    /// Propagates the first node-start failure.
+    /// Test-only, and the declaration says so: its callers are this file's own measurement
+    /// harnesses, exactly as `widest_withheld_scan` is.
+    #[cfg(test)]
+    pub(crate) async fn spawn_as_drawn_with_epoch<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+        epoch_period: Duration,
+    ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, Some(epoch_period)).await
     }
 
     /// As [`spawn`](Self::spawn), but taking the coordinate draw **as it comes** — collisions included.
@@ -430,7 +476,7 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, false).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, None).await
     }
 
     async fn spawn_inner_fleet<F: fanos_field::Field + 'static>(
@@ -438,6 +484,7 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
         injective: bool,
+        epoch_period: Option<Duration>,
     ) -> Result<Self, fanos_node::NodeError> {
         let fabric = Fabric::new(link);
         let (_shares, commitment) = fanos_vrf::vss::deal(
@@ -497,6 +544,11 @@ impl NodeFleet {
                         authority: None,
                     }),
                     roles,
+                    // A fleet that never crosses an epoch cannot exercise anything an epoch drives, and the
+                    // production default is 600 s against scenarios that run for tens. `None` keeps exactly
+                    // today's behaviour; a caller that needs a boundary asks for one, the way the node-tier
+                    // tests already do (`cell_diagnosis.rs`, `role_roster.rs`: `ROSTER_REFRESH * 2`).
+                    epoch_period: epoch_period.unwrap_or(fanos_node::config::DEFAULT_EPOCH_PERIOD),
                     // Derived from the role rather than taken as a parameter, because without them
                     // `exit_params` refuses the node outright: offering `exit` to this fleet used to be a
                     // *start error*, so no scenario could ever exercise the one role whose capacity is
@@ -1826,8 +1878,48 @@ mod tests {
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        for trial in 0..4 {
-            let fleet = NodeFleet::spawn_as_drawn::<F4>(7, Link::ideal(), roles).await.expect("fleet starts");
+        println!("{}", fanos_testkit::measurement_conditions());
+        // **Two arms, one run, because the comparison IS the measurement.** The production question is
+        // "does a collided draw resolve itself" at the shipped `DEFAULT_EPOCH_PERIOD`; the diagnostic
+        // question is whether the epoch turn is what resolves it, which #260 predicts ("both then hold one
+        // point until the epoch turns"). Answering them in separate runs would put a host and an hour
+        // between the two numbers; answering them here does not, and a reader gets a pair rather than a
+        // single figure they might mistake for behaviour.
+        //
+        // Measured 2026-08-16, eight forced collisions per arm: **4/8 at 600 s, 5/8 at 30 s** (Fisher exact
+        // `p = 1.0`). So the epoch turn is NOT the resolving event, and #260's deadlock — real, and the
+        // reason the seated loser cannot walk — is not what the missing half is about. Two caveats the
+        // numbers do not carry: at eight per arm even 4/8 vs 8/8 is only `p ≈ 0.08`, so this design can
+        // conclude from a total effect or from none; and under a short epoch "resolved" is a **transient**
+        // property, since the wait below and the re-read after it can straddle a boundary.
+        for (label, epoch) in [
+            ("epoch 600s (shipped)", fanos_node::config::DEFAULT_EPOCH_PERIOD),
+            ("epoch  30s (probe)  ", fanos_node::role_loop::ROSTER_REFRESH * 2),
+        ] {
+        let mut resolved = 0usize;
+        for trial in 0..8 {
+            // **Force the collision, and count more trials — the certification above was taken without
+            // either.** `spawn_as_drawn` takes the draw as it comes, so a trial can spend itself on an
+            // injective draw with nothing to resolve; re-running this on 2026-08-16 produced exactly that as
+            // trial 0 (`claims` all zero). The sibling measurement one function over states the rule and
+            // follows it — "a measurement that can silently pass by never exercising its path is not a
+            // measurement" — and this one did not, so "four trials, every one reaching 7/7" was three real
+            // trials and a vacuous one.
+            //
+            // It matters because the re-run reached 7/7 in **one of the three** that actually collided, with
+            // the original fingerprint (`index` all `0`: nobody advanced). Whether that is a regression or a
+            // sample too small to have shown it in July is exactly what a larger forced sample answers, and
+            // it is one constant.
+            let fleet = loop {
+                let fleet = NodeFleet::spawn_as_drawn_with_epoch::<F4>(7, Link::ideal(), roles, epoch)
+                    .await
+                    .expect("fleet starts");
+                let drawn: HashSet<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+                if drawn.len() < fleet.nodes().len() {
+                    break fleet;
+                }
+                fleet.shutdown().await;
+            };
             let settled = fleet.until(|f| {
                 let held: HashSet<_> = f.nodes().iter().map(|n| n.health().address).collect();
                 held.len() == f.nodes().len()
@@ -1839,15 +1931,33 @@ mod tests {
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
             // `None` = not bound at all (it lost the arbitration and holds no directory entry).
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
+            // **The stations, because one of them is the discriminator this measurement lacked.**
+            // `directory.seat_outranked` fires when a node holds the winning claim to its own point and is
+            // forbidden to act on it (#260), keyed by the contested coordinate — and its own doc gives the
+            // reading rule: "a nonzero count that does not clear at the next epoch is the settling window
+            // (`docs/design-coordinates.md`) being needed rather than one unlucky draw". The short-epoch arm
+            // spans several boundaries, so its persistence there tests the DESIGN's prediction rather than
+            // any story told about the numbers afterwards.
+            let stations = fleet.stations();
             fleet.shutdown().await;
             // Deliberately NOT reporting rosters here. The `until` predicate waits for distinct *addresses*, so a roster
             // sampled at that instant is read before the role loop has assigned anything — it prints `[0, 0, …]` and looks
             // like broken propagation when it is only an early read. Roster convergence has its own probe
             // (`probe_roster_convergence_against_cell_occupancy`), which waits for it.
+            // Both readings, because under a short epoch they are different facts: `settled` is what the
+            // wait observed, `held` is what a re-read found afterwards, and a boundary can fall between them.
+            // Equal ⇒ placement is stable; different ⇒ the epoch re-draws faster than placement settles,
+            // which would make the epoch period a quantity bounded below by the resolution time rather than
+            // a chosen one.
+            if settled {
+                resolved += 1;
+            }
             println!(
-                "trial {trial}: held {}/7, all-distinct: {settled}, claims {claims:?}, index {idx:?}",
+                "  {label} trial {trial}: held {}/7, all-distinct: {settled}, claims {claims:?}, index {idx:?}{stations}",
                 held.len()
             );
+        }
+        println!("{label}: resolved {resolved}/8");
         }
     }
 
@@ -1951,7 +2061,13 @@ mod tests {
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
         // F4 for the same reason as the assertions: the original F2 timeline that motivated this probe was partly a
         // collision artifact. The frozen *epoch* it revealed was real and independent of that.
-        let fleet = NodeFleet::spawn::<F4>(3, Link::ideal(), roles).await.expect("fleet starts");
+        // **A short epoch, or this probe cannot ask its own question.** It exists to see whether the roster
+        // grows at LATER epochs, and it observed 60 s against `DEFAULT_EPOCH_PERIOD = 600 s` — zero epoch
+        // boundaries, so the answer was never in the window. `ROSTER_REFRESH * 2` is the node tier's own
+        // choice (`cell_diagnosis.rs`, `role_roster.rs`) and sits well above `minimum_epoch_period`.
+        let fleet = NodeFleet::spawn_with_epoch::<F4>(3, Link::ideal(), roles, fanos_node::role_loop::ROSTER_REFRESH * 2)
+            .await
+            .expect("fleet starts");
         for tick in 0..12 {
             let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
             let epochs: Vec<String> =
