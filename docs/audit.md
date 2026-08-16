@@ -1161,6 +1161,22 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 
 **Fix:** wire `spawn_self_organization` into `Node::start` (this is also HOLARCH finding §4-H3 — the self-org brain is disconnected from the hands); make the setpoint/roster inputs **epoch-snapshotted and quorum-agreed** (assign off a committed membership snapshot per epoch, not the live mutable store) so the determinism precondition actually holds under churn; gate reputation decay on **reachability-corroborated** non-performance (a corroborated-down node is excused, not slashed).
 
+> **HALF CLOSED, and the halves are worth separating (2026-08-16).** `spawn_self_organization` **is** now
+> called from `fanos-node/src/node.rs` — the "never called by `Node::start`" anchor is stale, and the loop
+> computes and publishes an assignment every epoch.
+>
+> **What is still open is the actuation, and it is the more consequential half.** No production branch reads
+> the assignment: the node activates everything `config.roles` offers, at startup, and keeps it. Surveyed
+> against the three activity advertisements `Node::start` wires — the mix key is gated on the *offer* and
+> Relay's capacity is the placeholder `1`, so assignment == offer and no discrepancy can arise; the exit
+> descriptor is gated on the offer while Exit's capacity is derived from `diaulos::MAX_SESSIONS`, so a
+> discrepancy *can* arise there; and `spawn_rendezvous_host` is not called from `Node::start` at all. Exit is
+> therefore the only place a behavioural tripwire can stand today, and three independent reasons — one per
+> row — are why no existing test could have caught this.
+>
+> Consequence in the design's own terms: §5's reputation price for non-performance, the third of its three
+> Sybil bounds, is computed every epoch and **never charged**.
+
 ### [HIGH] R-H3 — Reintegration budget is zero for near-healthy cells: deep repair is structurally forbidden, forcing (unwired) escalation
 *Anchors:* `fanos-diakrisis/src/healing.rs:39` (`max_reroute_depth = ⌊log₉ Φ⌋`), `:19` (Φ→Φ/9 per coarse hop); `fanos-diakrisis/src/regeneration.rs:64` (`recovery_time = 1/Δ`, → ∞ as the gap closes).
 
