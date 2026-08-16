@@ -1489,6 +1489,17 @@ impl Node {
         &self.directory
     }
 
+    /// This node's transport handle — the seam a *plane-aware* caller needs.
+    ///
+    /// [`health`](Self::health) is not generic over the field, so a reading that needs `F` cannot go in
+    /// [`Health`] without erasing it into a closure first. `NodeHandle::seat_contended::<F>` is exactly such a
+    /// reading — whether a peer's claim to this node's own point is in its book — and the harness that asks it
+    /// knows the plane. Exposing the handle is the smaller change and keeps `Health` field-free.
+    #[must_use]
+    pub const fn handle(&self) -> &NodeHandle {
+        &self.handle
+    }
+
     /// A current health snapshot.
     #[must_use]
     pub fn health(&self) -> Health {

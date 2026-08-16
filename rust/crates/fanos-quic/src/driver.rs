@@ -974,6 +974,28 @@ impl NodeHandle {
         self.claims.as_ref().map(ClaimBook::len)
     }
 
+    /// Whether a **peer's** claim to the point this node currently occupies is recorded in its own book.
+    ///
+    /// **The pairwise question, which [`verified_claims`](Self::verified_claims) structurally cannot answer.**
+    /// That one is a total — how many claims were verified, not whether the one contesting *this* seat was
+    /// among them — so two nodes stuck on one point can both report a healthy-looking count while neither has
+    /// heard of the other. The forced-collision harness reads exactly that ambiguity today: every unresolved
+    /// trial shows an all-zero probe index (nobody advanced) with claim counts of 3–7, and the guide reads a
+    /// high count as "heard and did not move" when it may equally be "heard six others and not this one".
+    ///
+    /// `settle_index`'s order is **total**, so of any colliding pair exactly one must be able to advance. When
+    /// neither does, the remaining explanation is that the one that should move does not hold its rival's
+    /// claim — and this is the reading that says so, against `ClaimBook::contender`, the very oracle
+    /// `settle_index` consumes.
+    ///
+    /// `None` without a self-certifying identity, or when this node's coordinate is not a plane point.
+    #[must_use]
+    pub fn seat_contended<F: Field>(&self) -> Option<bool> {
+        let book = self.claims.as_ref()?;
+        let point = Point::<F>::new(self.address())?;
+        Some(book.contender::<F>(&point).is_some())
+    }
+
     /// The UDP socket address the node is actually bound to (its directory entry).
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {

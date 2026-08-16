@@ -2201,6 +2201,15 @@ mod tests {
             // The localising observable: whose claims did each node actually verify? A node still on a contested point with
             // a low count never heard of its rival; a high count means it heard and did not move.
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
+            // **The pairwise reading, and the one the columns beside it cannot give.** `claims` is a total:
+            // a node stuck on a contested point can have verified six peers and still not the one contesting
+            // *its* seat, and the guide would read that high count as "heard and did not move". This asks
+            // `ClaimBook::contender` — the very oracle `settle_index` consumes — whether a peer's claim to
+            // THIS node's point is in its book. `settle_index`'s order is total, so of a colliding pair
+            // exactly one must be able to advance; when the index column is all-zero, the two answers here
+            // separate "the mover never heard its rival" from "it heard and the rule declined".
+            let contended: Vec<_> =
+                fleet.nodes().iter().map(|n| n.handle().seat_contended::<F4>()).collect();
             // Did each node *decide* to move? `0` = stayed at its preferred point, `> 0` = advanced its probe walk,
             // `None` = not bound at all (it lost the arbitration and holds no directory entry).
             let idx: Vec<_> = fleet.nodes().iter().map(|n| n.health().probe_index).collect();
@@ -2226,7 +2235,8 @@ mod tests {
                 resolved += 1;
             }
             println!(
-                "  {label} trial {trial}: held {}/7, all-distinct: {settled}, claims {claims:?}, index {idx:?}{stations}",
+                "  {label} trial {trial}: held {}/7, all-distinct: {settled}, claims {claims:?}, rival-in-book \
+                 {contended:?}, index {idx:?}{stations}",
                 held.len()
             );
         }
