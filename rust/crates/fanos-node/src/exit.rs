@@ -748,12 +748,33 @@ pub fn spawn_exit_publisher(
             // a value captured once would be an offer wearing an assignment's name — which is exactly the
             // shape this closes: every activity advertisement was gated on `config.roles`, the OFFER, and
             // nothing consulted what the cell decided.
-            if assigned.borrow().roles.has(fanos_core::roles::Role::Exit) {
+            // **Two different withholdings, and telling them apart is the whole reason for the tag.** The
+            // publisher and the role loop both wake on the same beacon, so an assignment computed for an
+            // earlier epoch is a race rather than a decision. Neither blocks: waiting for the loop to catch
+            // up would hang this publisher on any epoch the loop legitimately declines to decide, and a
+            // chosen timeout would be a number nobody derived. It publishes on a decision that includes it,
+            // withholds otherwise, and says which case it was.
+            let (decided_for, serves) = {
+                let a = assigned.borrow();
+                (a.epoch, a.roles.has(fanos_core::roles::Role::Exit))
+            };
+            // **The decision is used as it stands, and the epoch it names is a diagnosis rather than a
+            // gate.** Requiring `decided_for >= epoch` was tried and measured: every withholding on every
+            // node came back tagged "stale", because the publisher and the role loop both wake on the same
+            // beacon and the publisher always wins. Gating on it silences every exit, every epoch — a
+            // functional regression the tag caught before it shipped. What the tag now records is that the
+            // advertisement for epoch E is written against the decision for E−1, which is an ordering defect
+            // of its own and is a different repair (wake the publisher *after* the assignment, or have the
+            // loop decide before the publishers run).
+            if serves {
                 publish(epoch, seed, &public).await;
             } else {
-                // Sampled where the decision is, not where a reader later compares two clocks — see
-                // `Station::ExitAdvertisementWithheld`.
-                client.record_station(fanos_runtime::ports::stations::Station::ExitAdvertisementWithheld, None, None);
+                let stale = u64::from(decided_for < epoch);
+                client.record_station(
+                    fanos_runtime::ports::stations::Station::ExitAdvertisementWithheld,
+                    None,
+                    Some(stale),
+                );
             }
         }
     });

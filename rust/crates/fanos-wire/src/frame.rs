@@ -72,7 +72,7 @@ pub enum FrameType {
     /// A relayed frame that **carries its own origin proof** — the symmetric-NAT fallback's authenticated
     /// form (#119). Unlike [`Relay`](Self::Relay), whose `origin` field is a claim the receiver must take on
     /// trust, this one binds the inner frame to a coordinate the receiver derives for itself.
-    RelayAttested = 0x1E,
+    RelayAttested = 0x0A,
     /// One anchor's distributed-VRF **beacon partial** for an epoch (audit E5): flooded among the
     /// beacon group; a threshold of them assemble the epoch's [`Beacon`](Self::Beacon) round.
     BeaconPartial = 0x18,
@@ -225,7 +225,7 @@ impl FrameType {
             0x16 => Self::DkgCommit,
             0x17 => Self::DkgComplaint,
             0x1D => Self::DkgCommitReq,
-            0x1E => Self::RelayAttested,
+            0x0A => Self::RelayAttested,
             0x18 => Self::BeaconPartial,
             0x19 => Self::EpochAgree,
             0x1A => Self::BeaconReshareTrigger,

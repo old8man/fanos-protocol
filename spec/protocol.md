@@ -725,7 +725,7 @@ frame = type:varint  ‖  length:varint  ‖  body:bytes[length]
 
 | Range | Group | Types |
 |---|---|---|
-| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `ERROR`, `OBSERVED_ADDR`, `CONNECT_REQ`, `PUNCH_TO`, `RELAY` |
+| `0x0*` | Session | `HELLO`, `HELLO_ACK`, `PING`, `PONG`, `ERROR`, `OBSERVED_ADDR`, `CONNECT_REQ`, `PUNCH_TO`, `RELAY`, `RELAY_ATTESTED` |
 | `0x1*` | Membership | `ANNOUNCE`, `BEACON_REQ`, `BEACON`, `DKG_*`, `BEACON_PARTIAL`, `EPOCH_AGREE`, `BEACON_RESHARE_*` |
 | `0x2*` | Overlay/storage | `LOOKUP`, `VALUE`, `PUBLISH`, `ACK` |
 | `0x3*` | Direct route | `ROUTE`, `ROUTE_HIER` |

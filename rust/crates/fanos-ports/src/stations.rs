@@ -538,6 +538,12 @@ pub enum Station {
     /// that never had it. Recording the *withholding* has no such gap: it is sampled at publication time and
     /// says exactly what the node did.
     ///
+    /// [`Observation::tag`] separates two withholdings that look alike and are not: `0` the cell **decided**
+    /// this epoch and did not assign this node, `1` the assignment on hand is for an **earlier** epoch, so
+    /// nothing has been decided for the one being published. The second is a race, not a decision — the
+    /// publisher and the role loop both wake on the beacon — and reading it as a decision would report a
+    /// cell that assigns nothing when it has merely not spoken yet.
+    ///
     /// **Zero means one of two things and they are far apart**: every offering node is assigned (a cell whose
     /// demand meets its supply), or the assignment is not being read at all — which is the state this
     /// station was added to end. Read it against the offer: a cell where more nodes offer Exit than the

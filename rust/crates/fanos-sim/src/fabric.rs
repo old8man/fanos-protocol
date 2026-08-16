@@ -1903,7 +1903,7 @@ mod tests {
         let roles = RoleSet { relay: true, exit: true, ..RoleSet::default() };
         let fleet = NodeFleet::spawn_with_epoch::<F4>(5, Link::ideal(), roles, floor).await.expect("fleet starts");
         tokio::time::sleep(8 * floor).await;
-        let withheld: Vec<u64> = fleet
+        let withheld: Vec<Vec<(u64, u64)>> = fleet
             .nodes()
             .iter()
             .map(|n| {
@@ -1911,15 +1911,15 @@ mod tests {
                     .driver_stations()
                     .iter()
                     .filter(|o| o.station == fanos_runtime::ports::stations::Station::ExitAdvertisementWithheld)
-                    .map(|o| o.count)
-                    .sum()
+                    .map(|o| (o.tag.unwrap_or(0), o.count))
+                    .collect::<Vec<_>>()
             })
             .collect();
         let assigned: Vec<bool> = fleet.nodes().iter().map(|n| n.serves(fanos_core::roles::Role::Exit)).collect();
         let epochs: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
         fleet.shutdown().await;
         println!(
-            "MEASURED exit.advertisement_withheld per node {withheld:?}, assigned now {assigned:?}, epochs \
+            "MEASURED exit.advertisement_withheld per node as (tag, count), tag 0 = decided-not-assigned, 1 = assignment stale for this epoch: {withheld:?}, assigned now {assigned:?}, epochs \
              {epochs:?} — all five offer Exit, so a nonzero count is the assignment acting"
         );
     }
