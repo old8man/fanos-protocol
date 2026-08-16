@@ -859,8 +859,21 @@ impl<F: Field> ThresholdRouter<F> {
             //
             // A decoy is safe because the combiner already treats every reply as a *candidate* and trusts
             // none until a `t`-subset actually peels — the mechanism built for up to `t − 1` forged shares
-            // (`MAX_SUBSETS`). A cover cell's gather cannot peel with or without this reply; what changes is
-            // that it now costs the same frames on the wire as a real one.
+            // (`MAX_PEEL_ATTEMPTS`). A cover cell's gather cannot peel with or without this reply; what
+            // changes is that it now costs the same frames on the wire as a real one.
+            //
+            // **And what it costs, since a defence that is only measured on the axis it was written for is
+            // half measured.** Before this arm replied, a combiner gathering an unpeelable cell collected at
+            // most one share and `try_peel` returned early. Now it collects `q` and runs the subset search
+            // to exhaustion. On the shipping plane that is one attempt — a line of three at threshold two,
+            // with the combiner's own partial absent for the same reason, gives `C(2,2) = 1` — and on any
+            // plane it is bounded by `min(C(q, t), MAX_PEEL_ATTEMPTS)` with `MAX_PEEL_ATTEMPTS = 256`.
+            //
+            // The amplification an attacker gains is likewise small and was mostly already there: a garbage
+            // onion of `THRESHOLD_ONION_LEN` (20493 B on the wire) drew `q` requests of 20513 B before this
+            // change and now also draws `q` replies of 42 B — `41110 B` out for `20493 B` in, `2.006×`, of
+            // which the decoy is **0.2%**. Anti-replay forces every such cell to be fresh, so the attacker
+            // pays the full onion each time. The requests, which dominate, are the price of gathering at all.
             return alloc::vec![Effect::Send {
                 to: combiner,
                 frame: encode_rep(req_id, &self.decoy_share(i, req_id, line)),
@@ -1505,6 +1518,50 @@ mod tests {
         assert_eq!(
             seq_a, seq_a2,
             "the schedule is deterministic for a given secret"
+        );
+    }
+
+    /// **The premise behind the decoy's cost arithmetic: a cover cell leaves the combiner without its own
+    /// share.**
+    ///
+    /// `on_request`'s comment computes the added search as `C(q, t) = C(2, 2) = 1` on the shipping plane,
+    /// and that "2" is the number of decoys the combiner ends up holding — which is `q` only because its
+    /// **own** partial is missing too, for the same AEAD reason. Asserted rather than reasoned, because the
+    /// arithmetic in a comment is exactly the kind that stays right by luck.
+    #[test]
+    fn a_cover_cell_leaves_the_gathering_member_without_its_own_share() {
+        let (s, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"self-share"));
+        let me = Point::<F2>::at(0);
+        let mut r = ThresholdRouter::<F2>::new(me, &s, 2, [0x11; 32]);
+        let line = Plane::<F2>::lines()
+            .find(|&l| Plane::<F2>::points_on(l).any(|p| p == me))
+            .expect("every point lies on a line");
+        let mut garbage = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        fanos_primitives::hash::hash_xof("test/cover-body", b"self-share", &mut garbage);
+
+        let out = r.step(
+            Instant(0),
+            Input::Message {
+                from: Point::<F2>::at(3).coords(),
+                frame: encode_onion(line.coords(), &garbage),
+            },
+        );
+
+        assert_eq!(
+            r.stations().total(Station::GatherSelfShareMissing),
+            1,
+            "the gatherer's own partial must fail on keystream too — otherwise it holds q+1 shares and the \
+             cost comment in `on_request` is understated"
+        );
+        // And it asks exactly the rest of the line: `q` requests for a line of `q + 1`.
+        let asks = out
+            .iter()
+            .filter(|e| matches!(e, Effect::Send { frame, .. } if frame.first() == Some(&TAG_REQ)))
+            .count();
+        assert_eq!(
+            asks,
+            Plane::<F2>::LINE_SIZE as usize - 1,
+            "a gather asks every OTHER member of the line — the q in the same arithmetic"
         );
     }
 
