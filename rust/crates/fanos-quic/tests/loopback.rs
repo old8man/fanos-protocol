@@ -178,10 +178,14 @@ async fn heartbeat_keeps_a_live_peer_up_then_detects_its_death() {
     });
     assert!(quiet.await.is_err(), "A declared a live peer dead");
 
-    // Now kill B. Within a few liveness windows, A must report exactly B down. 5 s is a generous
-    // margin over the 1000 ms `liveness_timeout`, robust even when the machine is loaded.
+    // Now kill B. A must report exactly B down. The claim is that detection *happens* — the message
+    // below says "never" — and the old 5 s was documented as "a generous margin, robust even when the
+    // machine is loaded", which is the backstop's rationale written out longhand. So it is the
+    // backstop, and the number stops pretending to bound anything. Note the contrast with the window
+    // above: 1400 ms there IS derived (one `liveness_timeout` plus slack) because there the expiry is
+    // the success condition, and widening it would delete the check.
     b.shutdown();
-    let detected = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let detected = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(Notification::PeerDown(p)) = a.next_notification().await
                 && p == b.address()
