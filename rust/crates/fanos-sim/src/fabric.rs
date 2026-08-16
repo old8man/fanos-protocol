@@ -559,7 +559,22 @@ impl NodeFleet {
                 continue;
             }
             for o in seen {
-                let _ = write!(out, "{}={} ", o.station.name(), o.count);
+                // **`line` and `tag`, not just the count — they are part of the key, not decoration.**
+                // The counter map is `(station, line, tag) → count`, so two observations of one station
+                // that differ only in line or tag are distinct rows; printing `name=count` collapsed them
+                // into indistinguishable pairs. Measured cost: four `conns.surplus_read` entries on one node
+                // are four *peers*, and this report could not say which — while
+                // `Station::ConnSurplusRead` exists precisely to separate "sending into a corpse is a
+                // bounded transient" from "the list is a graveyard whose head is permanently dead", and it
+                // separates them **by tag** ("how many entries that read removed"). The discriminator was
+                // collected and dropped one line before it was printed.
+                //
+                // Raw values rather than `admin.rs`'s resolved `tag N (name)` form: that surface serves an
+                // operator and owns a vocabulary; this one serves a failure message, where the number is
+                // what a reader correlates across nodes.
+                let line = o.line.map_or_else(String::new, |[x, y, z]| format!("@{x}:{y}:{z}"));
+                let tag = o.tag.map_or_else(String::new, |t| format!("#{t}"));
+                let _ = write!(out, "{}{line}{tag}={} ", o.station.name(), o.count);
             }
         }
         out
@@ -1016,7 +1031,14 @@ mod tests {
         // Not a quiet pass either: a run that skips its own subject and reports `ok` cannot be told from one
         // that checked, so the outcome is printed with the verdict that produced it.
         if !matches!(settled, Settled::Reached { .. }) {
-            eprintln!("SKIPPED {}: the fleet had not settled — {settled:?}", module_path!());
+            // The stations too, not only the verdict: the verdict says *what* did not settle (the rosters),
+            // and the counters say *why* — which is the half a reader cannot reconstruct afterwards, because
+            // the fleet is about to be shut down.
+            eprintln!(
+                "SKIPPED {}: the fleet had not settled — {settled:?}{}",
+                module_path!(),
+                fleet.stations()
+            );
             fleet.shutdown().await;
             return;
         }
