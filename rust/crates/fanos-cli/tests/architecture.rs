@@ -3314,3 +3314,86 @@ fn no_shipping_code_panics_on_an_impossibility_claim() {
         );
     }
 }
+
+
+/// **A type that wipes itself on drop may not derive `Debug`.**
+///
+/// The wipe is the type's own declaration that it holds secret material — nothing else zeroizes. And a
+/// derived `Debug` prints that material in full at any `{:?}`: a log line, a panic message, a failed
+/// assertion. The two are contradictory claims about the same bytes.
+///
+/// Written after `bb7ed5c` found the one violation: `fanos_aphantos::sealed::FreshSeed`, the seed every
+/// per-hop KEM ephemeral and every AEAD nonce derives from, carried `#[derive(Clone, Debug)]` and no `Drop`
+/// at all. Restoring the derive there prints `FreshSeed([171, 171, … 171])` — thirty-two bytes of the
+/// circuit's master secret.
+///
+/// **No budget, because there are no exceptions**: sixteen types wipe on drop and none derives `Debug`. A
+/// type that needs a debug rendering writes one that redacts, which is what `Attachment`, `Share` and now
+/// `FreshSeed` do. If this ever needs an exemption, the honest form is a redacting impl, not a list.
+///
+/// The trigger is deliberately the *wipe* and not the type's NAME: `BeaconSeed`, `Nullifier` and `CallId`
+/// all wrap bytes and are public by design, while `FreshSeed` reads like a nonce and is not. Only what the
+/// type does with the bytes distinguishes them, and wiping is the machine-readable half of that.
+#[test]
+fn a_type_that_wipes_itself_on_drop_does_not_derive_debug() {
+    let mut wiping: BTreeSet<String> = BTreeSet::new();
+    let mut derives: BTreeMap<String, (String, String)> = BTreeMap::new(); // type -> (derive text, file:line)
+
+    for file in corpus() {
+        if !file.is_crate_src() {
+            continue;
+        }
+        let ship = production_part(&file.text);
+        let lines: Vec<&str> = ship.lines().collect();
+
+        for (i, line) in lines.iter().enumerate() {
+            // A wiping `Drop`: the impl header, then `zeroize` inside the body.
+            if let Some(rest) = line.trim_start().strip_prefix("impl Drop for ") {
+                let name = rest.split_whitespace().next().unwrap_or("").trim_end_matches('{').to_owned();
+                if lines[i..].iter().take(12).any(|l| l.contains("zeroize")) {
+                    wiping.insert(name);
+                }
+            }
+        }
+
+        // Derives, accumulated across lines so a multi-line list is not silently half-read — under-reporting
+        // is the failure mode a hand-rolled scan reaches for first.
+        let mut pending: Option<String> = None;
+        for (n, line) in shipping_lines(&file.text) {
+            let t = line.trim_start();
+            if let Some(open) = t.find("#[derive(") {
+                pending = Some(t[open..].to_owned());
+            } else if let Some(acc) = pending.as_mut().filter(|a| !a.contains(")]")) {
+                acc.push_str(t);
+            }
+            let closed = pending.as_ref().is_some_and(|a| a.contains(")]"));
+            if closed {
+                let list = pending.clone().unwrap_or_default();
+                if let Some(after) = t.split("struct ").nth(1) {
+                    let name: String =
+                        after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if !name.is_empty() {
+                        derives.insert(name, (list, format!("{}:{n}", file.rel)));
+                    }
+                }
+                if t.contains("struct ") || t.contains("enum ") {
+                    pending = None;
+                }
+            }
+        }
+    }
+
+    assert!(wiping.len() >= 10, "the wipe scan found only {} types — it has stopped reading", wiping.len());
+
+    let mut leaks: Vec<String> = Vec::new();
+    for name in &wiping {
+        if let Some((_, at)) = derives.get(name).filter(|(l, _)| l.contains("Debug")) {
+            leaks.push(format!("{name} at {at}"));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "these wipe their bytes on drop and print them at any `{{:?}}`: {leaks:?}. Write a Debug that \
+         redacts — the wipe says the bytes are secret and the derive says they are not."
+    );
+}
