@@ -1232,6 +1232,15 @@ reconciliation tail (E→L / L→O / Ω2 / Ω9), which is design work rather tha
 
 **Fix:** route clearnet through the anonymous rendezvous to the exit's service key (the exit already advertises one, `exit.rs:280-317`) exactly like a `.fanos` service; until then, `--profile anonymous` must **refuse** clearnet targets rather than silently downgrade, and the banner must not claim anonymity for the exit path.
 
+> **CLOSED, verified 2026-08-16 by reading the branch rather than the comment.** `FanosDialer::dial` no
+> longer has an early clearnet branch. Both targets compute `(coord, identity, exit_target)` — a `.fanos`
+> host through the resolver, a clearnet host through the configured exit's **service key** — and then
+> converge on the *same* call: `self.establish(coord, &identity, &mut rng)`. `establish` switches on the
+> profile: `Direct` dials the service plainly, while `Fixed(route)` and `Fresh(params)` both go through
+> `rendezvous::anonymous_dial`. A clearnet target under an anonymous profile therefore rides the anonymous
+> rendezvous to the exit's service key, which is exactly the fix this finding prescribed. The destination is
+> handed to the exit *over the session already established*, not before it.
+
 ### [HIGH] S1-H1 — ~~The shipping mixnet runs with cover traffic AND Poisson mixing OFF~~ — **RESOLVED (re-verified 2026-07-26)**
 
 `fanos-node/src/node.rs:555-556` builds the live router with `.with_mixing(mix_mean_delay).with_cover(cover_interval)`, and
