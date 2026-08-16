@@ -493,6 +493,28 @@ impl<F: Field> DkgNode<F> {
     }
 
     /// Broadcast `frame` to every *other* cell member (the reliable-broadcast primitive).
+    ///
+    /// # It is not reliable, and QUAL agreement is what pays for that
+    ///
+    /// This is `n − 1` point-addressed sends with no acknowledgement and no retransmission. Every rung of
+    /// the transport's resolution ladder can drop one — and measured 2026-08-16, the two rungs share a
+    /// failure mode: the directory and the connection cache are both keyed by coordinate, so a reseat
+    /// invalidates both at the same instant (`conns.cache_miss` against occupied points read `[2,2,2]` on a
+    /// three-node fleet, i.e. every node missing both rungs for both real peers).
+    ///
+    /// What rides it is complaints and justifications, and `QUAL` is computed from **what this node
+    /// received**: `qualified.insert(d)` fires when we hold dealer `d`'s commitment *and* our share from it,
+    /// and an unanswered complaint disqualifies. So a single dropped frame does not merely delay a node — it
+    /// gives it a **different qualified set**, hence a different aggregate commitment, hence a final share
+    /// that does not interoperate with its peers'. Agreement here is a correctness property, not a
+    /// convergence one.
+    ///
+    /// **And this is exactly why it must NOT simply become [`Effect::Flood`].** Flooding fixes *reach under
+    /// coordinate churn*, which is what the beacon round needed; it does not make a broadcast reliable, so
+    /// it would swap one silent partial-delivery mode for another. What this primitive actually wants is
+    /// either an echo/acknowledgement round, or a `QUAL` derived from a published transcript every
+    /// participant reads rather than from each node's own inbox. Neither is written; the exposure is bounded
+    /// today only by the ceremony running on a freshly-spawned cell whose directory is still fresh.
     fn broadcast_to_peers(&self, frame: &[u8]) -> Vec<Effect> {
         (1..=self.n as u8)
             .filter(|&j| j != self.index)
