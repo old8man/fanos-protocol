@@ -59,6 +59,22 @@ use tokio::time::Instant;
 /// The liveness backstop for any real-socket wait: long enough that machine contention cannot trip it, short enough that
 /// a genuine hang still fails the run rather than wedging it.
 ///
+/// **"Contention cannot trip it" is measurably false against a heavy neighbour, and the numbers are worth
+/// carrying.** On 2026-08-16 a full gate run put three real-QUIC tests in the red —
+/// `exit_quic::the_proxy_dialer_relays_udp_through_the_exit` and both
+/// `mix_directory_quic` directory tests — while a *different project* built and ran on the same box (load
+/// average 6.3–7.7). Re-run after that workload ended, each of the three passes in **0.5 s**. So the ceiling
+/// survived a 480× stretch and then did not: it is sized for contention *this suite* generates, not for a
+/// neighbour saturating every core.
+///
+/// The consequence for a reader of a red gate: **these three failing is not evidence of a defect**, and the
+/// only sound response is to re-run on a quiet box before diagnosing anything — the asymmetry makes it cheap,
+/// since load can only prevent a pass, so a pass under load is conclusive and a failure under load is not.
+/// `fanos_testkit::require_quiet_host` exists for exactly this verdict and these tests deliberately do not
+/// call it, because the module note above records what blaming contention cost the last two times: a cell
+/// frozen at three seconds went undiagnosed while the ceiling burned 240 s. Both failure modes are real, they
+/// look identical from outside, and only the re-run separates them.
+///
 /// This is deliberately **not** a latency budget. Assert latency explicitly where it matters.
 pub const HANG_CEILING: Duration = Duration::from_secs(240);
 
