@@ -129,8 +129,34 @@ pub enum PeelOutcome {
 /// A newtype rather than a doc line, because the failure it prevents is catastrophic and invisible: see
 /// [`build`]'s "A repeated seed is a two-time pad". Every constructor below names how freshness is obtained,
 /// so a call site that has none has to say so out loud.
-#[derive(Clone, Debug)]
+/// **No derived `Debug` and a wiping `Drop`, because this is the onion's master secret.** `build`'s own doc
+/// says it: *"All randomness derives from `seed`"* and *"every per-hop KEM ephemeral **and** every AEAD nonce
+/// here is derived from `seed ‖ k`"*. So a single `{:?}` — in a log line, a panic message, a failed
+/// assertion — hands an observer every hop's ephemeral and every nonce, which is the whole circuit.
+///
+/// This is the rule `fanos_angelos::attachment::Attachment` states for its own key ("`Debug` is hand-written
+/// and `Drop` wipes the key… the four other key-holding types in this crate already live by both rules") and
+/// the one `fanos_nyx::ratchet` warns about in the other direction ("one stray `{:?}`/`dbg!` would leak
+/// forward-secure key material"). This type derived `Debug` and wiped nothing.
+///
+/// Safe to add `Drop` here: the bytes are read through the borrowing [`as_bytes`](Self::as_bytes) and never
+/// moved out, the same shape `fanos_primitives::shamir::Share` uses for exactly this reason.
+#[derive(Clone)]
 pub struct FreshSeed(Vec<u8>);
+
+impl core::fmt::Debug for FreshSeed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The length only: it is what a reader debugging a circuit actually needs, and it is not the secret.
+        write!(f, "FreshSeed(<{} bytes redacted>)", self.0.len())
+    }
+}
+
+impl Drop for FreshSeed {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
+    }
+}
 
 impl FreshSeed {
     /// A seed from a **per-boot-freshened** node seed and a counter that advances once per circuit.
@@ -576,5 +602,32 @@ mod tests {
             Err(ProtocolError::HolonomyFail),
             "a substituted hop must be caught and rejected, not silently accepted"
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_hygiene {
+    use super::FreshSeed;
+
+    /// **A `{:?}` on the onion's master secret must not print it.**
+    ///
+    /// `build` derives every per-hop KEM ephemeral and every AEAD nonce from this seed, so one debug print in
+    /// a log line, a panic message or a failed assertion hands an observer the whole circuit. The type used to
+    /// `#[derive(Debug)]`.
+    ///
+    /// Asserted on the OUTPUT rather than on the impl: a future `derive` would compile, pass every other test
+    /// in this crate, and reintroduce the leak silently — this is the only thing that would notice.
+    #[test]
+    fn debug_does_not_print_the_seed() {
+        let secret = [0xAB_u8; 32];
+        let seed = FreshSeed::replayable_for_test(&secret);
+        let shown = format!("{seed:?}");
+
+        assert!(!shown.contains("171"), "the decimal byte form leaks: {shown}");
+        assert!(!shown.contains("ab") && !shown.contains("AB"), "the hex byte form leaks: {shown}");
+        assert!(shown.contains("32"), "the length is what a reader needs and is not the secret: {shown}");
+        // And the control: the bytes ARE reachable through the accessor, so the test above is about the
+        // rendering and not about the seed being empty.
+        assert_eq!(seed.as_bytes(), &secret, "the seed itself is unchanged — only its rendering is redacted");
     }
 }

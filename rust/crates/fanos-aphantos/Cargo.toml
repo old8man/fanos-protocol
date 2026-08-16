@@ -17,6 +17,7 @@ subtle.workspace = true
 fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std", "aead"] }
+zeroize.workspace = true
 fanos-wire = { workspace = true, features = ["std"] }
 fanos-nyx = { workspace = true, features = ["std"] }
 # NyxNode / ThresholdRouter are sans-I/O engines that speak only the contract vocabulary — the light leaf,
