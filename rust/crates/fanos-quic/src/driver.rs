@@ -2111,12 +2111,18 @@ impl Reseater {
     /// the reorder introduces — bind lands, engine is gone — happens only on the shutdown path, where the loop breaks
     /// immediately and the entry outlives the node by the length of one teardown.
     ///
-    /// **What a refusal here means, and why it is not retried.** The walk settles against the *claim book*
+    /// **What a refusal here means, and what is done about it.** The walk settles against the *claim book*
     /// (`claims::settle`) and the refusal comes from the *directory* — two stores of one fact, each able to hold a claim
-    /// the other has never seen. `WriteOutcome::Superseded` carries the incumbent's address, not its claim, so there is
-    /// nothing to feed back into the book and re-settling would land on the same index and lose again. Holding the
-    /// current placement is correct rather than a concession: the loop is event-driven, and the next `BeaconReady`
-    /// re-derives everything from a fresh rank anyway.
+    /// the other has never seen. `WriteOutcome::Superseded` carries the incumbent's address, not its claim, so
+    /// re-settling on the spot would land on the same index and lose again; the placement is held.
+    ///
+    /// **But the address is not nothing.** This used to stop there, and the measured consequence was a loser that could
+    /// never learn *why* it lost: its only route to the incumbent is the contested coordinate, which the directory
+    /// serves as one address, so the incumbent addressing the other claimant dials itself
+    /// (`transport.self_connection`, 20 of 20 frames delivered to the sender). The refusal now emits a `Ping` at the
+    /// contested point — which resolves to the incumbent, since the table still holds *its* binding — and the handshake
+    /// records the incumbent's **verified** claim in the book. The next `Wake::Resettle` then settles against a book
+    /// that knows about the rival, which is the input `settle_index` was missing.
     fn apply<F: Field>(&self, at: &mut Placement, index: u16, claim: &CoordinateClaim) -> bool {
         let point = fanos_vrf::probe_point::<F>(&at.output, index).coords();
         // Bound with this epoch's rank AND the probed index: the arbitration order is the claim *pair*, so a table
@@ -2132,13 +2138,33 @@ impl Reseater {
             }
             WriteOutcome::Bound | WriteOutcome::Unchanged => {}
             WriteOutcome::Superseded { keeping } => {
-            self.client.record_station(Station::DirectorySeatSuperseded, Some(point), None);
-            tracing::debug!(
-                ?point,
-                index,
-                ?keeping,
-                "the settled seat is held by a better claim the book has not seen; holding position"
-            );
+                self.client.record_station(Station::DirectorySeatSuperseded, Some(point), None);
+                tracing::debug!(
+                    ?point,
+                    index,
+                    ?keeping,
+                    "the settled seat is held by a better claim the book has not seen; reaching the incumbent for it"
+                );
+                // **Reach the incumbent, because the address IS actionable.** The paragraph above used to end
+                // at "carries the incumbent's address, not its claim, so there is nothing to feed back into
+                // the book" — true of the *address*, and a dead end only if a dial is impossible. It is not:
+                // the table still says `point → keeping`, so a frame emitted at `point` resolves to the
+                // incumbent's address, and the handshake that follows records its **verified** claim through
+                // the ordinary path. That is exactly the fact the book is missing, obtained the one way the
+                // claim book will accept it.
+                //
+                // **Why a ping and not a new mechanism.** `Reseater` holds no `Transport` and cannot dial, so
+                // for a long time this looked like it needed one; it needs a *send*, and `Command::Emit`
+                // already is one. The frame is a `Ping` because the point is the connection, not the payload.
+                //
+                // **Bounded by the connection cache, not by a timer.** The first emit dials and the
+                // connection is filed under the incumbent's coordinate, so a later refusal reuses it rather
+                // than dialling again. The measured failure this addresses is the one where the loser can
+                // never learn why it lost: `transport.self_connection` on the contested point, which is the
+                // incumbent dialling itself because the directory serves that point as one address.
+                let mut ping = Vec::new();
+                encode_frame(FrameType::Ping.code(), &[], &mut ping);
+                let _ = self.client.command(Command::Emit { to: point, frame: ping });
                 return true;
             }
         }
