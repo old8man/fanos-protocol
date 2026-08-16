@@ -1441,7 +1441,13 @@ async fn router_loop(
                     // once per subscriber every snapshot period, from a store any peer can fill. It is a
                     // reply, not an event; nothing subscribes to it because nothing should.
                     Notification::Snapshot(_) => {
-                        let Notification::Snapshot(bytes) = note else { unreachable!() };
+                        // The outer `match &note` has already matched `Snapshot(_)`; this re-match only
+                        // moves the payload out of the owned value, which a borrow cannot do. Dead by
+                        // construction rather than by argument — and it says so, because the other two
+                        // impossibility claims that ship carry their proof and `PANIC_BUDGET` counts all three.
+                        let Notification::Snapshot(bytes) = note else {
+                            unreachable!("the outer match on &note already selected Snapshot")
+                        };
                         // Skip askers that have already given up, so an abandoned request cannot consume the
                         // answer a live one is waiting for.
                         while let Some((_, tx)) = snapshots.pop_front() {
