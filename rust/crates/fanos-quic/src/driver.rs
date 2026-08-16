@@ -729,9 +729,11 @@ pub const fn reflexive_quorum(q: u32) -> usize {
 const REFLEXIVE_QUORUM_FANO: usize = reflexive_quorum(2);
 
 /// An internal request from the engine actor to the transport loop.
-struct SendRequest {
-    to: Triple,
-    frame: Vec<u8>,
+enum SendRequest {
+    /// One frame to one coordinate, through the resolution ladder.
+    To { to: Triple, frame: Vec<u8> },
+    /// One frame to every connection this node holds, resolving nothing — see [`Effect::Flood`].
+    Flood { frame: Vec<u8> },
 }
 
 /// The transport's shared context: everything the send and receive paths need besides the destination.
@@ -2675,6 +2677,14 @@ async fn engine_loop(
         let now = Instant(origin.elapsed().as_nanos() as u64);
         for effect in engine.step(now, input) {
             match effect {
+                Effect::Flood { frame } => {
+                    if is_beacon_round(&frame)
+                        && let Ok(mut held) = last_round.lock()
+                    {
+                        *held = Some(frame.clone());
+                    }
+                    let _ = send_tx.send(SendRequest::Flood { frame });
+                }
                 Effect::Send { to, frame } => {
                     // **Kept before it goes out, because this is the only place both producers meet.** A node
                     // holds the current round either by assembling it (`adopt_and_announce`) or by re-flooding
@@ -2686,7 +2696,7 @@ async fn engine_loop(
                     {
                         *held = Some(frame.clone());
                     }
-                    let _ = send_tx.send(SendRequest { to, frame });
+                    let _ = send_tx.send(SendRequest::To { to, frame });
                 }
                 Effect::ArmTimer { token, after } => {
                     let tx = input_tx.clone();
@@ -2795,7 +2805,19 @@ async fn fire_timer(tx: mpsc::Sender<Input>, token: TimerToken, delay: std::time
 /// duplicate-dial race a naive per-frame spawn would suffer cannot arise.
 async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendRequest>) {
     let mut workers: HashMap<Triple, mpsc::Sender<Vec<u8>>> = HashMap::new();
-    while let Some(SendRequest { to, frame }) = send_rx.recv().await {
+    while let Some(request) = send_rx.recv().await {
+        // **A flood is dispatched here rather than through a worker, because it names no peer.** The workers
+        // exist so one slow peer cannot block another's traffic; a flood has no destination to be slow, so it
+        // is handed straight to the connections. Spawned, because the fan-out awaits a write per connection
+        // and this dispatcher must not stall behind it.
+        let (to, frame) = match request {
+            SendRequest::To { to, frame } => (to, frame),
+            SendRequest::Flood { frame } => {
+                let flooding = t.clone();
+                tokio::spawn(async move { flood_connections(&flooding, &frame).await });
+                continue;
+            }
+        };
         // Reuse the peer's worker, or start one. Workers live for the dispatcher's lifetime (bounded by the
         // node's peer set, exactly like the connection cache), so no per-peer teardown race exists: the
         // channel a frame is handed to always has a live receiver draining it.
@@ -2967,6 +2989,30 @@ async fn ask_restricted_peers(t: &Transport, frame: &[u8]) {
     }
     t.record_station(Station::RestrictedPullAsked, None, u64::try_from(held.len()).ok());
     for conn in &held {
+        send_uni(conn, &t.shaper, t.joining(conn), frame).await;
+    }
+}
+
+/// Put `frame` on every connection this node holds — the driver's half of [`Effect::Flood`].
+///
+/// **Both tables, and the restricted one is not an afterthought.** `conns` holds peers whose coordinate this
+/// node verified; `unjudged` holds peers neither side could judge, which is precisely the state a node that
+/// has fallen out of the epoch leaves everyone in. A beacon round is exactly what such a peer may be handed
+/// (`admitted_unjudged`), and it is the one thing that can bring it back, so excluding it would omit the
+/// case the flood exists for.
+///
+/// **No deduplication by coordinate.** A peer reachable on two connections gets the frame twice, which costs
+/// one extra write and saves a lock-ordering argument; the frames this carries are idempotent by
+/// construction — a beacon round is adopted once and monotone, a `BeaconReq` is contentless.
+async fn flood_connections(t: &Transport, frame: &[u8]) {
+    let mut peers: Vec<Connection> = match t.conns.lock() {
+        Ok(map) => map.values().flatten().cloned().collect(),
+        Err(_) => Vec::new(),
+    };
+    if let Ok(map) = t.unjudged.lock() {
+        peers.extend(map.values().cloned());
+    }
+    for conn in &peers {
         send_uni(conn, &t.shaper, t.joining(conn), frame).await;
     }
 }

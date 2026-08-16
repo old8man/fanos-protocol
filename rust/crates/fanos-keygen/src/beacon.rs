@@ -629,7 +629,7 @@ impl<F: Field> BeaconNode<F> {
             // directly rather than wait for evidence that, for a node the cell can no longer address, will
             // never arrive. The request is contentless and rides connections this node already holds; see
             // `fanos_quic::driver::ask_restricted_peers` for why that is the only rung left to it.
-            effects.extend(self.request_sync());
+            effects.extend(Self::request_sync());
         }
         self.buffer(target, partial);
         effects.extend(self.try_assemble(target));
@@ -737,7 +737,7 @@ impl<F: Field> BeaconNode<F> {
             return Vec::new();
         }
         self.sync_asked_for = Some(seen);
-        self.request_sync()
+        Self::request_sync()
     }
 
     /// The highest epoch this node has pulled for, or `None` if it has never had to — the observable half of
@@ -764,14 +764,23 @@ impl<F: Field> BeaconNode<F> {
         round: BeaconRound,
     ) -> Vec<Effect> {
         self.adopt(epoch, seed);
-        let effects = self.announce(epoch, seed, &round);
+        let effects = Self::announce(epoch, seed, &round);
         self.current_round = Some(round);
         effects
     }
 
     /// Flood `round` to the cell and emit the `BeaconReady` notification for the driver.
-    fn announce(&self, epoch: Epoch, seed: [u8; 32], round: &BeaconRound) -> Vec<Effect> {
-        let mut effects = self.broadcast(&round_frame(round));
+    ///
+    /// **A real flood, not `q² + q + 1` point-addressed sends.** A round is the one beacon frame that
+    /// authenticates itself against the group commitment, and [`on_round`](Self::on_round) re-floods every
+    /// strictly-newer one it receives — so connection-graph gossip reaches the whole connected component,
+    /// while point addressing reaches only whoever the sender can currently *resolve*. Measured, that is the
+    /// difference that matters: the directory and the connection cache are both keyed by coordinate and a
+    /// reseat invalidates both at once, so a node whose slot has expired is unreachable by every rung at the
+    /// moment it most needs the round. Under [`Effect::Flood`] it is reachable over the connection it already
+    /// holds, including a restricted one neither side could judge.
+    fn announce(epoch: Epoch, seed: [u8; 32], round: &BeaconRound) -> Vec<Effect> {
+        let mut effects = std::vec![Effect::Flood { frame: round_frame(round) }];
         effects.push(Effect::Notify(Notification::BeaconReady { epoch, seed }));
         effects
     }
@@ -791,8 +800,11 @@ impl<F: Field> BeaconNode<F> {
     /// Request the current beacon from the cell on join (spec §7.8 bootstrap): broadcast a `BeaconReq`, to
     /// which any synced peer replies with its round — so a node that missed live rounds still adopts the
     /// current epoch's verified seed rather than assuming one.
-    fn request_sync(&self) -> Vec<Effect> {
-        self.broadcast(&encode(FrameType::BeaconReq, &[]))
+    fn request_sync() -> Vec<Effect> {
+        // Flooded for the same reason the round is, and more sharply: a node asking for the beacon is by
+        // definition one the cell may no longer be able to address, so a request that needed resolution
+        // would fail exactly when it is needed. It only has to reach *someone* who is synced.
+        std::vec![Effect::Flood { frame: encode(FrameType::BeaconReq, &[]) }]
     }
 
     // ---- Verifiable secret redistribution (proactive resharing) — audit R-C1 ---------------------------
@@ -1173,7 +1185,7 @@ impl<F: Field> Engine for BeaconNode<F> {
             // The epoch-advance trigger (a timer/driver tick): an anchor proposes the next epoch's beacon.
             Input::Command(Command::AdvanceEpoch) => self.advance(),
             // On join, pull the current beacon from the cell (spec §7.8 bootstrap).
-            Input::Command(Command::StartHeartbeat) => self.request_sync(),
+            Input::Command(Command::StartHeartbeat) => Self::request_sync(),
             Input::Message { from, frame } => {
                 let Ok((f, _)) = decode_frame(&frame) else {
                     // **A frame that does not decode at all**, so its type was never read and no handler
@@ -1771,7 +1783,14 @@ mod tests {
         let req = encode(FrameType::BeaconReq, &[]);
         let mut node =
             BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), 2, BeaconSeed::GENESIS);
-        let asks = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Send { frame, .. } if *frame == req)).count();
+        // Counted on either shape: what is asserted is that an ask went out, not which primitive carried it.
+        let asks = |fx: &[Effect]| {
+            fx.iter()
+                .filter(|e| {
+                    matches!(e, Effect::Flood { frame } | Effect::Send { frame, .. } if *frame == req)
+                })
+                .count()
+        };
 
         let first = node.step(Instant(1), Input::Command(Command::AdvanceEpoch));
         assert_eq!(asks(&first), 0, "one proposal in flight is the healthy steady state, not a stall");
@@ -1810,7 +1829,7 @@ mod tests {
         let feed = |node: &mut BeaconNode<F2>, epoch: Epoch| {
             let frame = partial_frame(epoch, &partial_eval(&shares[1], epoch));
             let fx = node.step(Instant(1), Input::Message { from: [9, 9, 9], frame });
-            fx.iter().filter(|e| matches!(e, Effect::Send { frame, .. } if *frame == req)).count()
+            fx.iter().filter(|e| matches!(e, Effect::Flood { frame } | Effect::Send { frame, .. } if *frame == req)).count()
         };
 
         assert_eq!(node.epoch(), Epoch::ZERO, "the node starts at genesis, so `epoch + 1` is 1");
@@ -1932,7 +1951,7 @@ mod tests {
             .step(Instant(1), Input::Command(Command::StartHeartbeat))
             .into_iter()
             .find_map(|e| match e {
-                Effect::Send { frame, .. } => Some(frame),
+                Effect::Flood { frame } => Some(frame),
                 _ => None,
             })
             .expect("join broadcasts a BeaconReq");

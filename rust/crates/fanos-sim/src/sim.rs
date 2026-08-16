@@ -702,6 +702,19 @@ impl Sim {
     fn apply(&mut self, node: Triple, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
+                // **A flood is every peer this tier can reach, which here is the whole membership.** The
+                // abstract network has no connection table — that is the one thing this simulator models
+                // differently from production, and it is exactly the difference the fidelity rule permits —
+                // so "the connections I hold" becomes "every other node in the cell". Expanded into per-peer
+                // sends rather than delivered specially, so loss, delay, oversize and backpressure apply per
+                // link precisely as they do to addressed traffic; a flood that bypassed the network model
+                // would make every scenario read it as free.
+                Effect::Flood { frame } => {
+                    let peers: Vec<Triple> = self.nodes.keys().copied().filter(|&c| c != node).collect();
+                    for to in peers {
+                        self.apply(node, std::vec![Effect::Send { to, frame: frame.clone() }]);
+                    }
+                }
                 Effect::Send { to, frame } => {
                     self.report.metrics.frames_sent += 1;
                     let name = frame_name(&frame);

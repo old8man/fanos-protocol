@@ -357,6 +357,25 @@ pub enum Effect {
         /// Delay from now.
         after: Duration,
     },
+    /// Put a frame on **every connection this node holds**, with no coordinate resolved.
+    ///
+    /// **The primitive cell-wide gossip actually wants, and the reason it is not `Send` in a loop.** A flood
+    /// addressed as `N` point-sends is an *encoding* of "everyone" through the one mechanism that fails when
+    /// a cell is churning: the directory is keyed by coordinate and so is the connection cache, and a reseat
+    /// invalidates both at the same instant — measured, every node missing both rungs for both of its real
+    /// peers. A frame the whole cell should see must not depend on knowing where anyone is.
+    ///
+    /// It is also cheaper by construction. On `PG(2, q)` a point-addressed flood costs `q² + q + 1` sends of
+    /// which only the occupied ones can land; at `q = 4` with three nodes that is 21 sends, 18 of them
+    /// walking the full ladder to a dial that cannot succeed.
+    ///
+    /// **What it does not promise.** Reach is the connection graph, not the plane — so it is for frames that
+    /// are re-flooded on receipt (epidemic, reaching the whole connected component) or that only need to
+    /// arrive *somewhere*. A frame that must reach one specific coordinate is still a [`Send`](Self::Send).
+    Flood {
+        /// The canonical wire frame bytes.
+        frame: Vec<u8>,
+    },
     /// Notify the application of an event.
     Notify(Notification),
 }
