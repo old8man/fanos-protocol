@@ -85,7 +85,7 @@ async fn a_frame_at_the_ceiling_survives_the_shaper() {
 
     a.command(Command::Send { to: b.address(), payload: payload.clone() });
 
-    let got = tokio::time::timeout(StdDuration::from_secs(20), async {
+    let got = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(Notification::Delivered { from, payload }) = b.next_notification().await
                 && from == a.address()
@@ -128,7 +128,7 @@ async fn deliver_under(proteus: ProteusConfig) {
         payload: payload.clone(),
     });
 
-    let got = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let got = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(Notification::Delivered { from, payload }) = b.next_notification().await
                 && from == a.address()
@@ -253,6 +253,8 @@ async fn both_ways(mut member: fanos_quic::NodeHandle, mut joiner: fanos_quic::N
 /// Returns rather than panics so the caller's assertion carries the direction; a timeout here with an
 /// `expect` would report the same string for both halves.
 async fn deliver(to: &mut fanos_quic::NodeHandle, from: fanos_geometry::Triple) -> Option<Vec<u8>> {
+    // **Short on purpose:** this one's expiry is an ordinary outcome — `.await.unwrap_or(None)` below —
+    // so it asserts nothing about duration and must not become a backstop.
     tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             match to.next_notification().await {

@@ -50,7 +50,7 @@ async fn the_live_epoch_clock_advances_the_beacon_across_epochs() {
     // Before this fix nothing issued `AdvanceEpoch`, so `BeaconReady` would NEVER fire in a live node.
     // Assert the wall-clock driver advances the beacon across ≥ 2 DISTINCT epochs within the timeout —
     // proving the clock ticks repeatedly, not once.
-    let epochs = tokio::time::timeout(Duration::from_secs(5), async {
+    let epochs = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         let mut seen = BTreeSet::new();
         loop {
             if let Some(Notification::BeaconReady { epoch, .. }) = node.next_notification().await {

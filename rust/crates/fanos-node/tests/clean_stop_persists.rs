@@ -123,7 +123,7 @@ async fn a_clean_stop_with_nothing_stored_still_writes_a_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_keeps_nothing_still_stops() {
     let node = Node::start::<F2>(config(None)).await.expect("node starts");
-    tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+    tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, node.shutdown())
         .await
         .expect("a node with no persister must not wait on one");
 }
