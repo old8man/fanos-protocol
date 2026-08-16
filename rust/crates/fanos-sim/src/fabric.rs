@@ -1946,20 +1946,29 @@ mod tests {
         // Unlike the assembly fraction above, this number does not move with host load — a coordinate either resolves
         // or it does not — which is what makes it usable on a shared machine.
         let occupied: HashSet<_> = addrs.iter().copied().collect();
-        let unreachable: Vec<usize> = fleet
-            .nodes()
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                n.client()
-                    .driver_stations()
-                    .iter()
-                    .filter(|o| o.station == fanos_runtime::ports::stations::Station::DirectoryEntryFallback)
-                    .filter_map(|o| o.line)
-                    .filter(|c| occupied.contains(c) && addrs.get(i).copied() != Some(*c))
-                    .collect::<HashSet<_>>()
-                    .len()
-            })
+        let occupied_hits = |i: usize, station: fanos_runtime::ports::stations::Station| {
+            fleet
+                .nodes()
+                .get(i)
+                .map(|n| n.client().driver_stations())
+                .unwrap_or_default()
+                .iter()
+                .filter(|o| o.station == station)
+                .filter_map(|o| o.line)
+                .filter(|c| occupied.contains(c) && addrs.get(i).copied() != Some(*c))
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        let unreachable: Vec<usize> = (0..fleet.nodes().len())
+            .map(|i| occupied_hits(i, fanos_runtime::ports::stations::Station::DirectoryEntryFallback))
+            .collect();
+        // **Which rung failed, not merely that the ladder ran out.** `conns.cache_miss` is the second rung's
+        // own outcome, so an occupied point appearing here says this node had no live connection to a real
+        // peer at the moment it tried to send. Compare with `unreachable` above: equal counts mean the cache
+        // is the binding constraint (the directory had nothing either, and the ladder went all the way down),
+        // while a cache miss without a fallback means some later rung caught it.
+        let cache_missed: Vec<usize> = (0..fleet.nodes().len())
+            .map(|i| occupied_hits(i, fanos_runtime::ports::stations::Station::ConnCacheMiss))
             .collect();
         let stations = fleet.stations();
         fleet.shutdown().await;
@@ -1972,7 +1981,8 @@ mod tests {
         println!(
             "MEASURED beacon rounds: cell reached epoch {reached} in {periods} periods of {floor:?} ({:.2} per \
              period), per node {epochs:?}, addresses {addrs:?}, occupied points this node could NOT address \
-             {unreachable:?}, refusals {refusals:?}, stations{stations}",
+             {unreachable:?}, of which the connection cache missed {cache_missed:?}, refusals {refusals:?}, \
+             stations{stations}",
             f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods),
         );
     }

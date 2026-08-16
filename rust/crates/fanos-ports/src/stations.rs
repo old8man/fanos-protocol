@@ -431,6 +431,18 @@ pub enum Station {
     /// held", which is a different state from "asked and nobody answered". That distinction is the whole
     /// reason this is counted: without it, a silent stall reads identically either way.
     RestrictedPullAsked,
+    /// The live-connection cache held nothing for a coordinate the send ladder asked it about.
+    ///
+    /// **The rung the ladder never counted.** `directory.entry_fallback` records the *last* rung and states
+    /// that all of the earlier ones failed, which makes "there was never a connection" and "there was one and
+    /// it died" the same silence — and that silence is exactly what an investigation into a node the cell
+    /// cannot address runs into. This one names the second rung's outcome directly.
+    ///
+    /// [`Observation::line`] carries the coordinate asked for. Read it against
+    /// [`ConnSurplusRead`](Self::ConnSurplusRead), which fires on the same call when the entry existed and
+    /// had more than one connection: a miss on a coordinate that never appears there is a peer this node
+    /// never filed, while a miss on one that does is a peer whose connections have all closed.
+    ConnCacheMiss,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1059,6 +1071,7 @@ impl Station {
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
         Self::RestrictedPullAsked,
+        Self::ConnCacheMiss,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1128,6 +1141,7 @@ impl Station {
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
             Self::RestrictedPullAsked => "hello.restricted_pull_asked",
+            Self::ConnCacheMiss => "conns.cache_miss",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1269,6 +1283,7 @@ impl Station {
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed
+            | Self::ConnCacheMiss
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

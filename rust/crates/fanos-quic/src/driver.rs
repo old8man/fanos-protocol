@@ -3304,6 +3304,12 @@ fn cached(t: &Transport, peer: Triple) -> Option<Connection> {
     if surplus {
         t.record_station(Station::ConnSurplusRead, Some(peer), Some(pruned as u64));
     }
+    if conn.is_none() {
+        // The second rung's own outcome. `directory.entry_fallback` only says the ladder ran out, which
+        // leaves "never filed" and "filed and since closed" indistinguishable — the exact fork an
+        // investigation into an unaddressable peer lands on.
+        t.record_station(Station::ConnCacheMiss, Some(peer), None);
+    }
     conn
 }
 
