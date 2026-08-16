@@ -1125,6 +1125,18 @@ Nearly every CRITICAL and HIGH below is an instance of this pattern. It is not s
 
 **Fix:** build the live `ParentCell` transport — route child `Notification::Escalated{mask}` and role `deficit` to a parent committee (the Maekawa bridge point is already computed geometrically), with a real re-provisioning action (recruit a capable sibling into the child roster, or authoritatively lower the child's advertised service level) and a **bounded, terminating** escalation contract. This is the keystone R-C1, R-C3, and H-3 all depend on for recovery.
 
+> **CLOSED 2026-08-16, both halves, later the same day.** The observable is `Station::RecoveryEscalated`
+> (`recovery.escalated`), tagged with the regime — `0` proactive reshare, `1` re-genesis request — recorded
+> where the decision is made and readable through `fanos status stations`. The regime travels out of
+> `RecoveryWatcher::on_tick` rather than a `Client` travelling in, so the election stays pure and testable.
+> And the obligation a nonzero count carries is now discharegeable: `fanos beacon-reshare` signs the
+> authenticated trigger with the recovery-authority key and floods it to the cell (see R-C1).
+>
+> The note below stands as the record of what was open and why. Its second paragraph — a deaf node's
+> `live_anchors` staying full, so `recovery_decision` returns `None` and not even the log line fires — is
+> **still true** and is a separate defect: the detector's input is this node's `PeerDown` view, and a node
+> that has fallen out of the beacon is deaf rather than disconnected.
+>
 > **RE-VERIFIED OPEN, 2026-08-16, and narrower than "not wired".** The detector *is* wired:
 > `spawn_recovery_trigger` watches the live beacon epoch and `RECOVERY_PATIENCE = 4` epoch-driver periods with
 > no advance confirm a stall, with a rank-delayed election so the cell emits one action rather than one per
