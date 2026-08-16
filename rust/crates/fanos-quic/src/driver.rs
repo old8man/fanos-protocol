@@ -2947,7 +2947,15 @@ async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendR
             SendRequest::Dial { to, addr } => {
                 let dialing = t.clone();
                 tokio::spawn(async move {
-                    let _ = get_or_connect(&dialing, to, addr).await;
+                    // **Counted, because discarding it made the repair unfalsifiable.** Whether the
+                    // arbitration's dial reaches the other claimant is the whole question a fix here turns
+                    // on, and `let _ =` answered it with silence.
+                    let outcome = match get_or_connect(&dialing, to, addr).await {
+                        Dialed::Peer(_) => 0,
+                        Dialed::Unreachable => 1,
+                        Dialed::Ourself => 2,
+                    };
+                    dialing.record_station(Station::ArbitrationDial, Some(to), Some(outcome));
                 });
                 continue;
             }

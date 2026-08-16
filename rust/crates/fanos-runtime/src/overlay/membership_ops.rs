@@ -175,6 +175,24 @@ impl<F: Field> OverlayNode<F> {
         // epoch IS the lifetime: a slot keyed `(coordinate, epoch)` is dead exactly when the epoch it names
         // has passed, and this is the one place that fact becomes true.
         self.store.sweep_expired(self.epoch);
+        // **And membership, for exactly the reason stated two lines below.** `members` is keyed by
+        // coordinate, `on_announce` refuses a repeat at an occupied one ("first sight only", so no peer can
+        // overwrite another's key bundle), and the beacon re-draws every coordinate at this instant — so a
+        // map kept across the boundary describes the *previous* seating and locks out every node that
+        // legitimately arrives at a point its former occupant still holds. Measured before this line existed:
+        // `membership.repeat_ignored` went from `[0,0,0,0,0]` at genesis to `[52,54,69,51,107]` eight epochs
+        // later on a five-node fleet, growing without bound, and silently until the station was added.
+        //
+        // **Clearing is the consistent action, not a new policy.** The comment below already says state
+        // addressed by a position stops describing what its address names, and `grey_reported` is cleared for
+        // precisely that; the directory slot above is reclaimed for precisely that. Membership was the one
+        // position-keyed table the rule skipped.
+        //
+        // **What it costs, stated.** A node's view of the cell is empty for the moment after a boundary and
+        // refills from the re-announce every node emits when it reseats (`on_reseat` → `on_join`). A peer
+        // whose re-announce is lost is missing for one epoch — against being locked out permanently, which is
+        // what the measurement above shows the alternative to be.
+        self.membership.members.clear();
         // The epoch re-draws every node's VRF coordinate, so every cell position keeps its name and changes
         // its occupant. State addressed by a position stops describing what its address says — see
         // [`Healer::on_seating_changed`] for the measurement and for the two things deliberately kept.

@@ -1864,6 +1864,78 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_membership_locks_out_after_an_epoch_boundary() {
+        // **The consequence of keying membership by a position whose occupant changes.** `on_announce` ends
+        // at "first sight only" — `members.contains_key(&coord)` refuses a repeat, which protects a member's
+        // key bundle from being overwritten by any peer. But the beacon re-draws every node's VRF coordinate
+        // each epoch while `members` is keyed by position and is **not** cleared at the boundary, so after a
+        // turn an announcement can land on a point some *previous* occupant still holds and be dropped.
+        //
+        // The station's own reading rule is what this measures: repeats cluster while a flood drains,
+        // lock-outs appear **after** a boundary and do not stop. So the count is read at two instants — once
+        // before any boundary and once several epochs later — and it is the *growth* that carries the claim,
+        // not the total. A total would be satisfied by an ordinary flood terminating.
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+        use fanos_runtime::ports::stations::Station;
+
+        async fn ignored(fleet: &NodeFleet) -> Vec<u64> {
+            let mut out = Vec::new();
+            for n in fleet.nodes() {
+                let mut events = n.client().subscribe();
+                if !n.client().command(fanos_runtime::Command::Observe) {
+                    out.push(0);
+                    continue;
+                }
+                let seen = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
+                    loop {
+                        match events.recv().await {
+                            Ok(fanos_runtime::Notification::DataPath { stations, .. }) => return Some(stations),
+                            Ok(_) => {}
+                            Err(_) => return None,
+                        }
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+                out.push(
+                    seen.iter().filter(|o| o.station == Station::MembershipRepeatIgnored).map(|o| o.count).sum(),
+                );
+            }
+            out
+        }
+
+        let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+        let fleet = NodeFleet::spawn_with_epoch::<F4>(5, Link::ideal(), RoleSet::default(), floor)
+            .await
+            .expect("fleet starts");
+        // Before any boundary: whatever the join flood produced, and nothing else.
+        tokio::time::sleep(floor / 2).await;
+        let at_genesis = ignored(&fleet).await;
+        let epochs_before: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        // Several boundaries later.
+        tokio::time::sleep(8 * floor).await;
+        let after = ignored(&fleet).await;
+        let epochs_after: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        let addrs: Vec<_> = fleet.nodes().iter().map(|n| n.health().address).collect();
+        fleet.shutdown().await;
+
+        let growth: Vec<i64> = after
+            .iter()
+            .zip(&at_genesis)
+            .map(|(a, b)| i64::try_from(*a).unwrap_or(0) - i64::try_from(*b).unwrap_or(0))
+            .collect();
+        println!(
+            "MEASURED membership.repeat_ignored: at genesis {at_genesis:?} (epochs {epochs_before:?}), after \
+             {after:?} (epochs {epochs_after:?}), growth {growth:?}, addresses {addrs:?}"
+        );
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_what_fraction_of_beacon_rounds_assemble() {
         // **The beacon's liveness is a delivery probability, and nothing had ever measured it.** A round needs
         // `threshold` partials, and `BeaconNode::broadcast` addresses each one to a *plane point*, so every partial

@@ -474,6 +474,18 @@ pub enum Station {
     /// cell's membership view. Reading it against the epoch is what tells them apart — repeats cluster
     /// while a flood drains, lock-outs appear *after* a boundary and do not stop.
     MembershipRepeatIgnored,
+    /// An **arbitration dial** — the one the displaced/refused party is reached by — and how it ended.
+    ///
+    /// The arbitration is the only moment an *address* for the other claimant is in hand, because a
+    /// coordinate is exactly what a colliding pair cannot use: each table resolves the contested point to
+    /// itself. `SendRequest::Dial` spends that address, and its result used to be discarded — so "the dial
+    /// never reached the peer" and "it reached the peer and the claim still did not help" were the same
+    /// silence, which is the fork any repair here has to be judged on.
+    ///
+    /// [`Observation::tag`] carries the outcome: `0` the peer answered and proved a coordinate, `1`
+    /// unreachable, `2` the address answered as *this node* (a stale binding pointing at ourselves).
+    /// [`Observation::line`] is the contested point the arbitration was about.
+    ArbitrationDial,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1105,6 +1117,7 @@ impl Station {
         Self::ConnCacheMiss,
         Self::RelayOriginRefused,
         Self::MembershipRepeatIgnored,
+        Self::ArbitrationDial,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1177,6 +1190,7 @@ impl Station {
             Self::ConnCacheMiss => "conns.cache_miss",
             Self::RelayOriginRefused => "transport.relay_origin_refused",
             Self::MembershipRepeatIgnored => "membership.repeat_ignored",
+            Self::ArbitrationDial => "directory.arbitration_dial",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1270,6 +1284,7 @@ impl Station {
             | Self::ConnSurplusRead
             | Self::ConnMovedWithPeer
             | Self::EpochAgreeBelowQuorum
+            | Self::ArbitrationDial
             | Self::RestrictedPullAsked => {
                 TagKind::Quantity
             }
