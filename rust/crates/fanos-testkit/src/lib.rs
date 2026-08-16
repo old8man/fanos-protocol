@@ -156,6 +156,27 @@ fn read_load_average() -> Option<f64> {
 /// instrument than the flakiness this replaces.
 pub const FIXTURE_STALE_AFTER: Duration = Duration::from_secs(240);
 
+/// A bounded wait whose **expiry is asserted as a failure** — a liveness backstop, never a latency budget.
+///
+/// **The distinction is the whole of this constant, and getting it wrong is silent both ways.** Two different
+/// quantities hide under one `tokio::time::timeout` call:
+///
+/// * the wait that is *unwrapped into a panic* (`.expect("must not hang")`) — its only job is to turn "never"
+///   into a failure, so it must clear the worst legitimate case by a wide margin;
+/// * the wait whose *expiry is the success condition* (`assert!(res.is_err(), "must never deliver")`) — it
+///   asserts nothing about duration and **must stay short**. Using this constant there costs four minutes per
+///   run and the assertion still passes, so the damage does not show up as a failure.
+///
+/// `fanos-quic/tests/handshake_negotiation.rs` holds one of each within twenty lines, which is why the rule is
+/// written here rather than left to judgement at the call site.
+///
+/// **Derived, not chosen:** the same 240 s two other sized constants already carry —
+/// `fanos-node`'s `HANG_CEILING` and `fanos_sim::fabric::SETTLE_DEADLINE`, both documented as sized for a
+/// loaded host running composed real-QUIC nodes. A hand-picked budget is the documented flake shape: a 5 s
+/// wait over a 2 s delivery reddened a full gate on 2026-08-16 while the same test passed 3/3 in 2.01 s alone,
+/// and 26 such budgets remain across 12 test files.
+pub const LIVENESS_BACKSTOP: Duration = Duration::from_secs(240);
+
 /// The **machine-wide** whole-cell fixture lock: held while a test stands up a seven-node QUIC cell.
 ///
 /// ## Why machine-wide, and not per-binary or per-crate

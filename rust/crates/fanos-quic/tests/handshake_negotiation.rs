@@ -45,7 +45,7 @@ async fn overlapping_capability_sets_negotiate_and_deliver() {
         payload: b"negotiated".to_vec(),
     });
 
-    let got = tokio::time::timeout(StdDuration::from_secs(5), async {
+    let got = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
         loop {
             if let Some(Notification::Delivered { payload, .. }) = full.next_notification().await
             {
@@ -74,6 +74,11 @@ async fn disjoint_capability_sets_abort_cleanly_without_delivering() {
 
     // A bounded wait proves this aborts cleanly rather than hanging: if the handshake wedged, this
     // timeout is what would catch it (a hang would otherwise block the test suite indefinitely).
+    //
+    // **Deliberately short, and deliberately NOT `LIVENESS_BACKSTOP`.** Here the expiry is the *success*
+    // condition — the assertion below is `is_err()` — so a liveness backstop would spend four minutes
+    // proving the same thing and the assertion would still pass, which is damage that does not show up as
+    // a failure. The two budgets twenty lines apart are opposite quantities.
     let delivered = tokio::time::timeout(StdDuration::from_secs(2), b.next_notification()).await;
     assert!(
         delivered.is_err(),
@@ -100,7 +105,7 @@ async fn three_way_capability_diversity_each_negotiates_its_own_true_intersectio
             to: full.address(),
             payload: tag.clone(),
         });
-        let got = tokio::time::timeout(StdDuration::from_secs(5), async {
+        let got = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
             loop {
                 if let Some(Notification::Delivered { payload, .. }) =
                     full.next_notification().await
