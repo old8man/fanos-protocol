@@ -507,7 +507,33 @@ fn probe_index_on<F: Field>(output: &fanos_vrf::VrfOutput, coord: Triple) -> Opt
 /// understated ceiling is the same defect a little smaller.
 fn relay_overhead() -> usize {
     let body = 2 * TRIPLE_WIRE_LEN + MAX_FRAME;
-    varint::encoded_len(FrameType::Relay.code()) + varint::encoded_len(body as u64) + 2 * TRIPLE_WIRE_LEN
+    let plain =
+        varint::encoded_len(FrameType::Relay.code()) + varint::encoded_len(body as u64) + 2 * TRIPLE_WIRE_LEN;
+    plain.max(attested_relay_overhead())
+}
+
+/// The credential an [`attested relay`](FrameType::RelayAttested) may carry — certificate **plus** HELLO.
+///
+/// **Measured, with the headroom stated.** The shipped self-signed certificate is **402 bytes** and a
+/// witness-free HELLO is **115**, so an honest wrapper spends 517 of this. The rest is for a HELLO whose
+/// coordinate claim carries a *walked* probe index: each witness lengthens it, and a node displaced far along
+/// its line legitimately needs several. `an_honest_credential_fits_the_attested_relay_bound` pins the two
+/// measurements, so a change to the certificate or the HELLO encoding reddens here rather than silently
+/// eating the margin.
+///
+/// **What happens past it is graceful, not a failure.** A sender whose credential does not fit sends the
+/// *plain* wrapper instead, and the receiver applies [`relayable`] to that one — so an over-long credential
+/// costs the attestation and not the delivery, and the classes that cannot survive an unproven origin are
+/// still refused. Raising this would be a wire-ceiling change (`max_wire`), which is why it is a bound rather
+/// than an assumption that everything fits.
+const ATTESTED_CREDENTIAL_MAX: usize = 4096;
+
+/// Bytes an attested relay adds around the largest inner frame there can be — the counterpart of the plain
+/// wrapper's [`relay_overhead`], and the reason that function takes a maximum of the two.
+fn attested_relay_overhead() -> usize {
+    let fixed = TRIPLE_WIRE_LEN + 2 + 2 + fanos_vrf::PROOF_LEN + ATTESTED_CREDENTIAL_MAX;
+    let body = fixed + MAX_FRAME;
+    varint::encoded_len(FrameType::RelayAttested.code()) + varint::encoded_len(body as u64) + fixed
 }
 
 /// Per-stream receive cap on the **wire** — [`MAX_FRAME`] plus everything applied to it on the way out.
@@ -2943,12 +2969,12 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // bare overlay (no identity) has nothing to prove with, so it falls back to the old wrapper — and
             // the receiver applies `relayable` to that one, which is exactly the weaker guarantee it is.
             let wrapped = match t.identity.as_ref() {
-                Some(id) => {
+                Some(id) if id.own_cert.len() + hello_len(id) <= ATTESTED_CREDENTIAL_MAX => {
                     let hello = Arc::clone(&id.hello.read().unwrap_or_else(PoisonError::into_inner));
                     let proof = (id.attest)(&relay_alpha(to, &frame));
                     encode_relay_attested(to, &id.own_cert, &hello, &proof, &frame)
                 }
-                None => encode_relay(to, t.me, &frame),
+                _ => encode_relay(to, t.me, &frame),
             };
             send_uni(&hub, &t.shaper, t.joining(&hub), &wrapped).await;
         } else if let Some(entry) = t.directory.entries().into_iter().find(|a| entries_tried.insert(*a)) {
@@ -3090,6 +3116,11 @@ fn encode_relay(target: Triple, origin: Triple, inner: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
     encode_frame(FrameType::Relay.code(), &body, &mut frame);
     frame
+}
+
+/// This node's current HELLO length, read under the lock the reshuffle rewrites it behind.
+fn hello_len(id: &SelfCert) -> usize {
+    id.hello.read().unwrap_or_else(PoisonError::into_inner).len()
 }
 
 /// The domain separator for a relay attestation, so a proof minted here can never be replayed as a
@@ -4993,6 +5024,39 @@ mod tests {
         }
     }
 
+    /// The two measurements [`ATTESTED_CREDENTIAL_MAX`] is sized from, pinned so the bound cannot be eaten
+    /// silently by a change to either encoding.
+    ///
+    /// The margin is what a *walked* probe index costs: a displaced node's coordinate claim carries one
+    /// witness per step, and this is the room those have. Asserting only that today's credential fits would
+    /// be satisfied by a bound of 520; asserting the margin as well is what makes it a budget.
+    #[test]
+    fn an_honest_credential_fits_the_attested_relay_bound() {
+        let creds = NodeCredentials::generate().expect("credentials");
+        let cert = creds.cert_der().len();
+        let (_, proof, _) =
+            verifiable_coordinate_ranked::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS);
+        let claim = CoordinateClaim { proof, index: 0, witnesses: Vec::new() };
+        let hello = hello_bytes::<F2>(Epoch::ZERO, [0, 0, 1], &claim, Capabilities::default()).len();
+
+        assert!(
+            cert < 512,
+            "the shipped certificate measured 402 bytes; at {cert} the attested wrapper's budget needs re-deriving"
+        );
+        assert!(hello < 256, "a witness-free HELLO measured 115 bytes, read {hello}");
+        assert!(
+            cert + hello <= ATTESTED_CREDENTIAL_MAX,
+            "an honest credential must fit, or every relay silently drops to the unattested wrapper"
+        );
+        assert!(
+            ATTESTED_CREDENTIAL_MAX - (cert + hello) > 3 * 1024,
+            "and the margin is the point: a walked probe index adds a witness per step, and {} bytes of room \
+             is what those have",
+            ATTESTED_CREDENTIAL_MAX - (cert + hello)
+        );
+    }
+
+
     #[test]
     fn the_relay_wrapper_never_outgrows_the_ceiling_that_allows_for_it() {
         // `max_wire()` is what a receiver will read, and it reserves `relay_overhead()` for this wrapper.
@@ -5009,10 +5073,26 @@ mod tests {
                  reserves — a relayed full frame would be dropped by the peer's read bound"
             );
         }
-        // And the reservation is not absurdly loose: at the largest inner it must be exact, or the ceiling
-        // is carrying slack nobody derived.
-        let at_max = encode_relay([0, 0, 0], [0, 0, 0], &vec![0u8; MAX_FRAME]).len() - MAX_FRAME;
-        assert_eq!(at_max, declared, "the declared overhead must be the one the encoder actually adds");
+        // **The attested wrapper is the larger of the two and therefore the one the reservation is sized
+        // on.** It carries the origin's certificate and HELLO instead of a bare `origin` triple, which is
+        // exactly what makes its origin a proof rather than a claim — and it is why `relay_overhead` is a
+        // maximum over the two encoders rather than the plain one's growth.
+        let proof = fanos_vrf::VrfSecret::from_seed([3u8; 32]).prove(b"alpha").0;
+        let credential = vec![0u8; ATTESTED_CREDENTIAL_MAX / 2];
+        for len in [0usize, 1, 63, 16_384, MAX_FRAME] {
+            let inner = vec![0u8; len];
+            let grown =
+                encode_relay_attested([0, 0, 0], &credential, &credential, &proof, &inner).len() - len;
+            assert!(
+                grown <= declared,
+                "inner {len}: the attested wrapper added {grown}, over the {declared} the wire ceiling reserves"
+            );
+        }
+        // And the reservation is not absurdly loose: at the largest inner and a credential spending the whole
+        // budget it must be exact, or the ceiling is carrying slack nobody derived.
+        let full = vec![0u8; ATTESTED_CREDENTIAL_MAX - 1];
+        let at_max = encode_relay_attested([0, 0, 0], &full, &[0u8; 1], &proof, &vec![0u8; MAX_FRAME]).len() - MAX_FRAME;
+        assert_eq!(at_max, declared, "the declared overhead must be the one the larger encoder actually adds");
     }
 
     #[test]
