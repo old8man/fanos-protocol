@@ -138,7 +138,7 @@ fn closure(deps: &BTreeMap<String, BTreeSet<String>>, roots: &BTreeSet<String>) 
 
 /// The shipping-code slice, shared (#252). Seven copies of it existed; each cut at the FIRST
 /// `#[cfg(test)]` and so examined only the head of any file with a test module in the middle.
-use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, production_part};
+use fanos_testkit::source::{code_only, excluded_from_every_shipping_build, production_part, shipping_lines};
 
 /// Every crate is reachable from something this project ships, except the ones [`UNLINKED`] names.
 ///
@@ -3233,6 +3233,84 @@ fn the_tls_stack_sits_beside_the_boundary_and_not_inside_it() {
              and the scope note on this guard is wrong. If that was deliberate, record the arrivals in \
              TRUSTED — measured at the time of writing, the four TLS crates bring the boundary from 86 to \
              136 — and delete this guard."
+        );
+    }
+}
+
+
+/// **Shipping code may not panic on an impossibility claim, and no lint says so.**
+///
+/// `panic!`, `unreachable!`, `todo!` and `unimplemented!` assert that control cannot reach a point. When the
+/// claim is wrong the result is a panic in a deployed node — reachable, on the network path, from whatever
+/// input reached the branch. The workspace lint policy denies `unwrap_used`, `expect_used`,
+/// `panic_in_result_fn` and `indexing_slicing`, but `clippy::panic` and `clippy::unreachable` live in the
+/// `restriction` group and are **not** enabled, and `panic_in_result_fn` only reaches functions returning
+/// `Result`. So this class is held by discipline and by nothing else.
+///
+/// **A guard rather than the lints, for the reason this workspace already recorded.** Enabling them would
+/// need `#[allow]` in the 69 files that use these macros, 30 of them whole test files where panicking is the
+/// point — and the root manifest's own note on narrowing casts says scoping a lint that way "reproduces
+/// exactly this defect at crate granularity — twenty near-identical exemptions, each as unread as one global
+/// line".
+///
+/// **A budget rather than an exemption list**, the shape [`UNWIRED_BUDGET`] uses: the direction is down, and
+/// a bump needs its reason in the commit message. The three entries are not equivalent:
+///
+/// * `fanos-testkit` — panicking **is** the mechanism (`INCONCLUSIVE` for a host too loaded to measure on).
+/// * `fanos-node` — `bin/fanos.rs`'s `unreachable!("fixed_legs is non-empty, so payment_term returns Some")`,
+///   dead by the enclosing condition, with the proof in the message.
+/// * `fanos-quic` — `driver.rs`'s bare `unreachable!()`, dead because the outer `match &note` has already
+///   matched `Snapshot(_)` and the inner `let` only moves the payload out. The one with no message.
+///
+/// **Counted through `shipping_lines`, deliberately.** My own audit of this class first sliced test blocks at
+/// the first `#[cfg(test)]` — the method #252 measured as wrong in thirteen files, with shipping code after
+/// the test module in three of them — so its numbers were a lower bound, not a count. The budget below is
+/// whatever this guard reports, not what that scan said.
+const PANIC_BUDGET: &[(&str, usize)] = &[("fanos-testkit", 7), ("fanos-node", 1), ("fanos-quic", 1)];
+
+#[test]
+fn no_shipping_code_panics_on_an_impossibility_claim() {
+    const CLAIMS: [&str; 4] = ["panic!(", "unreachable!(", "todo!(", "unimplemented!("];
+    let budget: BTreeMap<&str, usize> = PANIC_BUDGET.iter().copied().collect();
+    let mut sites: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for file in corpus() {
+        if !file.is_crate_src() {
+            continue; // tests/ and benches/ are where these belong
+        }
+        for (n, line) in shipping_lines(&file.text) {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // a doc that NAMES the macro is not a call — this very file does it above
+            }
+            if CLAIMS.iter().any(|c| code.contains(c)) {
+                sites.entry(file.krate.clone()).or_default().push(format!("{}:{n}", file.rel));
+            }
+        }
+    }
+
+    let mut over: Vec<String> = Vec::new();
+    for (krate, found) in &sites {
+        let allowed = budget.get(krate.as_str()).copied().unwrap_or(0);
+        if found.len() > allowed {
+            over.push(format!("{krate}: {} > {allowed} — {found:?}", found.len()));
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "shipping code gained a panic on an impossibility claim: {over:?}. A wrong claim here is a panic in a \
+         deployed node, reachable from whatever input reached the branch. Prove it dead in a message and add \
+         it to PANIC_BUDGET with the reason, or return an error instead."
+    );
+
+    // The budget is a ceiling AND a census: an entry that stopped matching is a stale exemption, which is how
+    // a budget quietly becomes permission for something else.
+    for (krate, allowed) in PANIC_BUDGET {
+        let found = sites.get(*krate).map_or(0, Vec::len);
+        assert_eq!(
+            found, *allowed,
+            "PANIC_BUDGET says {krate} has {allowed} and the tree has {found}: lower it rather than leaving \
+             room nobody is using"
         );
     }
 }
