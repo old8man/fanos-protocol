@@ -458,6 +458,22 @@ pub enum Station {
     /// [`Observation::line`] carries the **claimed** origin, which is the useful field: it is what the
     /// sender wanted this node to believe, not who sent it.
     RelayOriginRefused,
+    /// A membership announcement was ignored because the coordinate it names is already held in
+    /// `members` — the "first sight only" rule (§7.8).
+    ///
+    /// **The rule is right and its silence was not.** A repeat must not overwrite a member's stored key
+    /// bundle, or any peer could replace another's advertised keys in this node's view and suppress the
+    /// re-flood. But the same branch also refuses a *different* identity that has legitimately taken that
+    /// point — and a coordinate changes occupant every epoch by construction, since the beacon re-draws
+    /// every node's VRF coordinate while `members` is keyed by position and is **not** cleared at the
+    /// boundary. `on_epoch_changed`'s own comment says state addressed by a position stops describing what
+    /// its address names; it acts on `grey_reported` and not on this.
+    ///
+    /// So a nonzero count is two different things and the [`Observation::line`] does not separate them: a
+    /// benign re-flood terminating, or a node that arbitration seated at this point being locked out of the
+    /// cell's membership view. Reading it against the epoch is what tells them apart — repeats cluster
+    /// while a flood drains, lock-outs appear *after* a boundary and do not stop.
+    MembershipRepeatIgnored,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1088,6 +1104,7 @@ impl Station {
         Self::RestrictedPullAsked,
         Self::ConnCacheMiss,
         Self::RelayOriginRefused,
+        Self::MembershipRepeatIgnored,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1159,6 +1176,7 @@ impl Station {
             Self::RestrictedPullAsked => "hello.restricted_pull_asked",
             Self::ConnCacheMiss => "conns.cache_miss",
             Self::RelayOriginRefused => "transport.relay_origin_refused",
+            Self::MembershipRepeatIgnored => "membership.repeat_ignored",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1302,6 +1320,7 @@ impl Station {
             | Self::RestrictedRoundServed
             | Self::ConnCacheMiss
             | Self::RelayOriginRefused
+            | Self::MembershipRepeatIgnored
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

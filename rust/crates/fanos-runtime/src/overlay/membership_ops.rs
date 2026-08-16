@@ -137,6 +137,12 @@ impl<F: Field> OverlayNode<F> {
         // could silently replace a member's advertised keys in our local view (and suppress the
         // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
         if self.membership.members.contains_key(&coord) {
+            // **Counted, because this branch refuses two different things and used to say nothing.** A
+            // benign re-flood terminating is one; a node that arbitration legitimately seated at this point
+            // being locked out of the cell's membership view is the other — and the second became reachable
+            // the moment epochs began to advance, since the beacon re-draws every coordinate while `members`
+            // is keyed by position and is not cleared at the boundary.
+            self.stations.record(Station::MembershipRepeatIgnored, Some(coord));
             return Vec::new();
         }
         self.membership.members.insert(coord, info.clone());
