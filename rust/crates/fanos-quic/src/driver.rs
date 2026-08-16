@@ -14,6 +14,7 @@
 //! The clock is the one real-time seam: a driver *may* read the wall clock (the engine never can),
 //! so virtual [`Instant`]s here are elapsed nanoseconds since the node started.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -779,7 +780,7 @@ struct Transport {
     punching: Arc<Mutex<BTreeSet<Triple>>>,
     /// Coordinates a dialed-but-unjudgeable connection is already being held open for (#235) — the dial
     /// side's ceiling, deliberately the same shape as `punching` above. See [`spawn_restricted`].
-    unjudged: Arc<Mutex<BTreeSet<Triple>>>,
+    unjudged: Arc<Mutex<BTreeMap<Triple, Connection>>>,
     /// The plane's probe walk, carried as a value so the send path can RANK a peer it verified (#249).
     ///
     /// `None` is not a disabled check but an **absent mechanism** — the distinction `fanos_node::bound`
@@ -2622,7 +2623,7 @@ fn spawn_inner(
         distrust: distrust.clone(),
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
-        unjudged: Arc::new(Mutex::new(BTreeSet::new())),
+        unjudged: Arc::new(Mutex::new(BTreeMap::new())),
         probe_index,
     };
     supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
@@ -2919,6 +2920,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             // #129's stall, and the comment on the direct dial above already says so. Recovery is also what
             // this rung *is*: this frame is dropped either way, and the dial buys the next one.
             t.record_station(Station::DirectoryEntryFallback, Some(to), None);
+            ask_restricted_peers(&t, &frame).await;
             let recover = t.clone();
             tokio::spawn(async move {
                 let _ = get_or_connect(&recover, to, entry).await;
@@ -2926,9 +2928,46 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
             t.directory.note_unresolved_drop(to);
         } else {
             // Genuinely unroutable (no direct path, no hub, no untried entry): drop, counted + logged so it
-            // is observable.
+            // is observable — unless it is the one frame a restricted connection can still carry.
+            ask_restricted_peers(&t, &frame).await;
             t.directory.note_unresolved_drop(to);
         }
+    }
+}
+
+/// Hand a `BeaconReq` to the **restricted connections this node already holds**, when the coordinate ladder
+/// has no rung left. Returns how many it went to.
+///
+/// **This is the half that makes [`serve_round_to_unjudged`] reachable.** A node that falls out of the epoch
+/// cannot be addressed by anyone: its coordinate is derived from the epoch it lost, so it stops
+/// re-publishing; its directory slot is reclaimed at `now ≥ E+2`; and its HELLO then names an epoch nobody
+/// can judge, so no peer will file it. Its own pull-sync therefore dies on the very ladder that stranded it
+/// — the last rung dials a configured entry, gets `PeerIdentity::Unjudged`, and by that contract "the
+/// caller's frame is not delivered". The connection opens and the request is dropped on it.
+///
+/// **Why this trusts nothing.** These are connections *this node opened*, held in the same map, under the
+/// same derived bound, that already existed to stop a re-dial storm. Nothing is keyed by a claim a stranger
+/// made, no directory entry is written, and the frame carries no secret: a `BeaconReq` names nothing and
+/// asks for a value that is broadcast to every point of the plane each round.
+///
+/// **Only `BeaconReq`.** Every other undeliverable frame is dropped exactly as before. A round is
+/// self-proving and a request is contentless, so this pair is the only traffic that can safely cross a
+/// connection neither side could authenticate — which is the same rule `admitted_unjudged` reads off the
+/// consumer, applied to the sending direction.
+async fn ask_restricted_peers(t: &Transport, frame: &[u8]) {
+    if !is_beacon_req(frame) {
+        return;
+    }
+    let held: Vec<Connection> = match t.unjudged.lock() {
+        Ok(map) => map.values().cloned().collect(),
+        Err(_) => Vec::new(),
+    };
+    if held.is_empty() {
+        return; // nothing to ask — deliberately unrecorded, see the station's doc
+    }
+    t.record_station(Station::RestrictedPullAsked, None, u64::try_from(held.len()).ok());
+    for conn in &held {
+        send_uni(conn, &t.shaper, t.joining(conn), frame).await;
     }
 }
 
@@ -3810,6 +3849,12 @@ fn is_beacon_round(frame: &[u8]) -> bool {
     matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::Beacon))
 }
 
+/// Whether `frame` is a beacon **pull request** — the one frame this node will push down a connection it
+/// could not authenticate, because it names nothing and asks for a value the cell broadcasts anyway.
+fn is_beacon_req(frame: &[u8]) -> bool {
+    matches!(decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()), Some(FrameType::BeaconReq))
+}
+
 fn admitted_unjudged(frame: &[u8]) -> bool {
     matches!(
         decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
@@ -3903,7 +3948,7 @@ async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
             continue;
         };
         // The pull, answered on the connection it arrived on — see [`serve_round_to_unjudged`].
-        if decode_frame(&frame).ok().and_then(|(f, _)| f.frame_type()) == Some(FrameType::BeaconReq) {
+        if is_beacon_req(&frame) {
             if !answered {
                 answered = serve_round_to_unjudged(&conn, &t).await;
             }
@@ -3952,8 +3997,11 @@ async fn read_restricted(conn: Connection, claimed: Triple, t: Transport) {
 /// It also closes a re-dial storm before it opens: nothing caches an unjudged connection, so without this
 /// every send to the same coordinate would open another one — the #72 shape.
 fn spawn_restricted(conn: Connection, claimed: Triple, t: Transport) {
+    // The connection is **kept**, not merely counted. It is the only path back to a peer neither side can
+    // judge, and `ask_restricted_peers` needs a handle to hand it a `BeaconReq`. Same key and therefore the
+    // same derived bound as the set it replaces — a `Triple` is a point, and there are `q² + q + 1` of them.
     let admitted = match t.unjudged.lock() {
-        Ok(mut held) => held.insert(claimed),
+        Ok(mut held) => held.insert(claimed, conn.clone()).is_none(),
         // A poisoned set is a local fault; refusing is what every path here did before this existed.
         Err(_) => false,
     };
@@ -4808,6 +4856,17 @@ mod tests {
             assert!(!is_beacon_round(&framed(other, b"x")), "{other:?} must never become what a stranger is handed");
         }
         assert!(!is_beacon_round(b"not-a-frame"), "and an undecodable frame is not a round by default");
+
+        // **The mirror, and the two must be checked together.** These are the only frames that cross a
+        // connection neither side authenticated: a round comes back (self-proving) and a request goes out
+        // (contentless). A predicate that confused them would either push our traffic down a stranger's
+        // connection or hand a stranger something it did not ask for, and each is invisible to the other's
+        // assertions.
+        assert!(is_beacon_req(&framed(FrameType::BeaconReq, b"")), "the ask is what we push to an unjudged peer");
+        for other in [FrameType::Beacon, FrameType::BeaconPartial, FrameType::Hello, FrameType::Relay] {
+            assert!(!is_beacon_req(&framed(other, b"x")), "{other:?} must never be pushed down an unauthenticated link");
+        }
+        assert!(!is_beacon_req(b"not-a-frame"), "and an undecodable frame is not a request by default");
     }
 
     #[test]

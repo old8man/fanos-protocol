@@ -1961,6 +1961,7 @@ mod tests {
                     .len()
             })
             .collect();
+        let stations = fleet.stations();
         fleet.shutdown().await;
         let reached = epochs.iter().flatten().copied().max().unwrap_or(0);
         // The driver skips its first tick, so `periods` of wall clock offer `periods - 1` rounds.
@@ -1971,7 +1972,7 @@ mod tests {
         println!(
             "MEASURED beacon rounds: cell reached epoch {reached} in {periods} periods of {floor:?} ({:.2} per \
              period), per node {epochs:?}, addresses {addrs:?}, occupied points this node could NOT address \
-             {unreachable:?}, refusals {refusals:?}",
+             {unreachable:?}, refusals {refusals:?}, stations{stations}",
             f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods),
         );
     }

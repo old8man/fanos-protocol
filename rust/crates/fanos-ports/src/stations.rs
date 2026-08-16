@@ -417,6 +417,20 @@ pub enum Station {
     /// [`PeerUnjudged`](Self::PeerUnjudged); a rising count says rounds are being missed somewhere, which
     /// the beacon's own assembly rate is the place to measure.
     RestrictedRoundServed,
+    /// This node handed a `BeaconReq` to the **restricted connections it already holds**, because the
+    /// coordinate send ladder had no rung left for it (#235).
+    ///
+    /// **The other half of [`RestrictedRoundServed`](Self::RestrictedRoundServed), and the one that makes it
+    /// reachable.** A node that falls out of the epoch cannot be addressed — its directory slot expires and
+    /// no peer will file a coordinate it cannot judge — so its pull-sync dies on the same ladder that
+    /// stranded it. These connections are the exception: this node opened them itself, so no unproven claim
+    /// is being trusted and no table is keyed by one.
+    ///
+    /// [`Observation::tag`] carries how many connections the ask went to. **Zero is not recorded** — the
+    /// station fires only when there was somewhere to ask — so absence means "no restricted connection was
+    /// held", which is a different state from "asked and nobody answered". That distinction is the whole
+    /// reason this is counted: without it, a silent stall reads identically either way.
+    RestrictedPullAsked,
 
     /// A peer in the restricted state sent something other than a beacon round, and it was dropped (#235).
     ///
@@ -1044,6 +1058,7 @@ impl Station {
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
+        Self::RestrictedPullAsked,
         Self::RestrictedFrameDropped,
         Self::SessionIngestDropped,
         Self::DirectoryStaleCoordinate,
@@ -1112,6 +1127,7 @@ impl Station {
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
+            Self::RestrictedPullAsked => "hello.restricted_pull_asked",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
             Self::SessionIngestDropped => "session.ingest_dropped",
             Self::DirectoryStaleCoordinate => "directory.stale_coordinate",
@@ -1204,7 +1220,8 @@ impl Station {
             | Self::FrameTypeUnknown
             | Self::ConnSurplusRead
             | Self::ConnMovedWithPeer
-            | Self::EpochAgreeBelowQuorum => {
+            | Self::EpochAgreeBelowQuorum
+            | Self::RestrictedPullAsked => {
                 TagKind::Quantity
             }
 

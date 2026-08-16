@@ -342,6 +342,20 @@ pub struct BeaconNode<F: Field> {
     /// for the chain (`maybe_request_sync` on `max_seen_height > height()`); this is the same trigger for the
     /// same primitive, one crate over.
     sync_asked_for: Option<Epoch>,
+    /// Rounds this node has **proposed without adopting one**, reset on every adoption.
+    ///
+    /// The other trigger for the pull, and the one that covers the case
+    /// [`maybe_request_sync`](Self::maybe_request_sync) structurally cannot: that one fires on a partial
+    /// arriving from further ahead, so it needs the node to still be *hearing* something. A node that has
+    /// fallen out of the cell hears nothing at all — its coordinate derives from the epoch it lost, its
+    /// directory slot expires, and no peer can judge the HELLO it now sends — so no evidence will ever reach
+    /// it. What it does still have is **its own silence**: the epoch driver keeps issuing `AdvanceEpoch`, and
+    /// this counts the proposals that led nowhere.
+    ///
+    /// **The clock is the one already there.** Asking from the second consecutive unadopted proposal onward
+    /// means one full epoch period of silence has passed, measured by the driver's own tick — so there is no
+    /// retry interval to choose and nothing to keep in step with a period the deployment may change.
+    proposals_since_adopt: u32,
     /// The current epoch's assembled round, cached so this node can answer a `BeaconReq` pull-sync from a
     /// joining node (spec §7.8 bootstrap) — `None` until the first round is adopted.
     current_round: Option<BeaconRound>,
@@ -447,6 +461,7 @@ impl<F: Field> BeaconNode<F> {
             genesis,
             pending: BTreeMap::new(),
             sync_asked_for: None,
+            proposals_since_adopt: 0,
             current_round: None,
             reshare_gen: 0,
             pending_reshare: BTreeMap::new(),
@@ -605,6 +620,17 @@ impl<F: Field> BeaconNode<F> {
             ))];
         }
         let mut effects = self.broadcast(&partial_frame(target, &partial));
+        // **Counted before the assembly attempt**, so the reset inside `adopt` wins when this proposal does
+        // land: the sequence is propose → maybe adopt, and a counter cleared after being read would report a
+        // stall that had just ended.
+        self.proposals_since_adopt = self.proposals_since_adopt.saturating_add(1);
+        if self.proposals_since_adopt > 1 {
+            // A full epoch period has passed with nothing adopted, on the driver's own tick. Ask the cell
+            // directly rather than wait for evidence that, for a node the cell can no longer address, will
+            // never arrive. The request is contentless and rides connections this node already holds; see
+            // `fanos_quic::driver::ask_restricted_peers` for why that is the only rung left to it.
+            effects.extend(self.request_sync());
+        }
         self.buffer(target, partial);
         effects.extend(self.try_assemble(target));
         effects
@@ -723,6 +749,7 @@ impl<F: Field> BeaconNode<F> {
 
     /// Adopt a new epoch + seed (monotone), dropping now-stale pending partials.
     fn adopt(&mut self, epoch: Epoch, seed: [u8; 32]) {
+        self.proposals_since_adopt = 0;
         self.epoch = epoch;
         self.seed = seed;
         self.pending.retain(|&e, _| e > epoch);
@@ -1731,6 +1758,37 @@ mod tests {
     ///
     /// Both directions for each, because a counter asserted only at zero is indistinguishable from a field
     /// that is always zero — which is exactly what `deal_rejected` turned out to be.
+    /// A node the cell can no longer address hears nothing, so a trigger that waits for evidence can never
+    /// fire for it. This one watches its **own silence** instead: the epoch driver keeps issuing
+    /// `AdvanceEpoch`, and a second consecutive proposal with nothing adopted means one full period passed.
+    ///
+    /// Both directions, because "asks while stalled" is satisfied by a beacon that asks on every tick — and
+    /// that would put a pull beside every healthy round the cell ever assembles.
+    #[test]
+    fn a_beacon_that_proposes_twice_without_adopting_asks_the_cell_and_a_healthy_one_never_does() {
+        let (shares, commitment) =
+            deal(&[0xC3; 32], 2, N, &mut DeterministicRng::new(b"beacon-silence")).unwrap();
+        let req = encode(FrameType::BeaconReq, &[]);
+        let mut node =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), 2, BeaconSeed::GENESIS);
+        let asks = |fx: &[Effect]| fx.iter().filter(|e| matches!(e, Effect::Send { frame, .. } if *frame == req)).count();
+
+        let first = node.step(Instant(1), Input::Command(Command::AdvanceEpoch));
+        assert_eq!(asks(&first), 0, "one proposal in flight is the healthy steady state, not a stall");
+        let second = node.step(Instant(2), Input::Command(Command::AdvanceEpoch));
+        assert!(asks(&second) > 0, "a second proposal with nothing adopted is a full period of silence — ask");
+
+        // And the counter is cleared by an adoption, so a cell that assembles never accumulates toward a
+        // pull. Feeding the peer's partial for the epoch under proposal reaches the threshold of two.
+        let target = node.epoch().next();
+        let frame = partial_frame(target, &partial_eval(&shares[1], target));
+        let adopted = node.step(Instant(3), Input::Message { from: [9, 9, 9], frame });
+        assert_eq!(node.epoch(), target, "the round assembles from this node's own partial plus the peer's");
+        assert_eq!(asks(&adopted), 0, "adoption is not a moment to ask");
+        let after = node.step(Instant(4), Input::Command(Command::AdvanceEpoch));
+        assert_eq!(asks(&after), 0, "and the first proposal after an adoption is healthy again");
+    }
+
     /// The pull existed and had one trigger: `Command::StartHeartbeat`, i.e. the join. A node that fell behind
     /// afterwards could only wait to be told — over `broadcast`, which addresses every partial and every round
     /// to a *plane point* and therefore drops what coordinate resolution cannot resolve (measured on a
