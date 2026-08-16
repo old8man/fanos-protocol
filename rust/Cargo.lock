@@ -923,9 +923,11 @@ name = "fanos-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "fanos-aphantos",
  "fanos-diakrisis",
  "fanos-field",
  "fanos-geometry",
+ "fanos-pqcrypto",
  "fanos-primitives",
 ]
 

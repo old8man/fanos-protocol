@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 
 use fanos_field::Field;
 use fanos_geometry::{Line, Plane, Point, Triple};
-use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, OnionKeyRatchet};
+use fanos_pqcrypto::{HybridCiphertext, HybridKemPublic, HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_primitives::Epoch;
 use fanos_primitives::shamir::Share;
 use fanos_ports::{
@@ -157,10 +157,32 @@ enum Resolved {
     Expired { armed_at: Instant },
 }
 
+/// A ciphertext whose decapsulation costs what a **real** one costs — the constant the decoy path runs to
+/// pay the same clock a cargo cell pays.
+///
+/// Encapsulated to this node's own onion key rather than assembled from fixed bytes, and that is the whole
+/// of the correctness argument: [`HybridKemSecret::decapsulate`] **early-returns** when the X25519 leg is
+/// non-contributory, *before* the ML-KEM half, so a degenerate probe would run the cheap branch and the
+/// equalisation would silently do nothing. A genuine encapsulation cannot take that branch.
+///
+/// The key rotates and the probe does not, deliberately: after a ratchet advance the decapsulation fails,
+/// which costs the same — the X25519 ephemeral is still a proper point, so the contributory check passes
+/// and the ML-KEM half still runs. Cost, not success, is what this object is for.
+///
+/// Seeded from `onion_seed` so a router is reproducible from its inputs; the probe is never transmitted.
+fn timing_probe(onion: &OnionKeyRatchet, onion_seed: [u8; 32]) -> Option<HybridCiphertext> {
+    let mut rng = SeedRng::from_seed(&onion_seed);
+    onion.public().encapsulate(&mut rng).map(|(ct, _)| ct)
+}
+
 /// A node that routes threshold-onion hops — combiner for hops addressed to it, line member for
 /// requests from other combiners.
 pub struct ThresholdRouter<F: Field> {
     coord: Point<F>,
+    /// A ciphertext this node decapsulates **for its cost alone**, on the decoy path — see
+    /// [`timing_probe`] and `decoy_share`'s residual. `None` only if encapsulating to our own onion key
+    /// failed at construction, which leaves the equalisation off rather than the router unbuilt.
+    timing_probe: Option<HybridCiphertext>,
     /// The forward-secure per-epoch **onion** decap keypair (audit E4). Shares addressed to this node are
     /// peeled with the ratchet's live keys (`onion.secrets()` — the current epoch plus a bounded grace
     /// window of recent ones, so an onion in flight across a rotation still peels). On each epoch advance
@@ -333,9 +355,12 @@ impl<F: Field> ThresholdRouter<F> {
         // the identity key itself is not retained — the onion is peeled with the forward-secure `onion`
         // ratchet, so a later compromise of the long-term key cannot recover past hops (audit E4).
         let mix_seed = kem_secret.derive_subkey("FANOS-v1/threshold-mix-seed");
+        let onion = OnionKeyRatchet::new(onion_seed, Epoch::ZERO);
+        let timing_probe = timing_probe(&onion, onion_seed);
         Self {
             coord,
-            onion: OnionKeyRatchet::new(onion_seed, Epoch::ZERO),
+            timing_probe,
+            onion,
             threshold,
             gather: GatherClock::new(),
             gather_override: None,
@@ -806,25 +831,36 @@ impl<F: Field> ThresholdRouter<F> {
     /// two decoys for one request are identical, which a retransmission needs, and decoys across requests
     /// are unlinkable without the secret.
     ///
-    /// # The residual this does not close: the two paths cost different amounts of time
+    /// # Width was the easy half: the clock separated the two arms by 240x, and now does not
     ///
-    /// Width is masked and *latency is not*. A cover cell fails at the parse and costs one XOF here; a cargo
-    /// cell costs a hybrid `X25519 ‖ ML-KEM-768` decapsulation plus an AEAD open. The reply goes out
-    /// **immediately**, not on the cover schedule, so request→reply latency carries the difference.
+    /// The decoy made refusal indistinguishable **by width**. Latency was untouched, and the reply leaves
+    /// **immediately** rather than on the cover schedule, so the request→reply gap carried the difference.
+    /// Measured (`fanos-bench --bench hot_paths -- gather/`), one member, one held secret:
     ///
-    /// **Who can use it is the whole of the assessment, and it is one party.** Not the combiner: a cover
-    /// cell's gather never converges — it collects `q` decoys and runs the subset search to exhaustion — so
-    /// the combiner learns cover-from-cargo by the deadline whatever the replies' timing. The decoys make
-    /// that costlier, not less certain. That leaves an **off-path network observer**, who sees the frames and
-    /// not their contents; for them the offset is tens of microseconds under millisecond-scale jitter per
-    /// sample, and turning it into a cargo-fraction estimate needs many gathers plus a path calibration to
-    /// the specific member.
+    /// | arm | what it runs | time |
+    /// |---|---|---|
+    /// | cargo addressed here | parse, hybrid decapsulation, AEAD open | `75.7 µs` |
+    /// | cargo addressed elsewhere — *decoy* | parse, hybrid decapsulation | `75.3 µs` |
+    /// | cover cell — *decoy* | parse only; it fails there | `0.31 µs` |
+    /// | (the decapsulation alone) | `X25519 ‖ ML-KEM-768` | `74.0 µs` |
     ///
-    /// **The remedy is cheap and deliberately not applied:** decapsulate against a fixed dummy key on this
-    /// path so both arms pay the same. It is not applied because the channel is **unmeasured** — spending a
-    /// KEM operation per cover cell to close a channel nobody has put a number on is the reasoning this
-    /// module exists to refuse. Measure it on a quiet host first (the offset is a *timing* quantity, so a
-    /// contended box cannot answer it); if it is above the observer's per-sample noise, apply the dummy.
+    /// **So the clock told cover from cargo, which is precisely what the constant-rate cover exists to hide
+    /// from a link observer.** Not from the combiner — a cover cell's gather never converges, it collects
+    /// `q` decoys and runs the subset search to exhaustion, so the combiner knows by the deadline whatever
+    /// the timing. The party who gains is one who watches this member's link: a deterministic `75 µs` offset
+    /// resolves against jitter `σ` in about `(σ/75 µs)²` samples — order **180** at millisecond jitter, which
+    /// is cheap.
+    ///
+    /// **Closed by paying the cargo clock on the decoy path** (`on_request`): a `Malformed` parse is followed
+    /// by one decapsulation of [`timing_probe`]'s constant. The decapsulation is `74.0` of the `75.3 µs`, so
+    /// the residual is the parse and the 20 KB AEAD open — about `1.0 µs`, derived from the measured parts
+    /// rather than timed end to end. That is a ~3000x rise in the samples needed (order `5·10⁵`), for one
+    /// KEM operation per cover cell and no new bound on what a peer can make this node spend.
+    ///
+    /// The remaining `~1 µs` is **not** closed. Closing it needs a well-formed probe *onion* rather than a
+    /// probe ciphertext, so the whole `member_partial_detailed` call is replayed — buildable, but it wants
+    /// a line-width fixture at construction, and the marginal gain over `5·10⁵` samples is small. Recorded
+    /// rather than hidden.
     fn decoy_share(&self, member_index: usize, req_id: u64, line: Triple) -> Share {
         let mut material = self.mix_seed.to_vec();
         material.extend_from_slice(&req_id.to_be_bytes());
@@ -845,10 +881,27 @@ impl<F: Field> ThresholdRouter<F> {
         // Try every held epoch key, remembering WHY the last one failed: `Malformed` does not depend on the
         // key (the bytes are not a sealed layer under any of them), so one look decides it.
         let mut why = threshold::PartialFailure::Malformed;
+        let probe = self.timing_probe.as_ref();
         let attempt = self.onion.secrets().find_map(|sk| {
             match threshold::member_partial_detailed::<F>(onion, i, sk) {
                 Ok(share) => Some(share),
                 Err(e) => {
+                    // **Pay the cargo path's clock even when the parse refused it.** `Malformed` is decided
+                    // before any KEM work, so this arm was measured at `0.31 µs` against `75.3 µs` for
+                    // `KeyMismatch` — a 240x separation between a cover cell and a cargo one, at a member
+                    // whose *reply* the decoy already made indistinguishable by width. Measured split:
+                    // the hybrid decapsulation alone is `74.0 µs` of that `75.3`, so one here closes 98%
+                    // of the gap (`fanos-bench --bench hot_paths -- gather/`).
+                    //
+                    // **It opens no DoS surface, and the reason is that the ceiling does not move.** A peer
+                    // could already force the `75.3 µs` arm by sending a well-formed onion sealed to a key
+                    // this node does not hold — `KeyMismatch` reaches the decapsulation by construction. So
+                    // this raises the *cheapest* request to what the *dearest* one already cost, which is
+                    // the same bound an attacker had before. Materiality is still checked first and stays
+                    // cheap: `my_index` rejects a line this node is not on without touching the KEM.
+                    if let (threshold::PartialFailure::Malformed, Some(ct)) = (e, probe) {
+                        let _ = core::hint::black_box(sk.decapsulate(ct));
+                    }
                     why = e;
                     None
                 }
@@ -1458,6 +1511,35 @@ mod tests {
     use super::*;
     use crate::threshold_onion::{HopLine, member_partial, seal_onion};
     use fanos_field::F2;
+
+    /// The timing probe must reach the **expensive** half of a decapsulation, and nothing about the decoy
+    /// path's behaviour can show that — the reply is identical either way, which is why this is asserted
+    /// structurally rather than by a timing measurement.
+    ///
+    /// [`HybridKemSecret::decapsulate`] returns `None` *before* the ML-KEM half when the X25519 leg is
+    /// non-contributory. A probe that took that branch would cost `~0.3 µs` instead of `~74 µs` and the
+    /// equalisation would be a no-op that still reads as installed. So: the real probe must decapsulate,
+    /// and a degenerate one must not — the second half is the control, without which the first asserts
+    /// only that `decapsulate` returns `Some` sometimes.
+    #[test]
+    fn the_timing_probe_reaches_the_half_of_a_decapsulation_that_costs() {
+        let seed = [7u8; 32];
+        let ratchet = OnionKeyRatchet::new(seed, Epoch::ZERO);
+        let probe = timing_probe(&ratchet, seed).expect("encapsulating to our own onion key succeeds");
+        assert!(
+            ratchet.secret().decapsulate(&probe).is_some(),
+            "the probe must pass the contributory check, or it never reaches the ML-KEM half it exists to pay for"
+        );
+
+        // The control: an all-zero X25519 ephemeral is the low-order point, so the DH output is
+        // non-contributory and `decapsulate` returns on the cheap branch.
+        let degenerate = HybridCiphertext::from_bytes(&[0u8; fanos_pqcrypto::kem::CIPHERTEXT_LEN])
+            .expect("a zero-filled ciphertext is still well-formed at the byte level");
+        assert!(
+            ratchet.secret().decapsulate(&degenerate).is_none(),
+            "if this also decapsulated, the assertion above would not be discriminating"
+        );
+    }
 
     /// **The censorship bound, asserted on two planes because it must follow from the geometry.**
     ///

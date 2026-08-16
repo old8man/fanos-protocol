@@ -17,6 +17,9 @@ fanos-field = { workspace = true, features = ["std"] }
 fanos-geometry = { workspace = true, features = ["std"] }
 fanos-primitives = { workspace = true, features = ["std"] }
 fanos-diakrisis = { workspace = true, features = ["std"] }
+# The threshold-gather arms: the cost asymmetry a cover cell and a cargo cell impose on one line member.
+fanos-aphantos.workspace = true
+fanos-pqcrypto.workspace = true
 
 [dev-dependencies]
 criterion = "0.8"
