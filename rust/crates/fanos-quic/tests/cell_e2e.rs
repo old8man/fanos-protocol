@@ -243,3 +243,99 @@ async fn every_ordered_pair_of_cell_points_can_deliver() {
         n.shutdown();
     }
 }
+
+/// A frame reaches a peer this node **cannot address**, through a hub that can — and the wrapper it travels
+/// in proves who sent it.
+///
+/// **This path had no end-to-end test at all**, which is why the wrapper's growth past the wire ceiling was
+/// caught by a unit guard on arithmetic rather than by a delivery that stopped working. The symmetric-NAT
+/// fallback (#119) is unreachable in `spawn_cell`: those seven nodes share one directory, so every peer
+/// resolves directly and the ladder never reaches its hub rung. Here each node gets its **own** directory and
+/// the bindings are chosen so exactly one route exists.
+///
+///   A knows B.   B knows A and C.   C knows B.   A ↔ C have no route but through B.
+///
+/// A's send to C therefore walks the whole ladder — no directory entry, no cached connection — and lands on
+/// the hub. What arrives at C is `RelayAttested`: the origin is not a field C believes but a coordinate C
+/// derives, by running A's certificate and HELLO through the same verifier it uses on a direct connection,
+/// and then checking A's VRF proof over the destination and the exact bytes.
+///
+/// Asserted on the payload rather than on a station, because the property is *delivery through a hub*, and a
+/// counter can rise while nothing arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_reaches_a_peer_only_a_hub_can_address() {
+    use fanos_quic::{Directory, spawn_pinned};
+    use fanos_runtime::{Command, Notification};
+
+    // **Pinned, because three self-certifying nodes on seven points collide 39 % of the time.** A
+    // self-certifying coordinate is `MapToPoint(H(cert))` and therefore a uniform draw; the first version of
+    // this test spawned them unpinned and was bimodal — delivering in half a second when the draw was
+    // injective and waiting out the whole backstop when two nodes shared a point, which shows up as
+    // `transport.self_connection` on the hub. That is the fixture, not the mechanism, and grinding the
+    // credentials removes it exactly as `spawn_cell` does.
+    let (dir_a, dir_b, dir_c) = (Directory::new(), Directory::new(), Directory::new());
+    let a = spawn_pinned::<F2>(Point::at(0), make_node, dir_a.clone()).await.expect("A starts");
+    let b = spawn_pinned::<F2>(Point::at(1), make_node, dir_b.clone()).await.expect("B starts");
+    let c = spawn_pinned::<F2>(Point::at(2), make_node, dir_c.clone()).await.expect("C starts");
+
+    // The one route: A→B, B→{A,C}, C→B. Nothing tells A where C is, and nothing tells C where A is.
+    let _ = dir_a.insert(b.address(), b.local_addr());
+    let _ = dir_b.insert(a.address(), a.local_addr());
+    let _ = dir_b.insert(c.address(), c.local_addr());
+    let _ = dir_c.insert(b.address(), b.local_addr());
+
+    // The hub must hold live connections to both ends before it can broker anything — `pick_relay_hub` looks
+    // in the **connection cache**, not the directory. One frame each way establishes them.
+    let mut at_c = c.client().subscribe();
+    let app_frame = |body: Vec<u8>| {
+        let mut frame = Vec::new();
+        fanos_wire::encode_frame(fanos_wire::FrameType::App.code(), &body, &mut frame);
+        frame
+    };
+    assert!(b.client().command(Command::Emit { to: a.address(), frame: app_frame(vec![1u8; 64]) }), "B reaches A");
+    assert!(b.client().command(Command::Emit { to: c.address(), frame: app_frame(vec![2u8; 64]) }), "B reaches C");
+
+    // **Re-sent until it lands, and that is not a workaround.** `Command::Emit` is fire-and-forget: a frame
+    // that finds no rung is dropped, not queued, so a single send races the hub's connections coming up and
+    // loses outright when it arrives first. The first run of this test waited out the whole backstop for
+    // exactly that reason. A real sender retries; so does this.
+    let mut body = vec![0xA5u8; 128];
+    body[0] = 0x5A;
+    let arrived = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
+        loop {
+            assert!(
+                a.client().command(Command::Emit { to: c.address(), frame: app_frame(body.clone()) }),
+                "A queues its frame for C"
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+            while let Ok(Ok(note)) = tokio::time::timeout_at(deadline, at_c.recv()).await {
+                if let Notification::App { from, body: got } = note
+                    && got.len() == 128
+                    && got.first() == Some(&0x5A)
+                {
+                    return from;
+                }
+            }
+        }
+    })
+    .await
+    .ok();
+
+    if arrived.is_none() {
+        for (tag, n) in [("A", &a), ("B", &b), ("C", &c)] {
+            let rows: Vec<String> =
+                n.client().driver_stations().iter().map(|o| format!("{}={}", o.station.name(), o.count)).collect();
+            println!("{tag} stations: {}", rows.join(" "));
+        }
+    }
+    let origin = arrived.expect("the frame must reach C through the hub — this is the fallback's whole purpose");
+    assert_eq!(
+        origin,
+        a.address(),
+        "and C must attribute it to A, derived from the attestation rather than taken from a field"
+    );
+
+    a.shutdown();
+    b.shutdown();
+    c.shutdown();
+}
