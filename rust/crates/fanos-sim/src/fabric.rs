@@ -1060,7 +1060,21 @@ mod tests {
     /// rather than "no actuation". The sharper observable is a node that was **never** assigned Exit and
     /// advertises anyway — which needs the assignment sampled *at publication time*, not at read time.
     ///
-    /// **When this test fails, actuation has landed.** That is the point of it: read
+    /// ⛔ **RETIRED AS AN ASSERTION 2026-08-16, in both directions, and the reason is not that it stopped
+    /// mattering.** With the actuation landed (`ff9a361`) neither colour proves anything here. Red is
+    /// reachable from load alone — the claim is *existential*, so a busy host on which fewer nodes publish
+    /// at all removes the witnesses and fails a healthy cell; measured, it failed once inside a full-suite
+    /// run and passed three times standalone minutes later. Green is reachable from the clock mismatch
+    /// above. A test that can go either way for reasons unrelated to its subject is a measurement, and it is
+    /// one now.
+    ///
+    /// **The question moved to an instrument that can answer it**:
+    /// `measure_whether_the_cell_withholds_an_unassigned_exit_advertisement` records the *withholding* at
+    /// publication time — `exit.advertisement_withheld`, tagged for "decided, not assigned" against
+    /// "decision is for an earlier epoch" — which has no clock gap because nothing is compared afterwards.
+    ///
+    /// **The original text, kept because it is the derivation:** when this test fails, actuation has landed.
+    /// That is the point of it: read
     /// `SelfOrganization::assigned` for the shape that was proposed (withhold the *advertisement*, do not stop
     /// the task) and check the three things that gap touches — the viability floor, a node's mix key
     /// outliving its assignment, and the still-absent `Escalation::Deficit`.
@@ -1071,7 +1085,8 @@ mod tests {
     /// *measured* and *not measured*, never a false red. A tripwire that fires on two runs in three is enough
     /// to be noticed on the day it starts firing, which is all this is for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_exit_advertises_itself_whether_or_not_the_cell_assigned_it_the_role() {
+    #[ignore = "measurement — run with --ignored --nocapture; see the note on why it is no longer an assertion"]
+    async fn measure_whether_an_exit_advertises_a_role_the_cell_did_not_assign() {
         use fanos_field::F4;
         use fanos_core::roles::Role;
         use fanos_node::{RoleSet, resolve_exit_key};

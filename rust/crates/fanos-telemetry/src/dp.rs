@@ -120,11 +120,14 @@ fn exp1(rng: &mut impl Rng) -> f64 {
     -ln(1.0 - uniform01(rng))
 }
 
+/// A zero-mean Laplace sample with scale `b`. Public because the load directory needs the same primitive
+/// at a scale derived from its own consumer's tolerance rather than from an ε — see `fanos_node::loaddir`.
+///
 /// A zero-mean Laplace sample with scale `b`, drawn as the difference of two standard exponentials
 /// (`Laplace(b) = b·(E₁ − E₂)`, `Eᵢ ~ Exp(1)`) — numerically robust, with no sign/branch handling and no
 /// `ln 0`.
 #[inline]
-fn laplace(scale_b: f64, rng: &mut impl Rng) -> f64 {
+pub fn laplace(scale_b: f64, rng: &mut impl Rng) -> f64 {
     scale_b * (exp1(rng) - exp1(rng))
 }
 

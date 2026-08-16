@@ -1552,7 +1552,10 @@ pub fn spawn_self_organization<F: Field>(
     let SelfOrgConfig { node_id, vrf_secret, capability, capacity, controller, prover } = config;
     let (capability_publisher, capability_ready) =
         spawn_capability_publisher(client.clone(), node_id, vrf_secret, capability, prover.clone());
-    let (load_publisher, load_ready) = spawn_load_publisher(client.clone(), load_source, prover.clone());
+    // The plane's point count is the `n` in the published report's noise scale (`loaddir::noise_scale`) — a
+    // cell-wide constant every node computes identically, which is what lets the scale need no agreement.
+    let (load_publisher, load_ready) =
+        spawn_load_publisher(client.clone(), load_source, prover.clone(), Plane::<F>::N);
     let (role_loop, assigned) =
         spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, assigned, prover);
     SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }

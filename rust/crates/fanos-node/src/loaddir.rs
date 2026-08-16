@@ -85,12 +85,74 @@ pub fn parse_load(bytes: &[u8]) -> Option<Demand> {
     Some(Demand::per_role(|role| pairs.get(role.index()).map_or(0, |p| u16::from_be_bytes(*p))))
 }
 
+/// The Laplace scale a per-role load report is noised at, **derived from the consumer's tolerance rather
+/// than from a chosen ε**.
+///
+/// # Why the raw figure could not stay
+///
+/// `publish_load` writes a per-role `u16`, coordinate-bound, into a store whose reads are unrestricted — so
+/// any cell member learns every other member's per-role load each epoch, **off-path**, with no network
+/// observation at all. This module's own docs treat the boundary at length in the *integrity* direction (who
+/// may publish, coordinate binding, inflating one's own report) and nowhere in the confidentiality one. Exit
+/// is the sharp case: its figure is in-flight work leaving to the clear net, and the gain to an adversary is
+/// not the quantity — the exit's peers and its destinations see volume anyway — but that it becomes readable
+/// **off-path**, which is what makes GPA-style correlation cheap.
+///
+/// # The scale is derived, and that is what makes it implementable
+///
+/// The only consumer is `cell_setpoint = ⌈Σ(loads) / capacity⌉`. It needs **the sum, to one capacity unit**;
+/// per-node `u16` precision has no consumer at all. Independent zero-mean noise of scale σ per report costs
+/// the aggregate `σ√n`, not `σn`, so requiring at most one node's worth of setpoint error gives
+///
+/// ```text
+///     σ ≤ C / √n           C = this role's capacity, n = the plane's point count
+/// ```
+///
+/// and for Laplace, `σ = b√2`, hence `b = C / √(2n)`. At `q = 7` (`n = 57`) that is σ ≈ `C/7.5`: an
+/// individual exit's volume obscured at ~13 % of a node's capacity while the setpoint stays accurate to one
+/// node.
+///
+/// **No new agreement is needed, which is usually what kills a proposal like this.** `C` is already a
+/// cell-wide denominator — `role_capacity`'s own doc says it "must stay a protocol bound and never become a
+/// node's local configuration", since two nodes computing capacity from different values disagree
+/// permanently about how many of a role the cell needs — and `n` is the plane. Every node therefore computes
+/// the same σ from constants it already holds.
+///
+/// # The coupling this is the precondition for
+///
+/// Today's estimator publishes **one instantaneous sample per epoch**, which is a coarse channel by
+/// accident. Time-averaging the gauge over the epoch — the correct fix for the control signal — sharpens the
+/// estimate by ≈55× in relative sd **and sharpens this channel by exactly the same factor**, since it is the
+/// same estimator. Landing the averaging without this would silently convert a once-per-ten-minutes reading
+/// into a well-estimated per-node volume series. They are one work item; this is its first half.
+fn noise_scale(capacity: u16, points: u32) -> f64 {
+    let n = f64::from(points.max(1));
+    f64::from(capacity) / (2.0 * n).sqrt()
+}
+
+/// A load report with each per-role figure independently noised at [`noise_scale`], clamped to the `u16` the
+/// wire carries.
+///
+/// Clamped rather than wrapped: a negative sample means "less than nothing in flight", which the consumer's
+/// sum reads as a smaller demand — correct — while a wrap would read as `u16::MAX` and ask the cell to
+/// provision for a node that is doing nothing.
+fn privatize(load: Demand, capacity: Demand, points: u32, rng: &mut impl rand_core::Rng) -> Demand {
+    Demand::per_role(|role| {
+        let noised = f64::from(load.of(role)) + fanos_telemetry::dp::laplace(noise_scale(capacity.of(role), points), rng);
+        // `as` conversions are checked by the clamp above them.
+        noised.clamp(0.0, f64::from(u16::MAX)).round() as u16
+    })
+}
+
 /// Publish this node's observed per-role `load` for `epoch` at its coordinate slot. `false` if the store
 /// rejected the write.
 ///
 /// `credential` is this node's coordinate proof for `epoch` — `Some` on any cell that runs VRF coordinates,
 /// which is every deployed node, and the record is then bound so no other member can write this slot.
 /// `None` emits the bare report a pinned cell can produce, where no coordinate is provable.
+///
+/// **The figure written here is already noised** — see [`privatize`]. The raw per-role reading never leaves
+/// the node, because a store this directory writes to is read without restriction by every cell member.
 pub async fn publish_load(
     client: &Client,
     coord: Coord,
@@ -218,6 +280,7 @@ pub fn spawn_load_publisher(
     client: Client,
     load_source: impl Fn() -> Demand + Send + 'static,
     prover: Option<CoordinateProver>,
+    points: u32,
 ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = oneshot::channel();
     // Supervised: this actor's death is a capability the node loses, and #106's failure counter — the one
@@ -239,7 +302,17 @@ pub fn spawn_load_publisher(
                 // startup would verify only in the epoch it was made — the same reason the capability
                 // publisher re-proves.
                 let credential = prover.as_ref().map(|prove| prove(epoch, &seed));
-                publish_load(&client, client.address(), epoch, load, credential.as_ref()).await
+                // **Noised at the boundary that publishes it** — the only place holding both the frame and
+                // entropy, which is the same argument `telemetry_dir::spawn_coherence_publisher` makes for
+                // the sibling stream. See `noise_scale` for why σ is derived and not chosen.
+                let mut seed_bytes = [0u8; 32];
+                // A failure to draw entropy must not publish the RAW figure: falling back to a fixed seed
+                // still noises, merely predictably, which is strictly better than the un-noised value this
+                // whole function exists to stop leaving the node.
+                let _ = getrandom::fill(&mut seed_bytes);
+                let mut rng = fanos_pqcrypto::rng::SeedRng::from_seed(&seed_bytes);
+                let reported = privatize(load, crate::role_loop::role_capacity(), points, &mut rng);
+                publish_load(&client, client.address(), epoch, reported, credential.as_ref()).await
             }
         };
         publish(epoch, seed, load_source()).await;
@@ -276,6 +349,56 @@ pub fn spawn_load_publisher(
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::expect_used)]
 mod tests {
+
+    /// The published figure is noised, and the scale is the one the consumer's tolerance derives.
+    ///
+    /// Three claims, because each failure this guards is different. **It noises at all** — the raw reading
+    /// never leaves the node, which is the whole point, and a test that only checked the scale would pass on
+    /// a function that returned its input. **The scale is `C/√(2n)`** — that is the σ ≤ C/√n the aggregate's
+    /// one-unit tolerance permits, written for Laplace, and a scale chosen instead of derived would drift
+    /// from it silently. **It stays a `u16` and never wraps** — a negative sample means "less than nothing in
+    /// flight" and must clamp to zero, because wrapping would read as `u16::MAX` and ask the cell to
+    /// provision for a node doing nothing.
+    #[test]
+    fn a_published_load_is_noised_at_the_scale_the_setpoint_tolerance_derives() {
+        // σ = C/√n for the aggregate, and σ = b√2 for Laplace, so b = C/√(2n). Checked at the shipped
+        // plane sizes rather than one, since `n` is what makes the scale cell-wide.
+        for (capacity, points) in [(64u16, 7u32), (64, 57), (1024, 57), (1024, 16257)] {
+            let b = noise_scale(capacity, points);
+            let sigma = b * core::f64::consts::SQRT_2;
+            let want = f64::from(capacity) / f64::from(points).sqrt();
+            assert!(
+                (sigma - want).abs() < 1e-9,
+                "capacity {capacity} on {points} points: σ is {sigma}, and the setpoint's one-unit tolerance \
+                 permits {want}"
+            );
+        }
+
+        // It noises at all: over many draws the published figure must differ from the raw one. A single draw
+        // could legitimately round back to the input, which is why this counts.
+        let mut rng = fanos_pqcrypto::rng::SeedRng::from_seed(&[0x5A; 32]);
+        let load = Demand::per_role(|_| 100);
+        let capacity = Demand::per_role(|_| 64);
+        let differed = (0..64)
+            .filter(|_| privatize(load, capacity, 57, &mut rng).of(Role::Exit) != 100)
+            .count();
+        assert!(differed > 32, "the published figure must be noised, differed in only {differed} of 64 draws");
+
+        // And clamps rather than wraps. The discriminator is **exact zeros**, not a magnitude: the noise is
+        // symmetric about the load, so at a load of zero roughly half the draws are negative, and clamping
+        // turns those into `0` while wrapping would turn them into values near `u16::MAX`. A large *positive*
+        // draw is legitimate at this scale, which is why an upper bound would be the wrong assertion — the
+        // first version asserted one and failed on an honest sample.
+        let zero = Demand::per_role(|_| 0);
+        let wide = Demand::per_role(|_| u16::MAX);
+        let zeros = (0..64).filter(|_| privatize(zero, wide, 7, &mut rng).of(Role::Exit) == 0).count();
+        assert!(
+            zeros > 8,
+            "negative samples must clamp to zero — saw {zeros} exact zeros in 64 draws, and wrapping would \
+             produce none at all"
+        );
+    }
+
     use super::*;
 
     #[test]
