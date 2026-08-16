@@ -1181,6 +1181,16 @@ mod tests {
         // someone once typed. Before any sample it *is* the base — genesis behaviour is unchanged.
         assert_eq!(estimated_round_timeout(None), ROUND_TIMEOUT_BASE, "no measurement yet ⇒ the documented base");
 
+        // **The formula, not only the direction.** Everything else here asserts that the settled value is
+        // *below* the base, which a smaller `K` satisfies even better — measured, `srtt + var·2` leaves all
+        // 296 tests in this crate green. `K = 4` is RFC 6298's, the same constant `GatherClock` carries, and
+        // a bound cannot distinguish two laws that both point the same way.
+        assert_eq!(
+            estimated_round_timeout(Some((Duration::from_millis(300), Duration::from_millis(50)))),
+            Duration::from_millis(500),
+            "srtt + 4·var = 300 + 200, inside the [TICK_PERIOD, ROUND_TIMEOUT_MAX] clamp; 400 means K became 2"
+        );
+
         let fast = Duration::from_millis(200);
         let mut rtt = None;
         for _ in 0..40 {
