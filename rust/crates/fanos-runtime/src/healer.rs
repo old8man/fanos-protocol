@@ -1151,3 +1151,50 @@ impl Healer {
     }
 }
 
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod dwell_gate {
+    use super::{BAND_DWELL, Healer};
+    use fanos_diakrisis::homeostat::BandControl;
+    use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
+
+    /// **The dwell GATE, which is a different claim from the dwell constant — and only the constant was
+    /// guarded.**
+    ///
+    /// `BAND_DWELL = 3` is load-bearing statistics, not a taste: `advance_band_dwell`'s own doc records that
+    /// a single-reading branch would need **34 standard errors** — over four hours of history — where three
+    /// consecutive readings need `2.5` and 89 seconds. Lowering the constant is caught, by
+    /// `the_decay_half_life_is_one_detection_dwell`, because the decay half-life is tied to it.
+    ///
+    /// **Breaking the gate is not.** Measured: replacing `self.band_streak >= BAND_DWELL` with `>= 1`, while
+    /// leaving the constant at 3, leaves all 71 `fanos-runtime` tests green. The coupling test reads the
+    /// constant; nothing read the comparison. So a cell would act on one reading of a statistic whose error
+    /// spans the band — the exact regime the dwell exists to refuse, and the one this branch used to be in.
+    ///
+    /// This is the tree's own rule about tolerance windows applied to a counter: step it `tolerance + 1`
+    /// times **and keep the one-step case**, because the one-step case is the whole claim.
+    #[test]
+    fn one_reading_must_not_open_the_band_gate_however_the_constant_is_spelled() {
+        let observer = SelfObserver::new(CellId([1; 16]), HistoryConfig::compact());
+        let mut healer = Healer::new(observer, 8, 2.5);
+        let bind = BandControl::Bind { authority: 0.5 };
+
+        for reading in 1..BAND_DWELL {
+            assert!(
+                !healer.advance_band_dwell(Some(&bind)),
+                "reading {reading} of {BAND_DWELL} opened the gate: a single sample of a statistic whose \
+                 error spans the band is what the dwell exists to refuse"
+            );
+        }
+        assert!(
+            healer.advance_band_dwell(Some(&bind)),
+            "and reading {BAND_DWELL} must open it, or the gate never opens and the dwell is a deadlock"
+        );
+
+        // A change of band restarts the streak — otherwise the count is of readings, not of *consecutive*
+        // ones, and the confidence derivation assumes consecutive.
+        assert!(!healer.advance_band_dwell(Some(&BandControl::Decouple { effort: 0.1 })), "a different band restarts");
+        assert!(!healer.advance_band_dwell(Some(&bind)), "and the streak begins again from one");
+    }
+}
