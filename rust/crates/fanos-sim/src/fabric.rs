@@ -1874,6 +1874,15 @@ mod tests {
         // runs: **3, 3, 9, 5, 3** — an assembly fraction of about a third, with one run at nominal. On an ideal link,
         // in a three-node cell, at a threshold of two.
         //
+        // **This instrument is load-dominated, and that is a property of the quantity, not a flaw to tune out.** The
+        // window is wall-clock and the epoch driver's ticks are wall-clock, so a busy host offers the same nine rounds
+        // while delivering fewer of them. Readings taken the same afternoon: `0.67, 0.78, 0.89` at host load ≈ 5, and
+        // `0.22, 0.33` at load ≈ 10, with no code change between the two groups. **Any before/after comparison across
+        // different host loads is therefore worthless** — the beacon pull-sync trigger added the same day looked like
+        // a large improvement until the loaded samples arrived and the bands overlapped. Use this to measure the *rate
+        // itself* on a quiet box, and use a presence observable (did the pull fire? did a laggard catch up?) for
+        // anything that has to survive a shared machine.
+        //
         // Two readings this cannot give, deliberately. It cannot say *why* a round failed: `Station::BeaconRefused`
         // rides `Notification::DataPath`, which is emitted only in answer to `Command::Observe`, so `fleet.stations()`
         // — the driver's map — cannot see refusals at all, and their absence there means nothing. And it cannot
@@ -1888,6 +1897,41 @@ mod tests {
             .expect("fleet starts");
         tokio::time::sleep(u32::try_from(periods).map_or(floor, |p| p * floor)).await;
         let epochs: Vec<_> = fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+        // **Why a round failed, asked of the one surface that can answer it.** `Station::BeaconRefused` never appears
+        // in `fleet.stations()` — that reads the driver's map, while a refusal rides `Notification::DataPath`, which
+        // the engine emits only in answer to `Command::Observe`. Reading the absence off the wrong surface is how the
+        // first account of this freeze went wrong, so the right surface is asked here explicitly. A tag names the
+        // class (`fanos_keygen::BeaconRefusal::ALL`): a partial for an already-adopted epoch is benign and expected
+        // to be nonzero, while a DLEQ failure or an own-share mismatch is a provisioning fault, and a future-epoch
+        // discard means this node is behind rather than deaf. Nothing at all means the partials never arrived.
+        let mut refusals = Vec::new();
+        for (i, n) in fleet.nodes().iter().enumerate() {
+            let mut events = n.client().subscribe();
+            if !n.client().command(fanos_runtime::Command::Observe) {
+                continue;
+            }
+            let seen = tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
+                loop {
+                    match events.recv().await {
+                        Ok(fanos_runtime::Notification::DataPath { stations, .. }) => return Some(stations),
+                        Ok(_) => {}
+                        Err(_) => return None,
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+            for o in seen.iter().filter(|o| o.station == fanos_runtime::ports::stations::Station::BeaconRefused) {
+                let name = o
+                    .tag
+                    .and_then(|t| usize::try_from(t).ok())
+                    .and_then(|t| fanos_keygen::BeaconRefusal::ALL.get(t))
+                    .map_or("unknown", |r| r.name());
+                refusals.push(format!("node {i} {name}={}", o.count));
+            }
+        }
         // Printed beside the epochs because a coordinate collision is the mechanism most likely to explain a node
         // that stops: the directory serves a contested point as ONE address, so a partial addressed to that point
         // reaches the incumbent and never the co-located claimant. Measured live here — two of three nodes reporting
@@ -1898,7 +1942,7 @@ mod tests {
         // The driver skips its first tick, so `periods` of wall clock offer `periods - 1` rounds.
         println!(
             "MEASURED beacon rounds: cell reached epoch {reached} of {} on offer in {periods} periods of {floor:?} \
-             (fraction {:.2}), per node {epochs:?}, addresses {addrs:?}",
+             (fraction {:.2}), per node {epochs:?}, addresses {addrs:?}, refusals {refusals:?}",
             periods - 1,
             f64::from(u32::try_from(reached).unwrap_or(u32::MAX)) / f64::from(periods - 1),
         );

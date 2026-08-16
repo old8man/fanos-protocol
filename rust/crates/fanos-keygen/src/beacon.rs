@@ -326,6 +326,22 @@ pub struct BeaconNode<F: Field> {
     genesis: BeaconSeed,
     /// Verified partials collected for each not-yet-adopted future epoch, until a round assembles.
     pending: BTreeMap<Epoch, Vec<BeaconPartial>>,
+    /// The highest epoch this node has already asked the cell about via the [`request_sync`](Self::request_sync)
+    /// pull, so the same gap is not re-asked once per arriving partial.
+    ///
+    /// **Why the pull needs a trigger at all, and why this is the one quantity it needs.** The push path is
+    /// `broadcast`, which addresses every partial and every assembled round to a *plane point* — so it rides
+    /// coordinate resolution and its last rung drops the frame. Measured on a three-node fleet over an ideal
+    /// link, rounds assemble at about a third of the rate the epoch driver offers. The pull is the opposite
+    /// shape: `on_beacon_req` answers with `Effect::Send { to: from }` where `from` is the **reply target**,
+    /// so the answer travels back over the connection the ask arrived on and never consults a coordinate.
+    ///
+    /// That asymmetry was already built and fired **once per node lifetime**, from
+    /// `Command::StartHeartbeat` — the join case of §7.8. A node that falls behind *after* joining had no way
+    /// to ask, and nothing compared its epoch with the cell's. `fanos_taxis::consensus` solved exactly this
+    /// for the chain (`maybe_request_sync` on `max_seen_height > height()`); this is the same trigger for the
+    /// same primitive, one crate over.
+    sync_asked_for: Option<Epoch>,
     /// The current epoch's assembled round, cached so this node can answer a `BeaconReq` pull-sync from a
     /// joining node (spec §7.8 bootstrap) — `None` until the first round is adopted.
     current_round: Option<BeaconRound>,
@@ -430,6 +446,7 @@ impl<F: Field> BeaconNode<F> {
             seed: *genesis.as_bytes(),
             genesis,
             pending: BTreeMap::new(),
+            sync_asked_for: None,
             current_round: None,
             reshare_gen: 0,
             pending_reshare: BTreeMap::new(),
@@ -625,7 +642,10 @@ impl<F: Field> BeaconNode<F> {
         let Some(round) = round else {
             // Not enough partials yet — the ordinary state between the first arrival and the threshold, and
             // deliberately uncounted: it happens on almost every call and would drown the six that matter.
-            return Vec::new();
+            //
+            // It is also the only place this node can notice it has **missed a round**, which is why the pull
+            // is triggered from here rather than from a timer.
+            return self.maybe_request_sync(epoch);
         };
         let Some(seed) = round.verify_and_seed(&self.commitment, self.threshold) else {
             self.rejects.assembly_unverified = self.rejects.assembly_unverified.saturating_add(1);
@@ -671,6 +691,34 @@ impl<F: Field> BeaconNode<F> {
         }
         self.buffer(epoch, partial);
         self.try_assemble(epoch)
+    }
+
+    /// Ask the cell for its current round when a partial proves a round was **missed**, not merely in flight.
+    ///
+    /// **The condition is `seen > epoch + 1`, and the `+ 1` is the whole of it.** Anchors propose the epoch
+    /// after the one they hold, so a partial exactly one ahead is the round now in progress — the healthy
+    /// case, on every tick, for every node. Two or more ahead means the cell adopted a round this node never
+    /// saw: `pending` will never fill for the epoch it is waiting on, because nobody will propose it again.
+    /// Without this the node waits for evidence that cannot arrive.
+    ///
+    /// **Rate-limited by the evidence, not by a clock.** It re-asks only when the gap *widens* — a strictly
+    /// higher epoch than the last one asked about — so a node behind by many rounds asks about once per round
+    /// the cell produces, and a node receiving many partials for one epoch asks once. That matters because
+    /// `request_sync` is itself a `broadcast`, so an ask can be dropped exactly like a partial; tying the
+    /// retry to the cell's own progress gives it repeated chances without inventing a retry timer.
+    fn maybe_request_sync(&mut self, seen: Epoch) -> Vec<Effect> {
+        if seen <= self.epoch.next() || self.sync_asked_for.is_some_and(|asked| seen <= asked) {
+            return Vec::new();
+        }
+        self.sync_asked_for = Some(seen);
+        self.request_sync()
+    }
+
+    /// The highest epoch this node has pulled for, or `None` if it has never had to — the observable half of
+    /// [`maybe_request_sync`], so a test can assert the trigger fired rather than that a frame appeared.
+    #[must_use]
+    pub const fn sync_asked_for(&self) -> Option<Epoch> {
+        self.sync_asked_for
     }
 
     /// Adopt a new epoch + seed (monotone), dropping now-stale pending partials.
@@ -1683,6 +1731,45 @@ mod tests {
     ///
     /// Both directions for each, because a counter asserted only at zero is indistinguishable from a field
     /// that is always zero — which is exactly what `deal_rejected` turned out to be.
+    /// The pull existed and had one trigger: `Command::StartHeartbeat`, i.e. the join. A node that fell behind
+    /// afterwards could only wait to be told — over `broadcast`, which addresses every partial and every round
+    /// to a *plane point* and therefore drops what coordinate resolution cannot resolve (measured on a
+    /// three-node fleet over an ideal link: rounds assemble at about a third of the offered rate). The pull is
+    /// the opposite shape — the answer goes back to the reply target, over the connection — so it is exactly
+    /// the recovery the push path cannot be.
+    ///
+    /// Both directions, because a trigger asserted only where it fires is indistinguishable from one that
+    /// fires always: **one epoch ahead is the healthy round in progress and must stay silent.**
+    #[test]
+    fn a_partial_that_proves_a_missed_round_pulls_the_cell_and_one_in_progress_does_not() {
+        let (shares, commitment) =
+            deal(&[0xB2; 32], 2, N, &mut DeterministicRng::new(b"beacon-pull")).unwrap();
+        // Threshold 2 with one partial per epoch, so no bucket ever assembles and every feed lands on the
+        // "not enough partials yet" branch — the only place a missed round is observable.
+        let mut node =
+            BeaconNode::<F2>::new(Point::at(0), Some(shares[0].clone()), commitment.clone(), 2, BeaconSeed::GENESIS);
+        let req = encode(FrameType::BeaconReq, &[]);
+        let feed = |node: &mut BeaconNode<F2>, epoch: Epoch| {
+            let frame = partial_frame(epoch, &partial_eval(&shares[1], epoch));
+            let fx = node.step(Instant(1), Input::Message { from: [9, 9, 9], frame });
+            fx.iter().filter(|e| matches!(e, Effect::Send { frame, .. } if *frame == req)).count()
+        };
+
+        assert_eq!(node.epoch(), Epoch::ZERO, "the node starts at genesis, so `epoch + 1` is 1");
+        assert_eq!(feed(&mut node, Epoch::new(1)), 0, "a partial for the round in progress must not pull");
+        assert_eq!(node.sync_asked_for(), None, "…and must not record an ask");
+
+        let asked = feed(&mut node, Epoch::new(3));
+        assert!(asked > 0, "a partial two epochs ahead proves a round was adopted without us — pull for it");
+        assert_eq!(node.sync_asked_for(), Some(Epoch::new(3)), "and the highest asked-for epoch is recorded");
+
+        assert_eq!(feed(&mut node, Epoch::new(2)), 0, "a gap no wider than the one already asked about re-asks nothing");
+        assert_eq!(node.sync_asked_for(), Some(Epoch::new(3)), "…and leaves the mark where it was");
+
+        assert!(feed(&mut node, Epoch::new(4)) > 0, "a widening gap asks again — the retry the cell's own progress gives");
+        assert_eq!(node.sync_asked_for(), Some(Epoch::new(4)), "and the mark follows the evidence");
+    }
+
     #[test]
     fn the_beacons_steady_state_tells_a_stale_reflood_from_a_forgery() {
         let (shares, commitment) =
