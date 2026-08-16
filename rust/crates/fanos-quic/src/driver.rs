@@ -3759,6 +3759,35 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
 ///
 /// So this is **narrower than `is_beacon_frame`** on purpose, and the difference is not a copy that drifted:
 /// that predicate answers "which engine owns this frame", this one answers "may a stranger send it".
+///
+/// # The `BeaconReq` refusal is sound for a joining node and leaves a fallen-behind one with no path at all
+///
+/// Measured 2026-08-16 on a three-node fleet, once the fixture's beacon anchors were dealt and epochs began
+/// to advance at all: a node that misses a round stops at that epoch **for ever**, in about two runs in five.
+/// The chain is closed and it is circular:
+///
+/// 1. its coordinate is derived from the epoch it lost, so it stops re-publishing;
+/// 2. its directory slot is reclaimed (`now ≥ E+2`);
+/// 3. its HELLO now names an epoch outside the cell's `{N−1, N, N+1}` **and is not genesis**, so every peer
+///    files it as [`PeerIdentity::Unjudged`] — no directory write, **no connection-map entry**;
+/// 4. so nothing in the cell can address it: partials and rounds alike reach the send ladder's last rung and
+///    are dropped;
+/// 5. it holds a restricted connection that only ever **reads**, and may not ask, because of the arm above.
+///
+/// **The genesis pin (#235) rescues epoch 0 and exactly epoch 0.** A joining node is judgeable — the cell can
+/// verify an epoch-zero proof for ever — so the cell files it, addresses it normally, and its round arrives.
+/// A node stuck at any epoch `≥ 1` outside the window is judgeable by nobody, and the same door is shut.
+///
+/// **And the refusal's own two reasons are conditional on answering by coordinate.** "Not reachable at the
+/// coordinate it names" and "a small reflection primitive" are both consequences of `on_beacon_req` emitting
+/// `Effect::Send { to: from }` into the coordinate ladder. Answer over **this connection** instead and both
+/// evaporate: the asker is reachable *by construction*, since the frame arrived here, and the answer goes
+/// back the way it came rather than to whoever really holds that point. The round is public and
+/// self-authenticating, so nothing is disclosed that the flood does not already broadcast.
+///
+/// That is the shape of the repair, and it is deliberately not made here: it changes what an unproven peer
+/// may cause this node to do, which is the authentication path, and it wants its own pass with a test that
+/// a stranger cannot use it to reflect anything but a round it could have read from the flood.
 fn admitted_unjudged(frame: &[u8]) -> bool {
     matches!(
         decode_frame(frame).ok().and_then(|(f, _)| f.frame_type()),
