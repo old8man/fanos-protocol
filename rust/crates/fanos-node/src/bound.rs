@@ -56,7 +56,7 @@ use fanos_field::Field;
 use fanos_geometry::Point;
 use fanos_primitives::BeaconSeed;
 use fanos_rendezvous::Epoch;
-use fanos_vrf::{VrfProof, VrfPublic, coordinate_output, probe_index_of};
+use fanos_vrf::{VrfOutput, VrfProof, VrfPublic, coordinate_output, probe_index_of};
 
 /// The fixed part of the wire form: `vrf_public(32) ‖ vrf_proof(80)`.
 const CREDENTIAL_LEN: usize = 32 + 80;
@@ -116,11 +116,33 @@ impl Entitlement {
         epoch: Epoch,
         beacon: &BeaconSeed,
     ) -> Option<(Self, &'a [u8])> {
+        let (me, payload, _, _) = Self::open_with_claim::<F>(bytes, coord, epoch, beacon)?;
+        Some((me, payload))
+    }
+
+    /// As [`open`](Self::open), and **hands back the claim it had to compute anyway**.
+    ///
+    /// Opening a bound record already derives the writer's `VrfOutput` and asks `probe_index_of` where the
+    /// slot's point sits on that writer's walk — the two values `fanos_vrf::claim_beats` orders claims by,
+    /// and the pair `fanos_quic`'s claim book is fed with. Both were computed, spent on one yes/no, dropped.
+    ///
+    /// **A reader that finds a record it did not write is holding a proof, not a puzzle.** Its own slot is
+    /// keyed by its coordinate (`cap_slot`), so any node contending for that coordinate writes and reads the
+    /// same place by construction — no routing luck, unlike dialling the point, which in a young cell
+    /// resolves to nothing and, once the contest is live, to the reader itself. Handing the pair back is
+    /// what lets the loser of a silent overwrite learn that it lost *and* prove the step it must take: an
+    /// index `k` needs `k` witnesses, and the record at the slot is one.
+    pub fn open_with_claim<'a, F: Field>(
+        bytes: &'a [u8],
+        coord: Coord,
+        epoch: Epoch,
+        beacon: &BeaconSeed,
+    ) -> Option<(Self, &'a [u8], VrfOutput, u16)> {
         let (me, payload) = Self::split(bytes)?;
         let point = Point::<F>::new(coord)?;
         let output = coordinate_output(&me.public, &me.id, epoch, beacon, &me.proof)?;
-        probe_index_of::<F>(&output, &point)?;
-        Some((me, payload))
+        let index = probe_index_of::<F>(&output, &point)?;
+        Some((me, payload, output, index))
     }
 }
 

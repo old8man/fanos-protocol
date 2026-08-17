@@ -25,6 +25,41 @@ use crate::poros::DescriptorBinding;
 /// their epochs stay aligned.
 pub const DEFAULT_EPOCH_PERIOD: Duration = Duration::from_secs(600);
 
+/// **The largest plane order whose collision resolution fits inside one epoch** — the ceiling
+/// [`DEFAULT_EPOCH_PERIOD`] puts on the base cell, which nothing stated until it was measured.
+///
+/// A contested node resolves by walking its line: at most `fanos_vrf::probe_bound = q + 1` steps. The steps
+/// cannot be taken faster than a new seat becomes known, because a move is announced by the very tables it
+/// invalidates — `on_reseat` floods an `Announce` to every point, each delivery needs the sender's table to
+/// resolve that point, and when many nodes move at once those tables are exactly as stale as the movement.
+/// Measured: with the walk bounded only in *count*, nodes more than two beacons behind went to 21, 24 and 22
+/// of ~30 across three builds; spacing the steps took it to 1–2.
+///
+/// The coordinate is re-derived at every boundary, so **a walk that does not finish inside one period never
+/// finishes at all**. Hence `epoch ≥ (q + 1) · step`, and this inverts it.
+///
+/// `step` is the honest question. A peer already talking to the mover re-keys from one frame
+/// (`Notification::PeerMoved`, emitted on the announcing connection). A peer that has never met it learns
+/// only from its own directory scan, floored at `role_loop::ROSTER_REFRESH = 3 · STORE_TIMEOUT = 15 s` —
+/// and *that* is the general case, so it is the one this uses. The measured rate limit used the driver's
+/// `HELLO_DEADLINE` of 10 s and sufficed on a densely-connected fleet, which is a weaker claim.
+///
+/// At the shipped constants the ceiling is **`q = 39`** (`N = 1561` points). Every order the tree actually
+/// runs is under it — `F2`, `F7`, `F31` cost 45 s, 120 s and 480 s — but `F127` and `F256` exist as types
+/// and would need 1920 s and 3855 s. **This is the tripwire for the day somebody reaches for one as a plane
+/// order**: scale past the ceiling belongs to the hierarchy (`fanos_geometry::hierarchy`), and this is the
+/// first quantitative reason to prefer nesting over a wider plane rather than an asymptotic one.
+#[must_use]
+pub const fn largest_plane_order_that_settles(epoch: Duration, step: Duration) -> u32 {
+    let (epoch, step) = (epoch.as_secs(), step.as_secs());
+    if step == 0 {
+        return u32::MAX; // no propagation cost, no ceiling — not a reachable configuration
+    }
+    // `q + 1` steps must fit, so `q = epoch/step - 1`, and an epoch shorter than one step admits nothing.
+    let steps = epoch / step;
+    if steps == 0 { 0 } else { (steps - 1) as u32 }
+}
+
 /// Default mean Poisson mixing delay a **relay** holds each forwarded onion hop for (spec §L5/V7): a batch of
 /// onions then leaves **reordered**, so which cell is which is not readable from arrival order.
 /// Non-zero by default so the shipping relay actually defends (closing audit S1-H1); an operator trading
@@ -2392,6 +2427,62 @@ mod tests {
         assert_eq!(cfg.proteus_secret.as_deref().map(Vec::as_slice), Some(&b"a-shared-bridge-secret"[..]));
         // An empty secret is a configuration error, not a silent no-op.
         assert!(NodeConfig::from_config_str("proteus_secret =").is_err());
+    }
+
+    /// **The epoch's ceiling on the plane, asserted rather than remembered.**
+    ///
+    /// `epoch ≥ (q+1) · step` is derived in [`largest_plane_order_that_settles`]; this pins the number it
+    /// yields at the shipped constants and — the half that makes it a guard rather than a restatement —
+    /// checks it against every order the tree actually instantiates, and against the two it merely defines.
+    ///
+    /// Falsifiable in both directions: a ceiling one order too high would admit a plane whose walk cannot
+    /// finish inside a period, and one order too low would forbid `q = 39`, whose walk fits exactly.
+    #[test]
+    fn the_epoch_caps_the_plane_order_and_every_order_we_run_is_under_it() {
+        let step = crate::role_loop::ROSTER_REFRESH;
+        assert_eq!(step, Duration::from_secs(15), "3 x STORE_TIMEOUT, the floor a directory scan sits at");
+        let ceiling = largest_plane_order_that_settles(DEFAULT_EPOCH_PERIOD, step);
+        assert_eq!(ceiling, 39, "600s / 15s = 40 steps, so q + 1 <= 40");
+
+        // **Exactly at the ceiling the walk fits, one past it does not — and this is checked at three
+        // configurations, not only the shipped one.** With a single case the `assert_eq!` above fires first
+        // for any change and these two never discriminate anything: several refusal paths, one live. Given
+        // other `(epoch, step)` pairs they answer for the relation rather than for the constant.
+        for (epoch, step) in [
+            (DEFAULT_EPOCH_PERIOD, step),
+            (Duration::from_secs(300), Duration::from_secs(15)),
+            (Duration::from_secs(120), Duration::from_secs(10)),
+        ] {
+            let q = largest_plane_order_that_settles(epoch, step);
+            assert!(
+                u64::from(q + 1) * step.as_secs() <= epoch.as_secs(),
+                "a walk of {} steps at {}s must fit in {}s, or the ceiling admits a plane that cannot settle",
+                q + 1,
+                step.as_secs(),
+                epoch.as_secs()
+            );
+            assert!(
+                u64::from(q + 2) * step.as_secs() > epoch.as_secs(),
+                "and one order higher must NOT fit, or the ceiling is lower than the epoch actually allows"
+            );
+        }
+
+        // Every plane order the tree instantiates. `F2` is the base cell every binary runs; `F7` and `F31`
+        // are reached from the CLI. If one is added above the ceiling, this is where it stops.
+        for q in [2u32, 7, 31] {
+            assert!(
+                q <= ceiling,
+                "PG(2,{q}) needs {}s to walk a line at {}s a step, and the epoch is {}s — a walk that does \
+                 not finish inside one period never finishes, because the boundary re-derives the coordinate",
+                u64::from(q + 1) * step.as_secs(),
+                step.as_secs(),
+                DEFAULT_EPOCH_PERIOD.as_secs()
+            );
+        }
+        // And the orders that exist as types but must not be used as plane orders at this epoch.
+        for q in [127u32, 256] {
+            assert!(q > ceiling, "F{q} is defined; using it as a PLANE order needs a longer epoch");
+        }
     }
 
     #[test]

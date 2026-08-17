@@ -1065,6 +1065,22 @@ pub struct Health {
     pub local_addr: SocketAddr,
     /// The number of peers currently in the address book.
     pub known_peers: usize,
+    /// Coordinates this node can reach **on evidence, right now** — a ranked binding *or* a live connection.
+    ///
+    /// **The third number, and the one the roster-convergence investigation needed.** Its two neighbours are
+    /// each wrong in one direction and neither can be corrected into this one:
+    /// [`known_peers`](Self::known_peers) counts the dial book, including seeds no handshake confirmed, and
+    /// [`routable_points`](Self::routable_points) counts proven coordinates only — which is blind to a peer
+    /// that dialled **in**, because that peer is answering right now and this node never wrote it an address.
+    ///
+    /// The decisive case is the fixture's own bootstrap node: `known_peers = 0`, `routable_points = 0` — both
+    /// say "reaches nobody" — while every other node holds an open connection to it and it answers each one.
+    /// That is the reading an earlier pass turned into "heard its rivals and **cannot reach them**", from a
+    /// gap that could not carry the claim.
+    ///
+    /// The only ordering to rely on is `deliverable_points >= routable_points` (a union cannot be smaller
+    /// than one of its sides). Its relation to `known_peers` is **not** fixed, in either direction.
+    pub deliverable_points: usize,
     /// Points this node holds a **ranked** binding for — what it can route to, as distinct from what it has
     /// heard of (#249).
     ///
@@ -1176,6 +1192,43 @@ fn seed_bootstrap(config: &NodeConfig, directory: &Directory) -> Result<(), Node
         );
     }
     Ok(())
+}
+
+/// **Does this node's epoch contain one collision resolution?** — the budget that decides whether a
+/// contested seat can ever settle, warned about where both terms are finally in hand.
+    //
+/// A contested node walks its line: up to `q + 1` steps, and a step cannot be taken faster than a new
+/// seat becomes known, because a move is announced through the very tables it invalidates. The
+/// coordinate is re-derived at every boundary, so **a walk that does not fit inside one period never
+/// finishes** — the node keeps starting over. Said rather than refused, in the style of the plane
+/// warning one function up: short epochs are a legitimate fixture (this very check would have flagged
+/// the 60 s epoch a day of measurements ran on, where `PG(2,4)`'s walk costs 75 s), and taking the
+/// configuration away would trade a real capability for a reporting problem.
+    fn warn_if_the_epoch_cannot_contain_a_walk<F: Field>(config: &NodeConfig) {
+    if let Some(ceiling) = epoch_shortfall::<F>(config) {
+        eprintln!(
+            "fanos: WARNING — PG(2,{}) needs {}s to walk a line at this network's {}s directory floor, and \
+             the epoch is {}s. A contested seat re-derives before its walk finishes, so collisions never \
+             settle: expect two nodes on one point and the lines through it short of quorum. This epoch \
+             supports plane orders up to {ceiling}.",
+            F::Q,
+            u64::from(F::Q + 1) * crate::role_loop::ROSTER_REFRESH.as_secs(),
+            crate::role_loop::ROSTER_REFRESH.as_secs(),
+            config.epoch_period.as_secs(),
+        );
+    }
+}
+
+/// The ceiling this configuration exceeds, or `None` when the walk fits.
+///
+/// Split from the warning above so the rule can be asserted from both sides rather than inferred from a
+/// silence — a guard nobody has watched fire is not evidence that it can.
+fn epoch_shortfall<F: Field>(config: &NodeConfig) -> Option<u32> {
+    let ceiling = crate::config::largest_plane_order_that_settles(
+        config.epoch_period,
+        crate::role_loop::ROSTER_REFRESH,
+    );
+    (F::Q > ceiling).then_some(ceiling)
 }
 
 impl Node {
@@ -1295,6 +1348,7 @@ impl Node {
     // points stay `async` for API stability, matching `fanos_quic`'s spawn family.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn start_over<F: Field + 'static>(config: NodeConfig, fabric: Fabric) -> Result<Self, NodeError> {
+        warn_if_the_epoch_cannot_contain_a_walk::<F>(&config);
         let credentials = identity::load_or_generate(config.identity_path.as_deref())?;
 
         // Seed the address book so a fresh node can dial into the network (design.md §9).
@@ -1570,6 +1624,7 @@ impl Node {
             local_addr: self.local_addr,
             known_peers: self.directory.len(),
             routable_points: self.directory.routable_points(),
+            deliverable_points: self.handle.deliverable_points(&self.directory),
             reflexive: self.reflexive,
             // The absence of a persister IS the `NotConfigured` answer — there is no other way to be without
             // one — so the two sources cannot disagree about which of the three states this node is in.
@@ -1658,6 +1713,35 @@ impl Node {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **The startup warning fires, and only when it should** — the wiring, not the arithmetic.
+    ///
+    /// `largest_plane_order_that_settles` is pinned in `config`; what this asserts is that a node actually
+    /// consults it, with its own plane order and its own configured epoch. A guard nobody has watched fire
+    /// is not evidence that it can, and this one is a `eprintln!` whose silence is indistinguishable from
+    /// absence — which is why the rule was split into a predicate that can be asked.
+    #[test]
+    fn a_node_whose_epoch_cannot_hold_a_walk_is_told_so() {
+        use fanos_field::{F2, F4};
+        let with = |secs: u64| NodeConfig {
+            epoch_period: Duration::from_secs(secs),
+            ..NodeConfig::default()
+        };
+        // The shipped default: `PG(2,4)`'s walk costs 5 x 15 = 75 s and the epoch is 600 s.
+        assert_eq!(epoch_shortfall::<F4>(&with(600)), None, "the default epoch holds any order up to 39");
+        // The epoch a day of measurements ran on. `PG(2,4)` does NOT fit — which is the finding that
+        // produced this check, and it must be reported rather than discovered again.
+        assert_eq!(
+            epoch_shortfall::<F4>(&with(60)),
+            Some(3),
+            "60s / 15s = 4 steps, so q + 1 <= 4: PG(2,4) needs five and cannot settle in this epoch"
+        );
+        // And the base cell still fits there, so the warning is about the PLANE and not about short epochs.
+        assert_eq!(epoch_shortfall::<F2>(&with(60)), None, "PG(2,2) walks three steps, 45s of the 60s");
+        // One second below its own walk is the boundary, and the check sits on the right side of it.
+        assert_eq!(epoch_shortfall::<F2>(&with(45)), None, "exactly three steps fit");
+        assert_eq!(epoch_shortfall::<F2>(&with(44)), Some(1), "and one second less does not");
+    }
+
 
     /// The planes this platform recommends cannot correlate a circuit's two ends within the fault budget, and
     /// the ones above them can — so fresh-per-dial is right here and the guard question is real there.
