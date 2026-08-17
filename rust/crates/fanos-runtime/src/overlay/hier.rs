@@ -72,13 +72,16 @@ impl<F: Field> OverlayNode<F> {
     /// `RouteHier` frame (`HierAddr(dst) ‖ payload`) toward the next hop — the driver entry a client
     /// uses to reach a multi-level destination (the single-plane ``on_send`` is unchanged).
     pub fn send_hier(&mut self, dst: &HierAddr<F>, payload: &[u8]) -> Vec<Effect> {
-        self.healer.record_origination();
         match self.router.route(dst) {
+            // A local delivery puts nothing on the wire, so no peer counts it and neither does this node.
+            // It used to: the origination was recorded before the routing decision, so addressing oneself
+            // raised one's own behavioural weight without any frame existing.
             HierRoute::Deliver => alloc::vec![Effect::Notify(Notification::Delivered {
                 from: self.coord.coords(),
                 payload: payload.to_vec(),
             })],
             HierRoute::Forward(next) => {
+                self.healer.record_origination(next);
                 let mut body = dst.encode();
                 body.extend_from_slice(payload);
                 alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, &body))]
@@ -108,6 +111,13 @@ impl<F: Field> OverlayNode<F> {
                 })]
             }
             HierRoute::Forward(next) => {
+                // **Carrying a frame is behavioural load on both ends of the hop, and neither end was
+                // counted.** `from` put this frame on the wire toward us exactly as it does when we are the
+                // destination — the arm above records that — and we put it on the wire toward `next`.
+                // Without both, a peer whose traffic only transits this node reads as idle, and this node's
+                // own transit work is invisible to its own coherence model.
+                self.healer.record_relay(from);
+                self.healer.record_origination(next);
                 alloc::vec![self.routed_send(next, encode(FrameType::RouteHier, body))]
             }
             HierRoute::Drop => Vec::new(),

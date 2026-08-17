@@ -252,6 +252,29 @@ const GREY_TOL: f64 = 0.10;
 /// (`fanos-node/tests/store_lifetime.rs`).
 pub const MAX_STORE_ENTRIES: usize = STORE_MEMORY_BUDGET / MAX_VALUE_LEN;
 
+/// The product the share was never checked against, now checked by the compiler.
+///
+/// The division above stood alone. It is the fourth site found in one sweep with a share divided and nothing
+/// multiplying the count back out — `MAX_PENDING`'s doc calls that shape *"the assertion whose absence was
+/// the defect"*, and of the four, two were genuinely over their share (the threshold router's send queues by
+/// `251_829 B`, and its attribution ring entirely outside the sum). This one is exact —
+/// `2048 × 65_536 = 134_217_728 = 128 MiB` — which is the reason to add the guard now rather than the reason
+/// to skip it: the cheap half of an assertion is the one that has never fired.
+const _: () = assert!(
+    MAX_STORE_ENTRIES * MAX_VALUE_LEN <= STORE_MEMORY_BUDGET,
+    "the store slice's worst case exceeds STORE_SHARE — raise the share deliberately or lower a factor"
+);
+
+/// …and it is the **largest** count the share buys, so the number is derived rather than merely fitting.
+///
+/// Without this the assertion above is satisfied by any small number and neither says the count was derived —
+/// which matters here more than elsewhere, because this constant's own doc records that it *was* `4096` with
+/// no derivation at all before the budget existed.
+const _: () = assert!(
+    (MAX_STORE_ENTRIES + 1) * MAX_VALUE_LEN > STORE_MEMORY_BUDGET,
+    "MAX_STORE_ENTRIES is below what the share buys, so it was chosen rather than derived"
+);
+
 /// The memory one node's store slice may occupy **at its ceiling** — the budget [`MAX_STORE_ENTRIES`]
 /// divides, so the count and the bytes cannot drift apart.
 ///
@@ -597,6 +620,16 @@ pub(super) fn reconstruct_highest(by_version: &VersionedShards) -> Option<Vec<u8
 #[derive(Clone, Copy)]
 pub(super) struct ContentPoint<F: Field>(Point<F>);
 
+// **The load report's width, proven equal to the role count.** `fanos_ports` cannot see `Role`, so
+// `Notification::LoadReport`'s `[Option<u16>; 5]` is a literal there. This is a site that sees both, so this
+// is where they are tied together: a sixth role that widened one and not the other would otherwise truncate
+// every reading in silence. Anonymous, so it is checked without being an item anyone can leave unread.
+const _: () = assert!(
+    fanos_ports::ROLE_COUNT == Role::COUNT,
+    "the load-report width and the role count must agree",
+);
+
+
 /// The base overlay node engine, generic over the cell's field `F`.
 pub struct OverlayNode<F: Field> {
     coord: Point<F>,
@@ -666,10 +699,18 @@ pub struct OverlayNode<F: Field> {
     ///
     /// **Bounded by two finite vocabularies, neither of them attacker-chosen.** The escalation fires only
     /// when [`FrameType::group_is_critical`] holds — `code >> 4 == 0x1`, so codes `0x10`–`0x1F` and nothing
-    /// else — and this build names `0x11`–`0x1C`, leaving exactly **four** codes that can reach here. The
-    /// other axis is a plane point, so `4 × (q² + q + 1)`: 28 entries on Fano. A peer cycling type codes
-    /// buys itself no growth, which is why this needs no cap of its own (contrast `MAX_SKEW_TAG`, whose
-    /// station IS tagged by any code and therefore does need one).
+    /// else — minus every code this build can name. That count is
+    /// [`FrameType::UNKNOWN_CRITICAL_CODES`], and the other axis is a plane point, so the set is bounded by
+    /// `UNKNOWN_CRITICAL_CODES × (q² + q + 1)`. A peer cycling type codes buys itself no growth, which is why
+    /// this needs no cap of its own (contrast `MAX_SKEW_TAG`, whose station IS tagged by any code and
+    /// therefore does need one).
+    ///
+    /// **The number used to be written here by hand, and it went stale.** The sentence read *"this build
+    /// names `0x11`–`0x1C`, leaving exactly four codes … `4 × (q² + q + 1)`: 28 entries on Fano"*, which was
+    /// true until `DkgCommitReq = 0x1D` joined the registry. Nothing re-counted: the bound over-stated
+    /// itself by one code — harmless, since it only sizes an argument — but the same stale range had also
+    /// been copied into a test, where it picked `0x1D` as an example of a code this build cannot name. That
+    /// assertion had quietly stopped being about anything.
     ///
     /// **Never cleared, and that is the design rather than an omission.** "Which release is this peer on"
     /// is a LEVEL, and the level already has its own always-current channel one line down —
@@ -1039,7 +1080,36 @@ impl<F: Field> OverlayNode<F> {
             // Counted with the type code *and* the sender, because `design-upgrade.md` §4's question is
             // "does any hop line hold fewer than `t` members that agree", and neither dimension answers it
             // alone: the code says which release, the sender says which line.
-            _ => {
+            _ => self.on_unclaimed_type(&frame, from),
+        }
+    }
+
+    /// A frame this dispatch has no arm for — **two findings with opposite remedies**, told apart here.
+    ///
+    /// The seventeen arms above claim a type each; everything else lands in one place, and for a long time
+    /// under one name. `frame_type()` resolving is the whole discriminator: `Some(_)` means the registry has
+    /// a name for the code, so the sender is on *this* protocol and the frame simply reached a plane that
+    /// does not serve it — a **dispatch** fact. `None` means this build cannot name the code at all, which is
+    /// the **release** fact `design-upgrade.md` §4 asks about.
+    ///
+    /// Measured, and the size is the argument: a five-node cell of ONE binary — where skew cannot occur by
+    /// construction — raised the skew station **130 times in 60 s**, every event the handshake's own tail
+    /// (`HelloAck`, `0x01`) arriving here. The count was not noise around a signal, it was the entire count.
+    fn on_unclaimed_type(&mut self, frame: &fanos_wire::Frame<'_>, from: Triple) -> Vec<Effect> {
+        if frame.frame_type().is_some() {
+            self.stations.record_tagged(
+                Station::FrameTypeUnhandled,
+                Some(from),
+                Some(frame.type_code),
+                1,
+            );
+            // **No `UnsupportedCritical` from here, deliberately.** That escalation says a *peer* is speaking
+            // a code this build does not support; a code it does support, delivered to a plane that does not
+            // serve it, is this node's own dispatch, and accusing the sender of it would put a second false
+            // statement where the first one already was.
+            return Vec::new();
+        }
+        {
                 // The **raw** `type_code`, not `frame_type()`. The enum cannot represent a code this build
                 // does not know — that is what makes it unknown — so resolving through it discards precisely
                 // the evidence the station exists to carry, and records a skew observation with nothing in it.
@@ -1061,9 +1131,8 @@ impl<F: Field> OverlayNode<F> {
                         type_code: frame.type_code,
                         from,
                     }))]
-                } else {
-                    Vec::new()
-                }
+            } else {
+                Vec::new()
             }
         }
     }
@@ -1279,8 +1348,9 @@ impl<F: Field> OverlayNode<F> {
 
 
     fn on_send(&mut self, to: Triple, payload: &[u8]) -> Vec<Effect> {
-        // This node originating a relay is its own behavioural activity (the self slot of the sample).
-        self.healer.record_origination();
+        // This node putting a data frame on the wire is its own behavioural activity (the self slot of the
+        // sample), recorded against the destination that will count it.
+        self.healer.record_origination(to);
         let mut effects = Vec::new();
         // Compute the rendezvous line u × v (O(1)); report it for observation, then deliver.
         if let Some(dst) = Point::<F>::new(to)
@@ -1538,9 +1608,19 @@ impl<F: Field> OverlayNode<F> {
         ));
         // The load this node is carrying, reported every observation — it needs no coherence matrix, only the
         // counts the node already keeps, and the role controller's setpoint is its one real input.
-        effects.push(
-            self.healer.load_effect(self.load_sensors.counting(Role::Storage, self.store.entries.len())),
-        );
+        //
+        // Assembled here rather than by the healer, and the move is what the sensor correction earned: the
+        // healer used to *add* `Role::Relay` from its coherence self-slot, so the report had two authors. It
+        // measured the wrong subject (frames this node **originated** — its work as a source, not the work it
+        // carries for others) and it silently overwrote whatever a composite had reported for that role. With
+        // that reading gone the healer contributed nothing, and a method that ignores its own `self` is a
+        // justification held by a non-member. So the reading is complete where it is assembled: the overlay
+        // adds the one sensor it owns, and every other role arrives through `observe_load`.
+        //
+        // The report's width is proven against `fanos_ports::ROLE_COUNT` by a const assertion at module scope.
+        effects.push(Effect::Notify(Notification::LoadReport {
+            per_role: self.load_sensors.counting(Role::Storage, self.store.entries.len()).into_array(),
+        }));
         // R-C2: the Healer raises the `Escalated` NOTIFICATION but has no router — the facade (which owns the
         // hierarchical address) transports the residue up to the parent cell's sibling members, where it folds
         // into their `ParentCell` reflex. Origination lives here so a driver on any transport gets it.
@@ -1851,6 +1931,68 @@ mod tests {
     /// every algebraic point whether or not anyone was there — so the fixture was resting on the very defect
     /// #216 removes. In production `last_seen` is set by the first frame from a peer, long before any
     /// directory read; a bare node reading the cell is not a state a deployment passes through.
+    /// **The seven erasure shards must land on distinct homes while distinct homes exist.**
+    ///
+    /// Placement used to walk each shard index to its *nearest-occupied successor* — the same rule content
+    /// routing uses, and right there. It is wrong here, and only the base cell hid it: on `PG(2,2)` the seven
+    /// shard indices **are** the seven plane indices, so the walk is the identity and `[7,3,4]`'s redundancy
+    /// is intact. On a wider plane the indices `0..7` sit in one corner of the ring and all of them walk to
+    /// the same successor.
+    ///
+    /// The fixture is that corner, chosen adversarially: **no occupied point between 1 and 7**. Under the old
+    /// rule shard 0 stayed at this node and shards 1–6 all went to point 8 — one home holding six of seven,
+    /// so a single home's loss left `1 < K = 3` and the value was gone. Sampled across placements the rule
+    /// lost the value in `48.1 %` of five-node `PG(2,4)` cells and `73.9 %` of seven-node `PG(2,7)` cells,
+    /// putting **all seven** on one node in `14.9 %` and `43.8 %` of them.
+    ///
+    /// Asserted as *distinct homes*, because that is the property and it is what a restored successor rule
+    /// would break first — a count of shards would still read seven.
+    #[test]
+    fn shard_homes_spread_over_the_occupied_points_rather_than_piling_on_one_successor() {
+        use fanos_field::F4;
+        use std::collections::BTreeSet as Set;
+
+        // This node is point 0; the other seats are all above the shard-index corner `1..=6`.
+        const SEATS: [usize; 4] = [8, 12, 15, 18];
+        let mut node = OverlayNode::<F4>::new(Point::at(0), Config::default());
+        let wanted: Set<Triple> = SEATS.iter().map(|&i| Point::<F4>::at(i).coords()).collect();
+        let known: Vec<Triple> = node.peers.keys().copied().collect();
+        for c in known {
+            if wanted.contains(&c)
+                && let Some(p) = node.peers.get_mut(&c)
+            {
+                p.last_seen = Some(Instant(0));
+            }
+        }
+        let occupied = node.occupied_points();
+        assert_eq!(occupied.len(), SEATS.len() + 1, "the fixture seats exactly five points, this node included");
+        assert!(
+            (1..erasure::N).all(|i| !occupied.contains(&i)),
+            "the corner must be empty, or the old rule would not have collapsed and this proves nothing"
+        );
+
+        let homes = node.shard_homes();
+        let distinct: Set<Triple> = homes.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            occupied.len().min(erasure::N),
+            "every occupied point must carry a shard while there are more shards than points; the successor \
+             rule gave two homes here, and one of them held six of the seven"
+        );
+
+        // And the property those homes exist for: losing the worst single home must still leave `K` indices.
+        let worst = distinct
+            .iter()
+            .map(|h| homes.iter().filter(|x| *x == h).count())
+            .max()
+            .unwrap_or(erasure::N);
+        assert!(
+            erasure::N - worst >= erasure::K,
+            "one home's loss must leave at least K = {} distinct shards; the worst home holds {worst}",
+            erasure::K
+        );
+    }
+
     fn seat_every_neighbour<F: Field>(node: &mut OverlayNode<F>, now: Instant) {
         let coords: Vec<Triple> = node.peers.keys().copied().collect();
         for c in coords {
@@ -2173,6 +2315,45 @@ mod tests {
         assert_eq!(skew.len(), 1, "the unclaimed type is counted once");
         assert_eq!(skew[0].line, Some(peer), "localized to the sender, so a LINE can be judged against `t`");
         assert_eq!(skew[0].tag, Some(0x7E), "carrying the code the peer used — the evidence of its release");
+
+        // --- The third thing this arm receives, and for a long time the LOUDEST. -----------------------
+        //
+        // `HelloAck` is in the registry and is not one of the seventeen types this dispatch claims, so it
+        // reaches the same catch-all as `0x7E` above and used to be counted beside it. The two are opposite
+        // findings — "a peer is on another release" versus "our own dispatch sent a known frame to a plane
+        // that does not serve it" — and a five-node cell of ONE binary, where skew cannot occur at all,
+        // raised the skew station 130 times in 60 s on nothing but this.
+        let mut known_here = Vec::new();
+        fanos_wire::encode_frame(FrameType::HelloAck.code(), &[7], &mut known_here);
+        node.step(Instant(3), Input::Message { from: peer, frame: known_here });
+        let obs = node
+            .step(Instant(4), Input::Command(Command::Observe))
+            .iter()
+            .find_map(|e| match e {
+                Effect::Notify(Notification::DataPath { stations, .. }) => Some(stations.clone()),
+                _ => None,
+            })
+            .expect("a sense-only read exports the data-path plane");
+        let at = |st: Station| -> Vec<crate::ports::stations::Observation> {
+            obs.iter().filter(|o| o.station == st && o.count > 0).copied().collect()
+        };
+
+        let unhandled = at(Station::FrameTypeUnhandled);
+        assert_eq!(unhandled.len(), 1, "a known type this plane does not serve is counted");
+        assert_eq!(unhandled[0].tag, Some(FrameType::HelloAck.code()));
+        assert_eq!(unhandled[0].line, Some(peer), "and localized, because a dispatch fault has a direction");
+
+        // The assertion the split exists for: the skew count did NOT move. Fold the two stations back
+        // together and this is what reddens — `skew` becomes two observations, one of them a code the
+        // registry can name, which is the one thing `FrameTypeUnknown` promises never to carry.
+        let skew = at(Station::FrameTypeUnknown);
+        assert_eq!(
+            skew.len(),
+            1,
+            "a frame this build CAN name must not touch the release alarm: skew is what the registry has no \
+             name for, and an alarm whose count is its own false-positive floor reports nothing"
+        );
+        assert_eq!(skew[0].tag, Some(0x7E), "and the one it does carry is still the unnameable code");
     }
 
     /// **A peer mints one version-skew report per (code, sender) pair — not one per frame** (#341).
@@ -2202,9 +2383,22 @@ mod tests {
             OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
         let peer = Point::<F2>::at(1).coords();
 
-        // `0x1F` and `0x1D`: the predicate's own test names `0x10`/`0x1F` as membership-group codes, and this
-        // build knows `0x11`–`0x1C` — so exactly four codes are unknown-and-critical, which is what bounds
-        // the dedup set to `4 × (q²+q+1)` without a cap of its own.
+        // `0x1F` and `0x1E`, and the second one used to be `0x1D` — **which this build knows**
+        // (`DkgCommitReq`), so the assertion beneath it had stopped being about an unknown code at all. The
+        // comment here carried the stale range that caused it (*"this build knows `0x11`–`0x1C`"*); the
+        // count is now `FrameType::UNKNOWN_CRITICAL_CODES`, derived from the registry, and the codes it
+        // leaves are `0x10`, `0x1E`, `0x1F`. Pinned below, so the next variant to join the group is caught
+        // here rather than by a test that silently stops testing.
+        assert_eq!(
+            FrameType::UNKNOWN_CRITICAL_CODES,
+            3,
+            "the membership group holds 16 codes and this build names 13 of them; if this moved, the two \
+             codes used below may no longer be unknown — check them before changing the number"
+        );
+        assert!(
+            FrameType::from_code(0x1E).is_none() && FrameType::from_code(0x1F).is_none(),
+            "both codes below must be ones this build cannot name, or the escalation under test cannot fire"
+        );
         let escalations = |node: &mut OverlayNode<F2>, code: u64, frames: usize, t0: u64| {
             (0..frames)
                 .map(|i| {
@@ -2231,7 +2425,7 @@ mod tests {
             "{FRAMES} frames of ONE unknown critical code from one peer must report once, not {FRAMES} times              — the pre-#341 code produced {FRAMES}, measured"
         );
         assert_eq!(
-            escalations(&mut node, 0x1D, FRAMES, 100),
+            escalations(&mut node, 0x1E, FRAMES, 100),
             1,
             "a DIFFERENT unknown critical code is a different release claim and reports on its own"
         );
@@ -2399,19 +2593,39 @@ mod tests {
         node.observe_load(Role::Service, 3);
         assert_eq!(load_of(&mut node, 1).of(Role::Service), Some(3), "a pushed reading is reported");
 
-        // The relay reading must track originated traffic. Probed rather than assumed: this sensor reads
-        // `self_activity`, which the heartbeat's behavioural sample *clears*, so an unlucky interleaving could
-        // leave it reporting zero forever and no assertion here would have noticed.
-        assert_eq!(idle.of(Role::Relay), Some(0), "an idle node originated nothing");
+        // **`Role::Relay` is now the composite's reading, and a bare overlay has none.** It used to be
+        // `self_activity` — `Route` frames this node *originated* — which measured the node's traffic as a
+        // source rather than the work it carries for others, and did it as a count over a window the
+        // behavioural sample clears. Both are recorded at `Healer::load_report`.
+        //
+        // The property that has to hold now is the one this file states for the other three: **no sensor
+        // means absent, not zero.** Traffic this node originates must not resurrect the old reading, so it is
+        // driven here and the assertion is that it changes nothing.
+        assert_eq!(
+            idle.of(Role::Relay),
+            None,
+            "a bare overlay carries no mix router; a `0` here is a fabricated reading, which is what retires \
+             a role that is busy"
+        );
         for i in 0..3u8 {
             node.step(
                 Instant(2),
                 Input::Command(Command::Send { to: Point::<F2>::at(3).coords(), payload: alloc::vec![i] }),
             );
         }
-        assert!(
-            load_of(&mut node, 2).of(Role::Relay) > Some(0),
-            "originated traffic must reach the relay sensor"
+        assert_eq!(
+            load_of(&mut node, 2).of(Role::Relay),
+            None,
+            "originating traffic is this node's own work as a source — it is not relay load, and reporting it \
+              as such let a node forwarding the whole cell's mix report zero"
+        );
+
+        // And the composite's own reading reaches the report by the same seam as the other three.
+        node.observe_load(Role::Relay, 9);
+        assert_eq!(
+            load_of(&mut node, 3).of(Role::Relay),
+            Some(9),
+            "the engine that owns the mix router is the one that can see this role's work"
         );
 
         // And the mechanism: give it shards to hold, and the storage figure must follow.
@@ -2650,6 +2864,52 @@ mod tests {
             Some(Point::<F2>::at(5).coords()),
             "an ancestor descends one level toward the destination",
         );
+    }
+
+    /// **A frame this node CARRIES is behavioural load on both ends of the hop, and the forward arm counted
+    /// neither end.**
+    ///
+    /// `on_route_hier`'s deliver arm records the sender's activity; the forward arm recorded nothing. So a
+    /// peer whose traffic through this node always transits read as **idle** in this node's coherence model,
+    /// and the node's own carrying work was invisible to itself — the two ends of one omission.
+    ///
+    /// Driven through the real dispatch rather than through the healer's counters, because the counters are
+    /// not the claim: removing both calls from the forward arm leaves a healer-level test green, which is
+    /// how this one came to exist.
+    #[test]
+    #[allow(clippy::float_cmp)] // counts, exactly representable: 1.0 is the count, not a computed quantity
+    fn a_carried_frame_is_behavioural_load_at_both_ends_of_the_hop() {
+        // Depth-2 seating [3,5], with a learned peer one cell over so a foreign destination FORWARDS rather
+        // than delivering or dropping.
+        let mut node = OverlayNode::<F2>::new(Point::at(3), Config::default()).with_hier_address(
+            HierAddr::from_path(alloc::vec![Point::<F2>::at(3), Point::<F2>::at(5)]).unwrap(),
+        );
+        let next_addr =
+            HierAddr::from_path(alloc::vec![Point::<F2>::at(2), Point::<F2>::at(1)]).unwrap();
+        let next_hop = Point::<F2>::at(2).coords();
+        node.learn_hier_peer(next_addr.clone(), next_hop);
+
+        let upstream = Point::<F2>::at(1).coords();
+        let mut body = next_addr.encode();
+        body.extend_from_slice(b"transit");
+        let effects = node.step(
+            Instant(0),
+            Input::Message { from: upstream, frame: encode(FrameType::RouteHier, &body) },
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Send { to, .. } if *to == next_hop)),
+            "the fixture must FORWARD — a delivered or dropped frame would test the wrong arm: {effects:?}"
+        );
+
+        node.healer.sample_behavior::<F2>(node.self_index);
+        let sample = node.healer.last_sample;
+        let me = node.self_index.expect("seated on the base cell");
+        assert_eq!(
+            sample[Point::<F2>::new(upstream).unwrap().index()],
+            1.0,
+            "the upstream peer put a frame on the wire toward us; carrying it is not a reason to ignore that"
+        );
+        assert_eq!(sample[me], 1.0, "and we put one on the wire toward the next hop — that is our work");
     }
 
     #[test]

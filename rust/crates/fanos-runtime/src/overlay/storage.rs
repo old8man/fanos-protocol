@@ -364,7 +364,49 @@ impl<F: Field> OverlayNode<F> {
     /// for as long as a timeout was reported as an absence (#215): two errors cancelling.
     pub(super) fn shard_homes(&self) -> [Triple; erasure::N] {
         let occupied = self.occupied_points();
-        core::array::from_fn(|i| Self::successor(&occupied, i))
+        // **Spread across the occupied points, not walked to their successors.**
+        //
+        // The successor rule is right for *content routing* — a key's responsible point is the nearest
+        // occupied successor of its ideal point, and that is what makes lookups converge. It is wrong for
+        // **shard placement**, and only the base cell hid it: on `PG(2,2)` the seven shard indices are the
+        // seven plane indices, so `successor(i) = i` wherever `i` is occupied and the code's `[7,3,4]`
+        // redundancy is intact. On any wider plane the shard indices `0..7` sit in one corner of the ring
+        // and every one of them walks to the same successor.
+        //
+        // Measured over sampled placements, taking the **worst single home** away and asking whether `K = 3`
+        // distinct indices survive:
+        //
+        // | plane | occupied | successor rule loses the value | all seven on ONE node |
+        // |---|---|---|---|
+        // | 7 (base cell) | 5 or 7 | 0.0 % | 0.0 % |
+        // | 21 | 5 | **48.1 %** | 14.9 % |
+        // | 21 | 7 | 30.7 % | 5.7 % |
+        // | 57 | 7 | **73.9 %** | **43.8 %** |
+        // | 57 | 20 | 29.6 % | 6.5 % |
+        //
+        // — against a code chosen to tolerate `N − K = 4` losses. The `q = 7` row is the sharp one: it is a
+        // plane `warn_if_plane_cannot_anonymize` steers operators toward, and there nearly half of all
+        // placements put the whole value on a single node.
+        //
+        // Spreading is `⌈N / |occupied|⌉` per home by construction, so one home's loss costs at most that,
+        // and `K` survives for any `|occupied| ≥ 2` (`7 − 4 = 3`). Sampled the same way: **0.0 % across every
+        // row above.**
+        //
+        // **Safe to change without a migration, and that is a property of the read rather than of luck.**
+        // `on_get` deliberately asks *every* point rather than the homes — see its own note, which records
+        // two narrowings that were tried and reverted — so a reader never assumes where a shard lives. Only
+        // the writer's placement moves.
+        //
+        // What this does **not** fix: placement is still computed from `occupied_points()`, a *local* view,
+        // so two writers with different views still place differently. That is the agreed-input problem the
+        // read path's note names, and it is untouched here; this makes the placement good *given a view*.
+        // At most `N` of them are ever needed, and they cycle when the cell holds fewer.
+        let ring: alloc::vec::Vec<usize> = occupied.iter().copied().take(erasure::N).collect();
+        core::array::from_fn(|i| {
+            ring.get(i % ring.len().max(1))
+                // Unreachable: `occupied_points` always contains this node, so the ring is never empty.
+                .map_or_else(|| self.coord.coords(), |&idx| Point::<F>::at(idx).coords())
+        })
     }
 
     /// `Command::Put` — erasure-code the value and distribute its shards across the cell (spec §L4). The

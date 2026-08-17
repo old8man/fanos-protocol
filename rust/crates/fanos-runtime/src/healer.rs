@@ -23,7 +23,6 @@ use fanos_diakrisis::monitor::BehaviorMonitor;
 use fanos_diakrisis::partition;
 use fanos_diakrisis::polar;
 use fanos_core::LiveDifficulty;
-use fanos_core::roles::{Role, RoleReading};
 use fanos_diakrisis::regeneration;
 use fanos_diakrisis::stability::{self, AdmissionController, inferred_disturbance};
 use fanos_diakrisis::{BandControl, HealingAction, Homeostat, Observation, diagnose, plan_healing};
@@ -112,9 +111,21 @@ pub(crate) struct Healer {
     /// the raw counts the coherence self-model is built from. Control chatter (pings, gossip) is excluded,
     /// so this reflects *load*, not liveness.
     activity: BTreeMap<Triple, u32>,
-    /// This node's own relay activity (`Route` frames it originated) since the last sample — the self slot
-    /// of the behavioural sample vector.
-    self_activity: u32,
+    /// Data-relay frames this node has **put on the wire**, per destination, since the last sample — the
+    /// self slot of the behavioural sample vector.
+    ///
+    /// **Per destination, because the self slot has to be the same measurement as every other slot.** Slot
+    /// `i` of the sample is `activity[point_i]`: frames that peer sent *to this node*. The self slot used to
+    /// be a bare count of frames this node **originated to anyone**, so on a cell of `N` points it was the
+    /// sum of `N − 1` such quantities while every neighbouring slot was one of them. Under flow balance —
+    /// a node's outgoing volume comparable to its incoming — that made the self column's variance equal the
+    /// *sum* of the peer columns' variances, hence an activity share of **exactly one half**, on every node,
+    /// on a perfectly balanced cell. See `sample_behavior` for what that cost.
+    ///
+    /// Keeping the destinations rather than one total is what lets the sample take the **mean over the peers
+    /// actually addressed**, which is precisely "what each peer counted for me". A bare total divided by a
+    /// constant `N − 1` would under-report a node that talks to two peers out of seven.
+    self_out: BTreeMap<Triple, u32>,
     /// The mutable **decoupling** shed factor `∈ [0, DECOUPLE_MAX]` (audit C6): scales this node's effective
     /// correlation down so a `Decouple` actually lowers `Φ`. `decoupled`/`escalated_coherence` dedup the
     /// homeostat notifications (which previously re-fired every diagnose).
@@ -220,7 +231,7 @@ impl Healer {
             reported_epoch: None,
             epoch_cost: None,
             activity: BTreeMap::new(),
-            self_activity: 0,
+            self_out: BTreeMap::new(),
             decoupling: 0.0,
             decoupled: false,
             escalated_coherence: false,
@@ -278,7 +289,7 @@ impl Healer {
         self.monitor.clear();
         self.endpoint_window.clear();
         self.activity.clear();
-        self.self_activity = 0;
+        self.self_out.clear();
         self.last_sample = [0.0; 7];
         self.measured_correlation = None;
         self.band_streak = 0;
@@ -301,9 +312,19 @@ impl Healer {
         *a = a.saturating_add(1);
     }
 
-    /// Count a relay this node *originated* toward its own activity (the self slot of the sample vector).
-    pub(crate) fn record_origination(&mut self) {
-        self.self_activity = self.self_activity.saturating_add(1);
+    /// Count a data-relay frame this node put on the wire toward `to` — the self slot of the sample vector.
+    ///
+    /// **Called wherever a data frame leaves, including a forward**, which is what makes the self slot the
+    /// mirror of a peer slot: peer `p`'s slot holds what `p` put on the wire toward this node, so this node's
+    /// slot must hold what it put on the wire toward a peer. A frame carried for someone else is still a
+    /// frame the next hop will count, and the node still did the work of carrying it.
+    ///
+    /// (The hop-counting objection belongs to the *setpoint*, not here: summing forwards there would make
+    /// demand a function of the supply already deployed. The behavioural model is asking a different
+    /// question — which points are active — and a transit node is active.)
+    pub(crate) fn record_origination(&mut self, to: Triple) {
+        let a = self.self_out.entry(to).or_insert(0);
+        *a = a.saturating_add(1);
     }
 
     /// The transport coordinate to actually send to when addressing `to`: the self-healing co-linear
@@ -363,10 +384,32 @@ impl Healer {
         let Some(self_index) = self_index else {
             return;
         };
+        // The self slot is the **mean over the peers this node addressed** — what each of them counted for
+        // it — so all seven slots hold one quantity: data-relay frames one point put on the wire toward
+        // another. It used to be the bare *total*, and the distortion that caused is worth stating because
+        // it was invisible: a peer slot is one node's traffic toward me, the self slot was my traffic toward
+        // everyone, so under flow balance `var(self) ≈ Σ var(peer)` and the activity share
+        // `d = std²/Σstd²` came out at **exactly ½ on every node of a perfectly balanced cell**.
+        //
+        // That share is not cosmetic. `Σd² ≥ ¼ + ¼/(N−1) = 7/24` at `N = 7`, while `CoherenceMatrix::measures`
+        // reports `P = Σd²·(1 + Φ) ≥ Σd²` and `Homeostat::control` escalates a coherence collapse on
+        // `P ≤ 2/N = 2/7`. Since `7/24 > 2/7` — by `1/168` — **the collapse branch could not be reached at
+        // all** on any cell of seven or more points, whatever its true coherence. `N = 7` is the first size
+        // at which that happens: the same arithmetic leaves the branch reachable for `N ≤ 6`.
+        //
+        // Correlation is scale-invariant, so this changes no `c_ij`; it changes exactly the diagonal, which
+        // is exactly what was wrong.
+        let addressed = self.self_out.len();
+        let self_mean = if addressed == 0 {
+            0.0
+        } else {
+            f64::from(self.self_out.values().copied().fold(0u32, u32::saturating_add))
+                / addressed as f64
+        };
         let mut sample = [0.0f64; 7];
         for (i, slot) in sample.iter_mut().enumerate() {
             *slot = if i == self_index {
-                f64::from(self.self_activity)
+                self_mean
             } else {
                 let coord = self.cell_coord::<F>(i);
                 f64::from(self.activity.get(&coord).copied().unwrap_or(0))
@@ -378,7 +421,7 @@ impl Healer {
         // `activity` is about to be cleared.
         self.last_sample = sample;
         self.activity.clear();
-        self.self_activity = 0;
+        self.self_out.clear();
     }
 
     /// **Hysteresis for every band branch, not only the over-coupled one** (#100): advance the streak of
@@ -594,49 +637,6 @@ impl Healer {
         self.last_stress = stress;
     }
 
-    /// What this node is carrying, per role, in `Role::ALL` order — `None` where it has no sensor.
-    ///
-    /// **Relay** is the count of frames this node **originated** since the last behavioural sample — read from
-    /// the coherence self-slot, which counts originations, not forwarding. This doc used to call it "relays
-    /// carried", which is the *other* counter (`activity`, keyed by peer) and would have sent the next
-    /// maintainer to swap in the wrong quantity. Originations are the right one and not by luck: the setpoint
-    /// asks how many relays the cell needs, so the load is the traffic that must be *carried*, summed once at
-    /// the origin. Summing frames forwarded would count each frame once per hop and make the demand a function
-    /// of the supply already deployed — a loop closed on itself.
-    ///
-    /// **Storage** is the number of keys this node holds shards for. Both are `Some`, *including when they read
-    /// zero* — an idle relay measured no demand, and that is a reading. Service, exit and rendezvous are
-    /// `None`: this function has no sensor for them, and the driver substitutes the node's own offer, because a
-    /// fabricated demand of zero would retire a role on sight.
-    ///
-    /// The `Option` is the whole point and it is load-bearing. This returned a bare `[u16; 5]` and said in prose
-    /// that a measured count and an offered one "would be unsafe to present as the same kind of number" — while
-    /// making them the same `u16`, so the driver had to guess, and guessed *by value*: any zero became the
-    /// offer. That silently discarded the true reading of a role that legitimately fell idle, which is precisely
-    /// the moment the controller should shrink it, and it bound the two roles that **are** measured. A cell
-    /// could not conclude "nobody here needs relays". Making absence a distinct inhabitant of the type is what
-    /// lets the driver believe a `Some(0)` and substitute only on `None`.
-    ///
-    /// The width is [`Role::COUNT`], not a literal, so this fails to compile if a sixth role is added without
-    /// widening the contract — which also pins the `5` in `Notification::LoadReport`, a crate that cannot see
-    /// [`Role`] and so cannot state the relationship itself.
-    ///
-    /// The other three are **fed by the caller**, through [`load_effect`](Self::load_effect)'s reading argument:
-    /// a composite engine reports the rendezvous registrations and the service intros it is carrying, and a
-    /// driver gauge reports exit flows in flight. This function stays deliberately ignorant of all three — it
-    /// knows what it counts and passes the rest through, so a new sensor needs no change here.
-    fn load_report(&self, sensed: RoleReading) -> [Option<u16>; Role::COUNT] {
-        // The contract crate cannot see `fanos-core`, so `Notification::LoadReport`'s width is a literal
-        // there. This is where the two meet, so this is where they are proven equal — a sixth role that
-        // updated one and not the other would otherwise truncate every reading in silence.
-        const _: () = assert!(
-            fanos_ports::ROLE_COUNT == Role::COUNT,
-            "the load-report width and the role count must agree",
-        );
-        // The caller supplies every reading it can see; the healer fills in the one only it counts.
-        sensed.measuring(Role::Relay, u16::try_from(self.self_activity).unwrap_or(u16::MAX)).into_array()
-    }
-
     /// The stress this cell last measured, for a law that must decide outside the observation loop.
     pub(crate) fn stress(&self) -> f64 {
         self.last_stress
@@ -661,16 +661,6 @@ impl Healer {
         let window = self.window_seconds?;
         let tau_windows = if gap > 0.0 { 1.0 / gap } else { f64::INFINITY };
         Some(regeneration::min_epoch_period(tau_windows, cost, radius) * window)
-    }
-
-    /// What this node is carrying, as an effect — emitted every observation, coherence or not.
-    ///
-    /// `sensed` carries the readings the *caller* can see; the healer adds the one it counts itself (relay
-    /// activity). Passing a reading rather than a bare shard count is what lets a composite engine — which owns
-    /// the mix router, the rendezvous gatherer and the service line — fill in the three roles the overlay alone
-    /// has no sensor for, without the healer growing a dependency on any of them.
-    pub(crate) fn load_effect(&self, sensed: RoleReading) -> Effect {
-        Effect::Notify(Notification::LoadReport { per_role: self.load_report(sensed) })
     }
 
     /// Run the per-observation control laws that need the cell's **coherence matrix**.
@@ -1151,6 +1141,113 @@ impl Healer {
     }
 }
 
+
+#[cfg(test)]
+#[allow(clippy::float_cmp, clippy::indexing_slicing)]
+mod commensurate_self_slot {
+    use super::Healer;
+    use fanos_diakrisis::coherence::p_crit;
+    use fanos_field::F2;
+    use fanos_geometry::Point;
+    use fanos_telemetry::{CellId, HistoryConfig, SelfObserver};
+
+    /// **Every slot of the behavioural sample must be the same measurement, and the self slot was not.**
+    ///
+    /// Slot `i` is `activity[point_i]` — data-relay frames that peer put on the wire *toward this node*.
+    /// The self slot used to be a bare count of frames this node put on the wire toward **anyone**, so on a
+    /// cell of `N` points it was the sum of `N − 1` quantities of the kind each neighbour holds one of.
+    ///
+    /// The fixture is the cleanest statement of it: perfectly balanced traffic, `R` frames each way on every
+    /// link. Every point in the cell is doing exactly the same thing, so the honest sample is flat. Under the
+    /// old rule the self slot read `6R` against six peers at `R`.
+    #[test]
+    fn a_balanced_cell_samples_flat_rather_than_six_times_itself() {
+        const R: u32 = 5;
+        let mut h = Healer::new(SelfObserver::new(CellId([2; 16]), HistoryConfig::compact()), 8, 2.5);
+        let me = 0usize;
+        for i in 0..7 {
+            if i == me {
+                continue;
+            }
+            let peer = Point::<F2>::at(i).coords();
+            for _ in 0..R {
+                h.record_relay(peer); // what that peer put on the wire toward me
+                h.record_origination(peer); // what I put on the wire toward it
+            }
+        }
+        h.sample_behavior::<F2>(Some(me));
+
+        assert_eq!(
+            h.last_sample,
+            [f64::from(R); 7],
+            "balanced traffic must sample flat; a self slot holding the TOTAL reads {}× its neighbours",
+            6
+        );
+    }
+
+    /// **A frame carried is behavioural load on both ends of the hop, and neither end was counted.**
+    ///
+    /// `on_route_hier`'s deliver arm records the sender's activity; its **forward** arm recorded nothing at
+    /// all. So a peer whose traffic through this node always transits read as idle in this node's coherence
+    /// model, and the node's own carrying work was invisible to itself. Both are the same omission seen from
+    /// the two ends of one hop, which is why they are asserted together.
+    ///
+    /// Latent rather than live — multi-hop forwarding needs learned hierarchical peers, i.e. depth > 1, and
+    /// the multi-cell driver is the L0 residual — so this is a tripwire on the day that lands, and it is
+    /// asserted at the healer because that is where the two counters live.
+    #[test]
+    fn carrying_a_frame_counts_at_both_ends_of_the_hop() {
+        let mut h = Healer::new(SelfObserver::new(CellId([3; 16]), HistoryConfig::compact()), 8, 2.5);
+        let upstream = Point::<F2>::at(1).coords();
+        let downstream = Point::<F2>::at(2).coords();
+        // One frame carried: received from `upstream`, put back on the wire toward `downstream`.
+        h.record_relay(upstream);
+        h.record_origination(downstream);
+        h.sample_behavior::<F2>(Some(0));
+
+        assert_eq!(h.last_sample[1], 1.0, "the sender put a frame on the wire toward us — carried or not");
+        assert_eq!(h.last_sample[0], 1.0, "and we put one on the wire toward the next hop");
+        assert_eq!(h.last_sample[2], 0.0, "the next hop sent us nothing; its slot is what IT sent, not what we did");
+    }
+
+    /// **And the cost of the old rule, stated where it lands: an alarm that could not fire.**
+    ///
+    /// `CoherenceMatrix::from_signals` builds the activity shares from the columns' *variances*
+    /// (`d = std²/Σstd²`), `measures()` reports `P = Σd²·(1 + Φ) ≥ Σd²`, and `Homeostat::control` escalates a
+    /// coherence collapse on `P ≤ 2/N`. A node's outgoing volume is comparable to its incoming — flow
+    /// balance, whatever the traffic pattern — so the old self column's variance was about the **sum** of the
+    /// peer columns' variances, giving `d_self ≈ ½` and
+    ///
+    /// ```text
+    ///   Σd² ≥ ¼ + ¼/(N−1) = 7/24 = 0.2917   >   2/N = 2/7 = 0.2857
+    /// ```
+    ///
+    /// by `1/168`. So on a cell of seven or more points the collapse branch was **unreachable**, whatever the
+    /// cell's true coherence — `N = 7` is the first size at which the same arithmetic closes it, and it stays
+    /// closed for every larger `N`. Measured on synthetic uncorrelated columns before the fix: `P = 0.343`,
+    /// silent; after: `P = 0.165`, escalating.
+    ///
+    /// This asserts the arithmetic rather than a simulated cell, because the arithmetic is the claim: it is
+    /// what makes the branch unreachable for *every* flow-balanced cell rather than for the one sampled here.
+    #[test]
+    fn the_old_self_slot_put_the_collapse_threshold_out_of_reach() {
+        for n in 3..14usize {
+            let nf = n as f64;
+            // `d_self = ½` and the remaining half split evenly — the least concentrated the rest can be, so
+            // this is the SMALLEST `Σd²` the old rule could produce at flow balance.
+            let old_floor = 0.25 + 0.25 / (nf - 1.0);
+            let trigger = p_crit(n);
+            assert_eq!(
+                old_floor > trigger,
+                n >= 7,
+                "n = {n}: the old rule's floor on Σd² is {old_floor}, the collapse trigger {trigger}"
+            );
+        }
+        // The shipped cell is exactly the first size that goes dark, and the margin is a sixth of a percent.
+        let (floor, trigger) = (0.25 + 0.25 / 6.0, p_crit(7));
+        assert!((floor - trigger - 1.0_f64 / 168.0).abs() < 1e-12, "the Fano margin is exactly 1/168");
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
