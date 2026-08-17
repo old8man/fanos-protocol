@@ -238,21 +238,32 @@ The three sensors, each already recorded:
 
 **Two traps to avoid, both of which this plane makes easy to fall into.**
 
-*Rate, not level.* `Relay` is already "relays carried since the last sample" — a rate — while `Storage` is a
-level ("keys held"). Both work because the controller steps each role toward *its own* setpoint and never
-compares across roles, but a new sensor must pick one deliberately and say which it is. Gathers are naturally a
-rate; sessions are naturally a level; mixing them inside one role's own history is what would break.
+*Rate, not level — and the example this trap used to be written around turned out to be the defect.* The text
+here said `Relay` "is already 'relays carried since the last sample' — a rate", and treated that as a working
+choice. It was neither working nor that quantity: the reading was `self_activity`, frames the node
+**originated**, so a relay carrying the whole cell's mix reported zero. Every capacity in reach is a *level* —
+an admission bound on how much a node is holding right now — so the rate had nothing to be divided by, and
+that units mismatch was recorded for months as "Relay needs a throughput measurement". It needed the right
+subject instead. **All six roles are levels today**, each against the bound its own subsystem enforces
+(`docs/design-self-organization.md` §4), which is what makes the ratio meaningful rather than merely
+arithmetic.
 
-*A measured zero is not the same as no sensor, and today the code cannot tell them apart.* `Node::start`
-substitutes the node's own offer whenever a role reports `0`. That substitution is right for a role with no
-sensor — and it is also what stops a self-latching failure, since a demand of zero would retire the role,
-after which it carries nothing and reports zero again.
+The rule the trap was reaching for survives, sharpened: *a sensor and the capacity it is divided by must count
+the same objects*. A rate over a level is not a ratio, and the way that error presents is not an obviously
+wrong number — it is a plausible one that never moves the controller.
 
-But it fires on *emptiness*, not on *absence*, and the two are different. **A role that HAS a sensor and
-legitimately reads zero has its true reading discarded and replaced by the offer** — so the controller can
-never learn that demand fell to zero, precisely when it should be shrinking the role. This is not a
-hypothetical about future sensors: it binds **relay and storage today**, the two roles that are already
-measured. A cell cannot currently conclude "nobody here needs relays".
+*A measured zero is not the same as no sensor — and this is now enforced by the type rather than guessed from
+the value.* `Node::start` used to substitute the node's own offer whenever a role reported `0`. That
+substitution is right for a role with no sensor — it is what stops a self-latching failure, since a demand of
+zero would retire the role, after which it carries nothing and reports zero again.
+
+But it fired on *emptiness*, not on *absence*, and the two are different: a role that HAS a sensor and
+legitimately reads zero had its true reading discarded and replaced by the offer, so the controller could
+never learn that demand fell to zero — precisely when it should shrink the role. **Closed** by making the
+reading `Option<u16>` end to end (`RoleReading`): a `Some(0)` is a measurement and is believed, a `None` is an
+absence and is substituted. The distinction is load-bearing enough that the load report refuses to fabricate
+one — an engine with no sensor for a role reports `None` rather than a zero, which is the rule the relay
+reading itself broke until its sensor was corrected.
 
 So the one type change this work genuinely needs is to make absence expressible: an `Option<u16>` per role, or
 a parallel "measured" mask, so the fallback fires on *no sensor* and a measured zero is believed.

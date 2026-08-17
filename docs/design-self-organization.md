@@ -119,13 +119,39 @@ homeostat realizes).
 - **The sensor.** The setpoint's load figures come from the cell's coherence self-scan (`fanos-telemetry`) and
   DIAKRISIS (`fanos-diakrisis`): the same third-order self-diagnosis that detects a failing node also measures
   whether a role is over- or under-provisioned. Self-diagnosis and self-provisioning are one loop.
-- **Escalation, never silent failure.** The demand is *not* capped at the eligible supply — a setpoint above
-  supply is a real, unmet want. When `Dρ > |Eρ|`, `roles::assign_report` surfaces the shortfall as a per-role
-  **deficit** (assigning `min(Dρ, |Eρ|)` and reporting the rest), the signal the cell escalates to its **parent
-  cell** (`fanos-core::hierarchy`): the parent recruits a capable node from a sibling cell, or lowers the cell's
-  advertised service level. A cell that cannot self-provision a role asks the level above — precisely the UHM
-  holarchic recovery protocol (T-148), where a collapsed cell that cannot self-heal hands its residue up for
-  external regeneration. The hierarchy is the overflow path for both health and provisioning.
+- **A shortfall is never silent, and its terminus is the operator — not the parent cell.** The demand is *not*
+  capped at the eligible supply: a setpoint above supply is a real, unmet want. When `Dρ > |Eρ|`,
+  `roles::assign_report` surfaces the shortfall as a per-role **deficit** (assigning `min(Dρ, |Eρ|)` and
+  reporting the rest), and `note_deficit` records `Station::RoleUnderProvisioned` with the role index. Since
+  every role's capacity is now derived from the bound its own subsystem enforces, that number means what it
+  says for all six.
+
+  **This paragraph used to say the cell escalates the deficit to its parent, which "recruits a capable node
+  from a sibling cell, or lowers the cell's advertised service level". Both branches are unbuildable here, and
+  the reasons are worth keeping.**
+
+  *There is nothing to lower.* Work reaches a node by **derivation**, not by lookup, for five of the six roles:
+  a key lands on its responsible point by geometry; a hidden service's meeting line is
+  `rendezvous_line(pubkey, epoch, beacon)`; a community's admission line is
+  `ingress_line(community, epoch, beacon)`; a mix hop **is** a line and its gatherer is salted; a threshold
+  service is keyed. A client derives what it needs from the epoch beacon, so **no party holds an advertisement
+  that could be lowered**. Exit is the one directory-based role, and it needs no channel: fewer exits publish
+  fewer descriptors and clients pick from what is there — the deficit is self-expressing.
+
+  *Recruiting needs an authority §L3 exists to deny.* A node's coordinate is
+  `MapToPoint(VRF(sk, id‖epoch‖beacon))` precisely so that no node can **aim itself** at a position. Granting a
+  parent the power to place a node in a child cell hands that aim to the parent, which is a threat-model change
+  (a hostile parent could pack a target cell), not a missing frame.
+
+  *And the existing escalation transport is the wrong shape anyway.* `CellEscalate{child, residue, ttl}` carries
+  a **node mask** and the parent spends a `⌊log₉Φ⌋` budget to install coarse reroutes around a failed child;
+  `ChildSummary` has exactly two fields, both about faults. A per-role shortfall is neither a node set nor
+  reroutable, and folding it in would make a parent route around a cell that is perfectly healthy.
+
+  So the hierarchy remains the overflow path for **health** — the UHM holarchic recovery protocol (T-148),
+  where a collapsed cell hands its residue up for external regeneration — and not for provisioning. The answer
+  to "nobody here offers enough relay" is more nodes or broader capability declarations, which is an operator
+  and incentive matter rather than a routing one.
 
 ## 5. Controlled freedom — the boundary between choice and control
 
@@ -134,9 +160,46 @@ The design deliberately splits what a node *chooses* from what the network *deci
 | The node chooses (freedom) | The network decides (control) |
 |---|---|
 | its identity and keys | its coordinate (VRF) — cannot be aimed |
-| which roles it *offers* (capability) | which offered roles are *active* (assignment) |
+| which roles it *offers* (capability) | which offered roles are *active* (assignment) — see below: for four of six this is an **exclusion** right, not a selection |
 | its declared capacity `weight` (bounded) | its priority, and whether it wins a scarce role |
 | when to join / leave | its quorum membership, leader/keyper turns (position + beacon) |
+
+### What "active" can mean, and it is not the same for every role
+
+The row above reads as one power over six roles. It is not, and the difference is decided by a single
+question: **what puts the work in front of a node?**
+
+| role | how work arrives | what the assignment can decide |
+|---|---|---|
+| **exit** | a client reads the exit directory and picks one | **everything** — who publishes is who serves |
+| **relay** | the mix hop *is* a line; its gatherer is salted from the cell | exclude at most `m − t` |
+| **rendezvous** | `MapToLine(H(secret ‖ epoch ‖ beacon))` | exclude at most `m − t` |
+| **ingress** | `ingress_line(community, epoch, beacon)` | exclude at most `m − t` |
+| **storage** | the key's responsible point; shards go to the nearest *occupied* homes | **nothing** — a node cannot decline to be a shard's home without losing the shard |
+| **service** | `ServiceParams::line`, fixed at the provisioning ceremony | **nothing** — the member set is not the assignment's to choose |
+
+For the four **geometry-placed** roles the work lands at a derived address whatever the cell assigned, so
+`⌈Σ load / capacity⌉` cannot be their law: raising the count moves no work and lowering it stops none. Their
+demand is a **coverage** count — `N − (m − t)`, near-full plane occupancy — and what the assignment retains is
+the right to withhold the role from `m − t` members, which is precisely the per-line fault budget the
+threshold already buys. Ask for fewer and some line falls below its quorum; that is not a weaker guarantee but
+an inverted one.
+
+**And that budget is what makes the reputation price below a price rather than an ornament.** `select` ranks by
+the minimum of `weight` beacon-bound tickets and the role loop scales `weight` by reputation, so the members a
+demand leaves out are the lowest-weighted. At the coverage floor the cell leaves out exactly `m − t` — the
+worst `m − t`. Measured over 40 000 draws of that rule, one member at `weight 1` against six at `weight 8`:
+**0.748** probability of being the one excluded, against a `0.143` chance baseline — a **5.2×** discrimination.
+Under a floor of `t` the cell left out five of seven instead, and an **honest** member was excluded `0.717` of
+the time, chance to three digits: the lottery, not the conduct, decided who served.
+
+Exit is the exception on both counts, and for the same reason: a client *chooses* it, so provisioning moves
+real work. Its floor is therefore an availability one — `fault_budget(N) + 1`, three on the base cell and
+nineteen at `q = 7` — because a service picked from a set survives the cell's stated tolerance only when the
+set is larger than it, the adversary choosing whom to take after the assignment is public. A floor of one made
+`discover_exit`'s "pick one at random, so a proxy restart spreads load across the available exits" a
+randomisation over a set of size one, and put every clearnet destination the cell reaches in front of a single
+node.
 
 The control side is enforced *structurally*, not by policy: a node cannot forge a role it lacks capability for
 (eligibility), cannot monopolize a role (beacon rotation), cannot aim at one (beacon unpredictability), and
@@ -196,7 +259,9 @@ a separate chain that must be secured and becomes a bottleneck.
 
 - **Implemented now** — the deterministic, verifiable, capability-weighted, rotating role assignment
   (`roles::assign`), the **Lyapunov-descent `RoleController`** (sans-I/O, UHM-grounded, with the contraction
-  proved in code), and the deficit/escalation signal; on the substrate side, the coordinate VRF, the beacon,
+  proved in code), **a derived per-node capacity for every one of the six roles** — each read from the
+  admission bound its own subsystem enforces, so the setpoint's denominator is never a chosen number — and the
+  deficit signal (local, by §4's derivation); on the substrate side, the coordinate VRF, the beacon,
   the cell-as-BFT-quorum-system, the projective LRC + DA sampling, the Maekawa bridge selection, and the
   parent-observes-child coherence recursion. On the L0 side, the **executed-state checkpoint**
   (`fanos-taxis::checkpoint` — divergence is now a detectable fault, not a silent fork), **trust-minimized
@@ -204,15 +269,27 @@ a separate chain that must be secured and becomes a bottleneck.
   + Merkle inclusion, no bridge trust), and **parent-attests-child-finality** (`fanos-taxis::hierarchy` — a
   parent anchors a child's finality, availability-gated, with child-equivocation detection) are all built and
   tested.
-- **Design-complete, wiring outstanding** — the *live control loop*'s **core is now the sans-I/O
-  `RoleController`**; what remains is the thin driver that feeds it each beacon round inside `fanos-node`: a
-  signed capability-descriptor advertisement (a wire type over the overlay store, like the mix directory) and
-  per-role **load metering** in `fanos-telemetry` to derive the setpoint. The performance-slash reputation
-  feedback (a non-performing assignee's `weight` decays) **is closed in code and has left this bullet**: the
-  role loop rebuilds `Reputation` from published diagnosis records each epoch and applies it to the members'
-  weights, so a non-performer's weight decays without any node trusting another's word for it. It is named
-  here rather than deleted because this list is what a reader consults for what is *outstanding*, and an item
-  that silently vanishes reads as forgotten rather than finished. The two items above it are the residual.
+- **The live control loop is closed end to end, and this bullet now records how rather than what is left.**
+  Three items stood here; all three are in code, and they are named rather than deleted because this list is
+  what a reader consults for what is *outstanding*, and an item that silently vanishes reads as forgotten
+  rather than finished.
+  * *A signed capability-descriptor advertisement* — `fanos_node::capdir`. Each node publishes a **signed**
+    record at its coordinate slot per epoch and `build_capability_directory` verifies both the signature and
+    the coordinate binding, so a roster is evidence rather than hearsay.
+  * *Per-role load metering to derive the setpoint* — **all six roles are measured now**, each against the
+    admission bound its own subsystem enforces, so `⌈Σ load / capacity⌉` divides quantities that count the
+    same objects. The last two arrived by correcting sensors rather than by adding them: relay's reading was
+    frames the node *originated* (its work as a source, not the work it carries for others), and ingress's
+    accessor existed and nothing read it.
+  * *The performance-slash reputation feedback* — the role loop rebuilds `Reputation` from published
+    diagnosis records each epoch and applies it to the members' weights, so a non-performer's weight decays
+    without any node trusting another's word for it. §5 records what makes that a price rather than an
+    ornament: at the coverage floor the cell excludes exactly the fault budget's worth of members, and they
+    are the worst-reputed ones (measured **5.2×** discrimination against a chance baseline).
+
+  What remains is **actuation for the three geometry-placed roles**: only Exit reads its assignment today (the
+  per-epoch advertisement is withheld when the cell did not assign it). §5's table says why that ordering is
+  not an accident — Exit is the one role where the assignment decides who serves.
 - **L0 frontier** — a live *multi-cell* driver that runs cross-cell relay and parent attestation end-to-end
   across real cells (the primitives are built and unit-proven; the multi-cell orchestration is the residual),
   and folding an executed `state_root` history into the block header so a light client can follow finality
