@@ -741,7 +741,7 @@ impl<F: Field> BeaconNode<F> {
     }
 
     /// The highest epoch this node has pulled for, or `None` if it has never had to — the observable half of
-    /// [`maybe_request_sync`], so a test can assert the trigger fired rather than that a frame appeared.
+    /// `maybe_request_sync`, so a test can assert the trigger fired rather than that a frame appeared.
     #[must_use]
     pub const fn sync_asked_for(&self) -> Option<Epoch> {
         self.sync_asked_for

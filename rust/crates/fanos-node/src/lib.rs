@@ -403,3 +403,91 @@ pub use resolve::{
     Coverage, NodeResolver, Read, ResolvedService, STORE_TIMEOUT, Scan, publish_service,
     spawn_descriptor_publisher, verify_descriptor,
 };
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod node_memory_apportionment {
+    //! **The node's true stated worst case, summed — because every subsystem states its own and nothing
+    //! summed them.**
+    //!
+    //! `fanos_primitives::budget` exists to hold the apportionment: it names seven shares, sums them in
+    //! `allocated()`, adds `PROCESS_RESIDENT`, and reports `overcommit()` against the 256 MiB node
+    //! recommendation. That module is honest about everything it can see.
+    //!
+    //! It cannot see the two largest consumers, and each of them says so in its own words:
+    //!
+    //! * `fanos_diaulos::budget::SESSION_OVERRUN` — **1967 MiB**. `MAX_SESSIONS × MAX_CONCURRENT_STREAMS`
+    //!   window buffers. Its doc pins the figure "so it cannot move silently" and calls closing it "a design
+    //!   decision with a measurement attached (#274)".
+    //! * `fanos_runtime::READ_MEMORY_CEILING` — **2688 MiB** of in-flight read accumulators. Its doc says
+    //!   the assertion "belongs in the shared apportionment #213 introduces, where all four subsystem budgets
+    //!   are visible at once", and deliberately does not assert it locally.
+    //!
+    //! **The shared apportionment #213 introduced does not carry either term.** So the store points at the
+    //! shared module, the shared module cannot depend on the store, and the sum has no owner — the seam
+    //! between two careful tools, each assuming the other. This crate is the first that can `use` all three,
+    //! so the sum lives here.
+    //!
+    //! What it costs to leave unsummed: `overcommit()` reports **125 MiB** of excess where the stated excess
+    //! is **4780 MiB** — **2 %** of it. A reader taking the module at its word under-reads the node's exposure by a factor of 38.
+
+    use fanos_primitives::budget;
+
+    /// One mebibyte, so the assertions below read in the units their docs are written in.
+    const MIB: usize = 1024 * 1024;
+
+    /// The node's worst case as every subsystem *states* it: the funded shares, the measured process
+    /// residency, and the two overruns their owners deliberately left unasserted.
+    ///
+    /// Not double counted: `SESSION_OVERRUN` is what the session layer exceeds `SESSION_SHARE` **by**, and
+    /// `READ_MEMORY_CEILING` is the in-flight read path, which `STORE_SHARE` does not cover — its own doc
+    /// says the store share's accounting called it "in-flight reads < 1 MiB" and that it was not.
+    fn stated_worst_case() -> usize {
+        budget::allocated()
+            + budget::PROCESS_RESIDENT
+            + fanos_diaulos::budget::SESSION_OVERRUN
+            + fanos_runtime::READ_MEMORY_CEILING
+    }
+
+    /// **The number the tree states about itself, in one place for the first time.**
+    ///
+    /// Pinned rather than bounded, for the reason `SESSION_OVERRUN`'s own pin gives: an assertion against the
+    /// recommendation would fail the build of a crate that cannot fix it, while a pin fails the build of
+    /// whoever *moves* it — including a change that makes it worse while looking local. Every input is a
+    /// derived constant, so this figure is exact rather than measured.
+    #[test]
+    fn the_node_states_a_worst_case_of_four_point_nine_gibibytes() {
+        assert_eq!(budget::allocated() / MIB, 336, "seven funded shares");
+        assert_eq!(budget::PROCESS_RESIDENT / MIB, 45, "measured resident outside every share");
+        assert_eq!(fanos_diaulos::budget::SESSION_OVERRUN / MIB, 1967, "sessions × streams, stated by #274");
+        assert_eq!(fanos_runtime::READ_MEMORY_CEILING / MIB, 2688, "in-flight read accumulators, stated by #212");
+
+        assert_eq!(
+            stated_worst_case() / MIB,
+            5036,
+            "the node's stated worst case moved: re-derive it, and note that no subsystem can see this \
+             number — each states its own share and this is the only site that sums them"
+        );
+    }
+
+    /// **And what the one module built to report the excess actually reports.**
+    ///
+    /// The gap is the finding. `overcommit()` is not wrong — it is complete over the terms it can reach, and
+    /// the terms it cannot reach are 37× larger than the ones it can. Asserted as a ratio so the point
+    /// survives a change to either figure: if a future commit funds one of the overruns, this fails and asks
+    /// for the claim to be re-read rather than for the number to be bumped.
+    #[test]
+    fn the_apportionment_module_can_see_two_and_a_half_percent_of_the_excess() {
+        let node = budget::NODE_MEMORY_BUDGET;
+        let seen = budget::overcommit();
+        let real = stated_worst_case() - node;
+
+        assert_eq!(seen / MIB, 125, "what `overcommit()` reports");
+        assert_eq!(real / MIB, 4780, "what the stated terms actually exceed the recommendation by");
+        assert!(
+            seen * 100 / real < 3,
+            "the shared apportionment sees under 3% of the stated excess — if this stops being true, either \
+             an overrun was funded (good, re-derive) or a share grew to hide one (not good)"
+        );
+    }
+}

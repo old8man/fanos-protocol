@@ -71,6 +71,27 @@ pub const EXIT_DATAGRAM_MEMORY_BUDGET: usize = fanos_primitives::budget::EXIT_DA
 /// `tests::the_exit_datagram_buffers_fit_the_share_the_budget_grants_them` checks the two against each other.
 pub const MAX_UDP_DATAGRAM_SESSIONS: usize = EXIT_DATAGRAM_MEMORY_BUDGET / MAX_DATAGRAM_LEN;
 
+/// The product the share was never checked against, now checked by the compiler.
+///
+/// The division above stood alone: nothing multiplied the count back out, so a change to either factor could
+/// have carried the datagram sessions past their share without a word. It is the third instance of that shape
+/// found in one sweep — `MAX_PENDING`'s own doc calls it *"the assertion whose absence was the defect"*, and
+/// the threshold router's two send queues were over their share by `251_829 B` for want of it. Here the
+/// arithmetic happens to be safe (`256 × 65_535 = 16_776_960` against `16_777_216`), which is exactly why the
+/// guard is worth adding while it costs nothing: an assertion that has never fired is the cheap half of one
+/// that would have.
+const _: () = assert!(
+    MAX_UDP_DATAGRAM_SESSIONS * MAX_DATAGRAM_LEN <= EXIT_DATAGRAM_MEMORY_BUDGET,
+    "the datagram sessions' worst case exceeds EXIT_DATAGRAM_SHARE — raise the share deliberately or lower a factor"
+);
+
+/// …and it is the **largest** count the share buys, so the number is derived rather than merely fitting —
+/// without this the assertion above is satisfied by any small number and neither says the count was derived.
+const _: () = assert!(
+    (MAX_UDP_DATAGRAM_SESSIONS + 1) * MAX_DATAGRAM_LEN > EXIT_DATAGRAM_MEMORY_BUDGET,
+    "MAX_UDP_DATAGRAM_SESSIONS is below what the share buys, so it was chosen rather than derived"
+);
+
 /// Whether `addr` is a destination an exit may relay to: **globally routable, and nothing else** (#170).
 ///
 /// The exit policy gated on the destination **port** and on nothing else, so a client could name any

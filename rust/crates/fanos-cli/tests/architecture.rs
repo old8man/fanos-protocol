@@ -1343,6 +1343,67 @@ fn no_subsystem_declares_its_memory_share_as_a_literal() {
     }
 }
 
+/// **A share that is DIVIDED must be multiplied back**, or the count it produces is a bound nobody checked.
+///
+/// The idiom this tree uses everywhere is `MAX_X = SOME_MEMORY_BUDGET / PER_ENTRY_COST`. The division is the
+/// easy half. The half that catches a mistake is the `const _: () = assert!(MAX_X * PER_ENTRY_COST <=
+/// SOME_MEMORY_BUDGET)` beside it — and `fanos_aphantos`'s own doc names its absence as *the* defect:
+/// *"the assertion whose absence was the defect: `MAX_PENDING` divided by one of the two terms it needed to
+/// divide by, and nothing multiplied the result back out."*
+///
+/// **One sweep found four sites with the division and no multiplication**, and two of them were genuinely
+/// over their share: the threshold router's send queues by `251_829 B`, and its attribution ring outside the
+/// sum entirely. The other two were exact — which is the argument for the guard rather than against it,
+/// since neither was exact *by check*.
+///
+/// Enumerating by name would not do here, because the failure is the absence of a line rather than the
+/// presence of one. So this asks the shape directly: for every `const` whose value divides a share, the same
+/// file must compare something back against that share.
+#[test]
+fn every_memory_share_that_is_divided_is_multiplied_back() {
+    let mut missing: Vec<String> = Vec::new();
+    for file in corpus().into_iter().filter(RustSource::is_crate_src) {
+        let code = code_only(&file.text);
+        for chunk in code.split("const ").skip(1) {
+            let Some((decl, _)) = chunk.split_once(';') else { continue };
+            if !decl.contains(": usize") || !decl.contains('/') {
+                continue;
+            }
+            let Some((_, value)) = decl.split_once('=') else { continue };
+            for share in budget_names(value) {
+                // The check may be spelled against the share or against a local alias of it; both are the
+                // same comparison, and both are what a reader looks for.
+                if !code.contains(&format!("<= {share}")) {
+                    missing.push(format!("{}: divides {share}", file.path.display()));
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "a memory share is divided into a count that nothing checks back against it — add \
+         `const _: () = assert!(COUNT * COST <= SHARE, ...)` beside the division, and its twin \
+         `(COUNT + 1) * COST > SHARE` so the count is the largest the share buys rather than merely one \
+         that fits:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// Every `*_MEMORY_BUDGET` / `*_SHARE` identifier mentioned in a const's value.
+///
+/// Split on non-identifier characters rather than matched by pattern, so a name that gains a prefix is still
+/// found — the guard above is about a missing line, and a scan that quietly stops recognising a share would
+/// report the absence as compliance.
+fn budget_names(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| t.ends_with("_MEMORY_BUDGET") || t.ends_with("_SHARE"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// **A fourth subsystem reserving "a share" must appear in the sum**, or #213 is back with one more term.
 ///
 /// The first three were invisible to each other because nothing enumerated them. Enumerating by name is the

@@ -87,23 +87,35 @@ const PENDING_ENTRY_BYTES: usize =
 ///
 /// It is what the budget buys at the true per-entry cost, so it is not a round number and should not be
 /// made one — the same discipline `fanos_diaulos::budget::MAX_SESSIONS` states.
-const MAX_PENDING: usize = GATHER_MEMORY_BUDGET / PENDING_ENTRY_BYTES;
+pub const MAX_PENDING: usize = GATHER_MEMORY_BUDGET / (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES);
 
 /// The product the budget was never checked against, now checked by the compiler.
 ///
 /// The assertion whose absence *was* the defect: `MAX_PENDING` divided by one of the two terms it needed to
 /// divide by, and nothing multiplied the result back out.
 const _: () = assert!(
-    MAX_PENDING * PENDING_ENTRY_BYTES <= GATHER_MEMORY_BUDGET,
-    "the pending gathers' worst case exceeds GATHER_MEMORY_BUDGET — raise the budget deliberately or lower a factor"
+    MAX_PENDING * (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES) <= GATHER_MEMORY_BUDGET,
+    "the gather state's worst case exceeds GATHER_MEMORY_BUDGET — raise the budget deliberately or lower a factor"
 );
 
 /// [`MAX_PENDING`] is the **largest** count the budget buys, not merely a count that fits — without this the
 /// assertion above is satisfied by any small number and neither says the count was derived.
 const _: () = assert!(
-    (MAX_PENDING + 1) * PENDING_ENTRY_BYTES > GATHER_MEMORY_BUDGET,
+    (MAX_PENDING + 1) * (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES) > GATHER_MEMORY_BUDGET,
     "MAX_PENDING is below what the budget buys, so it was chosen rather than derived"
 );
+
+/// One attribution-ring entry, **measured by the compiler** rather than restated.
+///
+/// The ring was outside the budget arithmetic entirely — `MAX_PENDING` consumed the whole `GATHER_SHARE` by
+/// construction (the assertion above says exactly that), and the ring's entries were then allocated beside
+/// it. That is the shape this file's own doc calls *"the assertion whose absence was the defect"*, one field
+/// over: a term named in prose and dropped from the sum. It was 12 KiB while the ring was a round `512`, and
+/// deriving the ring's size from `MAX_PENDING` is what makes the omission worth fixing rather than noting.
+///
+/// `size_of` and not a hand-counted width, because a hand-counted one drifts the first time `Resolved` gains
+/// a field — which is exactly how `PENDING_ENTRY_BYTES` came to exist.
+const RESOLVED_ENTRY_BYTES: usize = size_of::<(u64, Resolved)>();
 
 /// High bit marking a *mixing* timer token, distinguishing it from a gather-deadline token (which
 /// carries a small request id). No real request id reaches `2^63`.
@@ -123,10 +135,40 @@ const MAX_CANDIDATES: usize = 64;
 /// A share that arrives for a gather no longer pending is one of three things — the gather **peeled** and
 /// this is the expected remainder, it **expired** and the deadline was too tight, or it is foreign — and
 /// those call for opposite responses. Without this ring they are one number, which is why the largest
-/// counter on every node was arithmetic. `q + 1 − t` late shares follow each completion, so remembering a
-/// few hundred outcomes covers the window in which they can still arrive; older ones fall out and are
-/// attributed as unknown, which is the honest answer once the evidence is gone.
-const MAX_RESOLVED: usize = 512;
+/// counter on every node was arithmetic. Older outcomes fall out and are attributed as unknown, which is the
+/// honest answer once the evidence is gone.
+///
+/// # The size is [`MAX_PENDING`], and that is a derivation rather than a round number
+///
+/// It read "remembering a **few hundred** outcomes covers the window", at `512`. The window is not a matter
+/// of taste: a late share can only arrive while its request is still outstanding, so the ring must span the
+/// gathers that resolve within about one deadline. By Little's law the number resolved in a window `W` at
+/// arrival rate `λ` is `λ·W` — which is exactly the steady-state pending count, and that is bounded by
+/// [`MAX_PENDING`] because this engine refuses past it. **So the ring that covers every load this node
+/// admits is `MAX_PENDING` entries, and no other number is defensible.**
+///
+/// `512` covered it at light load and silently stopped at about a sixth of saturation: precisely under load,
+/// when the deadline signal matters most, resolutions fell out before their late shares landed and the three
+/// worlds merged back into `ShareForUnknownRequest` — the defect the ring exists to prevent, reappearing at
+/// the one load that hides it.
+///
+/// The cost is `24 B` an entry against the same `GATHER_SHARE` budget the pending map is drawn from:
+/// **70 KiB, 0.1 %**. Sizing a diagnostic ring below its own derivation to save a tenth of a percent of the
+/// budget it reports on is not a trade.
+const MAX_RESOLVED: usize = MAX_PENDING;
+
+/// The ring must cover every late share this node can still be owed, and that is what ties it to
+/// [`MAX_PENDING`] rather than to a taste for round numbers.
+///
+/// A late share can only arrive while its request is outstanding, so the ring must span the gathers resolved
+/// within about one deadline; by Little's law that count is the steady-state pending size, which this engine
+/// refuses to exceed. Anything smaller silently re-merges the three worlds the ring exists to separate — and
+/// does it *under load*, where the deadline signal is worth the most and the shortfall is least visible.
+const _: () = assert!(
+    MAX_RESOLVED >= MAX_PENDING,
+    "the attribution ring is shorter than the pending set it must outlive, so late shares will be attributed \
+     as unknown exactly when the node is busiest"
+);
 
 /// Cap on the number of `t`-subsets tried while searching for a set of shares that peels. Honest
 /// operation succeeds on the first (all-honest) subset; this bounds the CPU cost when up to `t − 1`
@@ -294,7 +336,7 @@ const QUEUED_CELL_BYTES: usize =
 /// default, for the **whole node**, not per circuit. Offered `λ`, this queue fills in `MAX_OUTBOX / (λ − 2)`
 /// seconds and cargo is shed from then on. That figure is also what #135 left open for the `Relay` role: its
 /// capacity is a derived protocol bound, not a measurement waiting to be taken.
-const MAX_OUTBOX: usize = ROUTER_QUEUE_MEMORY_BUDGET / QUEUED_CELL_BYTES;
+const MAX_OUTBOX: usize = ROUTER_QUEUE_BUYS;
 
 /// What the §L5 replay set may hold, carved from the router's own share rather than claimed separately.
 ///
@@ -333,7 +375,50 @@ const MAX_REPLAY_TAGS: usize = REPLAY_CACHE_BYTES / crate::sealed::REPLAY_TAG_LE
 /// Steady state is `λ × mean_delay` by Little's law, so at the shipping 120 ms mean this cap is reached at
 /// roughly `λ = 17 000 /s` — far above any honest relay and reachable by a flood, which is what it is for.
 /// Each entry also holds a live timer, so the bound caps two resources, not one.
-const MAX_MIX_PENDING: usize = ROUTER_QUEUE_MEMORY_BUDGET / QUEUED_CELL_BYTES;
+const MAX_MIX_PENDING: usize = ROUTER_QUEUE_BUYS;
+
+/// How many queued cells [`ROUTER_QUEUE_MEMORY_BUDGET`] buys **once its other tenant is paid for**.
+///
+/// # The share had three tenants and an arithmetic for none of them
+///
+/// [`MAX_OUTBOX`] and [`MAX_MIX_PENDING`] each divided the whole share by the per-cell cost, and
+/// [`MAX_REPLAY_TAGS`] took `REPLAY_CACHE_BYTES` beside it — so the worst case was `42_194_869 B` against a
+/// `41_943_040 B` share, over by `251_829 B`, and **nothing multiplied the counts back out to notice**. That
+/// is verbatim the defect [`MAX_PENDING`]'s own doc records one budget over: *"the assertion whose absence
+/// was the defect: it divided by one of the two terms it needed to divide by, and nothing multiplied the
+/// result back out."* The same file, the same shape, the neighbouring share.
+///
+/// **The two queues sharing one budget is correct, and it is not an accident worth leaving unstated.**
+/// `forward_send` branches on the *configuration*: a router with `cover_interval != 0` queues every forward
+/// in the outbox and returns, and only a router with cover off and a mixing delay reaches `mix_pending`. They
+/// are alternatives, never both live, so the worst case is one of them — which is why one budget covers both
+/// and why the assertion below is sound. A change that let both paths fill would double the footprint and
+/// this doc is where it must be read first.
+///
+/// The correction costs `13` cells of `2045`.
+const ROUTER_QUEUE_BUYS: usize =
+    (ROUTER_QUEUE_MEMORY_BUDGET - REPLAY_CACHE_BYTES) / QUEUED_CELL_BYTES;
+
+/// The product the share was never checked against, now checked by the compiler — the outbox *or* the
+/// mixing queue (never both, see [`ROUTER_QUEUE_BUYS`]) plus the replay cache that sits beside them.
+const _: () = assert!(
+    MAX_OUTBOX * QUEUED_CELL_BYTES + REPLAY_CACHE_BYTES <= ROUTER_QUEUE_MEMORY_BUDGET,
+    "the router's queue worst case exceeds THRESHOLD_ROUTER_SHARE — raise the share deliberately or lower a factor"
+);
+
+/// …and it is the **largest** count the share buys, so the number is derived rather than merely fitting.
+const _: () = assert!(
+    (MAX_OUTBOX + 1) * QUEUED_CELL_BYTES + REPLAY_CACHE_BYTES > ROUTER_QUEUE_MEMORY_BUDGET,
+    "the queue bound is below what the share buys, so it was chosen rather than derived"
+);
+
+/// The two queues are alternatives, so they are one count — stated as an identity because the assertion
+/// above checks only one of them and would be blind to the other drifting.
+const _: () = assert!(
+    MAX_OUTBOX == MAX_MIX_PENDING,
+    "the outbox and the mixing queue share one budget because they are never both live; if they stop being \
+     one number, the assertion above stops covering the pair"
+);
 
 impl<F: Field> ThresholdRouter<F> {
     /// A router at `coord`, peeling hops that need a threshold of `t`. `kem_secret` (the node's long-term
@@ -753,6 +838,31 @@ impl<F: Field> ThresholdRouter<F> {
 
     /// Handle an onion addressed to us as the combiner of `line`: seed a pending peel with our own
     /// partial and fan out share-requests to the rest of the line.
+    /// Gathers in flight right now — the **level** this relay is carrying, and the quantity its per-node
+    /// capacity is defined against.
+    ///
+    /// A level, not a rate, for the reason `RendezvousRelay` states about its own: it needs no observation
+    /// window, so it cannot drift out of step with whatever window the overlay's counters use. The units
+    /// mismatch that kept `Role::Relay` on a placeholder capacity was a rate being compared with a level;
+    /// taking the level dissolves it.
+    ///
+    /// **What publishing it costs, since this one is different from its neighbours.** The cost falls on the
+    /// *receiving* side, which is where this reading is taken: `emit_cover` sends and returns, spending no
+    /// slot, but the combiner a cover cell is salted to **cannot tell it from cargo** — that is the whole
+    /// claim of the design — so it arms a gather, collects `q` decoys, exhausts the subset search and waits
+    /// out the deadline. Hence `pending.len() ≈ (cover rate + cargo rate) × deadline`, and under a
+    /// constant-rate cover schedule the first term is constant. Publishing the level therefore publishes the
+    /// **cargo rate plus a constant**, off-path, for the most anonymity-critical role in the system — exactly
+    /// what constant-rate cover exists to deny a link observer. That is why the load directory noises every
+    /// report at a scale its consumer's tolerance derives (`fanos_node::loaddir`); this accessor was unsafe to
+    /// wire until that landed, and
+    /// `fanos_node::cell_node::tests::a_cell_node_reports_the_mix_load_and_a_decoy_costs_the_same_slot_as_cargo`
+    /// drives one decoy and no cargo at all to hold the arithmetic to the mechanism.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
     fn on_onion(&mut self, now: Instant, line: Triple, onion: Vec<u8>) -> Vec<Effect> {
         // §L5, BEFORE any peel work (#296). A recorded cell re-injected here would peel identically and
         // forward to the same next hop, which is a circuit-confirmation oracle: the adversary learns this
@@ -968,7 +1078,12 @@ impl<F: Field> ThresholdRouter<F> {
             // deadline was too tight, which is the opposite reading of a gather expiry taken alone; unknown
             // is what is left once the ring has forgotten, and it is the only one that is evidence of
             // nothing in particular.
-            let station = match self.resolved.iter().find(|(id, _)| *id == req_id).map(|(_, r)| *r) {
+            // **From the back, because the hit is the newest.** `note_resolved` pushes to the back, so a
+            // forward scan finds a just-resolved gather at the very last position — every late share paid a
+            // full traversal of the ring, every time, which is the worst case of the search and also its
+            // most common one. Reversed, the expected cost is the handful of resolutions that happened
+            // between the peel and the straggler landing. This is what makes the ring's derived size free.
+            let station = match self.resolved.iter().rev().find(|(id, _)| *id == req_id).map(|(_, r)| *r) {
                 Some(Resolved::Peeled) => Station::ShareLateAfterPeel,
                 Some(Resolved::Expired { armed_at }) => {
                     // The sample the estimator could not otherwise see. `observe` is fed only by gathers
@@ -2043,7 +2158,15 @@ mod tests {
         assert_eq!(threshold::THRESHOLD_ONION_LEN, 20480, "the constant bucket, on every plane");
         assert_eq!(fanos_threshold::SHARE_LEN, 33, "x(1) ‖ y(32), the Shamir split of a 32-byte layer key");
         assert_eq!(PENDING_ENTRY_BYTES, 22592, "20480 onion + 64 × 33 candidate shares");
-        assert_eq!(MAX_PENDING, 2970, "64 MiB / 22592 B");
+        // **Two terms, because the gather state is two maps.** The attribution ring was allocated beside a
+        // budget the pending map already consumed whole, so its bytes were outside the arithmetic this test
+        // exists to write out. Derived from `size_of` rather than restated, which is why the second term is
+        // read from the constant instead of spelled here.
+        assert_eq!(
+            MAX_PENDING,
+            (64 * 1024 * 1024) / (22592 + RESOLVED_ENTRY_BYTES),
+            "the budget buys the pending entry AND the resolution that outlives it"
+        );
         // The two invariants are `const` assertions above, so they fail the BUILD rather than a run.
         // What is left here is what the old divisor bought and what it left out.
         let onion_only = GATHER_MEMORY_BUDGET / threshold::THRESHOLD_ONION_LEN;

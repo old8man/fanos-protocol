@@ -37,6 +37,7 @@
 //! wrapped `ServiceNode` uses `0b011` (bit 61 set) — none match `0b0101`. A fired token is dispatched by
 //! that tag: `(token >> 60) == 0b0101` → the host (unmapped back), everything else → the inner engine.
 
+use fanos_core::roles::{CONTROL_LOAD_READING, Role, encode_load_reading};
 use fanos_geometry::Triple;
 use fanos_pqcrypto::HybridKemPublic;
 use fanos_rendezvous::{BeaconSeed, Epoch};
@@ -215,6 +216,29 @@ impl Engine for IngressNode {
                     r.target_epoch, &r.new_line, &refs, &r.key_randomness, &r.kem_seed,
                 ))
             }
+            // An observation is where this composite reports the one role only *it* can see: the admission
+            // requests this member is currently gathering for. Without it the ingress role falls back to the
+            // node's own offer — supply standing in for demand on a host that knows what it is carrying.
+            //
+            // A **level**, not a rate, measured against the bound the host's own admission rule enforces
+            // (`DEFAULT_MAX_PENDING`), so the numerator and the denominator count the same objects and no
+            // observation window has to be reconciled with anyone else's.
+            //
+            // Routed as a `Control` command for `ServiceNode`'s reason: `inner` is a `dyn Engine`, so the type
+            // that would let this call `observe_load` directly is erased by the composition. `Control` never
+            // arrives off the wire, so no peer can forge a load reading.
+            Input::Command(Command::Diagnose) => {
+                let carried = u16::try_from(self.host.pending()).unwrap_or(u16::MAX);
+                let reading = encode_load_reading(Role::Ingress, carried).to_vec();
+                let mut out = self.inner.step(
+                    now,
+                    Input::Command(Command::Control { tag: CONTROL_LOAD_READING, body: reading }),
+                );
+                let effects = self.inner.step(now, input);
+                self.arm_from_beacon(&effects);
+                out.extend(effects);
+                out
+            }
             Input::Timer(_) | Input::Command(_) => {
                 let effects = self.inner.step(now, input);
                 self.arm_from_beacon(&effects);
@@ -366,6 +390,75 @@ mod tests {
             refired.iter().any(|e| matches!(e, Effect::ArmTimer { .. })),
             "after the deadline dropped the gather, the same request is accepted anew — the tick reached the \
              host, not the overlay"
+        );
+    }
+
+    /// **The load the overlay cannot see, and the reading has to move.**
+    ///
+    /// `Role::Ingress` was the last role dividing by a placeholder capacity, described as "a bound with no
+    /// sensor". The sensor existed — `PorosHost::pending` — and nothing read it, so this is the wiring plus
+    /// the proof it measures something: a 2-of-2 line cannot serve from the combiner alone, so one admission
+    /// request stays gathering, and the level must follow it up and back down again when the deadline drops
+    /// it. Asserting only the idle `Some(0)` would have pinned the hand-off and not the quantity.
+    #[test]
+    fn an_ingress_node_reports_the_admission_load_the_overlay_cannot_see() {
+        let coord = Point::<F2>::at(0).coords();
+        let other = Point::<F2>::at(1).coords();
+        let beacon = BeaconSeed::new([0x44; 32]);
+        let desc = descriptor(6);
+        let randomness = vec![0x9u8; desc.to_bytes().len() + 8];
+        let dealt = shard_descriptor(&desc, 2, 2, &randomness).unwrap();
+        let host = PorosHost::new(
+            coord,
+            dealt.shares[0].clone(),
+            dealt.binding.clone(),
+            vec![coord, other],
+            2,
+            COMMUNITY.to_vec(),
+            EPOCH,
+            beacon,
+            DIFFICULTY,
+            Sybil::Uncapped,
+        );
+        let overlay = OverlayNode::<F2>::new(Point::<F2>::at(0), OverlayConfig::default());
+        let mut node = IngressNode::new(Box::new(overlay), host);
+
+        let read = |node: &mut IngressNode, at: Instant| {
+            node.step(at, Input::Command(Command::Diagnose))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::LoadReport { per_role }) => {
+                        Some(fanos_core::roles::RoleReading::from_array(*per_role).of(Role::Ingress))
+                    }
+                    _ => None,
+                })
+                .expect("an observation reports the load it measured")
+        };
+
+        assert_eq!(
+            read(&mut node, Instant(0)),
+            Some(0),
+            "an ingress point gathering nothing measured zero — it is not unsensed, which is what would put \
+             its own offer back in place of a measurement"
+        );
+
+        let requester = Point::<F2>::at(4).coords();
+        let req = solve_ingress_request(requester, COMMUNITY, EPOCH, &beacon, DIFFICULTY);
+        let armed = node
+            .step(Instant(1), Input::Message { from: requester, frame: request_frame(&req) })
+            .iter()
+            .find_map(|e| match e {
+                Effect::ArmTimer { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("a 2-of-2 line leaves the request gathering behind a deadline");
+        assert_eq!(read(&mut node, Instant(2)), Some(1), "one request gathering is one unit of load");
+
+        node.step(Instant(3), Input::Timer(armed));
+        assert_eq!(
+            read(&mut node, Instant(4)),
+            Some(0),
+            "and it goes back down: the deadline dropped the gather, so the node is carrying nothing again"
         );
     }
 

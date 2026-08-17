@@ -217,6 +217,17 @@ impl<F: Field> Engine for CellNode<F> {
             Input::Command(Command::Diagnose) => {
                 let carried = self.relay.registrations().saturating_add(self.relay.hosts());
                 self.obn.observe_load(Role::Rendezvous, u16::try_from(carried).unwrap_or(u16::MAX));
+                // The same reading for `Role::Relay`, off the half of this composite that owns the mixing.
+                // Gathers in flight is again a **level** measured against the bound its own subsystem
+                // enforces (`MAX_PENDING`), so the numerator and the denominator count the same objects.
+                //
+                // Wired only now, and deliberately last: a relay's pending count tracks the **cargo rate**
+                // (a cover gather occupies a slot exactly as a real one does, so the cover contributes a
+                // constant), which makes this the one role where publishing the sensor is itself the leak
+                // constant-rate cover exists to prevent. It became safe when the load directory started
+                // noising every report at a scale its consumer's tolerance derives (`crate::loaddir`).
+                let mixing = self.relay.router().pending();
+                self.obn.observe_load(Role::Relay, u16::try_from(mixing).unwrap_or(u16::MAX));
                 self.step_obn(now, input)
             }
             // The sense-only read reaches **both** halves. The overlay answers with the cell's coherence
@@ -425,6 +436,62 @@ mod tests {
             })
             .expect("an observation reports the load it measured");
         assert_eq!(reading, Some(0), "a combiner carrying nothing measured zero, not nothing");
+    }
+
+    /// The same seam for `Role::Relay` — **and the price of using it**, measured rather than asserted.
+    ///
+    /// Two claims in one stand, because they are the same number seen twice. The reading has to reach the
+    /// controller (the wiring), and it has to move with the router's work (the sensor), and the second is what
+    /// makes it a leak worth noising: the mover here is a **cover** cell, which carries no cargo at all. If a
+    /// decoy raises the level exactly as cargo does, the published level is the cargo rate plus a constant,
+    /// which is what `ThresholdRouter::pending`'s doc claims and what `crate::loaddir` noises.
+    ///
+    /// **The first spelling drove the wrong side and failed at this assertion**, which is the finding worth
+    /// keeping: emitting a cover cell costs the *emitter* no pending slot — `emit_cover` sends and returns.
+    /// The slot is spent on the **combiner**, which cannot tell a decoy from cargo (that is the whole claim of
+    /// the design) and so arms a gather for both. The sensor sits on the combiner, so the cost lands exactly
+    /// where the reading is taken.
+    #[test]
+    fn a_cell_node_reports_the_mix_load_and_a_decoy_costs_the_same_slot_as_cargo() {
+        let (shares, commitment) = beacon_key();
+        // Seated at the combiner of line 0, as the peel test is: a gather is armed by the member the cell is
+        // salted to, so a node that is not that member forwards instead of gathering and spends no slot.
+        let members = line_member_coords::<F2>(Line::<F2>::at(0).coords());
+        let mut node = cell_node(Point::<F2>::new(members[0]).unwrap().index(), &shares, &commitment);
+
+        let read = |node: &mut CellNode<F2>, at: Instant| {
+            node.step(at, Input::Command(Command::Diagnose))
+                .iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::LoadReport { per_role }) => {
+                        Some(RoleReading::from_array(*per_role).of(Role::Relay))
+                    }
+                    _ => None,
+                })
+                .expect("an observation reports the load it measured")
+        };
+
+        // Idle: a reading of zero, not an absence — the distinction the overlay's own load test pins.
+        assert_eq!(read(&mut node, Instant(0)), Some(0), "a relay carrying nothing measured zero, not nothing");
+
+        // One cover cell: a block of keystream and nothing else, so there is no cargo anywhere in this test.
+        // Built exactly as `emit_cover` builds one — a `THRESHOLD_ONION_LEN` XOF block handed to the same
+        // public launch encoder a real client uses, which is the point: the two are the same frame.
+        let line = Line::<F2>::at(0).coords();
+        let mut keystream = vec![0u8; fanos_aphantos::threshold::THRESHOLD_ONION_LEN];
+        fanos_primitives::hash::hash_xof("test/cover-body", b"mix-load", &mut keystream);
+        node.step(
+            Instant(1),
+            Input::Message { from: [9, 9, 9], frame: launch_frame(line, &keystream) },
+        );
+
+        assert_eq!(
+            read(&mut node, Instant(2)),
+            Some(1),
+            "a decoy occupies a gather slot exactly as cargo does — so the published level is the cargo rate \
+             plus a constant, and publishing it unnoised would hand a link observer the very quantity \
+             constant-rate cover exists to deny it"
+        );
     }
 
     #[test]
