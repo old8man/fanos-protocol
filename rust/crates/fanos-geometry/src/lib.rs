@@ -69,6 +69,117 @@ pub const fn line_threshold(line_size: usize) -> usize {
     if t == 0 { 1 } else { t }
 }
 
+/// The plane's point count from its line size: `N = q²+q+1` with `q = m − 1`, i.e. `m² − m + 1`.
+///
+/// Named because two laws below need the plane's size while holding only a line's, and re-deriving `q` at
+/// each site is how the two would come to disagree.
+#[must_use]
+pub const fn plane_points(line_size: usize) -> usize {
+    line_size * line_size - line_size + 1
+}
+
+/// **How many points of the plane must serve a role before EVERY line carries its
+/// [`line_threshold`]** — the count a per-line guarantee costs when the servers are chosen without
+/// reference to lines.
+///
+/// # Why a count of `t` is not this number
+///
+/// `line_threshold(m) = t` is a statement about **one line**: `t` of its `m` points must act. A cell's
+/// role demand, though, is a **count of nodes in the plane**, and `roles::select` fills it by ranking a
+/// beacon hash — no line enters that decision. So `t` nodes assigned cell-wide land on a *given* line
+/// with the probability of a hypergeometric draw, which on the base cell is
+///
+/// ```text
+///   P(a given line carries t) = C(3,2)/C(7,2) = 3/21 = 0.143
+/// ```
+///
+/// — six lines in seven unusable — and at `q = 7` it is `C(8,6)/C(57,6) ≈ 9·10⁻⁷`. A floor of `t` does
+/// not weaken the guarantee it exists to protect; it **inverts** it, in exactly the way that floor's own
+/// doc warns about one level down.
+///
+/// # The derivation
+///
+/// A line fails when more than `m − t` of its points are withheld. Any `m − t + 1` points **may be
+/// collinear** — in a projective plane collinearity is a property of the draw, not of the count — so a
+/// count can guarantee the property only by keeping the withheld set at or below that bound:
+///
+/// ```text
+///   floor(m) = N − (m − t),      N = m² − m + 1,   t = ⌈2m/3⌉
+/// ```
+///
+/// `6` of `7` on the base cell; `55` of `57` at `q = 7`.
+///
+/// # What that says about the role assignment, and it is the point
+///
+/// The withholding budget `m − t` **is the per-line fault budget the threshold already buys**. So for a
+/// role whose work arrives at a *derived* line — a mixnet hop, a service's meeting line, a community's
+/// ingress line — the assignment cannot be a rationing device: the work lands where the geometry puts it
+/// and provisioning a different node moves none of it. It is an **exclusion** device, and the number of
+/// exclusions it may spend is precisely the redundancy the threshold pays for. Asking for `t` nodes was
+/// reading a per-line quorum as a cell-wide budget.
+#[must_use]
+pub const fn points_serving_every_line(line_size: usize) -> usize {
+    plane_points(line_size) - (line_size - line_threshold(line_size))
+}
+
+/// **How many of the plane's lines actually reach `t` — the exact answer where
+/// [`points_serving_every_line`] gives only the threshold at which it is guaranteed.**
+///
+/// The floor answers *"how many points make EVERY line servable, whatever the draw"*. Below it the count
+/// alone says nothing: on `PG(2,4)` five occupied points leave **zero** servable lines in 91.6 % of
+/// placements and exactly one in the other 8.4 % (exhaustive over all `C(21,5)`), so `5 of 20` and
+/// `19 of 20` are the same sentence about a cell that can complete no threshold operation anywhere and a
+/// cell one point short of perfect. This distinguishes them, and it is a **measurement, not a probability**:
+/// the caller holds the occupancy, so the answer is exact.
+///
+/// The distinction earns its place because it was needed and missing. A five-node fixture on `PG(2,4)`
+/// (`M/N = 0.24`) raised `gather.expired` 15–30 times per node per minute and `role.under_provisioned` on
+/// all six roles, and both were read as flakiness for as long as the only available statement was "below
+/// floor". Zero servable lines says the same thing in a form that cannot be misread: **every gather the
+/// cell draws must expire, because no line it could draw holds `t` members.**
+///
+/// Sizing, from the same measurement (simulated against `fanos_vrf`'s live line-confined probe walk):
+/// `M = N` clears the floor 87 % of the time on `PG(2,2)` and only **25 %** on `PG(2,4)`, while
+/// `M ≈ 1.5·N` clears it ~99 % on both. A cell is sized in **nodes**, and the plane is counted in
+/// **points**; they are not the same number, and the ratio is not 1.
+#[must_use]
+pub fn servable_lines<F: Field>(occupied: impl Fn(Point<F>) -> bool) -> usize {
+    let t = line_threshold(Plane::<F>::LINE_SIZE as usize);
+    Plane::<F>::lines()
+        .filter(|&line| Plane::<F>::points_on(line).filter(|&p| occupied(p)).count() >= t)
+        .count()
+}
+
+/// **How many NODES a cell wants before its plane is covered** — the sizing constant a deployment needs and
+/// nothing states.
+///
+/// A plane is counted in points; a cell is sized in members; and they are not the same number, because
+/// members contend for points. Each node draws a coordinate and, when it is taken, walks the `q + 1` points
+/// of one line through it (`fanos_vrf::probe_walk`) — so the occupancy a cell reaches is strictly below its
+/// membership, and the shortfall grows with load.
+///
+/// Simulated against that walk with rank-ordered resolution, on the two planes the base tier uses, and the
+/// answer is the same shape on both:
+///
+/// | `M/N` | `PG(2,2)` P(every line servable) | `PG(2,4)` |
+/// |---|---|---|
+/// | 1.0 | 87 % | **25 %** |
+/// | **1.5** | **99.7 %** | **99.2 %** |
+/// | 2.0 | 100 % | 100 % |
+///
+/// So `3·N/2`, and the halves are not decoration: at `M = N` a `PG(2,4)` cell clears its viability floor a
+/// quarter of the time, which is the difference between a cell that serves threshold lines and one that
+/// cannot complete a gather anywhere. The excess is not waste — it is what fills the last points, and at
+/// this load about a third of the members hold no top-level seat in any given epoch and belong in sub-cells.
+///
+/// **Approximate on purpose.** The exact quantile depends on the plane, the walk and the arrival order, so
+/// this is the load factor those measurements agree on rather than a closed form; `servable_lines` is the
+/// exact question a running cell should ask about *itself*.
+#[must_use]
+pub const fn members_for_a_covered_plane(line_size: usize) -> usize {
+    plane_points(line_size) * 3 / 2
+}
+
 // Re-export the field crate so downstream users get a matched version.
 pub use fanos_field::{self, Field};
 
@@ -77,6 +188,136 @@ pub use fanos_field::{self, Field};
 mod tests {
     use super::*;
     use fanos_field::{F2, F7, F13, F31};
+
+    /// **`points_serving_every_line` is EXACT, proved by exhausting every placement on the base cell.**
+    ///
+    /// The claim is not "this many is enough" but "this many is the first count that is enough, whatever the
+    /// draw" — and on `PG(2,2)` that is checkable in full: all `2⁷` subsets, all 7 lines. A sampled check
+    /// could not distinguish an exact bound from a conservative one, and a conservative floor here would be
+    /// a real cost (it is a demand the cell escalates as a deficit when supply falls short).
+    ///
+    /// What the exhaustion shows, and why the shipped floor of `t = 2` was not merely low: at `D = 4` a whole
+    /// line can still be **empty**, and only at `D = 6` does every line carry its quorum.
+    /// **The floor and the measurement agree, and the measurement is the sharper of the two.**
+    ///
+    /// Exhaustive over every subset of `PG(2,2)`'s seven points, and it pins three separate facts:
+    ///
+    /// * at the floor (`6`) **every** placement serves all seven lines — the floor's own claim, restated as a
+    ///   count rather than a predicate;
+    /// * one point below it (`5`) **every** placement serves exactly six — a single value, not a range, so
+    ///   the last line is lost to the geometry and no draw or reseating recovers it;
+    /// * below that the count spreads (`4` gives four or six), which is exactly the regime where
+    ///   `points_serving_every_line` alone cannot answer and this can.
+    ///
+    /// `F7` then checks the same shape on a plane large enough that "all lines" and "the floor" are not
+    /// adjacent numbers: `57` points, `d = m − t = 2`, so the floor is `55`.
+    /// **The sizing constant is above the floor it exists to reach, at every order** — the one property
+    /// that makes `members_for_a_covered_plane` an answer rather than a ratio.
+    ///
+    /// A cell of that many members must be able, in principle, to occupy `points_serving_every_line` of its
+    /// plane; a recommendation below its own floor would be worse than none. Checked on every order the
+    /// tree instantiates and on the two it merely defines, because the relation is `3N/2` against
+    /// `N − ⌊(q+1)/3⌋` and those grow differently.
+    #[test]
+    fn the_sizing_constant_clears_the_floor_it_exists_to_reach() {
+        for line_size in 3..=40usize {
+            let (n, floor, want) = (
+                plane_points(line_size),
+                points_serving_every_line(line_size),
+                members_for_a_covered_plane(line_size),
+            );
+            assert!(
+                want >= floor,
+                "a cell of {want} members cannot be expected to occupy {floor} of {n} points on a plane \
+                 with {line_size}-point lines — the recommendation would sit below its own viability floor"
+            );
+            // And it is a *surplus*, not a coincidence of rounding: the excess over the plane is what fills
+            // the last points, and it must exist at every order rather than only at large ones.
+            assert!(want > n, "sizing at or below the point count is what makes M = N clear the floor 25% \
+                 of the time on PG(2,4); the constant exists to say so");
+        }
+        // The two orders the base tier uses, spelled out so a reader sees the numbers rather than the rule.
+        assert_eq!((plane_points(3), members_for_a_covered_plane(3)), (7, 10), "PG(2,2): 7 points, 10 nodes");
+        assert_eq!((plane_points(5), members_for_a_covered_plane(5)), (21, 31), "PG(2,4): 21 points, 31 nodes");
+    }
+
+    #[test]
+    fn servable_lines_is_exact_where_the_floor_is_only_a_threshold() {
+        let n = Plane::<F2>::N as usize;
+        let mut by_size: alloc::collections::BTreeMap<usize, alloc::collections::BTreeSet<usize>> =
+            alloc::collections::BTreeMap::new();
+        for mask in 0u32..(1 << n) {
+            let occupied = |p: Point<F2>| mask & (1 << p.index()) != 0;
+            by_size
+                .entry(mask.count_ones() as usize)
+                .or_default()
+                .insert(servable_lines::<F2>(occupied));
+        }
+        let floor = points_serving_every_line(Plane::<F2>::LINE_SIZE as usize);
+        assert_eq!(floor, 6, "the base cell's coverage floor");
+        assert_eq!(
+            by_size.get(&floor),
+            Some(&alloc::collections::BTreeSet::from([7usize])),
+            "at the floor EVERY placement must serve every line — that is what the floor asserts, and a \
+             single value here is what makes it a floor rather than an average"
+        );
+        assert_eq!(
+            by_size.get(&(floor - 1)),
+            Some(&alloc::collections::BTreeSet::from([6usize])),
+            "one point below it, every placement serves exactly six of seven: the missing line is forced by \
+             the geometry, so no draw and no reseating can recover it"
+        );
+        assert!(
+            by_size.get(&4).is_some_and(|v| v.len() > 1),
+            "and further down the count spreads, which is the regime the floor cannot describe and this can"
+        );
+
+        // The same shape one plane up, where the floor and full coverage are two points apart.
+        let big = points_serving_every_line(Plane::<F7>::LINE_SIZE as usize);
+        assert_eq!((Plane::<F7>::N as usize, big), (57, 55), "PG(2,7): 57 points, d = m - t = 2");
+        assert_eq!(
+            servable_lines::<F7>(|_| true),
+            57,
+            "a full plane serves every line, and there are as many lines as points"
+        );
+        assert_eq!(servable_lines::<F7>(|_| false), 0, "an empty plane serves none");
+    }
+
+    #[test]
+    fn the_coverage_floor_is_the_first_count_that_survives_every_placement() {
+        let lines: Vec<Vec<usize>> = Plane::<F2>::lines()
+            .map(|l| Plane::<F2>::points_on(l).map(|p| p.index()).collect())
+            .collect();
+        assert_eq!(lines.len(), 7, "the base cell has seven lines, and this walks all of them");
+
+        let t = line_threshold(Plane::<F2>::LINE_SIZE as usize);
+        // For each size, the WORST placement: the fewest points any line ends up carrying.
+        let worst = |d: u32| -> usize {
+            (0..1u32 << 7)
+                .filter(|mask| mask.count_ones() == d)
+                .map(|mask| {
+                    lines
+                        .iter()
+                        .map(|l| l.iter().filter(|&&p| mask >> p & 1 == 1).count())
+                        .min()
+                        .unwrap_or(0)
+                })
+                .min()
+                .unwrap_or(0)
+        };
+
+        let floor = points_serving_every_line(Plane::<F2>::LINE_SIZE as usize);
+        assert_eq!(floor, 6, "N − (m − t) = 7 − 1 on the base cell");
+        assert!(worst(floor as u32) >= t, "at the floor, no placement can starve a line");
+        assert!(
+            worst(floor as u32 - 1) < t,
+            "and one below it, some placement does — so the floor is exact, not conservative"
+        );
+        // The shipped floor used to be `t` itself. Stated as its own consequence rather than as a smaller
+        // number: at that count a line can be reached by NOBODY.
+        assert_eq!(worst(t as u32), 0, "a demand of t leaves some line with zero of its points serving");
+        assert_eq!(worst(4), 0, "and so does four of seven — the empty line survives past half the cell");
+    }
 
     /// V1: plane parameters `N = q²+q+1`, `q+1` per line, and `|PGL(3,q)|` (spec §2.1, §2.3).
     #[test]
