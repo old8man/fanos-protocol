@@ -533,7 +533,17 @@ impl NodeFleet {
         let mut attempts = 0usize;
         while nodes.len() < count {
             attempts += 1;
-            if attempts > 64 * count.max(1) || count > fanos_geometry::Plane::<F>::N as usize {
+            // **The plane's size bounds an INJECTIVE draw, not a fleet.** `count > N` cannot be satisfied
+            // when every node must land on a point of its own, so refusing early is right there — a retry
+            // loop that cannot terminate is worse than an error. `spawn_as_drawn` makes no such promise:
+            // taking the draw as it comes is the whole point of it, and a fleet larger than the plane is
+            // exactly the regime the design answers with sub-cell descent. Guarding both alike made the one
+            // load factor that matters unmeasurable — the plane is covered at `n/N ≈ 1.5`
+            // (`measure_how_many_nodes_a_plane_needs_before_its_lines_work`), and every attempt to reach it
+            // came back `NodeError::Identity` from a condition about a draw it was not using.
+            if attempts > 64 * count.max(1)
+                || (injective && count > fanos_geometry::Plane::<F>::N as usize)
+            {
                 return Err(fanos_node::NodeError::Identity);
             }
             let socket = fabric.bind();
@@ -641,6 +651,66 @@ impl NodeFleet {
                 let line = o.line.map_or_else(String::new, |[x, y, z]| format!("@{x}:{y}:{z}"));
                 let tag = o.tag.map_or_else(String::new, |t| format!("#{t}"));
                 let _ = write!(out, "{}{line}{tag}={} ", o.station.name(), o.count);
+            }
+        }
+        out
+    }
+
+    /// The **engine's** data-path plane, one line per node — the counterpart to [`stations`], which reads the
+    /// driver's map.
+    ///
+    /// **Two planes, and a failure message that prints one of them can mistake a blind spot for evidence.**
+    /// The driver's counters see frames: a send that found no rung (`directory.entry_fallback`), a
+    /// connection reused or pruned. The engine's see decisions: a read that did not conclude and *why*
+    /// (`read.inconclusive`, tagged with a `ReadStall`), a gather that expired, a share that arrived late.
+    /// A read that never reaches the store and a read that reaches it and starves look identical on the
+    /// transport plane and are opposite on this one.
+    ///
+    /// Paid for once, honestly: this **asks** each node (`Command::Observe`) and awaits its answer, where
+    /// `stations` reads a map already in hand. It is a diagnosis, not a sample, so it belongs in a failure
+    /// message rather than in a loop.
+    /// `#[cfg(test)]`, and that is the honest description rather than a concession. Every caller is a test
+    /// scenario in this file; a `pub` diagnostic with no reader outside the crate is exactly the shape
+    /// `no_new_public_capability_arrives_unwired` exists to catch, and a `pub(crate)` one with no
+    /// non-test reader is the same claim one step quieter. Promote it the day a shipping binary asks a node
+    /// for its engine plane — `bin/demo.rs` and `bin/experiment.rs` print neither plane today.
+    #[cfg(test)]
+    async fn engine_stations(&self) -> String {
+        let mut out = String::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let mut events = node.client().subscribe();
+            let _ = write!(out, "\n  node {i}: ");
+            if !node.client().command(fanos_runtime::Command::Observe) {
+                out.push_str("(engine did not accept Observe)");
+                continue;
+            }
+            // This crate's own deadline rather than the testkit's backstop — the same 240 s, derived from the
+            // same measurement, and `engine_stations` is library code that a dev-dependency cannot reach.
+            let seen = tokio::time::timeout(SETTLE_DEADLINE, async {
+                loop {
+                    match events.recv().await {
+                        Ok(fanos_runtime::Notification::DataPath { stations, .. }) => {
+                            return Some(stations);
+                        }
+                        Ok(_) => {}
+                        Err(_) => return None,
+                    }
+                }
+            })
+            .await;
+            match seen.ok().flatten() {
+                None => out.push_str("(no answer)"),
+                Some(obs) if obs.is_empty() => out.push_str("(nothing recorded)"),
+                Some(obs) => {
+                    for o in obs {
+                        // Same key as `stations` renders — `(station, line, tag)` — for the same reason: two
+                        // rows differing only in tag are different findings, and `read.inconclusive` carries
+                        // its `ReadStall` reason *in* the tag.
+                        let line = o.line.map_or_else(String::new, |[x, y, z]| format!("@{x}:{y}:{z}"));
+                        let tag = o.tag.map_or_else(String::new, |t| format!("#{t}"));
+                        let _ = write!(out, "{}{line}{tag}={} ", o.station.name(), o.count);
+                    }
+                }
             }
         }
         out
@@ -1011,10 +1081,16 @@ mod tests {
                 |f| (f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(), f.widest_withheld_scan()),
             )
             .await;
+        // Both planes, and the second one is what a reader of this message could not reconstruct. The
+        // driver's counters say whether a frame found a rung; only the engine's say whether a *read* reached
+        // the store and how it ended — and an assignment that never arrives is a scan that did not conclude,
+        // which is a read fact end to end. Asked before the assertion because it awaits each node.
+        let engine = fleet.engine_stations().await;
         assert!(
             !assigned.is_refuted(),
             "every member's composition must produce an assignment over the carrier: {assigned:?}\
-             \nassignment epochs: {:?}\nlive beacons: {:?}\nknown peers: {:?}\nstations at the fixed point:{}",
+             \nassignment epochs: {:?}\nlive beacons: {:?}\nknown peers: {:?}\ndriver plane:{}\n\
+             engine plane:{engine}",
             fleet.nodes().iter().map(|n| n.assignment().epoch.get()).collect::<Vec<_>>(),
             fleet.nodes().iter().map(|n| n.live_beacon().map(|(e, _)| e.get())).collect::<Vec<_>>(),
             fleet.nodes().iter().map(|n| n.health().known_peers).collect::<Vec<_>>(),
@@ -1076,8 +1152,11 @@ mod tests {
     /// **The original text, kept because it is the derivation:** when this test fails, actuation has landed.
     /// That is the point of it: read
     /// `SelfOrganization::assigned` for the shape that was proposed (withhold the *advertisement*, do not stop
-    /// the task) and check the three things that gap touches — the viability floor, a node's mix key
-    /// outliving its assignment, and the still-absent `Escalation::Deficit`.
+    /// the task) and check the two things that gap touches — the viability floor, and a node's mix key
+    /// outliving its assignment. (A third was listed here, `Escalation::Deficit`. It is **not** to be built:
+    /// five of the six roles are addressed by geometry rather than by a directory, so there is no
+    /// advertisement a parent could lower, and recruiting across cells would hand a parent the placement aim
+    /// §L3 exists to deny. `docs/design-self-organization.md` §4 carries the derivation.)
     ///
     /// **Measured before shipping, three consecutive runs: two measured the witness (2.8 s, 31.1 s), one
     /// skipped on the saturated precondition (4 published, 4 assigned), none red.** The variance is the
@@ -1087,14 +1166,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture; see the note on why it is no longer an assertion"]
     async fn measure_whether_an_exit_advertises_a_role_the_cell_did_not_assign() {
-        use fanos_field::F4;
+        use fanos_field::F2;
         use fanos_core::roles::Role;
         use fanos_node::{RoleSet, resolve_exit_key};
         use fanos_primitives::Epoch;
 
         const N: usize = 5;
+        // **The plane is F2 because the exit floor is now `fault_budget(N) + 1`.** This probe needs the
+        // assignment to be a strict subset of the offer, and on `F4` that floor is `fault_budget(21) + 1 = 7`
+        // against five offering nodes — saturated, so the probe would skip for ever. On `F2` it is
+        // `fault_budget(7) + 1 = 3`, leaving two of five withholding with the plane still slack (7 points,
+        // 5 nodes), which is the same regime this fixture was written in.
         let roles = RoleSet { relay: true, exit: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F4>(N, Link::default(), roles).await.expect("a fleet starts");
+        let fleet = NodeFleet::spawn::<F2>(N, Link::default(), roles).await.expect("a fleet starts");
         // `until_settled`, not `until`, and the difference is the whole reason the first version of this
         // test went red on a quiet machine: a `bool` conflates "the fleet reached a fixed point that fails
         // the predicate" with "the deadline arrived while it was still converging". Measured here — one run
@@ -1128,9 +1212,13 @@ mod tests {
             // and the counters say *why* — which is the half a reader cannot reconstruct afterwards, because
             // the fleet is about to be shut down.
             eprintln!(
-                "SKIPPED {}: the fleet had not settled — {settled:?}{}",
+                "SKIPPED {}: the fleet had not settled — {settled:?}\ndriver plane:{}\nengine plane:{}",
                 module_path!(),
-                fleet.stations()
+                fleet.stations(),
+                // The half the sentence above promises and the driver's map cannot give: "why" for a fleet
+                // that did not settle is almost always a read that did not conclude, and that station lives
+                // only on the engine's plane.
+                fleet.engine_stations().await
             );
             fleet.shutdown().await;
             return;
@@ -1144,7 +1232,7 @@ mod tests {
         let client = reader.client();
         let genesis = client.genesis();
         // Ask about the coordinates the fleet actually occupies, not the whole plane.
-        // `build_cell_exit_directory` sweeps all `Plane::<F4>::N = 21` points and each miss waits out
+        // `build_cell_exit_directory` sweeps all `Plane::<F2>::N = 7` points and each miss waits out
         // `resolve::STORE_TIMEOUT` (5 s), so one sweep of a five-node fleet costs up to eighty seconds —
         // polling it in a loop is what made the first version of this test exceed a 500 s timeout without
         // ever reaching an assertion. Five targeted reads, all of which should hit, cost nothing by
@@ -1164,7 +1252,7 @@ mod tests {
                     continue;
                 }
                 let coord = node.health().address; // re-read each round: the coordinate is what moves
-                if resolve_exit_key::<F4>(&client, coord, Epoch::ZERO, Some(genesis)).await.is_some()
+                if resolve_exit_key::<F2>(&client, coord, Epoch::ZERO, Some(genesis)).await.is_some()
                     && let Some(slot) = advertised.get_mut(i)
                 {
                     *slot = true;
@@ -1606,15 +1694,71 @@ mod tests {
                 |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
             )
             .await;
-        let trace = fleet.observe(8, Duration::from_secs(2), fanos_node::Node::assignment).await;
+        // **A joint trajectory, because a final snapshot cannot answer the question the readings raised.**
+        // Across four reproductions `deliver` came out `[5,5,5,5,5]` beside rosters of `[5,3,3,3,5]` twice —
+        // full reach, short roster — and once exactly equal to the roster, `[4,4,5,5,3]`. Two readings, two
+        // stories. But `deliver` is sampled at diagnosis time while the roster is the last value the loop
+        // *computed*, so the difference may be nothing but recovery: reach lost while the roster was derived
+        // and regained before anyone looked. Sampling both on one clock is what separates "reach was never
+        // the problem" from "reach came back and nothing re-derived".
+        let trace = fleet
+            .observe(8, Duration::from_secs(2), |n| (n.assignment(), n.health().deliverable_points))
+            .await;
+        let reach = trace.map(|(_, d)| *d);
+        // **The epoch each roster was computed FOR, because a capability slot is keyed by it.**
+        // `cap_slot(coord, epoch)` hashes the epoch into the key, so a node reading epoch `E` cannot see a
+        // record its neighbour published at `E-1` — the slot is a different one, and the read succeeds by
+        // finding nothing. That failure mode raises nothing: the scan concluded, `Coverage::unresolved` is
+        // zero, `complete` is *true*, and the loop climbs its stability ladder and goes quiet while holding a
+        // roster short of the cell. Measured on 2026-08-17: two nodes reporting `complete` with a roster of 3
+        // against 5 occupied coordinates and reach to all 5 — a short roster that no station and no flag
+        // contradicts. Without this column the two causes of a short roster are indistinguishable, and only
+        // one of them is a read problem.
+        let epoch = trace.map(|(a, _)| a.epoch.get());
+        // **Read the reach metrics BEFORE the shutdown, so an intermittent failure diagnoses itself.**
+        // This assertion fires rarely and its message used to carry the roster vector alone — which says the
+        // cell froze short without saying whether the missing members were *unreachable* or merely
+        // *unpublished*. Those want opposite repairs, and five earlier readings could not separate them
+        // because the two metrics available were wrong in opposite directions: `peers` counts the dial book
+        // including unconfirmed seeds, `route` counts proven bindings only and is blind to a peer that
+        // dialled **in**. `deliver` is the union that answers it (`Health::deliverable_points`).
+        //
+        // Captured unconditionally rather than inside the failure arm: `shutdown` consumes the fleet, so by
+        // the time the assertion runs there is nothing left to ask.
+        let deliver: Vec<usize> = fleet.nodes().iter().map(|n| n.health().deliverable_points).collect();
+        let route: Vec<usize> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
+        let peers: Vec<usize> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
+        let complete: Vec<bool> = fleet.nodes().iter().map(|n| n.assignment().complete).collect();
+        // **And the reason a read did not conclude, which the store already records and nothing printed.**
+        // `Station::ReadInconclusive` is tagged with a `ReadStall`: `TimedOut` says the cell did not assemble
+        // a reconstructable shard-set inside `read_timeout`, `TableFull` says the read was never issued. On a
+        // lossless link with full reach those are very different accusations, and the pair
+        // (`complete = false`, reason) is what turns "a scan did not conclude" into a mechanism.
+        let plane = fleet.stations();
+        // Both planes: the driver's says whether a frame found a rung, the engine's says whether a read
+        // reached the store and how it ended. An earlier pass read the *absence* of `read.inconclusive` off
+        // the driver's plane alone and concluded the reads never reached the store — an absence that plane
+        // structurally cannot report. See `engine_stations`.
+        let engine = fleet.engine_stations().await;
         fleet.shutdown().await;
-        let roster = trace.map(|a| a.roster);
+        let roster = trace.map(|(a, _)| a.roster);
         assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
         assert!(
             !verdict.is_refuted(),
             "every node must resolve every OCCUPIED coordinate ({occupied} of {N}); the cell froze short of it: \
-             {verdict:?}\n{}",
-            roster.render()
+             {verdict:?}\n  deliver {deliver:?}  route {route:?}  peers {peers:?}  complete {complete:?}\n\
+             (deliver ≈ occupied − 1 everywhere means reach is NOT the cause and the missing members were \
+             unpublished at read time; a low deliver means the opposite)\n\
+             roster over the observation clock:\n{}\n\
+             reach over the SAME clock — if this rises while the roster stands still, reach was never the \
+             binding constraint and nothing re-derived once it returned:\n{}\n\
+             driver plane — did a frame find a rung:{plane}\n\
+             epoch each roster was computed for — a capability slot is keyed by it, so nodes reading \
+             different epochs read different slots and each finds the other absent while concluding:\n{}\n\
+             engine plane — did a read reach the store, and how did it end:{engine}",
+            roster.render(),
+            reach.render(),
+            epoch.render()
         );
         // Role-assignment churn is measured in `a_lossy_cell_does_not_churn_its_role_assignment`, not here.
         // It was briefly asserted in this test and passed — and then passed just as green with the fix under
@@ -1889,6 +2033,7 @@ mod tests {
 
 
 
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_the_cell_withholds_an_unassigned_exit_advertisement() {
@@ -1918,12 +2063,17 @@ mod tests {
         // `priority_key` re-draws the holders against each beacon — and it is the direct evidence the
         // neighbouring tripwire structurally cannot give. Before the change all five published every epoch,
         // unconditionally.
-        use fanos_field::F4;
+        use fanos_field::F2;
         use fanos_node::RoleSet;
 
         let floor = Duration::from_nanos(Config::default().minimum_epoch_period().0);
+        // **The plane is F2 because the exit floor is now `fault_budget(N) + 1`.** This probe needs the
+        // assignment to be a strict subset of the offer, and on `F4` that floor is `fault_budget(21) + 1 = 7`
+        // against five offering nodes — saturated, so the probe would skip for ever. On `F2` it is
+        // `fault_budget(7) + 1 = 3`, leaving two of five withholding with the plane still slack (7 points,
+        // 5 nodes), which is the same regime this fixture was written in.
         let roles = RoleSet { relay: true, exit: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn_with_epoch::<F4>(5, Link::ideal(), roles, floor).await.expect("fleet starts");
+        let fleet = NodeFleet::spawn_with_epoch::<F2>(5, Link::ideal(), roles, floor).await.expect("fleet starts");
         tokio::time::sleep(8 * floor).await;
         let withheld: Vec<Vec<(u64, u64)>> = fleet
             .nodes()
@@ -2237,7 +2387,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_epoch_boundary_is_the_only_thing_that_ends_a_node_s_freedom_to_re_seat() {
+    async fn the_settling_window_re_opens_at_every_boundary_and_closes_when_the_seat_is_read() {
         // **The premise every collision measurement in this file is read through, and nothing pinned it.**
         // Settle-on-join (`docs/design-coordinates.md`; `Wake::Resettle if at.joining`) lets a node re-seat on a
         // peer's better claim only until it has lived through an epoch boundary. So whether a harness is observing
@@ -2254,6 +2404,25 @@ mod tests {
         use fanos_field::F4;
         use fanos_node::RoleSet;
         use fanos_runtime::ports::stations::Station;
+
+        // The **count**, not the presence. Under the rule this test was written for, a node committed its
+        // seat exactly once and never again, so a boolean said everything there was to say. It no longer
+        // does: the window is re-entered at every boundary, and how many times a node has closed one is the
+        // whole difference between the two designs.
+        fn commits(fleet: &NodeFleet) -> Vec<u64> {
+            fleet
+                .nodes()
+                .iter()
+                .map(|n| {
+                    n.client()
+                        .driver_stations()
+                        .iter()
+                        .filter(|o| o.station == Station::SeatCommitted)
+                        .map(|o| o.count)
+                        .sum()
+                })
+                .collect()
+        }
 
         fn committed(fleet: &NodeFleet) -> usize {
             fleet
@@ -2278,22 +2447,37 @@ mod tests {
         assert!(all_committed, "at a {floor:?} epoch every node must cross a boundary and commit its seat; {seen} of 3 did");
         println!("MEASURED all three seats committed after {took:?} at a {floor:?} epoch (backstop, not a latency claim)");
 
-        // **The control's wait is the second kind of timeout — its expiry IS the success condition — so it must be
-        // derived or it proves nothing.** It is taken from the arm above: at least four short epochs, and at least
-        // twice as long as commitment actually took *on this host, under this load*. A loaded machine stretches
-        // `took` and stretches this window with it, which is the property a fixed sleep here would not have.
-        let window = (4 * floor).max(2 * took);
-        let dflt = NodeFleet::spawn::<F4>(3, Link::ideal(), RoleSet::default()).await.expect("fleet starts");
-        tokio::time::sleep(window).await;
-        let late = committed(&dflt);
-        let stations = dflt.stations();
-        dflt.shutdown().await;
-        assert_eq!(
-            late, 0,
-            "at the default {:?} epoch a node cannot reach a boundary in {window:?}, so every node must still be free \
-             to re-seat — {late} of 3 committed, which changes what every collision measurement in this file means. \
-             Stations:{stations}",
-            fanos_node::NodeConfig::default().epoch_period,
+        // **The control, re-stated — because the thing it controlled for stopped being true, and that is
+        // the finding rather than a maintenance chore.**
+        //
+        // It used to be: at the default 600 s epoch a node cannot reach a boundary in a few seconds, so
+        // every node must still be free to re-seat. That held only while a boundary was the *only* thing
+        // that ended freedom — and `at.joining` was then cleared at the first boundary and never restored,
+        // so a node resolved collisions once in its life and every later epoch re-derived every placement at
+        // once with nobody permitted to move. Measured at `n = 31` on `PG(2,4)`: the joining phase reaches
+        // **21 of 21** servable lines, the first boundary drops it to 13, and six boundaries do not recover
+        // it (`measure_whether_shadowing_clears_at_the_epoch_or_is_stationary`).
+        //
+        // So freedom now ends where the invariant always said it did — when the cell has read this placement
+        // (`Client::commit_seat`, called by the role loop, which already computes that) or when the walk is
+        // spent (`may_walk`, bounded by `probe_bound = q + 1`) — and the window **re-opens at every
+        // boundary**. What the harness needs is unchanged: it must be able to tell a free node from a
+        // committed one, and produce both. The producer is what moved, and this asserts the new one, which
+        // the old rule could not satisfy at all: over several boundaries a node commits **more than once**.
+        let rounds = 6 * floor;
+        let many = NodeFleet::spawn_with_epoch::<F4>(3, Link::ideal(), RoleSet::default(), floor)
+            .await
+            .expect("fleet starts");
+        let reopened = many.until(|f| commits(f).iter().all(|&c| c >= 2)).await;
+        let counts = commits(&many);
+        let stations = many.stations();
+        many.shutdown().await;
+        assert!(
+            reopened,
+            "the settling window must re-open at every boundary: after {rounds:?} of {floor:?} epochs every \
+             node should have closed at least two windows, and the counts are {counts:?}. Exactly one apiece \
+             is the old rule — a node that resolved collisions once and was frozen for every epoch after. \
+             Stations:{stations}"
         );
     }
 
@@ -2445,6 +2629,239 @@ mod tests {
         }
     }
 
+    /// **How many nodes does a cell need before its plane is covered?** — the sizing number the geometry
+    /// implies, measured against the shipping placement rather than a model of it.
+    ///
+    /// A cell is sized in **nodes**; a plane is counted in **points**; and line viability is a statement
+    /// about points (`fanos_geometry::points_serving_every_line`, `servable_lines`). Nothing connects the
+    /// two, so a deployment has no way to answer "how many members before my lines work". This measures it
+    /// end to end: real coordinate draws, the real line-confined probe walk (`fanos_vrf::probe_walk`), real
+    /// claim ranking and displacement.
+    ///
+    /// **Pre-registered, so the run can refute rather than confirm.** Simulating the same walk in isolation
+    /// predicted, for `PG(2,4)` (`N = 21`, floor `20`): at `n = 21` about `18.9` distinct points and `2.1`
+    /// nodes unbound, clearing the floor a quarter of the time; at `n = 31` about `20.8` distinct and `10.2`
+    /// unbound, clearing it almost always. The prediction that matters is the SHAPE — distinct must fall
+    /// visibly below `n`, and `unbound ≈ n − distinct`. If distinct tracks `n`, the model is wrong and the
+    /// placement is doing something the walk alone does not explain.
+    ///
+    /// `servable_now` is the quantity the cell actually cares about, and it is a step function of the other
+    /// two: below the floor it collapses, and the collapse is what `role.under_provisioned` reports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_how_many_nodes_a_plane_needs_before_its_lines_work() {
+        use std::collections::HashSet;
+        let roles = fanos_node::RoleSet {
+                relay: true,
+                rendezvous: true,
+                ..fanos_node::RoleSet::default()
+            };
+        let n_points = fanos_geometry::Plane::<fanos_field::F4>::N as usize;
+        let floor = fanos_geometry::points_serving_every_line(
+            fanos_geometry::Plane::<fanos_field::F4>::LINE_SIZE as usize,
+        );
+        println!("PG(2,4): {n_points} points, viability floor {floor}");
+        for count in [11usize, 16, 21, 26, 31] {
+            // The error, not just its absence. The first run printed "fleet did not start" for `n = 26`
+            // and `31` and threw the reason away, which turned the one regime this measurement exists to
+            // reach — `n/N ≈ 1.5` — into an unexplained blank.
+            let fleet =
+                match NodeFleet::spawn_as_drawn::<fanos_field::F4>(count, Link::ideal(), roles).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        println!("n={count}: fleet did not start — {e:?}");
+                        continue;
+                    }
+                };
+            // **The same settling budget the neighbouring collision measurement uses**, and it is not
+            // generosity. A coordinate read before displacement resolves counts a point that is about to be
+            // vacated: the first run gave `10 × 2s` and saw 19 bound nodes on 16 points with every
+            // `probe_index` still at `0` — nobody had moved yet, so the reading was of a cell mid-settle
+            // rather than of a settled one. `40 × 4s` is what the collision scenario one screen down found
+            // sufficient for resolution to complete.
+            let _ = fleet.observe(40, Duration::from_secs(4), fanos_node::Node::assignment).await;
+            // **Bound nodes only.** An unbound node still reports an `address` — its preferred point — so
+            // folding it into the occupancy counts a seat nobody holds. The first run of this measurement
+            // did exactly that and produced `distinct + unbound > n`, which is the arithmetic saying so.
+            let seats: Vec<(fanos_geometry::Triple, Option<u16>)> =
+                fleet.nodes().iter().map(|n| (n.health().address, n.health().probe_index)).collect();
+            let coords: HashSet<fanos_geometry::Triple> =
+                seats.iter().filter(|(_, i)| i.is_some()).map(|(a, _)| *a).collect();
+            let unbound = seats.iter().filter(|(_, i)| i.is_none()).count();
+            // Two BOUND nodes on one point is shadowing, which §L0 forbids outright — so it is reported as
+            // the finding it would be rather than averaged into the occupancy.
+            let bound = seats.len() - unbound;
+            if bound != coords.len() {
+                println!(
+                    "  !! {} bound nodes hold {} distinct points — shadowing, or `Health::address` is the \
+                     PREFERRED point rather than the settled one. seats {seats:?}",
+                    bound,
+                    coords.len()
+                );
+            }
+            let servable =
+                fanos_geometry::servable_lines::<fanos_field::F4>(|p| coords.contains(&p.coords()));
+            // **Does the built-in repair fire at all?** `apply` reacts to a contested seat by dialling the
+            // other party — `Displaced` (we took the point) and `Superseded` (a better claim holds it) —
+            // precisely so the two books exchange the claim neither has. But it can only react to a conflict
+            // its OWN directory already knows about: a node that has never heard of the incumbent gets
+            // `WriteOutcome::Bound`, seats on top of it, and tells nobody. These two counts separate "the
+            // conflict was never detected" from "it was detected and the repair did not converge", which are
+            // opposite defects and look identical in the seat table.
+            let station_total = |st| -> u64 {
+                fleet
+                    .nodes()
+                    .iter()
+                    .flat_map(|n| n.client().driver_stations())
+                    .filter(|o| o.station == st)
+                    .map(|o| o.count)
+                    .sum()
+            };
+            let taken = station_total(fanos_runtime::ports::stations::Station::DirectoryPointTaken);
+            let superseded =
+                station_total(fanos_runtime::ports::stations::Station::DirectorySeatSuperseded);
+            let self_conn =
+                station_total(fanos_runtime::ports::stations::Station::TransportSelfConnection);
+            println!(
+                "      repair: point_taken={taken} seat_superseded={superseded} self_connection={self_conn}"
+            );
+            println!(
+                "n={count:>3}  n/N={:.2}  distinct={:>3} of {n_points}  unbound={unbound:>3}  \
+                 servable_now={servable:>3} of {n_points}  {}",
+                count as f64 / n_points as f64,
+                coords.len(),
+                if coords.len() >= floor { "AT OR ABOVE FLOOR" } else { "below floor" }
+            );
+            fleet.shutdown().await;
+        }
+    }
+
+    /// **Does shadowing clear at the epoch, or is its PREVALENCE stationary?** — the question the
+    /// within-epoch reading cannot answer and the design's own bound turns on.
+    ///
+    /// `driver`'s resettle arm accepts two nodes on one point deliberately: an established node must not
+    /// move mid-epoch, so *"both then hold one point until the epoch turns"*. That bounds the life of any
+    /// one collision. It says nothing about how many exist at once — and placement is **re-derived** from a
+    /// fresh beacon each epoch, so every turn that clears a collision also mints a new draw that can make
+    /// one. If the prevalence is stationary, "bounded by the epoch" describes each pair while the cell
+    /// carries a steady population of doubly-held points, every one of them a routing fault at that point.
+    ///
+    /// The sibling measurement could not see this: it runs at `DEFAULT_EPOCH_PERIOD = 600 s` and observes
+    /// `160 s`, so **no epoch turns at all** and every number it reports is within one. This one shortens
+    /// the period so turns actually happen, and samples across them.
+    ///
+    /// Read `excess` (bound nodes minus the points they hold). Falling to `0` after each `epoch` step and
+    /// staying there is the design working; oscillating about a level is a stationary fault population, and
+    /// the level is the number the settling phase — designed, not built — would have to remove.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_shadowing_clears_at_the_epoch_or_is_stationary() {
+        use std::collections::{BTreeSet, HashSet};
+        let roles = fanos_node::RoleSet {
+            relay: true,
+            rendezvous: true,
+            ..fanos_node::RoleSet::default()
+        };
+        // **Long enough for the machinery that RESPONDS to a turn, and that bound is not the beacon's.**
+        // The first version used `8 s`, which fits twenty turns into the run and is a measurement of the
+        // wrong thing: `ROSTER_REFRESH = 15 s` and a roster needs `STABLE_BEFORE_BACKOFF = 3` looks to
+        // settle, so placement was being re-derived about six times faster than anything could follow it.
+        // The excess it reported (11–14 of 30) is what an out-of-spec period produces, and the contrast
+        // proves it — the same fleet at the 600 s default sits at 1–6. A period must exceed the settling
+        // cadence or the reading is about the fixture.
+        //
+        // `60 s` is four times the refresh floor and above the `3 × 15 s` a roster takes to settle, while
+        // still fitting six turns into the run — which is what makes "did it clear at the turn" answerable
+        // at all. The production default is `600 s`; nothing here claims a shorter one is safe, only that
+        // the response has room.
+        let period = Duration::from_secs(60);
+        // **Two loads, because only one of them can show a repair.** At `n = 31` on 21 points the excess is
+        // arithmetic: thirty-one nodes cannot hold twenty-one points without sharing, and the measured
+        // excess of 12–14 is exactly `31 − points`. A mechanism that moves a loser onto a free point has no
+        // free point to move it to, and the remainder belongs in sub-cells production cannot reach. At
+        // `n = 16` five points are spare, so shadowing is *reducible* there and its level says whether the
+        // repair works rather than whether the plane is full.
+        for count in [16usize, 31] {
+        let fleet =
+            match NodeFleet::spawn_as_drawn_with_epoch::<fanos_field::F4>(count, Link::ideal(), roles, period)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("fleet did not start — {e:?}");
+                    return;
+                }
+            };
+        println!("\n=== PG(2,4): 21 points, n={count} (n/N={:.2}), epoch period {period:?}", count as f64 / 21.0);
+        for tick in 0..18u32 {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let seats: Vec<(fanos_geometry::Triple, Option<u16>)> =
+                fleet.nodes().iter().map(|n| (n.health().address, n.health().probe_index)).collect();
+            let bound: Vec<fanos_geometry::Triple> =
+                seats.iter().filter(|(_, i)| i.is_some()).map(|(a, _)| *a).collect();
+            let points: HashSet<fanos_geometry::Triple> = bound.iter().copied().collect();
+            let epochs: BTreeSet<u64> =
+                fleet.nodes().iter().map(|n| n.assignment().epoch.get()).collect();
+            let beacons: BTreeSet<u64> =
+                fleet.nodes().iter().filter_map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+            println!(
+                "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}  epochs={epochs:?}  \
+                 beacons={beacons:?}",
+                tick * 20,
+                bound.len(),
+                points.len(),
+                bound.len() - points.len(),
+                fanos_geometry::servable_lines::<fanos_field::F4>(|p| points.contains(&p.coords())),
+            );
+        }
+
+        // **The correlation the sets above cannot show.** Two facts came out of this run: the excess never
+        // reaches zero across twenty beacon turns, and the cell never agrees on an epoch — `{0, 1, 2}`
+        // persists beside `19`. If the SAME nodes are both stuck and shadowed, the two are one loop rather
+        // than two faults: a node sharing its point is unaddressable there, so it misses the beacon that
+        // would re-derive its placement, so it keeps the point it is sharing. The design's remedy for
+        // shadowing is "wait for the epoch"; that remedy would then be disabled by the very fault it
+        // answers, for exactly the nodes that need it.
+        let final_seats: Vec<(fanos_geometry::Triple, Option<u16>, u64, Option<u64>)> = fleet
+            .nodes()
+            .iter()
+            .map(|n| {
+                let h = n.health();
+                (h.address, h.probe_index, n.assignment().epoch.get(), n.live_beacon().map(|(e, _)| e.get()))
+            })
+            .collect();
+        let mut held: std::collections::BTreeMap<fanos_geometry::Triple, usize> =
+            std::collections::BTreeMap::new();
+        for (a, i, _, _) in &final_seats {
+            if i.is_some() {
+                *held.entry(*a).or_default() += 1;
+            }
+        }
+        let newest = final_seats.iter().filter_map(|(_, _, _, b)| *b).max().unwrap_or(0);
+        let (mut shad_stuck, mut shad_ok, mut solo_stuck, mut solo_ok) = (0u32, 0u32, 0u32, 0u32);
+        for (a, i, _, b) in &final_seats {
+            if i.is_none() {
+                continue;
+            }
+            let shadowed = held.get(a).copied().unwrap_or(0) > 1;
+            let stuck = b.unwrap_or(0) + 2 < newest;
+            match (shadowed, stuck) {
+                (true, true) => shad_stuck += 1,
+                (true, false) => shad_ok += 1,
+                (false, true) => solo_stuck += 1,
+                (false, false) => solo_ok += 1,
+            }
+        }
+        println!(
+            "\ncorrelation at the end of the run (newest beacon {newest}; `stuck` = more than two epochs behind):\n  \
+             shadowed & stuck {shad_stuck:>3}   shadowed & current {shad_ok:>3}\n  \
+             alone    & stuck {solo_stuck:>3}   alone    & current {solo_ok:>3}"
+        );
+        fleet.shutdown().await;
+        }
+    }
+
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_roster_convergence_with_collisions_allowed() {
@@ -2484,12 +2901,22 @@ mod tests {
             //
             // `route` is the third reading because the first two cannot separate the case that matters most here.
             // `claims` counts what the CLAIM BOOK verified; `route` counts what the DIAL TABLE will resolve, and the
-            // arbitration rule can refuse a write whose claim verified fine (`WriteOutcome::Superseded`). A node with
-            // `claims` high and `route` low heard its rivals and cannot reach them — which is a table state, not a
-            // propagation failure, and the two were previously one symptom. `peers` sees neither, counting seeds too.
+            // arbitration rule can refuse a write whose claim verified fine (`WriteOutcome::Superseded`).
+            //
+            // **The reading this comment used to carry was stronger than its metrics.** It said a node with
+            // `claims` high and `route` low "heard its rivals and cannot reach them", and neither number can
+            // say that: `route` counts *ranked* bindings while the send ladder resolves without consulting
+            // rank, so it under-counts reach; `peers` counts the dial book including seeds no handshake
+            // confirmed, so it over-counts. The gap between two numbers that are wrong in opposite
+            // directions cannot mean "cannot reach".
+            //
+            // `deliver` is the quantity that can: a ranked binding **or** a live connection, the union. Its
+            // decisive case is this fixture's own bootstrap node, which dialled nobody — `peers` and `route`
+            // both read zero while every other node holds a connection to it and it answers each one.
             let claims: Vec<_> = fleet.nodes().iter().map(|n| n.health().verified_claims).collect();
             let peers: Vec<_> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
             let route: Vec<_> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
+            let deliver: Vec<_> = fleet.nodes().iter().map(|n| n.health().deliverable_points).collect();
             // The FIFTH reading, and it says what the fourth is worth (#289): a roster count from an incomplete
             // scan is a race the next epoch settles; the same count from a complete one is the cell deciding on
             // an input its members do not share. Without it `agreed=None` names no cause.
@@ -2497,7 +2924,7 @@ mod tests {
             fleet.shutdown().await;
             let roster = trace.map(|a| a.roster);
             println!(
-                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} route {route:?} peers {peers:?} complete {complete:?} → final rosters {:?} agreed={:?}",
+                "trial {trial}: {} distinct of 7, index {idx:?} claims {claims:?} route {route:?} deliver {deliver:?} peers {peers:?} complete {complete:?} → final rosters {:?} agreed={:?}",
                 distinct.len(),
                 roster.last(),
                 roster.stable_agreement_at().map(|d| d.as_secs())
