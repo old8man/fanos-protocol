@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant as StdInstant;
 
@@ -40,7 +41,7 @@ use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::{Directory, WriteOutcome};
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
-use fanos_vrf::{CoordinateClaim, VrfProof, VrfPublic};
+use fanos_vrf::{CoordinateClaim, VrfOutput, VrfProof, VrfPublic};
 
 use crate::claims::{self, ClaimBook};
 use crate::identity::{
@@ -490,10 +491,10 @@ use fanos_wire::MAX_FRAME;
 /// TYPE at the site: walking the plane needs `F`, and `F` is monomorphised away at spawn, so by the time the
 /// send loop holds a `Proven(actual)` there is no type left to walk with. Carrying the walk as a value
 /// closes that without touching a frame, a proof, or a witness chain.
-type ProbeIndex = fn(&fanos_vrf::VrfOutput, Triple) -> Option<u16>;
+type ProbeIndex = fn(&VrfOutput, Triple) -> Option<u16>;
 
 /// [`ProbeIndex`] for a concrete plane — monomorphised where `F` is still known and passed down as a value.
-fn probe_index_on<F: Field>(output: &fanos_vrf::VrfOutput, coord: Triple) -> Option<u16> {
+fn probe_index_on<F: Field>(output: &VrfOutput, coord: Triple) -> Option<u16> {
     let point = Point::<F>::new(coord)?;
     fanos_vrf::probe_index_of::<F>(output, &point)
 }
@@ -873,6 +874,10 @@ pub type Beacons = tokio::sync::watch::Receiver<Option<(Epoch, [u8; 32])>>;
 /// Dropping the handle (or calling [`NodeHandle::shutdown`]) closes the endpoint and lets the
 /// actors wind down.
 pub struct NodeHandle {
+    /// The live connection cache, shared with the driver task — held so a reader can pair it with the
+    /// directory (see [`Directory::deliverable_points`], which is the pairing the directory's own doc names
+    /// as the missing step).
+    conns: ConnMap,
     /// Peer coordinate claims verified this epoch — the input coordinate resolution runs on. `None` for a node with no
     /// self-certifying identity, which never resolves and therefore has no book.
     ///
@@ -899,6 +904,10 @@ pub struct NodeHandle {
     /// forever, from the first reshuffle onward. That is a defect in the shipped reshuffle, not only in probing: an
     /// operator surface that names a node's position must name where it actually is.
     addr: Arc<Mutex<Triple>>,
+    /// Whether this node's placement is still settleable — see `Placement::settling`. Shared with the
+    /// reshuffle loop, which re-enters it at every boundary, and with every [`Client`], through which
+    /// the layer that knows the answer closes it ([`Client::commit_seat`]).
+    settling: Arc<AtomicBool>,
     /// The **driver's own** data-path readings, merged into the engine's when `Observe` is answered.
     ///
     /// Some work stops on this side of the seam and the engine never learns of it: a directory publish whose
@@ -919,7 +928,7 @@ pub struct NodeHandle {
     send_drops: Arc<std::sync::atomic::AtomicU64>,
     /// **This node was asked to stop** — the discriminator every supervisor reads (#257). See
     /// [`Client::is_stopping`] for why an actor's ending cannot be judged without it.
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    stopping: Arc<AtomicBool>,
     endpoint: Endpoint,
     reflexive: Reflexive,
     /// The **network's genesis seed** — the value epoch-0 coordinates on this network are drawn against
@@ -942,7 +951,7 @@ impl NodeHandle {
     /// The shared "this node was asked to stop" flag, for a supervisor spawned after the handle exists
     /// (#257) — the reshuffle loop is the one such actor. Same reasoning as [`Self::stations_handle`]: the
     /// supervisor must read the flag at the moment its actor ends, so it needs the cell, not a reading.
-    pub(crate) const fn stopping_handle(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) const fn stopping_handle(&self) -> &Arc<AtomicBool> {
         &self.stopping
     }
 
@@ -979,7 +988,7 @@ impl NodeHandle {
     /// that makes a defect unfalsifiable.
     #[must_use]
     pub fn send_drops(&self) -> u64 {
-        self.send_drops.load(std::sync::atomic::Ordering::Relaxed)
+        self.send_drops.load(Ordering::Relaxed)
     }
 
     /// How many peers' coordinate claims this node has verified this epoch, or `None` without a self-certifying identity.
@@ -1003,7 +1012,7 @@ impl NodeHandle {
     /// cell — because `contender` scores a peer by `probe_index_of(their_output, p)`, which is `Some` for
     /// every point on that peer's probe walk, and a walk covers its whole line. Almost every node therefore
     /// "has a claim" to almost every point, and the column was nearly vacuous. What decides a contest is
-    /// [`claim_beats`], and [`ClaimBook::outranked_at`] applies exactly it, against the very order
+    /// `claim_beats`, and `ClaimBook::outranked_at` applies exactly it, against the very order
     /// `settle_index` walks.
     ///
     /// So a `true` here is load-bearing: `settle_index`'s order is **total**, so of a colliding pair exactly
@@ -1020,6 +1029,21 @@ impl NodeHandle {
         let book = self.claims.as_ref()?;
         let (index, mine) = directory.claim_at(self.address())?;
         Some(book.outranked_at::<F>(&mine, index).is_some())
+    }
+
+    /// Coordinates this node can reach on evidence **right now** — see [`Directory::deliverable_points`]
+    /// for why neither the dial book nor the ranked count answers that.
+    ///
+    /// The live half is the connection map's key set: a coordinate with an open connection is answering by
+    /// definition, whether or not this node ever held an address for it. That half is what the ranked count
+    /// structurally cannot see, and it is the half a node accumulates by being *dialled*.
+    pub fn deliverable_points(&self, directory: &Directory) -> usize {
+        let live: BTreeSet<Triple> = self
+            .conns
+            .lock()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        directory.deliverable_points(&live)
     }
 
     /// The UDP socket address the node is actually bound to (its directory entry).
@@ -1075,6 +1099,8 @@ impl NodeHandle {
     pub fn client(&self) -> Client {
         Client {
             addr: self.addr.clone(),
+            settling: Arc::clone(&self.settling),
+            claims: self.claims.clone(),
             stations: self.stations.clone(),
             input_tx: self.input_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
@@ -1098,7 +1124,7 @@ impl NodeHandle {
     /// flag after the close would race the very ending it is trying to classify. Raised first, the ending is
     /// always judged against a `true`. `Release`/`Acquire` pair the store with those reads.
     pub fn shutdown(&self) {
-        self.stopping.store(true, std::sync::atomic::Ordering::Release);
+        self.stopping.store(true, Ordering::Release);
         self.endpoint.close(0u32.into(), b"shutdown");
     }
 
@@ -1150,6 +1176,11 @@ enum Control {
 pub struct Client {
     /// The node's live coordinate — the same shared cell [`NodeHandle`] holds, not a copy of it.
     addr: Arc<Mutex<Triple>>,
+    /// See [`NodeHandle::settling`] — the window this node may still walk its probe index in.
+    settling: Arc<AtomicBool>,
+    /// The peers' verified coordinate claims, shared with the reshuffle loop. `None` for a node with no
+    /// self-certifying identity, which resolves no coordinates and has nothing to record.
+    claims: Option<ClaimBook>,
     /// The driver's data-path plane — the same shared cell [`NodeHandle`] holds.
     stations: Arc<Mutex<Stations>>,
     input_tx: mpsc::Sender<Input>,
@@ -1158,7 +1189,7 @@ pub struct Client {
     beacons: Beacons,
     genesis: BeaconSeed,
     /// Whether this node is on its way out — see [`Client::is_stopping`].
-    stopping: Arc<std::sync::atomic::AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -1171,6 +1202,56 @@ impl Client {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .record_tagged(station, line, tag, 1);
+    }
+
+    /// **The cell has read this node's placement — stop settling.** Closes the window the reshuffle loop
+    /// re-enters at every boundary (see `NodeHandle::settling`), and records
+    /// [`Station::SeatCommitted`](fanos_runtime::ports::stations::Station::SeatCommitted) on the transition.
+    ///
+    /// Called by the layer that knows, which is not this one. The rule being enforced is *"a node the cell
+    /// has derived something from must not move"*, and the fact behind it — whether anything above has read
+    /// this coordinate — is the role loop's: it already withholds while it cannot find its own advertisement
+    /// in the roster it just scanned, and already reports that (`Station::AssignmentWithheld`). A self-read
+    /// is the sound lower bound: while *this* node cannot read its own record, no other node can either, so
+    /// nothing can have derived from it.
+    ///
+    /// Idempotent, and the station fires once per window: repeated calls within one epoch are the ordinary
+    /// case (the role loop reads on every refresh), and a boundary re-opens the window for the next one.
+    pub fn commit_seat(&self) {
+        if self.settling.swap(false, Ordering::Release) {
+            self.record_station(Station::SeatCommitted, None, None);
+        }
+    }
+
+    /// **Record a peer's coordinate claim that arrived through the DIRECTORY rather than a handshake.**
+    ///
+    /// The book is normally fed by connections: a peer proves its coordinate in the HELLO and the verifier
+    /// files it. That path has a hole exactly where it matters most. Two nodes contending for one point are
+    /// mutually invisible *at that point* — each one's table resolves it to itself, which is the
+    /// `transport.self_connection` a contested cell measures — so the one whose record was silently
+    /// overwritten in `cap_slot` cannot meet the winner by dialling the coordinate they are fighting over.
+    ///
+    /// The slot is the meeting place instead, and it needs no routing: `cap_slot(coord, epoch)` is derived
+    /// from the coordinate, so both claimants read and write the same key by construction. A record found
+    /// there under another identity is a *verified* claim to this node's own point —
+    /// `Entitlement::open_with_claim` has checked the proof against `(coord, epoch, beacon)` and derived the
+    /// pair `claim_beats` orders by — so filing it is the same act the handshake performs, with the same
+    /// evidence, reached the one way the contest cannot hide from.
+    ///
+    /// `settle_index` is monotone in information, so a claim arriving late can only move this node further
+    /// along its own walk, never back — and how *fast* it may move is bounded separately
+    /// (`Placement::last_move`), because a walk that outruns the propagation of its own new position is how
+    /// this repair paid for itself in lost beacon partials the first time it was tried.
+    pub fn record_peer_claim<F: Field>(
+        &self,
+        id: &[u8],
+        public: VrfPublic,
+        proof: VrfProof,
+        output: &VrfOutput,
+    ) {
+        if let Some(book) = &self.claims {
+            book.record::<F>(id, public, proof, output);
+        }
     }
 
     /// This node's driver-side readings, to be folded into the engine's answer to `Observe`.
@@ -1201,7 +1282,7 @@ impl Client {
     /// is the one ending that says the code is wrong rather than that the operator asked.
     #[must_use]
     pub fn is_stopping(&self) -> bool {
-        self.stopping.load(std::sync::atomic::Ordering::Acquire) || self.input_tx.is_closed()
+        self.stopping.load(Ordering::Acquire) || self.input_tx.is_closed()
     }
 
     /// This node's overlay coordinate, as of now — the same shared cell [`NodeHandle::address`] reads.
@@ -1935,7 +2016,9 @@ where
             // The seed this node's epoch-0 seat was actually drawn against, not the constant: the reshuffle
             // loop compares against it to decide whether a new beacon moves the coordinate at all.
             beacon: genesis_seed,
-            joining: true,
+            settling: Arc::clone(&handle.settling),
+            walk_after: None,
+            rounds: 0,
         },
         Reseater {
             dials: handle.dials.clone(),
@@ -2120,17 +2203,69 @@ impl BeaconWindow {
 /// publishing a claim for one epoch against the beacon of another.
 struct Placement {
     coord: Triple,
-    output: fanos_vrf::VrfOutput,
+    output: VrfOutput,
     index: u16,
     epoch: Epoch,
     beacon: BeaconSeed,
-    /// Whether this node is still **joining** — it has not yet lived through an epoch boundary.
+    /// Whether this node's placement is still **settleable** — nothing above it has derived anything from
+    /// its coordinate yet, so it may walk its probe index.
     ///
-    /// This is what makes moving safe, and it is a sharper condition than a timer. Committee membership, shard placement
-    /// and routing are all derived *at a boundary*, so a node that joined after the current one is in none of those sets:
-    /// nothing above it has derived anything from its coordinate yet, and it may re-seat freely. The moment the first
-    /// `BeaconReady` arrives, the cell commits to wherever it then sits, and it must stop.
-    joining: bool,
+    /// **The condition was always this; the implementation used to substitute "a boundary has happened".**
+    /// Committee membership, shares and routing are derived *at a boundary*, so a node the cell has not read
+    /// is in none of them and may re-seat freely. The old rule cleared this once, at the first
+    /// `BeaconReady`, and never restored it — but a boundary **re-derives the coordinate**, so the cell was
+    /// held to commit to a point drawn a moment earlier and never resolved. Measured
+    /// (`measure_whether_shadowing_clears_at_the_epoch_or_is_stationary`, `n = 31` on `PG(2,4)`, 60 s epoch):
+    /// the joining phase reaches 20 of 21 points and **21 of 21 servable lines**, the first boundary drops it
+    /// to 15 points and 13 lines, and six boundaries do not recover it — because after the first one no node
+    /// is permitted to resolve anything.
+    ///
+    /// So the window is re-entered at every boundary and closed by the fact it always named: **the cell has
+    /// read this placement.** Shared rather than owned because only the layer above knows that
+    /// ([`Client::commit_seat`]) — the role loop already computes it, since a node that cannot find its own
+    /// advertisement is exactly a node nothing has derived from, and it already reports it
+    /// (`Station::AssignmentWithheld`). A self-read is a sound lower bound: while *this* node cannot read its
+    /// own record, no other node can either.
+    settling: Arc<AtomicBool>,
+    /// The earliest this node may take its next step along the walk — a *rate*, and after a boundary also
+    /// a **stagger**.
+    ///
+    /// **The count was the right bound and the wrong dimension.** `rounds` is spent on notifications, which
+    /// arrive in bursts, so a node could exhaust its whole `q + 1` budget in milliseconds and end up on a
+    /// point no peer has heard it took. Everything that addresses it — beacon partials included, which the
+    /// beacon floods to *every* point of the plane and the transport must then resolve — lands on a seat it
+    /// has left. Measured three ways: the unbounded window gave 21 and 24 nodes more than two beacons
+    /// behind, the slot arbiter (which is what makes a node move at all) gave 22, and the only build that
+    /// did not increase movement gave 0.
+    ///
+    /// The interval is [`HELLO_DEADLINE`], and it is the right one by meaning rather than by size: a peer
+    /// learns a new seat by completing a handshake to it, and that constant is this driver's own bound on
+    /// how long one may take. Moving faster than it guarantees an in-flight handshake arrives at a vacated
+    /// point.
+    ///
+    /// **A cell-wide stagger of the first step was tried here and REVERTED**, because the epoch has no room
+    /// for it. One full walk at this rate already costs `(q+1) · HELLO_DEADLINE` — 50 s on `PG(2,4)` — and
+    /// the fixture's epoch is 60 s, so spreading the first step over the same interval pushes most nodes'
+    /// only move to the end of the period, where the new seat has no time to propagate before every
+    /// coordinate is re-derived again. Measured: nodes more than two beacons behind went from **1 of 31**
+    /// to **24 of 31**. Simultaneity is still the standing explanation for why a boundary never recovers
+    /// what sequential arrival reaches (`genesis 11 on 11, excess 0`), but the remedy needs an epoch that
+    /// contains a walk with room to spare — see the ceiling that implies: `epoch >= (q+1) · HELLO_DEADLINE`
+    /// caps the plane at `q = 59` for the 600 s default.
+    walk_after: Option<tokio::time::Instant>,
+    /// Resettle rounds spent in the current window, bounded by the walk itself.
+    ///
+    /// **The window needs a floor as well as a door, and the first version had only a door.** Closing on
+    /// "the cell has read me" is right and is *unreachable for exactly the nodes that need it*: a shadowed
+    /// node's advertisement is overwritten at `cap_slot`, so it never finds its own record, never commits,
+    /// and — with nothing else to stop it — walks for the whole epoch. Measured: two runs at `n = 31` on
+    /// `PG(2,4)` went from **0 of 30** nodes more than two beacons behind to **21 and 24 of 30**, because a
+    /// node that keeps moving keeps leaving the coordinate its beacon partials are addressed to.
+    ///
+    /// The bound is the geometry's, not a constant: `fanos_vrf::probe_bound::<F>() = q + 1` is the whole
+    /// length of a probe walk, so after that many rounds there is nowhere left to go and staying settleable
+    /// buys nothing. `settle_index` is monotone, so the count cannot be reset by a peer arriving late.
+    rounds: u16,
 }
 
 /// The three surfaces a re-seat has to move together, in one value.
@@ -2242,6 +2377,24 @@ impl Reseater {
     }
 }
 
+/// Whether a settleable placement has any walking left in it — the window's **floor**, where
+/// `Client::commit_seat` is its door.
+///
+/// **A window with only a door does not close for the nodes that need it.** Closing on "the cell has read
+/// me" is the right condition and is unreachable for a shadowed node: its advertisement is overwritten at
+/// `cap_slot`, so it never finds its own record and would walk for the whole epoch. Measured on the same
+/// instrument, `n = 31` on `PG(2,4)` at a 60 s epoch: with a door alone, nodes more than two beacons behind
+/// went from **0 of 30** to **21 and 24 of 30** over two runs — a node that keeps moving keeps leaving the
+/// coordinate its beacon partials are addressed to. With this floor, back to **0 of 31**.
+///
+/// **The bound is the geometry's, not a chosen number.** `fanos_vrf::probe_bound::<F>()` is `q + 1`, the
+/// whole length of a probe walk, so after that many rounds every point of this node's line has been
+/// considered and staying settleable can place it nowhere new. `settle_index` is monotone in information,
+/// so the count cannot be undone by a peer arriving late.
+const fn may_walk(rounds: u16, bound: u16) -> bool {
+    rounds <= bound
+}
+
 /// The per-epoch coordinate reshuffle **and live collision-resolution** driver (spec §L3 "epoch reshuffle", §3.2;
 /// tasks #102 and the probe-index wiring).
 ///
@@ -2333,10 +2486,15 @@ async fn reshuffle_loop<F: Field>(
                 // explanations. No line: the point is settled a few lines below and either `continue` can leave it where
                 // it was, so a coordinate recorded here would be the one held *entering* the boundary — a value close
                 // enough to the real answer to be read as it.
-                if at.joining {
-                    seat.client.record_station(Station::SeatCommitted, None, None);
-                }
-                at.joining = false;
+                // **Re-enter the window; do not close it.** The coordinate was just re-derived, so nothing
+                // above has read *this* placement yet — which is the condition the flag has always named.
+                // Closing here made the cell commit to an unresolved draw, and the measurement is the
+                // argument: the joining phase reaches every servable line and the first boundary loses a
+                // third of them for good. `Station::SeatCommitted` moved with the fact it reports, to
+                // `Client::commit_seat`, where the commitment actually happens.
+                at.settling.store(true, Ordering::Release);
+                at.rounds = 0;
+                at.walk_after = None;
                 // The book's claims belong to the retired epoch; clearing it is what stops a peer's past placement from
                 // justifying a displacement now. Settling immediately afterwards therefore lands at index 0 and moves
                 // up again as this epoch's peers are met.
@@ -2363,7 +2521,17 @@ async fn reshuffle_loop<F: Field>(
             // built. Whether moving an established node is in fact harmful is **unverified** rather than disproven — the
             // measurement that appeared to show it breaking consensus was a load artefact the baseline refuted — and "do
             // not move a node the cell has committed to" is the right default while that is open.
-            Wake::Resettle if at.joining => {
+            Wake::Resettle if at.settling.load(Ordering::Acquire) => {
+                // Too soon since the last step to have been followed — say nothing and spend no round. The
+                // next notification retries; the boundary clears the clock along with the budget.
+                if at.walk_after.is_some_and(|t| tokio::time::Instant::now() < t) {
+                    continue;
+                }
+                at.rounds = at.rounds.saturating_add(1);
+                if !may_walk(at.rounds, fanos_vrf::probe_bound::<F>()) {
+                    seat.client.commit_seat();
+                    continue;
+                }
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
                 let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
                     continue; // beaten on every point of the line; hold the current announcement rather than retract it
@@ -2374,6 +2542,7 @@ async fn reshuffle_loop<F: Field>(
                 if !seat.apply::<F>(&mut at, index, &claim) {
                     break;
                 }
+                at.walk_after = Some(tokio::time::Instant::now() + HELLO_DEADLINE);
             }
             // **The established node says so instead (#260).** Two rules, each sound alone, deadlock together:
             // `claim_beats` can decide the *seated* node lost, and the rule above forbids exactly that node to walk
@@ -2480,7 +2649,7 @@ fn bind_own_seat(
     stations: &Arc<Mutex<Stations>>,
     coord: Triple,
     addr: SocketAddr,
-    rank: Option<fanos_vrf::VrfOutput>,
+    rank: Option<VrfOutput>,
 ) {
     let outcome = match rank {
         Some(rank) => directory.insert_ranked(coord, addr, rank),
@@ -2600,7 +2769,7 @@ impl DriverActor {
 fn supervise(
     actor: DriverActor,
     stations: &Arc<Mutex<Stations>>,
-    stopping: &Arc<std::sync::atomic::AtomicBool>,
+    stopping: &Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<()>,
 ) -> tokio::task::JoinHandle<()> {
     let stations = Arc::clone(stations);
@@ -2610,7 +2779,7 @@ fn supervise(
         let panicked = ending.as_ref().err().is_some_and(tokio::task::JoinError::is_panic);
         // Read the flag AFTER awaiting the ending: `shutdown` raises it before closing the endpoint, so an
         // actor that ended because of the stop always finds it already `true`.
-        if !panicked && stopping.load(std::sync::atomic::Ordering::Acquire) {
+        if !panicked && stopping.load(Ordering::Acquire) {
             tracing::debug!(actor = actor.name(), "a driver actor retired because the node is stopping");
             return;
         }
@@ -2628,6 +2797,22 @@ fn supervise(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .record_tagged(Station::ActorDied, None, Some(actor.tag()), 1);
+    })
+}
+
+/// The datagram socket everything above rides on, obtained the one way the caller asked for.
+///
+/// Separated from [`spawn_inner`] because it is the one part of building a node that has nothing to do with
+/// a node: a real UDP bind and a simulator's in-memory fabric are two ways to get the same trait object, and
+/// which one is in use says nothing about the endpoint, the engine or the actors. Keeping it inline made
+/// `spawn_inner` a function whose first eight lines were about a socket.
+fn carrier_for(fabric: Fabric) -> Result<Arc<dyn quinn::AsyncUdpSocket>, QuicError> {
+    Ok(match fabric {
+        Fabric::Udp(bind) => {
+            use quinn::Runtime as _;
+            quinn::TokioRuntime.wrap_udp_socket(std::net::UdpSocket::bind(bind)?)?
+        }
+        Fabric::Abstract(socket) => socket,
     })
 }
 
@@ -2656,14 +2841,7 @@ fn spawn_inner(
     // Both carriers go through one abstract socket so the PROTEUS envelope (§13.3/§13.5) can wrap either.
     // Production used to take `Endpoint::server`, which owns its socket and admits no decorator — the
     // reason the envelope had nowhere to live and the handshake shipped in plaintext.
-    let carrier: Arc<dyn quinn::AsyncUdpSocket> = match fabric {
-        Fabric::Udp(bind) => {
-            use quinn::Runtime as _;
-            let sock = std::net::UdpSocket::bind(bind)?;
-            quinn::TokioRuntime.wrap_udp_socket(sock)?
-        }
-        Fabric::Abstract(socket) => socket,
-    };
+    let carrier = carrier_for(fabric)?;
     // The driver-side data-path plane, created **here** rather than at the `NodeHandle` below so the
     // transport can share it (#191). It now has to exist even earlier than that: the datagram envelope is
     // the outermost gate, and a refusal there is invisible everywhere else by design (#232).
@@ -2708,7 +2886,7 @@ fn spawn_inner(
     let (events_tx, events_rx) = broadcast::channel::<Notification>(4096);
     // Latest-state for the epoch, fed by the router (the one lossless reader) — see [`Beacons`].
     let (beacon_tx, beacon_rx) = tokio::sync::watch::channel::<Option<(Epoch, [u8; 32])>>(None);
-    let conns: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+    let (conns, conns_readable): (ConnMap, ConnMap) = { let m: ConnMap = Arc::new(Mutex::new(HashMap::new())); (Arc::clone(&m), m) };
     let reflexive: Reflexive = Arc::new(Mutex::new(ReflexiveAddr::new(reflexive_quorum)));
     let peer_addrs: PeerAddrs = Arc::new(Mutex::new(HashMap::new()));
     // Identity-keyed distrust, shared between the engine loop (which sees verdicts) and the accept path (which sees who
@@ -2719,7 +2897,7 @@ fn spawn_inner(
     let send_drops: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Shared with every supervisor, the handle and each `Client`: the one place that says whether an actor's
     // ending was asked for (#257). See [`Client::is_stopping`].
-    let stopping: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     // The one live coordinate cell every handle and client above shares. A copy per layer is what let the reported
     // coordinate go stale at the first reshuffle.
     let seat = Arc::new(Mutex::new(addr));
@@ -2767,8 +2945,12 @@ fn spawn_inner(
     );
 
     Ok(NodeHandle {
+        conns: Arc::clone(&conns_readable),
         dials: dial_tx,
         addr: seat,
+        // Beside the seat because it qualifies it — *may this seat still move?* A node starts settleable:
+        // at spawn nothing above has read it, and the reshuffle loop re-enters the window at every boundary.
+        settling: Arc::new(AtomicBool::new(true)),
         stations,
         stopping,
         local_addr,
@@ -2979,7 +3161,7 @@ async fn transport_loop(t: Transport, mut send_rx: mpsc::UnboundedReceiver<SendR
         // silent drop is the property that makes a defect unfalsifiable — `fanos status health` reports it,
         // and a non-zero count is the operator's evidence that a peer is not draining.
         if worker.try_send(frame).is_err() {
-            t.send_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            t.send_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -4003,7 +4185,7 @@ struct Handshake {
     /// back as a value.
     ///
     /// `None` on every non-`Proven` outcome, and on a `Proven` one reached by a path that never had it.
-    rank: Option<fanos_vrf::VrfOutput>,
+    rank: Option<VrfOutput>,
     /// Whether a shaped frame completed the round trip. **A refusal counts as `true`**: we decoded what the
     /// peer sent and rejected its contents, so the transport is not what failed.
     round_trip: bool,
@@ -4835,7 +5017,7 @@ impl PassThroughFabric {
     }
 
     fn sent(&self) -> usize {
-        self.sent.load(std::sync::atomic::Ordering::Relaxed)
+        self.sent.load(Ordering::Relaxed)
     }
 }
 
@@ -4846,7 +5028,7 @@ impl quinn::AsyncUdpSocket for PassThroughFabric {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> std::io::Result<()> {
-        self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sent.fetch_add(1, Ordering::Relaxed);
         self.socket.try_send_to(transmit.contents, transmit.destination).map(|_| ())
     }
 
@@ -4909,7 +5091,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_actor_is_named_and_a_finished_one_is_not() {
         let stations = Arc::new(Mutex::new(Stations::new()));
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(false));
         let count = |tag: u64| {
             stations
                 .lock()
@@ -4955,7 +5137,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_retiring_actor_is_silent_but_a_panic_during_shutdown_is_not() {
         let stations = Arc::new(Mutex::new(Stations::new()));
-        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopping = Arc::new(AtomicBool::new(true));
         let count = |tag: u64| {
             stations
                 .lock()
@@ -5010,6 +5192,8 @@ mod tests {
     fn a_client_whose_engine_is_gone_reports_that_the_node_is_stopping() {
         let (input_tx, input_rx) = mpsc::channel::<Input>(8);
         let client = Client {
+            claims: None,
+            settling: Arc::new(AtomicBool::new(true)),
             addr: Arc::new(Mutex::new([1, 0, 1])),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5017,7 +5201,7 @@ mod tests {
             events_tx: broadcast::channel::<Notification>(8).0,
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
-            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(
@@ -5044,6 +5228,8 @@ mod tests {
         let (events_tx, _events_rx) = broadcast::channel::<Notification>(8);
         let coord: Triple = [1, 0, 1];
         let client = Client {
+            claims: None,
+            settling: Arc::new(AtomicBool::new(true)),
             addr: Arc::new(Mutex::new(coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5051,7 +5237,7 @@ mod tests {
             events_tx,
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
-            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         };
 
         // Silent until something stops. A plane that reports counts before any work failed would make
@@ -5569,6 +5755,8 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
         let (events_tx, _events_rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
+            claims: None,
+            settling: Arc::new(AtomicBool::new(true)),
             addr: Arc::new(Mutex::new(genesis_coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5576,7 +5764,7 @@ mod tests {
             events_tx: events_tx.clone(),
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
-            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         };
 
         // A PROTEUS shaper started at genesis — the reshuffle must rotate its shape to the new epoch (§13.4).
@@ -5589,7 +5777,9 @@ mod tests {
                 index: 0,
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
-                joining: true,
+                settling: Arc::new(AtomicBool::new(true)),
+            walk_after: None,
+            rounds: 0,
             },
             Reseater {
                 // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
@@ -5668,6 +5858,8 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<Control>();
         let (events_tx, _rx0) = broadcast::channel::<Notification>(8);
         let client = Client {
+            claims: None,
+            settling: Arc::new(AtomicBool::new(true)),
             addr: Arc::new(Mutex::new(genesis_coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5675,7 +5867,7 @@ mod tests {
             events_tx: events_tx.clone(),
             beacons: tokio::sync::watch::channel(None).1,
             genesis: BeaconSeed::GENESIS,
-            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         };
         tokio::spawn(reshuffle_loop::<F2>(
             creds,
@@ -5685,7 +5877,9 @@ mod tests {
                 index: 0,
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
-                joining: true,
+                settling: Arc::new(AtomicBool::new(true)),
+            walk_after: None,
+            rounds: 0,
             },
             Reseater {
                 // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
@@ -5849,6 +6043,39 @@ mod tests {
     /// The live morph-auto-fallback glue (§13.7): a failure trip drives the controller, which rotates the
     /// real driver shaper's morph in place — verified off the network (the connect path calls this exact
     /// function; a censored morph would otherwise only surface as slow connect timeouts).
+    /// **The settling window has a door and a floor, and the floor is the geometry's.**
+    ///
+    /// `Client::commit_seat` is the door — the cell read this placement, stop walking. It is the right
+    /// condition and it is *unreachable* for the node that most needs it: a shadowed node's advertisement is
+    /// overwritten at its `cap_slot`, so it never finds its own record. With only a door, such a node walks
+    /// for the whole epoch and keeps leaving the coordinate its beacon partials are addressed to — measured
+    /// at `n = 31` on `PG(2,4)`, nodes more than two beacons behind went from 0 of 30 to **21 and 24 of 30**
+    /// across two runs, and back to **0 of 31** once this floor existed.
+    ///
+    /// Falsifiable in both directions on purpose: a floor one round short would stop a node before it has
+    /// seen every point of its line, and a floor that never trips is the unbounded version that regressed.
+    #[test]
+    fn the_settling_window_closes_when_the_walk_is_spent_and_not_before() {
+        let bound = fanos_vrf::probe_bound::<F2>();
+        assert_eq!(bound, 3, "PG(2,2): a line holds q+1 = 3 points, so a walk is three steps");
+        assert!(may_walk(1, bound), "the first round is the node's own preferred point");
+        assert!(
+            may_walk(bound, bound),
+            "and the LAST point of the line is still reachable — a floor that trips at `bound` would \
+             abandon a seat the walk was one step from proving"
+        );
+        assert!(
+            !may_walk(bound + 1, bound),
+            "one past the line's own length places nothing new: every point has been considered, so \
+             staying settleable only moves the node away from the coordinate it is addressed at"
+        );
+        // The bound is derived per plane, not shared: a wider plane has a longer line and a longer walk.
+        assert!(
+            may_walk(fanos_vrf::probe_bound::<F2>() + 1, fanos_vrf::probe_bound::<fanos_field::F4>()),
+            "PG(2,4)'s line is 5 points, so a walk that is spent on the base cell is not spent here"
+        );
+    }
+
     #[test]
     fn apply_outcome_rotates_the_shaper_morph_on_a_failure_trip() {
         let shaper: Shaper = Some(Arc::new(RwLock::new(ProteusShaper::with_morph(

@@ -348,15 +348,24 @@ async fn persistent_credentials_keep_the_same_coordinate_across_restarts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unroutable_coordinate_falls_back_to_a_configured_entry_address() {
     let dir = Directory::new();
-    let a = spawn_distinct(&dir, &[]).await;
-    let b = spawn_distinct(&dir, &[a.address()]).await;
+    // **The orphan is chosen first and excluded from the draw**, which is the whole fixture. A
+    // self-certifying coordinate is `MapToPoint(H(cert))` — a uniform draw over the plane's `q²+q+1 = 57`
+    // points — so a spawned node lands on any named point about `1/57` of the time, and with two nodes this
+    // test hit its own `assert_ne!` on roughly one run in thirty. It passed for months and then failed on a
+    // gate that had passed an hour earlier, which is the signature: not a regression, an unpinned draw.
+    // `spawn_distinct` already exists to keep the members off each other's points; a *named constant* is a
+    // taken point too, and this is the same rule applied to it.
+    let orphan = [1u32, 1, 1];
+    let a = spawn_distinct(&dir, &[orphan]).await;
+    let b = spawn_distinct(&dir, &[orphan, a.address()]).await;
 
     // The operator's bootstrap line, recorded the way `seed_directory` does: the ADDRESS on its own, with
     // no coordinate attached, because the coordinate is the perishable half.
     dir.note_entry(b.local_addr());
 
     // A point nobody holds and the directory does not name, so the ladder falls through every rung above.
-    let orphan = [1u32, 1, 1];
+    // The two `assert_ne!`s are kept as the tripwire on the exclusion above: if the draw ever stops
+    // honouring `taken`, this says so instead of the test silently measuring a routable coordinate.
     assert_ne!(orphan, a.address());
     assert_ne!(orphan, b.address());
     assert_eq!(dir.resolve(orphan), None, "the precondition is an UNROUTABLE coordinate, not a slow one");

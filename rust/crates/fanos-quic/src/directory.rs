@@ -390,6 +390,32 @@ impl Directory {
         self.inner.read().map_or(0, |map| map.values().filter(|b| b.rank.is_some()).count())
     }
 
+    /// Coordinates backed by **evidence and actionable now**: a ranked binding, or a live connection —
+    /// the union, given the caller's live set.
+    ///
+    /// This is the step [`routable_points`](Self::routable_points)' own doc names as missing: *"a ranked
+    /// binding says the coordinate was proven, not that the peer answers now; pairing it with the connection
+    /// map is a further step."* It is taken here rather than by the caller because the ranked set is this
+    /// map's business and the connection set is the driver's, and neither can see both.
+    ///
+    /// **Neither existing number answers "can this node deliver to that point".** [`len`](Self::len)
+    /// over-counts — it includes seeds no handshake ever confirmed. `routable_points` under-counts — a peer
+    /// that dialled *in* is answering right now and has no ranked binding at all, which is exactly the
+    /// asymmetry the roster-convergence investigation read as "heard its rivals and cannot reach them".
+    ///
+    /// The unranked half of the book is deliberately left out. The send ladder *will* try it — `resolve`
+    /// does not consult rank — but a seed address is a claim, not evidence, and a metric that counts claims
+    /// is the one this exists to replace.
+    pub fn deliverable_points(&self, live: &BTreeSet<Triple>) -> usize {
+        let ranked: BTreeSet<Triple> = self
+            .inner
+            .read()
+            .ok()
+            .map(|map| map.iter().filter(|(_, b)| b.rank.is_some()).map(|(c, _)| *c).collect())
+            .unwrap_or_default();
+        ranked.union(live).count()
+    }
+
     /// Whether the directory is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -598,6 +624,71 @@ mod tests {
 
         let _ = dir.insert_ranked(b, sa(4), rank);
         assert_eq!(dir.routable_points(), 2, "and it rises with evidence, not with acquaintance");
+    }
+
+    /// **The third number, on the state where the other two both say "reaches nobody" and are both wrong.**
+    ///
+    /// The roster-convergence investigation stalled between a book that over-counts (seeds no handshake
+    /// confirmed) and a ranked count that under-counts (blind to a peer that dialled **in**). Its decisive
+    /// fixture is the bootstrap node: it dialled nobody, so its book and its ranked set are **empty**, while
+    /// every other node holds an open connection to it and it answers each one. Both existing metrics read
+    /// zero; it reaches all of them.
+    ///
+    /// Driven directly on the two inputs rather than through a fleet, because the claim is about what the
+    /// pair means, not about any run: a live coordinate with no binding must count, a ranked binding with no
+    /// connection must count, and a seed must not.
+    #[test]
+    fn deliverable_points_counts_the_live_half_that_the_ranked_count_cannot_see() {
+        let (a, b, c) = ([1u32, 0, 0], [0u32, 1, 0], [0u32, 0, 1]);
+        let (rank, _) = ranks();
+        let dir = Directory::new();
+
+        // The bootstrap node's own state: nothing dialled out, three peers dialled in.
+        let live: BTreeSet<Triple> = [a, b, c].into_iter().collect();
+        assert_eq!(dir.len(), 0, "it dialled nobody, so it wrote no addresses");
+        assert_eq!(dir.routable_points(), 0, "and proved no coordinates itself");
+        assert_eq!(
+            dir.deliverable_points(&live),
+            3,
+            "yet it can answer all three — this is the reading an earlier pass inferred `cannot reach them` \
+             from, off metrics that structurally could not say it"
+        );
+
+        // A seed is a claim, not evidence: it must not raise the count.
+        let _ = dir.insert([1u32, 1, 0], sa(9));
+        assert_eq!(dir.len(), 1, "the book grew");
+        assert_eq!(dir.deliverable_points(&live), 3, "…and reach did not: a seeded address is hearsay");
+
+        // A ranked binding with no live connection is the other half, and it does.
+        let _ = dir.insert_ranked([1u32, 1, 0], sa(9), rank);
+        assert_eq!(
+            dir.deliverable_points(&live),
+            4,
+            "a proven coordinate counts whether or not a connection is open right now"
+        );
+
+        // And the two halves are a UNION, not a sum: a point that is both must not be counted twice.
+        let _ = dir.insert_ranked(a, sa(1), rank);
+        assert_eq!(
+            dir.deliverable_points(&live),
+            4,
+            "`a` was already live; proving it too adds no reach, and a sum would have said five"
+        );
+
+        // **The one ordering that is structural**, and the only one a reader may rely on: reach is
+        // `ranked ∪ live`, so it can never fall below `ranked`. Its relation to the book is *not* fixed —
+        // the bootstrap state above has a book of zero and reach of three — and a comment that implied
+        // otherwise was corrected before it shipped.
+        assert!(
+            dir.deliverable_points(&live) >= dir.routable_points(),
+            "a union cannot be smaller than one of its sides"
+        );
+        let empty = BTreeSet::new();
+        assert!(
+            dir.deliverable_points(&empty) >= dir.routable_points(),
+            "…including with nothing live, where the two must coincide exactly"
+        );
+        assert_eq!(dir.deliverable_points(&empty), dir.routable_points(), "no connections: reach IS the ranked set");
     }
 
     #[test]
