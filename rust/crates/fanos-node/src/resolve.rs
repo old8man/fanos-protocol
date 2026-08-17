@@ -526,6 +526,19 @@ impl<T> Scan<T> {
     }
 }
 
+/// Read every coordinate in `coords` concurrently and collect the outcome as a [`Scan`].
+///
+/// The one place a set of per-coordinate reads becomes a directory view, which is why the `Read`/`Coverage`
+/// doctrine above is enforced here rather than in each builder: **a task that panicked counts as `Unknown`,
+/// not as `Absent`.** The two are one `Err(_)` arm away from each other and mean opposite things — an absence
+/// is a definite negative a caller may rely on, while a panic established nothing at all. Folding a panic
+/// into `found`\'s complement would have published a *complete* scan that silently omitted a live member,
+/// which is precisely the substitution the rule above forbids.
+///
+/// Concurrent rather than sequential because a directory scan is `q²+q+1` independent reads whose cost is
+/// dominated by the slowest, and ordered on the way out: `JoinSet` completes in whatever order the network
+/// answers, so the original index is carried through and sorted back, leaving `found` in coordinate order for
+/// every builder downstream.
 pub(crate) async fn resolve_directory<T, Fut, R>(client: &Client, coords: Vec<Coord>, resolve: R) -> Scan<T>
 where
     R: Fn(Client, Coord) -> Fut + Clone + Send + 'static,

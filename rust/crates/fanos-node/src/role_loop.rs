@@ -68,51 +68,14 @@ use crate::resolve::Coverage;
 use crate::diagdir::{publish_diagnosis, read_diagnosis_window};
 use crate::loaddir::{build_cell_setpoint, spawn_load_publisher};
 
-/// The load one node is taken to absorb per role — the setpoint denominator, applied **once**, cell-wide, in
-/// `cell_setpoint`. An unsensed offered role publishes `capacity` as its load, so "everyone who offers it,
-/// serves it" holds for those whatever this value is.
-///
-/// # This value is wrong now, and `1` is why
-///
-/// `1` was right while every role was unsensed: each offering node published one node's worth, the setpoint
-/// came back equal to the eligible supply, and the identity above was the whole behaviour. Making the sensors
-/// live (`5fa70ea`) changed what a *sensed* role publishes — its **measured load**, counted in keys held and
-/// frames originated — while leaving the denominator at 1. So the setpoint is now
-///
-/// ```text
-///   ⌈Σ (keys held + frames originated) / 1⌉   nodes
-/// ```
-///
-/// which reads an event count as a node count. Where it still applies, demand exceeds the eligible supply
-/// permanently, `assign_report` fills `min(demand, eligible)` so **every offering node receives every role it
-/// offered**, and the controller can no longer express anything about that role: the assignment it produces
-/// is the one a node would reach with no controller at all. Measured on a fleet when it applied to all six:
-/// `transitions = 0` across a whole observation window, which is what made role-assignment churn
-/// undetectable (`c77120a`).
-///
-/// **"Where it still applies" is now two roles, not six, and this paragraph used to illustrate it with the
-/// first one to leave.** Storage — "a cell holding a hundred keys asks for a hundred storage nodes" — was the
-/// first capacity derived from a real admission bound, and Rendezvous, Service and Exit followed. Relay and
-/// Ingress are what remain, for reasons that are not the same: Relay's sensor is a rate measured against a
-/// level, and Ingress has an admission bound with no sensor to divide into it. An example drawn from a role
-/// that has since been fixed is worse than no example, because it reads as evidence that nothing has moved.
-///
-/// The permanent deficit that saturation implies **is read now, and only half of what reads it exists**.
-/// `note_deficit` is called from the epoch step and records `Station::RoleUnderProvisioned`, so a shortfall
-/// reaches this node's operator. What `docs/design-self-organization.md` §4 describes and the tree still lacks is the
-/// **parent-cell escalation**: `Escalation` has no `Deficit` variant, so a cell that cannot staff a role
-/// tells its operator and no other cell.
-///
-/// This paragraph used to say the deficit had no production caller at all, and used that as the reason the
-/// escalation was safe to leave unwired. Both halves of that have moved: four of the six roles now have a
-/// derived capacity, so their deficits are real rather than artefacts of a placeholder denominator — see
-/// `the_last_two_capacities_and_the_parent_escalation_are_still_open`, which fires when the last two get
-/// theirs.
-///
-/// Correcting it is a **measurement**, not a new constant: capacity must be in the load's own units — how
-/// many keys, or frames, one node absorbs per observation window — which is a throughput figure
-/// `fanos-bench` can produce. Setting it by taste would replace one wrong number with another.
-pub(crate) const ROLE_CAPACITY_PER_NODE: u16 = 1;
+// The setpoint denominator used to be one constant for every role — `ROLE_CAPACITY_PER_NODE = 1` — and it
+// read an **event count as a node count**: demand exceeded eligible supply permanently, `assign_report`
+// filled `min(demand, eligible)` so every offering node received every role it offered, and the controller
+// could express nothing at all. Measured on a fleet while it applied to all six roles: `transitions = 0`
+// across a whole observation window, which is what made role-assignment churn undetectable (`c77120a`).
+// Every role now divides by the bound its own subsystem enforces, so the constant has no reader and is gone;
+// `role_capacity`'s own test sweeps every role to keep it that way.
+
 
 /// **How many keys one node absorbs — and the one role whose capacity is a derivation rather than a
 /// placeholder.**
@@ -148,8 +111,8 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 ///
 /// Not a measurement to be commissioned and not a number to be chosen: the node is *already* refusing work
 /// past some point, and reading capacity off anything else would be reading a figure the node does not obey.
-/// Four of the six roles have both halves — a level-valued sensor and an enforced cap on that same level —
-/// and the match of units is what makes the ratio meaningful rather than merely arithmetic:
+/// **All six roles** have both halves — a level-valued sensor and an enforced cap on that same level — and
+/// the match of units is what makes each ratio meaningful rather than merely arithmetic:
 ///
 /// | role | the sensor reports | the node enforces |
 /// |---|---|---|
@@ -157,18 +120,19 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 /// | rendezvous | `registrations() + hosts()` | those two `BoundedMap`s' caps |
 /// | service | `service.pending()` | `max_pending`, checked before accepting an intro |
 /// | exit | flows in flight | `MAX_SESSIONS`, LRU-evicted by the session demux |
+/// | relay | `router.pending()` | `MAX_PENDING`, the gather memory budget over the true entry width |
+/// | ingress | `host.pending()` | POROS's own `max_pending`, checked before arming a gather |
 ///
-/// The two residuals are residual for **different reasons**, and collapsing them would lose the distinction
-/// that says what each still needs:
+/// **The last two were residual for different reasons, and both reasons dissolved on the same day.** Relay
+/// was described as "a sensor and no matching bound": its load was *frames originated*, a rate, against caps
+/// that are all levels. That sensor was measuring the wrong subject entirely — a node's traffic as a
+/// **source**, not the work it carries for others — so a relay forwarding the whole cell's mix reported zero
+/// (`fanos_runtime::overlay`, where the report is now assembled). Replacing it with gathers in flight gave a
+/// level, and the level's cap was already enforced. Ingress was the mirror image, a bound with no sensor;
+/// `PorosHost::pending` existed and nothing read it, so the wiring was one arm in `IngressNode`.
 ///
-/// * **Relay** has a sensor and no matching bound. Its load is *frames originated* — a rate — while every cap
-///   in reach is a level, so no admission rule answers "how many frames per window". That one is a genuine
-///   throughput measurement, which is `fanos-bench`'s job.
-/// * **Ingress** has a bound (POROS's own pending cap) and no sensor. A denominator over a numerator nobody
-///   reports is not a ratio, so the bound is unusable until the role is measured.
-///
-/// Both keep [`ROLE_CAPACITY_PER_NODE`] and its stated defect. Replacing one wrong number with another by
-/// taste is the thing this whole subsystem exists not to do.
+/// A residual stated as "we need a new number" was, twice, a residual that needed the **existing** number to
+/// be read correctly. Neither was a measurement problem.
 ///
 /// ## Why these read protocol constants and never a node's configuration
 ///
@@ -180,12 +144,6 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 #[must_use]
 pub(crate) fn role_capacity() -> Demand {
     Demand::per_role(|role| {
-        debug_assert_eq!(
-            capacity_is_derived(role),
-            !matches!(role, Role::Relay | Role::Ingress),
-            "`capacity_is_derived` must name exactly the roles this match derives, or `note_deficit` \
-             reports on a fabricated number (or stays silent about a real one)"
-        );
         match role {
             Role::Storage => STORAGE_CAPACITY_PER_NODE,
             Role::Rendezvous => saturating_cap(
@@ -193,23 +151,34 @@ pub(crate) fn role_capacity() -> Demand {
             ),
             Role::Service => saturating_cap(crate::threshold_service::DEFAULT_MAX_PENDING),
             Role::Exit => saturating_cap(crate::diaulos::MAX_SESSIONS),
-            Role::Relay | Role::Ingress => ROLE_CAPACITY_PER_NODE,
+            // **The bound its own subsystem enforces**, which is the rule every derived capacity here
+            // follows: a node's capacity is what it will accept. `MAX_PENDING` is
+            // `GATHER_MEMORY_BUDGET / PENDING_ENTRY_BYTES`, and its own doc cites "the same discipline
+            // `fanos_diaulos::budget::MAX_SESSIONS` states" — the very constant `Role::Exit` is taken from.
+            //
+            // **The throughput objection is answered, and by the tree rather than by a benchmark.** It read
+            // "`MAX_PENDING` bounds memory while the binding constraint is plausibly throughput, and a
+            // figure `fanos-bench` can produce is owed". Both halves were wrong. A relay has **two** derived
+            // bounds on **two different resources**, and `MAX_OUTBOX`'s doc had already written the second
+            // one down: with cover on, a real forward *displaces* a cover slot rather than adding a send, so
+            // the sustained rate is `1 / cover_interval` — ≈2 cells/s for the whole node at the shipping
+            // default — "a derived protocol bound, not a measurement waiting to be taken".
+            //
+            // It is not this capacity, because it does not bound this sensor: the reading is `pending.len()`,
+            // gathers this node is *assembling* as a combiner, and the slot rate bounds what it *forwards*
+            // as a hop. A capacity must count what its numerator counts.
+            //
+            // Nor is the slot rate a provisioning quantity at all. A relay is placed by geometry (see
+            // `Role::covers_a_threshold_line`), so exceeding its forward rate cannot be answered by adding
+            // nodes — the answer is a shorter `cover_interval`, a deployment parameter — and the observable
+            // is `Station::RelayCargoDropped`, which exists precisely so that ceiling is not silent. What is not in doubt is that an admission bound beats a placeholder of `1`, which reads
+            // an event count as a node count and makes the controller express nothing at all.
+            Role::Relay => saturating_cap(fanos_aphantos::threshold_router::MAX_PENDING),
+            Role::Ingress => saturating_cap(crate::poros::DEFAULT_MAX_PENDING),
         }
     })
 }
 
-/// Whether this role's capacity is **derived** from a bound its subsystem enforces, rather than still being
-/// the [`ROLE_CAPACITY_PER_NODE`] placeholder.
-///
-/// Named because two different things read it and must not drift apart: `role_capacity` decides the
-/// denominator, and `note_deficit` decides whether the resulting shortfall is worth an operator's attention.
-/// A placeholder capacity makes the demand exceed eligible supply on any active cell, so its "deficit" is an
-/// artefact of the denominator and reporting it would fire on every epoch for ever — and a station that fires
-/// every epoch is not a signal, which is the same reason the deficit went unreported before the capacities
-/// were derived at all.
-const fn capacity_is_derived(role: Role) -> bool {
-    matches!(role, Role::Storage | Role::Rendezvous | Role::Service | Role::Exit)
-}
 
 /// An admission bound in [`Demand`]'s `u16` units.
 ///
@@ -303,8 +272,25 @@ impl LoadSensor {
     /// coexist. The engine reports `None` for every role it has no sensor for, which is exactly the set a
     /// driver-side [`LoadGauge`] fills; storing the `None` would erase the gauge's reading on every observation
     /// and the three roles would silently fall back to the offer forever, looking wired.
+    ///
+    /// **And a `Some` must not overwrite a gauged one**, which is the other half of the same argument and was
+    /// missing. [`Self::gauge`] states the ownership — *"this slot's writer is the caller's task from here
+    /// on"* — but nothing enforced it, so an engine that grew a sensor for an already-gauged role would
+    /// re-stamp the slot every observation window and every `fetch_sub` the gauge made in between would be
+    /// lost. The failure is the nastiest shape available: the role stays *sensed*, the number stays
+    /// plausible, and it under-reports by however much work completed inside a window.
+    ///
+    /// It was latent rather than live — the engine reports Storage/Rendezvous/Service/Relay and the one
+    /// production gauge is `Role::Exit` — but the disjointness is an accident of which roles happen to have
+    /// which sensor, not a property anything held. Making the gauge's claim win is what makes its doc true;
+    /// the gauge is the more specific claim, since opening one is an explicit declaration that a task is
+    /// carrying this role's work.
     fn record(&self, reported: RoleReading) {
+        let gauged = self.gauged.load(Ordering::Relaxed);
         for role in Role::ALL {
+            if gauged & (1u32 << role.index()) != 0 {
+                continue;
+            }
             if let Some(v) = reported.of(role) {
                 self.slot(role).store(u32::from(v) + 1, Ordering::Relaxed);
             }
@@ -648,6 +634,9 @@ pub struct LiveRoleController {
     /// Per-role shortfall from the last [`step`](LiveRoleController::step) — see
     /// [`deficit`](LiveRoleController::deficit).
     last_deficit: Demand,
+    /// The shortfall an operator has already been told about, so a **standing** condition is reported once
+    /// rather than every epoch — see [`note_deficit`].
+    reported_deficit: Demand,
     reputation: Reputation,
 }
 
@@ -661,6 +650,7 @@ impl LiveRoleController {
             controller,
             last_agreed: None,
             last_deficit: Demand::default(),
+            reported_deficit: Demand::default(),
             reputation: Reputation::new(),
         }
     }
@@ -893,6 +883,8 @@ pub fn spawn_role_loop<F: Field>(
         let mut backoff = ROSTER_REFRESH;
         let mut settled = Assignment::NONE;
         let mut stable = 0u32;
+        // Consecutive scans that did not conclude — see `next_unreadable` for why one ladder was not enough.
+        let mut unreadable = 0u32;
         let mut refresh = tokio::time::interval(backoff);
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         refresh.tick().await; // the first tick is immediate; the genesis assignment just ran
@@ -1015,12 +1007,14 @@ pub fn spawn_role_loop<F: Field>(
                         // understates the roster in exactly the way a genuine absence does, so two partial scans agree with
                         // each other while both disagree with the cell — and relaxing on that agreement is what left a
                         // frozen roster with nothing to indicate why. `complete` is the distinction that was missing.
-                        if may_relax(stable, now.roster, peers(), now.complete) {
+                        unreadable = next_unreadable(unreadable, now.complete);
+                        if may_relax(stable, unreadable, now.roster, peers(), now.complete) {
                             backoff = (backoff * 2).min(ROSTER_REFRESH_MAX);
                         }
                     } else {
                         settled = now;
                         stable = next_stable(stable, false, now.complete);
+                        unreadable = next_unreadable(unreadable, now.complete);
                         backoff = ROSTER_REFRESH;
                     }
                     refresh = tokio::time::interval_at(tokio::time::Instant::now() + backoff, backoff);
@@ -1161,8 +1155,33 @@ const fn next_stable(stable: u32, repeated: bool, complete: bool) -> u32 {
 /// node that cannot read never comes to *believe* its assignment is settled, however long it backs off. It slows down
 /// without deciding anything — and recovers on its own, since the first complete scan that finds more members changes the
 /// assignment and resets the period to the floor.
-const fn may_relax(stable: u32, roster: usize, peers: usize, complete: bool) -> bool {
-    !complete || (stable >= STABLE_BEFORE_BACKOFF && roster >= peers)
+const fn may_relax(stable: u32, unreadable: u32, roster: usize, peers: usize, complete: bool) -> bool {
+    if complete {
+        stable >= STABLE_BEFORE_BACKOFF && roster >= peers
+    } else {
+        unreadable >= STABLE_BEFORE_BACKOFF
+    }
+}
+
+/// Consecutive scans that did **not** conclude, reset by the first that does — the unreadable twin of
+/// [`next_stable`], and the discriminator [`may_relax`] was missing.
+///
+/// **Both of the measurements this loop carries are about relaxation, and they point opposite ways.** One is
+/// in `may_relax`'s own neighbourhood: relaxing *too little* leaves a steady-state scan competing with the
+/// node's critical path, and under contention a seven-node real-QUIC consensus cell then fails to converge at
+/// all — *"steady-state cost must be zero, not a trickle."* The other is this session's: relaxing on the very
+/// first unreadable scan turned a transient into a run-long freeze, because the backoff doubles from a `15 s`
+/// floor to a ceiling of a **whole epoch**, so a node that misses one scan is next heard from at `15 s`,
+/// `45 s`, `105 s` — and a cell froze with `roster < occupied` for the rest of the run, three reproductions,
+/// every one with `complete = false` on exactly the short nodes.
+///
+/// A count separates them without a new constant and without a congestion signal the loop cannot see: a
+/// *transient* blindness spends its first [`STABLE_BEFORE_BACKOFF`] looks at the floor, where it is cheap and
+/// where recovery is possible; a *persistent* one backs off exactly as the contention measurement requires.
+/// The threshold is the same one the settled ladder uses, for the same reason — three readings of one thing
+/// are a state, one is a reading.
+const fn next_unreadable(unreadable: u32, complete: bool) -> u32 {
+    if complete { 0 } else { unreadable.saturating_add(1) }
 }
 
 /// The setpoint to step toward this epoch: the freshly-read one when the scan concluded, else the demand
@@ -1369,7 +1388,7 @@ async fn assign_epoch<F: Field>(
     // assignment's worst-case latency is one STORE_TIMEOUT, not two. That halving is what lets the refresh period
     // below stay short enough to converge while keeping its duty cycle bounded.
     let AssignAt { epoch, beacon, closed, .. } = at;
-    let ((members, seating, caps_view), (setpoint, load_view)) = tokio::join!(
+    let ((members, seating, occupied, caps_view), (setpoint, load_view)) = tokio::join!(
         build_capability_directory::<F>(client, epoch, vrf.then_some(beacon)),
         async {
             match closed.readable_for(epoch) {
@@ -1433,8 +1452,46 @@ async fn assign_epoch<F: Field>(
     // Holding means: publish nothing, step nothing, and report **incomplete** — which is already the signal
     // that keeps the refresh at its floor, so the next look comes soon rather than after a backoff.
     if !members.iter().any(|(id, _)| *id == live.node_id()) {
+        // **Before holding, ask who is standing where this node should be.**
+        //
+        // Withholding is right and it is not an answer: the loop keeps re-deriving against a directory that
+        // does not contain it, once per refresh, for as long as the condition lasts. The sharpest reason it
+        // can last is that another identity's record occupies this node's own `cap_slot` — two VRF draws
+        // landing on one point, both entitled, one overwrite deciding the roster and telling the loser
+        // nothing. That record is a **verified claim to this node's point**, and the slot is the one place
+        // both contenders reach by construction rather than by routing: dialling the coordinate they are
+        // fighting over resolves, in each one's own table, to itself.
+        //
+        // Filing it is the same act a handshake performs, with the same evidence. The driver decides what to
+        // do with it and how fast — the walk is monotone, bounded by the line's own length, and rate-limited
+        // so a node cannot outrun the propagation of its own new seat (`Placement::last_move`), which is the
+        // bound this repair needed and did not have the first time it was measured.
+        if let Some(seed) = vrf.then_some(beacon)
+            && let Some((id, public, proof, output)) = crate::capdir::foreign_claim_at::<F>(
+                client,
+                client.address(),
+                epoch,
+                &seed,
+                &live.node_id(),
+            )
+            .await
+        {
+            client.record_peer_claim::<F>(&id, public, proof, &output);
+        }
         return withhold(client, roles_tx, members.len());
     }
+    // **The other half of the same predicate, and it belongs to the transport.** Finding this node's own
+    // advertisement in the roster it just scanned means the cell can read its placement — which is precisely
+    // the condition the seat rule has always named: *"nothing above has derived anything from this
+    // coordinate yet, and it may re-seat freely"*. Until now the transport substituted "an epoch boundary
+    // has happened" for it and cleared the window once, forever, so every later boundary re-derived every
+    // coordinate at once with no node permitted to resolve a collision. Measured on `PG(2,4)` at `n = 31`:
+    // the joining phase reaches 21 of 21 servable lines, the first boundary drops it to 13, and six
+    // boundaries do not recover it.
+    //
+    // Said here rather than inferred there because this is the only place that holds the fact. Idempotent —
+    // it is re-asserted on every refresh, and a boundary re-opens the window for the next epoch.
+    client.commit_seat();
     // **`members.len() < peers()` is deliberately NOT a second hold condition, and that was a close call.**
     //
     // It is tempting: the loop already uses that comparison to decide whether to keep *looking*, so using it
@@ -1458,7 +1515,7 @@ async fn assign_epoch<F: Field>(
     // reduces it at its own decision, and the one that *reports* (`bin/fanos.rs`) is the one that does not.
     let settled = caps_view.complete() && load_view.complete();
     let roles = live.step(&members, epoch, &beacon, setpoint, settled);
-    note_deficit(client, epoch, live.deficit());
+    note_deficit::<F>(client, epoch, live.deficit(), &mut live.reported_deficit, &occupied);
     let _ = roles_tx.send(roles);
     // The `Assignment` alone: it already carries `complete` (#289), and returning the bool beside it made one
     // quantity travel under two names — which is how the comparison above came to fold it in (#293).
@@ -1510,29 +1567,106 @@ fn withhold(
 /// This is the **local** signal. Escalating to the parent cell, which `docs/design-self-organization.md` §4 describes, needs
 /// the hierarchy path and is deliberately not invented here: a half-wired escalation would be worse than a
 /// stated gap.
-fn note_deficit(client: &Client, epoch: Epoch, deficit: Demand) {
-    for role in Role::ALL {
+fn note_deficit<F: Field>(
+    client: &Client,
+    epoch: Epoch,
+    deficit: Demand,
+    reported: &mut Demand,
+    occupied: &std::collections::BTreeSet<usize>,
+) {
+    let line_size = Plane::<F>::LINE_SIZE as usize;
+    for role in deficit_transitions(deficit, reported) {
         let short = deficit.of(role);
-        // A shortfall is only evidence where the denominator is. Relay and Ingress still divide by the
-        // placeholder, so their demand exceeds supply on any active cell by construction — reporting that
-        // would put a permanent warning in front of an operator and teach them to ignore the station, which
-        // is worse than the silence this replaced. `the_last_two_capacities_and_the_parent_escalation_are_
-        // still_open` is the tripwire that says so when they gain a real capacity.
-        if short == 0 || !capacity_is_derived(role) {
-            continue;
-        }
         client.record_station(
             fanos_runtime::ports::stations::Station::RoleUnderProvisioned,
             Some(client.address()),
             Some(role.index() as u64),
         );
-        tracing::warn!(
-            role = ?role,
-            short,
-            epoch = ?epoch,
-            "the cell wants more nodes in this role than any member offered"
-        );
+        // A threshold-line role's shortfall is not "a few more relays would help" — it is lines that cannot
+        // be served at all, and the number an operator needs is what the *plane* demands. Said here because
+        // this is the one place that holds both the plane and the membership.
+        if role.covers_a_threshold_line() {
+            tracing::warn!(
+                role = ?role,
+                short,
+                epoch = ?epoch,
+                needs = fanos_geometry::points_serving_every_line(line_size),
+                of_points = fanos_geometry::plane_points(line_size),
+                per_line = fanos_geometry::line_threshold(line_size),
+                // **The one field here that is a measurement rather than a constant.** The three above are
+                // properties of the plane and read the same on a healthy cell and a dead one; this counts
+                // the lines that can actually be served RIGHT NOW, from the coordinates the scan just read.
+                // The difference is not cosmetic: on `PG(2,4)` a five-point cell serves **zero** of its
+                // twenty-one lines in 91.6% of placements and exactly one in the rest, so "short by 15" and
+                // "no threshold operation can complete anywhere in this cell" were the same sentence.
+                servable_now = fanos_geometry::servable_lines::<F>(|p| occupied.contains(&p.index())),
+                of_lines = fanos_geometry::plane_points(line_size),
+                // **The same shortfall said in the unit an operator can act in.** Everything above this
+                // line is counted in POINTS, and nobody deploys points: a cell is grown by admitting
+                // members, and members contend for points, so the two numbers differ and the ratio is not
+                // one. Simulated against the shipping walk, `M = N` clears the viability floor 25% of the
+                // time on `PG(2,4)` and `M = 1.5N` clears it 99% — which is the difference between a cell
+                // that serves threshold lines and one that completes no gather anywhere.
+                members_wanted = fanos_geometry::members_for_a_covered_plane(line_size),
+                "this role is placed by GEOMETRY: its work arrives at a derived line, so a shortfall means \
+                 lines nobody can serve rather than slower service. Every line needs `per_line` of its \
+                 points, and a line-blind assignment reaches that only at `needs` of `of_points`. \
+                 `servable_now` of `of_lines` is how many can be served with the cell as it stands, and \
+                 `members_wanted` is what that costs in NODES rather than points"
+            );
+        } else if role.availability_survives_the_fault_budget() {
+            // The one role a client reaches by CHOOSING, so its shortfall is an availability statement: the
+            // cell cannot keep this service across its own tolerated fault count, and — since a client picks
+            // uniformly from what is published — a smaller set is also a larger share of destinations in
+            // front of each member of it.
+            tracing::warn!(
+                role = ?role,
+                short,
+                epoch = ?epoch,
+                needs = fanos_geometry::fault_budget(fanos_geometry::plane_points(line_size)) + 1,
+                "a client PICKS this role from a directory, so the cell needs more of it than its fault \
+                 budget: at `needs` providers one may be taken and the service survives, below that the \
+                 adversary chooses whom to take after the assignment is public"
+            );
+        } else {
+            tracing::warn!(
+                role = ?role,
+                short,
+                epoch = ?epoch,
+                "the cell wants more nodes in this role than any member offered"
+            );
+        }
     }
+}
+
+/// The roles whose shortfall **changed** since the last report, updating the memo as it goes.
+///
+/// **Reported on change, not on presence**, which `note_deficit`'s own doc demands of itself: *"a station
+/// firing on every epoch is not a signal"*. The exemption that doc used to spend on the placeholder roles is
+/// gone, and the condition that replaced it is **standing** rather than momentary — a threshold-line role is
+/// floored at `N − (m − t)`, near-full plane occupancy, so a cell short of that is short of it for as long as
+/// it stays small. A level repeated every epoch teaches an operator to ignore the station; the *transition*
+/// is the event, and the level itself is recoverable from the closed epoch's published demand and supply
+/// whenever anyone wants it.
+///
+/// A role returning to zero updates the memo and is **not** returned: `RoleUnderProvisioned` would be a lie
+/// about a role that has recovered, and the absence of further records is what says so.
+///
+/// Pure, and separate from the emitter, because this decision is the whole of the claim — the caller is a
+/// loop over what this returns.
+fn deficit_transitions(deficit: Demand, reported: &mut Demand) -> impl Iterator<Item = Role> {
+    let mut changed = RoleSet::default();
+    for role in Role::ALL {
+        let short = deficit.of(role);
+        if short == reported.of(role) {
+            continue;
+        }
+        reported.set(role, short);
+        if short > 0 {
+            changed.insert(role);
+        }
+    }
+    Role::ALL.into_iter().filter(move |&r| changed.has(r))
 }
 
 /// Whether the role controller is still deciding, or the assignment a reader takes is **frozen** (#251).
@@ -1582,12 +1716,12 @@ pub struct SelfOrganization {
     /// its table puts "which roles it *offers*" on the node's side and "which offered roles are *active*" on
     /// the network's, and calls the control side "enforced structurally, not by policy".
     ///
-    /// **Why the gap is invisible, and what arms it.** `ROLE_CAPACITY_PER_NODE` is `1` for the two remaining
-    /// roles, so their demand exceeds eligible supply, `assign_report` fills `min(demand, eligible)`, and the
-    /// assignment comes out *numerically equal to the offer*. Actuating from the offer and actuating from the
-    /// assignment are the same function for them, which is why nothing can see the difference. The four roles
-    /// with a derived capacity are already past that: their assignment is a strict subset of the offer, and it
-    /// is already ignored.
+    /// **Why the gap was invisible, and what has armed it.** While every role divided by the placeholder
+    /// `1`, demand exceeded eligible supply, `assign_report` filled `min(demand, eligible)`, and the
+    /// assignment came out *numerically equal to the offer* — actuating from the offer and actuating from the
+    /// assignment were the same function, which is why nothing could see the difference. All six roles now
+    /// divide by their own admission bound, so every assignment is a strict subset of the offer and every one
+    /// of them is ignored. The gap is no longer masked by arithmetic; it is simply open.
     ///
     /// **What it costs is not tidiness.** §5's third bound on Sybil freedom is that capability is "declared
     /// freely but *priced by performance*": a non-performing assignee shows as a coherence deficit, DIAKRISIS
@@ -1868,27 +2002,22 @@ mod tests {
         );
     }
 
-    /// **A tripwire on a defect that is deliberately unfixed, because fixing half of it is worse than
-    /// neither half.**
+    /// **Storage's capacity is an identity against its own admission bound, not a number written here.**
     ///
-    /// `ROLE_CAPACITY_PER_NODE` is `1`, which reads an *event* count as a *node* count. **Storage is out of
-    /// its scope as of 2026-08-04** — its capacity is now derived from `MAX_STORE_ENTRIES`, the bound the
-    /// node's own admission rule enforces on the very number it reports — and **Rendezvous, Service and Exit
-    /// followed it**, each from its own admission bound. Two roles still carry the placeholder, Relay and
-    /// Ingress, for different reasons: Relay's sensor is a rate against a level, and Ingress has a bound with
-    /// no sensor to divide. For those two, demand exceeds eligible supply on any active cell, `assign_report`
-    /// fills `min(demand, eligible)`, every offering node gets the role it offered, and the controller
-    /// expresses nothing about them.
+    /// This began life as a tripwire on the placeholder denominator — one constant, `1`, for every role,
+    /// which reads an *event* count as a *node* count: demand exceeded eligible supply on any active cell,
+    /// `assign_report` filled `min(demand, eligible)`, every offering node got every role it offered, and the
+    /// controller expressed nothing at all. Storage left that scheme first (2026-08-04), Rendezvous, Service
+    /// and Exit followed, and Relay and Ingress last — each from the bound its own subsystem enforces. The
+    /// placeholder has no reader left and is gone, so what this test guards is no longer the exit from a
+    /// defect but the property that replaced it: **capacity is read from the source of truth**.
     ///
-    /// That residual saturation is **no longer harmless by accident, because the deficit is read**:
-    /// `note_deficit` records `Station::RoleUnderProvisioned` from the epoch step, so for Relay and Ingress it
-    /// reports a shortfall that is still an artefact of the denominator. What remains absent is the
-    /// **parent-cell escalation** — `Escalation` has no `Deficit` variant — which is a hierarchy-transport
-    /// gap, not an oversight.
+    /// A copy would drift the instant a cap moved, and nothing would notice — the assignment would simply
+    /// provision the wrong number of storage nodes, which is not a failure any other test asserts.
     ///
-    /// So the two must move together, and this test is one half of saying so; the other is
-    /// `the_last_two_capacities_and_the_parent_escalation_are_still_open`, which fires when Relay and Ingress
-    /// stop being placeholders — exactly when someone needs to be told about the escalation.
+    /// The escalation half of the old tripwire moved to `a_deficit_reaches_an_operator_and_no_other_cell`,
+    /// which is where it belongs: the deficit is now real for every role, and it still reaches only this
+    /// node's operator.
     #[test]
     fn storage_capacity_is_the_bound_the_node_actually_enforces() {
         // The one role whose capacity is derived rather than placed. Its load is `store.entries.len()`, so
@@ -1900,10 +2029,14 @@ mod tests {
             fanos_runtime::MAX_STORE_ENTRIES,
             "storage capacity must equal the store's own admission bound",
         );
+        // And capacity must not have collapsed back into one number. Stated as a property of the whole
+        // vector rather than against one named neighbour: the previous spelling compared Storage with Relay,
+        // and when Relay stopped being a placeholder the assertion started testing an accident of two
+        // unrelated bounds. What is actually meant is that the roles do not share a capacity.
+        let caps = role_capacity();
         assert!(
-            role_capacity().of(Role::Storage) > role_capacity().of(Role::Relay),
-            "and it must actually differ from the placeholder the unmeasured roles still carry — if these \
-             ever coincide, capacity has silently become one number again",
+            Role::ALL.iter().any(|&r| caps.of(r) != caps.of(Role::Storage)),
+            "if every role carries one capacity, the per-role denominator has silently become a constant",
         );
     }
 
@@ -1933,69 +2066,129 @@ mod tests {
             "an exit reports flows in flight, and the session demux caps concurrent sessions"
         );
 
-        // The two that are still placeholders, and the distinction between them is the point: each names what
-        // it is waiting for. Collapsing them into "unmeasured" loses that.
         assert_eq!(
-            cap.of(Role::Relay),
-            ROLE_CAPACITY_PER_NODE,
-            "relay's sensor is a RATE and every cap in reach is a level — it needs a throughput measurement"
+            usize::from(cap.of(Role::Relay)),
+            fanos_aphantos::threshold_router::MAX_PENDING,
+            "a relay reports gathers in flight, and the router refuses to arm another past MAX_PENDING"
         );
-        assert_eq!(
-            cap.of(Role::Ingress),
-            ROLE_CAPACITY_PER_NODE,
-            "ingress HAS a bound and no sensor — a denominator over a numerator nobody reports is not a ratio"
-        );
-    }
 
-    /// A shortfall is reported only where the denominator that produced it is real.
-    ///
-    /// The two halves have to name the same roles: `role_capacity` decides which capacities are derived, and
-    /// `note_deficit` decides which shortfalls reach an operator. If they drift, the node either warns every
-    /// epoch about a number that is an artefact of the placeholder — teaching an operator to ignore the
-    /// station, which is worse than the silence this replaced — or goes quiet about a real one.
-    #[test]
-    fn only_a_derived_capacity_may_report_a_shortfall() {
-        let cap = role_capacity();
+        assert_eq!(
+            usize::from(cap.of(Role::Ingress)),
+            crate::poros::DEFAULT_MAX_PENDING,
+            "an ingress point reports admission requests being gathered, and refuses past max_pending"
+        );
+
+        // **No role divides by the placeholder any more**, which is the property the six identities above add
+        // up to and the one a seventh role would break silently. Stated as a sweep rather than as another
+        // named row, because the failure it guards is a role being *added* without a capacity, and no
+        // enumeration written today can name that one.
         for role in Role::ALL {
-            let derived = cap.of(role) != ROLE_CAPACITY_PER_NODE;
-            assert_eq!(
-                capacity_is_derived(role),
-                derived,
-                "{role:?}: `capacity_is_derived` and the capacity vector disagree, so the deficit report is \
-                 either noise or missing"
+            assert_ne!(
+                cap.of(role),
+                1,
+                "{role:?} divides by 1, which reads an event count as a node count: the role saturates the \
+                 assignment and the controller expresses nothing about it"
             );
         }
-        // Named literally, so flipping the classification cannot move both sides together and pass.
-        assert!(!capacity_is_derived(Role::Relay), "relay divides by the placeholder — its deficit is an artefact");
-        assert!(!capacity_is_derived(Role::Ingress), "ingress has no sensor at all — same");
-        assert!(capacity_is_derived(Role::Exit), "exit divides by MAX_SESSIONS, so its shortfall is real");
+
+        // **The residual on the relay row, stated where it cannot be lost.** `MAX_PENDING` bounds memory,
+        // while a gather also costs CPU (75 µs per share request, measured), so if throughput binds first the
+        // true capacity is smaller than this and the role is under-provisioned by exactly that ratio. The
+        // number `fanos-bench` would produce is owed. What this assertion pins is only that the denominator
+        // is a bound the subsystem enforces rather than a constant chosen here — which the identity above
+        // already states, and the sweep already protects. (A `MAX_PENDING > 1` guard stood here briefly and
+        // was removed on sight: both sides are constants, so it is an assertion that cannot fail.)
     }
 
-    /// **A tripwire on the half of the capacity work that is still open.**
+    /// **A standing shortfall is reported once, not once per epoch.**
     ///
-    /// Four roles now divide by their own admission bound. Two do not, for the two different reasons the test
-    /// above pins, and while `ROLE_CAPACITY_PER_NODE` is still `1` those two saturate: their demand exceeds
-    /// eligible supply on any active cell, so every offering node gets them and the controller expresses
-    /// nothing about them.
+    /// This became load-bearing the day the threshold-line floor was corrected to `N − (m − t)`: that is
+    /// near-full plane occupancy, so any cell smaller than its plane is permanently short, and the station
+    /// `note_deficit`'s own doc calls "not a signal" when it fires every epoch would have fired every epoch
+    /// on every real deployment. The transition is the event.
     ///
-    /// The second half — the one this exists to hand on — is that a real capacity makes
-    /// `AssignReport::deficit` mean something. That is now recorded locally (`note_deficit` →
-    /// `Station::RoleUnderProvisioned`), so a shortfall is no longer silently dropped. What is still absent is
-    /// the **parent-cell escalation** `docs/design-self-organization.md` §4 describes: a cell that cannot staff a role tells
-    /// its operator and not its parent. That is a hierarchy-transport gap, deliberately not faked here.
+    /// Falsified in both directions on purpose — a repeat must be silent, and a *change* must not be.
     #[test]
-    fn the_last_two_capacities_and_the_parent_escalation_are_still_open() {
-        assert_eq!(
-            ROLE_CAPACITY_PER_NODE, 1,
-            "Relay and Ingress capacity are no longer the placeholder — good, but read this first.\n\
-             \n\
-             `1` reads an event count as a node count, so those two roles saturate the assignment and the\n\
-             controller cannot express anything about them. Their deficits are therefore FABRICATED, and\n\
-             `note_deficit` will be reporting a shortfall for them on every epoch.\n\
-             \n\
-             When you give them a real capacity, check that the reported deficit becomes true rather than\n\
-             merely quieter — and note that the parent-cell escalation is still unwired, so a genuine\n\
-             shortfall reaches an operator and no other cell."
+    fn a_standing_shortfall_is_reported_once_and_a_change_is_reported_again() {
+        let short = |r: Role, n: u16| Demand::per_role(|x| if x == r { n } else { 0 });
+        let mut reported = Demand::default();
+
+        let first: Vec<Role> = deficit_transitions(short(Role::Exit, 3), &mut reported).collect();
+        assert_eq!(first, vec![Role::Exit], "the shortfall appearing is the event");
+
+        let repeat: Vec<Role> = deficit_transitions(short(Role::Exit, 3), &mut reported).collect();
+        assert!(repeat.is_empty(), "the same shortfall next epoch is the same fact, and says nothing new");
+
+        let worse: Vec<Role> = deficit_transitions(short(Role::Exit, 5), &mut reported).collect();
+        assert_eq!(worse, vec![Role::Exit], "a shortfall that GREW is a new fact");
+
+        // Recovery updates the memo and stays silent: `RoleUnderProvisioned` about a role that is no longer
+        // under-provisioned would be a lie, and the next appearance must be reported afresh.
+        let recovered: Vec<Role> = deficit_transitions(Demand::default(), &mut reported).collect();
+        assert!(recovered.is_empty(), "recovery is not an under-provisioning event");
+        let again: Vec<Role> = deficit_transitions(short(Role::Exit, 5), &mut reported).collect();
+        assert_eq!(again, vec![Role::Exit], "and the memo cleared, so the next onset speaks again");
+
+        // Per role, not per cell: one role recovering must not silence another that is still short.
+        let mut memo = Demand::default();
+        let both = Demand::per_role(|r| u16::from(r == Role::Exit || r == Role::Relay));
+        let seen: Vec<Role> = deficit_transitions(both, &mut memo).collect();
+        assert_eq!(seen.len(), 2, "two roles short is two events");
+        let one: Vec<Role> = deficit_transitions(short(Role::Relay, 1), &mut memo).collect();
+        assert!(
+            one.is_empty(),
+            "exit recovered (silent) and relay is unchanged (silent) — one role's transition must not drag \
+             the other's along"
+        );
+        // …and the memo is per role, so exit speaking again does not re-open relay.
+        let mixed = Demand::per_role(|r| u16::from(r == Role::Exit) + u16::from(r == Role::Relay));
+        let reopened: Vec<Role> = deficit_transitions(mixed, &mut memo).collect();
+        assert_eq!(reopened, vec![Role::Exit], "only the role whose number moved is an event");
+    }
+
+    /// **Every shortfall is evidence now — and the tripwire moves to what is still missing.**
+    ///
+    /// `note_deficit` used to skip the roles whose capacity was the placeholder: their demand exceeded supply
+    /// on any active cell by construction, so reporting it would have put a permanent warning in front of an
+    /// operator and taught them to ignore the station. That exemption lived in `capacity_is_derived`, a
+    /// predicate that had to name exactly the roles `role_capacity` derived or the node would either warn
+    /// about an artefact or go quiet about a real shortfall.
+    ///
+    /// **Both are gone**, because the predicate became `true` for every role — and a predicate that cannot be
+    /// false is not a guard, it is a comment that compiles. What remains is the half this exists to hand on:
+    /// a real capacity makes `AssignReport::deficit` mean something, and it reaches this node's operator and
+    /// **nobody else — which is the correct terminus, not a gap**.
+    ///
+    /// `docs/design-self-organization.md` §4 used to promise a parent-cell escalation whose parent would
+    /// "recruit a capable node from a sibling cell, or lower the cell's advertised service level". Both are
+    /// unbuildable here and the doc now carries the derivation: work reaches a node by **derivation** for five
+    /// of the six roles — the responsible point, `rendezvous_line(pubkey, epoch, beacon)`,
+    /// `ingress_line(community, epoch, beacon)`, the mix hop's own line, a keyed threshold service — so no
+    /// advertisement exists to lower; exit is the one directory role and it self-corrects, since fewer exits
+    /// publish fewer descriptors. And recruiting would hand a *parent* the placement aim `§L3` exists to deny
+    /// a node (`MapToPoint(VRF(sk, id‖epoch‖beacon))`), which is a threat-model change rather than a frame.
+    ///
+    /// So the assertion is on the *shape of the vocabulary*: `Escalation` reports faults and a coherence
+    /// collapse, both node-set-shaped, and a `Deficit` variant would ride a transport whose parent-side
+    /// consumer installs coarse reroutes around a **failed child** — routing around a cell that is healthy.
+    /// If someone adds one anyway, this fails on that commit and asks for the consumer to be named.
+    #[test]
+    fn a_deficit_reaches_an_operator_and_no_other_cell() {
+        // Sanity on the reachable half: no role divides by a fabricated denominator, so every shortfall
+        // `note_deficit` sees is a real one. Without this the assertion below would be pinning the absence of
+        // an escalation for demand nobody could meet.
+        let cap = role_capacity();
+        for role in Role::ALL {
+            assert_ne!(cap.of(role), 1, "{role:?}: a placeholder denominator fabricates its own deficit");
+        }
+
+        // And the gap itself. `Escalation` is the vocabulary a cell has for asking the level above; it can
+        // report faults and a coherence collapse, and it cannot report "I could not staff a role".
+        let residue = fanos_runtime::ports::Escalation::Faults(0b101);
+        assert!(
+            matches!(residue, fanos_runtime::ports::Escalation::Faults(_)),
+            "the fault path is what exists — a `Deficit` variant is what does not, and adding one must come \
+             with the parent-side consumer that acts on it, not just the variant"
         );
     }
 
@@ -2004,10 +2197,22 @@ mod tests {
     use fanos_core::roles::{Capability, Role, RoleSet, cell_setpoint};
     use fanos_geometry::fano;
 
-    /// The threshold floor a line of `m` points imposes, in `Demand`'s units — the same conversion
-    /// `with_viability_floor` performs, so a test cannot pin a number the production path would not produce.
+    /// The floor a **plane** of line size `m` imposes on a threshold-line role, in `Demand`'s units — the
+    /// same conversion `with_viability_floor` performs, so a test cannot pin a number the production path
+    /// would not produce.
+    ///
+    /// It is `N − (m − t)`, not `t`. `t` is the quorum of **one line**; this demand is a count of nodes in
+    /// the plane, filled by a beacon lottery that never looks at a line, so `t` nodes cell-wide put `t` on a
+    /// *given* line only `3/21` of the time on the base cell. Six of seven lines unserved, by the floor that
+    /// exists to stop exactly that.
+    /// Exit's availability floor, `f + 1`, in `Demand`'s units — the same conversion `with_viability_floor`
+    /// performs, so a test cannot pin a number the production path would not produce.
+    fn exit_floor(m: usize) -> u16 {
+        u16::try_from(fanos_geometry::fault_budget(fanos_geometry::plane_points(m)) + 1).unwrap_or(u16::MAX)
+    }
+
     fn line_floor(m: usize) -> u16 {
-        u16::try_from(fanos_geometry::line_threshold(m)).unwrap_or(u16::MAX)
+        u16::try_from(fanos_geometry::points_serving_every_line(m)).unwrap_or(u16::MAX)
     }
 
     fn node(i: u8) -> NodeId {
@@ -2021,7 +2226,7 @@ mod tests {
         // it. With κ = 1 that is a one-step retirement of a role nobody stopped needing, undone the next epoch
         // by a read that happened to succeed. Churn in the anonymity set, driven by the measurement.
         let supply = Demand::per_role(|_| 3);
-        let held = Demand::per_role(|r| if r == Role::Relay { 5 } else { 0 });
+        let held = Demand::per_role(|r| if r == Role::Storage { 5 } else { 0 });
         let understated = Demand::default();
 
         assert_eq!(
@@ -2035,7 +2240,16 @@ mod tests {
         // would trade one defect for its mirror image.
         let measured_zero = Demand::default();
         let (moved, reported) = setpoint_to_track(measured_zero, true, Some(held), supply, fano::LINE_SIZE);
-        assert_eq!(moved.of(Role::Relay), 0, "a COMPLETE read of zero relay demand must shrink the role");
+        // Carried by `Storage`, and the choice is the assertion's whole discriminating power: it is the one
+        // role with **no floor at all** — structural, so held keys stay observable with nobody assigned — so a
+        // measured zero can reach zero and a failure to shrink cannot hide behind a floor. `Relay` used to
+        // carry this and stopped being able to the moment its guarantee was recognized as a line threshold.
+        assert_eq!(moved.of(Role::Storage), 0, "a COMPLETE read of zero storage demand must shrink the role");
+        assert_eq!(
+            moved.of(Role::Relay),
+            line_floor(fano::LINE_SIZE),
+            "and a mix line's coverage floor holds under a measured zero exactly as a rendezvous line's"
+        );
         assert_eq!(reported, None, "a scan that concluded is the normal case and must not raise a station");
 
         // …and the floor rides with the fresh branch. Rendezvous is floored at the LINE THRESHOLD, not at one:
@@ -2045,7 +2259,12 @@ mod tests {
             line_floor(fano::LINE_SIZE),
             "the freshly-read setpoint is floored, and for a threshold-line role the floor is t-of-(q+1)"
         );
-        assert_eq!(moved.of(Role::Exit), 1, "a role that is merely self-gated keeps the observability floor of 1");
+        assert_eq!(
+            moved.of(Role::Exit),
+            exit_floor(fano::LINE_SIZE),
+            "exit is not merely self-gated: a client PICKS it from a directory, so its availability floor is \
+             the cell's own fault budget plus one"
+        );
 
         // A young cell must not freeze. Its empty coordinates are definite absences, not unknowns, so the scan
         // reads complete and the demand is free to move from zero — which is what makes holding safe at all.
@@ -2083,9 +2302,9 @@ mod tests {
         assert_eq!(
             tracked.of(Role::Rendezvous),
             line_floor(fano::LINE_SIZE),
-            "a threshold-line role is floored at t-of-(q+1) — the geometry's own minimum, not zero"
+            "a threshold-line role is floored at the plane's coverage count, not at zero"
         );
-        assert_eq!(tracked.of(Role::Exit), 1, "a self-gated role keeps the floor of 1");
+        assert_eq!(tracked.of(Role::Exit), exit_floor(fano::LINE_SIZE), "and the exit floor rides with it");
 
         // The floor is conditioned on supply, and that condition survives: a role nobody offers stays at zero
         // rather than being provisioned into existence by a scan that failed.
@@ -2192,14 +2411,36 @@ mod tests {
         // pinned is *which roles are which*, and that only a literal can say.
         let floored = measured_nothing.with_viability_floor(everyone_offers, fano::LINE_SIZE);
         assert_eq!(floored.of(Role::Service), 1, "nobody serving means no service to measure");
-        assert_eq!(floored.of(Role::Exit), 1, "nobody exiting means no flows to measure");
+        // **Exit's floor is `f + 1`, not the observability `1`** — and the difference is not cosmetic. The
+        // load quotient only reaches `2` at `MAX_SESSIONS + 1 = 247` concurrent flows cell-wide, so `1` was
+        // both the floor and the operating point: a cell published exactly one exit, `discover_exit`'s
+        // "pick one at random, so a proxy restart spreads load across the available exits" randomised over a
+        // set of size one, and that node saw every clearnet destination the cell reached.
+        assert_eq!(
+            floored.of(Role::Exit),
+            exit_floor(fano::LINE_SIZE),
+            "a service a client picks from a set survives the cell's tolerance only if the set is larger \
+             than it: f + 1, since the adversary chooses whom to take after the assignment is public"
+        );
+        assert_eq!(exit_floor(fano::LINE_SIZE), 3, "PG(2,2): f = ⌊6/3⌋ = 2, so three exits");
+        assert_eq!(exit_floor(8), 19, "q = 7: f = ⌊56/3⌋ = 18, so nineteen");
+        assert!(
+            exit_floor(fano::LINE_SIZE) > u16::from(Role::Exit.load_is_self_gated()),
+            "and it subsumes the observability floor rather than replacing it — one server keeps the sensor \
+             alive, f + 1 keeps the service alive"
+        );
 
         // **The two floors are different questions, and this is where they part.** Observability is satisfied
         // by one server; a threshold line is not. `t`-of-`(q+1)` is what a rendezvous line's anonymity set and
         // POROS's seize-below-`t` guarantee both rest on, so one occupied point does not weaken the property —
         // it inverts it, handing a single node what the threshold exists to split.
         let t = line_floor(fano::LINE_SIZE);
-        assert_eq!(t, 2, "PG(2,2): a 3-point line acts at 2, and the floor must be that same t");
+        assert_eq!(
+            t, 6,
+            "PG(2,2): a 3-point line acts at 2, but the DEMAND is a count of nodes in a 7-point plane and \
+             the draw is line-blind — so the floor is N − (m − t) = 6, the point at which no withheld set \
+             can be collinear enough to starve a line"
+        );
         assert_eq!(floored.of(Role::Rendezvous), t, "a meeting line below t cannot peel at all");
         assert_eq!(floored.of(Role::Ingress), t, "and POROS's ingress line is the same property");
         assert!(
@@ -2215,11 +2456,34 @@ mod tests {
             line_floor(8),
             "q=7: an 8-point line needs 6 occupied, not the Fano plane's 2"
         );
+        // **Relay is the third threshold-line role, and the tie is exact rather than analogical.** A mix hop
+        // *is* a line: peeling one onion layer needs `t` of its `q+1` members to answer a share request, and
+        // `mix_threshold` — what the production router is actually constructed with — is a one-line call to
+        // the same `line_threshold` this floor uses. Asserted as an identity against that function, so the
+        // two cannot drift; a copy here would be the defect this file warns about everywhere else.
         assert_eq!(
             floored.of(Role::Relay),
-            0,
-            "relay load is originated traffic, which a node produces unassigned — no floor needed"
+            t,
+            "a mix line below t cannot peel either, and provisioning it by demand collapses the mix to one"
         );
+        // **The tie to the router's own constant, through the derivation rather than by equality.** This
+        // was first written as `floor == mix_threshold(LINE_SIZE)` — an identity between a cell-wide count
+        // and a per-line quorum, which is the very confusion the floor above corrects. Two quantities in
+        // different spaces cannot be equal; what they share is the derivation.
+        assert_eq!(
+            usize::from(t),
+            fanos_geometry::plane_points(fano::LINE_SIZE)
+                - (fano::LINE_SIZE - crate::node::mix_threshold(fano::LINE_SIZE)),
+            "the floor is the plane minus the withholding budget, and that budget is the router's own \
+             per-line fault tolerance — one derivation, not two constants that happen to agree"
+        );
+        assert_eq!(
+            usize::from(wide.of(Role::Relay)),
+            fanos_geometry::plane_points(8) - (8 - crate::node::mix_threshold(8)),
+            "and it tracks the plane, both terms of it: a q=7 hop acts at 6 of its 8, so at most 2 of the \
+             57 points may be withheld before some line drops below that — 55, not 6"
+        );
+        assert_eq!(usize::from(wide.of(Role::Relay)), 55, "written out, because a formula can agree with itself");
         assert_eq!(
             floored.of(Role::Storage),
             0,
@@ -2282,6 +2546,19 @@ mod tests {
         sensor.record(RoleReading::blind().measuring(Role::Relay, 4));
         assert_eq!(sensor.reading().of(Role::Exit), Some(2), "an engine report does not clobber a gauge");
         assert_eq!(sensor.reading().of(Role::Relay), Some(4), "and still lands its own readings");
+
+        // **And the other half of the same ownership**, which was only ever true by accident of which roles
+        // had which sensor. `gauge`'s doc says the slot's writer is the caller's task from here on; nothing
+        // enforced it, so an engine that reports a `Some` for an already-gauged role used to re-stamp the slot
+        // every observation window, discarding every completion the gauge recorded in between. The role stays
+        // sensed and the number stays plausible, so the under-report is invisible — the reason this is pinned
+        // with a value the engine would *plausibly* send rather than an absurd one.
+        sensor.record(RoleReading::blind().measuring(Role::Exit, 7));
+        assert_eq!(
+            sensor.reading().of(Role::Exit),
+            Some(2),
+            "a gauged role belongs to its driver: an engine `Some` must not overwrite work in flight"
+        );
 
         drop(first);
         assert_eq!(sensor.reading().of(Role::Exit), Some(1), "a finished flow stops being carried");
@@ -2407,23 +2684,49 @@ mod tests {
         // of its own membership: the answer is settled, or the store is not answering. Each was measured the hard way.
         const OK: u32 = STABLE_BEFORE_BACKOFF;
 
-        assert!(may_relax(OK, 5, 5, true), "settled, not behind, and the reads concluded: relax");
+        assert!(may_relax(OK, 0, 5, 5, true), "settled, not behind, and the reads concluded: relax");
 
         // One identical answer is not a pattern.
-        assert!(!may_relax(0, 5, 5, true));
-        assert!(!may_relax(OK - 1, 5, 5, true), "just short of the threshold still holds at the floor");
+        assert!(!may_relax(0, 0, 5, 5, true));
+        assert!(!may_relax(OK - 1, 0, 5, 5, true), "just short of the threshold still holds at the floor");
 
         // The transport's peer table is a lower bound the overlay store owes nothing to, so a roster below it is
         // DEMONSTRABLY behind — positive evidence of work left to do (§5.3.2, measured as a cell stuck at [2, 1, 2]).
-        assert!(!may_relax(OK, 4, 5, true), "roster below the transport's own peer count");
-        assert!(may_relax(OK, 6, 5, true), "a roster ABOVE it is not evidence of being behind");
+        assert!(!may_relax(OK, 0, 4, 5, true), "roster below the transport's own peer count");
+        assert!(may_relax(OK, 0, 6, 5, true), "a roster ABOVE it is not evidence of being behind");
 
         // An incomplete scan lengthens the period, and that is the RIGHT direction: a store that is not answering is not
         // fixed by asking it more often, and asking more often is what stopped it answering (§5.3.5). The soundness half is
         // at the call site — `stable` only accumulates on a complete repeat — so backing off here never turns into
         // believing a partial answer.
-        assert!(may_relax(0, 0, 9, false), "cannot read ⇒ retry less often, regardless of how it looks");
-        assert!(may_relax(OK, 5, 5, false), "and completeness is checked before stability, not after it");
+        // **This used to read `cannot read ⇒ retry less often`, and that sign turned a transient into a
+        // run-long freeze.** A node whose scan does not conclude has *no usable view*; backing off is the one
+        // response that guarantees it keeps not having one. Measured: on a lossless link with no congestion
+        // at all, an incomplete read at `t = 0` put the next attempts at `15 s`, `45 s`, `105 s` — a 60 s
+        // observation window sees two, and the assignment vector is frozen for the rest of the run. Three
+        // reproductions, and in every one `roster < occupied` held exactly where `complete` was false.
+        //
+        // **The congestion argument it was written for is already paid by the floor's own derivation.**
+        // `ROSTER_REFRESH = 3 × STORE_TIMEOUT`: a node whose reads all time out cannot retry faster than one
+        // scan per three timeouts however this predicate answers, so "retry at the floor" is not hammering
+        // and the extra doubling buys nothing. It also contradicted `withhold`'s own doc one screen up —
+        // *"`complete = false` … is already the signal that keeps the refresh at its floor — a withheld
+        // assignment must be re-derived soon, not backed off from"* — two instructions for one flag.
+        assert!(
+            !may_relax(0, 0, 0, 9, false),
+            "one unreadable scan must be re-derived at the floor: backing off on the first turns a transient \
+             into a freeze that outlives the run"
+        );
+        assert!(
+            may_relax(0, STABLE_BEFORE_BACKOFF, 0, 9, false),
+            "…and a PERSISTENTLY unreadable view does back off, which is the contention measurement this \
+             loop also carries: steady-state cost must be zero, not a trickle"
+        );
+        assert!(
+            !may_relax(OK, 0, 5, 5, false),
+            "completeness is still checked before stability — it is now a REQUIREMENT for relaxing rather \
+             than a reason to relax, so a settled-looking node with an unreadable view stays at the floor"
+        );
     }
 
     #[test]
@@ -2508,6 +2811,9 @@ mod tests {
             stable = next_stable(stable, true, false);
         }
         assert!(stable < STABLE_BEFORE_BACKOFF, "twenty unreadable scans must not add up to a settled answer");
-        assert!(may_relax(stable, 0, 9, false), "though the node does back off, which is the congestion response");
+        assert!(
+            !may_relax(stable, 1, 0, 9, false),
+            "and it keeps looking at the floor: twenty unreadable scans are twenty reasons to re-derive, not              a licence to go quiet — the sign this used to carry is what froze a cell for a whole run"
+        );
     }
 }

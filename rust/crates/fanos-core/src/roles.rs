@@ -104,8 +104,15 @@ impl Role {
     /// taxonomy — it is read off the loop topology, one role at a time, by asking *what produces this sensor's
     /// signal*:
     ///
-    /// - [`Relay`](Self::Relay) — **no**. Its sensor counts frames this node *originated*. A node originates
-    ///   traffic whether or not the cell assigned it the relay role, so the signal outlives the assignment.
+    /// - [`Relay`](Self::Relay) — **no**, but not for the reason first written here. The stated one was "its
+    ///   sensor counts frames this node *originated*", and that sensor is gone: it measured the node's work as
+    ///   a *source* rather than the work it carries for others, so a relay forwarding the whole cell's mix
+    ///   read zero (`fanos_runtime::healer::load_report`). The reading is now gathers in flight at the
+    ///   combiner, and the answer survives the correction for [`Storage`](Self::Storage)'s reason instead: a
+    ///   gather is armed by whichever line member the cell is *salted* to, which is geometry, so the signal
+    ///   does not wait on an assignment. **The floor it needs comes from
+    ///   [`covers_a_threshold_line`](Self::covers_a_threshold_line) regardless**, which is the stronger of the
+    ///   two and makes this row's answer moot for the setpoint.
     /// - [`Storage`](Self::Storage) — **no**. The DHT store is structural: a value lands on its responsible
     ///   content point by geometry, with nobody assigned, so held keys stay observable.
     /// - [`Service`](Self::Service), [`Exit`](Self::Exit), [`Rendezvous`](Self::Rendezvous) — **yes**. A node
@@ -126,11 +133,55 @@ impl Role {
     /// Whether this role's guarantee is a **threshold property of a line's occupancy** rather than a
     /// throughput one — so how many the cell needs is decided by the geometry, not by the load.
     ///
-    /// [`Rendezvous`](Self::Rendezvous) and [`Ingress`](Self::Ingress) are the two, and both role docs say so
-    /// already: a hidden service's anonymity set *is* its meeting line's membership, and POROS's
-    /// "seize fewer than `t` and learn nothing" is a statement about how much of the line is occupied. Neither
-    /// survives being provisioned by demand: a busy line and an idle one need the same `t` points, and an idle
-    /// one provisioned to a single point has not degraded its guarantee, it has inverted it.
+    /// # The axis underneath this predicate: **what decides where the work lands**
+    ///
+    /// Three answers, and a role's answer settles three separate questions at once — which is why it is worth
+    /// naming rather than deciding case by case.
+    ///
+    /// | role | where the work arrives | placement |
+    /// |---|---|---|
+    /// | [`Storage`](Self::Storage) | the key's responsible point; shards go to the nearest *occupied* homes | geometry |
+    /// | [`Relay`](Self::Relay) | the mix hop **is** a line; its gatherer is salted from the cell | geometry |
+    /// | [`Rendezvous`](Self::Rendezvous) | `MapToLine(H(secret ‖ epoch ‖ beacon))` | geometry |
+    /// | [`Ingress`](Self::Ingress) | `ingress_line(community, epoch, beacon)` | geometry |
+    /// | [`Service`](Self::Service) | `ServiceParams::line`, collected at a provisioning ceremony | operator |
+    /// | [`Exit`](Self::Exit) | whichever descriptors are published | directory |
+    ///
+    /// **1. Can the role be rationed?** Only where the work can be *moved onto* the nodes provisioned — the
+    /// directory row alone. A geometry-placed role's work arrives at a derived address whatever the cell
+    /// assigned, so `⌈Σ load / capacity⌉` cannot be its law: raising the count moves no work, and lowering it
+    /// does not stop any. That is why this predicate exists and why its floor is a *coverage* count.
+    ///
+    /// **2. Can a shortfall be escalated?** Only if some party could redirect the work. Nobody can redirect a
+    /// derived line or a ceremony's roster, and the directory corrects itself (fewer exits publish fewer
+    /// descriptors), so a role deficit has no remote consumer at all — `docs/design-self-organization.md` §4
+    /// carries that derivation.
+    ///
+    /// **3. Can the assignment be actuated?** Storage is the sharp case: a node cannot decline to be a
+    /// shard's nearest-occupied home without *losing the shard*, so `Role::Storage` has no actuator and can
+    /// have none — its demand is ceremonial, which is why a floor of zero costs nothing there while the same
+    /// zero would be fatal for a line role.
+    ///
+    /// [`Rendezvous`](Self::Rendezvous), [`Ingress`](Self::Ingress) and [`Relay`](Self::Relay) are the three,
+    /// and the first two role docs say so already: a hidden service's anonymity set *is* its meeting line's
+    /// membership, and POROS's "seize fewer than `t` and learn nothing" is a statement about how much of the
+    /// line is occupied. Neither survives being provisioned by demand: a busy line and an idle one need the
+    /// same `t` points, and an idle one provisioned to a single point has not degraded its guarantee, it has
+    /// inverted it.
+    ///
+    /// **`Relay` is the third, and it is not an analogy — it is the same function.** A mix hop *is* a line,
+    /// and peeling one onion layer needs `t` of that line's `q+1` members to answer a share request:
+    /// `fanos_node::node::mix_threshold` is a one-line call to `fanos_geometry::line_threshold`, the very
+    /// function this floor is computed from, and its own doc says a threshold fixed at the Fano value "would
+    /// let any two corrupt members own a hop however wide the line is" (audit E7). So the relay count a cell
+    /// needs is fixed by the plane, not by traffic — and provisioning it by demand is worse here than
+    /// anywhere else, because the load reading is now `MAX_PENDING`-scaled (`2970` gathers on the shipping
+    /// budget). A cell would have to be carrying nearly three thousand simultaneous gathers before the
+    /// quotient asked for a *second* relay, so demand alone would collapse the mix to one node — a mix of one
+    /// is not a weak mix, it is no mix, the same inversion the paragraph above describes.
+    ///
+    /// This row was `false` while `Relay`'s load was a count of *originated* frames, where it read as a
+    /// throughput role. The sensor correction is what made the geometry visible.
     ///
     /// The distinction is separate from [`load_is_self_gated`](Self::load_is_self_gated), which the other two
     /// self-gated roles ([`Service`](Self::Service), [`Exit`](Self::Exit)) satisfy without needing a line: they
@@ -138,7 +189,44 @@ impl Role {
     /// exit work. One rendezvous point does not do rendezvous work.
     #[must_use]
     pub const fn covers_a_threshold_line(self) -> bool {
-        matches!(self, Role::Rendezvous | Role::Ingress)
+        matches!(self, Role::Rendezvous | Role::Ingress | Role::Relay)
+    }
+
+    /// Whether this role's **availability must survive the cell's own fault budget** — so the count it needs
+    /// is `f + 1`, not one.
+    ///
+    /// [`Exit`](Self::Exit) is the only one, and it is the only role a client reaches by **choosing** from a
+    /// directory rather than by deriving an address (see the placement table on
+    /// [`covers_a_threshold_line`](Self::covers_a_threshold_line)). That is exactly what makes the count
+    /// meaningful for it and meaningless for the geometric roles: adding an exit adds a provider a client can
+    /// actually pick.
+    ///
+    /// # Why one is the wrong number, and what it was costing
+    ///
+    /// The self-gated floor of `1` answers *observability* — keep one server so the role's load stays
+    /// measurable — and for Exit it was also the **operating point**, because the load quotient only reaches
+    /// `2` at `MAX_SESSIONS + 1 = 247` concurrent flows cell-wide. So a cell published exactly one exit, and:
+    ///
+    /// * `fanos::discover_exit` reads the live exit directory and *"picks one at random, so a proxy restart
+    ///   spreads load across the available exits"* — a randomisation over a set of size one. The mechanism was
+    ///   built and made inert by a neighbouring constant.
+    /// * that one node is the single observer of **every clearnet destination the cell reaches**, and the
+    ///   single point at which clearnet egress fails.
+    ///
+    /// # The count, derived rather than chosen
+    ///
+    /// A cell states its tolerance once, as `fanos_geometry::fault_budget(N) = ⌊(N−1)/3⌋`. A service a client
+    /// picks from a set survives that tolerance exactly when the set is larger than it — the adversary chooses
+    /// which members to take after the assignment is public, so `f` providers can all be taken and `f + 1`
+    /// cannot. That is `3` on the base cell and `19` at `q = 7`.
+    ///
+    /// **Raising it cannot make a deployment worse**: `assign_report` fills `min(demand, eligible)`, so a cell
+    /// where few members offer Exit assigns the same nodes it assigned before and reports the shortfall once
+    /// (`note_deficit` reports transitions). A cell where many offer now spreads egress across them, which is
+    /// what the randomisation above was written for.
+    #[must_use]
+    pub const fn availability_survives_the_fault_budget(self) -> bool {
+        matches!(self, Role::Exit)
     }
 
     /// This role's index into a per-role array, in [`Role::ALL`] order.
@@ -504,7 +592,17 @@ impl Demand {
     /// **wrong question**, and getting the right answer to it is not enough. A rendezvous line's guarantee is
     /// `t`-of-`(q+1)`: below `t` occupied points the line cannot peel at all, and a *single* occupied point is
     /// not a weak anonymity set but none — that one node holds outright what the threshold exists to split.
-    /// So their floor is `line_threshold(line_size)`, a **security** requirement, not a measurement one.
+    /// So their floor is a **security** requirement, not a measurement one — and it is not `t`.
+    ///
+    /// **`t` is the quorum of one line; this demand is a count of nodes in the plane**, and `select` fills it
+    /// by ranking a beacon hash with no line in the decision. `t` nodes assigned cell-wide carry a *given*
+    /// line only `C(3,2)/C(7,2) = 3/21` of the time on the base cell, and `≈ 9·10⁻⁷` at `q = 7` — so the
+    /// floor written to stop a line falling below its quorum was putting six lines in seven below it. The
+    /// right count is `fanos_geometry::points_serving_every_line`: a line fails once more than `m − t` of its
+    /// points are withheld, and any `m − t + 1` points **may be collinear**, so
+    /// `floor = N − (m − t)` — `6` of `7`, `55` of `57`. Exhausted over every placement on the base cell,
+    /// where it is exact rather than conservative, and where even a line-*aware* assignment needs the same
+    /// `6`: these roles are not rationable at all.
     ///
     /// This was invisible while capacity was the placeholder `1`: the setpoint exceeded the eligible supply on
     /// every active cell, `assign_report` filled `min(demand, eligible)`, and every offering node received the
@@ -522,7 +620,18 @@ impl Demand {
                 return self.of(role);
             }
             let floor = if role.covers_a_threshold_line() {
-                u16::try_from(fanos_geometry::line_threshold(line_size)).unwrap_or(u16::MAX)
+                // **The plane's coverage floor, not the line's quorum.** `line_threshold` answers "how
+                // many of ONE line must act"; this demand is a count of nodes in the plane, filled by a
+                // beacon lottery that never looks at a line. `t` nodes cell-wide put `t` on a given line
+                // with probability `3/21` on the base cell — so the floor that exists to stop a line being
+                // provisioned below its quorum was itself provisioning six lines in seven below it.
+                u16::try_from(fanos_geometry::points_serving_every_line(line_size)).unwrap_or(u16::MAX)
+            } else if role.availability_survives_the_fault_budget() {
+                // `f + 1`, so the cell's stated tolerance covers the one service a client reaches by choosing
+                // rather than by deriving. See the classification's own doc for why `1` was both the floor
+                // and the operating point, and what that concentrated.
+                u16::try_from(fanos_geometry::fault_budget(fanos_geometry::plane_points(line_size)) + 1)
+                    .unwrap_or(u16::MAX)
             } else {
                 u16::from(role.load_is_self_gated())
             };

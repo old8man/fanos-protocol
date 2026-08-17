@@ -741,7 +741,12 @@ impl IngressResponse {
 
 /// Default cap on concurrently-gathering requests — a bound on combiner state against a request flood.
 /// Bounding `pending` by COUNT is what leaves the gather deadline free to be measured ([`GatherClock`]).
-const DEFAULT_MAX_PENDING: usize = 256;
+///
+/// Also `Role::Ingress`'s **capacity**: what one node will admit is what one node absorbs, the same identity
+/// every other derived capacity in `crate::role_loop::role_capacity` is read off. Visible to that module
+/// rather than restated there, because a copy would drift the moment this moved and nothing would notice —
+/// the cell would simply provision the wrong number of ingress points.
+pub(crate) const DEFAULT_MAX_PENDING: usize = 256;
 
 /// A combiner's in-flight gather for one requester: the request, the descriptor shares collected so far
 /// (deduped by share index so a member cannot inflate the count), and the timer that bounds it.
@@ -1241,7 +1246,20 @@ impl PorosHost {
             self.stations.record(Station::AdmissionSybilCapped, None);
             return Vec::new();
         }
-        if self.pending.contains_key(&req.requester) || self.pending.len() >= self.max_pending {
+        // **A retransmit is not a capacity refusal**, and one branch was calling it one. `AdmissionNoCapacity`
+        // promises "capacity, not policy" — the same distinction `AdmissionSybilCapped` was split out of one
+        // line above — while this condition also fired on a requester that simply *already had a gather in
+        // flight*. Retransmission is not an edge case here: the design counts on it (a gather dropped at the
+        // cap is one "its client retransmits"), so on any lossy link the capacity station was reporting
+        // ordinary duplicates, and the saturation signal it stands for could not be read.
+        //
+        // Split the way the sibling engine already does it — `threshold_service::on_intro` suppresses
+        // duplicates silently and records only the true cap — so this is the tree's own shape applied to the
+        // twin that was missing it, not a new convention.
+        if self.pending.contains_key(&req.requester) {
+            return Vec::new(); // already gathering for this requester; the duplicate is benign and silent
+        }
+        if self.pending.len() >= self.max_pending {
             self.stations.record(Station::AdmissionNoCapacity, None);
             return Vec::new();
         }
@@ -1646,6 +1664,28 @@ mod tests {
         let window = host.take_stations();
         assert_eq!(window.len(), 3, "three distinct stations fired");
         assert_eq!(host.stations().total(Station::AdmissionPowFailed), 0, "the window restarted");
+
+        // **Gate 4, and it used to wear gate 3's name.** An accepted request leaves a gather in flight; the
+        // requester retransmitting is refused by the duplicate guard — *policy* — while
+        // `AdmissionNoCapacity` promises "capacity, not policy". Both used to travel on one `||`, so on any
+        // lossy link the saturation signal was reporting ordinary retransmits. Retransmission is not an edge
+        // case in this design: a gather dropped at the cap is explicitly one "its client retransmits".
+        let ok = solve_ingress_request(admitted, &community, epoch, &beacon, difficulty);
+        assert!(
+            !host.step(Instant(3), Input::Message { from: admitted, frame: request_frame(&ok) }).is_empty(),
+            "the fixture must ACCEPT first — a refused request would leave nothing to duplicate"
+        );
+        let before = host.stations().total(Station::AdmissionNoCapacity);
+        assert!(
+            host.step(Instant(4), Input::Message { from: admitted, frame: request_frame(&ok) }).is_empty(),
+            "the retransmit is refused — the gather is already running"
+        );
+        assert_eq!(
+            host.stations().total(Station::AdmissionNoCapacity),
+            before,
+            "…and refused SILENTLY: a duplicate is not a want of capacity, and counting it as one makes the \
+             one station that could report saturation unreadable"
+        );
     }
 
     #[test]

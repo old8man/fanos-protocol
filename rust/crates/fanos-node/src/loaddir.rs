@@ -151,7 +151,7 @@ fn privatize(load: Demand, capacity: Demand, points: u32, rng: &mut impl rand_co
 /// which is every deployed node, and the record is then bound so no other member can write this slot.
 /// `None` emits the bare report a pinned cell can produce, where no coordinate is provable.
 ///
-/// **The figure written here is already noised** — see [`privatize`]. The raw per-role reading never leaves
+/// **The figure written here is already noised** — see `privatize`. The raw per-role reading never leaves
 /// the node, because a store this directory writes to is read without restriction by every cell member.
 pub async fn publish_load(
     client: &Client,

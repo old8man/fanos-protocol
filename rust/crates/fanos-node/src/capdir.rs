@@ -17,6 +17,8 @@
 //! is simply absent from the roster (a liveness fault, which the assignment already tolerates by running over whoever *did*
 //! verify).
 
+use std::collections::BTreeSet;
+
 use fanos_core::roles::{Capability, CapabilityDescriptor};
 use fanos_diaulos::Coord;
 use fanos_field::Field;
@@ -25,7 +27,8 @@ use fanos_primitives::{BeaconSeed, NodeId};
 use fanos_quic::{Client, CoordinateProver};
 use fanos_rendezvous::Epoch;
 use fanos_runtime::Notification;
-use fanos_vrf::{VrfProof, VrfPublic, VrfSecret};
+use fanos_runtime::ports::ReadOutcome;
+use fanos_vrf::{VrfOutput, VrfProof, VrfPublic, VrfSecret};
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 
@@ -106,6 +109,44 @@ pub fn parse_bound_advertisement<F: Field>(
         return None;
     }
     Some((desc.node_id, desc.capability))
+}
+
+/// **Who holds this node's own slot, when it is not this node.**
+///
+/// Called on the one path that has already established the question: the role loop withholds when it cannot
+/// find its own advertisement in the roster it just read, and *something else being there* is the sharpest
+/// reason that can happen. Two nodes whose VRF draws collided are entitled to the same point, both publish
+/// to `cap_slot(coord, epoch)`, and one overwrite decides the roster while telling the loser nothing.
+///
+/// Read separately rather than threaded through the scan on purpose: this is one extra `Get` on a path that
+/// is already holding, against a key the scan just read, and the alternative was carrying a claim through
+/// `Read`, `Scan`, the member list and `Demand::supply` — four types that have no use for it — to reach a
+/// branch that fires rarely.
+///
+/// `None` when the slot is empty, unreadable, or holds this node's own record; `Some` only for a record
+/// whose proof verified against `(coord, epoch, beacon)` and whose identity is somebody else's.
+pub(crate) async fn foreign_claim_at<F: Field>(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    own_id: &NodeId,
+) -> Option<(Vec<u8>, VrfPublic, VrfProof, VrfOutput)> {
+    let outcome =
+        tokio::time::timeout(STORE_TIMEOUT, client.read(cap_slot(coord, epoch))).await.ok()?;
+    // Only a definite `Found` can carry a claim: an absence proves nothing about who holds the point, and
+    // an inconclusive read proves nothing at all — the distinction `Read::of` exists to keep.
+    let ReadOutcome::Found(bytes) = outcome else { return None };
+    let (entitled, payload, output, _) =
+        Entitlement::open_with_claim::<F>(&bytes, coord, epoch, beacon)?;
+    let desc = CapabilityDescriptor::from_bytes(payload)?;
+    // The same three checks `parse_bound_advertisement` makes, for the same reason: an entitled publisher
+    // must not be able to advertise under somebody else's name.
+    if desc.epoch != epoch || desc.node_id.0 != entitled.public.to_bytes() || !desc.verify(&entitled.public)
+    {
+        return None;
+    }
+    (desc.node_id != *own_id).then_some((entitled.id, entitled.public, entitled.proof, output))
 }
 
 /// Publish this node's signed capability advertisement for `epoch` at its coordinate slot, so the cell can
@@ -189,7 +230,7 @@ pub(crate) async fn build_capability_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> (Vec<(NodeId, Capability)>, Seating, Coverage) {
+) -> (Vec<(NodeId, Capability)>, Seating, BTreeSet<usize>, Coverage) {
     let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
         read_capability::<F>(&client, coord, epoch, beacon).await
     })
@@ -199,7 +240,22 @@ pub(crate) async fn build_capability_directory<F: Field>(
     // answer (`role_loop`), and the shortfall is what distinguishes ordinary jitter from a cell going dark.
     let complete = scan.coverage();
     let mut seating: Seating = [None; 7];
+    // **The plane-wide counterpart to `seating`, and the reason both exist.** `Seating` is seven slots
+    // because the DIAKRISIS reflex is addressed off a seven-member index space; every point past the
+    // seventh is dropped from it *on purpose* (see the branch below). That makes it the wrong value for
+    // any question about the PLANE — and the plane is what a line reads when it counts members against
+    // `t`. This set is the same scan seen without the reflex's frame: every point that answered with a
+    // record, whatever the order of the plane.
+    //
+    // The information was here all along and left in the next line: `scan.found` is
+    // `Vec<(Coord, (NodeId, Capability))>` and the return mapped it to `|(_, member)| member`, discarding
+    // the coordinate at the one place that had it. A cell could therefore say "my roster is 5" and never
+    // "0 of my 21 lines can be served", which are different facts and only the second one is actionable.
+    let mut occupied = BTreeSet::new();
     for (coord, (id, _)) in &scan.found {
+        if let Some(i) = Point::<F>::new(*coord).map(|p| p.index()) {
+            occupied.insert(i);
+        }
         // Points past the seventh have no seat in the reflex's index space, and the diagnosis masks are `u8`.
         // Silently skipping them is right for the base cell (there are none) and is the honest answer on a
         // larger plane, where the reflex does not run at all (#145) and a seat number would be an invention.
@@ -207,7 +263,7 @@ pub(crate) async fn build_capability_directory<F: Field>(
             *seat = Some(*id);
         }
     }
-    (scan.found.into_iter().map(|(_, member)| member).collect(), seating, complete)
+    (scan.found.into_iter().map(|(_, member)| member).collect(), seating, occupied, complete)
 }
 
 /// As [`resolve_capability`], distinguishing a read that **did not conclude** from a definite absence.
