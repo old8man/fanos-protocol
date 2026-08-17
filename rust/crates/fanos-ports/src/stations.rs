@@ -218,8 +218,20 @@ pub enum Station {
     /// counter tracks the *cover rate*, and a drop in it means the cover schedule stopped — which no other
     /// observable on this path reports.
     SharePartialMalformed,
-    /// A share arrived for an unknown request: already peeled, foreign, or **past its deadline** — the
-    /// last of which says the deadline is too tight rather than the line too slow.
+    /// A share arrived for a request this node has **no record of** — foreign, or resolved so long ago that
+    /// the attribution ring has forgotten it. Evidence of nothing in particular, which is the point.
+    ///
+    /// **The two readable worlds were split out of it and live next door**: a share behind a completed
+    /// gather is [`ShareLateAfterPeel`](Self::ShareLateAfterPeel), the expected `q + 1 − t` remainder, and
+    /// one behind an expired gather is [`ShareAfterDeadline`](Self::ShareAfterDeadline), the actionable
+    /// evidence that the deadline is too tight. This doc used to claim all three — *"already peeled,
+    /// foreign, or past its deadline — the last of which says the deadline is too tight"* — and pointed an
+    /// operator at this counter for a signal that is now recorded on another. A contract doc that describes
+    /// a conflation its code no longer has costs exactly what the conflation did.
+    ///
+    /// So a rise here is not a tuning signal: it says shares are arriving for gathers **older than the
+    /// ring**, which at a ring sized from `MAX_PENDING` means the line is answering later than the node
+    /// admits work — or that the shares are not ours.
     ShareForUnknownRequest,
     /// A share carried an index outside the line's real membership — a **forged** share, and therefore
     /// distinguishable from noise: this is an attack indicator, not an error rate.
@@ -259,6 +271,32 @@ pub enum Station {
     /// that until the activation height — but "does any hop line hold fewer than `t` members that agree". A
     /// count without the tag cannot answer it, and a count without the line cannot localize it.
     FrameTypeUnknown,
+
+    /// A frame whose type **is** in this build's registry arrived at a component with no handler for it.
+    ///
+    /// **Split out of [`FrameTypeUnknown`](Self::FrameTypeUnknown), which it had been silently inflating.**
+    /// That station's whole evidentiary value is the claim *"a member of this line sent a code I have no name
+    /// for"* — a statement about releases. This one is a statement about **routing**: the code has a name, and
+    /// the frame simply reached a plane that does not serve it. Two facts, opposite remedies — one is "roll
+    /// the laggard forward", the other is "the dispatch is wrong" — and they were arriving under one name.
+    ///
+    /// The rule was already written one screen down, in the note pairing `FrameTypeUnknown` with
+    /// [`RestrictedFrameDropped`](Self::RestrictedFrameDropped): *"one carries a code the registry has a name
+    /// for, the other carries the codes it does not. Folding them would hand the resolver an unresolvable tag
+    /// and force it to invent a name or return a hole."* Two call sites folded them anyway, and one said so in
+    /// its own doc — `fanos_node::threshold_service`'s `unknown_type` is documented as *"a frame whose type
+    /// **parsed** and names something this build has no handler for"*, which is this station's definition, and
+    /// recorded the other one.
+    ///
+    /// **Measured, and the size is the argument.** A five-node cell of one binary, no adversary and therefore
+    /// no possible version skew, raised `frame.type_unknown` **130 times in a 60 s run** — every event the
+    /// handshake's own tail (`HelloAck`, code `0x01`) reaching the overlay's dispatch, which claims seventeen
+    /// types and not that one. An alarm whose false-positive floor is 130 per minute cannot report the fault
+    /// it exists for; the count is not noise around the signal, it *is* the whole count.
+    ///
+    /// Zero is not the target here — a healthy build routes some known frames to planes that ignore them, and
+    /// that is cheap. A *rising* count against one coordinate is a dispatch that lost an arm.
+    FrameTypeUnhandled,
 
     // --- Transport (`fanos_quic::driver`) ---
     //
@@ -827,11 +865,11 @@ pub enum Station {
     /// (`AssignReport::deficit`), which for a threshold-line role means the guarantee that role exists to
     /// provide is not currently being met.
     ///
-    /// Silent until now, and harmlessly so only by accident: while `ROLE_CAPACITY_PER_NODE` was the
-    /// placeholder `1` the demand exceeded eligible supply on *every* active cell, so the deficit was a
-    /// fabrication and reporting it would have been noise on every epoch. With the capacities derived from
-    /// each role's own admission bound the number means what it says, and a shortfall that nothing reads is
-    /// the worse of the two failure modes the tripwire in `role_loop` warned about.
+    /// Silent until recently, and harmlessly so only by accident: while every role divided by a placeholder
+    /// capacity of `1` the demand exceeded eligible supply on *every* active cell, so the deficit was a
+    /// fabrication and reporting it would have been noise on every epoch. All six capacities are now derived
+    /// from each role's own admission bound — the placeholder has no reader left — so the number means what
+    /// it says for every role, and a shortfall that nothing reads is the worse of the two failure modes.
     ///
     /// [`Observation::tag`] carries the role index. This is the *local* signal; escalating a shortfall to the
     /// parent cell (`docs/design-self-organization.md` §4) needs the hierarchy path and is not this station.
@@ -1165,6 +1203,7 @@ impl Station {
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
+        Self::FrameTypeUnhandled,
         Self::WireOverBound,
         Self::WireUnshaped,
         Self::WireForeignDatagram,
@@ -1241,6 +1280,7 @@ impl Station {
             Self::HolonomyRejected => "holonomy.rejected",
             Self::FrameDecodeFailed => "frame.decode_failed",
             Self::FrameTypeUnknown => "frame.type_unknown",
+            Self::FrameTypeUnhandled => "frame.type_unhandled",
             Self::WireOverBound => "wire.over_bound",
             Self::WireUnshaped => "wire.unshaped",
             Self::WireForeignDatagram => "wire.foreign_datagram",
@@ -1331,6 +1371,9 @@ impl Station {
             | Self::SnapshotWriteFailed       // fanos_node::PersistFailure
             | Self::ActorDied                 // fanos_quic::DriverActor
             | Self::RestrictedFrameDropped    // fanos_wire::FrameType
+            // Also `fanos_wire::FrameType`, and on this station the registry membership is not a hope but the
+            // defining condition — a code it could not name would be `FrameTypeUnknown` instead.
+            | Self::FrameTypeUnhandled        // fanos_wire::FrameType
             | Self::SessionIngestDropped      // fanos_diaulos::Ingest (dense index)
             | Self::BeaconRefused             // fanos_keygen::BeaconRefusal (dense index)
             => TagKind::Vocabulary,

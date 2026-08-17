@@ -325,11 +325,16 @@ impl ThresholdService {
 
     /// Count a frame whose type parsed and names something this build has no handler for, and discard it.
     ///
+    /// **The station follows the doc, which it used to contradict.** "Parsed and names something" is the
+    /// definition of [`FrameTypeUnhandled`](fanos_runtime::ports::stations::Station::FrameTypeUnhandled);
+    /// `FrameTypeUnknown`, which this recorded for as long as it existed, is defined by the code having *no*
+    /// name in the registry. One station carried two facts with opposite remedies.
+    ///
     /// Attributed **both ways**: by `tag`, because the type code says which release the sender is on, and by
     /// the sender's coordinate, because `design-upgrade.md` §4's question is whether any hop *line* has fallen
     /// below `t` agreeing members — a count that cannot be localized to a line cannot answer it.
     fn unknown_type(&mut self, tag: u64, from: Triple) -> Vec<Effect> {
-        self.stations.record_tagged(Station::FrameTypeUnknown, Some(from), Some(tag), 1);
+        self.stations.record_tagged(Station::FrameTypeUnhandled, Some(from), Some(tag), 1);
         Vec::new()
     }
 

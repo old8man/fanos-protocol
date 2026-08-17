@@ -205,7 +205,7 @@ impl FrameType {
 
     /// The registry entry for a numeric type code, or `None` if unknown to this build.
     #[must_use]
-    pub fn from_code(code: u64) -> Option<Self> {
+    pub const fn from_code(code: u64) -> Option<Self> {
         // Exhaustive match keeps the registry and this decoder in lock-step.
         Some(match code {
             0x00 => Self::Hello,
@@ -259,9 +259,35 @@ impl FrameType {
 
     /// The numeric type code.
     #[must_use]
-    pub fn code(self) -> u64 {
+    pub const fn code(self) -> u64 {
         self as u64
     }
+
+    /// How many codes in the **membership-critical group** this build cannot name — the size of the only
+    /// vocabulary an unsupported-critical report can draw from.
+    ///
+    /// **Derived, because the hand-count went stale the moment a variant was added.** The consumer
+    /// (`fanos_runtime::overlay`'s `skew_reported`) bounded itself with the sentence *"this build names
+    /// `0x11`–`0x1C`, leaving exactly four codes"*, written when that range was the truth. `DkgCommitReq =
+    /// 0x1D` joined the registry afterwards and no one re-counted, so the bound claimed a fourth code that
+    /// no longer exists and a test picked `0x1D` as its example of an *unknown* code — an assertion about
+    /// this build's ignorance that the build had stopped satisfying.
+    ///
+    /// The list is compile-time-complete ([`ALL`](Self::ALL) is length-checked against the variant count),
+    /// so this counts rather than guesses and cannot go stale again.
+    pub const UNKNOWN_CRITICAL_CODES: usize = {
+        let (mut count, mut code) = (0usize, 0x10u64);
+        while code <= 0x1F {
+            // Through the registry's **own** resolver rather than a second sweep of `ALL`. A parallel scan
+            // would be a second answer to "does this build name that code", and two answers to one question
+            // is how the hand-count this replaces went stale in the first place.
+            if Self::from_code(code).is_none() {
+                count += 1;
+            }
+            code += 1;
+        }
+        count
+    };
 
     /// Every frame type, for a reader that **enumerates rather than guesses** — the resolver that turns a
     /// station's tag into a name, a dashboard, a conformance sweep over the registry.

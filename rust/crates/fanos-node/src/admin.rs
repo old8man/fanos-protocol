@@ -306,6 +306,7 @@ pub fn render_health(health: &Health) -> String {
     let _ = writeln!(s, "known_peers: {}", health.known_peers);
     // Beside it deliberately: the contrast is the reading (#249) — acquaintance against reach.
     let _ = writeln!(s, "routable_points: {}", health.routable_points);
+    let _ = writeln!(s, "deliverable_points: {}", health.deliverable_points);
     // Reported unconditionally, including the zero. A counter that appears only when non-zero teaches an
     // operator that its absence means "not measured" — and this is a health signal about the *cell*, since a
     // peer that stops draining is what makes it move (#89).
@@ -449,6 +450,11 @@ fn tag_name(station: Station, tag: u64) -> Option<&'static str> {
         // raw number is the honest answer. Its sibling `FrameTypeUnknown` stays a `Quantity` for the same
         // reason from the other side — that station exists *because* the code is not in the registry.
         Station::RestrictedFrameDropped => {
+            fanos_wire::FrameType::ALL.iter().find(|f| f.code() == tag).map(|f| f.name())
+        }
+        // The same registry, and here the `find` cannot miss: the station is raised *because* the code
+        // resolved. A `None` from this arm would mean the recorder passed something other than a wire code.
+        Station::FrameTypeUnhandled => {
             fanos_wire::FrameType::ALL.iter().find(|f| f.code() == tag).map(|f| f.name())
         }
         // A dense index into `Ingest::ALL`, not a wire code — `usize::try_from` can only fail on a tag
@@ -814,6 +820,12 @@ mod tests {
             known_peers: 41,
             // Deliberately BELOW known_peers: the render test must show the contrast, not two equal numbers (#249).
             routable_points: 17,
+            // Above `routable_points`, which is the one **structural** ordering of the three: reach is
+            // `ranked ∪ live`, so it can never be smaller than `ranked`. Its relation to `known_peers` is
+            // *not* fixed and must not be read as one — the bootstrap node has a book of zero and reaches
+            // every peer that dialled it. Chosen distinct from both so the render proves it names this field
+            // rather than echoing a neighbour.
+            deliverable_points: 23,
             reflexive: false,
             send_drops: 43,
             collisions: 44,
