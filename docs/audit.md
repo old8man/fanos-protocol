@@ -896,7 +896,9 @@ configuration whose silent failure its own comment says it exists to prevent. On
 
 **A-H3 — the node recommended the planes where circuits cannot be built.** `warn_if_plane_cannot_anonymize`
 told the operator that `q = 2` supports only 2 concurrent circuits (a passive flow-matching floor of 0.50 —
-true) and to "pass `--plane-order 4|7|31`". `depth_for` says those planes carry 2 hops and 1, against the 3
+true **of the member-zero combiner map**; the digest map that replaced it gives 6 lines of 7, so **3 circuits
+and a floor of 1/3**, measured and pinned 2026-08-18 — the figure quoted here outlived the map because its
+guard asserted only `|image| > f`) and to "pass `--plane-order 4|7|31`". `depth_for` says those planes carry 2 hops and 1, against the 3
 required. Two subsystems, opposite counsel, neither aware of the other, sending the operator from a real
 weakness to a worse one. Joined by `plane_can_anonymize`, and the honest answer for a wide cell is a wider
 **onion budget** — cell width and onion width are independent deployment parameters.

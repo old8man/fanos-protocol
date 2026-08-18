@@ -777,14 +777,18 @@ impl<F: Field> ThresholdRouter<F> {
     /// control every combiner in the plane and censor every hidden service in the cell. The points are a public
     /// function of the geometry, so choosing them needed no secret.
     ///
-    /// Selecting by a digest of the line's own coordinates spreads the image to **5 of 7** and **40 of 57**
-    /// respectively. The property that must hold is `|image| ≥ f + 1` — 5 ≥ 3 and 40 ≥ 19 — because that is what
-    /// lets a service hold `f + 1` distinct meeting combiners and leaves at least one outside any admissible
-    /// adversary set. `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults` asserts exactly
-    /// that, on both planes.
+    /// Selecting by a digest of the line's own coordinates spreads the image to **6 of 7** and **37 of 57**.
+    /// The property that must hold is `|image| ≥ f + 1` — 6 ≥ 3 and 37 ≥ 19 — because that is what lets a
+    /// service hold `f + 1` distinct meeting combiners and leaves at least one outside any admissible
+    /// adversary set. `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults` asserts that
+    /// **and the sizes**, which it did not: it checked only the inequality, so this paragraph carried
+    /// **5 of 7 and 40 of 57** — measured before the map was re-expressed through
+    /// [`Self::combiner_of_salted`] — while three operator-facing places carried the *pre-fix* **4**. Two
+    /// stale figures and a live one, none of them guarded. They are pinned by value now.
     ///
-    /// Full coverage is neither achieved nor required: ~70 % on `PG(2,7)` is what a uniform per-line choice gives
-    /// (coupon-collector, `1 − 1/e`), and `|image| ≥ f + 1` is the whole requirement. This map is deliberately
+    /// Full coverage is neither achieved nor required: `37/57 = 65 %` on `PG(2,7)` is where the
+    /// coupon-collector estimate for a uniform per-line choice (`1 − 1/e ≈ 63 %`) puts it, and
+    /// `|image| ≥ f + 1` is the whole requirement. This map is deliberately
     /// **fixed across epochs**, which used to be a stated residual — it no longer is, because nothing routes by
     /// it: launches draw a per-onion member ([`Self::combiner_of_salted`]), so the uniform member coverage a
     /// rotating map would have bought is supplied per packet instead of per epoch.
@@ -1698,6 +1702,29 @@ mod tests {
                  — so an adversary within its budget can hold every combiner and censor the whole cell"
             );
         }
+
+        // **The sizes themselves, because three operator-facing places quote them and nothing checked.**
+        //
+        // `combiner_of`'s doc above records the fix this test guards: taking member zero left an image of
+        // "4 of 7 points on `PG(2,2)` and 14 of 57 on `PG(2,7)`", and selecting by a digest of the line's
+        // own coordinates "spreads the image to 5 of 7 and 40 of 57". Meanwhile `bin/fanos.rs`,
+        // `config.rs`'s `plane_order` table and `docs/testnet.md` all still say **4** — the pre-fix figure.
+        // The inequality above cannot tell those apart, so it let a replaced number propagate.
+        //
+        // Pinned by value, in the same idiom as `THRESHOLD_ONION_LEN`'s bucket assertion: a change to the
+        // map now has to restate what it did rather than leaving four documents quietly wrong.
+        assert_eq!(
+            image::<F2>(),
+            6,
+            "PG(2,2): the image of the shipped map — the doc above records 4 for the member-zero map it \
+             replaced and 5 for the digest map as measured then, and neither is what ships"
+        );
+        assert_eq!(
+            image::<F7>(),
+            37,
+            "PG(2,7): likewise, against 14 (member-zero) and 40 (as recorded). 37/57 = 65 % sits where the \
+             coupon-collector estimate 1 − 1/e ≈ 63 % predicts, which 40 did not"
+        );
     }
 
     use fanos_pqcrypto::SeedRng;

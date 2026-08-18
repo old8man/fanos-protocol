@@ -49,10 +49,20 @@ available, wait — there is no smaller valid cell above the coherence floor of 
 Result 4), and 3–6 nodes sit in a regime this platform doesn't consider viable.
 
 **One honesty check before you build on top of this:** `q = 2` is a **test fixture**, not an anonymity
-system. `config.rs`'s own doc comment on `plane_order` and `deployment-minima.md` both derive the same
-number: a passive adversary's flow-matching floor on the default plane is **0.50 — a coin flip**, because
-only 4 of Fano's 7 lines have distinct combiners and that supports exactly 2 concurrent circuits. If the
-testnet's purpose includes exercising the anonymity properties (not just connectivity, storage and
+system. A passive adversary's flow-matching floor on the default plane is **1/3**, because **6** of Fano's
+7 lines have distinct combiners and that supports **3** concurrent circuits — measured and pinned by
+`fanos_aphantos::threshold_router`'s
+`the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults`.
+
+> Two corrections live in that sentence, and both are worth knowing about. It used to read *"4 lines, 2
+> circuits, 0.50 — a coin flip"*: that was the **member-zero** combiner map, replaced by the digest map,
+> and the guard on that map asserted only `|image| > f`, which cannot tell one map from another — so the
+> superseded figure survived here, in `config.rs` and in `bin/fanos.rs`. It also claimed that `config.rs`
+> and `deployment-minima.md` *"both derive the same number"*; they do not. `deployment-minima.md` derives
+> the floor as `1/K` with **`K = N`** (so `1/7` at Fano), a different model of `K` entirely, and neither
+> derivation was pinned until now.
+
+If the testnet's purpose includes exercising the anonymity properties (not just connectivity, storage and
 consensus), raise `--plane-order` — see §3.5's caution before you do, since it isn't free and it isn't
 exposed by the `fanos init` wizard.
 

@@ -176,9 +176,13 @@ fn line_size_arg(args: &[String]) -> Result<usize, NodeError> {
 ///
 /// **Why the plane is the term that matters**, from this function's older doc and kept because the live one
 /// never restated it: an adversary's flow-matching floor in a linkability measurement is `1/K` for `K`
-/// concurrent circuits, and `K` comes from the **plane**, not the mix schedule. `PG(2,2)` has only 4 lines
-/// with *distinct* combiners, so it supports 2 circuits and the best any schedule achieves is a coin flip
-/// (`fanos_node::config::plane_order`). Under-delivering an anonymity request in silence is the worse
+/// concurrent circuits, and `K` comes from the **plane**, not the mix schedule. `PG(2,2)` has **6** lines
+/// with *distinct* combiners (measured and pinned by
+/// `fanos_aphantos::threshold_router`'s `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults`),
+/// so it supports **3** circuits and the best any schedule achieves is **one in three**
+/// (`fanos_node::config::plane_order`). This paragraph said *4 lines, 2 circuits, a coin flip* until the
+/// image was pinned: that was the member-zero map replaced by the digest map, and the inequality the test
+/// asserted could not tell the two apart. Under-delivering an anonymity request in silence is the worse
 /// failure: an operator who is told can raise the order or accept the limit knowingly; one who is not told
 /// believes the profile's name.
 fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
@@ -213,8 +217,8 @@ fn warn_if_plane_cannot_anonymize(config: &NodeConfig) {
         return;
     }
     eprintln!(
-        "warning: anonymity requested on plane order {q} — PG(2,{q}) supports only 2 concurrent circuits, so a passive \
-         adversary's flow-matching floor is a COIN FLIP (0.50) regardless of the mix schedule. A wider cell raises that \
+        "warning: anonymity requested on plane order {q} — PG(2,{q}) supports only 3 concurrent circuits, so a passive \
+         adversary's flow-matching floor is ONE IN THREE (0.33) regardless of the mix schedule. A wider cell raises that \
          floor, but only together with a wider onion budget: at the shipped budget every plane above order 3 fails the \
          depth check above, so `--plane-order 4` alone would trade a small anonymity set for none at all. See \
          fanos_node::config::plane_order.",

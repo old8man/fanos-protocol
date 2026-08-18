@@ -1372,13 +1372,18 @@ pub struct NodeConfig {
     ///
     /// | plane | points | lines with *distinct* combiners | concurrent circuits | adversary's floor |
     /// |---|---|---|---|---|
-    /// | **`PG(2,2)` (this default)** | 7 | **4** | **2** | **0.50 — a coin flip** |
-    /// | `PG(2,7)` | 57 | 10+ | 5 | 0.20 |
+    /// | **`PG(2,2)` (this default)** | 7 | **6** | **3** | **0.33 — one in three** |
+    /// | `PG(2,7)` | 57 | **37** | 18 | 0.056 |
     ///
-    /// Only 4 of `PG(2,2)`'s 7 lines have distinct combiners, because line-derived combiners collide — so a default
-    /// deployment supports **two** circuits and the best any schedule can achieve is a **coin flip**. The mixnet defaults
-    /// tuned on measurement reach 0.000 on `PG(2,7)`; on `PG(2,2)` they cannot go below 0.50, because there is nothing to
-    /// hide among.
+    /// Six of `PG(2,2)`'s 7 lines have distinct combiners — line-derived combiners still collide, but only once — so a
+    /// default deployment supports **three** circuits and no schedule can push the floor below **one in three**. The
+    /// mixnet defaults tuned on measurement reach 0.000 on `PG(2,7)`; on `PG(2,2)` they cannot go below 0.33, because
+    /// there is nothing more to hide among.
+    ///
+    /// **This table read 4 / 2 / 0.50 until the image was pinned by value.** Those were the member-zero map's figures,
+    /// replaced by the digest map; the guard on that map asserted only `|image| > f`, which cannot tell one map from
+    /// another, so the superseded number survived here, in `bin/fanos.rs` and in `docs/testnet.md`. Now pinned by
+    /// `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults`.
     ///
     /// So `q = 2` is a **test fixture**, and this is the quantitative form of that: the plane order dominates the schedule
     /// entirely. It remains the default only so no existing deployment changes behaviour silently, and a deployment that

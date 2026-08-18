@@ -1032,9 +1032,17 @@ remaining two rows the same way — look for claims that no assertion checks, no
 ## Tier B — platform capability
 
 ### 4. Settle the default plane order — now constrained by the onion payload floor
-- `plane_order` defaults to **2**, where `PG(2,2)` has 4 lines with distinct combiners ⇒ 2 concurrent circuits ⇒ a passive
-  adversary's flow-matching floor is **0.50 regardless of the mix schedule** (`8df2b08` made the order selectable and warns on
-  under-delivery; the schedule itself is calibrated and closed).
+- `plane_order` defaults to **2**, where `PG(2,2)` has **6** lines with distinct combiners ⇒ **3** concurrent circuits ⇒ a
+  passive adversary's flow-matching floor is **1/3 regardless of the mix schedule** (`8df2b08` made the order selectable and
+  warns on under-delivery; the schedule itself is calibrated and closed).
+  - *Corrected 2026-08-18.* This read **4 ⇒ 2 ⇒ 0.50** here and in three other places: those were the **member-zero**
+    combiner map's figures, replaced by the digest map, and the guard on that map asserted only `|image| > f` — which
+    cannot tell one map from another, so the superseded number outlived it. The image is now pinned by value (6 of 7,
+    37 of 57) in `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults`.
+  - **A second, unresolved discrepancy sits underneath.** `docs/deployment-minima.md` derives the same floor as `1/K`
+    with **`K = N`** — `1/7` at Fano — while this line and `config.rs` use `K = |image| / 2`. Two models of `K`, no
+    measurement adjudicating them: the linkability sweep that would is `#[ignore]`d and written for `PG(2,7)`. Deciding
+    which `K` is right is the open half of this task.
 - **New hard constraint:** the fixed-slot onion reserves one nested threshold seal of payload, so circuit depth falls as the
   plane widens — `slots::depth_for`: **3 hops at q=2 and q=3, 2 at q=4, 1 at q=7**. Raising the default to 4 buys a larger
   anonymity set and costs a hop; q=7 cannot carry a circuit at all inside `THRESHOLD_ONION_LEN`.

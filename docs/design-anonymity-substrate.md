@@ -844,6 +844,12 @@ This matters because the node used to *recommend* exactly those orders: the narr
 circuits at Fano, so a passive flow-matching floor of 0.50) to a worse one. Both facts are true; neither subsystem knew
 the other existed.
 
+> **Number corrected 2026-08-18, the argument unchanged.** "2 circuits, 0.50" was the **member-zero** combiner map;
+> the digest map that replaced it covers **6 of 7** lines, giving **3** circuits and a floor of **1/3** (and 37 of 57
+> at `q = 7`). The figure outlived the map because its guard asserted only `|image| > f`, which cannot distinguish
+> two maps; it is pinned by value now. Fano remains a real weakness — one in three is not anonymity — so the
+> conflicting-counsel finding stands exactly as written.
+
 ---
 
 A circuit is `depth` intermediate hops **plus** its destination line, so `D = 3` means at most **2** intermediate hops —
