@@ -1419,6 +1419,8 @@ impl Node {
         // Read before the engine closure captures `config`: the reflex's `cell_id` folds it, and the
         // closure is `move`, so taking it here is what keeps one network name serving both derivations.
         let genesis = config.genesis_seed();
+        // Taken here because the engine closure is `move` — see [`sign_descriptor`].
+        let desc_identity = credentials.descriptor_identity();
         let handle = spawn_self_certifying_persistent_over::<F>(
             fabric,
             &credentials,
@@ -1470,7 +1472,8 @@ impl Node {
                     cell_members: None,
                     hier_peers: Vec::new(),
                 };
-                crate::composition::compose_engine::<F>(coord, &what)
+                let desc = crate::composition::sign_descriptor::<F>(&desc_identity, coord);
+                crate::composition::compose_engine::<F>(coord, &what, Some(desc))
             },
             directory.clone(),
             // What this node ANNOUNCES is derived from what it wires, never written beside it (#284): these
@@ -2027,13 +2030,19 @@ mod tests {
                 .unwrap_or_else(|e| panic!("plane order {q} must start: {e}"));
             assert!(node.health().local_addr.port() > 0, "the node on PG(2,{q}) is live");
             // **And whether it has a reflex is reported, because "live" does not imply it** (#145). A cell
-            // is seven members and only the base plane is its own cell, so a larger-plane node runs with no
-            // coherence self-model, no diagnosis and no self-healing — while every other health field reads
-            // fine, since the component that would say otherwise is the one that is absent. Asserted on both
-            // sides so the flag cannot be a constant.
+            // is seven members, so a plane forms cells exactly when its point count divides by seven — and
+            // where it does not, a node runs with no coherence self-model, no diagnosis and no self-healing
+            // while every other health field reads fine, since the component that would say otherwise is
+            // the one that is absent.
+            //
+            // **This read `q == 2` and was right until #145 was answered.** `fano::cell_of` is
+            // `index mod (N/7)`, so `PG(2,4)`'s 21 points split into three cells and a node there has a real
+            // reflex; only `7 ∤ N` — `PG(2,7)`'s 57, and `q = 7` is in this loop for exactly that reason —
+            // still reports `false`. The predicate is imported rather than restated, so the two cannot drift
+            // again: a hand-written `q == 2` is what went stale here.
             assert_eq!(
                 node.health().reflexive,
-                q == 2,
+                fanos_geometry::fano::cells_in_order(q).is_some(),
                 "PG(2,{q}) must report whether it forms a cell — silence here is the defect, not the plane"
             );
             node.shutdown().await;
