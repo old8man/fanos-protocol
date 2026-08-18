@@ -724,6 +724,9 @@ pub struct OverlayNode<F: Field> {
     /// been copied into a test, where it picked `0x1D` as an example of a code this build cannot name. That
     /// assertion had quietly stopped being about anything.
     ///
+    /// Derived, it has since absorbed a second variant without a word being edited here: `DkgConfirm = 0x10`
+    /// took the group's last unnamed low code, and the count moved from three to two on its own.
+    ///
     /// **Never cleared, and that is the design rather than an omission.** "Which release is this peer on"
     /// is a LEVEL, and the level already has its own always-current channel one line down —
     /// [`Station::FrameTypeUnknown`], which an operator polls. The event channel's job is to say it happened,
@@ -2479,13 +2482,15 @@ mod tests {
         // `0x1F` and `0x1E`, and the second one used to be `0x1D` — **which this build knows**
         // (`DkgCommitReq`), so the assertion beneath it had stopped being about an unknown code at all. The
         // comment here carried the stale range that caused it (*"this build knows `0x11`–`0x1C`"*); the
-        // count is now `FrameType::UNKNOWN_CRITICAL_CODES`, derived from the registry, and the codes it
-        // leaves are `0x10`, `0x1E`, `0x1F`. Pinned below, so the next variant to join the group is caught
-        // here rather than by a test that silently stops testing.
+        // count is now `FrameType::UNKNOWN_CRITICAL_CODES`, derived from the registry. Pinned below, so the
+        // next variant to join the group is caught here rather than by a test that silently stops testing —
+        // **and it did catch one**: `DkgConfirm = 0x10` took the third leaf, which is why this reads `2`
+        // and not `3`. The two that remain are `0x1E` and `0x1F`, the pair used below, so a further variant
+        // in this group must move this test deliberately rather than find a gap in it.
         assert_eq!(
             FrameType::UNKNOWN_CRITICAL_CODES,
-            3,
-            "the membership group holds 16 codes and this build names 13 of them; if this moved, the two \
+            2,
+            "the membership group holds 16 codes and this build names 14 of them; if this moved, the two \
              codes used below may no longer be unknown — check them before changing the number"
         );
         assert!(

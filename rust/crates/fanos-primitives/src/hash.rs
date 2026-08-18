@@ -18,6 +18,14 @@ pub mod label {
     /// construction with some other node's *preference* derivation — the two derivations must stay independent for the
     /// occupancy analysis to hold.
     pub const COORD_PROBE: &str = "FANOS-v1/coord-probe";
+    /// A DKG participant's **agreement digest** (`fanos_keygen::DkgNode`), broadcast once at the complaint
+    /// deadline so every participant can tell — *before* it writes a provisioning file — whether a threshold
+    /// of its peers finalized on the same joint key.
+    ///
+    /// Its own domain because it commits to a ceremony's whole outcome at once (the context it ran under,
+    /// the participant count, the threshold and the aggregate commitment), and a digest of the whole must
+    /// never be producible as a digest of any part.
+    pub const DKG_CONFIRM: &str = "FANOS-v1/dkg-confirm";
     /// Private rendezvous line derivation.
     pub const RDV: &str = "FANOS-v1/rdv";
     /// Generic key-derivation.

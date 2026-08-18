@@ -2911,6 +2911,29 @@ fn set_of(
 ///
 /// The recovery authority is a **separate** step and stays one: a DKG that produces the beacon share does
 /// not produce the authority keys. Run `fanos authority-key` per founder and collect the verifiers.
+/// One DKG phase, in milliseconds — sharing, complaint and confirm each take this long.
+///
+/// **Wall-clock, not the simulator's 1.5 s**, and the reason is a safety one rather than politeness: these
+/// phases run over real TLS handshakes between machines an operator does not control, `DkgNode` advances on
+/// its timers rather than on completeness, and `QUAL` is whatever each participant has qualified when its
+/// own deadline fires. A phase that closes before an honest share arrives is indistinguishable from a
+/// Byzantine dealer — and the disagreement it causes is now *reported* (the confirm round) rather than
+/// written to disk, but a deadline generous enough not to cause it is still the cheaper answer.
+///
+/// It is a chosen number, and `docs/testnet.md` §7 says so: the phase must outlast the slowest honest
+/// founder's connect-and-deliver, which is a property of the operators' network rather than of this code.
+const KEYGEN_PHASE_MS: u64 = 30_000;
+
+/// How many deadline-bounded phases a ceremony runs — sharing, complaint, confirm.
+///
+/// Named so the overall ceiling below is arithmetic over the phases rather than a second number that has to
+/// be remembered when one is added. It was: the ceiling read 180 s "covering both phase deadlines" while
+/// there were three.
+const KEYGEN_PHASES: u32 = 3;
+
+/// [`KEYGEN_PHASE_MS`] as the engine's span type.
+const KEYGEN_PHASE: fanos_runtime::Duration = fanos_runtime::Duration::from_millis(KEYGEN_PHASE_MS);
+
 async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
     use fanos_keygen::DkgNode;
     use fanos_node::keygen::DkgCeremony;
@@ -2977,7 +3000,11 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
             // handshakes on machines an operator does not control, and a complaint round that closes before
             // an honest share arrives is indistinguishable from a Byzantine dealer.
             let node = DkgNode::<F2>::new(coord, threshold, secret, session)
-                .with_deadlines(fanos_runtime::Duration::from_millis(30_000), fanos_runtime::Duration::from_millis(30_000));
+                .with_deadlines(KEYGEN_PHASE, KEYGEN_PHASE)
+                // Bind the ceremony to the network the roster names, so two founders holding rosters that
+                // differ disagree **here**, by name, rather than founding two networks that each look
+                // complete. The engine cannot see a roster file; this is the one fact it needs from it.
+                .with_context(*network_id.as_bytes());
             Box::new(DkgCeremony::new(node, slot))
         },
         directory,
@@ -2996,12 +3023,28 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
     }
 
     // Bounded: a ceremony that cannot converge must say so rather than hang an operator's terminal. The
-    // ceiling covers both phase deadlines with room for the handshakes between them.
+    // ceiling is **derived** from the phases rather than chosen — three of them, doubled, so the handshakes
+    // between them have as much room again as the phases themselves. A number picked here would go stale
+    // the next time a phase was added, which is exactly what happened when the confirm round joined.
     let mut notes = handle.client().subscribe();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(KEYGEN_PHASE_MS * u64::from(KEYGEN_PHASES) * 2);
     loop {
         match tokio::time::timeout_at(deadline, notes.recv()).await {
             Ok(Ok(Notification::DkgComplete(_))) => break,
+            // **The ceremony assembled and did not agree.** Distinct from the timeout below in both cause
+            // and remedy: every founder was reachable, and what differs is what they ran with.
+            Ok(Ok(Notification::DkgDiverged { agreed, heard })) => {
+                return Err(NodeError::Config(format!(
+                    "the ceremony finished WITHOUT agreement: {agreed} of the {} participants needed hold \
+                     this node's joint key ({heard} peers answered at all). No file was written, and that \
+                     is the point — a share over a key the cell does not hold produces beacon partials that \
+                     never combine, so the cell's epoch clock would never turn and the cause would be this \
+                     ceremony. Check that every founder passed the IDENTICAL --roster file and --threshold, \
+                     then re-run; if they did, a frame was lost and re-running is the whole remedy.",
+                    threshold
+                )));
+            }
             Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 return Err(NodeError::Config("the node shut down mid-ceremony".to_owned()));
@@ -3030,7 +3073,8 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
         authority: None,
     };
     write_file(Path::new(&out), params.to_config_string(), true)?;
-    println!("joint key agreed; wrote {out}");
+    let (agreed, heard) = result.agreement;
+    println!("joint key agreed by {agreed} participants ({heard} answered); wrote {out}");
     println!(
         "next: run `fanos authority-key` on each founder and re-issue these files with \
          `--authority-verifiers`, or the cell can never reshape its beacon"

@@ -16,6 +16,12 @@
 //!
 //! So the result goes into a cell the ceremony already owns, written by the engine at the one moment it
 //! becomes true. The secret stays in this process's memory and reaches exactly one reader.
+//!
+//! **An outcome now means the cell agreed, not merely that this node finished.** `DkgNode` publishes
+//! `DkgComplete` only once a threshold of participants have confirmed the same joint key, context and
+//! threshold; a ceremony that forked reports `Notification::DkgDiverged` and leaves this slot empty. So a
+//! caller that writes a provisioning file whenever the slot is full is writing one that can produce a
+//! beacon round — which it could not previously assume.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -37,6 +43,13 @@ pub struct CeremonyOutcome {
     /// The joint public key, as announced. Carried so a caller can cross-check that the commitment it is
     /// about to write is the one the cell agreed on rather than one it merely computed.
     pub joint_key: [u8; 32],
+    /// `(agreed, heard)` from the ceremony's confirm round — how many participants hold this outcome
+    /// (this one included) and how many answered at all.
+    ///
+    /// An outcome exists **only** when `agreed` reached the threshold, so this is never a warning here; it
+    /// is the number an operator needs to see to know the ceremony was witnessed rather than merely
+    /// finished. A ceremony that did not agree produces `Notification::DkgDiverged` and no outcome at all.
+    pub agreement: (usize, usize),
 }
 
 /// The cell a ceremony's result is delivered into: `None` until the DKG completes here.
@@ -84,6 +97,11 @@ impl<F: Field> Engine for DkgCeremony<F> {
                     commitment,
                     share: self.inner.final_share(),
                     joint_key,
+                    // Read at the same step for the same reason as the share: the engine is the only
+                    // holder, and `DkgComplete` is emitted exactly when the tally that justified it was
+                    // computed. `(0, 0)` is unreachable — the engine emits nothing without an agreement —
+                    // and is the honest fallback rather than an unwrap on a value this type cannot check.
+                    agreement: self.inner.agreement().unwrap_or((0, 0)),
                 });
             }
         }

@@ -720,7 +720,27 @@ pub enum Notification {
     EpochAdvanced(Epoch),
     /// A distributed key generation completed (spec §L6): the 32-byte joint public key the cell
     /// agreed on, whose secret no single node holds.
+    ///
+    /// Emitted only once a threshold of participants have **confirmed the same outcome** — see
+    /// [`DkgDiverged`](Self::DkgDiverged) for the case that used to arrive here indistinguishably.
     DkgComplete([u8; 32]),
+    /// A distributed key generation **finalized without agreement** (spec §L6): this node computed a joint
+    /// key that fewer than `threshold` participants confirmed, so the share it holds does not combine with
+    /// its peers' and the beacon it would provision can never assemble a round.
+    ///
+    /// **Distinct from silence, and that is the whole point.** `QUAL` is computed from each participant's
+    /// own inbox, so one dropped frame forks it; before this existed a forked ceremony reported
+    /// [`DkgComplete`](Self::DkgComplete) exactly like an agreeing one, and the first symptom was a cell
+    /// whose epoch clock never turned, with the cause a ceremony old.
+    ///
+    /// `agreed` counts this node and every peer whose digest matched it; `heard` counts the peers that
+    /// answered at all, which separates *"we disagree"* from *"nobody replied"* — opposite operator actions.
+    DkgDiverged {
+        /// Participants holding this node's joint key, including this node.
+        agreed: u8,
+        /// Peers whose confirmation arrived at all (this node not counted).
+        heard: u8,
+    },
     /// The distributed randomness **beacon** produced (or adopted) an epoch's public seed (spec §L3,
     /// audit E5): a threshold of anchors' partials combined and verified. The `seed` is public and
     /// unpredictable-until-now; a driver folds it into the rendezvous meeting line and advances the

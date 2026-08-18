@@ -13,9 +13,15 @@
 //!    share (`DkgJustify`), which everyone verifies against the (public) commitment. A dealer with
 //!    an **unanswered** complaint is **disqualified**.
 //! 4. **Finalize.** At the complaint deadline, the **qualified set** `QUAL` = dealers with a known
-//!    commitment and no unanswered complaint. If `|QUAL| ≥ threshold`, the node publishes the joint
-//!    public key `Y = Σ_{d∈QUAL} C_{d,0}` ([`Notification::DkgComplete`]) and folds exactly the
-//!    `QUAL` shares into its final key share — so `Y` and the share are over the identical set.
+//!    commitment and no unanswered complaint. If `|QUAL| ≥ threshold`, the node computes the joint
+//!    public key `Y = Σ_{d∈QUAL} C_{d,0}` and folds exactly the `QUAL` shares into its final key share —
+//!    so `Y` and the share are over the identical set.
+//! 5. **Confirm.** The node broadcasts a digest of *everything its provisioning file depends on*
+//!    (`DkgConfirm`) and publishes [`Notification::DkgComplete`] only once a **threshold** of participants
+//!    have answered with the same one; otherwise it says [`Notification::DkgDiverged`] and publishes no
+//!    key. The threshold is not a choice: a beacon round needs `t` partials and partials combine only if
+//!    they are shares of one secret, so `t` agreeing participants is exactly the condition under which
+//!    this node's file is usable.
 //!
 //! **Authentication (Byzantine robustness).** Every control frame is bound to its origin so a malicious
 //! member cannot speak for an honest one:
@@ -28,10 +34,24 @@
 //!   only some members is still overruled.
 //!
 //! In the base cell every member reaches every other directly, so an honest complainer's complaint reaches
-//! the accused dealer (to be justified) without an echo relay. Every honest node therefore observes the
-//! same evidence and computes the **same** `QUAL` — even against a *Byzantine equivocating* dealer that
-//! deals validly to some members and invalidly/not-at-all to others. No node ever learns the joint secret.
-//! The same engine runs under the simulator and a real transport, exactly like the overlay node.
+//! the accused dealer (to be justified) without an echo relay. Against a *Byzantine equivocating* dealer
+//! that deals validly to some members and not to others, the justification round overrules it and every
+//! honest node computes the **same** `QUAL`. No node ever learns the joint secret. The same engine runs
+//! under the simulator and a real transport, exactly like the overlay node.
+//!
+//! ## What that argument assumes, and what happens when the assumption fails
+//!
+//! It assumes **delivery**. `QUAL` is computed from each participant's own inbox, and the broadcast under
+//! it is `n − 1` point-addressed sends with no acknowledgement (see [`DkgNode::broadcast_to_peers`], which
+//! states the repair this crate still owes). One dropped directed link is enough to fork it —
+//! `one_censored_link_gives_the_dkg_two_different_qualified_sets` asserts exactly that, with no faulty
+//! participant and no forged frame — and a fork means aggregate commitments that differ and final shares
+//! that never combine.
+//!
+//! **Step 5 does not repair that fork; it ends the silence around it.** Before it, a forked ceremony
+//! reported `DkgComplete` exactly like an agreeing one, so a founder wrote a beacon share to disk and
+//! learned months later that its cell's epoch clock would not turn. A ceremony that cannot agree now says
+//! so, names how many peers answered, and publishes nothing.
 
 #![forbid(unsafe_code)]
 
@@ -41,6 +61,7 @@ pub use beacon::BeaconNode;
 pub use beacon::BeaconRefusal;
 pub use recovery::{RecoveryAuthorization, RgcFormat};
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_field::Field;
@@ -55,6 +76,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 const DKG_SHARE_DEADLINE: TimerToken = TimerToken(0);
 /// The complaint-phase deadline timer: after this, a node finalizes on the qualified set.
 const DKG_COMPLAINT_DEADLINE: TimerToken = TimerToken(1);
+/// The confirm-phase deadline timer: after this, a node either publishes the joint key or reports that its
+/// peers did not agree on it.
+const DKG_CONFIRM_DEADLINE: TimerToken = TimerToken(2);
 
 /// Default sharing-phase length (collect dealings before opening complaints).
 const DEFAULT_SHARE_DEADLINE: Duration = Duration::from_millis(1500);
@@ -73,7 +97,13 @@ enum Phase {
     Sharing,
     /// Complaints opened; collecting complaints/justifications until the complaint deadline.
     Complaint,
-    /// Key published (or abandoned below threshold).
+    /// `QUAL` closed and the key computed; collecting peers' agreement digests before publishing it.
+    ///
+    /// The DKG proper is over here — no share, complaint or justification can change the outcome any more.
+    /// What is still open is whether the outcome is the **same** one this node's peers reached, which is a
+    /// different question and the only one this phase asks.
+    Confirm,
+    /// Key published, or withheld because the cell did not agree on it, or abandoned below threshold.
     Done,
 }
 
@@ -105,6 +135,14 @@ pub struct DkgRejects {
     pub deal_rejected: u64,
     /// A frame this build could not parse or does not handle.
     pub frame_unusable: u64,
+    /// A confirmation that did not come from the participant it names — B1's sibling on the agreement path.
+    /// It cannot evict a dealer, but it can make a node believe its key is agreed when it is not, which is
+    /// the one failure this phase exists to prevent.
+    pub confirm_impersonated: u64,
+    /// A participant that confirmed **two different** outcomes. The first is kept — a later one cannot
+    /// retract a digest already counted — and this counts the attempts, since equivocating here is a
+    /// deliberate act with no honest cause.
+    pub confirm_equivocated: u64,
 }
 
 
@@ -145,6 +183,22 @@ pub struct DkgNode<F: Field> {
     /// is holder `i`'s public key `Y_i`, so a randomness-beacon partial from a node's final share
     /// verifies against it (spec §L6 DKG → beacon). `None` until the DKG completes.
     aggregate: Option<VssCommitment>,
+    /// The joint public key computed at finalize, held until the confirm phase decides whether to publish
+    /// it. `None` before finalize and on the below-threshold abandon.
+    joint: Option<[u8; 32]>,
+    /// Opaque per-ceremony context folded into the agreement digest, so participants that ran under
+    /// *different provisioning inputs* disagree even when their key material happens to match.
+    ///
+    /// The host supplies whatever names this ceremony to it. `fanos keygen` passes the network id it
+    /// derived from the roster file, which is what catches the operator error the key material cannot: two
+    /// founders holding rosters that differ produce two networks, and nothing else in this engine would
+    /// ever notice.
+    context: [u8; 32],
+    /// Participant index → the agreement digest it broadcast. Bounded by the participant set, since the
+    /// key is authenticated against the sender's own coordinate.
+    confirmations: BTreeMap<u8, [u8; 32]>,
+    /// `(agreed, heard)` once the confirm phase has closed — see [`DkgNode::agreement`].
+    agreement: Option<(usize, usize)>,
 }
 
 impl<F: Field> DkgNode<F> {
@@ -196,10 +250,33 @@ impl<F: Field> DkgNode<F> {
             done: false,
             rejects: DkgRejects::default(),
             aggregate: None,
+            joint: None,
+            context: [0u8; 32],
+            confirmations: BTreeMap::new(),
+            agreement: None,
         }
     }
 
+    /// Bind this ceremony to a caller-chosen **context**, folded into the agreement digest of step 5.
+    ///
+    /// Two participants agree only if they agree on this too, so it is where a host puts whatever it knows
+    /// that the engine does not: `fanos keygen` passes the network id derived from the roster file, which
+    /// makes a mismatched roster a *named* disagreement rather than two networks founded by accident.
+    ///
+    /// Defaults to zero, which is the honest default rather than a weak one — an engine given no context
+    /// agrees on the key material alone, exactly as it did before this existed.
+    #[must_use]
+    pub const fn with_context(mut self, context: [u8; 32]) -> Self {
+        self.context = context;
+        self
+    }
+
     /// Override the phase deadlines (sharing, then complaint). Defaults are 1.5 s each.
+    ///
+    /// **The confirm phase is not a third parameter, and deriving it is the point.** What it waits for is
+    /// one broadcast to reach the cell and come back — the same thing the complaint phase waits for — so it
+    /// takes `complaint`'s value. A separate knob would be a third number to size against the same network
+    /// property, and the only way for the two to be right is for them to be one.
     #[must_use]
     pub fn with_deadlines(mut self, sharing: Duration, complaint: Duration) -> Self {
         self.share_deadline = sharing;
@@ -500,12 +577,15 @@ impl<F: Field> DkgNode<F> {
             })
             .collect();
 
-        self.phase = Phase::Done;
         if qual.len() < self.threshold {
             // Too few dealers survived — no key can be formed (genuine under-participation).
+            self.phase = Phase::Done;
             self.done = true;
             return Vec::new();
         }
+        // The DKG proper is over: nothing arriving now can change `QUAL`, the aggregate or the share, and
+        // every handler guards on this. What is *not* over is whether the cell reached the same answer,
+        // which the confirm phase below asks and `Phase::Confirm` — not this flag — gates.
         self.done = true;
 
         // Fold exactly the QUAL shares into the final share, and sum their C₀ for the joint key —
@@ -526,9 +606,127 @@ impl<F: Field> DkgNode<F> {
         let joint = dkg::joint_public_from_commitments(&refs);
         // The aggregate of exactly the folded commitments is the joint polynomial's commitment: its
         // `public_share(i)` is holder i's public key `Y_i`, so a beacon partial from a node's final
-        // share verifies against it. Every honest node folds the same QUAL, so all agree on this.
+        // share verifies against it. Every honest node that folded the same QUAL agrees on this — and
+        // whether it did is precisely what the round below establishes rather than assumes.
         self.aggregate = VssCommitment::aggregate(&refs);
-        alloc_vec_notify(joint)
+        self.joint = Some(joint);
+
+        // **Step 5.** `QUAL` is a decision that must agree cell-wide and is computed from a live local
+        // read, which `fanos_runtime::healer` names as a defect class and `broadcast_to_peers` records as
+        // this crate's eighth instance. The repair that class prescribes — publish, don't sense-and-act —
+        // has no medium here (during a ceremony the engine *is* the node: no overlay, no store). What is
+        // available is the cheaper half of it: publish the **outcome**, and refuse to act on a local read
+        // that the cell did not confirm.
+        self.phase = Phase::Confirm;
+        let Some(digest) = self.agreement_digest() else {
+            return Vec::new(); // unreachable: `aggregate` was just set — but a `?` here beats an unwrap
+        };
+        let mut effects = Self::broadcast_to_peers(&confirm_frame(self.index, &digest));
+        effects.push(Effect::ArmTimer {
+            token: DKG_CONFIRM_DEADLINE,
+            after: self.complaint_deadline,
+        });
+        effects
+    }
+
+    /// The digest every participant must match: **everything this node's provisioning file depends on.**
+    ///
+    /// Not the joint key alone, and the difference is the operator errors it catches. A file carries the
+    /// aggregate commitment, the threshold, and the network the ceremony was for; two founders can arrive
+    /// at the same key material from different `--threshold` values or different roster files, and a beacon
+    /// provisioned from mismatched files fails exactly as a forked `QUAL` does. Hashing them together makes
+    /// one comparison answer for all of them.
+    ///
+    /// `None` before finalize, since there is no outcome to commit to.
+    fn agreement_digest(&self) -> Option<[u8; 32]> {
+        let aggregate = self.aggregate.as_ref()?;
+        let aggregate = aggregate.to_bytes();
+        let mut buf = Vec::with_capacity(32 + 16 + aggregate.len());
+        buf.extend_from_slice(&self.context);
+        // Width-explicit rather than `as u8`: `n` is the plane's point count, which is 65 793 on the widest
+        // field this tree defines, and a truncating cast is how two different ceremonies come to agree.
+        buf.extend_from_slice(&(self.n as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.threshold as u64).to_le_bytes());
+        buf.extend_from_slice(&aggregate);
+        Some(fanos_primitives::hash::hash_labeled(
+            fanos_primitives::hash::label::DKG_CONFIRM,
+            &buf,
+        ))
+    }
+
+    /// A peer's agreement digest. **Authenticated** exactly as a commitment is — only from the participant
+    /// it names — because a forged confirmation is the one frame that could tell a node its key is agreed
+    /// when it is not, which is the failure this whole phase exists to prevent.
+    ///
+    /// Recorded in **any** phase, deliberately. Deadlines fire on each node's own clock, so a fast peer's
+    /// confirmation routinely arrives before this node has finalized; dropping it would make the tally a
+    /// measurement of clock skew. It is data, and it is counted when the phase closes.
+    fn on_confirm(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+        let Some((j, digest)) = parse_confirm(body) else {
+            self.rejects.frame_unusable = self.rejects.frame_unusable.saturating_add(1);
+            return Vec::new();
+        };
+        if self.dealer_of(from) != Some(j) {
+            self.rejects.confirm_impersonated = self.rejects.confirm_impersonated.saturating_add(1);
+            return Vec::new();
+        }
+        if j == self.index {
+            return Vec::new(); // our own broadcast, arriving back
+        }
+        match self.confirmations.entry(j) {
+            Entry::Vacant(slot) => {
+                slot.insert(digest);
+            }
+            // First wins: a later, different digest cannot retract one already counted, and an honest
+            // participant emits exactly one.
+            Entry::Occupied(held) if *held.get() != digest => {
+                self.rejects.confirm_equivocated = self.rejects.confirm_equivocated.saturating_add(1);
+            }
+            Entry::Occupied(_) => {}
+        }
+        Vec::new()
+    }
+
+    /// Confirm deadline: publish the joint key **iff a threshold of participants confirmed this one**.
+    ///
+    /// The rule is derived, not chosen. A beacon round needs `t` partials, and partials combine only if
+    /// they are evaluations of one polynomial — so `t` participants holding this node's aggregate is
+    /// exactly the condition under which the file this node is about to write can ever produce a round.
+    /// Below it the node holds a key that is real, verifiable and useless, and says so.
+    ///
+    /// **A dropped confirmation costs a false refusal, never a false accept**, which is the direction that
+    /// matters: refusing a good ceremony costs a re-run, and accepting a forked one founds a cell whose
+    /// epoch clock never turns.
+    fn close_confirm(&mut self) -> Vec<Effect> {
+        if self.phase != Phase::Confirm {
+            return Vec::new();
+        }
+        self.phase = Phase::Done;
+        let Some(mine) = self.agreement_digest() else {
+            return Vec::new();
+        };
+        let heard = self.confirmations.len();
+        let agreed = 1 + self.confirmations.values().filter(|&&d| d == mine).count();
+        self.agreement = Some((agreed, heard));
+        if agreed >= self.threshold {
+            return self.joint.map_or_else(Vec::new, alloc_vec_notify);
+        }
+        std::vec![Effect::Notify(Notification::DkgDiverged {
+            agreed: u8::try_from(agreed).unwrap_or(u8::MAX),
+            heard: u8::try_from(heard).unwrap_or(u8::MAX),
+        })]
+    }
+
+    /// `(agreed, heard)` once the confirm phase has closed — how many participants (this node included)
+    /// hold the same outcome, and how many answered at all.
+    ///
+    /// The two are reported separately because they call for opposite actions: `heard` low is a ceremony
+    /// that did not assemble (check that every founder is running), while `heard` high with `agreed` low is
+    /// a ceremony that assembled and **disagreed** (check that every founder holds the identical roster and
+    /// threshold, then re-run).
+    #[must_use]
+    pub const fn agreement(&self) -> Option<(usize, usize)> {
+        self.agreement
     }
 
     /// Answer a participant that reached the sharing deadline without this node's commitment.
@@ -675,12 +873,14 @@ impl<F: Field> Engine for DkgNode<F> {
                     Some(FrameType::DkgComplaint) => self.on_complaint(from, f.body),
                     Some(FrameType::DkgJustify) => self.on_justify(from, f.body),
                     Some(FrameType::DkgCommitReq) => self.on_commit_req(from),
+                    Some(FrameType::DkgConfirm) => self.on_confirm(from, f.body),
                     _ => Vec::new(),
                 },
                 Err(_) => Vec::new(),
             },
             Input::Timer(DKG_SHARE_DEADLINE) => self.open_complaints(),
             Input::Timer(DKG_COMPLAINT_DEADLINE) => self.finalize(),
+            Input::Timer(DKG_CONFIRM_DEADLINE) => self.close_confirm(),
             _ => Vec::new(),
         }
     }
@@ -688,6 +888,24 @@ impl<F: Field> Engine for DkgNode<F> {
     fn address(&self) -> Triple {
         self.coord.coords()
     }
+}
+
+/// Encode a `DkgConfirm`: `index(1) ‖ digest(32)`.
+///
+/// The index is carried even though the transport already names the sender, for the same reason
+/// `commit_frame` carries the dealer: the receiver checks the two against each other, so a frame that
+/// travelled a path its author did not is refused rather than attributed to whoever handed it over.
+fn confirm_frame(index: u8, digest: &[u8; 32]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + 32);
+    body.push(index);
+    body.extend_from_slice(digest);
+    frame(FrameType::DkgConfirm, &body)
+}
+
+/// Parse a `DkgConfirm` body into `(index, digest)`. Exact length: a 32-byte digest and nothing else.
+fn parse_confirm(body: &[u8]) -> Option<(u8, [u8; 32])> {
+    let (&index, rest) = body.split_first()?;
+    Some((index, <[u8; 32]>::try_from(rest).ok()?))
 }
 
 /// Encode a private `DkgDeal`: `share(33) ‖ commitment`.
@@ -816,9 +1034,20 @@ mod tests {
 
         o.step(Instant(20), Input::Timer(DKG_SHARE_DEADLINE));
         let fin = o.step(Instant(40), Input::Timer(DKG_COMPLAINT_DEADLINE));
+        // **The observable is the qualified set, not the notification, and that is a correction rather than
+        // a convenience.** This test drives ONE node; since the confirm round landed, a node that has heard
+        // from nobody publishes no key however healthy its own ceremony was — correctly, because it cannot
+        // know the cell reached the same answer. What this test is about is whether dealer 2 survived a
+        // forged complaint, and the aggregate commitment says so exactly: it exists only when
+        // `|QUAL| ≥ threshold`, and with `threshold = 2` that needs dealer 2 in it beside O itself.
         assert!(
-            completed(&fin),
-            "an honest dealer survives a forged complaint and the DKG completes"
+            !completed(&fin),
+            "a lone node must not publish a joint key: no peer confirmed it (this is the confirm round, not \
+             a failure of the dealer under test — the assertion below is the one about the dealer)"
+        );
+        assert!(
+            o.aggregate_commitment().is_some(),
+            "an honest dealer survives a forged complaint: QUAL reached the threshold and the key was formed"
         );
 
         // **Surviving the attack is half of it.** B1's whole effect was a ceremony that would not terminate,
@@ -983,6 +1212,47 @@ mod tests {
         }
     }
 
+    /// Fire `token` on every node, putting what each emits onto the bus, then drain the bus.
+    ///
+    /// Returns each node's own effects, in node order, so a caller can still ask what a *particular* node
+    /// said. Written once because the ceremony has three deadline-driven phases and a test that fires two of
+    /// them measures a ceremony that has not finished: before this existed the complaint deadline's effects
+    /// were consumed by `completed(..)` and dropped, so the confirm round's broadcasts never reached anyone
+    /// and every node would have reported a cell that did not agree.
+    fn fire(
+        nodes: &mut [DkgNode<F2>],
+        bus: &mut Vec<(Triple, usize, Vec<u8>)>,
+        clock: &mut u64,
+        token: TimerToken,
+    ) -> Vec<Vec<Effect>> {
+        let mut per_node = Vec::with_capacity(nodes.len());
+        for k in 0..nodes.len() {
+            *clock += 1;
+            let origin = Point::<F2>::at(k).coords();
+            let effects = nodes[k].step(Instant(*clock), Input::Timer(token));
+            for e in &effects {
+                match e {
+                    Effect::Send { to, frame } => {
+                        if let Some(j) = node_at_f2(*to) {
+                            bus.push((origin, j, frame.clone()));
+                        }
+                    }
+                    Effect::Flood { frame } => {
+                        for j in 0..nodes.len() {
+                            if j != k {
+                                bus.push((origin, j, frame.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            per_node.push(effects);
+        }
+        drain(nodes, bus, clock);
+        per_node
+    }
+
     /// The companion to the tripwire above, and the acceptance test for the commitment pull: when the loss
     /// is **transient** rather than a permanently dark link, `QUAL` no longer forks.
     ///
@@ -1145,25 +1415,73 @@ mod tests {
             }
         }
         // The censoring drain, otherwise identical to `drain`.
-        while !bus.is_empty() {
-            let (from, target, frame) = bus.remove(0);
-            clock += 1;
-            for e in nodes[target].step(Instant(clock), Input::Message { from, frame }) {
-                if let Effect::Send { to, frame } = e
-                    && let Some(k) = node_at_f2(to)
-                {
+        //
+        // **It has to carry floods, and for a while it did not.** `broadcast_to_peers` returns
+        // `Effect::Flood`, so a drain that matches only `Effect::Send` drops every complaint and every
+        // justification — which made this fixture *harsher* than the sentence above it, censoring the whole
+        // broadcast substrate rather than one directed link, and left the claim "one dropped link is enough"
+        // demonstrated by nothing. Floods now go everywhere except across the dark edge, which is what the
+        // scenario says.
+        let censoring_drain =
+            |nodes: &mut Vec<DkgNode<F2>>, bus: &mut Vec<(Triple, usize, Vec<u8>)>, clock: &mut u64| {
+                while !bus.is_empty() {
+                    let (from, target, frame) = bus.remove(0);
+                    *clock += 1;
                     let origin = Point::<F2>::at(target).coords();
-                    if !(origin == dark_from && k == dark_to) {
-                        bus.push((origin, k, frame));
+                    for e in nodes[target].step(Instant(*clock), Input::Message { from, frame }) {
+                        match e {
+                            Effect::Send { to, frame } => {
+                                if let Some(k) = node_at_f2(to)
+                                    && !(origin == dark_from && k == dark_to)
+                                {
+                                    bus.push((origin, k, frame));
+                                }
+                            }
+                            Effect::Flood { frame } => {
+                                for k in 0..n {
+                                    if k != target && !(origin == dark_from && k == dark_to) {
+                                        bus.push((origin, k, frame.clone()));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
+            };
+        censoring_drain(&mut nodes, &mut bus, &mut clock);
+        // Each deadline in turn, with what it emits put back on the (censored) bus — the confirm round is a
+        // broadcast, so a phase whose effects are dropped would make every node report a cell that never
+        // spoke, which is a different failure from the one under test.
+        let mut published: Vec<Vec<Effect>> = Vec::new();
+        for token in [DKG_SHARE_DEADLINE, DKG_COMPLAINT_DEADLINE, DKG_CONFIRM_DEADLINE] {
+            published.clear();
+            for k in 0..n {
+                clock += 1;
+                let origin = Point::<F2>::at(k).coords();
+                let effects = nodes[k].step(Instant(clock), Input::Timer(token));
+                for e in &effects {
+                    match e {
+                        Effect::Send { to, frame } => {
+                            if let Some(j) = node_at_f2(*to)
+                                && !(origin == dark_from && j == dark_to)
+                            {
+                                bus.push((origin, j, frame.clone()));
+                            }
+                        }
+                        Effect::Flood { frame } => {
+                            for j in 0..n {
+                                if j != k && !(origin == dark_from && j == dark_to) {
+                                    bus.push((origin, j, frame.clone()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                published.push(effects);
             }
-        }
-        for node in &mut nodes {
-            let _ = node.step(Instant(100), Input::Timer(DKG_SHARE_DEADLINE));
-        }
-        for node in &mut nodes {
-            let _ = node.step(Instant(200), Input::Timer(DKG_COMPLAINT_DEADLINE));
+            censoring_drain(&mut nodes, &mut bus, &mut clock);
         }
 
         let agg_majority = nodes[0].aggregate_commitment().expect("the unaffected nodes complete");
@@ -1178,6 +1496,104 @@ mod tests {
             !vss::verify_share(&nodes[dark_to].final_share(), &agg_majority),
             "and the divergence is not cosmetic: the starved node's final share does not verify against the \
              group's aggregate, so its beacon partials would be counted as forgeries for ever"
+        );
+
+        // **And the second half, which is what the confirm round buys.** The fork above is unrepaired; what
+        // changed is that it can no longer be written to disk in silence. The starved node hears every peer
+        // confirm an outcome that is not its own, so it publishes nothing and says how alone it is; the
+        // other six confirm each other and publish.
+        assert!(
+            !completed(&published[dark_to]),
+            "the starved node must NOT publish a joint key its cell does not hold — that file's beacon \
+             partials would never combine, and nothing else would say so until the epoch clock failed to turn"
+        );
+        assert!(
+            matches!(
+                published[dark_to].as_slice(),
+                [Effect::Notify(Notification::DkgDiverged { agreed: 1, heard })] if *heard as usize == n - 2
+            ),
+            "and it must say WHICH failure this is: {} of the 6 peers answered — every one of them except \
+             the dealer whose link is dark — and not one agreed, which is a different operator action from \
+             a ceremony nobody joined. Got {} effects.",
+            n - 2,
+            published[dark_to].len()
+        );
+        let agreeing = (0..n).filter(|&k| completed(&published[k])).count();
+        assert_eq!(
+            agreeing,
+            n - 1,
+            "the six that share an inbox agree and publish — a repair that silenced everyone would pass the \
+             assertion above and be a worse outcome than the fork"
+        );
+    }
+
+    /// **A founder that ran under a different roster does not quietly join the network.**
+    ///
+    /// The key material here is *identical* for everyone: one complete mesh, no losses, no adversary, so
+    /// every node folds the same `QUAL` and computes the same aggregate commitment. What differs is the
+    /// **context** — the value a host binds the ceremony to, which `fanos keygen` fills with the network id
+    /// it derived from the roster file. Two founders holding rosters that differ by one line therefore run
+    /// what is arithmetically the same ceremony and provision two different networks.
+    ///
+    /// Nothing in the key material can catch that, which is the whole reason the digest covers more than the
+    /// key: without the context, this test's odd node out agrees with everyone and writes a file naming a
+    /// network its peers have never heard of.
+    ///
+    /// Asserted in both directions — the mismatched node refuses and the rest publish — because a change
+    /// that made *everyone* refuse would satisfy the first half and be a worse outcome than the defect.
+    #[test]
+    fn a_participant_on_a_different_context_agrees_with_nobody() {
+        let (n, t) = (7usize, 4usize);
+        let odd = 3usize;
+        let mut nodes: Vec<DkgNode<F2>> = (0..n)
+            .map(|i| {
+                let node = DkgNode::<F2>::new(Point::at(i), t, [i as u8 + 1; 32], [(i as u8) ^ 0x5A; 32])
+                    .with_deadlines(Duration::from_millis(10), Duration::from_millis(10));
+                // Everyone but `odd` ran under the same roster; `odd` had one line more.
+                node.with_context(if i == odd { [0xAB; 32] } else { [0xCD; 32] })
+            })
+            .collect();
+
+        let mut clock = 0u64;
+        let mut bus: Vec<(Triple, usize, Vec<u8>)> = Vec::new();
+        for (k, node) in nodes.iter_mut().enumerate() {
+            for e in node.step(Instant(0), Input::Command(Command::StartHeartbeat)) {
+                if let Effect::Send { to, frame } = e
+                    && let Some(j) = node_at_f2(to)
+                {
+                    bus.push((Point::<F2>::at(k).coords(), j, frame));
+                }
+            }
+        }
+        drain(&mut nodes, &mut bus, &mut clock);
+        fire(&mut nodes, &mut bus, &mut clock, DKG_SHARE_DEADLINE);
+        fire(&mut nodes, &mut bus, &mut clock, DKG_COMPLAINT_DEADLINE);
+        let published = fire(&mut nodes, &mut bus, &mut clock, DKG_CONFIRM_DEADLINE);
+
+        // The premise: the ceremony really did agree on the key, so nothing but the context can be what
+        // separates them. Without this the test could pass because the mesh broke.
+        let agg = nodes[0].aggregate_commitment().expect("an all-honest mesh forms a key");
+        for (k, node) in nodes.iter().enumerate() {
+            assert_eq!(
+                node.aggregate_commitment().map(|a| a.to_bytes()),
+                Some(agg.to_bytes()),
+                "node {k} must hold the SAME key material — the context is the only difference under test"
+            );
+        }
+
+        assert!(
+            matches!(
+                published[odd].as_slice(),
+                [Effect::Notify(Notification::DkgDiverged { agreed: 1, heard })] if *heard as usize == n - 1
+            ),
+            "the founder on a different roster must refuse its own file: it heard every peer and agreed with \
+             none of them, which is exactly the operator error no key check can see"
+        );
+        assert_eq!(
+            (0..n).filter(|&k| completed(&published[k])).count(),
+            n - 1,
+            "and the other six publish — a change that made the whole cell refuse would pass the assertion \
+             above while destroying every ceremony that has a slow founder"
         );
     }
 
@@ -1208,18 +1624,27 @@ mod tests {
             }
         }
         drain(&mut nodes, &mut bus, &mut clock);
-        // Sharing deadline (no complaints — all honest), then complaint deadline ⇒ finalize.
-        for node in &mut nodes {
-            let _ = node.step(Instant(100), Input::Timer(DKG_SHARE_DEADLINE));
-        }
-        drain(&mut nodes, &mut bus, &mut clock);
-        let done = (0..n)
-            .filter(|&k| {
-                completed(&nodes[k].step(Instant(200), Input::Timer(DKG_COMPLAINT_DEADLINE)))
-            })
-            .count();
-        drain(&mut nodes, &mut bus, &mut clock);
+        // Sharing deadline (no complaints — all honest), then complaint deadline ⇒ finalize, then the
+        // confirm deadline, which is where the key is actually published. Each phase's effects go back on
+        // the bus: the confirm round is a broadcast, so a phase whose effects are dropped is a cell that
+        // never hears anyone agree.
+        fire(&mut nodes, &mut bus, &mut clock, DKG_SHARE_DEADLINE);
+        let finalized = fire(&mut nodes, &mut bus, &mut clock, DKG_COMPLAINT_DEADLINE);
+        assert!(
+            finalized.iter().all(|e| !completed(e)),
+            "finalizing is not publishing: the key is withheld until a threshold of peers confirm it"
+        );
+        let published = fire(&mut nodes, &mut bus, &mut clock, DKG_CONFIRM_DEADLINE);
+        let done = published.iter().filter(|e| completed(e)).count();
         assert_eq!(done, n, "all honest nodes complete the DKG");
+        for (k, node) in nodes.iter().enumerate() {
+            assert_eq!(
+                node.agreement(),
+                Some((n, n - 1)),
+                "node {k} must count every peer as heard AND agreeing — a tally short of that would mean \
+                 the key was published on a weaker witness than the test claims"
+            );
+        }
 
         let agg0 = nodes[0]
             .aggregate_commitment()

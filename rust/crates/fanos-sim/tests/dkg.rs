@@ -16,11 +16,19 @@ use fanos_vrf::dkg;
 use fanos_vrf::vss::{DeterministicRng, VssCommitment, VssShare};
 use fanos_wire::{FrameType, encode_frame};
 
-/// Short phase deadlines so the two-phase (sharing + complaint) protocol settles fast under test.
-const SHARING: Duration = Duration::from_millis(500);
-const COMPLAINT: Duration = Duration::from_millis(500);
-/// A run window comfortably past both phases.
-const WINDOW: Duration = Duration::from_millis(1600);
+/// One phase, in milliseconds. Short so the protocol settles fast under test; named once because three
+/// phases are sized from it and the run window below is arithmetic over them rather than a second number.
+const PHASE_MS: u64 = 500;
+/// Short phase deadlines so the protocol settles fast under test.
+const SHARING: Duration = Duration::from_millis(PHASE_MS);
+const COMPLAINT: Duration = Duration::from_millis(PHASE_MS);
+/// A run window past **all three** phases — sharing, complaint, confirm — with as much again for the
+/// propagation between them.
+///
+/// It read `1600 ms` and "comfortably past both phases" while there were two. The confirm round made that
+/// window end *inside* the ceremony, which would have read as "the nodes did not agree" rather than as a
+/// window that stopped early — so the number is derived here and cannot go stale the same way twice.
+const WINDOW: Duration = Duration::from_millis(PHASE_MS * 3 * 2);
 
 fn secret_of(i: usize) -> [u8; 32] {
     let mut s = [0u8; 32];

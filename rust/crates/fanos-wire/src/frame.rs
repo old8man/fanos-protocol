@@ -69,6 +69,19 @@ pub enum FrameType {
     /// deadline without one (#DKG-QUAL). Contentless: it is addressed to the dealer, and the only
     /// commitment that dealer may answer with is its own.
     DkgCommitReq = 0x1D,
+    /// A participant's **agreement digest** over the ceremony it has just finalized — body
+    /// `index(1B) ‖ digest(32B)`, broadcast once at the complaint deadline (#DKG-QUAL).
+    ///
+    /// `QUAL` is computed from each participant's own inbox, so one dropped frame gives two participants
+    /// different qualified sets, different aggregate commitments, and final shares that never combine —
+    /// `fanos_keygen`'s `one_censored_link_gives_the_dkg_two_different_qualified_sets` asserts exactly that
+    /// fork. This round does not repair it; it makes it **sayable**, so a founder learns before writing a
+    /// beacon share to disk that its key is not the one its peers hold.
+    ///
+    /// **`0x10` was the last free code in the membership-critical group.** `0x1E` and `0x1F` are held by
+    /// `fanos_runtime::overlay`'s version-skew tripwire, which asserts this build cannot name them — so the
+    /// next frame this group needs must move that tripwire deliberately rather than find a gap.
+    DkgConfirm = 0x10,
     /// A relayed frame that **carries its own origin proof** — the symmetric-NAT fallback's authenticated
     /// form (#119). Unlike [`Relay`](Self::Relay), whose `origin` field is a claim the receiver must take on
     /// trust, this one binds the inner frame to a coordinate the receiver derives for itself.
@@ -225,6 +238,7 @@ impl FrameType {
             0x16 => Self::DkgCommit,
             0x17 => Self::DkgComplaint,
             0x1D => Self::DkgCommitReq,
+            0x10 => Self::DkgConfirm,
             0x0A => Self::RelayAttested,
             0x18 => Self::BeaconPartial,
             0x19 => Self::EpochAgree,
@@ -295,7 +309,7 @@ impl FrameType {
     /// Completeness is a compile-time fact, not a test: the assertion below compares this list's length to
     /// the variant count, so adding a type without listing it here fails the build. A test could only visit
     /// the variants the list already holds, which is exactly the one it would need to notice.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::Hello,
         Self::HelloAck,
         Self::Ping,
@@ -313,6 +327,7 @@ impl FrameType {
         Self::DkgCommit,
         Self::DkgComplaint,
         Self::DkgCommitReq,
+        Self::DkgConfirm,
         Self::RelayAttested,
         Self::BeaconPartial,
         Self::EpochAgree,
@@ -370,6 +385,7 @@ impl FrameType {
             Self::DkgCommit => "dkg_commit",
             Self::DkgComplaint => "dkg_complaint",
             Self::DkgCommitReq => "dkg_commit_req",
+            Self::DkgConfirm => "dkg_confirm",
             Self::RelayAttested => "relay_attested",
             Self::BeaconPartial => "beacon_partial",
             Self::EpochAgree => "epoch_agree",
