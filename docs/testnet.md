@@ -58,9 +58,11 @@ system. A passive adversary's flow-matching floor on the default plane is **1/3*
 > circuits, 0.50 — a coin flip"*: that was the **member-zero** combiner map, replaced by the digest map,
 > and the guard on that map asserted only `|image| > f`, which cannot tell one map from another — so the
 > superseded figure survived here, in `config.rs` and in `bin/fanos.rs`. It also claimed that `config.rs`
-> and `deployment-minima.md` *"both derive the same number"*; they do not. `deployment-minima.md` derives
-> the floor as `1/K` with **`K = N`** (so `1/7` at Fano), a different model of `K` entirely, and neither
-> derivation was pinned until now.
+> and `deployment-minima.md` *"both derive the same number"*; they do not — but they are not in conflict
+> either. `deployment-minima.md` says the floor is `1/K` with `K = N`, *"`1/7` **at best**"*: a **ceiling**
+> on the anonymity set, since there cannot be more concurrent circuits than nodes. `|image| / 2 = 3` is the
+> **structural** limit the combiner map permits, and since a floor is the adversary's accuracy the larger
+> number binds. So **1/3 is the operative figure and 1/7 the unreachable ideal.**
 
 If the testnet's purpose includes exercising the anonymity properties (not just connectivity, storage and
 consensus), raise `--plane-order` — see §3.5's caution before you do, since it isn't free and it isn't

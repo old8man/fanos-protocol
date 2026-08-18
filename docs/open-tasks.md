@@ -1039,10 +1039,16 @@ remaining two rows the same way — look for claims that no assertion checks, no
     combiner map's figures, replaced by the digest map, and the guard on that map asserted only `|image| > f` — which
     cannot tell one map from another, so the superseded number outlived it. The image is now pinned by value (6 of 7,
     37 of 57) in `the_combiner_map_covers_more_of_the_plane_than_the_cell_tolerates_faults`.
-  - **A second, unresolved discrepancy sits underneath.** `docs/deployment-minima.md` derives the same floor as `1/K`
-    with **`K = N`** — `1/7` at Fano — while this line and `config.rs` use `K = |image| / 2`. Two models of `K`, no
-    measurement adjudicating them: the linkability sweep that would is `#[ignore]`d and written for `PG(2,7)`. Deciding
-    which `K` is right is the open half of this task.
+  - **And the apparent second discrepancy resolves, on a word.** `docs/deployment-minima.md` gives the floor as `1/K`
+    with `K = N` — *"on a Fano cell that is `1/7` **at best**"*. That **"at best"** makes it a ceiling on the anonymity
+    set (there cannot be more concurrent circuits than nodes), not a competing derivation. `|image| / 2 = 3` is the
+    **structural** limit the combiner map actually permits. A floor is the adversary's accuracy, so the *larger* number
+    binds: `1/3 > 1/7`, and **1/3 is the operative figure while 1/7 is an unreachable ideal**. The two are consistent
+    and the binding one is now pinned.
+  - What remains genuinely open is narrower: production launches draw a **salted, per-onion** combiner
+    (`combiner_for_salted`), so the entry point varies per packet, while both figures above are computed over the
+    *unsalted* canonical map. Whether salting raises `K` above 3 is unmeasured — the linkability sweep that would say
+    is `#[ignore]`d and written for `PG(2,7)`.
 - **New hard constraint:** the fixed-slot onion reserves one nested threshold seal of payload, so circuit depth falls as the
   plane widens — `slots::depth_for`: **3 hops at q=2 and q=3, 2 at q=4, 1 at q=7**. Raising the default to 4 buys a larger
   anonymity set and costs a hop; q=7 cannot carry a circuit at all inside `THRESHOLD_ONION_LEN`.
