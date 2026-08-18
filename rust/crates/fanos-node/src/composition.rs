@@ -215,8 +215,15 @@ pub fn compose_engine<F: Field + 'static>(
         // this whole task exists to remove, so it must not be reintroduced here.
         overlay.restore(bytes);
     }
-    if let Some(members) = what.cell_members {
-        overlay = overlay.with_cell_members(members);
+    // A malformed cell is **dropped**, never a panic — the same rule `hier_addr` states one function up,
+    // and for the same reason: the members arrive from configuration or a scenario, and under
+    // `panic = "abort"` a panic here kills the node. What is dropped now is wider than a bad coordinate:
+    // `CellMembers::new` also refuses seven points whose order does not realise `fano::LINE_POINTS`, which
+    // used to be accepted and would have run the whole reflex over triples that are not collinear.
+    if let Some(members) = what.cell_members
+        && let Some(cell) = fanos_geometry::fano::CellMembers::<F>::new(members)
+    {
+        overlay = overlay.with_cell_members(cell);
     }
     if let Some(path) = &what.hier_path
         && let Some(hier) = hier_addr::<F>(path)

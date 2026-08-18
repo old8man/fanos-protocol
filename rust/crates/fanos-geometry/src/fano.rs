@@ -8,7 +8,7 @@
 //! against the generic [`Plane`](crate::Plane)`<F2>` in the test suite, giving two
 //! independent derivations that must agree.
 
-use fanos_field::F2;
+use fanos_field::{F2, Field};
 
 use crate::element::Triple;
 use crate::plane::{Line, Point};
@@ -169,4 +169,116 @@ pub fn point(i: usize) -> Point<F2> {
 #[must_use]
 pub fn line(i: usize) -> Line<F2> {
     Line::at(i)
+}
+
+/// Seven **distinct** points of `PG(2, q)`, in the canonical position order the incidence tables index.
+///
+/// `OverlayNode::with_cell_members` accepts a roster and lets everything above it — `polar_class`,
+/// `theme_flags`, `cell_liveness`, `grey_rate_matrix` — read [`LINE_POINTS`] on the *index* of a member.
+/// Constructing this value is what makes "seven distinct points of this plane" a checked fact instead of
+/// a caller's promise, in the shape `fanos_taxis::CellParams` took when its fields went private: a
+/// validator a caller can forget is one that will be absent in production.
+///
+/// # What this deliberately does **not** require, and why the stronger rule is wrong
+///
+/// I first had it demand that the members **realise** the tables — that `members[l₀..l₂]` be collinear in
+/// the transport plane for each of the seven triples — reasoning that otherwise `polar_class` names pairs
+/// with no line between them. That is over-strict, and three existing tests failed on it before the
+/// reasoning was re-checked:
+///
+/// * the cell's Fano structure is a **combinatorial labelling of seven members**, not a geometric claim
+///   about their coordinates. `polar_class` groups the 21 pairs into 7 classes; `mediator_attestation`
+///   computes from a `degraded` mask over *indices*; `grey_rate_matrix` is built from per-peer loss on
+///   **direct** connections. The T-226 identities hold by construction of the rate formula.
+/// * **nothing routes along a cell line.** Threshold gathers use transport lines from `Plane<F>`;
+///   `cell_coord` only *names* a member. So a cell line is never a path that must exist.
+/// * and the rule would have been unsatisfiable where the tree actually uses it: an embedded cell on
+///   `PG(2,7)` or `PG(2,31)` — both shipped fixtures — cannot be a Fano subplane at all, because a
+///   subplane needs `GF(2) ⊆ GF(q)` and both orders are odd primes.
+///
+/// What the members *must* agree on is the index→member mapping, and that is a **distributed** property
+/// no local constructor can check. This type checks what is local: they are points, and they are seven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellMembers<F: Field> {
+    members: [Triple; N],
+    plane: core::marker::PhantomData<fn() -> F>,
+}
+
+impl<F: Field> CellMembers<F> {
+    /// `None` unless every coordinate is a point of `PG(2, q)` and all seven are **distinct** — a repeated
+    /// coordinate would make two roster positions the same node, so the reflex would attribute one
+    /// member's readings to two seats and its own consistency check could never see it.
+    #[must_use]
+    pub fn new(members: [Triple; N]) -> Option<Self> {
+        let mut points = [Point::<F>::at(0); N];
+        for (slot, &coords) in points.iter_mut().zip(members.iter()) {
+            *slot = Point::<F>::new(coords)?;
+        }
+        for (i, a) in points.iter().enumerate() {
+            if points.iter().skip(i + 1).any(|b| a == b) {
+                return None;
+            }
+        }
+        Some(Self { members, plane: core::marker::PhantomData })
+    }
+
+    /// The member coordinates, in the order the incidence tables index them.
+    #[must_use]
+    pub const fn coords(&self) -> [Triple; N] {
+        self.members
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// **What the constructor refuses, and what it deliberately accepts.**
+    ///
+    /// It refuses a repeated coordinate — two roster positions holding one node — and a triple that is not
+    /// a point of the plane. It **accepts** seven points that do not realise the incidence tables, because
+    /// the cell's Fano structure is a labelling of members rather than a geometric claim about them; see
+    /// the type's doc for why the stronger rule is wrong and which shipped fixtures it would have broken.
+    /// Both directions are asserted, because a constructor that refused everything would pass a one-sided
+    /// test.
+    #[test]
+    fn a_roster_is_seven_distinct_points_and_need_not_realise_the_tables() {
+        let good: [Triple; N] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        assert!(CellMembers::<F2>::new(good).is_some(), "the base cell must validate");
+
+        let mut duplicated = good;
+        duplicated[6] = duplicated[0];
+        assert!(CellMembers::<F2>::new(duplicated).is_none(), "a repeated member is not a roster");
+
+        let mut off_plane = good;
+        off_plane[3] = [0, 0, 0];
+        assert!(CellMembers::<F2>::new(off_plane).is_none(), "the zero triple is not a point");
+
+        // Accepted on purpose: a transposition breaks the tables' incidence and is still a valid roster.
+        let mut swapped = good;
+        swapped.swap(1, 2);
+        assert!(
+            CellMembers::<F2>::new(swapped).is_some(),
+            "the order is a labelling the cell must agree on, not a geometry this constructor can check"
+        );
+
+        // And the case that made the stronger rule untenable: seven arbitrary points of an ODD-order
+        // plane, which can never be a Fano subplane (a subplane needs `GF(2) ⊆ GF(q)`), yet is exactly
+        // what the shipped embedded-cell fixtures use.
+        let arbitrary: [Triple; N] =
+            core::array::from_fn(|i| Point::<fanos_field::F7>::at(i * 5 + 2).coords());
+        assert!(
+            CellMembers::<fanos_field::F7>::new(arbitrary).is_some(),
+            "an embedded roster on PG(2,7) is legitimate and no subplane exists there"
+        );
+    }
+
+    /// The accessor returns what was accepted, so a caller cannot be handed a different cell than it
+    /// validated.
+    #[test]
+    fn the_accepted_order_is_what_comes_back() {
+        let good: [Triple; N] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        assert_eq!(CellMembers::<F2>::new(good).unwrap().coords(), good);
+    }
 }

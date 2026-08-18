@@ -919,8 +919,17 @@ impl<F: Field> OverlayNode<F> {
     /// base plane's points `0..6` — for a cell embedded in a larger transport plane (a unified hierarchy). Sets
     /// the reflexive `self_index` to this node's position and rebuilds the cell peer set from the six other
     /// members, so liveness sensing, witnessing, and the whole reflex run over the real cell.
+    ///
+    /// **The argument is a [`CellMembers`](fano::CellMembers), not seven bare coordinates,
+    /// and that is the fix rather than a style choice.** Everything downstream reads `fano::LINE_POINTS` on
+    /// *indices* — `polar_class`, `theme_flags`, `cell_liveness`, `grey_rate_matrix` — so those tables are a
+    /// claim about the coordinates, and nothing used to check it. Seven points in the wrong order left every
+    /// polar identity, line gather and syndrome addressing triples that are **not collinear in the transport
+    /// plane**: the alarms stay quiet and the diagnosis describes a cell that does not exist. Constructing
+    /// the argument is now the check, so there is no call a caller can forget.
     #[must_use]
-    pub fn with_cell_members(mut self, members: [Triple; 7]) -> Self {
+    pub fn with_cell_members(mut self, cell: fano::CellMembers<F>) -> Self {
+        let members = cell.coords();
         self.self_index = members.iter().position(|&m| m == self.coord.coords());
         self.peers.clear();
         for &m in &members {
@@ -2222,14 +2231,17 @@ mod tests {
         // caught it.
         //
         // The seats are also NOT `Point::at(i)`: member `i` sits at point `i * 5 + 2`, so the base-plane rule
-        // and the roster rule disagree about every index and the old code cannot pass by coincidence.
+        // and the roster rule disagree about every index and the old code cannot pass by coincidence. They are
+        // not a Fano *subplane* either, and they need not be: `PG(2,7)` has none — a subplane needs
+        // `GF(2) ⊆ GF(q)` and 7 is an odd prime — while the cell's Fano structure is a labelling of the seven
+        // members rather than a geometric claim about their coordinates (`fano::CellMembers`).
         let seat_of = |i: usize| Point::<F7>::at(i * 5 + 2).coords();
         let members: [Triple; 7] = core::array::from_fn(seat_of);
         let mut node = OverlayNode::<F7>::new(
             Point::<F7>::new(seat_of(0)).expect("a plane point"),
             Config::default(),
         )
-        .with_cell_members(members);
+        .with_cell_members(fano::CellMembers::<F7>::new(members).expect("seven distinct plane points"));
         assert_eq!(node.self_index, Some(0), "seated at roster position 0");
 
         // **Inside the roster**: a move to another member's seat re-reads the index FROM THE ROSTER. Position
@@ -2285,7 +2297,8 @@ mod tests {
         // first draft of this test asserted against `ServiceNode` and failed for exactly that reason.
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
-            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+            OverlayNode::<F2>::new(Point::at(0), Config::default())
+                .with_cell_members(fano::CellMembers::new(members).expect("a real subplane"));
         let peer = Point::<F2>::at(1).coords();
 
         node.step(Instant(0), Input::Message { from: peer, frame: alloc::vec![0xFF, 0xFF, 0xFF] });
@@ -2380,7 +2393,8 @@ mod tests {
         const FRAMES: usize = 10;
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
-            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+            OverlayNode::<F2>::new(Point::at(0), Config::default())
+                .with_cell_members(fano::CellMembers::new(members).expect("a real subplane"));
         let peer = Point::<F2>::at(1).coords();
 
         // `0x1F` and `0x1E`, and the second one used to be `0x1D` — **which this build knows**
@@ -2471,7 +2485,8 @@ mod tests {
 
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
-            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+            OverlayNode::<F2>::new(Point::at(0), Config::default())
+                .with_cell_members(fano::CellMembers::new(members).expect("a real subplane"));
         let peer = Point::<F2>::at(1).coords();
 
         let refuse = |node: &mut OverlayNode<F2>, at: u64, body: Vec<u8>| {
@@ -2556,7 +2571,8 @@ mod tests {
         // node was doing.
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
-            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+            OverlayNode::<F2>::new(Point::at(0), Config::default())
+                .with_cell_members(fano::CellMembers::new(members).expect("a real subplane"));
 
         let load_of = |node: &mut OverlayNode<F2>, at: u64| -> RoleReading {
             node.step(Instant(at), Input::Command(Command::Diagnose))
@@ -2665,7 +2681,8 @@ mod tests {
         // read down, it makes it impossible.
         let members: [Triple; 7] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
         let mut node =
-            OverlayNode::<F2>::new(Point::at(0), Config::default()).with_cell_members(members);
+            OverlayNode::<F2>::new(Point::at(0), Config::default())
+                .with_cell_members(fano::CellMembers::new(members).expect("a real subplane"));
         // Pinning the roster says where the seats are; it does not say anyone is in them. Storage placement
         // follows CONTACT (`occupied_points`), so the fixture must state contact — which is what a deployed
         // node has by the time it reads anything (#216).
