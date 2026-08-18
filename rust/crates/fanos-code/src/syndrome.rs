@@ -28,6 +28,27 @@ pub enum Fault {
     Escalate(u8),
 }
 
+/// The largest fault set this cell can **name**, and it is the plane's order: `q` on `PG(2, q)`, so
+/// **2** here.
+///
+/// [`theme_flags`] reports, per line, whether that line holds a degraded node, and [`decode_themes`]
+/// inverts it. **That inversion is unique exactly on sets of size `≤ q`**, by the plane's own axiom: if
+/// two degraded sets share a theme and `p` lies in one but not the other, every one of the `q + 1` lines
+/// through `p` must meet the other set — and those lines pairwise meet only at `p`, so they demand
+/// `q + 1` **distinct** points of it. A collision therefore needs `q + 1` faults.
+///
+/// The first ambiguous size is exactly `q + 1`, and its witness is constructed rather than searched: a
+/// **line** is a minimum blocking set, so a line and that line plus any point both meet every line of the
+/// plane and share a theme. So [`Fault::Escalate`] is not a heuristic cut-off — it fires at the first
+/// size where the answer is provably not unique
+/// (`the_first_ambiguous_fault_set_is_a_line_plus_a_point`).
+///
+/// **The cell is the only projective order that can name every fault it survives**, which is why
+/// DIAKRISIS is defined on a Fano cell rather than on the transport plane: naming grows as `q` and
+/// surviving as `⌊(q²+q)/3⌋`, so `q ≥ ⌊(q²+q)/3⌋` reduces to `q ≤ 2` and the two coincide exactly once
+/// (`the_base_cell_is_the_only_order_that_can_name_every_fault_it_survives`).
+pub const LOCALIZABLE_FAULTS: usize = fano::LINE_SIZE - 1;
+
 /// The 3-bit syndrome of a degraded-node mask: the XOR of the **addresses** (packed
 /// `GF(2)` coordinates, `1..=7`) of the degraded points. A single degraded point `i` yields
 /// its own address, which localizes it (spec §6.3, V13).
@@ -112,13 +133,14 @@ pub fn decode_themes(flags: u8) -> Fault {
 /// escalate (spec §6.3).
 #[must_use]
 pub fn locate(degraded: u8) -> Fault {
-    match (degraded & 0x7F).count_ones() {
+    match (degraded & 0x7F).count_ones() as usize {
         0 => Fault::Healthy,
         1 => {
             let addr = syndrome3(degraded);
             index_of_address(addr).map_or(Fault::Escalate(theme_flags(degraded)), Fault::Single)
         }
-        2 => decode_themes(theme_flags(degraded)),
+        // The cap is stated once, by [`LOCALIZABLE_FAULTS`], rather than repeated as a literal here.
+        n if n <= LOCALIZABLE_FAULTS => decode_themes(theme_flags(degraded)),
         _ => Fault::Escalate(theme_flags(degraded)),
     }
 }
@@ -260,5 +282,82 @@ mod tests {
         let o = index_of_address(6).unwrap();
         assert_eq!(syndrome3(1 << o), 6);
         assert_eq!(locate(1 << o), Fault::Single(o));
+    }
+
+    /// **The base cell is the only projective order that can name every fault it survives**, and that is
+    /// why DIAKRISIS is defined on a Fano cell rather than on the transport plane it sits in.
+    ///
+    /// A cell of order `q` names `q` ([`LOCALIZABLE_FAULTS`]) and survives `f = ⌊(q²+q)/3⌋`;
+    /// `q ≥ ⌊(q²+q)/3⌋` reduces to `3q ≥ q² + q`, i.e. `q ≤ 2`. Naming grows linearly and surviving
+    /// quadratically, so they coincide exactly once. Above the base order a cell tolerates more faults
+    /// than it can point at, and `Escalate` — the parent — becomes the normal outcome rather than the
+    /// edge case. Asserted as an equivalence over a range of orders, so the *uniqueness* is what fails if
+    /// either side moves, not merely the `q = 2` value.
+    #[test]
+    fn the_base_cell_is_the_only_order_that_can_name_every_fault_it_survives() {
+        for q in 2usize..64 {
+            let n = q * q + q + 1;
+            let survives = fanos_geometry::fault_budget(n);
+            assert_eq!(
+                q >= survives,
+                q == 2,
+                "q={q}: names {q}, survives {survives} — the coincidence must be unique to the base cell"
+            );
+        }
+        assert_eq!(
+            LOCALIZABLE_FAULTS,
+            fanos_geometry::fault_budget(fano::N),
+            "and on this cell the two ARE the same number, which is the whole design"
+        );
+    }
+
+    /// The cap is `q` because `q + 1` is provably ambiguous, and the witness is **constructed**: a line
+    /// is a minimum blocking set, so it meets every line of the plane, and adding any point to it changes
+    /// no theme bit. `Escalate` is therefore the first size at which no decoder could do better.
+    #[test]
+    fn the_first_ambiguous_fault_set_is_a_line_plus_a_point() {
+        let line = fano::LINE_POINTS[0].iter().fold(0u8, |m, &p| m | (1 << p));
+        assert_eq!(line.count_ones() as usize, LOCALIZABLE_FAULTS + 1, "a line holds q+1 points");
+        assert_eq!(theme_flags(line), 0x7F, "and, being a blocking set, meets every line");
+        // The complement of a line is the hyperoval `lrc::is_hyperoval_fano` names, and its size is the
+        // reason a point outside always exists — asserted rather than assumed.
+        let outside: Vec<u8> = (0..7u8).filter(|i| line & (1 << i) == 0).collect();
+        assert_eq!(
+            outside.len(),
+            fano::N - (LOCALIZABLE_FAULTS + 1),
+            "a line's complement holds the remaining points"
+        );
+        assert_eq!(
+            theme_flags(line | (1 << outside[0])),
+            theme_flags(line),
+            "so one more fault is invisible in the theme vector"
+        );
+        assert!(
+            matches!(decode_themes(theme_flags(line)), Fault::Escalate(_)),
+            "and the decoder escalates rather than naming one of the two"
+        );
+    }
+
+    /// The positive half, so the cap is pinned from both sides: every set **within** it has a theme of
+    /// its own and decodes back to exactly itself.
+    #[test]
+    fn every_fault_set_within_the_cap_decodes_to_itself() {
+        let mut by_theme = alloc::collections::BTreeMap::new();
+        for mask in 1u8..0x80 {
+            if (mask.count_ones() as usize) > LOCALIZABLE_FAULTS {
+                continue;
+            }
+            let theme = theme_flags(mask);
+            assert!(
+                by_theme.insert(theme, mask).is_none(),
+                "two sets within the cap share theme {theme:#x}"
+            );
+            let back = match decode_themes(theme) {
+                Fault::Single(i) => 1u8 << i,
+                Fault::Pair(i, j) => (1u8 << i) | (1u8 << j),
+                other => panic!("{mask:#x} is within the cap but decoded as {other:?}"),
+            };
+            assert_eq!(back, mask, "decoded set differs from the injected one");
+        }
     }
 }
