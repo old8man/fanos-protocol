@@ -47,7 +47,7 @@ impl Drop for Scratch {
 /// A node's engine, optionally adopting a previous run's snapshot — assembled the way a deployment is.
 fn engine(restore: Option<Vec<u8>>) -> Box<dyn Engine + Send> {
     let what = CellComposition { restore, ..CellComposition::overlay_only(OverlayConfig::default()) };
-    compose_engine::<F2>(Point::<F2>::at(0), &what)
+    compose_engine::<F2>(Point::<F2>::at(0), &what, None)
 }
 
 /// Ask the engine what it holds, through the same command a persister uses.

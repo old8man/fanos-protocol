@@ -68,13 +68,13 @@ fn two_coherent_cells_report_and_route_across_each_other() {
     for (idx, &seat) in CELL0.iter().enumerate() {
         let what =
             if idx == 0 { gateway(m0, &g0, &g1, g1_tp) } else { member(m0) };
-        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what));
+        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what, None));
     }
     // Cell 1: seven coherent members; member 0 is the gateway [P1] that knows [P0].
     for (idx, &seat) in CELL1.iter().enumerate() {
         let what =
             if idx == 0 { gateway(m1, &g1, &g0, g0_tp) } else { member(m1) };
-        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what));
+        sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what, None));
     }
 
     sim.inject_all(&Command::StartHeartbeat);

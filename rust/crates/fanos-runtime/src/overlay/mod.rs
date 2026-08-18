@@ -1309,9 +1309,11 @@ impl<F: Field> OverlayNode<F> {
     /// **transport** coordinate, which the per-epoch VRF reshuffle re-draws — so a signature made at
     /// provisioning is stale at the first boundary and every honest announce fails the binding check from
     /// then on. A working producer has to re-sign at **every reseat**, which is a runtime path this builder
-    /// cannot be: `Command::Reseat` carries a coordinate and no signature, so nothing can update the two
-    /// together. See `fanos_node::config::OverlayChoices::require_self_certified_membership` for the whole
-    /// state of that switch, including the key a running node does not have.
+    /// cannot be. [`Command::Descriptor`] is that path: the host signs for the coordinate it is **about to**
+    /// reseat to and sends it first, so the announce that follows carries a signature over the coordinate it
+    /// names. This builder remains the right way to seat the first one, before the node has moved at all.
+    /// See `fanos_node::config::OverlayChoices::require_self_certified_membership` for the rest of that
+    /// switch's state.
     #[must_use]
     pub fn with_signed_descriptor(mut self, id: Vec<u8>, sig: Vec<u8>) -> Self {
         self.membership.identity = id;
@@ -1884,6 +1886,14 @@ impl<F: Field> Engine for OverlayNode<F> {
                 Vec::new()
             }
             Input::Command(Command::AdvanceEpoch) => self.on_advance_epoch(),
+            // Installed silently: it replaces provisioning that was already this node's own, carries no
+            // decision, and emits nothing. The announce that follows the `Reseat` is where it becomes
+            // visible — which is exactly why the ordering rule is on the command's own doc.
+            Input::Command(Command::Descriptor { id, sig }) => {
+                self.membership.identity = id;
+                self.membership.descriptor_sig = sig;
+                Vec::new()
+            }
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
             // An unarmed timer, and a sub-engine control message — inert here for the same reason: neither names
@@ -2252,6 +2262,61 @@ mod tests {
                 "{code:#x} is an allocated frame type above the tag ceiling — the clamp would hide it"
             );
         }
+    }
+
+    /// **The descriptor a host signs for the coordinate it is about to hold is one this engine accepts.**
+    ///
+    /// This is the agreement the whole §80 binding rests on, and it has two ends in two crates: the *host*
+    /// builds `descriptor_message(coord, hier, id)` and signs it (`fanos_quic`'s `Reseater`, at every
+    /// reseat, because the message binds the transport coordinate and the reshuffle re-draws it); the
+    /// *engine* rebuilds the identical bytes from the announce it emits and checks them. A signature over a
+    /// message the engine does not rebuild verifies nowhere, and nothing in either type says so.
+    ///
+    /// What it pins is the part the host has to *predict*: after a reseat, this node's overlay address is
+    /// `[new_coord]` — `HierAddr::root(new_coord)` — for the depth-1 case every production composition uses
+    /// (`hier_path: None`). **The day a node descends, this fails**, which is the point: the host would then
+    /// be signing over a path it does not know, and the deeper levels have to be handed to it.
+    #[test]
+    fn a_descriptor_signed_for_the_coordinate_about_to_be_held_verifies_on_the_announce_that_follows() {
+        let moving_to = Point::<F2>::at(3);
+        let (secret, verifier) =
+            fanos_pqcrypto::HybridSigSecret::generate(&mut fanos_pqcrypto::SeedRng::from_seed(b"descriptor"));
+        let id = verifier.encode();
+
+        // The host's half: sign for the coordinate it is ABOUT to hold, and for the address it predicts the
+        // engine will then have.
+        let predicted = HierAddr::<F2>::root(moving_to);
+        let sig = secret
+            .sign(&descriptor_message::<F2>(moving_to.coords(), &predicted, &id))
+            .to_bytes();
+
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default())
+            .with_signed_descriptor(id.clone(), sig.clone());
+        // A peer to flood to, or the reseat emits no announce to inspect.
+        node.peers.insert(
+            Point::<F2>::at(1).coords(),
+            Peer { last_seen: None, reported_down: false, loss: 0.0, awaiting_pong: false },
+        );
+        let effects = node.step(Instant(1), Input::Command(Command::Reseat { coord: moving_to.coords() }));
+
+        let announce = effects
+            .iter()
+            .find_map(|e| {
+                let Effect::Send { frame, .. } = e else { return None };
+                let (f, _) = decode_frame(frame).ok()?;
+                (f.frame_type() == Some(FrameType::Announce)).then(|| f.body.to_vec())
+            })
+            .expect("a reseat re-announces, or there is nothing for a peer to verify");
+        let parsed = crate::frames::parse_announce::<F2>(&announce)
+            .expect("this engine's own announce must parse");
+
+        assert_eq!(parsed.0, moving_to.coords(), "the announce names the coordinate that was signed for");
+        assert!(
+            crate::frames::descriptor_signature_ok::<F2>(parsed.0, &parsed.1, &parsed.2, &parsed.3),
+            "the engine must rebuild the very bytes the host signed — if this fails, the host's prediction \
+             of this node's overlay address after a reseat is wrong, and every honest announce would be \
+             refused by a peer running self-certified membership"
+        );
     }
 
     /// **A DERIVED cell follows the coordinate, where a provisioned one is defended** (#145).

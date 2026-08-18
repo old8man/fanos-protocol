@@ -99,7 +99,7 @@ pub fn spawn_composed_cell<F: Field + 'static>(
     let size = size.min(Plane::<F>::N as usize);
     let mut coords = Vec::with_capacity(size);
     for point in Plane::<F>::points().take(size) {
-        coords.push(sim.add(compose_engine::<F>(point, what)));
+        coords.push(sim.add(compose_engine::<F>(point, what, None)));
     }
     coords
 }

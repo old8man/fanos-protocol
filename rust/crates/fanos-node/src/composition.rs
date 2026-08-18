@@ -185,6 +185,31 @@ fn hier_addr<F: Field>(path: &[Triple]) -> Option<fanos_geometry::HierAddr<F>> {
     points.and_then(fanos_geometry::HierAddr::from_path)
 }
 
+/// Sign a node's **§80 descriptor** for `coord` — the host's half of the coordinate↔identity binding.
+///
+/// The engine verifies a peer's descriptor by rebuilding `descriptor_message` from the announce, so the host
+/// has to produce the identical bytes; `fanos_runtime` exports that function for exactly this reason, and two
+/// implementations of one format is the drift it exists to prevent.
+///
+/// `HierAddr::root(coord)` is what the engine holds after being seated at `coord` **at depth 1**, which every
+/// production composition is (`hier_path: None`). A descended node would hold `[coord] ++ deeper`, and the
+/// deeper levels are not knowable here — the runtime test
+/// `a_descriptor_signed_for_the_coordinate_about_to_be_held_verifies_on_the_announce_that_follows` pins the
+/// agreement and is what fails on the day that changes.
+pub fn sign_descriptor<F: Field>(
+    identity: &(Vec<u8>, fanos_pqcrypto::HybridSigSecret),
+    coord: Point<F>,
+) -> (Vec<u8>, Vec<u8>) {
+    let (id, secret) = identity;
+    let msg = fanos_runtime::descriptor_message::<F>(
+        coord.coords(),
+        &fanos_geometry::HierAddr::<F>::root(coord),
+        id,
+    );
+    (id.clone(), secret.sign(&msg).to_bytes())
+}
+
+
 /// Assemble the engine a node at `coord` runs, from `what` it is configured to be.
 ///
 /// The layering is not arbitrary and each step is a strict extension of the last:
@@ -207,8 +232,18 @@ fn hier_addr<F: Field>(path: &[Triple]) -> Option<fanos_geometry::HierAddr<F>> {
 pub fn compose_engine<F: Field + 'static>(
     coord: Point<F>,
     what: &CellComposition,
+    descriptor: Option<(Vec<u8>, Vec<u8>)>,
 ) -> Box<dyn Engine + Send> {
     let mut overlay = OverlayNode::<F>::new(coord, what.overlay);
+    // **The genesis descriptor**, signed by the host for *this* coordinate (spec §80). Every later one
+    // arrives as `Command::Descriptor` from the reshuffle loop, which signs at each reseat because the
+    // message binds the transport coordinate; without this one the node's first epoch would announce with
+    // no binding at all, and a peer running self-certified membership would refuse it until the first
+    // boundary. `None` for a build with no self-certifying credentials, which is the honest shape rather
+    // than an empty signature that looks like one.
+    if let Some((id, sig)) = descriptor {
+        overlay = overlay.with_signed_descriptor(id, sig);
+    }
     if let Some(bytes) = &what.restore {
         // Ignored on failure by design — see the field's doc. The *host* reports whether it took, because
         // the host is what knows there was a file to read at all; a silent empty start is the failure mode
@@ -351,7 +386,7 @@ mod tests {
     fn a_bare_composition_is_an_overlay_and_nothing_more() {
         let what = CellComposition::overlay_only(OverlayConfig::default());
         assert!(what.beacon.is_none() && !what.relay && what.service.is_none() && what.admission.is_none());
-        let _engine = compose_engine::<F2>(Point::at(0), &what);
+        let _engine = compose_engine::<F2>(Point::at(0), &what, None);
     }
 
     #[test]
@@ -360,7 +395,7 @@ mod tests {
         // there is nothing to rotate against. `Node::start` refuses that configuration outright; this asserts
         // the *engine* degrades to the overlay rather than silently building a router with no clock.
         let what = CellComposition { relay: true, ..CellComposition::overlay_only(OverlayConfig::default()) };
-        let _engine = compose_engine::<F2>(Point::at(0), &what);
+        let _engine = compose_engine::<F2>(Point::at(0), &what, None);
         // Reaching here without a panic is the assertion: the beacon-less branch is taken.
     }
 }

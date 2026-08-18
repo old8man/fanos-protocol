@@ -525,7 +525,10 @@ impl<F: Field> Engine for NyxNode<F> {
                 | Command::Readmit { .. }
                 | Command::Join { .. }
                 | Command::AdvanceEpoch
-                | Command::Reseat { .. },
+                | Command::Reseat { .. }
+                // The §80 signed descriptor binds an *overlay membership* announcement to an identity, and a
+                // mixnet relay makes none — it has no `Announce` to carry one and no peer's to check.
+                | Command::Descriptor { .. },
             ) => Vec::new(),
         }
     }

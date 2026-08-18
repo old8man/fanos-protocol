@@ -93,7 +93,7 @@ pub fn spawn_composed_beacon_cell<F: Field + 'static>(
             }),
             ..CellComposition::overlay_only(config)
         };
-        coords.push(sim.add(compose_engine::<F>(point, &what)));
+        coords.push(sim.add(compose_engine::<F>(point, &what, None)));
     }
     coords
 }
@@ -167,7 +167,7 @@ pub fn spawn_composed_cell<F: Field + 'static>(
         }
         what.onion_seed = [i as u8; 32];
         what.kem_seed = [0x80 ^ i as u8; 32];
-        coords.push(sim.add(compose_engine::<F>(point, &what)));
+        coords.push(sim.add(compose_engine::<F>(point, &what, None)));
     }
     coords
 }

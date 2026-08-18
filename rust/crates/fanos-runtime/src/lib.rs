@@ -23,6 +23,13 @@ extern crate alloc;
 
 /// Every `encode_*`/`parse_*` for the overlay's wire bodies — see [`frames`].
 mod frames;
+/// The bytes a node's hybrid signing key signs to bind its transport coordinate to its identity (§80).
+///
+/// **Exported because the signer is not in this crate.** The engine verifies a peer's descriptor by
+/// rebuilding this message from the parsed announce; the *host* has to build the identical bytes to sign
+/// its own, at the moment its coordinate changes. Two implementations of one format is the drift this
+/// export exists to prevent — see [`Command::Descriptor`](fanos_ports::Command::Descriptor).
+pub use frames::descriptor_message;
 /// The DIAKRISIS self-healing reflex, split out of [`overlay`] — see [`healer`].
 mod healer;
 /// The cell's membership view and admission gate — see [`membership`].

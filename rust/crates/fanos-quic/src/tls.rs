@@ -48,6 +48,29 @@ pub(crate) fn vrf_secret_from_key(key_der: &[u8]) -> fanos_vrf::VrfSecret {
     fanos_vrf::VrfSecret::from_seed(seed)
 }
 
+/// Derive a node's **descriptor signing key** deterministically from the same certificate private key, under
+/// its own domain — the hybrid `Ed25519 ‖ ML-DSA-65` identity whose public bundle *is* the node's `id`
+/// (spec §80, `fanos_runtime::descriptor_message`).
+///
+/// Same argument as [`vrf_secret_from_key`] and the same shape: reloading the credentials reproduces the key,
+/// so the identity file still round-trips the whole identity and nothing new has to be persisted. It also
+/// makes `id` a **function of the certificate**, so `H(cert)` — the anchor the coordinate VRF is proved
+/// against — commits to it, and an identity bundle cannot be transplanted onto another certificate.
+///
+/// `SeedRng` is the PQ stack's own domain-separated XOF generator, so this is a key-**derivation** step
+/// rather than a second source of randomness — and it is the right one rather than `fanos_vrf`'s
+/// `DeterministicRng`, which implements `rand_core` **0.6** against the RustCrypto crates' 0.10.
+pub(crate) fn descriptor_identity_from_key(
+    key_der: &[u8],
+) -> (Vec<u8>, fanos_pqcrypto::HybridSigSecret) {
+    let mut seed = [0u8; 32];
+    fanos_primitives::hash::hash_xof("FANOS-v1/node-descriptor-key", key_der, &mut seed);
+    let (secret, verifier) =
+        fanos_pqcrypto::HybridSigSecret::generate(&mut fanos_pqcrypto::SeedRng::from_seed(&seed));
+    seed.zeroize();
+    (verifier.encode(), secret)
+}
+
 /// A TLS setup failure (certificate generation or config assembly).
 #[derive(Debug)]
 pub enum TlsError {
@@ -164,6 +187,21 @@ impl NodeCredentials {
     #[must_use]
     pub fn vrf_secret(&self) -> fanos_vrf::VrfSecret {
         vrf_secret_from_key(&self.key_der)
+    }
+
+    /// This node's **descriptor signing key** — the hybrid identity whose public bundle is its `id` (§80),
+    /// derived from the certificate's private key so it is as durable as the identity itself.
+    ///
+    /// Used to sign `descriptor_message(coord, hier, id)` at every reseat: the message binds the **transport
+    /// coordinate**, and the per-epoch reshuffle re-draws it, so a signature made once at provisioning is
+    /// stale at the first boundary. That is why this is a runtime capability rather than a config field.
+    ///
+    /// Returned with its **identity bundle** — the encoded verifier, which is what `id` is on the wire and
+    /// what a receiver checks the signature against — because the two are one derivation and handing them
+    /// out separately is how a signature and the key it is checked with come to disagree.
+    #[must_use]
+    pub fn descriptor_identity(&self) -> (Vec<u8>, fanos_pqcrypto::HybridSigSecret) {
+        descriptor_identity_from_key(&self.key_der)
     }
 
     /// The certificate DER — the node's identity (its coordinate is `MapToPoint(H(cert))`).

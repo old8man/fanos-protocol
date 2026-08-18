@@ -1319,31 +1319,33 @@ pub struct OverlayChoices {
     /// but it means the `N^k` price above is what the switch buys LATER, not today. Today it would buy only
     /// the descriptor-signature half (threat §80, transport hijack), and only if that half had a producer:
     ///
-    /// **Turning this on today rejects every peer, and the measurement is in `fanos-sim`.** The check
-    /// verifies a signed descriptor that the engine cannot produce — it holds no signing key by construction
-    /// — so a deployment must install one through `OverlayNode::with_signed_descriptor`, whose doc says as
-    /// much ("a deployment signs once and installs the result here"). **Nothing in production calls it**: its
-    /// only caller in the tree is a simulator test. Measured on a live Fano cell,
-    /// `the_self_certified_check_measured_against_what_a_real_cell_actually_announces` reads 42 learned
-    /// membership edges ungated and **0** with the check on — 100 % of honest announcements refused.
+    /// **The producer now exists, and until 2026-08-18 it did not.** The check verifies a signed descriptor;
+    /// nothing in production produced one, so turning this on refused 100 % of honest announcements —
+    /// measured on a live Fano cell by
+    /// `the_self_certified_check_measured_against_what_a_real_cell_actually_announces`, 42 learned
+    /// membership edges ungated against **0** with the check on. Two things closed that:
     ///
-    /// **And a producer alone would not be enough, which is the part that shapes the fix.** The descriptor
-    /// binds `coord ‖ hier ‖ id`, and `coord` is the **transport** coordinate — the one the per-epoch VRF
-    /// reshuffle re-draws. `with_signed_descriptor`'s own doc says *"a deployment signs once and installs
-    /// the result here"*, and a signature made once is stale at the first boundary: every honest announce
-    /// then fails the binding check for the rest of the cell's life. So the missing piece is not a
-    /// provisioning step, it is a **runtime** one — the node must re-sign at every reseat, and the engine
-    /// has no path to receive that (`with_signed_descriptor` is a builder, and `Command::Reseat` carries a
-    /// coordinate and nothing else).
+    /// * the **key**, which a running node did not have: `NodeCredentials::descriptor_identity` derives the
+    ///   hybrid `Ed25519 ‖ ML-DSA-65` identity from the certificate's private key, exactly as the coordinate
+    ///   VRF secret is derived, so `id` is a function of the identity the coordinate is already proved
+    ///   against and nothing new is persisted;
+    /// * the **runtime path**, which a builder could never be: the descriptor binds the *transport*
+    ///   coordinate and the reshuffle re-draws it, so `Command::Descriptor` carries a fresh signature and the
+    ///   reshuffle loop sends it immediately before each `Reseat`. `compose_engine` installs the genesis one.
     ///
-    /// The key it would sign with does not exist in a running node either: `NodeCredentials` holds the TLS
-    /// certificate and its key, and the descriptor wants the **hybrid** `Ed25519 ‖ ML-DSA-65` identity whose
-    /// public bundle *is* `id`. Deriving it from `key_der` the way `vrf_secret_from_key` derives the VRF
-    /// secret would cost nothing and keep persistence unchanged — the identity file still round-trips the
-    /// whole identity — which is the cheapest route on record, not a built one.
+    /// **So the switch is reachable, and it is still off — because reachable is not measured.** The number
+    /// above was taken against a build with no producer; what a cell does with this on now has not been run.
+    /// Turn it on in a scenario and read the learned-edge count before recommending it to anyone.
     ///
-    /// So this is not a trade-off awaiting a number; it is a consumer whose producer was never wired, and the
-    /// default is off for that reason rather than out of caution. Said here for the same reason
+    /// **What it costs, since it is paid whether or not anyone verifies:** `id` is 1 984 bytes and `sig` is
+    /// ~3 373, on the `Announce` — the one frame class that floods. Roughly 5.4 KB per member per epoch,
+    /// cell-wide. Small beside a 20 KB threshold onion, and not nothing.
+    ///
+    /// ⚠️ **Depth-1 only.** The signed message includes the announcer's overlay address, and the host predicts
+    /// it as `root(coord)` — exact while every production composition sets `hier_path: None`. The runtime
+    /// test `a_descriptor_signed_for_the_coordinate_about_to_be_held_verifies_on_the_announce_that_follows`
+    /// pins that agreement, and is what fails the day a node descends — which is when the deeper levels have
+    /// to be handed to the signer. Said here for the same reason
     /// [`require_admission`](Self::require_admission) says it: a switch whose precondition is undocumented is
     /// a switch that costs an operator their cell. Its counterpart is already wired: the main path sets `vrf_coordinates: true`
     /// precisely so that, with this on, level 0 is verified by the HELLO proof rather than the hash chain.

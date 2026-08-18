@@ -2093,6 +2093,7 @@ where
             directory: dir_for_reshuffle,
             hello: hello_cell,
             client: handle.client(),
+            descriptor: Some(creds.descriptor_identity()),
         },
         beacon_cell,
         book,
@@ -2346,6 +2347,23 @@ struct Reseater {
     directory: Directory,
     hello: Arc<RwLock<Arc<Vec<u8>>>>,
     client: Client,
+    /// This node's **descriptor identity** (spec §80): the bundle peers see as `id`, and the key that signs
+    /// the binding between it and the coordinate this node holds.
+    ///
+    /// Derived from the certificate key rather than configured, so `id` is a function of the identity the
+    /// coordinate is already proved against and nothing new has to be persisted
+    /// ([`NodeCredentials::descriptor_identity`]).
+    ///
+    /// **Signed here because the message binds a value that rotates.** A descriptor made once at
+    /// provisioning is stale at the first boundary, and a peer running self-certified membership would then
+    /// refuse every honest announce this node makes.
+    ///
+    /// ⚠️ **Depth-1 only, deliberately and visibly.** The message includes the announcer's *overlay* address,
+    /// and after a reseat the engine holds `[new_coord] ++ deeper_levels` — the deeper levels being the
+    /// descent chain, which this crate does not know. Every production composition sets `hier_path: None`,
+    /// so `root(coord)` is exact today; the day a node descends, the deeper levels have to be handed in here
+    /// or the signature will be over a message the engine never rebuilds.
+    descriptor: Option<(Vec<u8>, fanos_pqcrypto::HybridSigSecret)>,
 }
 
 impl Reseater {
@@ -2434,6 +2452,21 @@ impl Reseater {
         // here"*. The other three things this function does are **not** no-ops there (the directory's
         // stored rank, the HELLO, and announcing it), which is what the removed `continue` in
         // `reshuffle_loop` used to skip along with this one.
+        // **The descriptor first, and the order is the rule.** `on_reseat` re-announces, so a descriptor
+        // installed after it would let one announce per epoch go out signed for the coordinate this node has
+        // just left — which a verifying peer drops, silently, because first-sight membership does not retry.
+        // Skipped when the seat did not move: the binding is over the coordinate, and that is what did not
+        // change (an ML-DSA signature is not free enough to make unconditionally).
+        if !unchanged
+            && let Some((id, secret)) = &self.descriptor
+        {
+            let hier = fanos_geometry::HierAddr::<F>::root(fanos_vrf::probe_point::<F>(&at.output, index));
+            let msg = fanos_runtime::descriptor_message::<F>(point, &hier, id);
+            let sig = secret.sign(&msg).to_bytes();
+            if !self.client.command(Command::Descriptor { id: id.clone(), sig }) {
+                return false;
+            }
+        }
         if !unchanged && !self.client.command(Command::Reseat { coord: point }) {
             return false;
         }
@@ -6057,6 +6090,10 @@ mod tests {
                 directory: directory.clone(),
                 hello: hello.clone(),
                 client,
+                // The unit tests drive the loop directly and assert the directory outcome; a node with
+                // no descriptor identity is the honest shape for that, and is what a build with no
+                // self-certifying credentials has.
+                descriptor: None,
             },
             beacon.clone(),
             ClaimBook::new(),
@@ -6160,6 +6197,10 @@ mod tests {
                 directory,
                 hello,
                 client,
+                // The unit tests drive the loop directly and assert the directory outcome; a node with
+                // no descriptor identity is the honest shape for that, and is what a build with no
+                // self-certifying credentials has.
+                descriptor: None,
             },
             beacon,
             ClaimBook::new(),

@@ -3845,6 +3845,7 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     let creds = credentials_for_point::<F2>(target, fanos_quic::DEFAULT_GRIND_LIMIT)
         .ok_or_else(|| NodeError::Config(format!("could not seat a node at validator point {me}")))?;
     let what = fanos_node::composition::CellComposition::bare(OverlayConfig::default());
+    let desc_identity = creds.descriptor_identity();
     let mut node = spawn_self_certifying_persistent_on::<F2>(
         listen,
         &creds,
@@ -3852,7 +3853,13 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
         // runs no cell role today, but "no roles" must be SAID rather than achieved by skipping the composer:
         // a layer added to `compose_engine` has to reach this binary on the same commit, which is the whole
         // invariant `composition.rs` exists to hold and which this call site silently broke (#168).
-        move |coord| fanos_node::composition::compose_engine::<F2>(coord, &what),
+        move |coord| {
+            // The §80 descriptor too: a validator announces its membership like any node, and a cell that
+            // verifies descriptors must be able to verify this one. Signed here for the point it is being
+            // seated at, which for a validator is fixed rather than VRF-drawn.
+            let desc = fanos_node::composition::sign_descriptor::<F2>(&desc_identity, coord);
+            fanos_node::composition::compose_engine::<F2>(coord, &what, Some(desc))
+        },
         directory,
         None,
     )

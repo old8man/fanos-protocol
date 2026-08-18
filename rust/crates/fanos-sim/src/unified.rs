@@ -65,7 +65,7 @@ impl UnifiedCluster {
                     what.hier_peers =
                         (0..cell_count).map(|k| (vec![Point::<F>::at(k).coords()], gw_transport(k))).collect();
                 }
-                sim.add(compose_engine::<F>(member_point(c, j), &what));
+                sim.add(compose_engine::<F>(member_point(c, j), &what, None));
             }
             cells.push(members);
             gateway_addrs.push(gw_root(c).encode());

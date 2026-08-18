@@ -83,7 +83,7 @@ fn spawn_ingress_cell(sim: &mut Sim, hosting: bool) -> Triple {
                 kem_seed: [0x1Du8; 32],
             });
         }
-        sim.add(compose_engine::<F2>(point, &what));
+        sim.add(compose_engine::<F2>(point, &what, None));
     }
     host_coord
 }

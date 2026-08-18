@@ -273,6 +273,26 @@ pub enum Command {
         /// The coordinate to clear.
         coord: Triple,
     },
+    /// Install this node's **signed descriptor** for the coordinate it is about to hold (spec §80): the
+    /// identity bundle `id` and a hybrid signature over `descriptor_message(coord, hier, id)`.
+    ///
+    /// **A runtime command rather than a builder, because the message binds a value that rotates.** The
+    /// descriptor binds the *transport* coordinate, and the per-epoch reshuffle re-draws it — so
+    /// `OverlayNode::with_signed_descriptor`'s *"a deployment signs once and installs the result"* cannot
+    /// hold past the first boundary, and a peer running self-certified membership would refuse every honest
+    /// announce from then on. The signing secret still never enters the engine: the host signs and hands
+    /// over the result, exactly as it does for the certificate it never shares.
+    ///
+    /// **Send it BEFORE the [`Reseat`](Self::Reseat) it belongs to.** `on_reseat` re-announces, and an
+    /// announce carrying the previous coordinate's signature is one a verifying peer drops — and drops
+    /// silently, since first-sight membership does not retry. The command channel is ordered, so "before"
+    /// is a rule a caller can keep.
+    Descriptor {
+        /// The identity bundle — the encoded hybrid verifier, which is what `id` is on the wire.
+        id: Vec<u8>,
+        /// The signature over `descriptor_message(coord, hier, id)` for the coordinate about to be held.
+        sig: Vec<u8>,
+    },
     /// Re-seat this node at a new VRF coordinate for the per-epoch reshuffle (spec §L3 "epoch reshuffle",
     /// §3.2): the driver computes `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` for the new epoch (the
     /// engine is crypto-free and cannot) and hands it here. The engine re-derives its cell neighbours /

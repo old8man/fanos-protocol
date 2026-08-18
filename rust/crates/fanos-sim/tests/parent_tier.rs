@@ -47,7 +47,7 @@ fn an_embedded_parent_runs_the_parent_stratum_reflex_on_a_child_escalation() {
     let mut coords = Vec::new();
     let what = CellComposition { cell_members: Some(members), ..CellComposition::overlay_only(config()) };
     for &seat in &PARENT {
-        coords.push(sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what)));
+        coords.push(sim.add(compose_engine::<F31>(Point::<F31>::at(seat), &what, None)));
     }
     // Settle the parent cell to health so its members carry a real Φ (self_index is set from cell_members).
     sim.inject_all(&Command::StartHeartbeat);

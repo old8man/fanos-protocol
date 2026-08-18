@@ -67,7 +67,7 @@ fn spawn_service_cell(sim: &mut Sim, hosting: bool) -> Vec<Triple> {
             // signing identity (half (a)) is a separate deployment choice and has its own coverage.
             what.service = Some((service_seed(seat), line.clone(), THRESHOLD, None));
         }
-        sim.add(compose_engine::<F2>(point, &what));
+        sim.add(compose_engine::<F2>(point, &what, None));
     }
     line
 }

@@ -34,7 +34,7 @@ fn embedded_cell(seed: u64) -> (Sim, [Triple; 7]) {
     let mut sim = Sim::new(seed);
     let what = CellComposition { cell_members: Some(members), ..CellComposition::overlay_only(config()) };
     for &i in &SEATS {
-        sim.add(compose_engine::<F31>(Point::<F31>::at(i), &what));
+        sim.add(compose_engine::<F31>(Point::<F31>::at(i), &what, None));
     }
     sim.inject_all(&Command::StartHeartbeat);
     sim.run_for(Duration::from_millis(1500));
