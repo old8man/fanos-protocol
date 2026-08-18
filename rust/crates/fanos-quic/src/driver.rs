@@ -2577,6 +2577,8 @@ async fn reshuffle_loop<F: Field>(
             Beacon(Epoch, [u8; 32]),
             /// Something changed that could move the settled index — a new peer claim, or any engine notification.
             Resettle,
+            /// A member was learned by announcement; ask it for its claim if the book has none for that point.
+            Meet(Triple),
             /// The engine stopped.
             Stop,
         }
@@ -2585,6 +2587,17 @@ async fn reshuffle_loop<F: Field>(
         let wake = tokio::select! {
             event = events.recv() => match event {
                 Ok(Notification::BeaconReady { epoch, seed }) => Wake::Beacon(epoch, seed),
+                // **A member this node has heard of but holds no claim for.** The flooded `Announce` names
+                // a peer and the coordinate it sits at; the claim book is fed only by verified `HELLO`s, so
+                // a node learns *that* a peer exists long before it learns *what that peer claims* — and
+                // `settle_index` arbitrates on claims, not on membership. Measured on the shipped plane: the
+                // book sits at a third to two thirds of the peers, and coordinate resolution runs on that.
+                //
+                // Asking is free and needs no wire change: the announcement carries the coordinate, and a
+                // frame emitted there resolves to whoever holds it, whose handshake files its claim through
+                // the ordinary path. One request per member first seen, so it is bounded by the membership
+                // this node learns rather than by anything a peer can drive.
+                Ok(Notification::MemberJoined { coord, .. }) => Wake::Meet(coord),
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Wake::Resettle,
                 Err(broadcast::error::RecvError::Closed) => Wake::Stop,
             },
@@ -2727,6 +2740,19 @@ async fn reshuffle_loop<F: Field>(
                         "a peer proved a better claim to the point this node is seated on, and an established node \
                          must not move mid-epoch: both hold it until the next beacon re-derives placement"
                     );
+                }
+            }
+            // **Ask, then re-settle.** A member learned by flood is a peer whose claim this node needs and
+            // has no other way to get: dialling is by coordinate, and the announcement is the one place the
+            // coordinate arrives without a handshake having happened first. Silent when the book already
+            // holds a claim at that point — which is the common case once a cell is settled, so the steady
+            // state costs one map lookup per announcement.
+            Wake::Meet(coord) => {
+                let Some(point) = Point::<F>::new(coord) else {
+                    continue; // not a point of this plane; the engine already refuses these
+                };
+                if book.contender::<F>(&point).is_none() {
+                    seat.client.command(Command::Send { to: coord, payload: Vec::new() });
                 }
             }
             Wake::Stop => break,

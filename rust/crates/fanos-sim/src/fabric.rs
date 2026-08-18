@@ -2975,12 +2975,21 @@ mod tests {
     /// numbers an operator can be given. The earlier 19 %-against-69 % spread was the contended box, not the
     /// distribution.
     ///
-    /// **One regression came back with the signed descriptor and is not explained**: `outranked` was 0 at
-    /// both loads in run 5 and reads 914 and 3 251 at `n = 10` here. The rule it belongs to is intact — a
-    /// contested seat is not *committed* — but a node can commit while uncontested and be outranked
-    /// afterwards, and an `Announce` that grew by ~5.4 KB is a plausible reason the claim now arrives after
-    /// the role loop's 15 s commit rather than before it. Measure that before treating the descriptor's cost
-    /// as free.
+    /// **`outranked` came back with the signed descriptor, and asking for the claim removed it again.** It
+    /// read 0 at both loads before the descriptor, then 914 and 3 251 at `n = 10` with it — a node can commit
+    /// while uncontested and be outranked *afterwards*, so the contested-seat rule was intact and the window
+    /// it leaves open had widened. Wiring `Wake::Meet` — a member learned by announcement is asked for its
+    /// claim when the book holds none for that point — closes it: **0 in both paired runs**.
+    ///
+    /// | | `n = 7` below | `n = 10` below | `n = 10` book | `outranked` |
+    /// |---|---|---|---|---|
+    /// | baseline A / B | 86 % / 86 % | 25 % / 25 % | 5.1 / 5.3 of 9 | 914 / 3 251 |
+    /// | + ask C / D | 100 % / 75 % | 31 % / 17 % | 4.4 / 6.3 of 9 | **0 / 0** |
+    ///
+    /// **And nothing else moved.** Occupancy and the book size are unchanged within the spread — 24 % mean
+    /// against 25 %, a book that goes both ways — so the change is justified by the window it closes, not by
+    /// the packing column. Said explicitly because the temptation with a cheap change is to credit it with
+    /// the run it happened to land in.
     ///
     /// ## The third layer, and the instrument is what found it
     ///
