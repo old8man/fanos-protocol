@@ -2862,6 +2862,173 @@ mod tests {
     }
 
 
+    /// **Does the SHIPPED plane stay packed across an epoch boundary?** — the same question the two
+    /// measurements above ask, asked on the plane a deployment actually runs.
+    ///
+    /// Both of them run `PG(2,4)`, and `NodeConfig::plane_order`'s default is **2**. That is not a detail:
+    /// a Fano line holds `q + 1 = 3` points, so a node's whole probe walk is three long and
+    /// `probe_bound` gives it three rounds before `commit_seat` freezes it where it stands. The `PG(2,4)`
+    /// results (genesis packs 11 on 11, the first boundary leaves 8 points and an excess of 6) are
+    /// therefore a measurement of a *five*-point walk with five spare seats, and neither number transfers.
+    /// Every deployment this project documents — `docs/testnet.md`'s seven founding operators — is the
+    /// configuration nobody has measured.
+    ///
+    /// ## Pre-registered, so the run can refute
+    ///
+    /// * `N = 7` points, `LINE_SIZE = 3`, viability floor `points_serving_every_line(3) = 6`. The mixnet
+    ///   needs **6 of 7** points occupied and consensus **5 of 7** (`CellParams::FANO` quorum over the
+    ///   point count), so on this plane a single doubly-held point is one step from switching the mixnet
+    ///   off and two from stalling the chain. There is no margin to average over.
+    /// * `n = 7` (`n/N = 1.0`) and `n = 10` — the second **read from
+    ///   `fanos_geometry::members_for_a_covered_plane`** rather than chosen, since a load factor picked by
+    ///   hand is exactly the kind of constant this project refuses. At that load three nodes cannot be
+    ///   seated at all — there are seven points — so `unbound ≈ 3` is arithmetic, not a fault, and the
+    ///   number to read is `excess` among the **bound**.
+    /// * **The prediction**: genesis packs (sequential arrival resolves against a settled state), and every
+    ///   boundary unpacks, as it does at `q = 4`. If instead `excess` returns to `0` within an epoch, the
+    ///   `PG(2,4)` result does not generalise downward and the shipped default is not affected by it.
+    ///
+    /// ## The discriminating observable, and why it is this one
+    ///
+    /// `Health::verified_claims` is the size of the driver's claim book — *the input coordinate resolution
+    /// runs on*. `fanos_vrf::settle_index` is **one-shot and order-independent given the contending
+    /// claims**: a claim to `p` is `(probe_index_of(their_output, p), their_output)`, a function of the
+    /// peer's VRF output alone, so with complete knowledge every node computes the same assignment with no
+    /// negotiation and no iteration. The book is cleared at every boundary by design (a claim proves a
+    /// placement for one epoch only) and refills **only from peers this node has actually met**.
+    ///
+    /// So the two candidate explanations separate cleanly, and nothing else in the seat table can tell them
+    /// apart:
+    ///
+    /// | if after a turn | then |
+    /// |---|---|
+    /// | `claims → n−1` quickly **and** `excess > 0` | the rule is wrong, or the walk budget is too short |
+    /// | `claims` stays low **and** `excess > 0` | the rule is starved of its input — a propagation defect |
+    ///
+    /// Sampled every `10 s` against a `60 s` period, so six samples fall inside each epoch: "did it clear
+    /// before the next turn" is a question about the shape within one epoch and a per-epoch reading cannot
+    /// answer it.
+    ///
+    /// ## Result, 2026-08-18 — 36 samples per load, `Link::ideal()`
+    ///
+    /// | | `n = 7` (`n/N = 1.00`) | `n = 10` (`n/N = 1.43`) |
+    /// |---|---|---|
+    /// | excess | mean **1.7**, zero in 5 of 36 | mean **4.2**, zero in **0** of 36 |
+    /// | occupied points | mean 5.1 of 7 | mean 5.5 of 7 |
+    /// | servable lines | mean 6.5 of 7 | mean 6.2 of 7 |
+    /// | **below the viability floor** | **50 % of samples** | **53 %** |
+    /// | claim book | mean 3.0 of 6 peers | mean 6.0 of 9 |
+    ///
+    /// **The shipped default plane sits below its own line-viability floor about half the time**, and
+    /// sizing the cell up does not fix it — `n = 10` is no better and never once reaches `excess = 0`.
+    ///
+    /// **Genesis does not pack here.** The very first sample at `n = 7` reads 5 points and `excess = 2`,
+    /// where `PG(2,4)` reaches a perfect packing before its first boundary. So the `PG(2,4)` result does not
+    /// transfer downward — it is *optimistic* about the plane a deployment actually runs — and the two
+    /// planes differ in the direction that matters: a Fano line is three points, so a node's whole probe
+    /// walk is three long and `probe_bound` gives it three rounds before `commit_seat` freezes it.
+    ///
+    /// **The discriminator answered the question it was built for — and then refuted the answer.** The claim
+    /// book never reached `n − 1` at either load: half the contenders at `n = 7`, two thirds at `n = 10`,
+    /// 14 % of readings at *zero*. That is the starved-input arm of the table above, so three
+    /// one-directional claim losses were found and fixed (a node whose new point equalled its old one never
+    /// re-announced; a claim from a peer ahead of this node's beacon was verified-as-unjudgeable and
+    /// dropped; the claim book adopted an epoch *after* the beacon window did).
+    ///
+    /// **The book filled — samples of 8–9 of 9 — and every node still read `probe_index = 0` while ten of
+    /// them shared four points.** Knowledge was never the binding constraint, and making it complete made
+    /// the plane *worse*, which is only possible if knowledge itself was ending something. It was: this loop
+    /// wakes on **every recorded claim** and spent a round on each, while `may_walk`'s bound is derived for
+    /// **steps** along the walk. A node with nine peers burned its whole budget on the first three claims to
+    /// arrive and committed its seat before it had a reason to move.
+    ///
+    /// ## Three runs, same fixture
+    ///
+    /// | | `n = 7` below floor | walked | `n = 10` below floor | walked | `n = 10` points |
+    /// |---|---|---|---|---|---|
+    /// | as shipped | 50 % | 17/252 | 53 % | 6/360 | 5.5 |
+    /// | + the three claim fixes | 100 % | 24/252 | 67 % | 1/360 | 5.2 |
+    /// | + the budget spent on steps | 86 % | 10/252 | **19 %** | **49/360** | **6.1** |
+    ///
+    /// **At the sized load the change is decisive**: below-floor from 53 % to 19 %, occupancy from 5.5 to
+    /// 6.1 of 7 points, and eight times as many nodes actually walking. `n = 10` is
+    /// `members_for_a_covered_plane(3)`, i.e. the load a deployment is supposed to run.
+    ///
+    /// **At `n = N` exactly it is still broken, and that is geometry rather than a bug left over.** Seven
+    /// nodes on seven points have **no spare seat**: a node that walks off its preferred point takes one
+    /// another node prefers, so resolution cascades with nowhere to end. `members_for_a_covered_plane`'s own
+    /// table says the same thing from the other side — at `M = N` even the idealised walk clears the
+    /// viability floor only 87 % of the time. **A seven-operator testnet is under-sized, and this is the
+    /// measurement that says so.**
+    ///
+    /// What is still open at 19 %: claims reach only direct connection partners, and in a projective plane
+    /// every two lines meet, so every node contends for exactly one point of every other node's line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary() {
+        use std::collections::{BTreeSet, HashSet};
+        use fanos_field::F2;
+        let roles = fanos_node::RoleSet {
+            relay: true,
+            rendezvous: true,
+            ..fanos_node::RoleSet::default()
+        };
+        let n_points = fanos_geometry::Plane::<F2>::N as usize;
+        let floor = fanos_geometry::points_serving_every_line(
+            fanos_geometry::Plane::<F2>::LINE_SIZE as usize,
+        );
+        // The same period the `PG(2,4)` measurement justified: above `ROSTER_REFRESH * STABLE_BEFORE_BACKOFF`
+        // so the machinery that responds to a turn has room, and short enough that turns actually happen.
+        let period = Duration::from_secs(60);
+        println!("PG(2,2): {n_points} points, line size {}, viability floor {floor}", fanos_geometry::Plane::<F2>::LINE_SIZE);
+        // Read, not chosen: the sizing constant the geometry crate derives for this plane.
+        let sized = fanos_geometry::members_for_a_covered_plane(
+            fanos_geometry::Plane::<F2>::LINE_SIZE as usize,
+        );
+        for count in [n_points, sized] {
+            let fleet = match NodeFleet::spawn_as_drawn_with_epoch::<F2>(count, Link::ideal(), roles, period).await {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("n={count}: fleet did not start — {e:?}");
+                    continue;
+                }
+            };
+            println!(
+                "\n=== PG(2,2): {n_points} points, n={count} (n/N={:.2}), epoch period {period:?}",
+                count as f64 / n_points as f64
+            );
+            for tick in 0..36u32 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let health: Vec<_> = fleet.nodes().iter().map(fanos_node::Node::health).collect();
+                let bound: Vec<fanos_geometry::Triple> =
+                    health.iter().filter(|h| h.probe_index.is_some()).map(|h| h.address).collect();
+                let points: HashSet<fanos_geometry::Triple> = bound.iter().copied().collect();
+                let epochs: BTreeSet<u64> =
+                    fleet.nodes().iter().map(|n| n.assignment().epoch.get()).collect();
+                let beacons: BTreeSet<u64> =
+                    fleet.nodes().iter().filter_map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
+                // The discriminator. `None` means the node has no self-certifying identity and so no book at
+                // all, which is a different statement from an empty one and is printed as such.
+                let claims: Vec<i64> =
+                    health.iter().map(|h| h.verified_claims.map_or(-1, |c| c as i64)).collect();
+                let indices: Vec<i64> =
+                    health.iter().map(|h| h.probe_index.map_or(-1, i64::from)).collect();
+                let servable = fanos_geometry::servable_lines::<F2>(|p| points.contains(&p.coords()));
+                println!(
+                    "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}/{n_points}  {}  \
+                     epochs={epochs:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}",
+                    tick * 10,
+                    bound.len(),
+                    points.len(),
+                    bound.len() - points.len(),
+                    servable,
+                    if points.len() >= floor { "AT/ABOVE FLOOR" } else { "BELOW FLOOR" },
+                );
+            }
+            fleet.shutdown().await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_roster_convergence_with_collisions_allowed() {

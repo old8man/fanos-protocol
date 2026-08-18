@@ -727,6 +727,34 @@ fn file_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple, conn: Con
 /// Shared reflexive-address discovery state — peers' observations of this node's public address (#119).
 type Reflexive = Arc<Mutex<ReflexiveAddr>>;
 
+/// A HELLO this node received, could not judge, and kept until it can.
+///
+/// **The frame is not the problem; the beacon is.** A peer that adopts an epoch before this node does
+/// announces a coordinate proved against a beacon this node has no record of, and `verify` answers
+/// `EpochUnknown` — *"this node admitting it cannot judge"*, which is deliberately not a forgery. What
+/// happened next was a silent, one-directional loss: the frame was counted and dropped, and nothing ever
+/// asked for it again. So the peer that moves **first** at every boundary is invisible to every peer that
+/// moves later, and the claim book — the input coordinate resolution runs on — is missing exactly the
+/// contenders that are already committed.
+///
+/// Keeping it costs one entry per connection and closes that with no new frame, no request, and no
+/// cooperation from the peer: the retry is a map lookup until the beacon arrives (`verify` answers
+/// `EpochUnknown` *before* any signature check), and one real verification once it has.
+struct PendingHello {
+    /// The peer's certificate, as authenticated by the connection the frame arrived on. Held rather than
+    /// re-read so the retry judges the same pair the first attempt did.
+    cert: Vec<u8>,
+    /// The HELLO frame verbatim.
+    hello: Vec<u8>,
+}
+
+/// Per-connection [`PendingHello`]s, keyed by `Connection::stable_id`.
+///
+/// Bounded by the number of live connections, which `MAX_INBOUND_CONNECTIONS` already caps — the same
+/// derivation `unjudged` uses, and for the same reason: this holds nothing a connection does not already
+/// entitle a peer to. One entry per connection, since a later HELLO supersedes an earlier one.
+type PendingHellos = Arc<Mutex<HashMap<usize, PendingHello>>>;
+
 /// This node's record of the public source address each peer was observed dialing in from — the raw
 /// material a **hub** needs to broker a hole-punch (#119). A node that accepts a connection sees the
 /// dialer's NAT-mapped public endpoint (`conn.remote_address()`); remembering it, keyed by the dialer's
@@ -831,6 +859,8 @@ struct Transport {
     /// Coordinates a dialed-but-unjudgeable connection is already being held open for (#235) — the dial
     /// side's ceiling, deliberately the same shape as `punching` above. See [`spawn_restricted`].
     unjudged: Arc<Mutex<BTreeMap<Triple, Connection>>>,
+    /// HELLOs held for a beacon this node did not have yet — see [`PendingHello`].
+    pending_hello: PendingHellos,
     /// The plane's probe walk, carried as a value so the send path can RANK a peer it verified (#249).
     ///
     /// `None` is not a disabled check but an **absent mechanism** — the distinction `fanos_node::bound`
@@ -2311,6 +2341,9 @@ impl Reseater {
     /// that knows about the rival, which is the input `settle_index` was missing.
     fn apply<F: Field>(&self, at: &mut Placement, index: u16, claim: &CoordinateClaim) -> bool {
         let point = fanos_vrf::probe_point::<F>(&at.output, index).coords();
+        // Whether this call moves the seat at all. It decides who announces the new HELLO, and the two
+        // cases are covered by different mechanisms — see the flood at the end of this function.
+        let unchanged = point == at.coord;
         // Bound with this epoch's rank AND the probed index: the arbitration order is the claim *pair*, so a table
         // recording only the rank would disagree with what every node's own `settle_index` concludes
         // (`Directory::supersedes`).
@@ -2359,7 +2392,13 @@ impl Reseater {
                 return true;
             }
         }
-        if !self.client.command(Command::Reseat { coord: point }) {
+        // **Not when the seat did not move**, and that is a tripwire's finding rather than an
+        // optimisation: `a_beacon_that_does_not_move_the_coordinate_is_a_noop` asserts no `Reseat` reaches
+        // the engine in that case, and the engine agrees — `on_reseat` returns early with *"already seated
+        // here"*. The other three things this function does are **not** no-ops there (the directory's
+        // stored rank, the HELLO, and announcing it), which is what the removed `continue` in
+        // `reshuffle_loop` used to skip along with this one.
+        if !unchanged && !self.client.command(Command::Reseat { coord: point }) {
             return false;
         }
         if point != at.coord {
@@ -2368,8 +2407,31 @@ impl Reseater {
             // rightful occupant unroutable here until it announced again (#241).
             let _ = self.directory.remove_if(at.coord, self.local_addr);
         }
+        let bytes = hello_bytes::<F>(at.epoch, point, claim, self.capabilities);
         if let Ok(mut h) = self.hello.write() {
-            *h = Arc::new(hello_bytes::<F>(at.epoch, point, claim, self.capabilities));
+            *h = Arc::new(bytes.clone());
+        }
+        // **A seat that did not move still has a new HELLO, and nothing else would carry it.**
+        //
+        // `announce_moves` pushes this node's HELLO to every live connection when the engine reports
+        // `Reseated` — and `on_reseat` returns early with *"already seated here"* when the coordinate is
+        // unchanged, so it reports nothing. But the coordinate is the only thing that did not change: the
+        // epoch, the VRF proof and the whole claim are this epoch's, and a peer holding the previous
+        // epoch's HELLO for this node has a claim its own book must refuse (a claim proves a placement for
+        // one epoch only, `crate::claims`).
+        //
+        // The consequence was one-directional and silent. On `PG(2,2)` a node re-draws onto the point it
+        // already holds with probability `1/N` — better than one node per epoch on a seven-point plane —
+        // and that node became an **invisible contender**: nobody could learn the claim it holds, so peers
+        // walking their own line read its point as uncontested and settled on top of it. Measured on the
+        // shipped default before this existed: 7 nodes on 4 points, half the samples below the plane's own
+        // line-viability floor (`fanos_sim::fabric`'s
+        // `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary`).
+        //
+        // Only in this branch, so a move is not announced twice: `Reseated` covers the other case, and it
+        // covers movers this type never sees (recovery, a direct `Command::Reseat`).
+        if unchanged {
+            let _ = self.dials.send(SendRequest::Flood { frame: bytes });
         }
         at.coord = point;
         at.index = index;
@@ -2388,11 +2450,17 @@ impl Reseater {
 /// coordinate its beacon partials are addressed to. With this floor, back to **0 of 31**.
 ///
 /// **The bound is the geometry's, not a chosen number.** `fanos_vrf::probe_bound::<F>()` is `q + 1`, the
-/// whole length of a probe walk, so after that many rounds every point of this node's line has been
+/// whole length of a probe walk, so after that many **steps** every point of this node's line has been
 /// considered and staying settleable can place it nowhere new. `settle_index` is monotone in information,
 /// so the count cannot be undone by a peer arriving late.
-const fn may_walk(rounds: u16, bound: u16) -> bool {
-    rounds <= bound
+///
+/// **Steps, and the word is load-bearing.** The caller used to increment on every *wake* — and it wakes on
+/// every recorded peer claim, not on every move — so a node with nine peers spent its whole budget on the
+/// first three claims to arrive and committed its seat before it had a reason to move. Measured on
+/// `PG(2,2)` once the claim book was filled: every node read `probe_index = 0` with ten of them on four
+/// points. A bound derived for one quantity and spent on another is not a bound at all.
+const fn may_walk(steps: u16, bound: u16) -> bool {
+    steps <= bound
 }
 
 /// The per-epoch coordinate reshuffle **and live collision-resolution** driver (spec §L3 "epoch reshuffle", §3.2;
@@ -2465,6 +2533,13 @@ async fn reshuffle_loop<F: Field>(
                         .rotate(epoch);
                 }
                 let seed = BeaconSeed::new(seed);
+                // **The book adopts before the window, and the order is an invariant rather than a
+                // preference.** `verify` selects a beacon from the window and then records the claim only
+                // when its epoch equals the *book's* — so a window that ran ahead of the book gave a span in
+                // which a peer's claim verified and was silently not recorded, with nothing to retry it.
+                // Adopting here makes "the window can judge epoch `e`" imply "the book holds `e`", which is
+                // what lets `rejudge_pending` treat a decided verdict as a recorded claim.
+                book.adopt(epoch);
                 let (_, proof, rank) = verifiable_coordinate_ranked::<F>(&creds, epoch, &seed);
                 // Publish the beacon BEFORE the HELLO: a connection accepted between the two then verifies a peer
                 // against the newer beacon while announcing the older coordinate — harmless (the peer re-syncs on an
@@ -2495,16 +2570,20 @@ async fn reshuffle_loop<F: Field>(
                 at.settling.store(true, Ordering::Release);
                 at.rounds = 0;
                 at.walk_after = None;
-                // The book's claims belong to the retired epoch; clearing it is what stops a peer's past placement from
-                // justifying a displacement now. Settling immediately afterwards therefore lands at index 0 and moves
-                // up again as this epoch's peers are met.
-                book.adopt(epoch);
+                // The book's claims belong to the retired epoch; clearing it (above, before the window) is
+                // what stops a peer's past placement from justifying a displacement now. Settling
+                // immediately afterwards therefore lands at index 0 and moves up again as this epoch's
+                // peers are met — which is why a claim held back by a beacon this node did not have yet is
+                // worth retrying rather than dropping.
                 let Some((index, claim)) = claims::settle::<F>(&book, &rank, proof) else {
                     continue; // every point of this epoch's line is better claimed — announce nothing
                 };
-                if fanos_vrf::probe_point::<F>(&rank, index).coords() == at.coord && index == at.index {
-                    continue; // this epoch's VRF landed on the same point — nothing to move
-                }
+                // **No early exit for "the point did not change".** It used to `continue` here, and what it
+                // skipped was not a move — there is none — but the three things `apply` does besides moving:
+                // it refreshes the directory's binding with *this* epoch's rank and index, it rewrites this
+                // node's HELLO, and it announces the rewrite. Skipping them left the node advertising a
+                // retired proof at a point its own table still described with the previous epoch's claim,
+                // and left every peer unable to learn the claim it holds now.
                 if !seat.apply::<F>(&mut at, index, &claim) {
                     break;
                 }
@@ -2527,17 +2606,28 @@ async fn reshuffle_loop<F: Field>(
                 if at.walk_after.is_some_and(|t| tokio::time::Instant::now() < t) {
                     continue;
                 }
-                at.rounds = at.rounds.saturating_add(1);
-                if !may_walk(at.rounds, fanos_vrf::probe_bound::<F>()) {
-                    seat.client.commit_seat();
-                    continue;
-                }
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
                 let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
                     continue; // beaten on every point of the line; hold the current announcement rather than retract it
                 };
                 if index == at.index {
-                    continue; // still the right seat
+                    continue; // still the right seat — and no round is spent, because no step was taken
+                }
+                // **The budget is spent on STEPS, and it used to be spent on WAKES.** `may_walk`'s own
+                // derivation is about the walk — *"`probe_bound` is `q + 1`, the whole length of a probe
+                // walk, so after that many rounds every point of this node's line has been considered"* —
+                // and this arm wakes on **every recorded claim**, not on every step. A node with nine peers
+                // is woken nine times as their claims land, and it used to burn its whole budget on the
+                // first three of them, commit its seat, and never move again.
+                //
+                // Latent while the claim book was starved and reached by the fixes that filled it: measured
+                // on `PG(2,2)` with the book at 8–9 of 9 peers, **every node still read `probe_index = 0`**
+                // while ten of them shared four points. Knowledge was complete and the walk was already over
+                // — the wakes that delivered the knowledge were what ended it.
+                at.rounds = at.rounds.saturating_add(1);
+                if !may_walk(at.rounds, fanos_vrf::probe_bound::<F>()) {
+                    seat.client.commit_seat();
+                    continue;
                 }
                 if !seat.apply::<F>(&mut at, index, &claim) {
                     break;
@@ -2927,6 +3017,7 @@ fn spawn_inner(
         send_drops: Arc::clone(&send_drops),
         punching: Arc::new(Mutex::new(BTreeSet::new())),
         unjudged: Arc::new(Mutex::new(BTreeMap::new())),
+        pending_hello: Arc::new(Mutex::new(HashMap::new())),
         probe_index,
     };
     supervise(DriverActor::AnnounceMoves, &stations, &stopping, tokio::spawn(announce_moves(transport.clone(), events_tx.subscribe())));
@@ -4245,6 +4336,82 @@ async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notificati
     }
 }
 
+/// Move everything this node holds for `from` onto `moved` — the peer moved and proved it. Returns `moved`,
+/// so a caller re-attributes its own view in the same expression.
+///
+/// Extracted so the two paths that can learn of a move share it exactly: a `HELLO` that arrived judgeable,
+/// and one that did not and was re-judged once this node's beacon caught up ([`rejudge_pending`]). Two
+/// copies of this would be two answers to "where is that peer now", and the surplus-connection rule below
+/// is precisely the kind of detail one copy would lose.
+fn apply_move(t: &Transport, conn: &Connection, from: Triple, moved: Triple) -> Triple {
+    tracing::debug!(?from, ?moved, "peer moved; re-keying its live connection");
+    if let Ok(mut map) = t.conns.lock() {
+        // **Move every connection this peer holds here, not just the one that carried the
+        // announcement** (#271). The rule the old comment stated is right and unchanged —
+        // a peer takes ITS connections along, and anything else under the vacated point
+        // belongs to whoever still holds it — but the discriminator had to change. When
+        // the map held one connection per coordinate, "this connection only" *was* all of
+        // them. #265 made the value a list, so the peer's surplus stayed behind: measured
+        // at 6 left under the old point against 1 moved, with `keep_alive_interval = 10 s`
+        // pinging every one of them and #241's directory retraction guaranteeing nothing
+        // would ever address that point again to prune them.
+        //
+        // Identity is what separates "this peer's surplus" from "the next occupant's",
+        // and it is the same answer `Distrust::seat` already gives one field over: the
+        // verdict is keyed on the identity precisely so it survives a move. Read from the
+        // certificate each connection authenticated with, so nothing has to be stored.
+        let mine = peer_cert_der(conn).map(|c| identity_of(&c));
+        let mut moving = Vec::new();
+        if let Some(old) = map.get_mut(&from) {
+            old.retain(|c| {
+                // `None` for our own identity means the cert is unreadable, which is not
+                // a licence to take everything: fall back to the single connection the
+                // announcement arrived on, which is what this did before.
+                let same = mine.is_some()
+                    && peer_cert_der(c).map(|d| identity_of(&d)) == mine;
+                if same || c.stable_id() == conn.stable_id() {
+                    moving.push(c.clone());
+                    return false;
+                }
+                true
+            });
+            if old.is_empty() {
+                map.remove(&from);
+            }
+        }
+        // **The announcing connection is filed even when the old key held nothing.**
+        // The previous code did this unconditionally and my first version did not, so a
+        // move whose old coordinate had no entry — the peer was never filed there, or was
+        // already re-keyed — silently filed nothing at all. The station caught it on the
+        // first run: `#0` appeared repeatedly, and a move that carries zero connections
+        // is a peer this node just stopped being able to reach.
+        if !moving.iter().any(|c| c.stable_id() == conn.stable_id()) {
+            moving.push(conn.clone());
+        }
+        let carried = moving.len();
+        for c in moving {
+            file_conn(&mut map, moved, c);
+        }
+        // Counted because the surplus is exactly what used to be lost, and a zero here
+        // after a move would mean the old point held nothing — a different world from
+        // "held six and moved six".
+        t.record_station(
+            Station::ConnMovedWithPeer,
+            Some(moved),
+            Some(carried as u64),
+        );
+    }
+    if let Ok(mut map) = t.peer_addrs.lock()
+        && let Some(addr) = map.remove(&from)
+    {
+        map.insert(moved, addr);
+    }
+    // Tell the layers above: the cell's coordinate composition changed without its peer *count*
+    // changing, so nothing else would prompt a re-derivation until the mover's own backoff expired.
+    let _ = t.events_tx.send(Notification::PeerMoved { old: from, new: moved });
+    moved
+}
+
 /// The peer's **new** coordinate from a mid-connection `HELLO`, if it verifies and actually differs from `known`.
 ///
 /// `None` when there is no self-certifying identity to check against (a build that never verified coordinates cannot start
@@ -4265,8 +4432,62 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
         }
         HelloVerdict::EpochUnknown => {
             t.record_station(Station::HelloEpochUnknown, Some(known), None);
+            // **Kept, not dropped** — see [`PendingHello`]. The peer is ahead of this node's beacon window,
+            // which is the ordinary state for whoever adopts an epoch first, and the frame becomes judgeable
+            // the moment this node catches up. One entry per connection: a newer announcement supersedes an
+            // older one, since only the newest can still be true.
+            if let Ok(mut held) = t.pending_hello.lock() {
+                held.insert(conn.stable_id(), PendingHello { cert, hello: frame.to_vec() });
+            }
             None
         }
+    }
+}
+
+/// Re-judge the HELLO this connection left pending, now that a beacon may have arrived.
+///
+/// Returns the peer's new coordinate when the retry finally verifies **and** the peer moved, so the caller
+/// re-keys exactly as it does for a HELLO that arrived judgeable. Cheap while it cannot succeed: `verify`
+/// answers `EpochUnknown` from a beacon-window lookup, before any signature or VRF check, so this costs a
+/// map lookup per frame until the epoch is known and one real verification when it is.
+///
+/// The entry is removed on any *decided* verdict — verified, or a forgery — and kept only while the answer
+/// is still "cannot judge". A connection that closes takes its entry with it via [`forget_pending`].
+fn rejudge_pending(t: &Transport, conn: &Connection, known: Triple) -> Option<Triple> {
+    let (cert, hello) = t
+        .pending_hello
+        .lock()
+        .ok()?
+        .get(&conn.stable_id())
+        .map(|p| (p.cert.clone(), p.hello.clone()))?;
+    let id = t.identity.as_ref()?;
+    let verdict = (id.verify)(&cert, &hello);
+    if matches!(verdict, HelloVerdict::EpochUnknown) {
+        return None; // still ahead of us — keep it, and pay nothing but the lookup that got here
+    }
+    // Decided either way now, so the entry has done its job: a verified claim reached the book inside
+    // `verify`, and a forgery is not going to become true later.
+    if let Ok(mut map) = t.pending_hello.lock() {
+        map.remove(&conn.stable_id());
+    }
+    let HelloVerdict::Ok(result) = verdict else {
+        t.record_station(Station::HelloProofRejected, Some(known), None);
+        return None;
+    };
+    let HelloResult::Established { coord, .. } = *result else {
+        return None; // negotiated incompatible — nothing to re-key, and not a forgery either
+    };
+    t.record_station(Station::HelloRejudged, Some(known), None);
+    // Against the caller's **current** view, not the one recorded when the frame arrived: this connection
+    // may have been re-keyed since, and comparing with a stale label would re-key it to where it already is.
+    (coord != known).then_some(coord)
+}
+
+/// Drop a closed connection's pending HELLO, so the store is bounded by the *live* connections rather than
+/// by every one this node has ever accepted.
+fn forget_pending(t: &Transport, conn: &Connection) {
+    if let Ok(mut map) = t.pending_hello.lock() {
+        map.remove(&conn.stable_id());
     }
 }
 
@@ -4698,6 +4919,15 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
             t.record_station(Station::WireUnshaped, Some(from), None);
             continue;
         };
+        // **Retry whatever this connection left pending**, before anything is attributed to `from` — the
+        // peer may have announced a move this node could not judge at the time, and `from` would then be a
+        // coordinate it has already left. Driven by the connection's own traffic rather than by a
+        // notification, because that is the one signal that cannot race the epoch adoption it depends on;
+        // and while it cannot yet succeed it costs a map lookup, since `verify` answers `EpochUnknown` from
+        // the beacon window before any signature check. See [`PendingHello`].
+        if let Some(moved) = rejudge_pending(&t, &conn, from) {
+            from = apply_move(&t, &conn, from, moved);
+        }
         // Intercept transport-level signalling before the engine sees it — reflexive discovery and NAT
         // hole-punch brokering (#119) are the driver's concern, not overlay traffic. Everything is
         // attributed to `from`, the peer's cryptographically-proven coordinate.
@@ -4718,72 +4948,7 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
                 // connection *is* the reachability, and the peer that accepted it may hold no listen address for us.
                 Some(FrameType::Hello) => {
                     if let Some(moved) = verified_move(&t, &conn, &frame, from) {
-                        tracing::debug!(?from, ?moved, "peer moved; re-keying its live connection");
-                        if let Ok(mut map) = t.conns.lock() {
-                            // **Move every connection this peer holds here, not just the one that carried the
-                            // announcement** (#271). The rule the old comment stated is right and unchanged —
-                            // a peer takes ITS connections along, and anything else under the vacated point
-                            // belongs to whoever still holds it — but the discriminator had to change. When
-                            // the map held one connection per coordinate, "this connection only" *was* all of
-                            // them. #265 made the value a list, so the peer's surplus stayed behind: measured
-                            // at 6 left under the old point against 1 moved, with `keep_alive_interval = 10 s`
-                            // pinging every one of them and #241's directory retraction guaranteeing nothing
-                            // would ever address that point again to prune them.
-                            //
-                            // Identity is what separates "this peer's surplus" from "the next occupant's",
-                            // and it is the same answer `Distrust::seat` already gives one field over: the
-                            // verdict is keyed on the identity precisely so it survives a move. Read from the
-                            // certificate each connection authenticated with, so nothing has to be stored.
-                            let mine = peer_cert_der(&conn).map(|c| identity_of(&c));
-                            let mut moving = Vec::new();
-                            if let Some(old) = map.get_mut(&from) {
-                                old.retain(|c| {
-                                    // `None` for our own identity means the cert is unreadable, which is not
-                                    // a licence to take everything: fall back to the single connection the
-                                    // announcement arrived on, which is what this did before.
-                                    let same = mine.is_some()
-                                        && peer_cert_der(c).map(|d| identity_of(&d)) == mine;
-                                    if same || c.stable_id() == conn.stable_id() {
-                                        moving.push(c.clone());
-                                        return false;
-                                    }
-                                    true
-                                });
-                                if old.is_empty() {
-                                    map.remove(&from);
-                                }
-                            }
-                            // **The announcing connection is filed even when the old key held nothing.**
-                            // The previous code did this unconditionally and my first version did not, so a
-                            // move whose old coordinate had no entry — the peer was never filed there, or was
-                            // already re-keyed — silently filed nothing at all. The station caught it on the
-                            // first run: `#0` appeared repeatedly, and a move that carries zero connections
-                            // is a peer this node just stopped being able to reach.
-                            if !moving.iter().any(|c| c.stable_id() == conn.stable_id()) {
-                                moving.push(conn.clone());
-                            }
-                            let carried = moving.len();
-                            for c in moving {
-                                file_conn(&mut map, moved, c);
-                            }
-                            // Counted because the surplus is exactly what used to be lost, and a zero here
-                            // after a move would mean the old point held nothing — a different world from
-                            // "held six and moved six".
-                            t.record_station(
-                                Station::ConnMovedWithPeer,
-                                Some(moved),
-                                Some(carried as u64),
-                            );
-                        }
-                        if let Ok(mut map) = t.peer_addrs.lock()
-                            && let Some(addr) = map.remove(&from)
-                        {
-                            map.insert(moved, addr);
-                        }
-                        // Tell the layers above: the cell's coordinate composition changed without its peer *count*
-                        // changing, so nothing else would prompt a re-derivation until the mover's own backoff expired.
-                        let _ = t.events_tx.send(Notification::PeerMoved { old: from, new: moved });
-                        from = moved;
+                        from = apply_move(&t, &conn, from, moved);
                     }
                     continue;
                 }
@@ -4832,10 +4997,12 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
         }
     }
     // The connection ended: drop this peer's reflexive vote so a departed observer stops propping up a
-    // possibly-stale address.
+    // possibly-stale address, and anything it left pending with it — see [`PendingHello`] for why that
+    // store must be bounded by the LIVE connections rather than by every one ever accepted.
     if let Ok(mut r) = t.reflexive.lock() {
         r.forget(from);
     }
+    forget_pending(&t, &conn);
 }
 
 /// Broker a hole-punch (#119). `requester` (reached on `req_conn`) asked us — a hub both parties have a
@@ -5869,6 +6036,7 @@ mod tests {
             genesis: BeaconSeed::GENESIS,
             stopping: Arc::new(AtomicBool::new(false)),
         };
+        let (dials_tx, mut dials_rx) = mpsc::unbounded_channel();
         tokio::spawn(reshuffle_loop::<F2>(
             creds,
             Placement {
@@ -5882,9 +6050,10 @@ mod tests {
             rounds: 0,
             },
             Reseater {
-                // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
-                // is what these cases want — they assert the directory outcome, not the transport's reaction.
-                dials: mpsc::unbounded_channel().0,
+                // **The receiver is kept here**, unlike the neighbouring case: this one asserts what the
+                // transport was ASKED to do, because "the coordinate did not move" and "nothing happened" are
+                // different statements, and conflating them is what this test now exists to prevent.
+                dials: dials_tx,
                 capabilities: Capabilities::CORE,
                 local_addr,
                 directory,
@@ -5910,6 +6079,18 @@ mod tests {
         assert!(
             quiet.is_err(),
             "no re-seat command when the coordinate does not move"
+        );
+
+        // **And the half that used to be skipped along with it.** A beacon that leaves the coordinate alone
+        // still changes the epoch, the proof and the whole claim, so this node's HELLO is new and its peers
+        // cannot learn the claim it holds now unless it says so. `announce_moves` cannot carry that one —
+        // it fires on `Reseated`, and the assertion above is precisely that no reseat happens — so `apply`
+        // floods it itself. Without this the node is an **invisible contender** for a whole epoch, which on
+        // `PG(2,2)` is one node in seven, every epoch.
+        let announced = dials_rx.try_recv();
+        assert!(
+            matches!(announced, Ok(SendRequest::Flood { .. })),
+            "a beacon that does not move the coordinate must still announce the new HELLO"
         );
     }
 

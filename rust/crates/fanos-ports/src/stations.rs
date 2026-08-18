@@ -447,6 +447,17 @@ pub enum Station {
     /// peer's claim lands here and nothing else moves at all.
     HelloEpochUnknown,
 
+    /// A HELLO this node could not judge when it arrived **verified later**, once the beacon it was proved
+    /// against reached this node.
+    ///
+    /// The claim it carries is the one coordinate resolution most needs and was least likely to have: at
+    /// every epoch boundary the peer that adopts the new beacon *first* announces against a beacon its
+    /// peers do not hold yet, and before the frame was kept, that announcement was counted at
+    /// [`HelloEpochUnknown`](Self::HelloEpochUnknown) and thrown away. So this counts a claim recovered
+    /// rather than an error: a run where it is zero while `hello.epoch_unknown` is not means the retry is
+    /// not reaching the frames, and a run where both are high is a cell whose beacon spreads slowly.
+    HelloRejudged,
+
     /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
     /// (#235) — the count of joins currently in progress.
     ///
@@ -1247,6 +1258,7 @@ impl Station {
         Self::EpochAgreeSuperseded,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
+        Self::HelloRejudged,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
@@ -1324,6 +1336,7 @@ impl Station {
             Self::EpochAgreeSuperseded => "epoch.agree_superseded",
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
+            Self::HelloRejudged => "hello.rejudged",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
@@ -1482,6 +1495,7 @@ impl Station {
             | Self::EpochAgreeSuperseded
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
+            | Self::HelloRejudged
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed
