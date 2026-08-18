@@ -1303,8 +1303,15 @@ impl<F: Field> OverlayNode<F> {
     /// [`descriptor_message(coord, hier, id)`](descriptor_message) produced by the identity's hybrid
     /// signing key. Under self-certified membership peers verify this signature, so the transport
     /// coordinate is bound to the identity — an attacker cannot re-announce another node's address at
-    /// its own endpoint (§80). The signing secret is never handed to the engine; a deployment signs
-    /// once and installs the result here.
+    /// its own endpoint (§80). The signing secret is never handed to the engine.
+    ///
+    /// **"Signs once" is wrong, and it is why this has no production caller.** The message includes the
+    /// **transport** coordinate, which the per-epoch VRF reshuffle re-draws — so a signature made at
+    /// provisioning is stale at the first boundary and every honest announce fails the binding check from
+    /// then on. A working producer has to re-sign at **every reseat**, which is a runtime path this builder
+    /// cannot be: `Command::Reseat` carries a coordinate and no signature, so nothing can update the two
+    /// together. See `fanos_node::config::OverlayChoices::require_self_certified_membership` for the whole
+    /// state of that switch, including the key a running node does not have.
     #[must_use]
     pub fn with_signed_descriptor(mut self, id: Vec<u8>, sig: Vec<u8>) -> Self {
         self.membership.identity = id;

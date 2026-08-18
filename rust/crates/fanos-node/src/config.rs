@@ -1327,6 +1327,21 @@ pub struct OverlayChoices {
     /// `the_self_certified_check_measured_against_what_a_real_cell_actually_announces` reads 42 learned
     /// membership edges ungated and **0** with the check on — 100 % of honest announcements refused.
     ///
+    /// **And a producer alone would not be enough, which is the part that shapes the fix.** The descriptor
+    /// binds `coord ‖ hier ‖ id`, and `coord` is the **transport** coordinate — the one the per-epoch VRF
+    /// reshuffle re-draws. `with_signed_descriptor`'s own doc says *"a deployment signs once and installs
+    /// the result here"*, and a signature made once is stale at the first boundary: every honest announce
+    /// then fails the binding check for the rest of the cell's life. So the missing piece is not a
+    /// provisioning step, it is a **runtime** one — the node must re-sign at every reseat, and the engine
+    /// has no path to receive that (`with_signed_descriptor` is a builder, and `Command::Reseat` carries a
+    /// coordinate and nothing else).
+    ///
+    /// The key it would sign with does not exist in a running node either: `NodeCredentials` holds the TLS
+    /// certificate and its key, and the descriptor wants the **hybrid** `Ed25519 ‖ ML-DSA-65` identity whose
+    /// public bundle *is* `id`. Deriving it from `key_der` the way `vrf_secret_from_key` derives the VRF
+    /// secret would cost nothing and keep persistence unchanged — the identity file still round-trips the
+    /// whole identity — which is the cheapest route on record, not a built one.
+    ///
     /// So this is not a trade-off awaiting a number; it is a consumer whose producer was never wired, and the
     /// default is off for that reason rather than out of caution. Said here for the same reason
     /// [`require_admission`](Self::require_admission) says it: a switch whose precondition is undocumented is

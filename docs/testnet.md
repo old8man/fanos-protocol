@@ -16,7 +16,7 @@ by name rather than describing a path that doesn't exist.
 
 | | |
 |---|---|
-| **Minimum viable cell** | 7 operators (one Fano plane, `q = 2` — the shipped default) |
+| **Minimum viable cell** | 7 operators fill the plane; **10 is the load that makes its lines work** — see §1, where both are measured |
 | **Governance today** | the epoch beacon is **dealt**: one founder briefly holds the whole secret |
 | **Governance, trust-minimized** | `fanos keygen` drives the Byzantine-robust DKG across the founding set, so no party ever holds the beacon secret — read §7 before using it: the ceremony finalizes on **timers**, which makes its phase deadlines a safety parameter |
 | **Roles a cell should cover** | relay, storage, rendezvous (cheap, offer broadly); exit, service, ingress (opt-in, see §2) |
@@ -43,10 +43,34 @@ want from the cell:
 | serving storage reads after losses | 4 survivors | 3 survivors still serve 28 of the 35 four-loss patterns |
 | a mixnet hop | 3 members of a line | sound at `q = 2` — see the anonymity caveat below |
 
-**Fill all 7.** A cell smaller than 7 is not "a smaller testnet", it is an incomplete Fano plane that never
-reports healthy, and every founding-operator step below assumes 7 people showed up. If fewer than 7 are
-available, wait — there is no smaller valid cell above the coherence floor of 3 (deployment-minima §1,
-Result 4), and 3–6 nodes sit in a regime this platform doesn't consider viable.
+**Fill all 7, and then bring three more.** A cell smaller than 7 is not "a smaller testnet", it is an
+incomplete Fano plane that never reports healthy, and every founding-operator step below assumes at least 7
+people showed up. If fewer than 7 are available, wait — there is no smaller valid cell above the coherence
+floor of 3 (deployment-minima §1, Result 4), and 3–6 nodes sit in a regime this platform doesn't consider
+viable.
+
+**But seven is the plane's size, not the cell's, and running a cell at exactly seven does not work.** Nodes
+*contend* for points: each draws a coordinate from the epoch beacon and walks its own line when a better
+claim holds the point it wanted, so seven nodes do not land on seven distinct points. The load factor that
+makes every line viable is `fanos_geometry::members_for_a_covered_plane`, which is **10** on this plane —
+and measured on a live cell (`fanos-sim`'s
+`measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary`, 36 samples per load across six
+epoch turns, on a build carrying the placement fixes of 2026-08-18 — an older binary is *worse*, not
+better):
+
+| operators | occupied points | samples below the line-viability floor |
+|---|---|---|
+| 7 | 4.8 of 7 | 86 % |
+| **10** | **6.1 of 7** | **19 %** |
+
+Below that floor at least one of the seven lines cannot serve a threshold gather, which is what a mixnet hop
+is — so a seven-operator cell spends most of its life unable to complete an onion hop *somewhere*, silently.
+Three of the ten hold no seat at any given moment; that is not waste, it is what fills the points a
+seven-node draw leaves empty.
+
+**19 % is not zero, and this document will not pretend otherwise.** Placement across an epoch boundary is
+an open defect with a measured history, not a solved problem: see the same measurement's own notes for the
+three claim-propagation losses and the walk-budget defect fixed so far, and for what remains.
 
 **One honesty check before you build on top of this:** `q = 2` is a **test fixture**, not an anonymity
 system. A passive adversary's flow-matching floor on the default plane is **1/3**, because **6** of Fano's
