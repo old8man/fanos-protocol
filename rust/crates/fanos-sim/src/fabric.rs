@@ -2950,16 +2950,68 @@ mod tests {
     /// | + the three claim fixes | 100 % | 24/252 | 67 % | 1/360 | 5.2 |
     /// | + the budget spent on steps | 86 % | 10/252 | **19 %** | **49/360** | **6.1** |
     ///
-    /// **At the sized load the change is decisive**: below-floor from 53 % to 19 %, occupancy from 5.5 to
-    /// 6.1 of 7 points, and eight times as many nodes actually walking. `n = 10` is
-    /// `members_for_a_covered_plane(3)`, i.e. the load a deployment is supposed to run.
+    /// ⛔ **CORRECTION — the outcome column is not reproducible, and the box was not quiet.** A fourth run of
+    /// the **identical** build read `n = 10` at **69 %** below floor against the third run's 19 %, and
+    /// `n = 7` at 67 % against 86 %. The difference between those two runs is not the code: the fourth was
+    /// taken while a `cargo build` and a `cargo test` competed for the same four cores this fixture asks for
+    /// (`worker_threads = 4`). That is this project's own recorded lesson — *measure on a quiet box or not
+    /// at all* — paid for again.
     ///
-    /// **At `n = N` exactly it is still broken, and that is geometry rather than a bug left over.** Seven
-    /// nodes on seven points have **no spare seat**: a node that walks off its preferred point takes one
-    /// another node prefers, so resolution cascades with nowhere to end. `members_for_a_covered_plane`'s own
-    /// table says the same thing from the other side — at `M = N` even the idealised walk clears the
-    /// viability floor only 87 % of the time. **A seven-operator testnet is under-sized, and this is the
-    /// measurement that says so.**
+    /// **What survives the variance is the mechanism, and it survives cleanly.** `walked` — samples in which
+    /// any node sat at a probe index above zero — reads **6 and 1** before the budget fix and **49 and 66**
+    /// after it, across two independent runs each. An order of magnitude, in the same direction, twice. The
+    /// budget fix is justified by *that*, not by the packing column.
+    ///
+    /// **So the honest statement of the outcome is a range, not a number**: on the shipped plane the cell
+    /// spends somewhere between a fifth and all of its time below the line-viability floor, and no single
+    /// run of this fixture separates the arms. Answering it needs repeated runs on an idle machine, which is
+    /// work this measurement has not done.
+    ///
+    /// ## The third layer, and the instrument is what found it
+    ///
+    /// Adding the station line above answered in one run what the seat table could not answer in three.
+    /// At genesis, with claim books **complete** (6 of 6 peers), it read `committed = 7` and
+    /// `DirectorySeatOutranked = 386`: every node had closed its settling window, every node knew a better
+    /// claim held its point, and not one of them was permitted to move. Over a whole run the outranked count
+    /// reached **12 421** at `n = 7` and **21 469** at `n = 10`.
+    ///
+    /// The cause is two facts kept apart. `Client::commit_seat` closes the window on *"I can read my own
+    /// record"*, which proves the cell **can** read this node and says nothing about whether another node is
+    /// standing on its point — and two contenders share one `cap_slot` by construction, so each of them
+    /// transiently reads *itself* there and both commit. After that the established-node rule forbids the
+    /// very move that would resolve the contest. **A commit is now refused while a better claim holds the
+    /// seat**, which costs the rule nothing: a node another node also sits on is one nothing above it can
+    /// have derived anything from — its record is the one being overwritten.
+    ///
+    /// | | `outranked` | `self_connection` | `committed` |
+    /// |---|---|---|---|
+    /// | before, `n = 7` / `n = 10` | 12 421 / 21 469 | 2 075 / 1 030 | 32 / 43 |
+    /// | after | **0 / 0** | 703 / 477 | 26 / 21 |
+    ///
+    /// Zero is categorical, not a shift within the noise: the frozen-and-outranked state is **gone**, and
+    /// self-connections — two nodes each resolving one point to themselves — are halved with it. The
+    /// occupancy column moved 5.3 → 5.6 at `n = 10` and 5.2 → 5.1 at `n = 7`, i.e. inside the variance above,
+    /// and is **not** claimed.
+    ///
+    /// ### How to use this fixture, so the next reader does not pay for it again
+    ///
+    /// 1. **Nothing else may run.** It asks for four worker threads and drives real timers — `HELLO_DEADLINE`,
+    ///    the roster refresh, the epoch period — so a competing `cargo` build does not slow it down evenly,
+    ///    it changes what the cell does.
+    /// 2. **Two runs per arm, minimum**, and report both. One run of this fixture is a sample of one from a
+    ///    distribution wide enough to swallow any change worth making.
+    /// 3. **Read `walked` and the station line first.** They say whether the mechanism under test is running
+    ///    at all — `outranked` says nodes know they lost, `committed` says whether their window closed,
+    ///    `rejudged` says whether the retention path is yielding — and each of those is a count of events
+    ///    rather than a state sampled at an instant, so none of them is at the mercy of *when* the tick fell.
+    ///
+    /// **`n = N` exactly is under-sized, and the argument for that is the derivation rather than this
+    /// fixture.** Seven nodes on seven points have **no spare seat**: a node that walks off its preferred
+    /// point takes one another node prefers, so resolution cascades with nowhere to end.
+    /// `members_for_a_covered_plane`'s own table prices it — at `M = N` even the idealised walk clears the
+    /// viability floor only 87 % of the time, against 99.7 % at `M = 1.5N`. These runs are **consistent**
+    /// with that and do not add to it: at this sample size and this noise, `n = 7` and `n = 10` are not
+    /// separated (67 % against 69 % in the paired run).
     ///
     /// What is still open at 19 %: claims reach only direct connection partners, and in a projective plane
     /// every two lines meet, so every node contends for exactly one point of every other node's line.
@@ -3014,6 +3066,31 @@ mod tests {
                 let indices: Vec<i64> =
                     health.iter().map(|h| h.probe_index.map_or(-1, i64::from)).collect();
                 let servable = fanos_geometry::servable_lines::<F2>(|p| points.contains(&p.coords()));
+                // **The second discriminator, and it separates the two ways a node stops walking.** A node
+                // that has not moved is either uninformed (its book lacks the claim that beats it) or
+                // *forbidden* — `DirectorySeatOutranked` is raised exactly when the winning claim IS in its
+                // own book and the established-node rule refuses the move, and `SeatCommitted` counts the
+                // windows that closed. Without these two the seat table cannot tell "nobody told it" from
+                // "it was told and may not act", which are opposite defects with opposite fixes — and the
+                // first round of fixes here was spent on the wrong one of them.
+                let station = |st: fanos_runtime::ports::stations::Station| -> u64 {
+                    fleet
+                        .nodes()
+                        .iter()
+                        .flat_map(|n| n.client().driver_stations())
+                        .filter(|o| o.station == st)
+                        .map(|o| o.count)
+                        .sum()
+                };
+                println!(
+                    "          committed={} outranked={} taken={} superseded={} self_conn={} rejudged={}",
+                    station(fanos_runtime::ports::stations::Station::SeatCommitted),
+                    station(fanos_runtime::ports::stations::Station::DirectorySeatOutranked),
+                    station(fanos_runtime::ports::stations::Station::DirectoryPointTaken),
+                    station(fanos_runtime::ports::stations::Station::DirectorySeatSuperseded),
+                    station(fanos_runtime::ports::stations::Station::TransportSelfConnection),
+                    station(fanos_runtime::ports::stations::Station::HelloRejudged),
+                );
                 println!(
                     "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}/{n_points}  {}  \
                      epochs={epochs:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}",

@@ -16,7 +16,7 @@ by name rather than describing a path that doesn't exist.
 
 | | |
 |---|---|
-| **Minimum viable cell** | 7 operators fill the plane; **10 is the load that makes its lines work** — see §1, where both are measured |
+| **Minimum viable cell** | 7 operators fill the plane; **10 is the load its lines need** — see §1, where the derivation and what a live cell actually does are both stated |
 | **Governance today** | the epoch beacon is **dealt**: one founder briefly holds the whole secret |
 | **Governance, trust-minimized** | `fanos keygen` drives the Byzantine-robust DKG across the founding set, so no party ever holds the beacon secret — read §7 before using it: the ceremony finalizes on **timers**, which makes its phase deadlines a safety parameter |
 | **Roles a cell should cover** | relay, storage, rendezvous (cheap, offer broadly); exit, service, ingress (opt-in, see §2) |
@@ -53,24 +53,22 @@ viable.
 *contend* for points: each draws a coordinate from the epoch beacon and walks its own line when a better
 claim holds the point it wanted, so seven nodes do not land on seven distinct points. The load factor that
 makes every line viable is `fanos_geometry::members_for_a_covered_plane`, which is **10** on this plane —
-and measured on a live cell (`fanos-sim`'s
-`measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary`, 36 samples per load across six
-epoch turns, on a build carrying the placement fixes of 2026-08-18 — an older binary is *worse*, not
-better):
+— its own table gives **87 %** of draws clearing the viability floor at `M = N` against **99.7 %** at
+`M = 1.5N`, simulated against the real line-confined probe walk. Three of the ten hold no seat at any given
+moment; that is not waste, it is what fills the points a seven-node draw leaves empty.
 
-| operators | occupied points | samples below the line-viability floor |
-|---|---|---|
-| 7 | 4.8 of 7 | 86 % |
-| **10** | **6.1 of 7** | **19 %** |
+**And a live cell does worse than that table, by an amount this document will not put a number on.**
+`fanos-sim`'s `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per
+load across six epoch turns, and on a build carrying the placement fixes of 2026-08-18 it read the cell
+**below the line-viability floor in between a fifth and all of its samples**, depending on the run — two
+runs of the identical build differed by 50 points, because the second was taken on a machine that was not
+idle. What is *not* in doubt is the direction: below that floor at least one of the seven lines cannot serve
+a threshold gather, which is what a mixnet hop is, and the cell does not say so.
 
-Below that floor at least one of the seven lines cannot serve a threshold gather, which is what a mixnet hop
-is — so a seven-operator cell spends most of its life unable to complete an onion hop *somewhere*, silently.
-Three of the ten hold no seat at any given moment; that is not waste, it is what fills the points a
-seven-node draw leaves empty.
-
-**19 % is not zero, and this document will not pretend otherwise.** Placement across an epoch boundary is
-an open defect with a measured history, not a solved problem: see the same measurement's own notes for the
-three claim-propagation losses and the walk-budget defect fixed so far, and for what remains.
+**Placement across an epoch boundary is an open defect, not a solved problem.** Read the measurement's own
+notes before planning a launch around it: three claim-propagation losses and a walk-budget defect are fixed,
+a seat that a better claim holds is no longer committed, and the remaining question — how often a settled
+cell is short a point — is one that needs repeated runs on a quiet machine to answer at all.
 
 **One honesty check before you build on top of this:** `q = 2` is a **test fixture**, not an anonymity
 system. A passive adversary's flow-matching floor on the default plane is **1/3**, because **6** of Fano's

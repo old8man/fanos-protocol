@@ -956,12 +956,34 @@ pub enum Station {
     /// where this node sits. Both are load-bearing and neither was observable — so a contested coordinate could
     /// not be diagnosed without first guessing which side was even permitted to walk on.
     ///
-    /// Fires **once per node lifetime**, on the transition. A second one is a node that restarted, which is a
-    /// different reading from a node that never committed at all — and telling those apart is the point.
+    /// Fires **once per window**, on the transition — and that sentence used to read *"once per node
+    /// lifetime … a second one is a node that restarted"*, which was true of the design it was written for
+    /// and became a misreading the operator would act on. The window is **re-entered at every boundary**
+    /// (`Client::commit_seat` is idempotent within one, and `reshuffle_loop` re-opens it on `BeaconReady`),
+    /// so on a healthy node the count tracks the epochs it has lived through. What a *low* count against
+    /// many turns says is the interesting reading: a node whose window never closes is one the cell cannot
+    /// read — its own advertisement is not in the roster it scans, which is what a shadowed seat looks like
+    /// from inside.
+    ///
     /// [`Observation::line`] is deliberately absent: the boundary re-derives the placement a few statements
     /// later and may leave it unchanged, so any coordinate recorded here would be the one held *entering* the
     /// boundary, close enough to the settled answer to be misread as it.
     SeatCommitted,
+
+    /// A **commit was refused because a better claim holds this node's seat** — the window is being held
+    /// open on purpose.
+    ///
+    /// The companion to [`SeatCommitted`](Self::SeatCommitted), and the two answer a question one of them
+    /// used to answer wrongly. The layer that closes the window knows *"the cell can read my record"*; it
+    /// does not know whether another node is standing on the same point, and two contenders share one
+    /// directory slot by construction — so each of them transiently reads itself there and both used to
+    /// commit, after which neither was permitted to move. Measured at genesis on the shipped plane with
+    /// complete claim books: seven nodes committed and `DirectorySeatOutranked` stood at 386.
+    ///
+    /// A steady nonzero count is a node that cannot resolve its contest and is honestly saying so; a count
+    /// that never falls to zero across an epoch turn is the settling window being needed rather than one
+    /// unlucky draw — the same reading `DirectorySeatOutranked` carries, from the other side of the rule.
+    SeatCommitContested,
 
     /// An anonymous **RPC request exceeded the bound its host was constructed with**, and was refused (#194).
     ///
@@ -1240,6 +1262,7 @@ impl Station {
         Self::DirectoryPointTaken,
         Self::DirectorySeatOutranked,
         Self::SeatCommitted,
+        Self::SeatCommitContested,
         Self::HostRequestOverBound,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
@@ -1381,6 +1404,7 @@ impl Station {
             Self::DirectoryPointTaken => "directory.point_taken",
             Self::DirectorySeatOutranked => "directory.seat_outranked",
             Self::SeatCommitted => "seat.committed",
+            Self::SeatCommitContested => "seat.commit_contested",
             Self::HostRequestOverBound => "host.request_over_bound",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
@@ -1463,6 +1487,7 @@ impl Station {
             | Self::DirectoryPointTaken
             | Self::DirectorySeatOutranked
             | Self::SeatCommitted
+            | Self::SeatCommitContested
             | Self::HostRequestOverBound
             | Self::GatherExpired
             | Self::GatherCompleted

@@ -938,6 +938,15 @@ pub struct NodeHandle {
     /// reshuffle loop, which re-enters it at every boundary, and with every [`Client`], through which
     /// the layer that knows the answer closes it ([`Client::commit_seat`]).
     settling: Arc<AtomicBool>,
+    /// Whether a **better claim currently holds this node's seat** — maintained by the reshuffle loop from
+    /// the claim book, and read by [`Client::commit_seat`], which must refuse while it is true.
+    ///
+    /// The two facts were kept apart and the gap between them is a measured defect: the role loop closes the
+    /// settling window on *"I found my own advertisement"*, which proves the cell **can** read this node and
+    /// says nothing about whether anyone else is standing on its point. Two contenders share one `cap_slot`,
+    /// so each of them transiently reads itself there and both commit — after which the established-node
+    /// rule forbids the very move that would resolve the contest.
+    contested: Arc<AtomicBool>,
     /// The **driver's own** data-path readings, merged into the engine's when `Observe` is answered.
     ///
     /// Some work stops on this side of the seam and the engine never learns of it: a directory publish whose
@@ -1130,6 +1139,7 @@ impl NodeHandle {
         Client {
             addr: self.addr.clone(),
             settling: Arc::clone(&self.settling),
+            contested: Arc::clone(&self.contested),
             claims: self.claims.clone(),
             stations: self.stations.clone(),
             input_tx: self.input_tx.clone(),
@@ -1208,6 +1218,8 @@ pub struct Client {
     addr: Arc<Mutex<Triple>>,
     /// See [`NodeHandle::settling`] — the window this node may still walk its probe index in.
     settling: Arc<AtomicBool>,
+    /// See [`NodeHandle::contested`] — whether a better claim holds this node's seat right now.
+    contested: Arc<AtomicBool>,
     /// The peers' verified coordinate claims, shared with the reshuffle loop. `None` for a node with no
     /// self-certifying identity, which resolves no coordinates and has nothing to record.
     claims: Option<ClaimBook>,
@@ -1247,10 +1259,34 @@ impl Client {
     ///
     /// Idempotent, and the station fires once per window: repeated calls within one epoch are the ordinary
     /// case (the role loop reads on every refresh), and a boundary re-opens the window for the next one.
+    /// **Refused while a better claim holds this node's seat**, and that refusal is the whole of a measured
+    /// defect. The condition above — *"this node can read its own record"* — proves the cell **can** read it
+    /// and says nothing about whether anyone else is standing on its point. Two contenders share one
+    /// `cap_slot` by construction, so each of them transiently reads *itself* there and both commit; after
+    /// which `reshuffle_loop`'s established arm forbids the very move that would resolve the contest, and
+    /// raises `DirectorySeatOutranked` while the plane stays a point short for the rest of the epoch.
+    ///
+    /// Measured on the shipped plane at genesis with complete claim books (6 of 6 peers):
+    /// `committed = 7`, `outranked = 386`. Every node had closed its window, every node knew it had lost,
+    /// and not one of them was permitted to move.
+    ///
+    /// Deferring costs nothing the rule was protecting: the rule exists because the cell derives committee
+    /// membership, shard placement and routing from where a node sits, and a node **another node also sits
+    /// on** is one nothing above it can have derived anything from — its record is the one being overwritten.
     pub fn commit_seat(&self) {
+        if self.contested.load(Ordering::Acquire) {
+            self.record_station(Station::SeatCommitContested, None, None);
+            return;
+        }
         if self.settling.swap(false, Ordering::Release) {
             self.record_station(Station::SeatCommitted, None, None);
         }
+    }
+
+    /// Publish whether a better claim holds this node's seat — written by `reshuffle_loop`, which owns both
+    /// the placement and the claim book, and read by [`commit_seat`](Self::commit_seat).
+    pub(crate) fn set_contested(&self, contested: bool) {
+        self.contested.store(contested, Ordering::Release);
     }
 
     /// **Record a peer's coordinate claim that arrived through the DIRECTORY rather than a handshake.**
@@ -2540,6 +2576,10 @@ async fn reshuffle_loop<F: Field>(
                 // Adopting here makes "the window can judge epoch `e`" imply "the book holds `e`", which is
                 // what lets `rejudge_pending` treat a decided verdict as a recorded claim.
                 book.adopt(epoch);
+                // The book is empty, so nothing outranks this node until a peer's claim for the new epoch
+                // arrives. Cleared here rather than left standing, or a contest resolved last epoch would
+                // hold the window open through the next one.
+                seat.client.set_contested(false);
                 let (_, proof, rank) = verifiable_coordinate_ranked::<F>(&creds, epoch, &seed);
                 // Publish the beacon BEFORE the HELLO: a connection accepted between the two then verifies a peer
                 // against the newer beacon while announcing the older coordinate — harmless (the peer re-syncs on an
@@ -2606,6 +2646,9 @@ async fn reshuffle_loop<F: Field>(
                 if at.walk_after.is_some_and(|t| tokio::time::Instant::now() < t) {
                     continue;
                 }
+                // Kept current on every wake, because the layer that closes the window is not this one and
+                // it has no other way to learn that this seat is contested.
+                seat.client.set_contested(book.outranked_at::<F>(&at.output, at.index).is_some());
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
                 let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
                     continue; // beaten on every point of the line; hold the current announcement rather than retract it
@@ -2641,7 +2684,9 @@ async fn reshuffle_loop<F: Field>(
             // fixed nothing. What was missing is that the state was invisible: measured on the two-node join probe,
             // the frozen side reported `collisions = 0` and looked healthy while the cell was split.
             Wake::Resettle => {
-                if let Some(point) = book.outranked_at::<F>(&at.output, at.index) {
+                let outranked = book.outranked_at::<F>(&at.output, at.index);
+                seat.client.set_contested(outranked.is_some());
+                if let Some(point) = outranked {
                     seat.client.record_station(Station::DirectorySeatOutranked, Some(point), None);
                     tracing::warn!(
                         ?point,
@@ -3042,6 +3087,7 @@ fn spawn_inner(
         // Beside the seat because it qualifies it — *may this seat still move?* A node starts settleable:
         // at spawn nothing above has read it, and the reshuffle loop re-enters the window at every boundary.
         settling: Arc::new(AtomicBool::new(true)),
+        contested: Arc::new(AtomicBool::new(false)),
         stations,
         stopping,
         local_addr,
@@ -5347,6 +5393,57 @@ mod tests {
     use crate::identity::verifiable_coordinate;
     use fanos_field::F2;
 
+    /// **A contested seat is not committed, and an uncontested one still is** (both directions).
+    ///
+    /// The rule the window enforces is *"a node the cell has derived something from must not move"*, and the
+    /// fact the closing layer holds is *"I can read my own record"*. Those are not the same fact: two
+    /// contenders share one `cap_slot` by construction, so each of them transiently reads **itself** there
+    /// and both used to commit — after which `reshuffle_loop`'s established arm forbade the very move that
+    /// would resolve the contest. Measured at genesis on the shipped plane with complete claim books
+    /// (6 of 6 peers): every one of seven nodes had committed and `DirectorySeatOutranked` stood at 386.
+    ///
+    /// Asserted in both directions because a change that simply stopped committing would satisfy the first
+    /// half and break the rule the window exists for — an established node must still become established.
+    #[tokio::test]
+    async fn a_seat_a_better_claim_holds_is_not_committed_until_the_contest_clears() {
+        let (input_tx, _input_rx) = mpsc::channel::<Input>(8);
+        let client = Client {
+            claims: None,
+            settling: Arc::new(AtomicBool::new(true)),
+            contested: Arc::new(AtomicBool::new(true)),
+            addr: Arc::new(Mutex::new([1, 0, 1])),
+            stations: Arc::new(Mutex::new(Stations::new())),
+            input_tx,
+            ctrl_tx: mpsc::unbounded_channel::<Control>().0,
+            events_tx: broadcast::channel::<Notification>(8).0,
+            beacons: tokio::sync::watch::channel(None).1,
+            genesis: BeaconSeed::GENESIS,
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        let count = |st| -> u64 {
+            client.driver_stations().iter().filter(|o| o.station == st).map(|o| o.count).sum()
+        };
+
+        client.commit_seat();
+        assert!(
+            client.settling.load(Ordering::Acquire),
+            "the window must stay open while a better claim holds this node's point — closing it is what \
+             then forbids the move that would resolve the contest"
+        );
+        assert_eq!(count(Station::SeatCommitContested), 1, "and the refusal is counted, or it is invisible");
+        assert_eq!(count(Station::SeatCommitted), 0, "nothing was committed");
+
+        // The contest clears — the other claimant walked on, or this node did.
+        client.set_contested(false);
+        client.commit_seat();
+        assert!(
+            !client.settling.load(Ordering::Acquire),
+            "and an uncontested seat still commits: the rule this defers to is real, and a node the cell can \
+             read must stop moving"
+        );
+        assert_eq!(count(Station::SeatCommitted), 1, "counted once, on the transition");
+    }
+
     /// **An embedder that drops its `Node` is stopping too, and only the channel says so (#257).**
     ///
     /// The other half of [`Client::is_stopping`]. `shutdown` covers the binary, which closes the endpoint;
@@ -5361,6 +5458,7 @@ mod tests {
         let client = Client {
             claims: None,
             settling: Arc::new(AtomicBool::new(true)),
+            contested: Arc::new(AtomicBool::new(false)),
             addr: Arc::new(Mutex::new([1, 0, 1])),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5397,6 +5495,7 @@ mod tests {
         let client = Client {
             claims: None,
             settling: Arc::new(AtomicBool::new(true)),
+            contested: Arc::new(AtomicBool::new(false)),
             addr: Arc::new(Mutex::new(coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -5924,6 +6023,7 @@ mod tests {
         let client = Client {
             claims: None,
             settling: Arc::new(AtomicBool::new(true)),
+            contested: Arc::new(AtomicBool::new(false)),
             addr: Arc::new(Mutex::new(genesis_coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
@@ -6027,6 +6127,7 @@ mod tests {
         let client = Client {
             claims: None,
             settling: Arc::new(AtomicBool::new(true)),
+            contested: Arc::new(AtomicBool::new(false)),
             addr: Arc::new(Mutex::new(genesis_coord)),
             stations: Arc::new(Mutex::new(Stations::new())),
             input_tx,
