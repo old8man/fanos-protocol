@@ -3024,6 +3024,22 @@ mod tests {
     ///    it changes what the cell does.
     /// 2. **Two runs per arm, minimum**, and report both. One run of this fixture is a sample of one from a
     ///    distribution wide enough to swallow any change worth making.
+    /// ### What the station line said about the transport, measured 2026-08-19
+    ///
+    /// | | `conns.cache_miss` | `directory.entry_fallback` (frame **dropped**) | `stale_coordinate` | `repeat_ignored` |
+    /// |---|---|---|---|---|
+    /// | `n = 7` | **139 269** | **77** | 10 | 0 |
+    /// | `n = 10` | **45 217** | **71** | 17 | 0 |
+    ///
+    /// The send ladder asks for a coordinate it has no connection filed under **tens of thousands of times
+    /// per run** — the coordinate key rotating out from under the cache
+    /// ([[transport-state-keyed-by-a-rotating-value]] had this as inferred; it is observed now). **But the
+    /// ladder recovers**: frames actually lost are ~75, so the cost is overwhelmingly wasted work rather
+    /// than lost delivery, and identity-keying the cache is justified without being urgent.
+    ///
+    /// `repeat_ignored = 0` settles a neighbouring question in passing: `members` is cleared at every
+    /// boundary, so an announcement really does repeat each epoch and the flood is not being suppressed.
+    ///
     /// 3. **Read `walked` and the station line first.** They say whether the mechanism under test is running
     ///    at all — `outranked` says nodes know they lost, `committed` says whether their window closed,
     ///    `rejudged` says whether the retention path is yielding — and each of those is a count of events
@@ -3116,7 +3132,7 @@ mod tests {
                 };
                 println!(
                     "          committed={} outranked={} taken={} superseded={} self_conn={} rejudged={} \
-                     withheld={}",
+                     withheld={} cache_miss={} stale_coord={} repeat_ignored={} dropped={}",
                     station(fanos_runtime::ports::stations::Station::SeatCommitted),
                     station(fanos_runtime::ports::stations::Station::DirectorySeatOutranked),
                     station(fanos_runtime::ports::stations::Station::DirectoryPointTaken),
@@ -3130,6 +3146,23 @@ mod tests {
                     // cost (stale) from the same cause. Counted here because the transport-level tables
                     // above cannot price either.
                     station(fanos_runtime::ports::stations::Station::AssignmentWithheld),
+                    // **Why a claim this node ASKED for did not arrive.** `Wake::Meet` emits a frame at the
+                    // coordinate an announcement named, and every address this node holds is keyed by that
+                    // same rotating coordinate — so the ask can only reach a peer whose *current* seat is
+                    // already in the local tables. These two separate the outcomes: `cache_miss` is "no
+                    // connection was filed there at all", `stale_coord` is "we dialled and the peer that
+                    // answered proved a different seat", i.e. our entry rotated out from under us.
+                    station(fanos_runtime::ports::stations::Station::ConnCacheMiss),
+                    station(fanos_runtime::ports::stations::Station::DirectoryStaleCoordinate),
+                    // And whether an announcement is even repeated each epoch — `members` is cleared at the
+                    // boundary, so it should be, and a high count here would mean it is not.
+                    station(fanos_runtime::ports::stations::Station::MembershipRepeatIgnored),
+                    // **And whether a miss costs delivery.** A cache miss falls to the next rung, which
+                    // usually dials; this is the LAST rung — no address, no cached connection, no hub — and
+                    // its own doc says it is *"zero on a healthy node"* because the frame is dropped. The
+                    // two together separate "the ladder works harder" from "the cell loses frames", which
+                    // is the difference between tidying the key and having to.
+                    station(fanos_runtime::ports::stations::Station::DirectoryEntryFallback),
                 );
                 println!(
                     "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}/{n_points}  {}  \
