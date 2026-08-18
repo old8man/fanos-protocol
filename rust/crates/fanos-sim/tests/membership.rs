@@ -116,7 +116,22 @@ fn the_self_certified_check_measured_against_what_a_real_cell_actually_announces
         let mut sim = Sim::new(7);
         let cell = spawn_cell::<F2>(
             &mut sim,
-            Config { require_self_certified_membership: require, ..Config::default() },
+            Config {
+                require_self_certified_membership: require,
+                // **`vrf_coordinates: true`, because that is what `Node::start` sets** — and without it this
+                // measures the wrong half. The check has two: the overlay address must be the identity's own
+                // descent chain, and the descriptor must bind this transport coordinate. Under VRF
+                // coordinates the first skips level 0 (the HELLO's proof-of-coordinate authenticates it
+                // instead, audit C3); with the flag off it demands `address_point(id, 0) == coord`, which a
+                // fixture seating nodes at `Point::at(i)` satisfies only by coincidence.
+                //
+                // Measured with it off, for the record: **42 ungated edges against 12 guarded, 71 % refused**
+                // — two identities in seven happened to hash onto their own seat, and their announcements are
+                // the ones that survived. That is a statement about the fixture's seating, not about the
+                // check, and reading it as the latter is what this comment exists to prevent.
+                vrf_coordinates: true,
+                ..Config::default()
+            },
         );
         for &c in &cell {
             sim.inject(c, Command::Join { info: b"key".to_vec() });
@@ -136,22 +151,29 @@ fn the_self_certified_check_measured_against_what_a_real_cell_actually_announces
     // announcements wholesale is not a default anyone would consider.
     println!("self-certified membership: ungated {b} learned edges, guarded {g} — rejected {} ({:.0}%)",
              b.saturating_sub(g), 100.0 * f64::from(u32::try_from(b.saturating_sub(g)).unwrap_or(0)) / f64::from(u32::try_from(b).unwrap_or(1)));
-    // **Pinning zero, which is a defect and not a property to preserve.** The measured answer is that the
-    // check refuses 100% of honest traffic, and the cause is known and narrow: the engine holds no signing
-    // key by construction, so a deployment must install a signed descriptor through
-    // `OverlayNode::with_signed_descriptor` — and in this whole tree that builder's only caller is a
-    // simulator test. `hier_poisoning::a_deployed_identity_node_self_certifies_end_to_end` proves the check
-    // ACCEPTS a properly signed announcement, so what is missing is the producer, not the check.
+    // **This asserted `g == 0` until 2026-08-18, and that was the honest reading at the time**: the engine
+    // holds no signing key by construction, nothing in production installed a signed descriptor, and the
+    // check therefore refused every honest announcement. It was written as a tripwire — *"the day production
+    // learns to sign its descriptor this fails"* — and it did.
     //
-    // Hence this reads `assert_eq!(g, 0)` rather than the `g > 0` a first draft asserted from the hypothesis.
-    // It is a tripwire: the day production learns to sign its descriptor this fails, and the failure is the
-    // notice to drop the "rejects EVERY peer today" warning from `NodeConfig::require_self_certified_membership`
-    // and its `setup.rs` hint — a warning that outlives its cause is a lie the operator acts on.
+    // What changed: `NodeCredentials::descriptor_identity` derives the hybrid identity from the certificate
+    // key, `Command::Descriptor` carries a fresh signature at every reseat (the message binds the transport
+    // coordinate, which the reshuffle re-draws), and `compose_engine` installs the genesis one — so the
+    // simulator's cell now announces what a deployment announces, which is the whole point of spawning
+    // through the composer.
+    //
+    // **The cost on honest traffic is zero, and that is the number the default was waiting for.** What it does
+    // NOT settle: this measures the descriptor-signature half only. Level 0's authenticity comes from the
+    // HELLO proof-of-coordinate, which this bus does not carry, and the address-binding half is vacuous at
+    // depth 1 anyway (`at_depth_one_the_vrf_skip_makes_the_binding_vacuous_for_any_identity`). So the switch
+    // costs nothing and buys the transport-hijack defence (§80) — not the poisoning defence (§79), which
+    // arrives with the descent.
     assert_eq!(
-        g, 0,
-        "the self-certified check no longer refuses every honest announcement (ungated {b} edges, guarded \
-         {g}). If production now installs a signed descriptor, this measurement is stale: re-run it, then \
-         remove the precondition warning from NodeConfig::require_self_certified_membership and \
-         render_overlay_choices, and revisit whether the default should now be ON."
+        g, b,
+        "the self-certified check must not refuse a single honest announcement now that production produces \
+         the descriptor it verifies (ungated {b} edges, guarded {g}). A gap here is the producer disagreeing \
+         with the verifier about the bytes — the two build `descriptor_message` from the same exported \
+         function precisely so they cannot."
     );
+    assert_eq!(b, 42, "seven nodes learning six peers each — the baseline the percentage above divides by");
 }

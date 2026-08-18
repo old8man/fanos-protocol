@@ -1333,9 +1333,21 @@ pub struct OverlayChoices {
     ///   coordinate and the reshuffle re-draws it, so `Command::Descriptor` carries a fresh signature and the
     ///   reshuffle loop sends it immediately before each `Reseat`. `compose_engine` installs the genesis one.
     ///
-    /// **So the switch is reachable, and it is still off — because reachable is not measured.** The number
-    /// above was taken against a build with no producer; what a cell does with this on now has not been run.
-    /// Turn it on in a scenario and read the learned-edge count before recommending it to anyone.
+    /// **Measured with the producer in place: the cost on honest traffic is ZERO.** Re-running the same
+    /// instrument — same cell, twice, differing only in this flag — reads **42 learned edges ungated and 42
+    /// guarded**. Nothing legitimate is refused any more.
+    ///
+    /// **And it is still off, for a reason that is now about upgrades rather than producers.** A node with
+    /// this on refuses every peer whose build does not produce a descriptor — so flipping the default
+    /// partitions a cell mid-upgrade, older members on one side and newer on the other, each of them
+    /// behaving exactly as configured. That is what `docs/design-upgrade.md`'s activation registry is for: a
+    /// cell-wide height at which the requirement begins, agreed before anyone enforces it. Turning it on
+    /// **within** a cell whose members all produce descriptors is safe today and is the way to use it.
+    ///
+    /// Two things the measurement does not settle, stated so they are not read into it: it runs on the
+    /// simulator's bus, so the **driver's** per-reseat signature has not been exercised over real QUIC; and
+    /// it measures the descriptor half only — level 0's authenticity comes from the HELLO proof, and the
+    /// address-binding half is vacuous at depth 1 either way.
     ///
     /// **What it costs, since it is paid whether or not anyone verifies:** `id` is 1 984 bytes and `sig` is
     /// ~3 373, on the `Announce` — the one frame class that floods. Roughly 5.4 KB per member per epoch,

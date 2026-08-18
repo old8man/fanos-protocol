@@ -756,7 +756,7 @@ fn render_overlay_choices(s: &mut String, c: crate::config::OverlayChoices, d: c
     if c.require_self_certified_membership == d.require_self_certified_membership {
         let _ = writeln!(
             s,
-            "# require_self_certified_membership = {}   (the signed descriptor it checks is produced now, but what a cell does with this ON has not been measured)",
+            "# require_self_certified_membership = {}   (measured: 0 honest announcements refused now that the descriptor is produced — but a peer on an older build has none, so agree a cell-wide activation first)",
             c.require_self_certified_membership
         );
     } else {

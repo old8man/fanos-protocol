@@ -16,6 +16,9 @@ categories = ["simulation", "network-programming"]
 fanos-ergon.workspace = true
 fanos-field.workspace = true
 fanos-geometry.workspace = true
+# The §80 signed descriptor a simulated node announces — production signs one from its certificate key, so a
+# fixture that announces none differs from production in membership and not only in transport.
+fanos-pqcrypto.workspace = true
 fanos-diakrisis.workspace = true
 fanos-wire.workspace = true
 fanos-runtime = { workspace = true, features = ["std"] }

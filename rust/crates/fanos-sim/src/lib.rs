@@ -99,9 +99,32 @@ pub fn spawn_composed_cell<F: Field + 'static>(
     let size = size.min(Plane::<F>::N as usize);
     let mut coords = Vec::with_capacity(size);
     for point in Plane::<F>::points().take(size) {
-        coords.push(sim.add(compose_engine::<F>(point, what, None)));
+        coords.push(sim.add(compose_engine::<F>(point, what, Some(sim_descriptor::<F>(point)))));
     }
     coords
+}
+
+/// A simulated node's **§80 signed descriptor** for `point` — what `Node::start` produces from its
+/// certificate key, reproduced here from the point itself.
+///
+/// **The fidelity seam, again, and it is the same one.** The rule is that the simulator differs from
+/// production *only in transport*; a cell whose members announce **unsigned** descriptors differs in
+/// membership too, and the difference is invisible until something verifies one. It was: the measurement
+/// that decides whether `require_self_certified_membership` can be turned on reads the learned-edge count
+/// of a cell spawned here, and with no descriptor it could only ever report that the check refuses
+/// everything — which was true of production until the producer landed and is now true only of this
+/// fixture.
+///
+/// A deterministic identity per point, because a simulated node has no certificate to derive one from and a
+/// scenario must replay. Everything else is the production call: `fanos_node::composition::sign_descriptor`,
+/// over `fanos_runtime::descriptor_message`, so the bytes are the ones the engine rebuilds to verify.
+fn sim_descriptor<F: Field>(point: fanos_geometry::Point<F>) -> (Vec<u8>, Vec<u8>) {
+    let mut seed = Vec::with_capacity(24);
+    seed.extend_from_slice(b"fanos-sim/descriptor/");
+    seed.extend_from_slice(&fanos_geometry::encode_triple(point.coords()));
+    let (secret, verifier) =
+        fanos_pqcrypto::HybridSigSecret::generate(&mut fanos_pqcrypto::SeedRng::from_seed(&seed));
+    fanos_node::composition::sign_descriptor::<F>(&(verifier.encode(), secret), point)
 }
 
 #[cfg(test)]
