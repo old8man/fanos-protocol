@@ -2911,6 +2911,72 @@ fn set_of(
 ///
 /// The recovery authority is a **separate** step and stays one: a DKG that produces the beacon share does
 /// not produce the authority keys. Run `fanos authority-key` per founder and collect the verifiers.
+/// Wait for the ceremony to publish a key, or say **which** way it failed.
+///
+/// Bounded: a ceremony that cannot converge must say so rather than hang an operator's terminal. The ceiling
+/// is **derived** from the phases rather than chosen — three of them, doubled, so the handshakes between
+/// them have as much room again as the phases themselves. A number picked here would go stale the next time
+/// a phase was added, which is exactly what happened when the confirm round joined and the old literal still
+/// said it "covers both phase deadlines".
+///
+/// Three outcomes, and they are deliberately not one: a published key, a ceremony that **assembled and
+/// disagreed**, and a ceremony that never assembled. The middle one is the reason this is not a bare
+/// timeout — every founder was reachable and what differs is what they ran with, which is a different
+/// remedy from "check that everyone is running".
+async fn await_ceremony(
+    mut notes: tokio::sync::broadcast::Receiver<Notification>,
+    threshold: usize,
+) -> Result<(), NodeError> {
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(KEYGEN_PHASE_MS * u64::from(KEYGEN_PHASES) * 2);
+    loop {
+        match tokio::time::timeout_at(deadline, notes.recv()).await {
+            Ok(Ok(Notification::DkgComplete(_))) => return Ok(()),
+            Ok(Ok(Notification::DkgDiverged { agreed, heard })) => {
+                return Err(NodeError::Config(format!(
+                    "the ceremony finished WITHOUT agreement: {agreed} of the {threshold} participants \
+                     needed hold this node's joint key ({heard} peers answered at all). No file was \
+                     written, and that is the point — a share over a key the cell does not hold produces \
+                     beacon partials that never combine, so the cell's epoch clock would never turn and \
+                     the cause would be this ceremony. Check that every founder passed the IDENTICAL \
+                     --roster file and --threshold, then re-run; if they did, a frame was lost and \
+                     re-running is the whole remedy."
+                )));
+            }
+            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(NodeError::Config("the node shut down mid-ceremony".to_owned()));
+            }
+            Err(_) => {
+                return Err(NodeError::Config(
+                    "the ceremony did not complete: check that every founder in the roster is running \
+                     `fanos keygen` with the identical file, and that their addresses are reachable"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+/// The roster of a ceremony, in **file order** — which is also the order its network name is derived from,
+/// so every founder must hold the identical file. Blank lines and `#` comments are allowed; anything else
+/// must parse, and the line number travels with the error because a roster is hand-assembled by several
+/// people.
+///
+/// Its own function because "what counts as a roster line" is a rule about the *file* rather than about the
+/// ceremony — and because `cmd_keygen` has a line budget that the confirm round pushed it over.
+fn parse_ceremony_roster(text: &str) -> Result<Vec<Peer>, NodeError> {
+    let mut roster: Vec<Peer> = Vec::new();
+    for (n, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        roster.push(Peer::parse(line).map_err(|e| NodeError::Config(format!("roster line {}: {e}", n + 1)))?);
+    }
+    Ok(roster)
+}
+
 /// One DKG phase, in milliseconds — sharing, complaint and confirm each take this long.
 ///
 /// **Wall-clock, not the simulator's 1.5 s**, and the reason is a safety one rather than politeness: these
@@ -2947,17 +3013,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
         .parse()
         .map_err(|_| NodeError::Config("bad --threshold".to_owned()))?;
 
-    // The roster, in file order — which is also the order the name is derived from, so every founder must
-    // hold the identical file. Blank lines and `#` comments are allowed; anything else must parse.
-    let text = std::fs::read_to_string(roster_path)?;
-    let mut roster: Vec<Peer> = Vec::new();
-    for (n, raw) in text.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        roster.push(Peer::parse(line).map_err(|e| NodeError::Config(format!("roster line {}: {e}", n + 1)))?);
-    }
+    let roster = parse_ceremony_roster(&std::fs::read_to_string(roster_path)?)?;
     if roster.len() < threshold || threshold == 0 {
         return Err(NodeError::Config(format!(
             "a {threshold}-of-{} ceremony is not expressible: need 1 <= t <= participants",
@@ -3022,42 +3078,7 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
         return Err(NodeError::Config("the engine is not accepting commands".to_owned()));
     }
 
-    // Bounded: a ceremony that cannot converge must say so rather than hang an operator's terminal. The
-    // ceiling is **derived** from the phases rather than chosen — three of them, doubled, so the handshakes
-    // between them have as much room again as the phases themselves. A number picked here would go stale
-    // the next time a phase was added, which is exactly what happened when the confirm round joined.
-    let mut notes = handle.client().subscribe();
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_millis(KEYGEN_PHASE_MS * u64::from(KEYGEN_PHASES) * 2);
-    loop {
-        match tokio::time::timeout_at(deadline, notes.recv()).await {
-            Ok(Ok(Notification::DkgComplete(_))) => break,
-            // **The ceremony assembled and did not agree.** Distinct from the timeout below in both cause
-            // and remedy: every founder was reachable, and what differs is what they ran with.
-            Ok(Ok(Notification::DkgDiverged { agreed, heard })) => {
-                return Err(NodeError::Config(format!(
-                    "the ceremony finished WITHOUT agreement: {agreed} of the {} participants needed hold \
-                     this node's joint key ({heard} peers answered at all). No file was written, and that \
-                     is the point — a share over a key the cell does not hold produces beacon partials that \
-                     never combine, so the cell's epoch clock would never turn and the cause would be this \
-                     ceremony. Check that every founder passed the IDENTICAL --roster file and --threshold, \
-                     then re-run; if they did, a frame was lost and re-running is the whole remedy.",
-                    threshold
-                )));
-            }
-            Ok(Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err(NodeError::Config("the node shut down mid-ceremony".to_owned()));
-            }
-            Err(_) => {
-                return Err(NodeError::Config(
-                    "the ceremony did not complete: check that every founder in the roster is running \
-                     `fanos keygen` with the identical file, and that their addresses are reachable"
-                        .to_owned(),
-                ));
-            }
-        }
-    }
+    await_ceremony(handle.client().subscribe(), threshold).await?;
 
     let Some(result) = outcome.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else {
         return Err(NodeError::Config("the ceremony completed without an outcome".to_owned()));
