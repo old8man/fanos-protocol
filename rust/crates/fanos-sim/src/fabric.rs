@@ -3055,7 +3055,15 @@ mod tests {
                 let bound: Vec<fanos_geometry::Triple> =
                     health.iter().filter(|h| h.probe_index.is_some()).map(|h| h.address).collect();
                 let points: HashSet<fanos_geometry::Triple> = bound.iter().copied().collect();
-                let epochs: BTreeSet<u64> =
+                // **`assigned` is the epoch of each node's last ROLE ASSIGNMENT, not its engine epoch**, and
+                // the difference is worth the longer name. `Node::assignment` reads `self_org.assigned`, which
+                // the role loop writes only when it does **not** withhold — and it withholds precisely while
+                // it cannot find its own advertisement in the roster it scanned, which is what a shadowed seat
+                // looks like from inside. So a spread here is a **shadowing** reading, not a disagreement
+                // about the clock; `beacons` is the clock, and it is usually a single value while this is not.
+                // Read as "epochs" it says the cell cannot agree on the time, which is a different and much
+                // larger claim, and one this field cannot support.
+                let assigned: BTreeSet<u64> =
                     fleet.nodes().iter().map(|n| n.assignment().epoch.get()).collect();
                 let beacons: BTreeSet<u64> =
                     fleet.nodes().iter().filter_map(|n| n.live_beacon().map(|(e, _)| e.get())).collect();
@@ -3083,17 +3091,25 @@ mod tests {
                         .sum()
                 };
                 println!(
-                    "          committed={} outranked={} taken={} superseded={} self_conn={} rejudged={}",
+                    "          committed={} outranked={} taken={} superseded={} self_conn={} rejudged={} \
+                     withheld={}",
                     station(fanos_runtime::ports::stations::Station::SeatCommitted),
                     station(fanos_runtime::ports::stations::Station::DirectorySeatOutranked),
                     station(fanos_runtime::ports::stations::Station::DirectoryPointTaken),
                     station(fanos_runtime::ports::stations::Station::DirectorySeatSuperseded),
                     station(fanos_runtime::ports::stations::Station::TransportSelfConnection),
                     station(fanos_runtime::ports::stations::Station::HelloRejudged),
+                    // **What shadowing costs one layer up.** The role loop withholds while it cannot find
+                    // its own advertisement, which is exactly a shadowed seat seen from inside — and a node
+                    // shadowed since genesis has *never* been assigned, so it holds the default assignment
+                    // and serves nothing. One shadowed later keeps its previous roles, which is a different
+                    // cost (stale) from the same cause. Counted here because the transport-level tables
+                    // above cannot price either.
+                    station(fanos_runtime::ports::stations::Station::AssignmentWithheld),
                 );
                 println!(
                     "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}/{n_points}  {}  \
-                     epochs={epochs:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}",
+                     assigned={assigned:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}",
                     tick * 10,
                     bound.len(),
                     points.len(),
