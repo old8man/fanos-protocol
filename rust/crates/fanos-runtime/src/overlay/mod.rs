@@ -655,6 +655,18 @@ pub struct OverlayNode<F: Field> {
     /// remaps position `i` to `members[i]`, so the whole index-addressed reflex runs unchanged over a
     /// cell seated anywhere. See [`cell_coord`](Self::cell_coord) / [`with_cell_members`](Self::with_cell_members).
     cell_members: Option<[Triple; 7]>,
+    /// Whether [`cell_members`](Self::cell_members) was **derived from the plane** rather than provisioned.
+    ///
+    /// The two want opposite behaviour at an epoch boundary, and one field decides which. A *provisioned*
+    /// cell is a committee at fixed transport points, so a `Reseat` that would move a node out of it is a
+    /// provisioning contradiction and is refused. A *derived* cell is a function of the plane
+    /// (`fano::cell_of`), so the node's cell **follows its coordinate**: at every reshuffle it lands in
+    /// whichever cell its new point belongs to, and the roster is re-derived rather than defended.
+    ///
+    /// Without this distinction a derived roster would meet the refusal rule and a node would reject its
+    /// **own** epoch reshuffle — freezing at its founding coordinate while the rest of the cell moved on,
+    /// with every effect still firing.
+    cell_roster_derived: bool,
     /// The **parent-stratum reflex** (audit R-C2): when a child cell escalates its irrecoverable residue to
     /// this cell, its members fold the failure into a [`ParentCell`] — the same reflexive Fano decoder one
     /// tier up — and coarse-reroute around the failed child. `None` until this node first receives a child
@@ -849,6 +861,7 @@ impl<F: Field> OverlayNode<F> {
             heartbeating: false,
             self_index,
             cell_members: None,
+            cell_roster_derived: false,
             parent_cell: None,
             healer: Healer::new(observer, config.behavior_window(), config.control_confidence()),
             witnessed: BTreeMap::new(),
@@ -944,6 +957,31 @@ impl<F: Field> OverlayNode<F> {
         }
         self.healer.cell_members = Some(members); // the reflex actuates on the real member coords too
         self.cell_members = Some(members);
+        self
+    }
+
+    /// Seat this node in the cell **the plane says it belongs to** — `fano::cell_of(coord)` — rather than
+    /// in a provisioned roster. A no-op when the plane does not split (`7 ∤ N`), which is the honest
+    /// outcome rather than a cell invented for it.
+    ///
+    /// This is #145's answer wired: *"which seven of my peers are my cell"* is `index mod (N/7)`, a pure
+    /// function of the plane that every node computes identically, so no agreement round is needed. At
+    /// `q = 2` it degenerates to exactly the base-plane behaviour — one cell whose roster is
+    /// `Point::at(0..7)` — so it **unifies** the `N == 7` special case rather than adding a second one.
+    ///
+    /// Unlike [`with_cell_members`](Self::with_cell_members), the roster this installs is re-derived at
+    /// every reshuffle: see [`cell_roster_derived`](Self::cell_roster_derived) for why the two must differ
+    /// there and what happens if they do not.
+    #[must_use]
+    pub fn with_derived_cell(mut self) -> Self {
+        let Some(index) = fano::cell_of(self.coord) else {
+            return self; // the plane does not split — no cell to seat this node in
+        };
+        let Some(cell) = fano::cell_members_of::<F>(index) else {
+            return self;
+        };
+        self = self.with_cell_members(cell);
+        self.cell_roster_derived = true;
         self
     }
 
@@ -2013,7 +2051,7 @@ mod tests {
     // Codec helpers the tests build frames with; scoped here so the library build does not carry them.
     use crate::frames::{announce_body, encode_publish, encode_value};
     use super::*;
-    use fanos_field::{F2, F7};
+    use fanos_field::{F2, F4, F7};
 
     /// **The Fano-only invariant is written in four places now, and this pins the fourth.**
     ///
@@ -2204,6 +2242,47 @@ mod tests {
                 "{code:#x} is an allocated frame type above the tag ceiling — the clamp would hide it"
             );
         }
+    }
+
+    /// **A DERIVED cell follows the coordinate, where a provisioned one is defended** (#145).
+    ///
+    /// The neighbouring test pins the provisioned case: a `Reseat` out of an explicit roster is refused,
+    /// because that roster is a committee at fixed transport points. A roster obtained from the plane is
+    /// the opposite — `fano::cell_of` is a function of the coordinate, so at every reshuffle the node
+    /// belongs to whichever cell its new point is in. Applying the refusal rule there would make a node
+    /// reject its **own** epoch reshuffle and freeze at its founding coordinate, with every effect still
+    /// firing; one field decides which rule applies and this asserts that it decides correctly.
+    ///
+    /// On `F4`, where the plane splits into three cells and a move can change both the cell and the
+    /// position inside it — at `q = 2` there is one cell, so neither could change and the test would pass
+    /// on a build that had no rule at all.
+    #[test]
+    fn a_derived_cell_follows_the_coordinate_across_a_reshuffle() {
+        let cells = fano::cells_in::<F4>().expect("PG(2,4) splits into three cells");
+        assert_eq!(cells, 3, "21 points, seven to a cell");
+
+        let start = Point::<F4>::at(0);
+        let mut node = OverlayNode::<F4>::new(start, Config::default()).with_derived_cell();
+        assert_eq!(fano::cell_of(start), Some(0), "point 0 is in cell 0");
+        assert_eq!(node.self_index, Some(0), "and holds position 0 of it");
+
+        // Point 4 is in cell 1 at position 1, so BOTH change — a build that re-read only the position, or
+        // only the roster, fails here.
+        let moved = Point::<F4>::at(4);
+        assert_eq!(fano::cell_of(moved), Some(1), "the fixture really does cross a cell boundary");
+        node.step(Instant(1), Input::Command(Command::Reseat { coord: moved.coords() }));
+
+        assert_eq!(node.coord, moved, "the reshuffle was applied, not refused");
+        assert_eq!(node.self_index, Some(1), "and the index is its position in the NEW cell");
+        assert_eq!(
+            node.cell_members,
+            Some(fano::cell_members_of::<F4>(1).expect("cell 1").coords()),
+            "the roster was re-derived, so the reflex attests against the seven it is actually among",
+        );
+        assert_eq!(
+            node.healer.cell_members, node.cell_members,
+            "and the healer actuates on the same roster — it has its own copy",
+        );
     }
 
     /// **A node seated in an explicit cell does not reseat out of it** (#145).

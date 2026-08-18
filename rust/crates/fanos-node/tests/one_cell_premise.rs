@@ -1,28 +1,54 @@
 //! **The cross-cell publishers and cell formation must be fixed together** (#167, and #280 beside it).
 //!
 //! `crosscell_dir` ships a checkpoint directory, a health directory and a receipt inbox, and no shipped
-//! binary calls any of them. That is not pending wiring. A FANOS deployment has **exactly one cell, or
-//! none**: `Health::reflexive` is `config.plane_order == 2`, because the DIAKRISIS unit is a seven-member
-//! cell and only `PG(2,2)` forms one from the plane itself; above that a node discovers peers but nothing
-//! tells it which seven are its cell (#145). At `q = 2` the cell *is* the network, so a cross-cell
-//! publisher's counterpart is itself; at `q > 2` no cell forms to be one.
+//! binary calls any of them. That was once because there was nowhere to publish *to*: a deployment had
+//! exactly one cell or none, since only `PG(2,2)` formed a cell from the plane itself.
 //!
-//! So the obligation is conditional, and a conditional obligation needs a tripwire, or the condition becomes
-//! true and nobody notices. This file holds one: **if a cross-cell publisher gains a production caller while
-//! cells still cannot form above `q = 2`, that is the defect** — a publisher wired to an address nobody can
-//! be at, which reads exactly like working shared security and carries none.
+//! **#145 is answered and that half has changed.** `fano::cell_of` is `index mod (N/7)`, a pure function
+//! every node computes identically, so any plane whose point count divides by seven now forms cells and
+//! `compose_engine` seats a node in its own. `Health::reflexive` follows the same predicate. So a
+//! cross-cell publisher *does* have a counterpart on `PG(2,4)`, `PG(2,11)`, `PG(2,16)` and `PG(2,32)`.
 //!
-//! It fails in either direction, which is the point: wiring a publisher fails it, and so does changing how
-//! cells form, and both failures are a demand to re-read the design rather than a demand to revert.
+//! **What still holds them back is evidence, not addressing**, and this file now watches that instead:
+//!
+//! * `publish_health` carries **one bare byte** (`alloc_vec(report.block())`) at a `(cell, epoch)` slot,
+//!   and `resolve_health` parses it with **no signature, no envelope and no publisher binding** — while
+//!   its consumer `diagnose_children` runs the Turyn federated covering and localizes up to three faults
+//!   to `(child, axis)`. A covering designed to localize confidently will mislocalize confidently on
+//!   forged input. The sibling directories solved exactly this and said why: `telemetry_dir.rs` — *"the
+//!   slot key names a coordinate; nothing used to make that name true"* — and `ingressdir.rs`. This slot
+//!   is keyed `(cell, epoch)`, so a coordinate-bound ownership rule would not cover it.
+//! * `attest_children` calls `ChildRegistry::attest_available`, whose availability mask needs the §L4.3
+//!   sampler that **no shipped binary issues** (#173). A caller with none must pass `0`, which refuses
+//!   every child — so the loop would run and vouch for nothing.
+//!
+//! So the obligation is still conditional, and a conditional obligation still needs a tripwire: **if a
+//! cross-cell publisher gains a production caller while `publish_health` is unauthenticated, that is the
+//! defect** — a federated covering fed forgeable input, which reads exactly like working shared security
+//! and carries none.
+//!
+//! It fails in either direction, which is the point: wiring a publisher fails it, and so does giving
+//! `publish_health` an envelope, and both failures are a demand to re-read the design rather than to
+//! revert.
 
 #![allow(clippy::expect_used)]
 
 /// The premise, as it is written in the code that decides it.
 ///
-/// A source-text observable rather than a behavioural one, deliberately: the fact is *derived from
-/// configuration and nothing at run time can change it* (`Health::reflexive`'s own doc), so there is no
-/// state a running node could be in that would report it. The line is the fact.
-const CELL_FORMATION_PREMISE: &str = "reflexive: config.plane_order == 2";
+/// A source-text observable rather than a behavioural one, deliberately: no state a running node could be
+/// in would report "this directory's record is unauthenticated". The line is the fact.
+///
+/// It used to be `"reflexive: config.plane_order == 2"` — the claim that only the base plane forms a cell.
+/// That claim is now false (#145 is answered by `fano::cell_of`), and its going false is exactly what this
+/// tripwire is for: the premise moved rather than vanished, from *"there is no second cell"* to *"a
+/// parent would be deciding on unsigned evidence"*.
+///
+/// **It has to be a line of CODE, not of prose**, and the first attempt at this was a doc paragraph in
+/// `crosscell_dir.rs` that the scan could never see: `shipping_sources` runs every file through
+/// `fanos_testkit::source::code_only`, which strips comments. So the observable is `resolve_health`'s
+/// parse — it reads **exactly one byte** and nothing else, which is precisely what an envelope would have
+/// to change.
+const CELL_FORMATION_PREMISE: &str = "<[u8; 1]>::try_from(bytes.as_slice())";
 
 /// The entry points that would carry a cell's state to another cell.
 const CROSS_CELL_PUBLISHERS: [&str; 5] = [
@@ -95,32 +121,29 @@ fn a_cross_cell_publisher_may_not_be_wired_while_only_one_cell_can_exist() {
         callers.len()
     );
 
-    let one_cell_only =
-        sources.iter().any(|(path, text)| path.contains("node.rs") && text.contains(CELL_FORMATION_PREMISE));
+    let evidence_is_unsigned = sources
+        .iter()
+        .any(|(path, text)| path.contains("crosscell_dir.rs") && text.contains(CELL_FORMATION_PREMISE));
 
     assert!(
-        one_cell_only || !callers.is_empty(),
-        "`{CELL_FORMATION_PREMISE}` is gone from node.rs, so cells may now form above q=2 — the premise \
-         behind leaving every cross-cell publisher unwired (#167) no longer holds. Wire them, and re-read \
-         `Census`'s single-cell verdict (#280), which refuses a network reading for the same reason.\n\n\
-         AND READ THIS BEFORE WIRING `publish_health`, because this tripwire watches REACHABILITY and the \
-         other half is EVIDENCE. `publish_checkpoint` carries an `ExecCertificate` and `attest_children` \
-         refuses a child whose certificate fails to verify. `publish_health` carries **one bare byte** \
-         (`alloc_vec(report.block())`) at a `(cell, epoch)` slot, and `resolve_health` parses it with no \
-         signature, no envelope and no publisher binding — while its consumer, `diagnose_children`, runs the \
-         Turyn federated covering and localizes up to three faults to `(child, axis)`. A covering designed \
-         to localize confidently will mislocalize confidently on forged input. The sibling directories \
-         already solved this and said why: `telemetry_dir.rs` — \"the slot key names a coordinate; nothing \
-         used to make that name true\" — and `ingressdir.rs` — \"why this directory needed the envelope and \
-         could not lean on the store\". `crosscell_dir`'s health record got neither, and its slot key is \
-         `(cell, epoch)` rather than a coordinate, so a coordinate-bound ownership rule would not cover it."
+        evidence_is_unsigned || !callers.is_empty(),
+        "`{CELL_FORMATION_PREMISE}` is gone from crosscell_dir.rs, so the health record now carries its own \
+         evidence — the reason for leaving every cross-cell publisher unwired (#167) no longer holds. Wire \
+         them, and re-read `Census`'s single-cell verdict (#280), which refuses a network reading for the \
+         same reason.\n\n\
+         The addressing half is already done: `fano::cell_of` answers #145 and `compose_engine` seats a node \
+         in its own cell, so a publisher has a counterpart on any plane whose point count divides by seven. \
+         What remains before wiring is the availability sampler (#173) — `attest_children` must pass a real \
+         mask or `0`, and `0` refuses every child, so the loop would vouch for nothing."
     );
     assert!(
-        !one_cell_only || callers.is_empty(),
-        "a cross-cell publisher has a production caller while `{CELL_FORMATION_PREMISE}` still holds, so \
-         there is no second cell for it to reach: it will publish to a slot no cell occupies and the \
-         deployment will look like it has live shared security. Close #145 (cell formation above q=2) \
-         first, or state here why this caller is exempt.\ncallers:\n  {}",
+        !evidence_is_unsigned || callers.is_empty(),
+        "a cross-cell publisher has a production caller while `{CELL_FORMATION_PREMISE}` still holds, so a \
+         parent would run the Turyn federated covering over **unsigned** health records and localize faults \
+         to `(child, axis)` from them. A covering designed to localize confidently will mislocalize \
+         confidently on forged input, and the deployment will look like it has live shared security. Give \
+         `publish_health` an envelope and a publisher binding first, or state here why this caller is \
+         exempt.\ncallers:\n  {}",
         callers.join("\n  ")
     );
 }

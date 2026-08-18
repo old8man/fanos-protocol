@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::ports::stations::Station;
 use fanos_core::PowAdmission;
 use fanos_field::Field;
-use fanos_geometry::{HierAddr, Plane, Point, Triple};
+use fanos_geometry::{fano, HierAddr, Plane, Point, Triple};
 use fanos_primitives::Epoch;
 use fanos_wire::error::ProtocolError;
 use fanos_wire::FrameType;
@@ -354,6 +354,20 @@ impl<F: Field> OverlayNode<F> {
         // VRF reshuffle is a defence for a node's placement on the BASE plane, and the two are different
         // things. So a `Reseat` that would move a node out of its roster is refused, loudly, rather than
         // half-applied — and one that lands back inside it re-reads the index from the roster.
+        //
+        // **A DERIVED roster is the opposite case, and the same code would get it exactly wrong.** A cell
+        // obtained from `fano::cell_of` is a function of the plane, not a provisioned committee, so the
+        // node's cell FOLLOWS its coordinate: at each reshuffle it belongs to whichever cell its new point
+        // is in. Defending the old roster there would make a node refuse its **own** epoch reshuffle and
+        // freeze at its founding coordinate while the rest of the plane moved on. So a derived roster is
+        // re-derived here, and only a provisioned one is defended.
+        if self.cell_roster_derived {
+            let derived = fano::cell_of(new_pt)
+                .and_then(|index| fano::cell_members_of::<F>(index))
+                .map(|cell| cell.coords());
+            self.cell_members = derived;
+            self.healer.cell_members = derived;
+        }
         let seat = match &self.cell_members {
             // The roster's own index, never the base plane's — see above.
             Some(members) => members.iter().position(|&m| m == new_coord),
@@ -361,6 +375,12 @@ impl<F: Field> OverlayNode<F> {
             None if Plane::<F>::N == 7 => (0..7).find(|&i| Point::<F>::at(i) == new_pt),
             None => None,
         };
+        // No `&& !derived` here, and that is checked rather than assumed: the re-derivation above runs
+        // BEFORE this lookup, so a derived roster always contains the new coordinate — it is the roster of
+        // the very cell that coordinate is in — and `seat` cannot be `None` for one. Where the plane does
+        // not split the re-derivation sets the roster to `None`, so the `is_some()` fails first. Guarding
+        // it again passed every test, which is how the redundancy was found; the ORDER is what makes it
+        // redundant, so moving the re-derivation below this line would need the guard back.
         if self.cell_members.is_some() && seat.is_none() {
             // Nothing is mutated — the node keeps its coordinate, its index and its peer set — and the
             // refusal is counted, because a silent one is indistinguishable from a `Reseat` that never

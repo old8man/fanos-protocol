@@ -1095,13 +1095,19 @@ pub struct Health {
     /// the §6.7 self-healing actions (#145).
     ///
     /// `false` is not a degraded reading, it is an *absent instrument*: the DIAKRISIS unit is a seven-member
-    /// cell, and only `PG(2,2)` forms one from the plane itself. On a larger plane a node discovers peers but
-    /// nothing tells it which seven are its cell, so the whole reflex returns early — and every other field
-    /// here still reads healthy, because the component that would say otherwise is the one that is missing.
+    /// cell, and a plane forms cells only when its `q² + q + 1` points divide by seven. Where they do not —
+    /// `PG(2,7)`'s 57, `PG(2,31)`'s 993 — no assignment rule can seat a cell however it is written, so the
+    /// whole reflex returns early and every other field here still reads healthy, because the component that
+    /// would say otherwise is the one that is missing.
     ///
-    /// Derived from configuration rather than read from the engine, which is exact: the condition is
-    /// `plane_order == 2` (or an explicit roster, which no deployment path sets today), and nothing at run
-    /// time can change it.
+    /// **It is an instrument, not a verdict**, and the distinction matters more now than when this said
+    /// `plane_order == 2`. Since #145 was answered (`fano::cell_of`), a node on `PG(2,4)`, `PG(2,11)`,
+    /// `PG(2,16)` or `PG(2,32)` has a cell and reads `true` — but a *sparsely populated* cell will then
+    /// report degraded coherence, which is the instrument working rather than failing. `true` says the
+    /// readings below mean something; it does not say they are good.
+    ///
+    /// Derived from the plane rather than read from the engine, which is exact: the condition is
+    /// `fano::cells_in::<F>().is_some()` (or an explicit roster), and nothing at run time can change it.
     pub reflexive: bool,
     /// Whether this node is keeping durable state, and if not, which of the two reasons (#200).
     ///
@@ -1278,13 +1284,15 @@ impl Node {
         //     equicorrelated model produced from the configured `healthy_correlation = 0.45`.
         // The warning below is still the right thing to print at startup; it is no longer the only thing that
         // tells the operator.
-        if config.plane_order > 2 {
+        if fanos_geometry::fano::cells_in_order(config.plane_order).is_none() {
             eprintln!(
-                "fanos: WARNING — running on PG(2,{}) with no cell roster: this node has NO coherence \
+                "fanos: WARNING — running on PG(2,{q}) with no cell roster: this node has NO coherence \
                  self-model, NO liveness diagnosis and NO self-healing. `fanos status health` reports \
                  `reflexive: NO` and its coherence snapshot is not ready, because nothing measures. \
-                 Only PG(2,2) forms a cell from the plane itself (#145).",
-                config.plane_order
+                 A cell is seven members, and this plane's {n} points do not divide by seven — so no \
+                 assignment rule can seat one here, however it is written (#145).",
+                q = config.plane_order,
+                n = u64::from(config.plane_order) * u64::from(config.plane_order) + u64::from(config.plane_order) + 1,
             );
         }
         // **What this node's subsystems have reserved, against what it is documented to run within (#213).**
@@ -1533,8 +1541,14 @@ impl Node {
             directory,
             local_addr,
             roles: config.roles,
-            // A cell is seven members; only the base plane is its own cell (#145).
-            reflexive: config.plane_order == 2,
+            // A cell is seven members, and **the plane says which seven** (#145): `fano::cell_of` is
+            // `index mod (N/7)`, so a node is reflexive exactly when its plane splits into cells —
+            // `7 | q²+q+1`. This read `plane_order == 2` while that was the only plane that formed a cell
+            // from itself; deriving the assignment made it under-report, since `PG(2,4)`, `PG(2,11)`,
+            // `PG(2,16)` and `PG(2,32)` all split and now seat a real reflex. At `q = 2` the answer is
+            // unchanged — one cell, and it is the plane — and `PG(2,7)`/`PG(2,31)` still read `false`,
+            // correctly: `57 = 8·7+1` and `993 = 141·7+6` do not divide, so no rule can seat a cell there.
+            reflexive: fanos_geometry::fano::cells_in::<F>().is_some(),
             store_persister,
             self_org,
             live_beacon,

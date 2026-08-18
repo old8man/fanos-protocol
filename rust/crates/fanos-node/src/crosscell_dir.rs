@@ -129,6 +129,22 @@ pub async fn attest_children(
 /// One byte, and it is the byte the federated grammar consumes: a cell's health was already represented as a 7-bit
 /// degraded-axis mask throughout DIAKRISIS (`polar::rho_vector_from_degraded`), which is exactly `golay::Report::axes`, so
 /// the wire format needed no invention. The bus occupies bit 7, which is where the code puts it too.
+///
+/// # ⚠️ The record is unauthenticated, and its consumer is a confident localizer
+///
+/// It is one bare byte at a `(cell, epoch)` slot, and [`resolve_health`] parses it with **no signature, no
+/// envelope and no publisher binding** — while `diagnose_children` runs the Turyn federated covering over it
+/// and localizes up to three faults to `(child, axis)`. **A covering designed to localize confidently will
+/// mislocalize confidently on forged input.** Its sibling [`publish_checkpoint`] does not have this problem:
+/// it carries an `ExecCertificate` and [`attest_children`] refuses a child whose certificate fails to verify.
+///
+/// The sibling directories solved exactly this and said why — `telemetry_dir.rs`: *"the slot key names a
+/// coordinate; nothing used to make that name true"*, and `ingressdir.rs` on why it *"needed the envelope and
+/// could not lean on the store"*. This slot is keyed `(cell, epoch)` rather than a coordinate, so the
+/// coordinate-bound ownership rule those use does not cover it and an envelope has to be added.
+///
+/// This paragraph is a **tripwire**, not a note: `one_cell_premise.rs` watches for the phrase above and fails
+/// the moment a cross-cell publisher gains a production caller while it is still here.
 pub async fn publish_health(client: &Client, cell: u32, epoch: Epoch, report: Report) -> bool {
     let landed = client
         .put_ephemeral(health_slot(cell, epoch), alloc_vec(report.block()), DIRECTORY_SLOT_EPOCHS)

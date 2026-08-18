@@ -229,10 +229,77 @@ impl<F: Field> CellMembers<F> {
     }
 }
 
+/// The number of DIAKRISIS cells a transport plane splits into, or `None` when it does not split.
+///
+/// A cell is seven members, so the plane's `N = q² + q + 1` points partition into cells exactly when
+/// **`7 | N`**. That is the whole condition — see [`CellMembers`] for why a cell is a 7-set and **not** a
+/// Fano subplane, which would additionally demand `q` even.
+///
+/// | `q` | `N` | cells |
+/// |---|---|---|
+/// | 2 | 7 | 1 — the cell *is* the plane |
+/// | 4 | 21 | 3 |
+/// | 11 | 133 | 19 |
+/// | 16 | 273 | 39 |
+/// | 32 | 1057 | 151 |
+///
+/// `q = 7` (`N = 57`), `q = 8` (`73`) and `q = 31` (`993`) do **not** divide, so no assignment rule can
+/// seat a cell on them however it is written — which is why #145 read as unanswerable at two of the four
+/// dispatched orders.
+#[must_use]
+pub fn cells_in<F: Field>() -> Option<usize> {
+    cells_in_order(F::Q)
+}
+
+/// [`cells_in`] from the projective **order** rather than the field, for callers that have `q` before they
+/// have a type — the startup path decides whether to warn about an absent reflex before it dispatches to a
+/// [`Field`]. One definition, so the two answers cannot drift.
+#[must_use]
+pub const fn cells_in_order(q: u32) -> Option<usize> {
+    let n = (q as usize) * (q as usize) + (q as usize) + 1;
+    if n.is_multiple_of(N) { Some(n / N) } else { None }
+}
+
+/// The cell a point belongs to: **`index mod cells_in()`**. `None` when the plane does not split.
+///
+/// This answers *"which seven of my peers are my cell"* (#145), and it is one modulo because a cell is a
+/// **labelling** rather than a geometric object ([`CellMembers`]). Every point lands in exactly one cell
+/// and every cell holds exactly seven, because the residue classes of `0..N` modulo `N/7` each hold `7`
+/// indices.
+///
+/// **A stronger partition exists and is not needed.** In Singer coordinates the unique order-7 subgroup
+/// and its cosets are Fano *subplanes* when `q` is even, which would make every cell line a real transport
+/// line. Nothing routes along a cell line, so that buys nothing here and would cost a discrete log in
+/// `GF(q³)`.
+#[must_use]
+pub fn cell_of<F: Field>(point: Point<F>) -> Option<usize> {
+    cells_in::<F>().map(|cells| point.index() % cells)
+}
+
+/// The seven members of cell `c`, in the canonical order the incidence tables index them: position `i`
+/// holds the point whose plane index is `c + i · cells`.
+///
+/// `None` when the plane does not split, or when `c` is not a cell of it. The order is what every member
+/// must agree on — [`CellMembers`] states why no local check can confirm that agreement, and this is how
+/// they come to hold it: a pure function of the plane, so two nodes computing it cannot disagree.
+#[must_use]
+pub fn cell_members_of<F: Field>(c: usize) -> Option<CellMembers<F>> {
+    let cells = cells_in::<F>()?;
+    if c >= cells {
+        return None;
+    }
+    let mut members = [[0u32; 3]; N];
+    for (i, slot) in members.iter_mut().enumerate() {
+        *slot = Point::<F>::at(c + i * cells).coords();
+    }
+    CellMembers::new(members)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::plane::Plane;
 
     /// **What the constructor refuses, and what it deliberately accepts.**
     ///
@@ -272,6 +339,53 @@ mod tests {
             CellMembers::<fanos_field::F7>::new(arbitrary).is_some(),
             "an embedded roster on PG(2,7) is legitimate and no subplane exists there"
         );
+    }
+
+    /// **#145, answered and checked: every point is in exactly one cell, and every cell holds seven.**
+    ///
+    /// Asserted on every constructible plane that splits, and asserted **absent** on the ones that do not —
+    /// because the interesting half of this rule is which orders it refuses, and those refusals are what
+    /// made the question read as unanswerable.
+    #[test]
+    fn the_cell_assignment_partitions_every_plane_that_splits() {
+        fn partitions<F: Field>(expect_cells: usize) {
+            let cells = cells_in::<F>().unwrap();
+            assert_eq!(cells, expect_cells, "q={}: cell count", F::Q);
+            let n = Plane::<F>::N as usize;
+
+            let mut seen = alloc::vec![0usize; cells];
+            for i in 0..n {
+                let c = cell_of(Point::<F>::at(i)).unwrap();
+                assert!(c < cells, "q={}: point {i} claimed cell {c} of {cells}", F::Q);
+                seen[c] += 1;
+            }
+            assert!(seen.iter().all(|&k| k == N), "q={}: every cell holds seven — got {seen:?}", F::Q);
+
+            for c in 0..cells {
+                let roster = cell_members_of::<F>(c).unwrap();
+                for (i, coords) in roster.coords().iter().enumerate() {
+                    let p = Point::<F>::new(*coords).unwrap();
+                    assert_eq!(cell_of(p), Some(c), "q={}: member {i} of cell {c} is in another cell", F::Q);
+                }
+            }
+            assert!(cell_members_of::<F>(cells).is_none(), "q={}: there is no cell {cells}", F::Q);
+        }
+        partitions::<F2>(1);
+        partitions::<fanos_field::F4>(3);
+        partitions::<fanos_field::F11>(19);
+        partitions::<fanos_field::F16>(39);
+
+        // At `q = 2` the rule must reproduce the base plane exactly, or it would be a second mechanism
+        // wearing the same name rather than a generalisation of the one that ships.
+        let base = cell_members_of::<F2>(0).unwrap().coords();
+        let expected: [Triple; N] = core::array::from_fn(|i| Point::<F2>::at(i).coords());
+        assert_eq!(base, expected, "the derived cell at q = 2 IS the base plane's points 0..7");
+
+        // The refusals: `7 ∤ N`, so no rule can seat a cell on these however it is written.
+        assert!(cells_in::<fanos_field::F7>().is_none(), "PG(2,7) has 57 points and 57 = 8·7 + 1");
+        assert!(cells_in::<fanos_field::F8>().is_none(), "PG(2,8) has 73 points");
+        assert!(cells_in::<fanos_field::F31>().is_none(), "PG(2,31) has 993 = 141·7 + 6");
+        assert!(cell_of(Point::<fanos_field::F31>::at(0)).is_none(), "so no point of it has a cell");
     }
 
     /// The accessor returns what was accepted, so a caller cannot be handed a different cell than it

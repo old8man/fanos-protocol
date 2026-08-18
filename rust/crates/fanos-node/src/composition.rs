@@ -220,11 +220,19 @@ pub fn compose_engine<F: Field + 'static>(
     // `panic = "abort"` a panic here kills the node. What is dropped now is wider than a bad coordinate:
     // `CellMembers::new` also refuses seven points whose order does not realise `fano::LINE_POINTS`, which
     // used to be accepted and would have run the whole reflex over triples that are not collinear.
-    if let Some(members) = what.cell_members
-        && let Some(cell) = fanos_geometry::fano::CellMembers::<F>::new(members)
-    {
-        overlay = overlay.with_cell_members(cell);
-    }
+    overlay = match what.cell_members.and_then(fanos_geometry::fano::CellMembers::<F>::new) {
+        // A provisioned roster: a committee at fixed transport points, defended across reshuffles. A
+        // malformed one is **dropped**, never a panic — the rule `hier_addr` states one function up, and
+        // for the same reason: it arrives from configuration, and under `panic = "abort"` a panic there
+        // kills the node.
+        Some(cell) => overlay.with_cell_members(cell),
+        // Otherwise the plane says which cell this node is in (#145): `fano::cell_of` is `index mod (N/7)`,
+        // a pure function every node computes identically, so no agreement round is needed. A no-op where
+        // the plane does not split (`7 ∤ N`, i.e. `q ∈ {7, 8, 31}`), which is honest rather than inventing
+        // a cell for it — and at `q = 2` it derives exactly the base plane's own `Point::at(0..7)`, so the
+        // shipped default is unchanged and the `N == 7` special case becomes one case of a rule.
+        None => overlay.with_derived_cell(),
+    };
     if let Some(path) = &what.hier_path
         && let Some(hier) = hier_addr::<F>(path)
     {
