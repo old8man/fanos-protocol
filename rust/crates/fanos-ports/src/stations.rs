@@ -386,6 +386,38 @@ pub enum Station {
     /// reporting that its authoritative source and its fallback disagree about who is driving.
     EpochAgreeBelowQuorum,
 
+    /// A consensus message was admitted from a peer whose **slot this node has not re-pointed yet** — a
+    /// validator that re-seated and whose move is still in flight.
+    ///
+    /// **Zero on a settled cell, and a rising count is the vote-loss window made visible.** Membership in
+    /// TAXIS is a key: the engine attributes a vote by the `voter` the sender signed and checks it against
+    /// `verifiers[voter]`, and the coordinate takes no part in that. The driver nevertheless used the
+    /// coordinate→slot lookup as an admission test, so a validator that had walked its probe index had its
+    /// signature-verified votes dropped **before they reached the engine** — the driver's own comment names
+    /// the state: such a mover is *"indistinguishable from a stranger"*. Placement is a routing fact and
+    /// membership is an identity fact, and one was standing in for the other.
+    ///
+    /// The message is now admitted on its own evidence and this counts the cases, because the condition is
+    /// real and worth watching: it says a move has not propagated here, which is the same reachability limit
+    /// the beacon has (`PeerMoved` reaches only peers holding a live connection to the mover). A sustained
+    /// count means moves are outrunning their own announcements.
+    ///
+    /// [`Observation::line`] is the coordinate the message actually came from.
+    ConsensusFromUnseatedPeer,
+
+    /// An **anonymous** delivery carried a consensus message, and it was refused.
+    ///
+    /// Anonymity is for transactions: a client submits without showing a seat. Consensus is the opposite —
+    /// every message is weighed by its sender's committee membership, which an anonymous delivery cannot
+    /// establish. This is a member trying to vote without showing a seat, or a misrouted frame, and both are
+    /// worth seeing.
+    ///
+    /// **It was already counted and the count reached nobody**: `taxis_driver` incremented a local
+    /// `anon_refused` whose own comment promised "things an operator should be able to see happening", and
+    /// no reader existed. Unattributed, because an anonymous delivery has no coordinate to name — inventing
+    /// one would put fabricated evidence against a line into the plane.
+    ConsensusFromAnonymous,
+
     /// An inbound `EpochAgree` was dropped because this node is **beacon-driven** (#351).
     ///
     /// The frame's own doc states the rule — under a live beacon the DVRF round is authoritative and the
@@ -1210,6 +1242,8 @@ impl Station {
         Self::TransportRoundTripLost,
         Self::TransportSelfConnection,
         Self::EpochAgreeBelowQuorum,
+        Self::ConsensusFromUnseatedPeer,
+        Self::ConsensusFromAnonymous,
         Self::EpochAgreeSuperseded,
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
@@ -1296,6 +1330,8 @@ impl Station {
             Self::RestrictedPullAsked => "hello.restricted_pull_asked",
             Self::ConnCacheMiss => "conns.cache_miss",
             Self::RelayOriginRefused => "transport.relay_origin_refused",
+            Self::ConsensusFromUnseatedPeer => "consensus.from_unseated_peer",
+            Self::ConsensusFromAnonymous => "consensus.from_anonymous",
             Self::MembershipRepeatIgnored => "membership.repeat_ignored",
             Self::ArbitrationDial => "directory.arbitration_dial",
             Self::MembershipSize => "membership.size",
@@ -1470,6 +1506,10 @@ impl Station {
             | Self::ReseatOutOfCell
             | Self::ExitDialFailed
             | Self::ExitSocketUnavailable
+            // Both consensus admission counters: the coordinate is the LINE, not a tag, and an anonymous
+            // delivery has neither. A count and a line are the whole finding in each case.
+            | Self::ConsensusFromUnseatedPeer
+            | Self::ConsensusFromAnonymous
             | Self::PeerRefusalUnreadable => TagKind::Untagged,
         }
     }

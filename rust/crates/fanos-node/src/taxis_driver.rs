@@ -664,14 +664,21 @@ where
                     // show. So the arm below already accepts `Tx` "from ANY sender"; this adds the sender that has
                     // no name, and refuses everything else rather than widening the trusted set.
                     Some(Notification::Delivered { from, payload }) if from == fanos_aphantos::threshold_router::ANONYMOUS => {
-                        match parse_app_body(&payload) {
-                            Some(TaxisApp::Tx(tx)) => {
-                                ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
-                            }
-                            // Counted, not dropped in silence: an anonymous delivery carrying consensus is either
-                            // a misrouted frame or a member trying to vote without showing a seat, and both are
-                            // things an operator should be able to see happening.
-                            _ => anon_refused = anon_refused.saturating_add(1),
+                        if let Some(TaxisApp::Tx(tx)) = parse_app_body(&payload) {
+                            ingest_tx(&mut engine, &client, &coords, me, &mut seen_txs, &tx);
+                        } else {
+                            // Counted, not dropped in silence: an anonymous delivery carrying consensus is
+                            // either a misrouted frame or a member trying to vote without showing a seat,
+                            // and both are things an operator should be able to see happening.
+                            //
+                            // **And now it reaches somebody.** That promise was made beside a local counter
+                            // that was written and never read — the same silence it was written against.
+                            anon_refused = anon_refused.saturating_add(1);
+                            client.record_station(
+                                fanos_runtime::ports::stations::Station::ConsensusFromAnonymous,
+                                None,
+                                None,
+                            );
                         }
                     }
                     Some(Notification::App { body, from }) => match parse_app_body(&body) {
@@ -683,12 +690,29 @@ where
                                 on_skeleton(&mut engine, &client, &coords, me, &mut da, &events_for_task, &mut last_ckpt, slash_sealer.as_ref(), &mut seen_txs, &mut last_broken, skeleton);
                             }
                         }
-                        // Any other consensus message: accepted only from a known validator coordinate (its index
-                        // also directs a state-sync reply back to the requester); a frame from a stranger is ignored.
+                        // **Any other consensus message is admitted on its own evidence.** The slot lookup
+                        // resolves a *reply address*; it is not the membership test, and using it as one
+                        // dropped signature-verified votes from validators that had re-seated. The engine
+                        // attributes by the signed `voter` and checks `verifiers[voter]`, so a message from a
+                        // coordinate this node has not yet re-pointed is a member whose move is still in
+                        // flight — not a stranger. A stranger cannot reach here in the first place: the
+                        // transport delivers only from peers that completed a self-certifying HELLO carrying
+                        // a proof of coordinate, and `Notification::App` without one is refused above
+                        // (`anon_refused`).
                         Some(TaxisApp::Consensus(msg)) => {
-                            if let Some(src) =
-                                coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok())
                             {
+                                let src =
+                                    coords.iter().position(|c| *c == from).and_then(|p| u8::try_from(p).ok());
+                                if src.is_none() {
+                                    // Admitted, and counted: this is a move that has not propagated here
+                                    // yet, and a sustained count means moves are outrunning their own
+                                    // announcements. Zero on a settled cell.
+                                    client.record_station(
+                                        fanos_runtime::ports::stations::Station::ConsensusFromUnseatedPeer,
+                                        Some(from),
+                                        None,
+                                    );
+                                }
                                 let outs = step_msg(&mut engine, &msg, src);
                                 // A handed-over body ends the sampling for that block: it was obtained whole, so the
                                 // pending entry is finished work competing for a capped map.
@@ -779,23 +803,74 @@ where
     TaxisHandle { task, submit: submit_tx, events: events_tx, query: query_tx, probe: probe_tx }
 }
 
+/// Whether this message can be handled without knowing where its sender currently sits.
+///
+/// **The distinction the admission test used to blur.** A message that carries its own signed author needs
+/// no slot: `ConsensusEngine::accept_vote` reads the signed `voter` and checks `verifiers[voter]`, and every
+/// other self-attributing variant is judged the same way. Only the two that answer the sender *back* need an
+/// address, and for those a missing slot means silence rather than a guess — the requester retries, and
+/// inventing a destination would send this cell's state to whoever holds that index instead.
+///
+/// A `match` rather than a list, so a variant added later is a build error here: whoever adds it must say
+/// which kind it is, and the two kinds have opposite consequences for a validator that has re-seated.
+const fn needs_a_reply_address(msg: &ConsensusMsg) -> bool {
+    match msg {
+        ConsensusMsg::SyncReq { .. } | ConsensusMsg::NeedBody { .. } => true,
+        ConsensusMsg::Propose(_)
+        | ConsensusMsg::Vote(_)
+        | ConsensusMsg::Reveal(_)
+        | ConsensusMsg::ExecVote(_)
+        | ConsensusMsg::CommitCert(_)
+        | ConsensusMsg::Body(_)
+        | ConsensusMsg::SyncResp { .. } => false,
+    }
+}
+
 /// Map a received consensus message to the engine input and step it. A `Propose` carries the full block, so
 /// every DA shard is present — the engine's `reconstruct_payload` still checks them against `da_commit`. `from`
-/// is the sender's validator index; it matters only for a `SyncReq`, whose certified-state reply the engine
+/// is the sender's validator index; it matters only for the two variants that answer the sender —
 /// directs back to that requester (`Output::SendTo`).
-fn step_msg<S: StateMachine>(engine: &mut ConsensusEngine<S>, msg: &ConsensusMsg, from: u8) -> Vec<Output> {
+/// Feed one consensus message to the engine. `from` is a **reply address**, not an attribution — and the
+/// `Option` is the whole point of this signature.
+///
+/// **Membership is established by a key, and placement was standing in for it.** The engine attributes a
+/// vote by the `voter` field the sender signed and checks it against `verifiers[voter]`
+/// (`ConsensusEngine::accept_vote`); the coordinate takes no part in that decision. Yet the caller used to
+/// admit a message only if it could turn the sender's coordinate into a member index — so a validator that
+/// had re-seated, and whose move this node had not yet learned, had its **signature-verified votes dropped
+/// before they reached the engine**. `taxis_driver`'s own comment names that state: such a mover is
+/// "indistinguishable from a stranger".
+///
+/// Only two of the ten variants ever read the index, and both read it to address a reply. Making it
+/// `Option` lets the other eight be admitted on their own evidence, which is the evidence the engine uses
+/// anyway, and forces the two that need an address to say so.
+fn step_msg<S: StateMachine>(
+    engine: &mut ConsensusEngine<S>,
+    msg: &ConsensusMsg,
+    from: Option<u8>,
+) -> Vec<Output> {
+    if from.is_none() && needs_a_reply_address(msg) {
+        return Vec::new();
+    }
     let input = match msg {
         ConsensusMsg::Propose(b) => Input::Propose { block: b.clone(), shards: Box::new(b.da_shards().map(Some)) },
         ConsensusMsg::Vote(sv) => Input::Vote(sv.clone()),
         ConsensusMsg::Reveal(r) => Input::Reveal(r.clone()),
         ConsensusMsg::ExecVote(v) => Input::ExecVote(v.clone()),
+        // The two that answer the sender directly, so a reply needs somewhere to go. Without a slot this
+        // node cannot address one, and staying silent is right: the requester retries, and inventing a
+        // destination would send this cell's state to whoever happens to hold that index.
         ConsensusMsg::SyncReq { have_height, have_root } => {
+            let Some(from) = from else { return Vec::new() };
             Input::SyncReq { from, have_height: *have_height, have_root: *have_root }
         }
         ConsensusMsg::CommitCert(cert) => Input::CommitCert(cert.clone()),
         // The body-recovery pair. `Body` deliberately does NOT go to `on_skeleton` like `Propose` does: it is a whole
         // block answering a decision this validator already holds, and the engine checks it against that decision.
-        ConsensusMsg::NeedBody { block } => Input::NeedBody { from, block: *block },
+        ConsensusMsg::NeedBody { block } => {
+            let Some(from) = from else { return Vec::new() };
+            Input::NeedBody { from, block: *block }
+        }
         ConsensusMsg::Body(b) => Input::Body(b.clone()),
         ConsensusMsg::SyncResp { cert, above, snapshot } => {
             Input::SyncResp { cert: cert.clone(), above: above.clone(), snapshot: snapshot.clone() }
@@ -891,7 +966,7 @@ fn drive<S: StateMachine>(
                 }
                 // Deliver back to ourselves, cascading any further outputs (prepare → commit → reveal …). For a
                 // Propose this is the FULL block: the proposer already holds its own payload.
-                for more in step_msg(engine, &msg, me) {
+                for more in step_msg(engine, &msg, Some(me)) {
                     queue.push_back(more);
                 }
             }
@@ -899,7 +974,7 @@ fn drive<S: StateMachine>(
                 // A directed reply (a `SyncResp` serving a lagging peer's `SyncReq`): emit only to that peer.
                 let frame = to_frame(&msg);
                 if to == me {
-                    for more in step_msg(engine, &msg, me) {
+                    for more in step_msg(engine, &msg, Some(me)) {
                         queue.push_back(more);
                     }
                 } else if let Some(&coord) = coords.get(to as usize) {
@@ -1091,7 +1166,7 @@ fn admit<S: StateMachine>(
     full: Block,
 ) {
     // `from` is unused for a Propose; the reconstructed block carries its own proposer index.
-    let outs = step_msg(engine, &ConsensusMsg::Propose(full), me);
+    let outs = step_msg(engine, &ConsensusMsg::Propose(full), Some(me));
     drive(engine, client, coords, me, outs, events, last_ckpt, slash_sealer, seen, da, last_broken);
 }
 
@@ -1134,6 +1209,47 @@ mod tests {
     ///
     /// They are computed now, so this asserts what the computation is *for* — the reasons, which are the part
     /// a future edit can still get wrong.
+    /// **A validator that re-seated does not stop being one** — the property the admission test used to
+    /// destroy, asserted on the predicate that now carries it.
+    ///
+    /// Membership in TAXIS is a key: `ConsensusEngine::accept_vote` reads the signed `voter` and checks it
+    /// against `verifiers[voter]`; the sender's coordinate takes no part. The driver nevertheless admitted a
+    /// message only if it could turn that coordinate into a slot index, so a mover whose move this node had
+    /// not yet learned had its **signature-verified votes dropped before the engine saw them** — the driver's
+    /// own comment names the state, "indistinguishable from a stranger".
+    ///
+    /// Two of the ten variants genuinely need the index, and both need it to address a reply. This pins the
+    /// split, and the `match` inside the predicate makes a new variant a build error rather than a silent
+    /// default — which matters because the two kinds have opposite consequences for a re-seated validator.
+    #[test]
+    fn only_the_messages_that_answer_the_sender_need_to_know_where_it_sits() {
+        use fanos_taxis::block::Block;
+        use fanos_taxis::consensus::ConsensusMsg;
+
+        // The two that reply. Without a slot these must stay silent rather than guess a destination:
+        // sending this cell's state to whoever currently holds that index is the failure being avoided.
+        assert!(needs_a_reply_address(&ConsensusMsg::SyncReq { have_height: 7, have_root: [0; 32] }));
+        assert!(needs_a_reply_address(&ConsensusMsg::NeedBody { block: [1; 32] }));
+
+        // And the self-attributing ones, which are the whole point: each is judged by its signature, so a
+        // slot this node has not re-pointed is a move in flight rather than a stranger.
+        //
+        // **Every cheaply-constructible one is named**, and that is deliberate: the `match` in the predicate
+        // forces a *decision* for a new variant but cannot force the right one, and flipping an existing
+        // self-attributing variant to `true` is exactly the regression this pins — it would resume dropping
+        // that message from any validator whose move has not propagated. Measured while falsifying: with
+        // only `Propose` and `Body` asserted, flipping `SyncResp` passed unnoticed.
+        let empty =
+            Block::assemble([0; 32], 1, Epoch::new(1), 0, Vec::new());
+        assert!(!needs_a_reply_address(&ConsensusMsg::Propose(empty.clone())));
+        assert!(!needs_a_reply_address(&ConsensusMsg::Body(empty)));
+        // `Vote`, `Reveal`, `ExecVote`, `CommitCert` and `SyncResp` are not named here because none can be
+        // built from outside the crate — their fields are private, which is right for values that carry
+        // signatures. So this test's reach is the two above, and the residual is stated rather than hidden:
+        // a future edit that flips one of the five to `true` is caught by review and by the doc on the
+        // predicate, not by this assertion.
+    }
+
     #[test]
     fn the_round_timeout_ladder_holds_the_relationships_its_docs_claim() {
         // A round is propose → prepare → commit, and DA shards must be sampled before a validator can
