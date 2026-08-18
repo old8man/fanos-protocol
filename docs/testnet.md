@@ -18,7 +18,7 @@ by name rather than describing a path that doesn't exist.
 |---|---|
 | **Minimum viable cell** | 7 operators (one Fano plane, `q = 2` — the shipped default) |
 | **Governance today** | the epoch beacon is **dealt**: one founder briefly holds the whole secret |
-| **Governance available, not wired** | a real Byzantine-robust DKG exists (`fanos-keygen`) but has no CLI verb — see §7 |
+| **Governance, trust-minimized** | `fanos keygen` drives the Byzantine-robust DKG across the founding set, so no party ever holds the beacon secret — read §7 before using it: the ceremony finalizes on **timers**, which makes its phase deadlines a safety parameter |
 | **Roles a cell should cover** | relay, storage, rendezvous (cheap, offer broadly); exit, service, ingress (opt-in, see §2) |
 | **Convergence check** | `fanos status census` + `fanos status coherence` — see §5 |
 | **Binary** | `fanos`, built from `crates/fanos-node`; `--features validator` adds the TAXIS chain, `--features vpn` the full-tunnel datapath |
@@ -95,8 +95,9 @@ material beyond the shared beacon, so there's no reason not to spread that cover
 
 ## 3. Founding a cell, step by step
 
-This is the **dealt** path — the only one `fanos` can drive today. §7 covers exactly what a DKG-based
-founding would need instead, and why it isn't this section.
+This is the **dealt** path. It is no longer the *only* one `fanos` can drive — `fanos keygen` (§7) runs the
+distributed ceremony end to end — and it is still the simpler one: a single command, on one machine, against
+no schedule. §6 says what it costs; §7 says what the alternative costs instead.
 
 ### 3.1 One founder deals the epoch beacon
 
@@ -576,9 +577,13 @@ ever holding the whole secret.
   qualified set, so a bad dealer changes which key everyone lands on and not whether they agree.*
 
   *What remains is genuinely the verb and the choreography below — the transport question is answered.)*
-* **No provisioning-file writer for a DKG run's output.** `BeaconParams::to_config_string()` — the format
-  every anchor file uses — already exists and needs no changes; nothing currently calls it from a
-  `DkgNode`'s `final_share()` / `aggregate_commitment()`.
+* ~~**No provisioning-file writer for a DKG run's output.**~~ **CLOSED — the verb writes it.** `cmd_keygen`
+  builds `BeaconParams { network_id, commitment, threshold, share: Some(..), authority: None }` from the
+  ceremony's own outcome and writes `to_config_string()` to `--out`, in the same format `beacon-deal`
+  produces — so nothing downstream of §3.4 changes once the file exists. `authority` is `None` deliberately
+  and the verb says so on success: a DKG that produces the beacon share does not produce the
+  recovery-authority keys, and a file that silently carried none would look provisioned while leaving the
+  cell unable to ever reshape its beacon.
 * **The recovery authority is untouched by the DKG entirely**, and this is worth stating precisely because
   it's easy to assume the DKG closes the whole governance gap in §2.1 and it does not: `DkgNode` has no
   concept of a recovery-authority keypair. Even a fully-wired `fanos keygen` would still need the step
@@ -588,37 +593,40 @@ ever holding the whole secret.
   moved off the dealer — `fanos authority-key` generates a founder's keypair on that founder's own machine
   and `beacon-deal --authority-verifiers` deals against the collected public halves, writing no authority
   secret at all (§3.1a). So the recovery authority is now the **less** centralized half of the founding: it
-  needs no trusted dealer, and the beacon secret still does until the DKG below is wired. The step remains
+  needs no trusted dealer, and — since `fanos keygen` shipped — neither does the beacon secret. The step remains
   separate from a `fanos keygen` run — a DKG that produced the beacon share would still not produce these
   keys — but it is no longer a single-party one.)*
-* **No discovery/transport step** for "these `n` operators, each on their own machine, are all in the same
-  run." `fanos-sim`'s test wires every `DkgNode` directly in one process over a hand-rolled bus; a real
-  multi-operator run needs the participants reachable by network address first.
+* ~~**No discovery/transport step**~~ **CLOSED — the roster is the discovery step.** `--roster` takes the
+  `x:y:z@host:port` seed form every other verb already speaks and calls
+  `fanos_node::config::seed_directory`, then seats the ceremony on the shipped mutual-TLS transport
+  (`fanos_quic::spawn_self_certifying_persistent_over::<F2>`) at the fixed point `DkgNode` addresses its
+  peers by. The participants reach each other by network address; the sim's in-process bus is no longer the
+  only thing that has ever carried a `DkgNode` frame.
 
-### What building it would concretely require
+### What was built — and the one residual, which is a safety parameter rather than a convenience
 
-Naming this precisely, so it's a scoped piece of work rather than an open question:
+All three items this section used to list as unbuilt work are in the tree: the verb (`cmd_keygen`), the
+provisioning-file write, and the transport. What is left is the third item's last sentence, and it is
+sharper than "unmeasured".
 
-1. A CLI verb — e.g. `fanos keygen --n 7 --t 5 --index <1..7> --listen ADDR --bootstrap <other peers>
-   --out DIR` — that draws this operator's own secret and session nonce from OS entropy, seats a
-   `DkgNode::<F>::new(Point::at(index-1), t, secret, nonce)` on a real transport reaching the other `n-1`
-   participants (very likely `spawn_self_certifying_persistent_on`/`_over` at a *fixed* point, the same
-   pattern `fanos validator` already uses to seat at `Point::at(me)` — `DkgNode` already addresses peers by
-   `coord_of(index)`, a fixed point, so this is closer to `taxis-deal`'s ceremony shape than to a normal
-   VRF-seated node), waits for `Notification::DkgComplete`, and writes this participant's own
-   `anchor-<index>.beacon`-equivalent file from `final_share()` + `aggregate_commitment()` + `t` — in the
-   same `BeaconParams::to_config_string()` format already in use, so nothing downstream of this document's
-   §3.4 needs to change once the file exists.
-2. The recovery-authority step above, run separately — each founder's own `fanos authority-key`, collected
-   into a verifier list (§3.1a). Unchanged by the DKG in either direction: it is already trust-minimized,
-   and a `keygen` run that produced the beacon share would still not produce these keys.
-3. All `n` founding operators running step 1 at roughly the same time — the library's sharing/complaint
-   deadlines default to 1.5 s each (`DEFAULT_SHARE_DEADLINE`/`DEFAULT_COMPLAINT_DEADLINE`), tuned for a
-   simulated bus, not real network latency plus human coordination across operators in different locations.
-   What deadline a real multi-operator ceremony needs is itself unmeasured.
+**`DkgNode` advances strictly on timers.** `Input::Timer(DKG_SHARE_DEADLINE) → open_complaints` and
+`Input::Timer(DKG_COMPLAINT_DEADLINE) → finalize`; no phase closes early because every frame it was waiting
+for arrived. Two things follow, and only the second is a hazard:
 
-Until this exists, **the dealt path in §3.1 is the only one `fanos` can drive**, and §6's costs apply to
-every testnet founded from this document today.
+1. A ceremony always costs `share + complaint` — **60 s** at the CLI's `30 s` apiece — however fast the
+   founders are. That is a price, and a small one.
+2. **`QUAL` is whatever each participant has qualified when its own timer fires.** So on a real network two
+   founders can finalize on *different* qualified sets, and the library's own test names the consequence:
+   *"two nodes then finalize on different qualified sets, so their aggregate commitments differ"*. Different
+   aggregates are shares that never combine — a beacon that can never assemble a round, i.e. an epoch clock
+   that never turns.
+
+`30 s` is a chosen number where a measurement would do: the phase has to outlast the slowest honest
+founder's connect-and-deliver, which is a property of the operators' network rather than of this code.
+
+So both paths are drivable today, and the choice is a real one rather than a default: §6's costs apply to
+every testnet founded on §3.1, and the paragraph above is what founding on `fanos keygen` asks you to accept
+instead.
 
 ---
 

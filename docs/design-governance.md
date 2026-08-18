@@ -53,10 +53,13 @@ Two paths exist, and only one is safe for a public network:
 It cannot run the DKG itself — that needs the founding nodes to be running and talking to each other — which is
 precisely why the dealt path must not be the one a public launch walks into by default.
 
-**Decision required before a public launch:** run the DKG across the founding set. The code is there; what is
-missing is only the operational choreography. `docs/testnet.md` §7 spells out exactly what exists in
-`fanos-keygen` today, what a CLI ceremony for it would still need to be built, and — separately — what the
-dealt path costs in the meantime for anyone launching before that choreography exists.
+**Decision required before a public launch:** run the DKG across the founding set. **The choreography is no
+longer missing** — `fanos keygen --roster FILE --threshold T --out FILE` seats a `DkgNode` on the shipped
+mutual-TLS transport, waits for the ceremony, and writes this founder's beacon params, so every founder draws
+its own secret and none is ever transmitted whole. What remains is a *parameter*, and `docs/testnet.md` §7
+states it precisely: the engine finalizes on timers, so `QUAL` is whatever each participant has qualified when
+its own deadline fires, and two founders that finalize on different qualified sets agree on no joint key at
+all. §7 also states what the dealt path costs instead, for a launch that chooses it knowingly.
 
 ### 2.1b The POROS ingress descriptor — a dealt secret with a *published* half
 
