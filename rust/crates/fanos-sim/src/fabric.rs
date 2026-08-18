@@ -2962,10 +2962,25 @@ mod tests {
     /// after it, across two independent runs each. An order of magnitude, in the same direction, twice. The
     /// budget fix is justified by *that*, not by the packing column.
     ///
-    /// **So the honest statement of the outcome is a range, not a number**: on the shipped plane the cell
-    /// spends somewhere between a fifth and all of its time below the line-viability floor, and no single
-    /// run of this fixture separates the arms. Answering it needs repeated runs on an idle machine, which is
-    /// work this measurement has not done.
+    /// **Answered on an idle machine, and it does separate the arms.** Two paired runs of one build, with
+    /// nothing else running, plus a third of the preceding build:
+    ///
+    /// | | `n = 7` below floor | points | `n = 10` below floor | points |
+    /// |---|---|---|---|---|
+    /// | run 5 (pre-descriptor) | 86 % | 5.1 | 44 % | 5.6 |
+    /// | quiet A | 86 % | 4.5 | **25 %** | 5.9 |
+    /// | quiet B | 86 % | 5.1 | **25 %** | 6.1 |
+    ///
+    /// `n = 7` reads **86 %** in all three; `n = 10` reads **25 %** in both paired runs. Those are the
+    /// numbers an operator can be given. The earlier 19 %-against-69 % spread was the contended box, not the
+    /// distribution.
+    ///
+    /// **One regression came back with the signed descriptor and is not explained**: `outranked` was 0 at
+    /// both loads in run 5 and reads 914 and 3 251 at `n = 10` here. The rule it belongs to is intact — a
+    /// contested seat is not *committed* — but a node can commit while uncontested and be outranked
+    /// afterwards, and an `Announce` that grew by ~5.4 KB is a plausible reason the claim now arrives after
+    /// the role loop's 15 s commit rather than before it. Measure that before treating the descriptor's cost
+    /// as free.
     ///
     /// ## The third layer, and the instrument is what found it
     ///

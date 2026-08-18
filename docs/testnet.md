@@ -57,13 +57,22 @@ makes every line viable is `fanos_geometry::members_for_a_covered_plane`, which 
 `M = 1.5N`, simulated against the real line-confined probe walk. Three of the ten hold no seat at any given
 moment; that is not waste, it is what fills the points a seven-node draw leaves empty.
 
-**And a live cell does worse than that table, by an amount this document will not put a number on.**
-`fanos-sim`'s `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per
-load across six epoch turns, and on a build carrying the placement fixes of 2026-08-18 it read the cell
-**below the line-viability floor in between a fifth and all of its samples**, depending on the run — two
-runs of the identical build differed by 50 points, because the second was taken on a machine that was not
-idle. What is *not* in doubt is the direction: below that floor at least one of the seven lines cannot serve
-a threshold gather, which is what a mixnet hop is, and the cell does not say so.
+**And a live cell does worse than that table.** `fanos-sim`'s
+`measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per load across six
+epoch turns; measured on an idle machine, two paired runs of the same build (2026-08-18):
+
+| operators | occupied points | samples below the line-viability floor |
+|---|---|---|
+| 7 | 4.5–5.1 of 7 | **86 %** |
+| **10** | **5.9–6.1 of 7** | **25 %** |
+
+Below that floor at least one of the seven lines cannot serve a threshold gather, which is what a mixnet hop
+is — and the cell does not say so. A seven-operator cell is below it **most of the time**; ten operators cut
+that to a quarter of the time. Neither is zero.
+
+(An earlier revision of this section quoted 19 % for ten operators from a single run. A repeat of the
+identical build read 69 %, because that one was taken while the machine was compiling. The numbers above are
+from an idle box and agree with each other.)
 
 **Placement across an epoch boundary is an open defect, not a solved problem.** Read the measurement's own
 notes before planning a launch around it: three claim-propagation losses and a walk-budget defect are fixed,
