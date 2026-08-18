@@ -4129,6 +4129,18 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
             commitment = %fanos_node::config::hex_encode(commitment),
             "distributed key generation complete"
         ),
+
+        // **A ceremony that finished and did not agree**, which is a person's problem and not a status
+        // line: the key this node holds is real, verifiable and useless, because fewer than a threshold of
+        // participants hold the same one. `warn!` rather than `info!` for the reason the admission arm one
+        // screen down splits on — nothing will change on its own, and the remedy (identical roster and
+        // threshold on every founder, then re-run) is an action.
+        Notification::DkgDiverged { agreed, heard } => warn!(
+            agreed,
+            heard,
+            "distributed key generation finished WITHOUT agreement — no key was published; check that every \
+             founder passed the identical --roster file and --threshold, then re-run"
+        ),
         Notification::RendezvousLine(l) => info!(line = ?l, "rendezvous line selected"),
         Notification::Availability { key, available } => info!(
             key = %fanos_node::config::hex_encode(key),
