@@ -199,17 +199,28 @@ so of any identities contesting a position exactly one (the minimum id) keeps it
 recursively and conflict-free, with no negotiation. A 5-way contention converges to a distinct address per
 node (proven by fixed-point iteration) and is order-independent.
 
-**Remaining to make the hierarchy fully live (the large follow-on).** (a) **Transport addressing keyed by
-the hierarchical address.** The base cell conflates the transport coordinate with the level-0 point; that
-is correct only at depth 1, because two identities that VRF to the same level-0 point then collide on one
-transport coordinate. A genuine multi-cell topology must reach a node by *routing to its sub-cell then its
-leaf* (`RouteHier`, already built), so the physical/Directory key must be the full `HierAddr` (or a unique
-flattening), not the level-0 point — this is the foundational change the deep hierarchy waits on. (b) A
-**multi-cell simulator**: the sim is one node per transport `Triple` in a single plane; a real deep
-hierarchy needs a multi-cell container that seats sub-cells and routes cell-to-cell (the descent policy +
-`RouteHier` are ready; the harness is not). (c) **Live descent actuation**: wire
-`derive_hierarchical_address` into `OverlayNode::on_announce` (re-derive on membership change, re-seat,
-re-announce), which unblocks once (a) lands. (d) **Parent-observes-child**: route a child's
+**Remaining to make the hierarchy fully live (the large follow-on).** Items (a) and (c) are **superseded by
+what shipped 2026-08-19** — read this paragraph before either.
+
+*(a) was thought to be foundational and is not needed.* The claim was that the Directory key must become the
+full `HierAddr`, because two identities that VRF to the same level-0 point collide on one transport
+coordinate. The cheaper answer, and the one built: **a descendant keeps its transport coordinate and is
+reached inbound by `RouteHier` through an ancestor**, so `Directory` stays `HashMap<Triple, Binding>` and
+holds depth-1 nodes only. Re-keying it would have moved every coordinate-keyed consumer in the tree
+(`cap_slot`, the erasure shard homes, the validator table) for nothing a descendant needs. The one
+requirement is negative and testable: a descended node must not *write* a flat binding under the point it
+lost. Its price, stated rather than hidden: a deep node's inbound reachability depends on an ancestor being
+alive, which the flat plane does not require.
+
+*(c) actuates from the driver, not from `on_announce`.* The trigger is not a membership change — it is the
+**placement walk running out**, which only `fanos-quic`'s `reshuffle_loop` can see, because level 0 is
+settled by the VRF claim order and a rival for this node's own point never appears in `router.peers`. So the
+driver states that one fact (`Command::ProposeAddress { contested }`), the engine derives the deeper levels
+from the identities its `Announce`s carry, and `Command::Descend { path }` adopts and re-announces — with the
+descriptor signed in between, because it binds `(coord, hier, id)` and the engine cannot sign.
+
+*(b) still stands*: the sim is one node per transport `Triple` in a single plane, so a deep hierarchy still
+has no harness that seats sub-cells and routes cell-to-cell. (d) **Parent-observes-child**: route a child's
 `Notification::Escalated` to a live `ParentCell` (today fed only by hand in `hierarchy.rs`). (e)
 **Cross-cell content placement**: `MapToPoint(H(key))` is single-plane full-cell today; the hierarchy needs
 a cross-cell key-placement rule. The descent policy is the verified keystone the rest of this composes on.

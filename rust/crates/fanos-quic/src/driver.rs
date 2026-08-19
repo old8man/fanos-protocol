@@ -2085,6 +2085,8 @@ where
             settling: Arc::clone(&handle.settling),
             walk_after: None,
             rounds: 0,
+            addressed: None,
+            deep: Vec::new(),
         },
         Reseater {
             dials: handle.dials.clone(),
@@ -2333,6 +2335,27 @@ struct Placement {
     /// length of a probe walk, so after that many rounds there is nowhere left to go and staying settleable
     /// buys nothing. `settle_index` is monotone, so the count cannot be reset by a peer arriving late.
     rounds: u16,
+    /// The last answer this node gave the engine about whether it holds its level-0 point, or `None` if it
+    /// has not asked this epoch (spec §L0/§L1).
+    ///
+    /// **A latch, not a cache**, and it is what keeps the descent from becoming a flood. This arm wakes on
+    /// every recorded claim, so asking on each exhausted settle would put one `ProposeAddress` on the
+    /// command channel per peer per epoch and re-announce the same address every time. Asking only when the
+    /// answer *changes* makes it at most twice per epoch: once when the walk runs out, once if a later draw
+    /// wins the point back.
+    ///
+    /// Cleared at the boundary, because the coordinate is re-derived there and the question is asked afresh
+    /// about a point this node has not contested yet.
+    addressed: Option<bool>,
+    /// The levels **below** level 0 of this node's overlay address — empty for the flat case.
+    ///
+    /// Held here because the descriptor signature must cover the address the engine will announce, and
+    /// after a reshuffle those are not the same thing: `on_reseat` deliberately preserves the deep levels
+    /// (they are identity-derived and epoch-independent) while moving level 0, so a descendant's next
+    /// announce carries `[new_point] ++ deep`. `sign_descriptor`'s own warning is exactly this — *"the host
+    /// predicts it as `root(coord)` … and is what fails the day a node descends"* — and predicting a root
+    /// address for a descended node produces a signature every verifying peer drops in silence.
+    deep: Vec<Triple>,
 }
 
 /// The three surfaces a re-seat has to move together, in one value.
@@ -2393,6 +2416,64 @@ impl Reseater {
     /// contested point — which resolves to the incumbent, since the table still holds *its* binding — and the handshake
     /// records the incumbent's **verified** claim in the book. The next `Wake::Resettle` then settles against a book
     /// that knows about the rival, which is the input `settle_index` was missing.
+    /// Tell the engine whether this node holds its level-0 point, so it can name the overlay address that
+    /// follows (spec §L0/§L1). Answered by `Notification::AddressProposed`; nothing moves here.
+    ///
+    /// **Latched on the answer, not on the event.** The `Resettle` arm wakes on every recorded claim, so
+    /// asking each time the walk came up empty would put one command on the channel per peer per epoch and
+    /// re-announce an address that had not changed. Asking only when the *answer* changes bounds it at twice
+    /// per epoch — once when the walk runs out, once if a later draw wins the point back — and the latch is
+    /// cleared at the boundary, where the coordinate is re-derived and the question is genuinely new.
+    ///
+    /// The latch is set only when the command was accepted: a stopped engine will not answer, and recording
+    /// the question as asked would leave the node waiting for a reply nobody is going to send.
+    fn ask_address(&self, at: &mut Placement, contested: bool) {
+        if at.addressed == Some(contested) {
+            return;
+        }
+        if self.client.command(Command::ProposeAddress { contested }) {
+            at.addressed = Some(contested);
+        }
+    }
+
+    /// Sign the address the engine named and hand it back to be adopted.
+    ///
+    /// **The descriptor first, and here the order is structural rather than remembered.** `Command::Descend`
+    /// re-announces, the announce carries the address, and a peer running self-certified membership rebuilds
+    /// `descriptor_message(coord, hier, id)` to check it — so a descent announced under the previous
+    /// signature is dropped silently, exactly as `Command::Descriptor` warns for a reseat. Splitting the
+    /// engine's *proposal* from its *adoption* is what makes room for the signature between them.
+    ///
+    /// **The directory is deliberately untouched.** A descendant keeps its transport coordinate and is
+    /// reached inbound through an ancestor (`RouteHier`), and the requirement that goes with that is
+    /// negative: it must not *write* a flat binding under the point it lost. It does not — `apply` is the
+    /// only writer and the exhausted paths never reach it — and the binding it already holds is ranked, so
+    /// the node that wins the point supersedes it by the ordinary rule rather than by anything special here.
+    ///
+    /// A malformed path is dropped rather than passed on. It can only come from this node's own engine, so
+    /// there is nobody to report it to; the engine counts the refusal it would have made.
+    fn adopt_address<F: Field>(&self, at: &mut Placement, path: Vec<Triple>) {
+        let Some(points) = path.iter().map(|&c| Point::<F>::new(c)).collect::<Option<Vec<_>>>() else {
+            return;
+        };
+        let Some(hier) = fanos_geometry::HierAddr::<F>::from_path(points) else {
+            return;
+        };
+        if let Some((id, secret)) = &self.descriptor {
+            let msg = fanos_runtime::descriptor_message::<F>(at.coord, &hier, id);
+            let sig = secret.sign(&msg).to_bytes();
+            if !self.client.command(Command::Descriptor { id: id.clone(), sig }) {
+                return; // the engine stopped; the address is not adopted, which is the safe direction
+            }
+        }
+        if !self.client.command(Command::Descend { path: path.clone() }) {
+            return;
+        }
+        // Remember the levels below the top, so the next reshuffle signs the address the engine will
+        // actually announce rather than the flat one it would otherwise predict.
+        at.deep = path.into_iter().skip(1).collect();
+    }
+
     fn apply<F: Field>(&self, at: &mut Placement, index: u16, claim: &CoordinateClaim) -> bool {
         let point = fanos_vrf::probe_point::<F>(&at.output, index).coords();
         // Whether this call moves the seat at all. It decides who announces the new HELLO, and the two
@@ -2460,7 +2541,23 @@ impl Reseater {
         if !unchanged
             && let Some((id, secret)) = &self.descriptor
         {
-            let hier = fanos_geometry::HierAddr::<F>::root(fanos_vrf::probe_point::<F>(&at.output, index));
+            // **The address the engine will announce, which after a reshuffle is not `root(point)`.**
+            // `on_reseat` preserves the deep levels on purpose — they are identity-derived and
+            // epoch-independent — so a descended node's next announce carries `[point] ++ deep`, and a
+            // signature over the flat address is one every verifying peer drops in silence.
+            // `sign_descriptor`'s own warning names this: *"the host predicts it as `root(coord)` … and is
+            // what fails the day a node descends."* A node that never descended has `deep` empty, so this
+            // is the same value it always was.
+            let hier = {
+                let mut levels = vec![fanos_vrf::probe_point::<F>(&at.output, index)];
+                levels.extend(at.deep.iter().filter_map(|&c| Point::<F>::new(c)));
+                match fanos_geometry::HierAddr::<F>::from_path(levels) {
+                    Some(h) => h,
+                    // Unreachable while `deep` comes from an adopted path, and a refusal is the safe
+                    // reading: signing a shorter address than the announce carries is the failure above.
+                    None => return false,
+                }
+            };
             let msg = fanos_runtime::descriptor_message::<F>(point, &hier, id);
             let sig = secret.sign(&msg).to_bytes();
             if !self.client.command(Command::Descriptor { id: id.clone(), sig }) {
@@ -2550,6 +2647,11 @@ const fn may_walk(steps: u16, bound: u16) -> bool {
 ///
 /// Exits when the engine stops.
 #[allow(clippy::too_many_arguments)]
+// One cohesive select loop over the wakes a placement can have — a beacon, a recorded claim, a member
+// learned, an address named — and the arms share `at`, `seat` and `book` on every path. Splitting it would
+// thread that state through signatures rather than remove any of it, which is the same judgement
+// `taxis_driver::spawn_taxis` records for its own loop.
+#[allow(clippy::too_many_lines)]
 async fn reshuffle_loop<F: Field>(
     creds: NodeCredentials,
     mut at: Placement,
@@ -2579,6 +2681,9 @@ async fn reshuffle_loop<F: Field>(
             Resettle,
             /// A member was learned by announcement; ask it for its claim if the book has none for that point.
             Meet(Triple),
+            /// The engine answered `Command::ProposeAddress` with the hierarchical address this node may
+            /// hold. Nothing has moved yet — the descriptor must be signed over it first.
+            Addressed(Vec<Triple>),
             /// The engine stopped.
             Stop,
         }
@@ -2598,6 +2703,7 @@ async fn reshuffle_loop<F: Field>(
                 // the ordinary path. One request per member first seen, so it is bounded by the membership
                 // this node learns rather than by anything a peer can drive.
                 Ok(Notification::MemberJoined { coord, .. }) => Wake::Meet(coord),
+                Ok(Notification::AddressProposed { path }) => Wake::Addressed(path),
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => Wake::Resettle,
                 Err(broadcast::error::RecvError::Closed) => Wake::Stop,
             },
@@ -2656,13 +2762,19 @@ async fn reshuffle_loop<F: Field>(
                 at.settling.store(true, Ordering::Release);
                 at.rounds = 0;
                 at.walk_after = None;
+                // The coordinate was just re-derived, so whether this node holds its level-0 point is an
+                // open question again — and a node that descended last epoch may win a seat this one.
+                at.addressed = None;
                 // The book's claims belong to the retired epoch; clearing it (above, before the window) is
                 // what stops a peer's past placement from justifying a displacement now. Settling
                 // immediately afterwards therefore lands at index 0 and moves up again as this epoch's
                 // peers are met — which is why a claim held back by a beacon this node did not have yet is
                 // worth retrying rather than dropping.
                 let Some((index, claim)) = claims::settle::<F>(&book, &rank, proof) else {
-                    continue; // every point of this epoch's line is better claimed — announce nothing
+                    // Every point of this epoch's line is better claimed. Announce nothing **flat** — and
+                    // ask for a sub-cell address instead of sitting on a point this node does not own.
+                    seat.ask_address(&mut at, true);
+                    continue;
                 };
                 // **No early exit for "the point did not change".** It used to `continue` here, and what it
                 // skipped was not a move — there is none — but the three things `apply` does besides moving:
@@ -2686,6 +2798,13 @@ async fn reshuffle_loop<F: Field>(
             // built. Whether moving an established node is in fact harmful is **unverified** rather than disproven — the
             // measurement that appeared to show it breaking consensus was a load artefact the baseline refuted — and "do
             // not move a node the cell has committed to" is the right default while that is open.
+            // **The engine named an address; this signs it and adopts it.** Three steps rather than one
+            // because the descriptor binds `(coord, hier, id)` and the engine cannot sign: it proposes, the
+            // driver signs, and only then does `Command::Descend` announce. That ordering is the same rule
+            // `Command::Descriptor` states for a reseat, made structural instead of remembered.
+            Wake::Addressed(path) => {
+                seat.adopt_address::<F>(&mut at, path);
+            }
             Wake::Resettle if at.settling.load(Ordering::Acquire) => {
                 // Too soon since the last step to have been followed — say nothing and spend no round. The
                 // next notification retries; the boundary clears the clock along with the budget.
@@ -2697,10 +2816,17 @@ async fn reshuffle_loop<F: Field>(
                 seat.client.set_contested(book.outranked_at::<F>(&at.output, at.index).is_some());
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
                 let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
-                    continue; // beaten on every point of the line; hold the current announcement rather than retract it
+                    // Beaten on every point of the line — which is exactly "this plane has no seat for me",
+                    // and is `derive_address`'s trigger. The flat announcement is held rather than retracted
+                    // (a retraction would make this node unreachable before the sub-cell address lands).
+                    seat.ask_address(&mut at, true);
+                    continue;
                 };
                 if index == at.index {
-                    continue; // still the right seat — and no round is spent, because no step was taken
+                    // Still the right seat. If this node had descended, it holds its point again and must
+                    // ascend — `on_reseat` preserves the deep levels by design, so nothing else would.
+                    seat.ask_address(&mut at, false);
+                    continue; // and no round is spent, because no step was taken
                 }
                 // **The budget is spent on STEPS, and it used to be spent on WAKES.** `may_walk`'s own
                 // derivation is about the walk — *"`probe_bound` is `q + 1`, the whole length of a probe
@@ -2715,7 +2841,11 @@ async fn reshuffle_loop<F: Field>(
                 // — the wakes that delivered the knowledge were what ended it.
                 at.rounds = at.rounds.saturating_add(1);
                 if !may_walk(at.rounds, fanos_vrf::probe_bound::<F>()) {
+                    // The same state as the arm above, reached by budget instead of by proof: the walk has
+                    // considered every point of this node's line. `commit_seat` is a no-op while the seat is
+                    // contested, so without this the node would hold a point it lost until the boundary.
                     seat.client.commit_seat();
+                    seat.ask_address(&mut at, true);
                     continue;
                 }
                 if !seat.apply::<F>(&mut at, index, &claim) {
@@ -6105,7 +6235,7 @@ mod tests {
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
             walk_after: None,
-            rounds: 0,
+            rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
@@ -6211,7 +6341,7 @@ mod tests {
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
             walk_after: None,
-            rounds: 0,
+            rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // **The receiver is kept here**, unlike the neighbouring case: this one asserts what the
