@@ -1604,9 +1604,16 @@ fn note_deficit<F: Field>(
                 // **The same shortfall said in the unit an operator can act in.** Everything above this
                 // line is counted in POINTS, and nobody deploys points: a cell is grown by admitting
                 // members, and members contend for points, so the two numbers differ and the ratio is not
-                // one. Simulated against the shipping walk, `M = N` clears the viability floor 25% of the
-                // time on `PG(2,4)` and `M = 1.5N` clears it 99% — which is the difference between a cell
-                // that serves threshold lines and one that completes no gather anywhere.
+                // one — and it is not a ratio at all. Enumerated through the shipping arbitration at
+                // complete knowledge (`fanos-vrf/examples/line_confinement_coverage.rs`), `M = N` clears the
+                // viability floor **0%** of the time on `PG(2,4)` and `M = 1.5N` clears it **7.5%**; the
+                // load that clears it is `4N`, because line-confined draws must cover `N − d` of `N` points
+                // and that is the coupon-collector shape rather than a multiple.
+                //
+                // This comment read *"`M = N` 25%, `M = 1.5N` 99%"* until 2026-08-19 — the figures
+                // `members_for_a_covered_plane` carried before its own table was refuted, and the last copy
+                // of them in the tree. A number quoted in several places and guarded in none is how the
+                // stale one outlives the correction; this one is the report an operator acts on.
                 members_wanted = fanos_geometry::members_for_a_covered_plane(line_size),
                 "this role is placed by GEOMETRY: its work arrives at a derived line, so a shortfall means \
                  lines nobody can serve rather than slower service. Every line needs `per_line` of its \

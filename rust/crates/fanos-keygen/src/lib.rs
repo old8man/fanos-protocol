@@ -812,10 +812,36 @@ impl<F: Field> DkgNode<F> {
     /// direct sends. The first is the tree's own pattern (self-authenticating frames are relayable,
     /// transport-authenticated ones are not) and is the recommendation.
     ///
+    /// **The signature route has a blocker of its own, priced 2026-08-19 so the third attempt does not pay
+    /// for it again.** A signature is only checkable against a *verifier the receiver associates with the
+    /// claimed dealer index*, and there are three places that could come from, two of which are closed:
+    ///
+    /// * **the roster** — `fanos keygen --roster` speaks `x:y:z@host:port` and carries no keys, so this is
+    ///   an operator-facing format change, not a code one;
+    /// * **inline in the frame** — self-defeating: a bundle carried by the frame is only as good as the
+    ///   binding between it and the index, which is the thing being established;
+    /// * **the transport** — sound, and the one that fits. Every participant authenticates by mutual TLS on
+    ///   a direct connection, and `NodeCredentials::descriptor_identity` makes a node's verifier a function
+    ///   of that certificate. So a receiver that has handshaken with participant `j` **can** know `j`'s
+    ///   verifier, and `Command::Control` is the designed path for a host to hand key material to a
+    ///   sub-engine (*"a sub-engine that installs key material from one is not thereby accepting key
+    ///   material from the network"*).
+    ///
+    /// What blocks the third is small and nameable: **the driver emits no notification when a peer completes
+    /// a handshake**, so the host never learns the moment at which it would hand one over. That is the
+    /// enabling change, and it is smaller than either alternative.
+    ///
+    /// The bootstrap also works out, which is worth stating because it looks circular: a ceremony's roster
+    /// names everyone and every participant dials every other at the start, so the verifiers are established
+    /// while all links are healthy. The relay is then needed only when a link fails *later* — which is
+    /// exactly the failure `one_censored_link_gives_the_dkg_two_different_qualified_sets` models.
+    ///
     /// The flood below **is** kept: it costs nothing, it preserves `from` (this node is the dealer of what
     /// it broadcasts), and it removes the dependence on resolving `q² + q + 1` coordinates that a churning
     /// cell cannot satisfy. It does not close the `QUAL` fork, and
-    /// `one_censored_link_gives_the_dkg_two_different_qualified_sets` still asserts that fork today.
+    /// `one_censored_link_gives_the_dkg_two_different_qualified_sets` still asserts that fork today — what
+    /// is no longer true is that the fork is *silent*: the confirm round refuses to publish a key the cell
+    /// did not confirm.
     ///
     fn broadcast_to_peers(frame: &[u8]) -> Vec<Effect> {
         std::vec![Effect::Flood { frame: frame.to_vec() }]
@@ -1186,6 +1212,16 @@ mod tests {
     /// Deliver every queued `(from, target, frame)` — routing each node's resulting sends back onto the
     /// bus — until the bus is quiescent. `clock` advances monotonically so stepped inputs stay ordered.
     fn drain(nodes: &mut [DkgNode<F2>], bus: &mut Vec<(Triple, usize, Vec<u8>)>, clock: &mut u64) {
+        drain_over(nodes, bus, clock, None);
+    }
+
+    /// [`drain`] with one directed link dark — see [`fire_over`].
+    fn drain_over(
+        nodes: &mut [DkgNode<F2>],
+        bus: &mut Vec<(Triple, usize, Vec<u8>)>,
+        clock: &mut u64,
+        dark: Option<(Triple, usize)>,
+    ) {
         while !bus.is_empty() {
             let (from, target, frame) = bus.remove(0);
             *clock += 1;
@@ -1193,7 +1229,9 @@ mod tests {
             for e in nodes[target].step(Instant(*clock), Input::Message { from, frame }) {
                 match e {
                     Effect::Send { to, frame } => {
-                        if let Some(k) = node_at_f2(to) {
+                        if let Some(k) = node_at_f2(to)
+                            && dark != Some((origin, k))
+                        {
                             bus.push((origin, k, frame));
                         }
                     }
@@ -1201,7 +1239,7 @@ mod tests {
                     // and it is complete, which is what the driver's `flood_connections` approximates.
                     Effect::Flood { frame } => {
                         for k in 0..nodes.len() {
-                            if k != target {
+                            if k != target && dark != Some((origin, k)) {
                                 bus.push((origin, k, frame.clone()));
                             }
                         }
@@ -1225,6 +1263,23 @@ mod tests {
         clock: &mut u64,
         token: TimerToken,
     ) -> Vec<Vec<Effect>> {
+        fire_over(nodes, bus, clock, token, None)
+    }
+
+    /// [`fire`] with one directed link **dark** — `Some((from, to))` drops everything the node at `from`
+    /// emits toward node `to`, in both the addressed and the flooded direction.
+    ///
+    /// One helper rather than two, because the censored copy this replaces had already drifted: it matched
+    /// only `Effect::Send` while `broadcast_to_peers` returns `Effect::Flood`, so it censored the whole
+    /// broadcast substrate rather than one link, and the claim it was demonstrating ("one dropped link is
+    /// enough to fork QUAL") was demonstrated by nothing.
+    fn fire_over(
+        nodes: &mut [DkgNode<F2>],
+        bus: &mut Vec<(Triple, usize, Vec<u8>)>,
+        clock: &mut u64,
+        token: TimerToken,
+        dark: Option<(Triple, usize)>,
+    ) -> Vec<Vec<Effect>> {
         let mut per_node = Vec::with_capacity(nodes.len());
         for k in 0..nodes.len() {
             *clock += 1;
@@ -1233,13 +1288,15 @@ mod tests {
             for e in &effects {
                 match e {
                     Effect::Send { to, frame } => {
-                        if let Some(j) = node_at_f2(*to) {
+                        if let Some(j) = node_at_f2(*to)
+                            && dark != Some((origin, j))
+                        {
                             bus.push((origin, j, frame.clone()));
                         }
                     }
                     Effect::Flood { frame } => {
                         for j in 0..nodes.len() {
-                            if j != k {
+                            if j != k && dark != Some((origin, j)) {
                                 bus.push((origin, j, frame.clone()));
                             }
                         }
@@ -1249,7 +1306,7 @@ mod tests {
             }
             per_node.push(effects);
         }
-        drain(nodes, bus, clock);
+        drain_over(nodes, bus, clock, dark);
         per_node
     }
 
@@ -1414,75 +1471,20 @@ mod tests {
                 }
             }
         }
-        // The censoring drain, otherwise identical to `drain`.
-        //
-        // **It has to carry floods, and for a while it did not.** `broadcast_to_peers` returns
-        // `Effect::Flood`, so a drain that matches only `Effect::Send` drops every complaint and every
-        // justification — which made this fixture *harsher* than the sentence above it, censoring the whole
-        // broadcast substrate rather than one directed link, and left the claim "one dropped link is enough"
-        // demonstrated by nothing. Floods now go everywhere except across the dark edge, which is what the
-        // scenario says.
-        let censoring_drain =
-            |nodes: &mut Vec<DkgNode<F2>>, bus: &mut Vec<(Triple, usize, Vec<u8>)>, clock: &mut u64| {
-                while !bus.is_empty() {
-                    let (from, target, frame) = bus.remove(0);
-                    *clock += 1;
-                    let origin = Point::<F2>::at(target).coords();
-                    for e in nodes[target].step(Instant(*clock), Input::Message { from, frame }) {
-                        match e {
-                            Effect::Send { to, frame } => {
-                                if let Some(k) = node_at_f2(to)
-                                    && !(origin == dark_from && k == dark_to)
-                                {
-                                    bus.push((origin, k, frame));
-                                }
-                            }
-                            Effect::Flood { frame } => {
-                                for k in 0..n {
-                                    if k != target && !(origin == dark_from && k == dark_to) {
-                                        bus.push((origin, k, frame.clone()));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            };
-        censoring_drain(&mut nodes, &mut bus, &mut clock);
-        // Each deadline in turn, with what it emits put back on the (censored) bus — the confirm round is a
-        // broadcast, so a phase whose effects are dropped would make every node report a cell that never
-        // spoke, which is a different failure from the one under test.
+        // Both helpers take the dark edge as a parameter, so this test's transport is the shared one with
+        // one link removed rather than a copy that can drift from it — and it did drift once: the copy this
+        // replaces matched only `Effect::Send` while `broadcast_to_peers` returns `Effect::Flood`, so it
+        // censored every complaint and justification in the cell instead of one directed link.
+        let dark = Some((dark_from, dark_to));
+        drain_over(&mut nodes, &mut bus, &mut clock, dark);
+        // Each deadline in turn. The confirm round is a broadcast, so a phase whose effects are dropped
+        // would make every node report a cell that never spoke — a different failure from the one under
+        // test.
         let mut published: Vec<Vec<Effect>> = Vec::new();
         for token in [DKG_SHARE_DEADLINE, DKG_COMPLAINT_DEADLINE, DKG_CONFIRM_DEADLINE] {
-            published.clear();
-            for k in 0..n {
-                clock += 1;
-                let origin = Point::<F2>::at(k).coords();
-                let effects = nodes[k].step(Instant(clock), Input::Timer(token));
-                for e in &effects {
-                    match e {
-                        Effect::Send { to, frame } => {
-                            if let Some(j) = node_at_f2(*to)
-                                && !(origin == dark_from && j == dark_to)
-                            {
-                                bus.push((origin, j, frame.clone()));
-                            }
-                        }
-                        Effect::Flood { frame } => {
-                            for j in 0..n {
-                                if j != k && !(origin == dark_from && j == dark_to) {
-                                    bus.push((origin, j, frame.clone()));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                published.push(effects);
-            }
-            censoring_drain(&mut nodes, &mut bus, &mut clock);
+            published = fire_over(&mut nodes, &mut bus, &mut clock, token, dark);
         }
+
 
         let agg_majority = nodes[0].aggregate_commitment().expect("the unaffected nodes complete");
         let agg_starved = nodes[dark_to].aggregate_commitment().expect("the starved node completes too — that is the point");
