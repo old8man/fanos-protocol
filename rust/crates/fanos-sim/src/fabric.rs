@@ -3049,10 +3049,31 @@ mod tests {
     /// | `n = 10` | **45 217** | **71** | 17 | 0 |
     ///
     /// The send ladder asks for a coordinate it has no connection filed under **tens of thousands of times
-    /// per run** — the coordinate key rotating out from under the cache
-    /// ([[transport-state-keyed-by-a-rotating-value]] had this as inferred; it is observed now). **But the
-    /// ladder recovers**: frames actually lost are ~75, so the cost is overwhelmingly wasted work rather
-    /// than lost delivery, and identity-keying the cache is justified without being urgent.
+    /// per run**, and frames actually lost are ~75 — so the ladder's lower rungs recover almost everything.
+    ///
+    /// ⛔ **`cache_miss` is NOT a measure of orphaning, and reading it as one was a mistake.** A miss fires
+    /// whenever nothing is filed at the coordinate asked for, and on a 7-point plane with 5 occupied that
+    /// includes every send to a point *this node has never met anyone at* — which
+    /// [[transport-state-keyed-by-a-rotating-value]] names as the competing explanation and says the
+    /// discriminator is the station's `line` (the coordinate refused), a field this fixture does not print.
+    /// Keying the cache by identity did **not** move the count (139 k / 298 k before, 306 k / 216 k after),
+    /// which is what a counter measuring something else looks like.
+    ///
+    /// ⛔ **And identity-keying was BUILT, MEASURED and REVERTED — it regresses the sized load.** Two runs
+    /// per arm, idle machine, `n = 10` below the floor: **17 % / 17 %** with the coordinate key against
+    /// **56 % / 36 %** with the identity key. The arms do not overlap.
+    ///
+    /// The mechanism is the direction each key fails in. A coordinate key fails **safe**: a peer that moved
+    /// leaves nothing filed at its old point, so the lookup misses, the ladder falls through to a dial, and
+    /// the dial reaches whoever is actually there. An identity key with a coordinate index fails **unsafe**:
+    /// `seat[old_point]` still names the departed peer until something removes it, so the lookup *hits* and
+    /// the frame goes to the wrong node. **A wrong hit is worse than a miss**, and the orphaning the key was
+    /// meant to prevent is what kept the old index honest for free.
+    ///
+    /// So the remedy `transport-state-keyed-by-a-rotating-value` recommends needs a third piece it does not
+    /// name: the seat index has to be **invalidated when it goes stale** — the coordinate is only meaningful
+    /// within an epoch, and nothing in the transport expires it at a boundary. Do not re-attempt the key
+    /// without that.
     ///
     /// `repeat_ignored = 0` settles a neighbouring question in passing: `members` is cleared at every
     /// boundary, so an announcement really does repeat each epoch and the flood is not being suppressed.
