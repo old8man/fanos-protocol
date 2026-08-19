@@ -98,10 +98,14 @@ fanos-testkit = { path = "../fanos-testkit" }
 libc = { workspace = true }
 # Build return circuits for the SURB relay tests (audit §5 S1-H3).
 fanos-nyx.workspace = true
+# `test-util` for the paused clock: the cross-cell availability sample asserts four outcomes, three of which
+# are deadlines at `STORE_TIMEOUT`. On a real clock that is fifteen seconds of sleeping to learn nothing the
+# paused clock does not tell instantly — and a suite that sleeps is a suite nobody runs before committing.
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "time",
+    "test-util",
 ] }
 # The live-epoch-clock test builds a 1-of-1 beacon group and reads BeaconReady notifications.
 fanos-field = { workspace = true }

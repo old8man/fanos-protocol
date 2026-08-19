@@ -18,9 +18,10 @@
 //!   forged input. The sibling directories solved exactly this and said why: `telemetry_dir.rs` — *"the
 //!   slot key names a coordinate; nothing used to make that name true"* — and `ingressdir.rs`. This slot
 //!   is keyed `(cell, epoch)`, so a coordinate-bound ownership rule would not cover it.
-//! * `attest_children` calls `ChildRegistry::attest_available`, whose availability mask needs the §L4.3
-//!   sampler that **no shipped binary issues** (#173). A caller with none must pass `0`, which refuses
-//!   every child — so the loop would run and vouch for nothing.
+//! * `attest_children` calls `ChildRegistry::attest_available`, whose availability mask needs a §L4.3
+//!   sampler nothing issued (#173). A caller with none must pass `0`, which refuses every child — so the
+//!   loop would run and vouch for nothing. **Closed**: `sample_child_availability` establishes the mask by
+//!   sampling the child cell's own shards, so a parent can now say yes.
 //!
 //! So the obligation is still conditional, and a conditional obligation still needs a tripwire: **if a
 //! cross-cell publisher gains a production caller while `publish_health` is unauthenticated, that is the
@@ -38,31 +39,39 @@
 /// A source-text observable rather than a behavioural one, deliberately: no state a running node could be
 /// in would report "this directory's record is unauthenticated". The line is the fact.
 ///
-/// **The premise has moved twice, and each move is the tripwire working rather than failing.**
+/// **The premise has moved three times, and each move is the tripwire working rather than failing.**
 ///
-/// It was `"reflexive: config.plane_order == 2"` — *"there is no second cell"* — until #145 was answered by
-/// `fano::cell_of`. It became `resolve_health`'s one-byte parse — *"a parent would decide on unsigned
-/// evidence"* — until that record gained an `Entitlement`: a cell's health is now spoken for by a member of
-/// that cell, verified through the same primitive five sibling directories use.
+/// 1. `"reflexive: config.plane_order == 2"` — *"there is no second cell"* — until #145 was answered by
+///    `fano::cell_of`, which makes cells on any plane whose point count divides by seven.
+/// 2. `resolve_health`'s one-byte parse — *"a parent would decide on unsigned evidence"* — until that record
+///    gained an `Entitlement` binding it to a member of the cell it speaks for.
+/// 3. The availability mask — *"ratification can only say no"* — until `sample_child_availability` built one
+///    from the child cell's own shards.
 ///
-/// **What is left is the availability mask.** `attest_children` calls `ChildRegistry::attest_available` with
-/// a `present` byte its caller supplies, and a caller with no sampler must pass `0`, which refuses every
-/// child — so ratification can only ever say no.
+/// **What is left is the committee, and it is the same shape as the mask was.** `attest_available` resolves
+/// the child's `ChildCommittee` before it verifies anything, and an unregistered child is refused outright —
+/// so a parent that cannot learn its children's validator keys still ratifies nothing, for a *different*
+/// missing input. Nothing anywhere constructs a `ChildCommittee`: it is defined, re-exported, built in
+/// `hierarchy.rs`'s own tests, and built nowhere else. There is no directory that publishes a cell's
+/// committee and none that resolves one.
 ///
-/// The observable took two attempts and the first one was **refuted by this very test**, which is worth
-/// recording because it corrects the work queue. The premise was written as *"nothing issues
-/// `Command::SampleAvailability`"* on the queue's word that #173 was open; the scan immediately reported a
-/// production issuer. It was right: `fanos_quic::Client::sample_availability` exists and its own doc says
-/// the door was cut — *"no way for anything outside the engine to issue one"* was the state **before** it.
+/// That is why the observable is a **struct literal** rather than a call. The mask's producer could be
+/// recognised by someone calling it; a committee's producer cannot, because the type is `pub` with `pub`
+/// fields and any deployment would simply build one. Existence of a construction site is the fact.
 ///
-/// So the door is cut and **nobody walks through it**: zero callers outside the driver that defines it. That
-/// is the premise, and it is a call scan rather than a claim about a function's existence — the same shape
-/// this file already uses for the publishers, and the only shape a stripped-comment corpus can see.
+/// One earlier attempt is worth recording because it corrected the work queue. The premise was once written
+/// as *"nothing issues `Command::SampleAvailability`"* on the queue's word that #173 was open, and the scan
+/// immediately reported a production issuer — `fanos_quic::Client::sample_availability` exists, and *"no way
+/// for anything outside the engine to issue one"* describes the state **before** it.
 ///
 /// **It has to be a line of CODE, not of prose**, and an early attempt at this was a doc paragraph in
 /// `crosscell_dir.rs` that the scan could never see: `shipping_sources` runs every file through
 /// `fanos_testkit::source::code_only`, which strips comments.
-const CELL_FORMATION_PREMISE: &str = "sample_availability(";
+const CELL_FORMATION_PREMISE: &str = "ChildCommittee {";
+
+/// The file that defines the premise's type, excluded for the reason a publisher's own module is: a type
+/// declaring itself, and a test building one, are the mechanism rather than a deployment reaching for it.
+const PREMISE_HOME: &str = "hierarchy.rs";
 
 /// The entry points that would carry a cell's state to another cell.
 const CROSS_CELL_PUBLISHERS: [&str; 5] = [
@@ -135,28 +144,36 @@ fn a_cross_cell_publisher_may_not_be_wired_while_only_one_cell_can_exist() {
         callers.len()
     );
 
-    // The definition lives in `fanos-quic`'s driver, so it is excluded for the same reason the publishers'
-    // own modules are: a function reaching for itself is the mechanism, not a deployment reaching for it.
+    // The scan asserts itself here too, and this half is easy to get wrong: `code_only` strips comments and
+    // test modules, so a premise that only ever appeared in a test would read as "absent" from the start and
+    // the guard would be vacuous forever. `hierarchy.rs` declares the type, so the string must be findable
+    // there — if it is not, this scan cannot see struct literals at all and its verdict means nothing.
+    assert!(
+        sources.iter().any(|(path, text)| path.contains(PREMISE_HOME) && text.contains(CELL_FORMATION_PREMISE)),
+        "`{CELL_FORMATION_PREMISE}` is not even in {PREMISE_HOME}, so this scan cannot see a struct literal \
+         and would report the premise holds no matter what the workspace does"
+    );
     let ratification_refuses_everything = !sources
         .iter()
-        .any(|(path, text)| !path.contains("fanos-quic") && text.contains(CELL_FORMATION_PREMISE));
+        .any(|(path, text)| !path.contains(PREMISE_HOME) && text.contains(CELL_FORMATION_PREMISE));
 
     assert!(
         ratification_refuses_everything || !callers.is_empty(),
-        "something outside the driver now calls `{CELL_FORMATION_PREMISE}`, so a caller of `attest_children` \
-         can build a real availability mask and ratification can say yes — the last recorded reason for \
-         leaving every cross-cell publisher unwired (#167) no longer holds. Wire them, and re-read `Census`'s \
-         single-cell verdict (#280), which refuses a network reading for the same reason.\n\n\
-         The other two halves are already done: `fano::cell_of` answers #145 and `compose_engine` seats a \
-         node in its own cell, and the health record now carries an `Entitlement` binding it to a member of \
-         the cell it speaks for."
+        "something outside {PREMISE_HOME} now builds a `{CELL_FORMATION_PREMISE}`, so a parent can learn a \
+         child's committee and ratification can conclude — the last recorded reason for leaving every \
+         cross-cell publisher unwired (#167) no longer holds. Wire them, and re-read `Census`'s single-cell \
+         verdict (#280), which refuses a network reading for the same reason.\n\n\
+         The other three halves are already done: `fano::cell_of` answers #145 and `compose_engine` seats a \
+         node in its own cell; the health record carries an `Entitlement` binding it to a member of the cell \
+         it speaks for; and `sample_child_availability` establishes the availability mask (#173)."
     );
     assert!(
         !ratification_refuses_everything || callers.is_empty(),
-        "a cross-cell publisher has a production caller while nothing outside the driver calls \
-         `{CELL_FORMATION_PREMISE}`, so `attest_children`'s availability mask can only be `0` — which \
-         refuses every child. The federation would run, vouch for nothing, and look like live shared \
-         security. Build the §L4.3 sampler first, or state here why this caller is exempt.\ncallers:\n  {}",
+        "a cross-cell publisher has a production caller while nothing outside {PREMISE_HOME} builds a \
+         `{CELL_FORMATION_PREMISE}`, so `ChildRegistry` knows no child and `attest_available` refuses every \
+         one it is handed. The federation would run, vouch for nothing, and look like live shared security. \
+         Give a parent a way to learn its children's committees first, or state here why this caller is \
+         exempt.\ncallers:\n  {}",
         callers.join("\n  ")
     );
 }

@@ -20,19 +20,28 @@
 //! in a test. That was read for a long time as "the wiring is pending", and it is not — the missing piece is
 //! not a caller.
 //!
-//! **A FANOS deployment has exactly one cell, or none.** `Health::reflexive` is `config.plane_order == 2`,
-//! and its doc says why: the DIAKRISIS unit is a seven-member cell, and only `PG(2,2)` forms one from the
-//! plane itself; on a larger plane a node discovers peers but nothing tells it which seven are its cell
-//! (#145). So at `q = 2` the cell *is* the network — a cross-cell publisher's counterpart is itself — and at
-//! `q > 2` no cell forms to be a counterpart. There is never a second cell.
+//! **The reason has been three different things, and `fanos-node/tests/one_cell_premise.rs` is the tripwire
+//! that made each one falsifiable.** The history matters because each answer looked final:
 //!
-//! That also relocates the blocker. It was recorded as an open *cell-identity* question, and identity is not
-//! what is missing: `overlay::cell_id` already derives a stable id per `(genesis, plane order)`, which is
-//! exactly right for the one cell that exists. What is missing is a cell-**formation** mechanism above
-//! `q = 2`, which is #145. Wiring a publisher before then buys an address nobody can be at.
+//! 1. *"A FANOS deployment has exactly one cell, or none."* `Health::reflexive` was `plane_order == 2`, and
+//!    only `PG(2,2)` formed a seven-member cell from the plane itself. **Closed by #145**: `fano::cell_of`
+//!    is `index mod (N/7)`, a pure function every node computes identically, so any plane whose point count
+//!    divides by seven forms cells and `compose_engine` seats a node in its own.
+//! 2. *"A parent would decide on unsigned evidence."* [`publish_health`] wrote one bare byte into the Turyn
+//!    federated covering. **Closed**: the record carries an [`Entitlement`] and [`open_health`] admits it
+//!    only from a member of the cell it speaks for.
+//! 3. *"Ratification can only say no."* [`attest_children`] took its availability mask as an argument and
+//!    nothing could produce one, so the only safe value was `0` — which refuses every child. **Closed**:
+//!    [`sample_child_availability`] establishes it from the child cell's own shards.
 //!
-//! The `cell: u32` these slots are keyed by is the visible edge of the same thing: every caller must supply a
-//! number the platform has no way to derive, because the space it would index does not exist yet.
+//! **What is left is the committee.** [`ChildRegistry::attest_available`] resolves a child's registered
+//! `ChildCommittee` before it verifies anything, and an unregistered child is refused outright. Nothing in
+//! the workspace constructs one: there is no directory that publishes a cell's validator keys and none that
+//! resolves them. So a parent can address its children, authenticate their health, and sample their data —
+//! and still cannot check a single signature on their certificates.
+//!
+//! The `cell: u32` these slots are keyed by is no longer the same problem it was: `fano::cell_of` derives it.
+//! What a caller still has no way to derive is *whose* keys sit at those seven points.
 //!
 //! The observability sibling of this is [`crate::telemetry_dir::Census`], and it is worth reading together:
 //! there the same "one cell only" fact was not stated, and an operator-facing verdict claimed to compare
@@ -44,13 +53,18 @@ use fanos_quic::Client;
 use fanos_rendezvous::Epoch;
 use fanos_taxis::checkpoint::ExecCertificate;
 use fanos_taxis::crosscell::CrossCellReceipt;
+use fanos_taxis::consensus::ConsensusMsg;
+use fanos_taxis::da::Sampler;
 use fanos_taxis::hierarchy::ChildRegistry;
+use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame};
 
 use tokio::task::JoinHandle;
 
 use fanos_field::Field;
-use fanos_geometry::fano;
+use fanos_geometry::{Triple, fano};
 use fanos_primitives::BeaconSeed;
+use fanos_runtime::{Command, Notification};
+use tokio::sync::broadcast;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::bound::Entitlement;
@@ -95,6 +109,168 @@ pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Opt
     ExecCertificate::from_bytes(&bytes)
 }
 
+/// **The `present` mask a parent must establish before it anchors a child (#173).** Bit `i` is set iff shard
+/// `i` of the child's finalized `block` came back from the child cell's seat `i` *and* the gathered shards
+/// rebuilt the payload. `0` — refuse — if the child cell is not on this plane, if no seat could supply the
+/// skeleton, or if what came back does not reconstruct.
+///
+/// [`ChildRegistry::attest_available`] refuses to vouch for a child whose payload is withheld, and it takes
+/// that evidence as an argument rather than assuming it. Nothing produced one, so every caller had to pass
+/// `0`, which refuses every child: the guard could only ever say no, and the safe door was the unusable one.
+/// This is the producer, and it is a real data-availability sample of a **foreign** cell.
+///
+/// # It needs no protocol of its own, and that is the finding
+///
+/// Every piece already ships, in three different crates that had never been put together:
+///
+/// * the child cell's seven seats are [`fano::cell_members_of`] — member `i` is validator `i`, the same
+///   index the shard is coded at and the same one [`ExecVote`](fanos_taxis::checkpoint::ExecVote) attributes by;
+///
+///   ⚠️ **and the consensus driver disagrees above `q = 2`.** `TaxisParams::me` is documented as *"its Fano
+///   point index — it must be seated at `Point::at(me)`"`, and `spawn_taxis` builds its address map as
+///   `(0..Plane::<F>::N).map(Point::at)` — the whole plane, in index order. `cell_members_of(c)` seats member
+///   `i` at `Point::at(c + i·cells)`. The two coincide exactly when the plane holds one cell (`cells = 1`,
+///   i.e. `N = 7`, i.e. `q = 2`) and diverge everywhere else: on `PG(2,4)` cell 0 is points `0,3,6,9,12,15,18`
+///   and the driver's first seven are `0..6`. This function follows the cell map, because that is the one
+///   `fano::cell_of`, `open_health` and `federation::diagnose_cell` all use; the driver is what has to move,
+///   and it needs a cell id `TaxisParams` does not carry;
+/// * `ShardMsg::NeedSkeleton` and `ShardMsg::Request` are answered by `taxis_driver::on_shard` **for any
+///   requester** — the DA transport is point-addressed ([`Command::Emit`]) and was never cell-confined, so a
+///   parent is already able to ask; the `Propose` arm above it is the filtered one, not this;
+/// * [`Sampler`] is the sans-I/O decision procedure, and its `reconstruct` re-encodes the recovered payload
+///   and matches it against the header's `da_commit`.
+///
+/// # Why the mask is reconstruction and not who answered
+///
+/// A claim of possession is free, so "seat `i` replied" is worth nothing on its own — which is exactly why
+/// §L4.3 sampling moves the shard rather than asking a yes/no question. The bits are set as shards arrive but
+/// the mask is **discarded unless `reconstruct` succeeds**, and that check is cryptographic: a withholding
+/// child (too few shards) and a tampering one (wrong bytes) both fail it. The sampler is seeded with a `me`
+/// outside `0..7` because this node holds no shard of a foreign cell's block, so every index is genuinely
+/// missing and none is assumed present.
+///
+/// A shard for index `i` is accepted **only from seat `i`**. Without that, one seat answers for all seven —
+/// `on_shard` falls back to `ConsensusEngine::shard_of`, which regenerates any index from a held block — and
+/// the mask would report seven custodians where there is one.
+///
+/// # ⚠️ What this establishes, and what it does not
+///
+/// That the child's finalized **payload** is retrievable from its own cell, now. It is not a durability
+/// claim, and it is not a claim about any earlier height: `da::Sampler`'s `held` map is bounded at the child
+/// too, so a parent that samples long after the fact is asking about data the honest cell may legitimately
+/// have dropped. That is why this runs at attest time, per checkpoint, rather than as a sweep.
+///
+/// It also costs the parent's **own** driver a little noise, and the price is named rather than hidden: the
+/// replies arrive as `Notification::App` on the shared broadcast, so the parent's `on_shard` sees a foreign
+/// cell's shards too. It credits them to `note_shard_taken` and may retain one at its own index. Both are
+/// bounded (`HELD_CAP`, and a foreign block's height is pruned by `prune_below`), and both disappear once the
+/// driver's seat map is cell-scoped — the same fix the seat-map divergence above needs.
+pub async fn sample_child_availability<F: Field>(client: &Client, cell: u32, block: [u8; 32]) -> u8 {
+    let Some(members) = fano::cell_members_of::<F>(cell as usize) else {
+        return 0; // the child cell is not a cell of this plane — there is nobody to ask
+    };
+    let seats = members.coords();
+    // Subscribed **before** the first emit, for the reason every read on this client is: an answer that
+    // arrives between the send and the subscribe is an answer nobody hears, and the sample would then wait
+    // out its whole deadline to conclude the opposite of what the cell told it.
+    let mut events = client.subscribe();
+
+    // The skeleton first: it carries the `da_commit` every shard is checked against, so nothing can be
+    // verified before it lands. Asked of every seat because any holder answers and the first one wins.
+    for &to in &seats {
+        client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::NeedSkeleton { block }) });
+    }
+    let Some(skeleton) = await_skeleton(&mut events, block).await else {
+        return 0; // no seat could name the block — nothing to sample against
+    };
+
+    let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
+    if !sampler.begin(skeleton) {
+        return 0; // unreachable on a fresh sampler; a refusal is the safe reading of an impossible state
+    }
+    for (i, &to) in seats.iter().enumerate() {
+        let Ok(index) = u8::try_from(i) else { continue };
+        client.command(Command::Emit { to, frame: shard_to_frame(&ShardMsg::Request { block, index }) });
+    }
+    gather_shards(&mut events, &mut sampler, &seats, block).await
+}
+
+/// The sampler index a parent uses for a **foreign** cell's block: outside `0..7`, so `Sampler::missing`
+/// reports every index and `accept` never mistakes an answer for this node's own dispersed shard.
+const NOT_A_CUSTODIAN: u8 = u8::MAX;
+
+/// How long one exchange of a cross-cell availability sample waits before giving up.
+///
+/// [`STORE_TIMEOUT`] — deliberately the same quantity rather than a new one, because this is the same thing:
+/// a read of a value another node holds. The sample is two *dependent* exchanges (skeleton, then shards), so
+/// one that concludes nothing costs at most twice it, which is the number a caller has to budget for.
+const SAMPLE_EXCHANGE: std::time::Duration = STORE_TIMEOUT;
+
+/// Wait for any seat to answer `NeedSkeleton` with the skeleton of `block`.
+///
+/// The hash is re-derived and compared, so a seat that answers with a *different* block — the cheap forgery,
+/// since the reply is an ordinary `Propose` — is ignored rather than becoming the thing every shard is then
+/// checked against.
+async fn await_skeleton(
+    events: &mut broadcast::Receiver<Notification>,
+    block: [u8; 32],
+) -> Option<fanos_taxis::Block> {
+    let listen = async {
+        loop {
+            match events.recv().await {
+                Ok(Notification::App { body, .. }) => {
+                    if let Some(TaxisApp::Consensus(ConsensusMsg::Propose(skeleton))) = parse_app_body(&body)
+                        && skeleton.hash() == block
+                    {
+                        return Some(skeleton);
+                    }
+                }
+                // Someone else's notification, or a lag that *may* have dropped ours: neither is a
+                // conclusion, so both keep waiting and the deadline below decides.
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    };
+    tokio::time::timeout(SAMPLE_EXCHANGE, listen).await.ok().flatten()
+}
+
+/// Collect shard deliveries until the payload reconstructs, returning the mask of the seats that supplied it
+/// — or `0` if the deadline passes first.
+async fn gather_shards(
+    events: &mut broadcast::Receiver<Notification>,
+    sampler: &mut Sampler,
+    seats: &[Triple],
+    block: [u8; 32],
+) -> u8 {
+    let listen = async {
+        let mut present = 0u8;
+        loop {
+            match events.recv().await {
+                Ok(Notification::App { body, from }) => {
+                    let Some(TaxisApp::Shard(ShardMsg::Deliver { block: b, index, data })) =
+                        parse_app_body(&body)
+                    else {
+                        continue;
+                    };
+                    // Its own block, from its own seat. Both halves matter: the first keeps another block's
+                    // dispersal out of this mask, the second keeps one seat from answering for seven.
+                    if b != block || seats.get(usize::from(index)) != Some(&from) {
+                        continue;
+                    }
+                    present |= 1u8 << index;
+                    if sampler.accept(block, index, data).is_some() {
+                        return present; // reconstructed and `da_commit`-checked — the mask is evidence now
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return 0,
+            }
+        }
+    };
+    tokio::time::timeout(SAMPLE_EXCHANGE, listen).await.unwrap_or(0)
+}
+
 /// A parent cell anchors its `children`'s finalities for `epoch`: resolve each child's published checkpoint
 /// and [`attest_available`](ChildRegistry::attest_available) it into `registry` (each child's committee must
 /// already be registered). Returns the `(cell, height, state_root)` newly anchored — a child that has not
@@ -107,21 +283,26 @@ pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Opt
 /// documented as the protection and had no caller anywhere; the guarded twin is now the only door, and the
 /// evidence is an argument nobody can forget to pass.
 ///
-/// A caller with no mask for a child has two honest options and no third: leave the child out, or pass a mask
-/// that says what it actually knows. `0` means "nothing present" and refuses — the safe direction. Producing
-/// a real mask needs the §L4.3 sampler, which no shipped binary issues yet (#173); this signature is where
-/// that shows up rather than being skipped in silence.
-pub async fn attest_children(
+/// **The mask is established here rather than demanded from the caller (#173).** It used to be an argument,
+/// and the honest reading of that signature was that no caller could fill it: the only safe value available
+/// was `0`, which refuses every child, so a parent could ratify nothing. [`sample_child_availability`] is the
+/// producer, and it runs per child at attest time — which is also the only time the answer is meaningful,
+/// since the child's own `held` shards are bounded and an old height is legitimately gone.
+///
+/// A child whose payload does not reconstruct is skipped exactly like one whose certificate fails to verify.
+/// Both are the same refusal — the parent does not vouch — and neither is an error to report upward: a child
+/// that is late this epoch is anchored the next one.
+pub async fn attest_children<F: Field>(
     client: &Client,
     registry: &mut ChildRegistry,
-    children: &[(u32, u8)],
+    children: &[u32],
     epoch: Epoch,
 ) -> Vec<(u32, u64, [u8; 32])> {
     let mut anchored = Vec::new();
-    for &(cell, present) in children {
-        if let Some(cert) = resolve_checkpoint(client, cell, epoch).await
-            && let Some((height, root)) = registry.attest_available(cell, cert, present)
-        {
+    for &cell in children {
+        let Some(cert) = resolve_checkpoint(client, cell, epoch).await else { continue };
+        let present = sample_child_availability::<F>(client, cell, cert.head).await;
+        if let Some((height, root)) = registry.attest_available(cell, cert, present) {
             anchored.push((cell, height, root));
         }
     }
@@ -425,7 +606,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -504,6 +685,118 @@ mod tests {
             open_health::<F4>(&[report.block()], cell, epoch, Some(beacon)).is_none(),
             "a bare byte read under a beacon must be refused, or the envelope is optional in the direction \
              that matters"
+        );
+    }
+
+    /// A `Notification::App` body carrying `msg` — the bytes the receive path actually sees.
+    ///
+    /// Built by encoding the production frame and unwrapping it with the production decoder, rather than by
+    /// hand-assembling `kind ‖ payload`: a hand-built body is a second spelling of the wire format, and the
+    /// two would drift with nothing to notice.
+    #[cfg(test)]
+    fn app_body(frame: &[u8]) -> Vec<u8> {
+        fanos_wire::decode_frame(frame).expect("a canonical App frame").0.body.to_vec()
+    }
+
+    /// **A parent's availability mask must be what reconstructed, not who answered** — and both ways it could
+    /// stop being that are cheap for a child cell to arrange.
+    ///
+    /// The mask decides whether a parent anchors a child's finality (`ChildRegistry::attest_available`), so a
+    /// mask that can be inflated is a parent vouching for a state whose data is withheld — the exact failure
+    /// the guard exists to prevent, arrived at through its evidence instead of around it.
+    ///
+    /// Four properties, and the third and fourth are the ones an implementation gets wrong:
+    ///
+    /// 1. the honest case concludes — enough shards from their own seats rebuild the payload and the mask
+    ///    names them;
+    /// 2. a **shard that arrives from the wrong seat** sets no bit, so one node cannot answer for seven (it
+    ///    can: `on_shard` falls back to `shard_of`, which regenerates any index from a held block);
+    /// 3. **bits set without a reconstruction are discarded** — a child that sends two shards and withholds
+    ///    the rest has told us nothing, and a mask of two bits is not "two shards are available", it is a
+    ///    sample that did not conclude;
+    /// 4. a skeleton for a **different block** is not adopted, because everything downstream is checked
+    ///    against its `da_commit` and adopting a foreign one moves the whole test to the attacker's block.
+    ///
+    /// Time is paused: each negative case is a deadline, and asserting four of them at `STORE_TIMEOUT` apiece
+    /// would cost twenty seconds of wall clock to learn nothing extra.
+    #[tokio::test(start_paused = true)]
+    async fn a_parents_availability_mask_is_what_reconstructed_and_not_who_answered() {
+        use fanos_code::lrc::is_recoverable_fano;
+        use fanos_field::F4;
+        use fanos_taxis::wire::to_frame;
+        use fanos_taxis::{Block, GENESIS_PARENT};
+
+        let block = Block::assemble(GENESIS_PARENT, 1, Epoch::new(3), 4, vec![]);
+        let (hash, skeleton, shards) = (block.hash(), block.skeleton(), block.da_shards());
+        let seats = fano::cell_members_of::<F4>(1).expect("PG(2,4) has three cells").coords();
+        let deliver = |i: usize| {
+            let msg = ShardMsg::Deliver { block: hash, index: i as u8, data: shards[i].clone() };
+            app_body(&shard_to_frame(&msg))
+        };
+
+        // ── 1. the honest case: shards from their own seats, and the sample concludes.
+        let (tx, mut rx) = broadcast::channel(32);
+        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
+        assert!(sampler.begin(skeleton.clone()), "a fresh sampler begins");
+        for i in 0..7 {
+            let _ = tx.send(Notification::App { from: seats[i], body: deliver(i) });
+        }
+        let present = gather_shards(&mut rx, &mut sampler, &seats, hash).await;
+        assert!(
+            present.count_ones() >= 3 && is_recoverable_fano((!present) & 0x7F),
+            "the sample concluded, so its mask must be one `attest_available` accepts — got {present:#09b}"
+        );
+
+        // ── 2. every shard from the wrong seat: nothing is credited, so nothing reconstructs.
+        let (tx, mut rx) = broadcast::channel(32);
+        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
+        assert!(sampler.begin(skeleton.clone()));
+        for i in 0..7 {
+            let _ = tx.send(Notification::App { from: seats[(i + 1) % 7], body: deliver(i) });
+        }
+        assert_eq!(
+            gather_shards(&mut rx, &mut sampler, &seats, hash).await,
+            0,
+            "a shard credited to the seat that did not send it lets one node answer for the whole cell"
+        );
+
+        // ── 3. two honest shards and silence: bits were set, and they are not a conclusion.
+        let (tx, mut rx) = broadcast::channel(32);
+        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
+        assert!(sampler.begin(skeleton.clone()));
+        for i in 0..2 {
+            let _ = tx.send(Notification::App { from: seats[i], body: deliver(i) });
+        }
+        assert_eq!(
+            gather_shards(&mut rx, &mut sampler, &seats, hash).await,
+            0,
+            "a mask survived a sample that never rebuilt the payload — presence was taken on the sender's word"
+        );
+
+        // ── 4. a skeleton for another block is not what the shards get checked against.
+        let other = Block::assemble([9u8; 32], 2, Epoch::new(3), 1, vec![]);
+        assert_ne!(other.hash(), hash, "the fixture needs two distinct blocks");
+        let (tx, mut rx) = broadcast::channel(32);
+        let _ = tx.send(Notification::App {
+            from: seats[0],
+            body: app_body(&to_frame(&ConsensusMsg::Propose(other.skeleton()))),
+        });
+        assert!(
+            await_skeleton(&mut rx, hash).await.is_none(),
+            "a seat answered `NeedSkeleton` with a different block and it was adopted"
+        );
+
+        // …and the same channel, given the right skeleton, does return it — so case 4 is a discrimination
+        // and not a helper that refuses everything.
+        let (tx, mut rx) = broadcast::channel(32);
+        let _ = tx.send(Notification::App {
+            from: seats[0],
+            body: app_body(&to_frame(&ConsensusMsg::Propose(skeleton.clone()))),
+        });
+        assert_eq!(
+            await_skeleton(&mut rx, hash).await.map(|b| b.hash()),
+            Some(hash),
+            "the skeleton of the block being sampled must be adopted"
         );
     }
 
