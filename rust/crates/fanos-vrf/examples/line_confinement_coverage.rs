@@ -19,13 +19,20 @@
 //!
 //! ## Result, 2026-08-19 — the live cell is already AT this ceiling, and the tree's sizing table is not
 //!
-//! | load | `PG(2,2)` clears the floor | `PG(2,4)` |
-//! |---|---|---|
-//! | `1.0 N` | 32.7 % | 0.0 % |
-//! | **`1.5 N`** — `members_for_a_covered_plane` | **74.5 %** | **7.5 %** |
-//! | `2 N` | 93.8 % | 51.8 % |
-//! | `3 N` | 99.4 % | 90.5 % |
-//! | `4 N` | 99.9 % | 98.0 % |
+//! | load | `PG(2,2)` clears the floor | unseated | `PG(2,4)` | unseated |
+//! |---|---|---|---|---|
+//! | `1.0 N` | 32.7 % | 1.8 of 7 | 0.0 % | 5.5 of 21 |
+//! | `1.5 N` — what the constant used to be | 74.5 % | 4.1 of 10 | 7.5 % | 13.0 of 31 |
+//! | `2 N` | 93.8 % | 7.5 of 14 | 51.8 % | 22.5 of 42 |
+//! | **the constant** (16 / 84) | **96.6 %** | **9.4 of 16** | **98.0 %** | **63.2 of 84** |
+//! | `3 N` | 99.4 % | 14.2 of 21 | 90.5 % | 42.6 of 63 |
+//!
+//! **The `unseated` column is the price and it is severe.** At the load a deployment is sized to,
+//! **59 %** of a Fano cell's members hold no seat at any given moment, and **75 %** of a `PG(2,4)` cell's.
+//! They are not idle by accident: they are the draw's spare candidates, and what they buy is the coverage
+//! column beside them. But production sets `hier_path: None` everywhere, so there is no sub-cell for them to
+//! be in — they are simply unaddressable. `addressing-capacity-is-not-serving-capacity` put this at "about a
+//! third"; measured at the corrected sizing it is well over half.
 //!
 //! **Two things follow, and the first closes an investigation.** `fanos_sim`'s live cell reads **75 %** at
 //! `1.5 N` on `PG(2,2)`; the ceiling here is **74.5 %**. The running mechanism is at its geometric limit, so
@@ -134,6 +141,9 @@ fn main() {
     run!(F2, "PG(2,2)", 7, 4000);
     run!(F2, "PG(2,2)", 10, 4000);
     run!(F2, "PG(2,2)", 14, 4000);
+    // The constant itself, so the row a deployment is sized against is in the table rather than inferred
+    // from its neighbours — and so the price in unseated members is stated where the recommendation is.
+    run!(F2, "PG(2,2)", 16, 4000);
     run!(F2, "PG(2,2)", 21, 4000);
     run!(F2, "PG(2,2)", 28, 2000);
     run!(F4, "PG(2,4)", 21, 400);

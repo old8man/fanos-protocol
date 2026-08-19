@@ -66,8 +66,11 @@ the fixed point a real run converges to, and therefore the ceiling — and price
 | 14 (`2 N`) | 93.8 % |
 | 21 (`3 N`) | 99.4 % |
 
-**16** sits between the third and fourth rows. Members beyond the seventh hold no seat at any given moment;
-that is not waste, it is what fills the points a smaller draw leaves empty.
+**16** clears the floor **96.6 %** of the time — and costs **9.4 of those 16 members holding no seat at any
+given moment**. That is not waste in the sense of a bug: they are the draw's spare candidates, and their
+being there is what fills the points a smaller draw leaves empty. It *is* a real cost to plan for. You are
+running sixteen machines so that seven points stay covered, and the nine are unaddressable while they wait —
+production sets no hierarchical address, so there is no sub-cell for them to serve in yet.
 
 **And a live cell reaches that ceiling rather than falling short of it.** `fanos-sim`'s
 `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per load across six

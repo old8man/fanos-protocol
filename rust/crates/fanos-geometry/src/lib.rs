@@ -187,6 +187,13 @@ pub fn servable_lines<F: Field>(occupied: impl Fn(Point<F>) -> bool) -> usize {
 /// will usually clear at, and that is the one choice in here — stated, so it can be revisited against the
 /// table above rather than re-derived.
 ///
+/// **What the surplus costs, since it is most of the cell.** At this load **59 %** of a Fano cell's members
+/// and **75 %** of a `PG(2,4)` cell's hold no seat at any given moment — 9.4 of 16 and 63.2 of 84, measured
+/// by the same enumeration. They are the draw's spare candidates and the coverage above is what they buy;
+/// but production sets `hier_path: None` everywhere, so there is no sub-cell for them to be in and they are
+/// unaddressable while they wait. A deployment reading this number is being told to run a cell most of which
+/// cannot serve, which is the strongest argument in the tree for wiring the descent.
+///
 /// `servable_lines` remains the exact question a running cell should ask about *itself*; this is the demand
 /// figure a deployment is sized against.
 #[must_use]
