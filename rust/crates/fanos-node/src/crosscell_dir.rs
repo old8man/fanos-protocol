@@ -412,6 +412,69 @@ fn open_health<F: Field>(
     Some(Report { axes: block & 0x7F, bus_fault: block >> golay::AXES & 1 == 1 })
 }
 
+/// What a parent learned about its seven children in one epoch: the covering's verdict, **and which children
+/// were not in it**.
+///
+/// The two travel together because separating them is what made a dead federation read as a healthy one.
+/// `federation::Cell::Healthy` means *"no child reports a fault"*, and a child that publishes nothing
+/// contributes a clean block — so seven silent children decode to `Healthy`, which is the strongest possible
+/// statement about a parent that heard from nobody.
+///
+/// The clean block is not the defect and must stay: injecting a fabricated "fully degraded" block for a
+/// silent child would move blame rather than add noise (the Golay decoder corrects toward the nearest
+/// codeword — `resolve_health` states this and `golay::Provenance` proves it with a measured 24.9 %
+/// false-accusation rate). **Silence is an erasure, not an observation**, and this code has no erasure
+/// decoder — so the honest place for it is beside the verdict, not inside the codeword.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChildDiagnosis {
+    /// The covering's verdict over the children that **did** report.
+    ///
+    /// Reading this field alone is the misreading this type exists to prevent: it is scoped to the reporting
+    /// children, so `Healthy` here means "nobody who spoke reported a fault", never "the federation is well".
+    pub verdict: federation::Cell,
+    /// Bit `p` set ⇒ the child at point `p` published no readable health report for this epoch.
+    ///
+    /// "No readable" folds three causes deliberately — nothing published, a lookup that timed out, and a
+    /// record that failed authentication — because a parent cannot tell them apart and must not act as if it
+    /// could. The refusal is counted separately by `note_authentication` in the sibling directories, which is
+    /// where an operator distinguishes a quiet child from an attacked one.
+    pub silent: u8,
+}
+
+impl ChildDiagnosis {
+    /// Fold what the resolver returned per child into a verdict and a silence mask.
+    ///
+    /// **The whole decision, and it takes no client** — which is the point of it being a function. Written
+    /// inline in [`diagnose_children`] it was reachable only through a live store, so the one property that
+    /// matters (silence is not health) could be asserted about a type but never about the step that
+    /// produces it: breaking `None => silent |= …` left every test green.
+    ///
+    /// `None` is *one* outcome deliberately. Nothing published, the lookup timed out, and the record failed
+    /// authentication are three different facts, and a parent cannot tell them apart — `resolve_health`
+    /// returns the same `None` for all three, and inventing a distinction here would be a claim about
+    /// evidence this node does not have. `note_authentication` is where a refusal is counted apart, in the
+    /// directories that can see it.
+    fn from_resolved(resolved: &[Option<Report>; federation::CHILDREN]) -> Self {
+        let mut reports = [Report::default(); federation::CHILDREN];
+        let mut silent = 0u8;
+        for (p, (slot, heard)) in reports.iter_mut().zip(resolved.iter()).enumerate() {
+            match heard {
+                Some(r) => *slot = *r,
+                // `p < CHILDREN = 7`, so the shift is in range for the same reason the array is.
+                None => silent |= 1u8 << p,
+            }
+        }
+        Self { verdict: federation::diagnose_cell(reports, golay::Provenance::SelfReported), silent }
+    }
+
+    /// Whether the parent may act on this as a clean bill of health: every child reported, and none reports
+    /// a fault. Anything else needs the fields read together.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.silent == 0 && matches!(self.verdict, federation::Cell::Healthy)
+    }
+}
+
 /// A parent cell diagnoses its seven `children` for `epoch`: resolve each child's published health report and run the
 /// **Turyn federated covering** over them (`docs/design-federation.md`).
 ///
@@ -422,28 +485,36 @@ fn open_health<F: Field>(
 /// than inventing an attribution.
 ///
 /// `children` is indexed by position in the parent's plane, so `children[p]` is the cell at point `p` — the covering's
-/// federations are the parent's *lines*, and a line names points, not cells. A child that has not published is read as
-/// clean for the reason `resolve_health` documents.
+/// federations are the parent's *lines*, and a line names points, not cells. A child that has not published still
+/// contributes a clean block, and [`ChildDiagnosis::silent`] is what keeps that from reading as health.
+///
+/// ⚠️ **`children[p]` is a cell *identifier*, and the two things that derive one do not agree.** The live
+/// derivation is `fano::cell_of` — `index mod (N/7)`, which partitions a plane into `N/7` sibling cells, so
+/// on `PG(2,4)` the only valid ids are `0..3`. The reading this signature assumes is the hierarchical one —
+/// point `p` of the parent hosts child cell `p`, which always gives exactly seven and is the only shape
+/// `federation::CHILDREN` can be fed. They coincide nowhere: a partition never yields seven cells, since
+/// `N/7 = 7` has no projective solution. The hierarchical id is #167 (*"no identity above the base cell to
+/// fold in"*) and does not exist yet, so today [`open_health`]'s membership check can only authenticate a
+/// partition id — and a child whose id it cannot resolve is refused, which lands in `silent` rather than
+/// being taken on trust.
 pub async fn diagnose_children<F: Field>(
     client: &Client,
     children: &[u32; federation::CHILDREN],
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
-) -> federation::Cell {
-    let mut reports = [Report::default(); federation::CHILDREN];
-    for (slot, &cell) in reports.iter_mut().zip(children.iter()) {
+) -> ChildDiagnosis {
+    let mut resolved: [Option<Report>; federation::CHILDREN] = [None; federation::CHILDREN];
+    for (slot, &cell) in resolved.iter_mut().zip(children.iter()) {
         // `beacon: None` reads the bare byte, which is what a build with no self-certifying identity writes
         // — and a caller that has a beacon and passes `None` is asking this covering to localize faults from
         // records anyone could have written. The parameter exists so that is a decision rather than a default.
-        if let Some(r) = resolve_health::<F>(client, cell, epoch, beacon).await {
-            *slot = r;
-        }
+        *slot = resolve_health::<F>(client, cell, epoch, beacon).await;
     }
     // SELF-REPORTED, and the distinction is load-bearing: these masks are what each child says about *itself*, so a child
     // controlling its own eight coordinates could otherwise relocate blame onto a healthy sibling — the Golay decoder
     // corrects by moving to the nearest codeword, so injected coordinates do not add noise, they move the blame. See
     // `fanos_code::golay::Provenance`. A peer-measured source keeps the full `t = 3`; this one does not.
-    federation::diagnose_cell(reports, golay::Provenance::SelfReported)
+    ChildDiagnosis::from_resolved(&resolved)
 }
 
 /// Keep this cell's health report **live**: spawn the task that publishes `health()`'s current view each epoch.
@@ -798,6 +869,55 @@ mod tests {
             Some(hash),
             "the skeleton of the block being sampled must be adopted"
         );
+    }
+
+    /// **A parent that heard from nobody must not report its federation healthy.**
+    ///
+    /// `federation::Cell::Healthy` means *"no child reports a fault"*, and a child that published nothing
+    /// contributes a clean block — so seven silences decode to the strongest statement the covering can
+    /// make, produced from no evidence at all — an alarm that cannot fire, sitting under the Turyn covering the
+    /// whole cross-cell directory exists to feed.
+    ///
+    /// The clean block itself is **not** the defect and is deliberately kept: substituting a fabricated
+    /// "fully degraded" block for a silent child would move blame rather than add noise, because the Golay
+    /// decoder corrects toward the nearest codeword — `golay::Provenance`'s own note measures that at a
+    /// 24.9 % false-accusation rate. Silence is an erasure, this code has no erasure decoder, so the honest
+    /// place for it is beside the verdict.
+    ///
+    /// Both directions, because a `is_clean` that always refused would satisfy the first assertion alone.
+    #[test]
+    fn a_parent_that_heard_from_no_child_does_not_read_as_healthy() {
+        let heard_nobody = ChildDiagnosis::from_resolved(&[None; federation::CHILDREN]);
+        assert_eq!(
+            heard_nobody.verdict,
+            federation::Cell::Healthy,
+            "the covering itself is unchanged — it still decodes seven clean blocks to Healthy, and that is \
+             why the verdict alone cannot be the answer"
+        );
+        assert!(
+            !heard_nobody.is_clean(),
+            "seven children said nothing and the parent called its federation clean"
+        );
+
+        let all_well = [Some(Report::default()); federation::CHILDREN];
+        assert!(
+            ChildDiagnosis::from_resolved(&all_well).is_clean(),
+            "every child reported and none reports a fault — refusing this would make the guard useless \
+             rather than strict"
+        );
+        // One silent child is already enough: the covering carries `t = 3` faults, and a missing report is
+        // not one of them — it is a child the verdict says nothing about.
+        let mut one_quiet = all_well;
+        one_quiet[2] = None;
+        let one_quiet = ChildDiagnosis::from_resolved(&one_quiet);
+        assert_eq!(one_quiet.silent, 0b000_0100, "the silent bit must name the child that said nothing");
+        assert!(!one_quiet.is_clean(), "a single silent child must still deny a clean bill of health");
+        // And a reported fault is not laundered by everyone else being present.
+        let mut faulty = all_well;
+        faulty[2] = Some(Report { axes: 0b000_0001, bus_fault: false });
+        let faulty = ChildDiagnosis::from_resolved(&faulty);
+        assert_eq!(faulty.silent, 0, "nobody was silent here — the mask must not borrow the fault's bit");
+        assert!(!faulty.is_clean(), "a localized fault with nobody silent must not read clean either");
     }
 
     #[test]
