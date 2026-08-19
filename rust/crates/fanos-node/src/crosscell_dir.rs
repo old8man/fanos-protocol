@@ -48,7 +48,12 @@ use fanos_taxis::hierarchy::ChildRegistry;
 
 use tokio::task::JoinHandle;
 
+use fanos_field::Field;
+use fanos_geometry::fano;
+use fanos_primitives::BeaconSeed;
+
 use crate::DIRECTORY_SLOT_EPOCHS;
+use crate::bound::Entitlement;
 use crate::resolve::{Read, STORE_TIMEOUT};
 
 /// A cell's checkpoint slot: the store address its latest execution certificate for `epoch` lives at.
@@ -145,10 +150,24 @@ pub async fn attest_children(
 ///
 /// This paragraph is a **tripwire**, not a note: `one_cell_premise.rs` watches for the phrase above and fails
 /// the moment a cross-cell publisher gains a production caller while it is still here.
-pub async fn publish_health(client: &Client, cell: u32, epoch: Epoch, report: Report) -> bool {
-    let landed = client
-        .put_ephemeral(health_slot(cell, epoch), alloc_vec(report.block()), DIRECTORY_SLOT_EPOCHS)
-        .await;
+pub async fn publish_health<F: Field>(
+    client: &Client,
+    cell: u32,
+    epoch: Epoch,
+    report: Report,
+    credential: Option<&(Vec<u8>, fanos_vrf::VrfPublic, fanos_vrf::VrfProof)>,
+) -> bool {
+    let payload = alloc_vec(report.block());
+    // The same shape the five sibling directories use — `diagdir`, `ingressdir`, `exit`, `capdir`,
+    // `loaddir` — and for the same reason: the publisher's entitlement travels *with* the record, so a
+    // reader authenticates it without asking anyone. `None` writes the bare byte, which is what a node with
+    // no self-certifying identity has and what every existing test drives.
+    let record = match credential {
+        Some((id, public, proof)) => Entitlement::encode(id, public, proof, &payload),
+        None => payload.clone(),
+    };
+    let landed = client.put_ephemeral(health_slot(cell, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
+    let _ = core::marker::PhantomData::<F>;
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
 
@@ -160,9 +179,55 @@ fn alloc_vec(byte: u8) -> Vec<u8> { vec![byte] }
 /// A wrong-width value is rejected rather than parsed leniently, and the safe direction is deliberate: an absent report
 /// contributes a *clean* block to the federated word (a child that says nothing is not accused), while a mis-parsed one
 /// would fabricate faults and could make the grammar accuse an innocent sibling.
-pub async fn resolve_health(client: &Client, cell: u32, epoch: Epoch) -> Option<Report> {
+pub async fn resolve_health<F: Field>(
+    client: &Client,
+    cell: u32,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Option<Report> {
     let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(cell, epoch))).await.ok()??;
-    let [block] = <[u8; 1]>::try_from(bytes.as_slice()).ok()?;
+    open_health::<F>(&bytes, cell, epoch, beacon)
+}
+
+/// The inverse of the publish encoding — and, when `beacon` is `Some`, the **authentication** the federated
+/// covering was running without.
+///
+/// **The slot is keyed by `(cell, epoch)`, so there is no single coordinate to bind to**, which is exactly
+/// why the coordinate-bound rule the sibling directories use did not reach here. What replaces it is the
+/// cell's own membership: `fano::cell_members_of` derives the seven points of `cell` from the plane, and the
+/// record is accepted when its publisher is entitled to **one of them**. A cell's health may be spoken for
+/// by a member of that cell and by nobody else.
+///
+/// **What that costs an attacker, said in the terms `bound.rs` already uses.** An `Entitlement` proves the
+/// publisher's own probe walk reaches the point — `q + 1` of the plane's `q² + q + 1` — so speaking for a
+/// chosen cell means holding a walk that touches one of its seven points, against **zero** for the bare byte
+/// this replaces. It deliberately stops short of the exact settled index, which would need the publisher's
+/// full `CoordinateClaim` witness chain; that is the stronger form and `bound.rs` names it as the natural
+/// follow-up for the same reason.
+///
+/// ⚠️ **At `q = 2` it buys nothing, and the arithmetic says so rather than the doc hoping otherwise**: the
+/// Fano plane is one cell, so *every* node is a member of it and the check is vacuous. It bites from
+/// `PG(2,4)` up, where a cell is seven of twenty-one points — which is also the first plane at which a
+/// second cell exists to publish for.
+#[must_use]
+fn open_health<F: Field>(
+    bytes: &[u8],
+    cell: u32,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Option<Report> {
+    let payload = match beacon {
+        Some(seed) => {
+            let members = fano::cell_members_of::<F>(cell as usize)?;
+            let (_, payload) = members
+                .coords()
+                .iter()
+                .find_map(|&point| Entitlement::open::<F>(bytes, point, epoch, &seed))?;
+            payload.to_vec()
+        }
+        None => bytes.to_vec(),
+    };
+    let [block] = <[u8; 1]>::try_from(payload.as_slice()).ok()?;
     Some(Report { axes: block & 0x7F, bus_fault: block >> golay::AXES & 1 == 1 })
 }
 
@@ -178,14 +243,18 @@ pub async fn resolve_health(client: &Client, cell: u32, epoch: Epoch) -> Option<
 /// `children` is indexed by position in the parent's plane, so `children[p]` is the cell at point `p` — the covering's
 /// federations are the parent's *lines*, and a line names points, not cells. A child that has not published is read as
 /// clean for the reason `resolve_health` documents.
-pub async fn diagnose_children(
+pub async fn diagnose_children<F: Field>(
     client: &Client,
     children: &[u32; federation::CHILDREN],
     epoch: Epoch,
+    beacon: Option<BeaconSeed>,
 ) -> federation::Cell {
     let mut reports = [Report::default(); federation::CHILDREN];
     for (slot, &cell) in reports.iter_mut().zip(children.iter()) {
-        if let Some(r) = resolve_health(client, cell, epoch).await {
+        // `beacon: None` reads the bare byte, which is what a build with no self-certifying identity writes
+        // — and a caller that has a beacon and passes `None` is asking this covering to localize faults from
+        // records anyone could have written. The parameter exists so that is a decision rather than a default.
+        if let Some(r) = resolve_health::<F>(client, cell, epoch, beacon).await {
             *slot = r;
         }
     }
@@ -201,10 +270,11 @@ pub async fn diagnose_children(
 /// Mirrors [`crate::capdir::spawn_capability_publisher`] — a closure so this module stays agnostic to how a cell observes
 /// its own axes, which is DIAKRISIS's business and not the directory's. Ends when the notification stream closes.
 #[must_use]
-pub fn spawn_health_publisher(
+pub fn spawn_health_publisher<F: Field>(
     client: Client,
     cell: u32,
     health: impl Fn() -> Report + Send + 'static,
+    prover: Option<fanos_quic::CoordinateProver>,
 ) -> JoinHandle<()> {
     // Supervised: this actor's death is a capability the node loses, and the counters that would
     // have shown it are written by the actor itself (#251).
@@ -212,12 +282,18 @@ pub fn spawn_health_publisher(
     let task = tokio::spawn(async move {
         let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
-        publish_health(&client, cell, epoch, health()).await;
+        // This network's epoch-0 seed rather than the constant, and re-proven on every write: a bound record
+        // proves a coordinate against a *specific* beacon, so a proof captured once verifies only in the
+        // epoch it was made — the same reasoning `capdir::spawn_capability_publisher` states.
+        let mut seed = client.genesis();
+        let credential = |epoch: Epoch, seed: &BeaconSeed| prover.as_ref().map(|prove| prove(epoch, seed));
+        publish_health::<F>(&client, cell, epoch, health(), credential(epoch, &seed).as_ref()).await;
         // Latest-state, not the lossy stream: a cell whose health report is missing for an epoch reads to its
         // neighbours as a cell that has nothing to say, which is not the same as one that is healthy (#86).
-        while let Some((e, _)) = crate::next_epoch(&mut beacons, epoch).await {
+        while let Some((e, s)) = crate::next_epoch(&mut beacons, epoch).await {
             epoch = e;
-            publish_health(&client, cell, epoch, health()).await;
+            seed = s;
+            publish_health::<F>(&client, cell, epoch, health(), credential(epoch, &seed).as_ref()).await;
         }
     });
     crate::supervise::supervise(crate::supervise::NodeActor::HealthPublisher, &supervised, task)
@@ -349,8 +425,87 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// **A cell's health may be spoken for by a member of that cell and by nobody else** — the binding the
+    /// federated covering was running without.
+    ///
+    /// `diagnose_children` localizes up to three faults to `(child, axis)` from these bytes, and a covering
+    /// designed to localize confidently mislocalizes confidently on forged input. The slot is keyed by
+    /// `(cell, epoch)` and not by a coordinate, which is why the rule its five sibling directories use — the
+    /// publisher is entitled to the slot's own point — does not reach here. What replaces it is the cell's
+    /// membership, derived from the plane by `fano::cell_members_of`.
+    ///
+    /// **On `PG(2,4)`, because `PG(2,2)` cannot express the negative case.** The Fano plane is one cell, so
+    /// every node is a member of it and a refusal is unreachable — the doc says so and this fixture is what
+    /// makes that statement checkable rather than a hope. `PG(2,4)` has three cells of seven points.
+    ///
+    /// Asserted in both directions: a member's record opens, an outsider's is refused, and the unauthenticated
+    /// path still reads a bare byte — a change that refused everything would satisfy the middle assertion and
+    /// break the directory.
+    #[test]
+    fn a_cells_health_is_spoken_for_by_a_member_of_that_cell_and_refused_from_anyone_else() {
+        use fanos_field::F4;
+        use fanos_primitives::BeaconSeed;
+        use fanos_vrf::{VrfSecret, probe_index_of, prove_coordinate_ranked};
+
+        let (epoch, beacon, cell) = (Epoch::new(4), BeaconSeed::GENESIS, 1u32);
+        let members = fano::cell_members_of::<F4>(cell as usize).expect("PG(2,4) splits into three cells");
+        let report = Report { axes: 0b010_1101, bus_fault: true };
+
+        // Seal a record with `seed`'s identity, and say which of the cell's points its walk reaches.
+        let sealed = |seed: u8| {
+            let sk = VrfSecret::from_seed([seed; 32]);
+            let id = format!("health-{seed}").into_bytes();
+            let (_, proof, out) = prove_coordinate_ranked::<F4>(&sk, &id, epoch, &beacon);
+            let reaches = members
+                .coords()
+                .iter()
+                .any(|&c| fanos_geometry::Point::<F4>::new(c).and_then(|p| probe_index_of::<F4>(&out, &p)).is_some());
+            (Entitlement::encode(&id, &sk.public(), &proof, &[report.block()]), reaches, out)
+        };
+
+        // A member: its walk reaches a point of the cell. A stranger: it reaches none. Both exist — the
+        // walk is `q + 1 = 5` of twenty-one points and the cell is seven, so neither is a rare draw.
+        let member = (0u8..=255).find_map(|s| { let (r, ok, _) = sealed(s); ok.then_some(r) });
+        let stranger = (0u8..=255).find_map(|s| { let (r, ok, _) = sealed(s); (!ok).then_some(r) });
+        let member = member.expect("some identity's walk reaches this cell — if none does, the fixture is wrong");
+        let stranger = stranger.expect("some identity's walk misses all seven — the negative case must exist");
+
+        assert!(
+            open_health::<F4>(&member, cell, epoch, Some(beacon)).is_some(),
+            "a member of the cell must be able to publish its health, or the directory refuses everyone and \
+             the covering has no input at all"
+        );
+        assert!(
+            open_health::<F4>(&stranger, cell, epoch, Some(beacon)).is_none(),
+            "an identity entitled to no point of this cell spoke for it — which is the forged input the \
+             Turyn covering localizes confidently and wrongly"
+        );
+        assert_eq!(
+            open_health::<F4>(&member, cell, epoch, Some(beacon)).map(|r| (r.axes, r.bus_fault)),
+            Some((report.axes, report.bus_fault)),
+            "and the payload survives the envelope — an authenticated record that decodes to something else \
+             is a different defect wearing this one's clothes"
+        );
+
+        // The unauthenticated path is unchanged: `None` reads a bare byte, which is what a build with no
+        // self-certifying identity writes and what every existing caller drives.
+        assert_eq!(
+            open_health::<F4>(&[report.block()], cell, epoch, None).map(|r| r.axes),
+            Some(report.axes),
+            "the ungated path must still parse the bare byte"
+        );
+        // And an authenticated read of a bare byte is a refusal rather than a lenient parse: the record
+        // carries no entitlement, so there is nobody to have written it.
+        assert!(
+            open_health::<F4>(&[report.block()], cell, epoch, Some(beacon)).is_none(),
+            "a bare byte read under a beacon must be refused, or the envelope is optional in the direction \
+             that matters"
+        );
+    }
 
     #[test]
     fn health_slots_are_deterministic_distinct_and_domain_separated() {

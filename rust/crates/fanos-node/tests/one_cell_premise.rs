@@ -38,17 +38,31 @@
 /// A source-text observable rather than a behavioural one, deliberately: no state a running node could be
 /// in would report "this directory's record is unauthenticated". The line is the fact.
 ///
-/// It used to be `"reflexive: config.plane_order == 2"` — the claim that only the base plane forms a cell.
-/// That claim is now false (#145 is answered by `fano::cell_of`), and its going false is exactly what this
-/// tripwire is for: the premise moved rather than vanished, from *"there is no second cell"* to *"a
-/// parent would be deciding on unsigned evidence"*.
+/// **The premise has moved twice, and each move is the tripwire working rather than failing.**
 ///
-/// **It has to be a line of CODE, not of prose**, and the first attempt at this was a doc paragraph in
+/// It was `"reflexive: config.plane_order == 2"` — *"there is no second cell"* — until #145 was answered by
+/// `fano::cell_of`. It became `resolve_health`'s one-byte parse — *"a parent would decide on unsigned
+/// evidence"* — until that record gained an `Entitlement`: a cell's health is now spoken for by a member of
+/// that cell, verified through the same primitive five sibling directories use.
+///
+/// **What is left is the availability mask.** `attest_children` calls `ChildRegistry::attest_available` with
+/// a `present` byte its caller supplies, and a caller with no sampler must pass `0`, which refuses every
+/// child — so ratification can only ever say no.
+///
+/// The observable took two attempts and the first one was **refuted by this very test**, which is worth
+/// recording because it corrects the work queue. The premise was written as *"nothing issues
+/// `Command::SampleAvailability`"* on the queue's word that #173 was open; the scan immediately reported a
+/// production issuer. It was right: `fanos_quic::Client::sample_availability` exists and its own doc says
+/// the door was cut — *"no way for anything outside the engine to issue one"* was the state **before** it.
+///
+/// So the door is cut and **nobody walks through it**: zero callers outside the driver that defines it. That
+/// is the premise, and it is a call scan rather than a claim about a function's existence — the same shape
+/// this file already uses for the publishers, and the only shape a stripped-comment corpus can see.
+///
+/// **It has to be a line of CODE, not of prose**, and an early attempt at this was a doc paragraph in
 /// `crosscell_dir.rs` that the scan could never see: `shipping_sources` runs every file through
-/// `fanos_testkit::source::code_only`, which strips comments. So the observable is `resolve_health`'s
-/// parse — it reads **exactly one byte** and nothing else, which is precisely what an envelope would have
-/// to change.
-const CELL_FORMATION_PREMISE: &str = "<[u8; 1]>::try_from(bytes.as_slice())";
+/// `fanos_testkit::source::code_only`, which strips comments.
+const CELL_FORMATION_PREMISE: &str = "sample_availability(";
 
 /// The entry points that would carry a cell's state to another cell.
 const CROSS_CELL_PUBLISHERS: [&str; 5] = [
@@ -121,29 +135,28 @@ fn a_cross_cell_publisher_may_not_be_wired_while_only_one_cell_can_exist() {
         callers.len()
     );
 
-    let evidence_is_unsigned = sources
+    // The definition lives in `fanos-quic`'s driver, so it is excluded for the same reason the publishers'
+    // own modules are: a function reaching for itself is the mechanism, not a deployment reaching for it.
+    let ratification_refuses_everything = !sources
         .iter()
-        .any(|(path, text)| path.contains("crosscell_dir.rs") && text.contains(CELL_FORMATION_PREMISE));
+        .any(|(path, text)| !path.contains("fanos-quic") && text.contains(CELL_FORMATION_PREMISE));
 
     assert!(
-        evidence_is_unsigned || !callers.is_empty(),
-        "`{CELL_FORMATION_PREMISE}` is gone from crosscell_dir.rs, so the health record now carries its own \
-         evidence — the reason for leaving every cross-cell publisher unwired (#167) no longer holds. Wire \
-         them, and re-read `Census`'s single-cell verdict (#280), which refuses a network reading for the \
-         same reason.\n\n\
-         The addressing half is already done: `fano::cell_of` answers #145 and `compose_engine` seats a node \
-         in its own cell, so a publisher has a counterpart on any plane whose point count divides by seven. \
-         What remains before wiring is the availability sampler (#173) — `attest_children` must pass a real \
-         mask or `0`, and `0` refuses every child, so the loop would vouch for nothing."
+        ratification_refuses_everything || !callers.is_empty(),
+        "something outside the driver now calls `{CELL_FORMATION_PREMISE}`, so a caller of `attest_children` \
+         can build a real availability mask and ratification can say yes — the last recorded reason for \
+         leaving every cross-cell publisher unwired (#167) no longer holds. Wire them, and re-read `Census`'s \
+         single-cell verdict (#280), which refuses a network reading for the same reason.\n\n\
+         The other two halves are already done: `fano::cell_of` answers #145 and `compose_engine` seats a \
+         node in its own cell, and the health record now carries an `Entitlement` binding it to a member of \
+         the cell it speaks for."
     );
     assert!(
-        !evidence_is_unsigned || callers.is_empty(),
-        "a cross-cell publisher has a production caller while `{CELL_FORMATION_PREMISE}` still holds, so a \
-         parent would run the Turyn federated covering over **unsigned** health records and localize faults \
-         to `(child, axis)` from them. A covering designed to localize confidently will mislocalize \
-         confidently on forged input, and the deployment will look like it has live shared security. Give \
-         `publish_health` an envelope and a publisher binding first, or state here why this caller is \
-         exempt.\ncallers:\n  {}",
+        !ratification_refuses_everything || callers.is_empty(),
+        "a cross-cell publisher has a production caller while nothing outside the driver calls \
+         `{CELL_FORMATION_PREMISE}`, so `attest_children`'s availability mask can only be `0` — which \
+         refuses every child. The federation would run, vouch for nothing, and look like live shared \
+         security. Build the §L4.3 sampler first, or state here why this caller is exempt.\ncallers:\n  {}",
         callers.join("\n  ")
     );
 }
