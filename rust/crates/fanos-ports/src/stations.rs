@@ -1069,6 +1069,40 @@ pub enum Station {
     /// is not doing what the operator's configuration says it is.
     ReseatOutOfCell,
 
+    /// This node **descended into a sub-cell** (spec §L0/§L1): beaten on every point of its probe walk, it
+    /// took an address under the point it wanted rather than sitting on a seat it does not own.
+    ///
+    /// Tagged with the level-0 point it descended under, because that is the contested point and the
+    /// question an operator asks next is *which* point is oversubscribed.
+    ///
+    /// **Nonzero is the design working, not a fault.** `members_for_a_covered_plane(3) = 16` — a Fano cell
+    /// wants sixteen members over seven points — so nine of them belong in sub-cells by construction, and a
+    /// deployment at the sized load with this station at **zero** is one where the overflow went somewhere
+    /// else: two nodes bound to one point, which §L0 forbids and `directory.point_taken` counts.
+    Descended,
+
+    /// The engine could not place this node at all: [`MAX_DEPTH`](fanos_geometry::MAX_DEPTH) consecutive
+    /// levels of its own descent chain were every one of them occupied, so `derive_address` returned nothing
+    /// and the node has **no overlay address to announce**.
+    ///
+    /// **Not the same event as a refused `Descend`, and the difference is whose fault it is.** A refusal is a
+    /// caller bug; this is a capacity limit, and the documented risk for it prices the wrong plane:
+    /// `derive_address` says `N^-MAX_DEPTH = 1.7e-7`, which treats every level as an independent `1/7` — true
+    /// on an *empty* plane, where the shallow prefixes are free. In a populated trie they are occupied almost
+    /// surely and only the deepest few are chancy. Simulated on the rule itself: **0** unplaceable at 10^4
+    /// nodes, 56.5 at 2·10^5, and **17 754 — 1.77 %** at 10^6, which is 10^5 times the documented figure.
+    /// `MAX_DEPTH = 10` takes the last row to zero for 24 bytes of `HierAddr`.
+    AddressUnplaceable,
+
+    /// A `Command::Descend` was refused: the path was not a descent of this node.
+    ///
+    /// Depth 0 or 1 (depth 1 is `Reseat`'s job), deeper than `MAX_DEPTH`, a non-canonical point, or a level 0
+    /// that is not this node's own coordinate. Every one of them is a caller bug rather than a peer's doing —
+    /// the path is computed by this node's own driver from its own certificate — so nonzero means the
+    /// placement loop and the engine disagree about where this node is, which is exactly the state a
+    /// descendant must not be in: it would announce an address nobody routes to it.
+    DescendRefused,
+
     /// A `(coordinate, epoch)` directory publish did not land — the node is **absent from that roster for
     /// that epoch**, and until this station existed it was the last to know.
     ///
@@ -1266,6 +1300,9 @@ impl Station {
         Self::HostRequestOverBound,
         Self::EscalationUnbudgeted,
         Self::ReseatOutOfCell,
+        Self::Descended,
+        Self::DescendRefused,
+        Self::AddressUnplaceable,
         Self::AuthenticationRejected,
         Self::GatherOpenFailed,
         Self::FrameTypeUnknown,
@@ -1408,6 +1445,9 @@ impl Station {
             Self::HostRequestOverBound => "host.request_over_bound",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
             Self::ReseatOutOfCell => "reseat.out_of_cell",
+            Self::Descended => "hierarchy.descended",
+            Self::DescendRefused => "hierarchy.descend_refused",
+            Self::AddressUnplaceable => "hierarchy.unplaceable",
             Self::AuthenticationRejected => "auth.rejected",
             Self::ExitRefused => "exit.refused",
             Self::ExitDialFailed => "exit.dial_failed",
@@ -1543,6 +1583,9 @@ impl Station {
             | Self::ShareOffCommitment
             | Self::DescriptorUnrecoverable
             | Self::ReseatOutOfCell
+            | Self::Descended
+            | Self::DescendRefused
+            | Self::AddressUnplaceable
             | Self::ExitDialFailed
             | Self::ExitSocketUnavailable
             // Both consensus admission counters: the coordinate is the LINE, not a tag, and an anonymous

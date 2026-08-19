@@ -526,6 +526,11 @@ impl<F: Field> Engine for NyxNode<F> {
                 | Command::Join { .. }
                 | Command::AdvanceEpoch
                 | Command::Reseat { .. }
+                // Hierarchical placement is an *overlay* address, and a mixnet relay has none: it holds no
+                // membership, floods no `Announce`, and routes no `RouteHier`. Both halves are inert here for
+                // the same reason `Reseat` is — the relay's only address is its transport coordinate.
+                | Command::ProposeAddress { .. }
+                | Command::Descend { .. }
                 // The §80 signed descriptor binds an *overlay membership* announcement to an identity, and a
                 // mixnet relay makes none — it has no `Announce` to carry one and no peer's to check.
                 | Command::Descriptor { .. },

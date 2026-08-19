@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::ports::stations::Station;
 use fanos_core::PowAdmission;
 use fanos_field::Field;
-use fanos_geometry::{fano, HierAddr, Plane, Point, Triple};
+use fanos_geometry::{derive_address, fano, HierAddr, Plane, Point, Triple};
 use fanos_primitives::Epoch;
 use fanos_wire::error::ProtocolError;
 use fanos_wire::FrameType;
@@ -133,19 +133,53 @@ impl<F: Field> OverlayNode<F> {
             self.stations.record(Station::AdmissionIdentityUnbound, Some(coord));
             return Vec::new();
         }
-        // First sight only. A repeat must NOT overwrite the stored key bundle — otherwise any peer
-        // could silently replace a member's advertised keys in our local view (and suppress the
-        // re-flood, diverging the cell). Ignore repeats entirely; the monotone guard ends the flood.
+        // First sight only, with **one** exception that the descent made necessary. A repeat must not
+        // overwrite the stored key bundle — otherwise any peer could silently replace a member's advertised
+        // keys in our local view (and suppress the re-flood, diverging the cell) — and the monotone guard is
+        // what ends the flood.
+        //
+        // The exception: **an identity may move its own overlay address.** A node that descends into a
+        // sub-cell (§L0/§L1) re-announces from the coordinate it already holds, and under the plain
+        // first-sight rule every peer read that as a repeat and dropped it — so the descendant announced a
+        // sub-cell address nobody ever learned and stayed unroutable, which is the whole thing the descent
+        // exists to fix. Admitted only when all three hold, and each one is load-bearing:
+        //
+        // * the announcer's identity **equals the one already recorded** at this coordinate — so a stranger
+        //   still cannot touch a member's record, which is the property the guard protects;
+        // * that identity is **non-empty** — under an unsigned deployment every announcer's `id` is empty
+        //   and "equal" would admit anybody;
+        // * the address **actually differs** from the one held — so a re-flood of an unchanged announcement
+        //   still terminates, which is the guard's other job.
+        //
+        // The key bundle is left alone even on the admitted path: only the route moves.
         if self.membership.members.contains_key(&coord) {
-            // **Counted, because this branch refuses two different things and used to say nothing.** A
-            // benign re-flood terminating is one; a node that arbitration legitimately seated at this point
-            // being locked out of the cell's membership view is the other — and the second became reachable
-            // the moment epochs began to advance, since the beacon re-draws every coordinate while `members`
-            // is keyed by position and is not cleared at the boundary.
-            self.stations.record(Station::MembershipRepeatIgnored, Some(coord));
-            return Vec::new();
+            let same_identity = !id.is_empty() && self.membership.identities.get(&coord) == Some(&id);
+            let moved = self.router.peers.get(&coord) != Some(&hier);
+            if !(same_identity && moved) {
+                // **Counted, because this branch refuses two different things and used to say nothing.** A
+                // benign re-flood terminating is one; a node that arbitration legitimately seated at this
+                // point being locked out of the cell's membership view is the other — and the second became
+                // reachable the moment epochs began to advance, since the beacon re-draws every coordinate
+                // while `members` is keyed by position and is not cleared at the boundary.
+                self.stations.record(Station::MembershipRepeatIgnored, Some(coord));
+                return Vec::new();
+            }
+            self.learn_hier_peer(hier.clone(), coord);
+            let mut effects = self.flood(&encode(
+                FrameType::Announce,
+                &announce_body(coord, &hier, &id, &sig, &proof, &info),
+            ));
+            effects.push(Effect::Notify(Notification::PeerAddressed {
+                coord,
+                path: hier.points().iter().map(Point::coords).collect(),
+            }));
+            return effects;
         }
         self.membership.members.insert(coord, info.clone());
+        // …and the identity behind it, which is what a contested sub-cell point is arbitrated on. Inserted
+        // beside `members` and under the same first-sight rule, so the two cannot disagree about who is at
+        // a coordinate.
+        self.membership.identities.insert(coord, id.clone());
         // Seed the hierarchical routing table: this overlay address is reachable via `coord`. A
         // descended sub-cell member thus becomes routable cell-wide from its announcement alone (§L1);
         // a depth-1 announcer adds its own direct entry, so `send_hier` also delivers within one plane.
@@ -155,6 +189,10 @@ impl<F: Field> OverlayNode<F> {
             &announce_body(coord, &hier, &id, &sig, &proof, &info),
         );
         let mut effects = self.flood(&frame);
+        // No `PeerAddressed` here: `MemberJoined` already says the cell learned this peer, and an extra
+        // notification on every announce is broadcast pressure — on a channel whose own doc calls itself
+        // lossy under lag — that every existing deployment would pay for nothing. The notification means
+        // *changed*, and on first sight there is nothing that changed.
         effects.push(Effect::Notify(Notification::MemberJoined { coord, info }));
         effects
     }
@@ -201,6 +239,9 @@ impl<F: Field> OverlayNode<F> {
             1,
         );
         self.membership.members.clear();
+        // With them, and for the identical reason: `identities` is the same view keyed the same way, and a
+        // stale entry there would arbitrate a sub-cell contest against a node that has left the point.
+        self.membership.identities.clear();
         // The epoch re-draws every node's VRF coordinate, so every cell position keeps its name and changes
         // its occupant. State addressed by a position stops describing what its address says — see
         // [`Healer::on_seating_changed`] for the measurement and for the two things deliberately kept.
@@ -313,6 +354,117 @@ impl<F: Field> OverlayNode<F> {
     /// replication every cell member is a replica for every key, so within a cell there is nothing to prune.
     ///
     /// A no-op if `new_coord` is not a canonical projective point or already equals this coordinate.
+    /// `Command::ProposeAddress` — compute, and only report, the shortest hierarchical address this node may
+    /// hold (spec §L0/§L1). Nothing moves; [`on_descend`](Self::on_descend) is what adopts.
+    ///
+    /// # Why level 0 is an argument and everything below it is derived here
+    ///
+    /// The two levels are arbitrated by different rules held in different places. Level 0 is settled by the
+    /// **VRF claim order** — `(probe_index, VrfOutput)` verified against a beacon — which lives in the
+    /// driver and is invisible from here: a rival for this node's own point is not in `router.peers`,
+    /// because that table is keyed by transport coordinate and this node *is* that coordinate. So `contested`
+    /// is the one fact the caller must supply.
+    ///
+    /// Levels ≥ 1 are settled by the strict total order on **identity bytes**, and the identities arrive
+    /// only here — `on_announce` parses each peer's `id`, and `membership.identities` keeps it beside the
+    /// `router.peers` address under the same key. Every node runs the same pure function over the same view,
+    /// so of any identities contesting a position exactly one (the minimum id) keeps it and the rest descend,
+    /// conflict-free and with no negotiation.
+    ///
+    /// [`fanos_primitives::derive_hierarchical_address`] is deliberately **not** reused: its level-0 rule is
+    /// the same id order, which would contradict the VRF arbitration and let the two mechanisms disagree
+    /// about who owns a point. What is shared is the primitive underneath — `derive_address`, the one
+    /// implementation of "keep the shortest prefix nothing else holds".
+    ///
+    /// A `None` from that primitive means `MAX_DEPTH` consecutive levels were all occupied, and it is not a
+    /// caller's mistake: it is a node that **cannot join at all**, counted apart for that reason.
+    pub(super) fn on_propose_address(&mut self, contested: bool) -> Vec<Effect> {
+        let own_id = self.membership.identity.clone();
+        let own_point = self.coord;
+        let derived = {
+            // The pairs the tie-break needs, and only those: a peer whose address is known but whose
+            // identity is not cannot be compared, so it does not get to displace anyone.
+            let seated: Vec<(&[u8], &HierAddr<F>)> = self
+                .router
+                .peers
+                .iter()
+                .filter_map(|(coord, addr)| {
+                    self.membership.identities.get(coord).map(|id| (id.as_slice(), addr))
+                })
+                .collect();
+            derive_address::<F>(
+                |level| if level == 0 { own_point } else { fanos_primitives::address_point::<F>(&own_id, level) },
+                |path| match path.len() {
+                    1 => contested,
+                    _ => seated
+                        .iter()
+                        .any(|(pid, addr)| *pid < own_id.as_slice() && addr.points() == path),
+                },
+            )
+        };
+        let Some(addr) = derived else {
+            self.stations.record(Station::AddressUnplaceable, Some(own_point.coords()));
+            return Vec::new();
+        };
+        alloc::vec![Effect::Notify(Notification::AddressProposed {
+            path: addr.points().iter().map(Point::coords).collect(),
+        })]
+    }
+
+    /// `Command::Descend` — adopt `path` as this node's overlay hierarchical address and re-announce under it.
+    ///
+    /// **The transport coordinate does not move, and that is the whole design.** A descended node keeps
+    /// `self.coord`, keeps its store, keeps its cell peers; what changes is the *overlay* address it is
+    /// addressed by. `with_hier_address` already states the decoupling — *"the two need not coincide past
+    /// depth 1"* — and this is the runtime path that finally uses it. The alternative, re-keying transport by
+    /// the full path, moves every coordinate-keyed consumer in the tree (`cap_slot`, the erasure shard homes,
+    /// the validator table) and buys nothing a descendant needs: it is reached inbound by `RouteHier` through
+    /// an ancestor, which is dispatched and live.
+    ///
+    /// Depth 1 is the flat address and is accepted rather than refused — it is how a node that wins its point
+    /// back **ascends** out of a sub-cell. `on_reseat` deliberately preserves the deep levels across a
+    /// reshuffle (they are identity-derived and epoch-independent), so without an explicit ascent a node that
+    /// descended once would stay descended for the life of the process.
+    ///
+    /// Refused, with no mutation and a counted station, when the path is not an address **of this node**:
+    /// empty, deeper than `MAX_DEPTH`, carrying a point that is not canonical on this plane, or rooted
+    /// anywhere but `self.coord` — a descendant hangs *under* the point it wanted, so a foreign level 0 is a
+    /// different node's address and adopting it would make this node unreachable at an address nobody routes
+    /// to it. Every one of those is a caller bug rather than a peer's doing, which is why the refusal is
+    /// silent to the network and loud in the stations.
+    pub(super) fn on_descend(&mut self, path: &[Triple]) -> Vec<Effect> {
+        let refuse = |me: &mut Self| {
+            me.stations.record(Station::DescendRefused, path.first().copied());
+            Vec::new()
+        };
+        let Some(points) = path.iter().map(|&c| Point::<F>::new(c)).collect::<Option<Vec<_>>>() else {
+            return refuse(self);
+        };
+        if points.first() != Some(&self.coord) {
+            return refuse(self);
+        }
+        // Depth is `HierAddr::from_path`'s to enforce, not this function's: it already refuses an empty path
+        // and anything past `MAX_DEPTH`, and a second copy of that bound here is a constant that can drift
+        // from the one the wire codec uses.
+        let Some(addr) = HierAddr::from_path(points) else {
+            return refuse(self);
+        };
+        if addr == self.router.address {
+            return Vec::new(); // already there — re-announcing would be a flood with no news in it
+        }
+        let deepened = addr.depth() > 1;
+        self.router.address = addr;
+        if deepened {
+            self.stations.record(Station::Descended, Some(self.coord.coords()));
+        }
+        // Re-announce under the new address so peers can route to it: `on_announce` feeds `learn_hier_peer`,
+        // which is what makes `RouteHier` able to reach a descendant at all. The membership entry is re-used
+        // rather than removed and re-added — unlike a reseat, nothing about this node's *coordinate* changed,
+        // so there is no stale entry to drop.
+        let info = self.membership.members.get(&self.coord.coords()).cloned().unwrap_or_default();
+        self.on_join(info)
+    }
+
     pub(super) fn on_reseat(&mut self, new_coord: Triple) -> Vec<Effect> {
         let Some(new_pt) = Point::<F>::new(new_coord) else {
             return Vec::new(); // not a canonical projective point — ignore

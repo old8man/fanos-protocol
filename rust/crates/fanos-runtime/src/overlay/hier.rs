@@ -51,6 +51,24 @@ impl<F: Field> OverlayNode<F> {
         self.router.learn_peer(addr, transport);
     }
 
+    /// Register a hierarchical peer **with the identity that earned its address** — the pair the sub-cell
+    /// tie-break needs.
+    ///
+    /// [`learn_hier_peer`](Self::learn_hier_peer) records a *route* and nothing more, which is all
+    /// `RouteHier` forwarding asks for. Deciding who yields at a contested sub-cell point asks for more:
+    /// levels ≥ 1 of an address are `address_point(id, level)` and priority is the order on identity bytes,
+    /// so a peer registered without one cannot be compared and therefore cannot displace anybody. That is
+    /// the safe direction — an unknown rival costs this node a level it need not have taken, never somebody
+    /// else's seat — but it is a real difference and a seeder that has the identity should pass it.
+    ///
+    /// The ordinary path needs neither builder: `on_announce` records both halves from the same frame.
+    #[must_use]
+    pub fn with_hier_peer_identity(mut self, id: alloc::vec::Vec<u8>, addr: HierAddr<F>, transport: Triple) -> Self {
+        self.membership.identities.insert(transport, id);
+        self.learn_hier_peer(addr, transport);
+        self
+    }
+
     /// Builder form of [`learn_hier_peer`](Self::learn_hier_peer).
     #[must_use]
     pub fn with_hier_peer(mut self, addr: HierAddr<F>, transport: Triple) -> Self {

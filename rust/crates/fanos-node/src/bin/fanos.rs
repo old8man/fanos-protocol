@@ -4145,6 +4145,12 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
         ),
 
         Notification::PeerMoved { old, new } => info!(?old, ?new, "a peer moved coordinate"),
+        // The coordinate is what did NOT change — that is why this is not `PeerMoved`: a descendant keeps its
+        // point and is reached through an ancestor. A rising depth means the plane is oversubscribed and the
+        // overflow is nesting rather than doubling up on points, which is the design working. `AddressProposed`
+        // is one step of a three-message exchange, so it goes to debug and the adoption is what an operator sees.
+        Notification::PeerAddressed { coord, path } => info!(?coord, depth = path.len(), "a peer took a sub-cell address"),
+        Notification::AddressProposed { path } => tracing::debug!(depth = path.len(), "an overlay address was named for this node"),
         Notification::Grey(p) => info!(node = ?p, "peer greylisted"),
         Notification::Bound => info!("cell bound (homeostat)"),
         Notification::Verdict(v) => info!(verdict = ?v, "coherence verdict"),

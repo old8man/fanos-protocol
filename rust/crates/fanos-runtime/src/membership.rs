@@ -49,6 +49,18 @@ pub(crate) struct Membership {
     /// The membership view: cell coordinate → announced info (public keys, capabilities), learned by
     /// flooding JOIN announcements (spec §7.8). This is the key distribution onion routing reads.
     pub(crate) members: BTreeMap<Triple, Vec<u8>>,
+    /// Cell coordinate → the peer's announced **identity bytes** (`Announce`'s `id`, the same hybrid
+    /// signature bundle [`identity`](Self::identity) is for this node).
+    ///
+    /// Kept because the hierarchical descent is arbitrated on identities and nothing else could supply
+    /// them. Levels ≥ 1 of an address are `address_point(id, level)`, so deciding who yields at a contested
+    /// sub-cell point means computing *a rival's* points — and a rival's `id` arrives only here, in the
+    /// announcement. The driver's claim book holds certificates, which are different bytes and derive
+    /// different points.
+    ///
+    /// Keyed and cleared exactly like [`members`](Self::members): a coordinate-keyed table stops describing
+    /// what its address names the moment the beacon re-draws.
+    pub(crate) identities: BTreeMap<Triple, Vec<u8>>,
 }
 
 impl Membership {

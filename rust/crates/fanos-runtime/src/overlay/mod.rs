@@ -8,7 +8,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::vec::Vec;
+use Vec;
 
 use fanos_code::erasure;
 use crate::ports::stations::{GatherHealth, Station, Stations};
@@ -1895,6 +1895,8 @@ impl<F: Field> Engine for OverlayNode<F> {
                 Vec::new()
             }
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
+            Input::Command(Command::ProposeAddress { contested }) => self.on_propose_address(contested),
+            Input::Command(Command::Descend { path }) => self.on_descend(&path),
             Input::Timer(HEARTBEAT) if self.heartbeating => self.on_heartbeat(now),
             // An unarmed timer, and a sub-engine control message — inert here for the same reason: neither names
             // anything this engine owns. The overlay composes no sub-engine that takes a `Control`, and the
@@ -3083,6 +3085,219 @@ mod tests {
             "the upstream peer put a frame on the wire toward us; carrying it is not a reason to ignore that"
         );
         assert_eq!(sample[me], 1.0, "and we put one on the wire toward the next hop — that is our work");
+    }
+
+    /// **Only the identity already at a coordinate may move that coordinate's address.**
+    ///
+    /// `on_announce` is first-sight-only, and the descent needed one exception: a node that descends
+    /// re-announces from the coordinate it already holds, so under the plain rule every peer drops it as a
+    /// repeat and the sub-cell address is announced into silence. The exception is narrow because the guard's
+    /// own reason is real — *"any peer could silently replace a member's advertised keys in our local
+    /// view"* — and this pins the narrowness rather than the exception.
+    ///
+    /// Three announcements at one coordinate: the member's own (learned), a **stranger's** with a different
+    /// address (refused), and the member's own again with a new address (learned). Without the identity
+    /// check the middle one would be admitted and whoever announced last would own the route.
+    #[test]
+    fn a_strangers_announcement_cannot_move_a_members_overlay_address() {
+        use crate::frames::announce_body;
+        let mine = alloc::vec![9u8; 8];
+        let stranger = alloc::vec![4u8; 8];
+        let seat = Point::<F2>::at(1);
+        let mut node = OverlayNode::<F2>::new(Point::at(0), Config::default());
+
+        let announce = |id: &[u8], depth: usize| {
+            let path: Vec<Point<F2>> =
+                (0..depth).map(|l| if l == 0 { seat } else { Point::<F2>::at(3 + l) }).collect();
+            let hier = HierAddr::from_path(path).unwrap();
+            encode(FrameType::Announce, &announce_body(seat.coords(), &hier, id, &[], &[], &[7u8]))
+        };
+        // `PeerAddressed` means *moved*, so first sight is observed through `MemberJoined` instead — the
+        // asymmetry is the notification's contract and asserting it here is what keeps the two apart.
+        let moved = |effects: &[Effect]| {
+            effects.iter().find_map(|e| match e {
+                Effect::Notify(Notification::PeerAddressed { path, .. }) => Some(path.len()),
+                _ => None,
+            })
+        };
+        let joined = |effects: &[Effect]| {
+            effects.iter().any(|e| matches!(e, Effect::Notify(Notification::MemberJoined { .. })))
+        };
+
+        let first = node.step(Instant(0), Input::Message { from: seat.coords(), frame: announce(&mine, 1) });
+        assert!(joined(&first), "first sight of a member must be learned, or the guard refuses everyone");
+        assert_eq!(
+            moved(&first),
+            None,
+            "first sight is not a move — reporting one would put an extra notification on the broadcast for \
+             every announce the cell has ever made"
+        );
+        assert_eq!(
+            moved(&node.step(Instant(0), Input::Message { from: seat.coords(), frame: announce(&stranger, 3) })),
+            None,
+            "a different identity moved a member's address — then the route belongs to whoever announced last"
+        );
+        assert_eq!(
+            moved(&node.step(Instant(0), Input::Message { from: seat.coords(), frame: announce(&mine, 2) })),
+            Some(2),
+            "the identity that holds the coordinate must be able to descend, which is the whole exception"
+        );
+        assert_eq!(
+            moved(&node.step(Instant(0), Input::Message { from: seat.coords(), frame: announce(&mine, 2) })),
+            None,
+            "and re-flooding an address it already announced is not news — that is what ends the flood"
+        );
+
+        // **An unsigned deployment must not get the exception at all.** With no self-certifying identity
+        // every announcer's `id` is empty, so "the same identity" would be true for anybody and the
+        // exception would hand the route to whoever announced last — the opposite of what it is for. A
+        // second coordinate, because the first one's identity is now recorded.
+        let bare = Point::<F2>::at(2);
+        let unsigned = |depth: usize| {
+            let path: Vec<Point<F2>> =
+                (0..depth).map(|l| if l == 0 { bare } else { Point::<F2>::at(3 + l) }).collect();
+            let hier = HierAddr::from_path(path).unwrap();
+            encode(FrameType::Announce, &announce_body(bare.coords(), &hier, &[], &[], &[], &[7u8]))
+        };
+        assert!(
+            joined(&node.step(Instant(0), Input::Message { from: bare.coords(), frame: unsigned(1) })),
+            "an unsigned deployment still learns its members at first sight"
+        );
+        assert_eq!(
+            moved(&node.step(Instant(0), Input::Message { from: bare.coords(), frame: unsigned(3) })),
+            None,
+            "an empty identity matched itself and moved the address — under an unsigned deployment that is \
+             every peer, so the exception would be unconditional"
+        );
+    }
+
+    /// **The descent's two levels are decided by two different rules, and the engine may only apply one of
+    /// them.**
+    ///
+    /// Level 0 is settled by the VRF claim order, which lives in the driver and is invisible here: a rival
+    /// for this node's own point is not in `router.peers`, because that table is keyed by transport
+    /// coordinate and this node *is* that coordinate. So `contested` is an argument. Levels ≥ 1 are
+    /// `address_point(id, level)` arbitrated on identity bytes, and only this layer has the identities.
+    ///
+    /// Both answers are asserted, because an implementation that always descended would satisfy the second
+    /// alone — and a node that descends while it holds its point makes itself unreachable for nothing.
+    #[test]
+    fn a_contested_node_is_told_a_sub_cell_under_the_point_it_lost_and_an_uncontested_one_its_flat_address() {
+        let id = alloc::vec![7u8; 32];
+        let mut node = OverlayNode::<F2>::new(Point::at(3), Config::default()).with_identity(id.clone());
+
+        let proposed = |node: &mut OverlayNode<F2>, contested: bool| -> Option<Vec<Triple>> {
+            node.step(Instant(0), Input::Command(Command::ProposeAddress { contested }))
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::AddressProposed { path }) => Some(path),
+                    _ => None,
+                })
+        };
+
+        assert_eq!(
+            proposed(&mut node, false),
+            Some(alloc::vec![Point::<F2>::at(3).coords()]),
+            "a node that holds its point is told the flat address — descending would cost it its own seat"
+        );
+        assert_eq!(
+            proposed(&mut node, true),
+            Some(alloc::vec![
+                Point::<F2>::at(3).coords(),
+                fanos_primitives::address_point::<F2>(&id, 1).coords(),
+            ]),
+            "a beaten node is told a sub-cell UNDER the point it wanted, derived from its own identity"
+        );
+    }
+
+    /// **A smaller identity already in the sub-cell pushes this node one level deeper, and a peer nobody can
+    /// name pushes nobody.**
+    ///
+    /// Priority is the strict total order on identity bytes, so of any identities contesting a position
+    /// exactly one keeps it and the rest descend — conflict-free, with no negotiation, because every node
+    /// runs the same pure function over the same view. The second half is the one an implementation gets
+    /// wrong: a peer registered as a *route* carries no identity, cannot be compared, and must therefore not
+    /// displace anyone. Yielding to it would be yielding to whoever announced last.
+    #[test]
+    fn only_a_smaller_identity_can_push_this_node_deeper_into_a_sub_cell() {
+        let mine = alloc::vec![7u8; 32];
+        let smaller = alloc::vec![1u8; 32];
+        let sub = fanos_primitives::address_point::<F2>(&mine, 1);
+        let taken = HierAddr::from_path(alloc::vec![Point::<F2>::at(3), sub]).unwrap();
+
+        let deeper = |node: &mut OverlayNode<F2>| {
+            node.step(Instant(0), Input::Command(Command::ProposeAddress { contested: true }))
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::Notify(Notification::AddressProposed { path }) => Some(path.len()),
+                    _ => None,
+                })
+        };
+
+        // The rival holds exactly the path this node would take, and its identity sorts first.
+        let mut yielded = OverlayNode::<F2>::new(Point::at(3), Config::default())
+            .with_identity(mine.clone())
+            .with_hier_peer_identity(smaller, taken.clone(), Point::<F2>::at(5).coords());
+        assert_eq!(deeper(&mut yielded), Some(3), "the larger identity descends past the point it lost twice");
+
+        // The same route with no identity behind it: nothing to compare, so nothing yields.
+        let mut held = OverlayNode::<F2>::new(Point::at(3), Config::default())
+            .with_identity(mine)
+            .with_hier_peer(taken, Point::<F2>::at(5).coords());
+        assert_eq!(
+            deeper(&mut held),
+            Some(2),
+            "a route with no identity displaced this node — then whoever announces last wins the sub-cell"
+        );
+    }
+
+    /// **`Descend` adopts an address and re-announces under it; depth 1 is how a node comes back up.**
+    ///
+    /// `on_reseat` preserves the deep levels across a reshuffle on purpose — they are identity-derived and
+    /// epoch-independent — so without an explicit ascent a node that descended once would stay in a sub-cell
+    /// for the life of the process even after it won its point back.
+    ///
+    /// The refusals are asserted beside it because each of them is a caller bug that would leave this node
+    /// announcing an address nobody routes to it: a foreign level 0 is a different node's address, and a
+    /// coordinate that is not a point of this plane is not an address at all.
+    #[test]
+    fn descend_adopts_re_announces_and_ascends_and_refuses_an_address_that_is_not_this_nodes() {
+        let mut node = OverlayNode::<F2>::new(Point::at(3), Config::default());
+        let deep = alloc::vec![Point::<F2>::at(3).coords(), Point::<F2>::at(5).coords()];
+
+        let effects = node.step(Instant(0), Input::Command(Command::Descend { path: deep.clone() }));
+        assert_eq!(node.hier_address().points(), &[Point::<F2>::at(3), Point::<F2>::at(5)], "the address is adopted");
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Send { .. })),
+            "a descent that nobody hears leaves the descendant unroutable — `RouteHier` learns from the announce"
+        );
+        assert_eq!(node.coord.coords(), Point::<F2>::at(3).coords(), "the TRANSPORT coordinate does not move");
+
+        // Idempotent: the same address again is not news, so it does not re-flood.
+        assert!(
+            node.step(Instant(0), Input::Command(Command::Descend { path: deep })).is_empty(),
+            "re-adopting the address already held must not put an announce on the wire"
+        );
+
+        // Ascent.
+        node.step(
+            Instant(0),
+            Input::Command(Command::Descend { path: alloc::vec![Point::<F2>::at(3).coords()] }),
+        );
+        assert_eq!(node.hier_address().depth(), 1, "depth 1 brings a node back out of its sub-cell");
+
+        // Refusals, each leaving the address untouched.
+        for bad in [
+            alloc::vec![Point::<F2>::at(4).coords(), Point::<F2>::at(5).coords()], // a foreign level 0
+            alloc::vec![[0, 0, 0]],                                                // not a point of the plane
+            alloc::vec![],                                                         // no address at all
+        ] {
+            assert!(
+                node.step(Instant(0), Input::Command(Command::Descend { path: bad })).is_empty(),
+                "a path that is not this node's address must not be adopted or announced"
+            );
+            assert_eq!(node.hier_address().depth(), 1, "and must leave the address it had standing");
+        }
     }
 
     #[test]

@@ -303,6 +303,45 @@ pub enum Command {
         /// The node's new VRF-derived coordinate for the current epoch.
         coord: Triple,
     },
+    /// **Ask the engine what this node's overlay address should be** (spec §L0/§L1), answered by
+    /// [`Notification::AddressProposed`]. It computes and reports; nothing moves until [`Descend`](Self::Descend).
+    ///
+    /// The two halves of placement are settled by two different rules, in two different places, and this is the
+    /// seam between them. **Level 0** is settled by the VRF claim order — `(probe_index, VrfOutput)`, verified
+    /// against a beacon — and only the driver holds it. **Levels ≥ 1** are settled by the strict total order on
+    /// identity bytes (`fanos_primitives::derive_hierarchical_address`), and only the engine holds those: it
+    /// learns each peer's identity from the `Announce` it verifies, and the driver's claim book keeps
+    /// certificates, which are different bytes and would derive different points.
+    ///
+    /// So the driver states the one fact it owns and asks for the rest.
+    ProposeAddress {
+        /// Whether this node was **beaten** on every point of its probe walk. `true` makes level 0 occupied,
+        /// so the answer descends; `false` asks for the flat address and is how a node that wins a seat
+        /// again **ascends** back to depth 1.
+        contested: bool,
+    },
+    /// Adopt `path` as this node's **overlay hierarchical address** and re-announce under it (spec §L0/§L1).
+    ///
+    /// This is the other half of the placement rule the walk implements. `probe_walk` searches the drawn
+    /// point's **line** — `q + 1` points of one plane — and the descent is what that search becomes when the
+    /// line is exhausted. Without it a Fano cell tops out at seven members while its own sizing constant asks
+    /// for sixteen, and the overflow ends as two nodes bound to one point, which §L0 forbids.
+    ///
+    /// The **transport coordinate does not move**: a descendant keeps its point, dials out normally, and is
+    /// reached inbound by `RouteHier` through an ancestor. Depth 1 is the flat address and is how a node
+    /// returns from a sub-cell once it holds its point again.
+    ///
+    /// **Send it AFTER the [`Descriptor`](Self::Descriptor) that signs the same path**, for the reason that
+    /// command states: the engine re-announces here, an announce carries the address the descriptor signature
+    /// has to cover, and a mismatch is dropped in silence.
+    Descend {
+        /// The full hierarchical path, level 0 first — normally the one
+        /// [`Notification::AddressProposed`] just named. Refused at depth `0`, past
+        /// `fanos_geometry::MAX_DEPTH`, on a non-canonical point, and when `path[0]` is not this node's own
+        /// coordinate: a descendant hangs **under** the point it wanted, so a path rooted anywhere else is a
+        /// different node's address and adopting it would make this node unreachable.
+        path: Vec<Triple>,
+    },
 }
 
 /// An input delivered to the engine — the only things it reacts to.
@@ -781,6 +820,36 @@ pub enum Notification {
         old: Triple,
         /// The coordinate the node holds after the reshuffle.
         new: Triple,
+    },
+    /// A **peer's overlay address changed** (spec §L1): the node at `coord` now serves `path`.
+    ///
+    /// The observable the descent would otherwise not have. A descendant keeps its transport coordinate and
+    /// re-announces under a deeper address, so nothing about the *cell's* view of it moves — `MemberJoined`
+    /// already fired at its first sight and does not fire again. Without this, "the cell learned where the
+    /// node went" is a claim no test and no operator can check, and a descent that announced into silence
+    /// would look exactly like one that worked.
+    ///
+    /// Emitted **only when a peer moves an address it already held** — not on first sight, where
+    /// [`MemberJoined`](Self::MemberJoined) already says the cell learned it. The distinction is not
+    /// tidiness: this rides the same lossy broadcast every consumer reads, so an extra notification per
+    /// announce would be pressure that every existing deployment pays and no descendant needs.
+    PeerAddressed {
+        /// The peer's transport coordinate, which is what did **not** change.
+        coord: Triple,
+        /// Its overlay hierarchical path, level 0 first.
+        path: Vec<Triple>,
+    },
+    /// The engine's answer to [`Command::ProposeAddress`]: the shortest hierarchical path this node may hold
+    /// (spec §L0/§L1). **Nothing has moved** — the address is adopted only by [`Command::Descend`], and only
+    /// after the driver has signed a descriptor over this exact path.
+    ///
+    /// Reported rather than applied because the descriptor signature binds `(coord, hier, id)` and the engine
+    /// cannot sign. Making that a round trip is what keeps "the descriptor precedes the announce" structural
+    /// instead of a rule every caller has to remember.
+    AddressProposed {
+        /// The path, level 0 first. Depth 1 is the flat address — the answer for an uncontested node, and
+        /// what a descendant receives once it holds its point again.
+        path: Vec<Triple>,
     },
     /// The **differential-DDoS load-balance prescription** (spec §6.7): on entering the homeostat's
     /// under-coupled (`Aggregate`/`Bind`) band — the regime a load hotspot induces by decorrelating the cell

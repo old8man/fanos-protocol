@@ -61,6 +61,8 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Join { .. } => "Join",
         Command::AdvanceEpoch => "AdvanceEpoch",
         Command::Reseat { .. } => "Reseat",
+        Command::ProposeAddress { .. } => "ProposeAddress",
+        Command::Descend { .. } => "Descend",
         Command::Descriptor { .. } => "Descriptor",
         Command::Quarantine { .. } => "Quarantine",
         Command::Readmit { .. } => "Readmit",
@@ -100,6 +102,11 @@ fn admission_desc(outcome: &AdmissionOutcome) -> String {
     }
 }
 
+// One arm per `Notification` variant and nothing else, so the length tracks the enum rather than any
+// complexity of its own. Splitting it would cost the exhaustiveness that makes a new variant a compile
+// error here — the property `FrameTypeUnhandled`'s own doc calls the defining condition — since either half
+// would need a catch-all or an unreachable arm.
+#[allow(clippy::too_many_lines)]
 fn note_desc(note: &Notification) -> String {
     match note {
         Notification::Delivered { from, .. } => format!("Delivered from {}", fmt_coord(*from)),
@@ -205,6 +212,8 @@ fn note_desc(note: &Notification) -> String {
         Notification::PeerMoved { old, new } => {
             format!("PeerMoved {}→{}", fmt_coord(*old), fmt_coord(*new))
         }
+        Notification::PeerAddressed { coord, path } => format!("PeerAddressed {} d{}", fmt_coord(*coord), path.len()),
+        Notification::AddressProposed { path } => format!("AddressProposed d{}", path.len()),
         Notification::Rebalance { loads } => format!("Rebalance {loads:?}"),
         Notification::Observed(bytes) => format!("Observed {}B", bytes.len()),
     }
