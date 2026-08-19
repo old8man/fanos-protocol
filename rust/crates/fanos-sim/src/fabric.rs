@@ -416,7 +416,7 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true, None).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, None, fanos_node::config::OverlayChoices::default()).await
     }
 
     /// As [`spawn`](Self::spawn), with an explicit **epoch period** — the one thing a fleet could not say.
@@ -441,7 +441,7 @@ impl NodeFleet {
         roles: fanos_node::RoleSet,
         epoch_period: Duration,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period)).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), fanos_node::config::OverlayChoices::default()).await
     }
 
     /// [`spawn_as_drawn`](Self::spawn_as_drawn) with an explicit epoch period — the collision half of
@@ -462,7 +462,7 @@ impl NodeFleet {
         roles: fanos_node::RoleSet,
         epoch_period: Duration,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, false, Some(epoch_period)).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, Some(epoch_period), fanos_node::config::OverlayChoices::default()).await
     }
 
     /// As [`spawn`](Self::spawn), but taking the coordinate draw **as it comes** — collisions included.
@@ -476,7 +476,29 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, false, None).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, None, fanos_node::config::OverlayChoices::default()).await
+    }
+
+    /// A fleet running an **overlay configuration a deployment can choose**, so a scenario can exercise a
+    /// switch rather than argue about it.
+    ///
+    /// The one that needed it: `require_self_certified_membership` verifies a signed descriptor, and the
+    /// producer for that descriptor is the *driver* — it re-signs at every reseat, because the message binds
+    /// the transport coordinate and the reshuffle re-draws it. So the sans-I/O simulator cannot reach the
+    /// property at all: only a fleet, which runs the real QUIC transport and the real reshuffle loop, puts
+    /// the signer and the verifier in the same run.
+    ///
+    /// # Errors
+    /// Propagates the first node-start failure.
+    #[cfg(test)]
+    pub(crate) async fn spawn_with_overlay<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+        epoch_period: Duration,
+        overlay: fanos_node::config::OverlayChoices,
+    ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), overlay).await
     }
 
     async fn spawn_inner_fleet<F: fanos_field::Field + 'static>(
@@ -485,6 +507,7 @@ impl NodeFleet {
         roles: fanos_node::RoleSet,
         injective: bool,
         epoch_period: Option<Duration>,
+        overlay: fanos_node::config::OverlayChoices,
     ) -> Result<Self, fanos_node::NodeError> {
         let fabric = Fabric::new(link);
         // **The shares are dealt and kept.** They used to be `_shares`, and that one underscore cost this tier every
@@ -591,6 +614,7 @@ impl NodeFleet {
                     // repeats a coordinate, and treating that as an operator's typo made both of them
                     // impossible to run at all (#186).
                     bootstrap_source: fanos_node::config::SeatSource::Observed,
+                    overlay,
                     ..fanos_node::NodeConfig::default()
                 },
                 fanos_quic::Fabric::Abstract(socket),
@@ -2861,6 +2885,87 @@ mod tests {
         }
     }
 
+
+    /// **What does verifying membership descriptors COST a real cell?** — the question a default turns on,
+    /// and the one the simulator cannot answer.
+    ///
+    /// `require_self_certified_membership` refused 100 % of honest announcements until the producer landed.
+    /// The instrument that measured that runs on the sans-I/O simulator, and it cannot reach this property:
+    /// the producer is the **driver**, which re-signs at every reseat because the descriptor binds the
+    /// *transport* coordinate and the reshuffle re-draws it. Only a fleet — real QUIC, the real reshuffle
+    /// loop, a real beacon — puts the signer and the verifier in one run.
+    ///
+    /// **Both arms, read after a real boundary.** A cell that learns its membership at genesis and is never
+    /// asked again would prove only that `compose_engine` installs the first descriptor; what has never been
+    /// exercised is `Command::Descriptor` from the reshuffle loop, and that fires once per boundary. So each
+    /// arm waits for the beacon to turn twice before it is read.
+    ///
+    /// The assertion is a **comparison**, not a threshold: this fixture's membership view is partial even
+    /// ungated (five nodes on seven points, a 20 s epoch, and `known_peers` counts what a node has actually
+    /// heard), so an absolute floor would be a number about the fixture. What a default needs to know is
+    /// whether the check *takes* anything, and that is the difference between the arms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_what_verifying_membership_descriptors_costs_a_real_cell() {
+        use fanos_field::F2;
+        let roles = fanos_node::RoleSet { relay: true, ..fanos_node::RoleSet::default() };
+        // Short enough that two boundaries arrive inside the run, and the fixture's clock rather than the
+        // production floor — `NodeFleet` does not enforce the latter, and this measures the reshuffle.
+        let period = Duration::from_secs(20);
+        let n = 5usize;
+        let mut readings = Vec::new();
+        for (label, require) in [("ungated", false), ("guarded", true)] {
+            let overlay = fanos_node::config::OverlayChoices {
+                require_self_certified_membership: require,
+                ..fanos_node::config::OverlayChoices::default()
+            };
+            let fleet = match NodeFleet::spawn_with_overlay::<F2>(
+                n,
+                Link::ideal(),
+                roles,
+                period,
+                overlay,
+            )
+            .await
+            {
+                Ok(f) => f,
+                Err(e) => panic!("a fleet must start ({label}): {e:?}"),
+            };
+            // Two rounds, so the reading is of a cell that has re-signed rather than of one still on its
+            // composition-time descriptor.
+            let turned = fleet
+                .until(|f| {
+                    f.nodes()
+                        .iter()
+                        .filter_map(|x| x.live_beacon().map(|(e, _)| e.get()))
+                        .min()
+                        .unwrap_or(0)
+                        >= 2
+                })
+                .await;
+            let known: Vec<usize> = fleet.nodes().iter().map(|x| x.health().known_peers).collect();
+            let claims: Vec<i64> =
+                fleet.nodes().iter().map(|x| x.health().verified_claims.map_or(-1, |c| c as i64)).collect();
+            let total: usize = known.iter().sum();
+            println!(
+                "{label:>8}: turned={turned}  known_peers={known:?} (sum {total} of {})  claims={claims:?}",
+                n * (n - 1)
+            );
+            readings.push(total);
+            fleet.shutdown().await;
+        }
+        let [ungated, guarded] = readings[..] else {
+            panic!("both arms must have run — the loop above has exactly two");
+        };
+        assert!(ungated > 0, "the ungated arm learned nothing — the measurement has no baseline");
+        assert!(
+            guarded > 0,
+            "verifying descriptors still costs the cell ALL of its membership ({guarded} learned edges \
+             against {ungated} ungated). Either nothing produces the signed descriptor, or what it produces \
+             is not what the engine rebuilds to check it — and after a boundary that also means the \
+             re-signing path is not running."
+        );
+    }
 
     /// **Does the SHIPPED plane stay packed across an epoch boundary?** — the same question the two
     /// measurements above ask, asked on the plane a deployment actually runs.
