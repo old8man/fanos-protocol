@@ -2936,11 +2936,28 @@ mod tests {
     /// dropped; the claim book adopted an epoch *after* the beacon window did).
     ///
     /// **The book filled — samples of 8–9 of 9 — and every node still read `probe_index = 0` while ten of
-    /// them shared four points.** Knowledge was never the binding constraint, and making it complete made
-    /// the plane *worse*, which is only possible if knowledge itself was ending something. It was: this loop
-    /// wakes on **every recorded claim** and spent a round on each, while `may_walk`'s bound is derived for
-    /// **steps** along the walk. A node with nine peers burned its whole budget on the first three claims to
-    /// arrive and committed its seat before it had a reason to move.
+    /// them shared four points.** Knowledge was never the binding constraint *at that moment*, and making it
+    /// complete made the plane *worse*, which is only possible if knowledge itself was ending something. It
+    /// was: this loop wakes on **every recorded claim** and spent a round on each, while `may_walk`'s bound
+    /// is derived for **steps** along the walk. A node with nine peers burned its whole budget on the first
+    /// three claims to arrive and committed its seat before it had a reason to move.
+    ///
+    /// ⛔ **And the claim column in the tables below is a MEAN over a cycle that resets, so read the
+    /// plateaus instead.** The book is cleared at every boundary and refills within one 10 s tick, then does
+    /// not change for the rest of the epoch — five identical readings, then a step. Grouping the run into
+    /// those plateaus says something the mean hides completely:
+    ///
+    /// | | genesis plateau | later plateaus |
+    /// |---|---|---|
+    /// | `n = 7`, 6 peers | 6.0 / 6.6 / 6.0 — **complete** | 4.0, 5.9, 3.4, 1.3 · 4.6, 5.1, 4.7, 4.6, 2.3 · 4.4, 5.3, 2.6, 3.9, 2.1 |
+    /// | `n = 10`, 9 peers | 8.9 / 9.2 / 9.0 — **complete** | 7.9, 5.4, 3.4, 2.0, **0.3** · 6.1, 5.8, 6.3, 7.1, 5.5 · 6.8, 7.2, 5.4, 6.5, 4.3 |
+    ///
+    /// **Every node knows every peer's claim at genesis and never again.** After the first boundary the book
+    /// refills to somewhere between a half and three quarters, and in one of three runs it **ratchets down**
+    /// — 8.9 → 7.9 → 5.4 → 3.4 → 2.0 → 0.3 — until placement is running on no knowledge at all. That is not
+    /// a static cost: the same rotation that orphans the connection cache (139 k misses a run) removes a
+    /// little more reach each epoch, and the ask on `MemberJoined` can only reach peers this node can still
+    /// address. **This is the open half of the placement problem**, and it is a decay rather than a floor.
     ///
     /// ## Three runs, same fixture
     ///
