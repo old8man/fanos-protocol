@@ -20,6 +20,7 @@ by name rather than describing a path that doesn't exist.
 | **Governance today** | the epoch beacon is **dealt**: one founder briefly holds the whole secret |
 | **Governance, trust-minimized** | `fanos keygen` drives the Byzantine-robust DKG across the founding set, so no party ever holds the beacon secret — read §7 before using it: the ceremony finalizes on **timers**, which makes its phase deadlines a safety parameter |
 | **Roles a cell should cover** | relay, storage, rendezvous (cheap, offer broadly); exit, service, ingress (opt-in, see §2) |
+| **Membership check** | **on by default** since 2026-08-19: a peer's announced overlay address must be its own, signed. Every founding node must run a build that produces the §80 descriptor — one that does not is refused, which is the point |
 | **Convergence check** | `fanos status census` + `fanos status coherence` — see §5 |
 | **Binary** | `fanos`, built from `crates/fanos-node`; `--features validator` adds the TAXIS chain, `--features vpn` the full-tunnel datapath |
 
@@ -69,8 +70,19 @@ the fixed point a real run converges to, and therefore the ceiling — and price
 **16** clears the floor **96.6 %** of the time — and costs **9.4 of those 16 members holding no seat at any
 given moment**. That is not waste in the sense of a bug: they are the draw's spare candidates, and their
 being there is what fills the points a smaller draw leaves empty. It *is* a real cost to plan for. You are
-running sixteen machines so that seven points stay covered, and the nine are unaddressable while they wait —
-production sets no hierarchical address, so there is no sub-cell for them to serve in yet.
+running sixteen machines so that seven points stay covered.
+
+**Since 2026-08-19 the nine are addressable.** They used to be unroutable while they waited — production set
+no hierarchical address, so there was no sub-cell for them to be in — and a node beaten on every point of
+its line simply held an announcement for a seat it did not own. The descent is now wired: such a node asks
+its engine for a sub-cell address under the point it lost, adopts it, and is reached inbound through the
+node that holds that point (`RouteHier`). Its transport coordinate does not move.
+
+Two things an operator should know about that. **A descendant's inbound reachability depends on its ancestor
+being alive** — that is the honest price of nesting and the flat plane does not have it. And a descended
+node is *not* a consensus member: `CellParams::FANO` seats validators at the plane's seven points, so the
+nine are overlay members, not a second cell. What would make them one is the child-committee directory,
+which does not exist (§ below).
 
 **And a live cell reaches that ceiling rather than falling short of it.** `fanos-sim`'s
 `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per load across six
