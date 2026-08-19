@@ -16,7 +16,7 @@ by name rather than describing a path that doesn't exist.
 
 | | |
 |---|---|
-| **Minimum viable cell** | 7 operators fill the plane; **10 is the load its lines need** — see §1, where the derivation and what a live cell actually does are both stated |
+| **Minimum viable cell** | 7 operators fill the plane; **16 is the load its lines need** — see §1, where the derivation and what a live cell actually does are both stated |
 | **Governance today** | the epoch beacon is **dealt**: one founder briefly holds the whole secret |
 | **Governance, trust-minimized** | `fanos keygen` drives the Byzantine-robust DKG across the founding set, so no party ever holds the beacon secret — read §7 before using it: the ceremony finalizes on **timers**, which makes its phase deadlines a safety parameter |
 | **Roles a cell should cover** | relay, storage, rendezvous (cheap, offer broadly); exit, service, ingress (opt-in, see §2) |
@@ -43,7 +43,7 @@ want from the cell:
 | serving storage reads after losses | 4 survivors | 3 survivors still serve 28 of the 35 four-loss patterns |
 | a mixnet hop | 3 members of a line | sound at `q = 2` — see the anonymity caveat below |
 
-**Fill all 7, and then bring three more.** A cell smaller than 7 is not "a smaller testnet", it is an
+**Fill all 7, and then bring nine more.** A cell smaller than 7 is not "a smaller testnet", it is an
 incomplete Fano plane that never reports healthy, and every founding-operator step below assumes at least 7
 people showed up. If fewer than 7 are available, wait — there is no smaller valid cell above the coherence
 floor of 3 (deployment-minima §1, Result 4), and 3–6 nodes sit in a regime this platform doesn't consider
@@ -51,13 +51,25 @@ viable.
 
 **But seven is the plane's size, not the cell's, and running a cell at exactly seven does not work.** Nodes
 *contend* for points: each draws a coordinate from the epoch beacon and walks its own line when a better
-claim holds the point it wanted, so seven nodes do not land on seven distinct points. The load factor that
-makes every line viable is `fanos_geometry::members_for_a_covered_plane`, which is **10** on this plane —
-— its own table gives **87 %** of draws clearing the viability floor at `M = N` against **99.7 %** at
-`M = 1.5N`, simulated against the real line-confined probe walk. Three of the ten hold no seat at any given
-moment; that is not waste, it is what fills the points a seven-node draw leaves empty.
+claim holds the point it wanted — and a walk is confined to the `q + 1 = 3` points of one line, so seven
+nodes do not land on seven distinct points and no amount of time or signalling makes them.
 
-**And a live cell does worse than that table.** `fanos-sim`'s
+`fanos_geometry::members_for_a_covered_plane` is that number, and on this plane it is **16**. It was 10
+until 2026-08-19; the enumeration that corrected it runs the shipping arbitration at complete knowledge —
+the fixed point a real run converges to, and therefore the ceiling — and prices each load
+(`fanos-vrf/examples/line_confinement_coverage.rs`):
+
+| operators | share of draws clearing the viability floor |
+|---|---|
+| 7 (`1.0 N`) | 32.7 % |
+| 10 (the old constant) | 74.5 % |
+| 14 (`2 N`) | 93.8 % |
+| 21 (`3 N`) | 99.4 % |
+
+**16** sits between the third and fourth rows. Members beyond the seventh hold no seat at any given moment;
+that is not waste, it is what fills the points a smaller draw leaves empty.
+
+**And a live cell reaches that ceiling rather than falling short of it.** `fanos-sim`'s
 `measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary` runs 36 samples per load across six
 epoch turns; measured on an idle machine, two paired runs of the same build (2026-08-18):
 
@@ -66,9 +78,13 @@ epoch turns; measured on an idle machine, two paired runs of the same build (202
 | 7 | 4.5–5.1 of 7 | **86 %** |
 | **10** | **5.9–6.1 of 7** | **25 %** |
 
-Below that floor at least one of the seven lines cannot serve a threshold gather, which is what a mixnet hop
-is — and the cell does not say so. A seven-operator cell is below it **most of the time**; ten operators cut
-that to a quarter of the time. Neither is zero.
+At ten operators the live cell clears the floor 75 % of the time and the enumerated ceiling is 74.5 %. **So
+the running placement is at its geometric limit**, and the way to a cell that stays above the floor is more
+members, not a better mechanism. Below that floor at least one of the seven lines cannot serve a threshold
+gather, which is what a mixnet hop is — and the cell does not say so.
+
+Sixteen has not been run live; what stands behind it is the ceiling above, plus the one load where the live
+cell was measured against that ceiling and matched it.
 
 (An earlier revision of this section quoted 19 % for ten operators from a single run. A repeat of the
 identical build read 69 %, because that one was taken while the machine was compiling. The numbers above are

@@ -158,26 +158,50 @@ pub fn servable_lines<F: Field>(occupied: impl Fn(Point<F>) -> bool) -> usize {
 /// of one line through it (`fanos_vrf::probe_walk`) — so the occupancy a cell reaches is strictly below its
 /// membership, and the shortfall grows with load.
 ///
-/// Simulated against that walk with rank-ordered resolution, on the two planes the base tier uses, and the
-/// answer is the same shape on both:
+/// ⛔ **This returned `3·N/2` until 2026-08-19, on a table that does not reproduce.** The doc recorded
+/// *"1.5 → 99.7 % on `PG(2,2)`, 99.2 % on `PG(2,4)`"*. Enumerated through the **shipping** arbitration —
+/// `settle_index` at complete knowledge, which is order-independent and therefore the fixed point a run
+/// converges to — the same load reads **74.5 %** and **7.5 %**
+/// (`fanos-vrf/examples/line_confinement_coverage.rs`), and a live cell reads 75 % beside it. One candidate
+/// explanation for the gap was tested and refuted: counting each node's *preferred* point instead of its
+/// settled one gives *lower* coverage, not higher. The old table's method is not recoverable from its
+/// description; two independent measurements agree against it.
 ///
-/// | `M/N` | `PG(2,2)` P(every line servable) | `PG(2,4)` |
+/// | load | `PG(2,2)` clears the floor | `PG(2,4)` |
 /// |---|---|---|
-/// | 1.0 | 87 % | **25 %** |
-/// | **1.5** | **99.7 %** | **99.2 %** |
-/// | 2.0 | 100 % | 100 % |
+/// | `1.0 N` | 32.7 % | 0.0 % |
+/// | `1.5 N` (what this used to return) | 74.5 % | 7.5 % |
+/// | `2 N` | 93.8 % | 51.8 % |
+/// | `3 N` | 99.4 % | 90.5 % |
+/// | `4 N` | 99.9 % | 98.0 % |
 ///
-/// So `3·N/2`, and the halves are not decoration: at `M = N` a `PG(2,4)` cell clears its viability floor a
-/// quarter of the time, which is the difference between a cell that serves threshold lines and one that
-/// cannot complete a gather anywhere. The excess is not waste — it is what fills the last points, and at
-/// this load about a third of the members hold no top-level seat in any given epoch and belong in sub-cells.
+/// **And the load is not a constant multiple of `N` at all** — coverage at a *fixed* ratio falls as the
+/// plane grows (74.5 % against 7.5 % at the same 1.5), so no single ratio can serve two planes. What the
+/// numbers follow is the coupon-collector shape: line-confined draws must cover `N − d` of `N` points,
+/// where `d` is what the viability floor may leave empty, and that costs about `N·(H(N) − H(d))` draws.
 ///
-/// **Approximate on purpose.** The exact quantile depends on the plane, the walk and the arrival order, so
-/// this is the load factor those measurements agree on rather than a closed form; `servable_lines` is the
-/// exact question a running cell should ask about *itself*.
+/// So the `3/2` was the right factor applied to the wrong base. It is kept — as **confidence over the
+/// expectation** rather than slack over the point count — and it lands both planes where a deployment wants
+/// them: `PG(2,2)` at **16** members (between the measured 93.8 % and 99.4 %) and `PG(2,4)` at **84**, which
+/// is exactly the 98 % row. A cell asking "how many members before my lines work" is asking for a load it
+/// will usually clear at, and that is the one choice in here — stated, so it can be revisited against the
+/// table above rather than re-derived.
+///
+/// `servable_lines` remains the exact question a running cell should ask about *itself*; this is the demand
+/// figure a deployment is sized against.
 #[must_use]
 pub const fn members_for_a_covered_plane(line_size: usize) -> usize {
-    plane_points(line_size) * 3 / 2
+    let n = plane_points(line_size);
+    // The points the viability floor may leave empty — `N − points_serving_every_line(m)`.
+    let spare = line_size / 3;
+    // `N · (H(N) − H(spare))`, summed in integers with rounding: the expected number of line-confined draws
+    // before every point but `spare` of them is held.
+    let (mut k, mut draws) = (spare + 1, 0);
+    while k <= n {
+        draws += (n + k / 2) / k;
+        k += 1;
+    }
+    draws * 3 / 2
 }
 
 // Re-export the field crate so downstream users get a matched version.
@@ -216,8 +240,10 @@ mod tests {
     ///
     /// A cell of that many members must be able, in principle, to occupy `points_serving_every_line` of its
     /// plane; a recommendation below its own floor would be worse than none. Checked on every order the
-    /// tree instantiates and on the two it merely defines, because the relation is `3N/2` against
-    /// `N − ⌊(q+1)/3⌋` and those grow differently.
+    /// tree instantiates and on the two it merely defines, because the relation is a coupon-collector sum
+    /// against `N − ⌊(q+1)/3⌋` and those grow differently — the sum grows like `N ln N`, so the margin over
+    /// the floor *widens* with the plane rather than staying a ratio, which is the property the old `3N/2`
+    /// did not have and the reason it read 7.5 % on `PG(2,4)`.
     #[test]
     fn the_sizing_constant_clears_the_floor_it_exists_to_reach() {
         for line_size in 3..=40usize {
@@ -236,9 +262,14 @@ mod tests {
             assert!(want > n, "sizing at or below the point count is what makes M = N clear the floor 25% \
                  of the time on PG(2,4); the constant exists to say so");
         }
-        // The two orders the base tier uses, spelled out so a reader sees the numbers rather than the rule.
-        assert_eq!((plane_points(3), members_for_a_covered_plane(3)), (7, 10), "PG(2,2): 7 points, 10 nodes");
-        assert_eq!((plane_points(5), members_for_a_covered_plane(5)), (21, 31), "PG(2,4): 21 points, 31 nodes");
+        // The two orders the base tier uses, spelled out so a reader sees the numbers rather than the rule
+        // — and pinned by **what they were measured to buy**, not by the arithmetic that produced them.
+        // `fanos-vrf/examples/line_confinement_coverage.rs` enumerates the shipping arbitration at complete
+        // knowledge: 16 on `PG(2,2)` sits between the 93.8 % of `2N` and the 99.4 % of `3N`, and 84 on
+        // `PG(2,4)` is exactly its 98 % row. These read 10 and 31 until 2026-08-19, which the same
+        // enumeration prices at **74.5 %** and **7.5 %**.
+        assert_eq!((plane_points(3), members_for_a_covered_plane(3)), (7, 16), "PG(2,2): 7 points, 16 nodes");
+        assert_eq!((plane_points(5), members_for_a_covered_plane(5)), (21, 84), "PG(2,4): 21 points, 84 nodes");
     }
 
     #[test]

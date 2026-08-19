@@ -3088,6 +3088,11 @@ mod tests {
     ///   needs **6 of 7** points occupied and consensus **5 of 7** (`CellParams::FANO` quorum over the
     ///   point count), so on this plane a single doubly-held point is one step from switching the mixnet
     ///   off and two from stalling the chain. There is no margin to average over.
+    /// ⚠️ **The second load was 10 when every table below was measured, and the constant now says 16.**
+    /// `members_for_a_covered_plane` was corrected on 2026-08-19 (its `3/2` was applied to the point count
+    /// rather than to the coupon-collector expectation), so a fresh run of this fixture measures a *larger*
+    /// cell than the numbers recorded here and they are not comparable to it. Re-run before quoting.
+    ///
     /// * `n = 7` (`n/N = 1.0`) and `n = 10` — the second **read from
     ///   `fanos_geometry::members_for_a_covered_plane`** rather than chosen, since a load factor picked by
     ///   hand is exactly the kind of constant this project refuses. At that load three nodes cannot be
@@ -3295,10 +3300,11 @@ mod tests {
     /// **`n = N` exactly is under-sized, and the argument for that is the derivation rather than this
     /// fixture.** Seven nodes on seven points have **no spare seat**: a node that walks off its preferred
     /// point takes one another node prefers, so resolution cascades with nowhere to end.
-    /// `members_for_a_covered_plane`'s own table prices it — at `M = N` even the idealised walk clears the
-    /// viability floor only 87 % of the time, against 99.7 % at `M = 1.5N`. These runs are **consistent**
-    /// with that and do not add to it: at this sample size and this noise, `n = 7` and `n = 10` are not
-    /// separated (67 % against 69 % in the paired run).
+    /// `members_for_a_covered_plane`'s own table used to price it at 87 % against 99.7 %, and **that table
+    /// was refuted on 2026-08-19**: enumerating the shipping arbitration at complete knowledge gives 32.7 %
+    /// at `M = N` and 74.5 % at `M = 1.5N` on this plane. The live 25 %-below-floor reading at `n = 10` is
+    /// the *same number* as that ceiling's 74.5 % clearing — so this fixture is not falling short of the
+    /// geometry, it is sitting on it.
     ///
     /// What is still open at 19 %: claims reach only direct connection partners, and in a projective plane
     /// every two lines meet, so every node contends for exactly one point of every other node's line.
