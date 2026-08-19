@@ -52,26 +52,45 @@ async fn a_nodes_health_reports_the_directory_counters_it_is_documented_to_repor
         .expect("a seven-point plane has a point that is not this node's");
     let a: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
     let b: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
+    // **Deltas across the narrowest window, not absolute values, and one absolute reading is what made this
+    // test fail under load.** These two counters are written by the *running node* as well as by this test:
+    // the driver publishes its directory records at startup and, with no peers, a send to a point nobody
+    // holds reaches the last rung of the ladder and notes an unresolved drop. `before == 0` samples once and
+    // therefore proves the node had not written yet — never that it will not write next. Measured: the exact
+    // `== 1` passed for months and failed inside a full suite on a loaded box, where more of that startup
+    // publishing lands between the two reads.
+    //
+    // So each half is read immediately before its own mutation and immediately after, and the assertion is
+    // that *this* call moved the counter by exactly one. That still fails if the node writes inside a
+    // two-statement window, which is the honest residual — it does not pretend the node is frozen, it makes
+    // the window as small as the surface allows.
+    let mid = node.health();
     let _ = node.directory().insert(coord, a);
     let _ = node.directory().insert(coord, b);
-    // And a drop for an unresolvable destination.
-    node.directory().note_unresolved_drop([0, 1, 1]);
-
-    let after = node.health();
+    let after_collision = node.health();
     assert_eq!(
-        after.collisions, 1,
+        after_collision.collisions,
+        mid.collisions + 1,
         "the health surface did not report the collision the directory counted — the counter's own doc says a \
          node reacts to this by relocating, and a node that cannot read it cannot react",
     );
+    // And a drop for an unresolvable destination.
+    node.directory().note_unresolved_drop([0, 1, 1]);
+    let after = node.health();
     assert_eq!(
-        after.unresolved_drops, 1,
+        after.unresolved_drops,
+        after_collision.unresolved_drops + 1,
         "the health surface did not report the unresolved drop — indistinguishable from a quiet cell, which \
          is the opposite diagnosis",
     );
     // Same coordinate, same address is a re-bind, not a collision: a counter that also counted those would
     // read nonzero on every healthy node and mean nothing.
     let _ = node.directory().insert(coord, b);
-    assert_eq!(node.health().collisions, 1, "a repeat of the SAME binding is not a collision");
+    assert_eq!(
+        node.health().collisions,
+        after_collision.collisions,
+        "a repeat of the SAME binding is not a collision"
+    );
 
     node.shutdown().await;
 }
