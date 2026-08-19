@@ -1337,27 +1337,45 @@ pub struct OverlayChoices {
     /// instrument — same cell, twice, differing only in this flag — reads **42 learned edges ungated and 42
     /// guarded**. Nothing legitimate is refused any more.
     ///
-    /// **And it is still off, for a reason that is now about upgrades rather than producers.** A node with
-    /// this on refuses every peer whose build does not produce a descriptor — so flipping the default
-    /// partitions a cell mid-upgrade, older members on one side and newer on the other, each of them
-    /// behaving exactly as configured. That is what `docs/design-upgrade.md`'s activation registry is for: a
-    /// cell-wide height at which the requirement begins, agreed before anyone enforces it. Turning it on
-    /// **within** a cell whose members all produce descriptors is safe today and is the way to use it.
+    /// **ON by default since 2026-08-19, and what changed is that the last two caveats closed.**
     ///
-    /// Two things the measurement does not settle, stated so they are not read into it: it runs on the
-    /// simulator's bus, so the **driver's** per-reseat signature has not been exercised over real QUIC; and
-    /// it measures the descriptor half only — level 0's authenticity comes from the HELLO proof, and the
-    /// address-binding half is vacuous at depth 1 either way.
+    /// The measurement above ran on the simulator's bus, so the *driver's* per-reseat signature — the one
+    /// that fires at every boundary — had never been exercised over real QUIC.
+    /// `fanos_sim::fabric`'s `measure_what_verifying_membership_descriptors_costs_a_real_cell` is that run:
+    /// a five-node fleet, real QUIC, read after **two beacon turns** so the cell has re-signed rather than
+    /// still standing on its composition-time descriptor. Two readings, both under load — which can only
+    /// *cost* the guarded arm, never flatter it:
+    ///
+    /// | | ungated | guarded |
+    /// |---|---|---|
+    /// | run 1 | 13 learned edges | **13** |
+    /// | run 2 | 12 | **14** |
+    ///
+    /// Equal or better. Verifying descriptors costs a real cell nothing.
+    ///
+    /// **The upgrade argument does not apply to a network that has never launched.** A node with this on
+    /// refuses every peer whose build does not produce a descriptor, so flipping it *inside a running cell*
+    /// partitions it mid-upgrade — that is what `docs/design-upgrade.md`'s activation registry is for. FANOS
+    /// has no running cell: a founding set starts on one build, and the default it starts with is the one it
+    /// keeps. Leaving it off to protect an upgrade path that has no cell to protect is a design shaped by a
+    /// blocker that outlived the blocker.
+    ///
+    /// **And the descent made it load-bearing rather than merely prudent.** Levels ≥ 1 of an overlay address
+    /// are verified by `address_matches_identity_from` — which is behind *this* flag. With it off, a
+    /// descendant's announced sub-cell path is checked by nobody, and cell membership becomes self-declared:
+    /// an adversary announces itself into the target cell instead of grinding for it.
     ///
     /// **What it costs, since it is paid whether or not anyone verifies:** `id` is 1 984 bytes and `sig` is
     /// ~3 373, on the `Announce` — the one frame class that floods. Roughly 5.4 KB per member per epoch,
     /// cell-wide. Small beside a 20 KB threshold onion, and not nothing.
     ///
-    /// ⚠️ **Depth-1 only.** The signed message includes the announcer's overlay address, and the host predicts
-    /// it as `root(coord)` — exact while every production composition sets `hier_path: None`. The runtime
-    /// test `a_descriptor_signed_for_the_coordinate_about_to_be_held_verifies_on_the_announce_that_follows`
-    /// pins that agreement, and is what fails the day a node descends — which is when the deeper levels have
-    /// to be handed to the signer. Said here for the same reason
+    /// ~~⚠️ **Depth-1 only.**~~ **Closed by the descent.** The signed message includes the announcer's overlay
+    /// address, and the host used to predict it as `root(coord)` — exact only while every production
+    /// composition set `hier_path: None`. That is what would have failed the day a node descended, and the
+    /// deeper levels are now handed to the signer: `Placement::deep` holds them and `Reseater::apply` signs
+    /// `[point] ++ deep`. The runtime test
+    /// `a_descriptor_signed_for_the_coordinate_about_to_be_held_verifies_on_the_announce_that_follows` still
+    /// pins the depth-1 agreement. Said here for the same reason
     /// [`require_admission`](Self::require_admission) says it: a switch whose precondition is undocumented is
     /// a switch that costs an operator their cell. Its counterpart is already wired: the main path sets `vrf_coordinates: true`
     /// precisely so that, with this on, level 0 is verified by the HELLO proof rather than the hash chain.
@@ -1373,7 +1391,7 @@ pub struct OverlayChoices {
 
 impl Default for OverlayChoices {
     fn default() -> Self {
-        Self { self_healing: true, require_self_certified_membership: false, require_admission: false }
+        Self { self_healing: true, require_self_certified_membership: true, require_admission: false }
     }
 }
 
