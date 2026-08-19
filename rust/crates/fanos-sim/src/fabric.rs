@@ -2967,6 +2967,110 @@ mod tests {
         );
     }
 
+    /// **Is the plane below its line floor because placement is broken, or because the FIXTURE's epoch is
+    /// tight?** — the question that decides whether the numbers in `docs/testnet.md` are about a deployment.
+    ///
+    /// `Node::start` warns when a walk does not fit inside a period, and states the arithmetic: a contested
+    /// node takes up to `q + 1` steps and a step cannot be faster than a new seat becomes known, so
+    /// `PG(2,2)` needs `3 × 15 s = 45 s`. The neighbouring measurement runs a **60 s** epoch — valid, and
+    /// only **1.33×** the walk. Production's default is **600 s**, or 13×. A cell whose walk barely fits is
+    /// a cell that re-derives placement almost as fast as it can resolve it, and every below-floor sample
+    /// this fixture reports would then be a property of the fixture.
+    ///
+    /// So: one load — `n = 10`, the sized one a deployment is told to run — at two epochs, everything else
+    /// identical. If the below-floor share collapses at the longer period, the operator-facing number is the
+    /// long one and the fixture has been measuring its own clock.
+    ///
+    /// ## Result, 2026-08-19 — REFUTED, and the refutation is what makes the other numbers usable
+    ///
+    /// | epoch | margin over the walk | below floor | mean points |
+    /// |---|---|---|---|
+    /// | 60 s | 1.3× | **25 %** (10/40) | 6.0 |
+    /// | 180 s | 4.0× | **28 %** (11/40) | 5.7 |
+    ///
+    /// **Three times the margin buys nothing.** So the below-floor share is not an artefact of a fixture
+    /// whose epoch barely fits its walk, and the 25 % that `docs/testnet.md` gives an operator is about
+    /// placement rather than about this clock. It also reproduces the neighbouring measurement's 25 % at a
+    /// different sampling interval (15 s here against 10 s there), which rules out the sampling phase too.
+    ///
+    /// **What it leaves.** Time is not the constraint, and neither is knowledge (the claim book is complete
+    /// at genesis and refills every epoch) nor permission (a contested seat is no longer frozen). What has
+    /// not been ruled out is the **geometry of the walk itself**: `probe_point` confines a node to the
+    /// `q + 1` points of one line — 3 of 7 here — and `probe_point`'s own doc records that plane-wide
+    /// probing was built, measured and reverted for a stated security reason. Whether ten line-confined
+    /// walks can cover six of seven points is a question about the draw, answerable by enumerating the real
+    /// walk rather than by simulating a cell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_whether_the_epochs_margin_over_the_walk_is_what_holds_the_plane_short() {
+        use fanos_field::F2;
+        use std::collections::HashSet;
+        let roles = fanos_node::RoleSet {
+            relay: true,
+            rendezvous: true,
+            ..fanos_node::RoleSet::default()
+        };
+        let n_points = fanos_geometry::Plane::<F2>::N as usize;
+        let floor = fanos_geometry::points_serving_every_line(
+            fanos_geometry::Plane::<F2>::LINE_SIZE as usize,
+        );
+        let sized = fanos_geometry::members_for_a_covered_plane(
+            fanos_geometry::Plane::<F2>::LINE_SIZE as usize,
+        );
+        // The walk this plane owes, from the same terms the node's own warning uses.
+        let walk = (fanos_geometry::Plane::<F2>::LINE_SIZE as u64) * 15;
+        for period_s in [60u64, 180] {
+            let period = Duration::from_secs(period_s);
+            let fleet = match NodeFleet::spawn_as_drawn_with_epoch::<F2>(
+                sized,
+                Link::ideal(),
+                roles,
+                period,
+            )
+            .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    println!("epoch {period_s}s: fleet did not start — {e:?}");
+                    continue;
+                }
+            };
+            println!(
+                "\n=== n={sized} on {n_points} points, epoch {period_s}s = {:.1}x the {walk}s walk",
+                period_s as f64 / walk as f64
+            );
+            let (mut below, mut samples, mut pts_total) = (0usize, 0usize, 0usize);
+            for tick in 0..40u32 {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let health: Vec<_> = fleet.nodes().iter().map(fanos_node::Node::health).collect();
+                let points: HashSet<fanos_geometry::Triple> = health
+                    .iter()
+                    .filter(|h| h.probe_index.is_some())
+                    .map(|h| h.address)
+                    .collect();
+                samples += 1;
+                pts_total += points.len();
+                if points.len() < floor {
+                    below += 1;
+                }
+                if tick % 8 == 0 {
+                    println!(
+                        "  t={:>4}s  points={:>2}  {}",
+                        tick * 15,
+                        points.len(),
+                        if points.len() >= floor { "AT/ABOVE FLOOR" } else { "BELOW FLOOR" }
+                    );
+                }
+            }
+            println!(
+                "  epoch {period_s}s: below floor in {below}/{samples} samples ({:.0}%), mean points {:.1}",
+                100.0 * below as f64 / samples as f64,
+                pts_total as f64 / samples as f64
+            );
+            fleet.shutdown().await;
+        }
+    }
+
     /// **Does the SHIPPED plane stay packed across an epoch boundary?** — the same question the two
     /// measurements above ask, asked on the plane a deployment actually runs.
     ///
