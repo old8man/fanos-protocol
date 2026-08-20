@@ -1060,6 +1060,11 @@ impl<F: Field> OverlayNode<F> {
         // from exactly this mark, so an unread ping is a member the cell cannot place shards on or find
         // records at.
         self.note_heard(now, from);
+        // Counted per frame, not per first contact: `overlay.first_heard` says contact happened at all, and
+        // the question the fleet leaves open is one of *volume* — a node writing ~150 frames to a live
+        // connection whose peer's engine is never stepped. The send side is counted on the driver plane; this
+        // is the only place the receiving side can be.
+        self.stations.record(Station::OverlayFrameIn, Some(from));
         match frame.frame_type() {
             Some(FrameType::Ping) => alloc::vec![Effect::Send {
                 to: from,
@@ -2616,6 +2621,7 @@ mod tests {
             node.step(Instant(3), Input::Command(Command::PeerHandshaken { coord: me, identity: [9u8; 32] }));
         assert!(self_effects.is_empty(), "this node is not a peer of itself");
     }
+
 
     fn seat_every_neighbour<F: Field>(node: &mut OverlayNode<F>, now: Instant) {
         let coords: Vec<Triple> = node.peers.keys().copied().collect();

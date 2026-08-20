@@ -612,6 +612,20 @@ pub enum Station {
     /// epoch boundary, so this is at most one event per peer per epoch, and its **absence** for a coordinate
     /// the directory can route to is the finding.
     OverlayFirstHeard,
+    /// **Every frame that reached the engine's dispatch**, by the coordinate it came from — the receiving
+    /// half of a question the sending half could not answer alone.
+    ///
+    /// Its sibling [`OverlayFirstHeard`](Self::OverlayFirstHeard) fires once per peer per epoch, which
+    /// answers "did contact ever happen" and nothing about volume. The send side is already counted
+    /// (`conns.surplus_read` counts a read of a peer's connection list, `send_drops` counts what the
+    /// dispatcher could not hand over), and the gap between the two is exactly where a five-node fleet's
+    /// remaining partition lives: a node writes ~150 frames to a **live** connection and the peer's engine
+    /// is never stepped with one. Without this the two halves are counted on different planes and the
+    /// difference has to be inferred.
+    ///
+    /// Hot by construction — one increment per received frame — which is what a station is: the driver plane
+    /// beside it already carries counts in the thousands.
+    OverlayFrameIn,
     /// A write whose shard placement **does not survive the loss of the writer** — this node kept more than
     /// `N − K` of the value's `N` shards, so fewer than `K` went anywhere else.
     ///
@@ -1395,6 +1409,7 @@ impl Station {
         Self::MembershipSize,
         Self::MembershipVacated,
         Self::OverlayFirstHeard,
+        Self::OverlayFrameIn,
         Self::StoreWriteNotDurable,
         Self::AnonymityFloorUnmet,
         Self::RecoveryEscalated,
@@ -1479,6 +1494,7 @@ impl Station {
             Self::MembershipSize => "membership.size",
             Self::MembershipVacated => "membership.vacated",
             Self::OverlayFirstHeard => "overlay.first_heard",
+            Self::OverlayFrameIn => "overlay.frame_in",
             Self::StoreWriteNotDurable => "store.write_not_durable",
             Self::AnonymityFloorUnmet => "anonymity.floor_unmet",
             Self::RecoveryEscalated => "recovery.escalated",
@@ -1649,6 +1665,7 @@ impl Station {
             | Self::MembershipRepeatIgnored
             | Self::MembershipVacated
             | Self::OverlayFirstHeard
+            | Self::OverlayFrameIn
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld
