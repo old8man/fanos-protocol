@@ -682,6 +682,22 @@ type LastRound = Arc<Mutex<Option<Vec<u8>>>>;
 
 type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
 
+/// Per-connection **arrival order**: `Connection::stable_id` → the sequence number of the last frame read on
+/// it, drawn from one monotonic counter shared by every reader task.
+///
+/// **Why a counter and not a clock.** The question `live_conn` has to answer is *which of these connections
+/// did the peer most recently use*, which is an ordering, not a duration — and an ordering needs no clock,
+/// no `Instant` in a `no_std`-adjacent layer, and no comparison of two clocks that may not be the same one.
+/// A `fetch_add` per received frame is the whole cost.
+///
+/// **And not `stats().udp_rx.datagrams`**, which was tried and is wrong: it is *cumulative*, so it ranks by
+/// age rather than by liveness — a corpse that lived a minute outscores a healthy connection born a second
+/// ago, which is precisely the redial case the choice exists to serve.
+///
+/// Entries are removed when their reader task ends, so this is bounded by the live connections exactly as
+/// the map above is.
+type RxOrder = Arc<Mutex<HashMap<usize, u64>>>;
+
 /// The one place the liveness rule is applied: drop closed connections to `peer` and hand back the
 /// **newest** survivor. Every reader goes through this so "live" cannot come to mean two things in two
 /// callers.
@@ -698,7 +714,11 @@ type ConnMap = Arc<Mutex<HashMap<Triple, Vec<Connection>>>>;
 /// succeeds locally, and the write is buffered into silence. Nothing reports a failure to fall back *from*.
 /// That lagging predicate is also why picking the oldest was actively harmful and not merely arbitrary: it
 /// pinned every redial onto the dead entry for a full idle timeout, which is longer than most exchanges live.
-fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> (Option<Connection>, usize) {
+fn live_conn(
+    map: &mut HashMap<Triple, Vec<Connection>>,
+    order: &RxOrder,
+    peer: Triple,
+) -> (Option<Connection>, usize) {
     let Some(live) = map.get_mut(&peer) else {
         return (None, 0);
     };
@@ -709,24 +729,37 @@ fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> (Optio
         map.remove(&peer);
         return (None, pruned);
     }
-    // **Kept at the newest, and an evidence-based rule was tried and reverted.**
+    // **Choose the connection the peer is actually using, not the newest one filed.**
     //
-    // The suspicion is real: two connections to one peer is a normal steady state — both ends may dial, and
-    // the acceptor keeps the surplus while the dialer discards it (`ConnSurplusHeld`) — so if the discarded
-    // one is the newest, every send goes into a socket whose other end stopped reading. Nothing prunes it:
-    // `close_reason()` reports only a closure *observed* on this side, and a keep-alive-configured
-    // connection produces none. `ConnSurplusRead` measures that world and shows it on every node of a
-    // five-node fleet: a list of two, read a thousand times, pruning zero.
+    // Two connections to one peer is a normal steady state: both ends may dial, and the acceptor keeps the
+    // surplus while the dialer discards it (`ConnSurplusHeld`). If the discarded one happens to be the
+    // newest, every send goes into a socket whose other end stopped reading — and nothing prunes it, because
+    // `close_reason()` reports only a closure *observed* on this side and a keep-alive-configured connection
+    // produces none. `ConnSurplusRead` measures that world and showed it on every node of a five-node fleet:
+    // a list of two, read a thousand times, pruning zero, while the engine heard from one peer in four.
     //
-    // The rule tried was "prefer the connection with the most received datagrams". It is wrong, and the test
-    // below caught it: `stats().udp_rx.datagrams` is **cumulative**, so it is a proxy for *age*, not for
-    // liveness — a corpse that lived a minute outscores a healthy connection born a second ago, which is
-    // exactly the redial case this choice exists to serve. It also bought nothing measurable: the fleet's
-    // heard-edge count moved 4 → 6 → 4 across runs with and without it, inside its own run-to-run spread.
+    // The discriminator is **arrival order** — which connection the peer last sent on ([`RxOrder`], stamped
+    // by `read_frames`). A connection nobody has sent on ranks below every one that has, and among those the
+    // most recent wins.
     //
-    // The signal that would work is *recency* of receipt, and quinn exposes no such clock. Getting it means
-    // carrying our own timestamp per connection, updated in `read_frames` — a change to what this map
-    // holds, not to how it chooses — and that is the shape any future attempt should take.
+    // **`stats().udp_rx.datagrams` was tried here first and is wrong**: it is cumulative, so it ranks by age
+    // rather than by liveness, and a corpse that lived a minute outscores a healthy connection born a second
+    // ago — the redial case this choice exists to serve. `the_connection_map_hands_back_the_newest_and_drops
+    // _the_closed` caught it.
+    //
+    // Ties keep the newest filed, which is the old rule and the right one when there is nothing to choose
+    // between — including the first frame to a peer, before either side has sent anything.
+    if live.len() > 1 {
+        let seen = order.lock().ok();
+        let rank = |c: &Connection| seen.as_ref().and_then(|m| m.get(&c.stable_id()).copied());
+        let best = live
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, c)| (rank(c), *i))
+            .map(|(_, c)| c.clone());
+        drop(seen);
+        return (best, pruned);
+    }
     (live.last().cloned(), pruned)
 }
 
@@ -842,6 +875,10 @@ struct Transport {
     joining: crate::proteus_socket::ReplyAddressing,
     endpoint: Endpoint,
     conns: ConnMap,
+    /// Which connection each peer most recently sent on — see [`RxOrder`].
+    rx_order: RxOrder,
+    /// The counter [`rx_order`](Self::rx_order) draws from; one per node, shared by every reader task.
+    rx_seq: Arc<std::sync::atomic::AtomicU64>,
     /// The last beacon round this node emitted — the one thing it can hand an unjudged peer, read by
     /// [`read_restricted`] so the answer never touches the coordinate ladder.
     last_round: LastRound,
@@ -3279,6 +3316,11 @@ fn spawn_inner(
 
     // One shared context object drives both the accept/receive path and the send path.
     let transport = Transport {
+        // The arrival-order map and its counter are born here and shared by every reader task — see
+        // [`RxOrder`]. One counter per node is what makes "which connection did this peer last use" a
+        // comparison rather than a guess.
+        rx_order: Arc::new(Mutex::new(HashMap::new())),
+        rx_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         stations: Arc::clone(&stations),
         joining: Arc::clone(&joining),
         endpoint: endpoint.clone(),
@@ -3632,7 +3674,7 @@ async fn peer_send_worker(t: Transport, to: Triple, mut rx: mpsc::Receiver<Vec<u
         };
         if let Some(conn) = direct {
             send_uni(&conn, &t.shaper, t.joining(&conn), &frame).await;
-        } else if let Some((hub_coord, hub)) = pick_relay_hub(&t.conns, to) {
+        } else if let Some((hub_coord, hub)) = pick_relay_hub(&t.conns, &t.rx_order, to) {
             // **Try to stop relaying before settling into it.** The relay below is the fallback for the case
             // a hole-punch cannot fix, but nothing in a running node ever *asked* for a punch — `hole_punch`
             // had no caller outside its own test — so every NAT-to-NAT pair relayed all of its traffic
@@ -3781,10 +3823,10 @@ async fn send_uni(conn: &Connection, shaper: &Shaper, joining: Option<OpenedUnde
 /// A live cached connection to any peer other than `exclude` — a hub to relay through when `exclude` is
 /// not directly reachable (#119) — **with its coordinate**, which the caller needs to remember which hubs it
 /// has already asked to broker a punch. `None` if this node has no other live connection to relay via.
-fn pick_relay_hub(conns: &ConnMap, exclude: Triple) -> Option<(Triple, Connection)> {
+fn pick_relay_hub(conns: &ConnMap, order: &RxOrder, exclude: Triple) -> Option<(Triple, Connection)> {
     let mut map = conns.lock().ok()?;
     let peers: Vec<Triple> = map.keys().copied().filter(|&p| p != exclude).collect();
-    peers.into_iter().find_map(|p| live_conn(&mut map, p).0.map(|c| (p, c)))
+    peers.into_iter().find_map(|p| live_conn(&mut map, order, p).0.map(|c| (p, c)))
 }
 
 /// A [`ConnectReq`](FrameType::ConnectReq) frame asking a hub to broker a hole-punch to `target`. One
@@ -4161,7 +4203,7 @@ fn cached(t: &Transport, peer: Triple) -> Option<Connection> {
     let (conn, pruned, surplus) = {
         let mut map = t.conns.lock().ok()?;
         let surplus = map.get(&peer).is_some_and(|l| l.len() > 1);
-        let (conn, pruned) = live_conn(&mut map, peer);
+        let (conn, pruned) = live_conn(&mut map, &t.rx_order, peer);
         (conn, pruned, surplus)
     };
     // Reported on every surplus read, **including the ones that prune nothing**. Recording only the
@@ -5256,6 +5298,14 @@ impl Transport {
         crate::proteus_socket::addressing_for(&self.joining, conn.remote_address())
     }
 
+    /// Stamp `conn` as the most recently used connection to its peer — see [`RxOrder`].
+    fn note_rx(&self, conn: &Connection) {
+        let n = self.rx_seq.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut order) = self.rx_order.lock() {
+            order.insert(conn.stable_id(), n);
+        }
+    }
+
     /// Record one driver-side discard on this node's data-path plane — the same plane `Client` records on
     /// and `NodeHandle::driver_stations` merges into the answer to `Observe`, reached through the `Arc` this
     /// struct now shares (#191).
@@ -5291,6 +5341,11 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
             t.record_station(Station::WireUnshaped, Some(from), None);
             continue;
         };
+        // **This connection is the one the peer is using, as of now.** Stamped before the frame is sorted,
+        // because the fact is about the *connection* and holds whatever the frame turns out to be — a
+        // transport-level `ObservedAddr` proves the peer is here exactly as an overlay frame does. See
+        // [`RxOrder`]; the send side reads it in `live_conn`.
+        t.note_rx(&conn);
         // **Retry whatever this connection left pending**, before anything is attributed to `from` — the
         // peer may have announced a move this node could not judge at the time, and `from` would then be a
         // coordinate it has already left. Driven by the connection's own traffic rather than by a
@@ -5373,6 +5428,9 @@ async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // store must be bounded by the LIVE connections rather than by every one ever accepted.
     if let Ok(mut r) = t.reflexive.lock() {
         r.forget(from);
+    }
+    if let Ok(mut order) = t.rx_order.lock() {
+        order.remove(&conn.stable_id());
     }
     forget_pending(&t, &conn);
 }
@@ -6992,7 +7050,7 @@ mod tests {
         );
     }
 
-    /// Two connections proving one coordinate, and the reader must hand back the **newest** (#266).
+    /// Two connections proving one coordinate, and the reader must hand back the one the **peer is using**.
     ///
     /// The property is not a preference: a second connection exists either because both sides dialed at
     /// once — in which case either carries the frame — or because the peer lost its side and dialed again,
@@ -7043,7 +7101,10 @@ mod tests {
         assert_eq!(file_conn(&mut map, peer, older.clone()), 0, "the first is not surplus");
         assert_eq!(file_conn(&mut map, peer, newer.clone()), 1, "the second arrives over one held");
 
-        let picked = live_conn(&mut map, peer).0.expect("both are live, so one must come back");
+        // Nothing has arrived on either, so there is nothing to choose between them and the tie-break is
+        // the old rule: the newest filed.
+        let order: RxOrder = Arc::new(Mutex::new(HashMap::new()));
+        let picked = live_conn(&mut map, &order, peer).0.expect("both are live, so one must come back");
         assert_eq!(
             picked.stable_id(),
             newer.stable_id(),
@@ -7052,13 +7113,35 @@ mod tests {
              from — the send succeeds locally and the frame is buffered into silence (#266)."
         );
 
+        // **And the half `newest` cannot express.** The peer sends on the OLDER connection — which is what
+        // an acceptor sees when the dialer keeps its own and discards the surplus this node filed second.
+        // Arrival order says so; "newest filed" says the opposite, and every send would go into the socket
+        // the peer stopped reading, with nothing to prune because QUIC reports no closure it has not seen.
+        order.lock().unwrap().insert(older.stable_id(), 1);
+        let by_arrival = live_conn(&mut map, &order, peer).0.expect("both are live");
+        assert_eq!(
+            by_arrival.stable_id(),
+            older.stable_id(),
+            "the send followed the newest FILED connection rather than the one the peer is using; on a \
+             five-node fleet that read as every node hearing one peer in four while holding four live \
+             connections"
+        );
+        // A later arrival on the newer one moves the choice back — the rule is an ordering, not a preference
+        // for whichever connection happened to receive first.
+        order.lock().unwrap().insert(newer.stable_id(), 2);
+        assert_eq!(
+            live_conn(&mut map, &order, peer).0.expect("both are live").stable_id(),
+            newer.stable_id(),
+            "arrival order must track the LAST frame, not the first"
+        );
+
         newer.close(0u32.into(), b"gone");
-        let survivor = live_conn(&mut map, peer).0.expect("the older one is still live");
+        let survivor = live_conn(&mut map, &order, peer).0.expect("the older one is still live");
         assert_eq!(
             survivor.stable_id(),
             older.stable_id(),
-            "a closed connection was handed back: `newest` must mean the newest SURVIVOR, or the map \
-             degrades into always returning the most recent corpse."
+            "a closed connection was handed back: the choice is among SURVIVORS, or the map degrades into \
+             always returning the most recently used corpse."
         );
     }
 }
