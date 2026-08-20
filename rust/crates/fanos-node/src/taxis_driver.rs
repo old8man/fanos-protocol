@@ -400,8 +400,20 @@ impl<S> TaxisHandle<S> {
 }
 
 /// Spawn the live TAXIS driver for one validator on plane `F`, bound to `client`. Returns a [`TaxisHandle`].
-/// Must run inside a tokio runtime. The node must be seated at `Point::at(params.me)` so its validator index
-/// matches its overlay coordinate (the fan-out addresses peers by `Point::at(p).coords()`).
+/// Must run inside a tokio runtime. `params.me` is this node's **position within its own cell** — the index
+/// `i` for which `fano::cell_members_of(fano::cell_of(my_coord))[i]` is this node's coordinate — because that
+/// is what the fan-out addresses peers by.
+///
+/// **It used to be the plane index, and the two agree only at `q = 2`.** The seating below was
+/// `Point::at(i)` over the whole plane, while `#145` made a cell `{c, c + cells, c + 2·cells, …}` and
+/// `compose_engine` seats every overlay node in the cell that rule gives it. On `PG(2,2)` there is one cell
+/// and `cell_members_of(0)[i] == Point::at(i)`, so nothing ever disagreed; on `PG(2,4)` the plane splits into
+/// three and points `0..6` belong to cells `0,1,2,0,1,2,0` — **not a cell at all**. A consensus committee
+/// seated that way addresses votes to three different cells and accepts them from nodes that are not its
+/// members, silently, because every message is addressed by coordinate and filtered by this same list.
+///
+/// Latent rather than observed: every caller today is a test on `F2`. It fires on the first deployment of a
+/// plane that splits, which is also the first deployment where it cannot be noticed by inspection.
 #[must_use]
 #[allow(clippy::too_many_lines)] // the driver is one cohesive async orchestration loop (select over ticks,
 // timeouts, submissions, and the DA/consensus/tx receive paths) — splitting it would only scatter shared state.
@@ -425,8 +437,29 @@ where
     // list — so a peer that moved would have its votes dropped as "a frame from a stranger" while the votes
     // addressed to it went to the point it left. The cell would carry on without it, tolerating two such
     // losses and halting at the third, with no error anywhere: the moved validator is simply gone.
-    let mut coords: Vec<Triple> = (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect();
+    // Derived from this node's own cell, and falling back to the plane's first `N` points only where the
+    // plane does not split — where the two are the same list. See this function's doc for what the fallback
+    // used to cost everywhere else.
+    let mut coords: Vec<Triple> = Point::<F>::new(client.address())
+        .and_then(fanos_geometry::fano::cell_of::<F>)
+        .and_then(fanos_geometry::fano::cell_members_of::<F>)
+        .map_or_else(
+            || (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect(),
+            |cell| cell.coords().to_vec(),
+        );
     let me = params.me;
+    // **The seating contract, checked rather than assumed.** If this index does not name this node's own
+    // coordinate then every vote it sends is addressed as somebody else and every vote it receives is
+    // filtered against the wrong list — and the cell simply carries on without it, which is the failure this
+    // whole map exists to prevent. A count rather than a refusal: the driver is spawned by a caller that
+    // cannot re-seat the node, so refusing would trade a silent fault for a dead one.
+    if coords.get(me as usize).copied() != Some(client.address()) {
+        client.record_station(
+            fanos_runtime::ports::stations::Station::SeatIndexMismatch,
+            Some(client.address()),
+            Some(u64::from(me)),
+        );
+    }
 
     // **Drainer task.** The client's `subscribe()` stream is a *lossy* broadcast: a subscriber that falls
     // behind has messages dropped (`RecvError::Lagged`). The engine task below does slow hybrid-PQ verification

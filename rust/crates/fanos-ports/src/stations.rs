@@ -626,6 +626,22 @@ pub enum Station {
     /// Hot by construction — one increment per received frame — which is what a station is: the driver plane
     /// beside it already carries counts in the thousands.
     OverlayFrameIn,
+    /// A consensus driver's **validator index does not name its own seat** — `coords[me]` is not this node's
+    /// coordinate.
+    ///
+    /// Every consensus message is addressed by coordinate and accepted only from a coordinate in that same
+    /// list, so an index that names somebody else's seat sends this node's votes as another validator and
+    /// drops the votes meant for it. The cell carries on without it, tolerating two such losses and halting
+    /// at the third, with no error anywhere.
+    ///
+    /// **The condition became reachable when the seating stopped being the plane's first `N` points.** A cell
+    /// is `{c, c + cells, …}` (#145), and on `PG(2,2)` that is `Point::at(i)` — so the two maps agreed
+    /// everywhere anyone had looked. On a plane that splits they do not, and a caller passing a plane index
+    /// where a cell position is wanted is the mistake this names.
+    ///
+    /// Counted rather than refused: the driver's caller cannot re-seat the node, so a refusal would trade a
+    /// silent fault for a dead one. Keyed by this node's coordinate, tagged with the index it was given.
+    SeatIndexMismatch,
     /// A write whose shard placement **does not survive the loss of the writer** — this node kept more than
     /// `N − K` of the value's `N` shards, so fewer than `K` went anywhere else.
     ///
@@ -1410,6 +1426,7 @@ impl Station {
         Self::MembershipVacated,
         Self::OverlayFirstHeard,
         Self::OverlayFrameIn,
+        Self::SeatIndexMismatch,
         Self::StoreWriteNotDurable,
         Self::AnonymityFloorUnmet,
         Self::RecoveryEscalated,
@@ -1444,6 +1461,7 @@ impl Station {
     //
     // (The completeness of `ALL` is proven below the impl, at compile time — not here, and not by a test.)
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "one exhaustive table over a closed set; splitting it splits the exhaustiveness")]
     pub const fn name(self) -> &'static str {
         match self {
             Self::GatherExpired => "gather.expired",
@@ -1495,6 +1513,7 @@ impl Station {
             Self::MembershipVacated => "membership.vacated",
             Self::OverlayFirstHeard => "overlay.first_heard",
             Self::OverlayFrameIn => "overlay.frame_in",
+            Self::SeatIndexMismatch => "consensus.seat_index_mismatch",
             Self::StoreWriteNotDurable => "store.write_not_durable",
             Self::AnonymityFloorUnmet => "anonymity.floor_unmet",
             Self::RecoveryEscalated => "recovery.escalated",
@@ -1606,6 +1625,7 @@ impl Station {
             | Self::EpochAgreeBelowQuorum
             | Self::ArbitrationDial
             | Self::MembershipSize
+            | Self::SeatIndexMismatch
             | Self::StoreWriteNotDurable
             | Self::AnonymityFloorUnmet
             | Self::RecoveryEscalated
