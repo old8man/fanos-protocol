@@ -33,6 +33,16 @@ pub(crate) struct PendingGet {
     pub(crate) nonce: u64,
     /// How many `Lookup`s this read fanned out — the peers it is awaiting shard replies from.
     pub(crate) queried: u16,
+    /// How many of those peers were **known to be occupied when the read was issued** — the denominator a
+    /// definite absence has to exhaust, recorded here because the occupancy view moves in *both* directions
+    /// while a read is in flight.
+    ///
+    /// It grows as peers are heard from, which is why `sweep_pending_gets` recomputes it and takes the
+    /// larger of the two; and it **drops to zero at an epoch boundary**, where every liveness mark is
+    /// cleared because every coordinate is re-drawn. Taking only the sweep-time value would let a boundary
+    /// turn an in-flight read into `negatives >= 0` — a definite "nothing is here", concluded from a sample
+    /// of nobody, which is #215's lie re-entered through the clock.
+    pub(crate) answerable_at_issue: u16,
     /// How many of those peers have replied `found=false` (they hold no shard for this key). Once this
     /// reaches [`queried`](Self::queried) and the gathered shards still do not reconstruct, the value is
     /// concluded absent immediately — a fast miss, instead of waiting out the read timeout.

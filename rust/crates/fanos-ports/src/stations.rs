@@ -583,6 +583,19 @@ pub enum Station {
     /// [`Observation::tag`] carries the size. Recorded **before** the boundary clears the map, so it reports
     /// what the epoch actually ended with rather than what the next one starts from.
     MembershipSize,
+    /// A coordinate was **retracted** because the identity seated there announced from a different one
+    /// (a reseat, or a probe walk that settled further along).
+    ///
+    /// **The only retraction a cell ever gets, and before it there was none.** A mover announces where it
+    /// *is*; no frame says where it no longer is. So the vacated point stayed marked occupied in three
+    /// position-keyed places at once — `members`, `identities`, and the liveness mark `occupied_points`
+    /// reads — and placement kept addressing shards to it. Nothing can read what no point holds, and the
+    /// failure is silent on both ends: the writer is acknowledged, the reader concludes honestly.
+    ///
+    /// Keyed by the **vacated** coordinate, not the new one, because that is the point whose story changed.
+    /// A count that tracks reseats is healthy; one that grows while nothing moves means identities are
+    /// colliding, which is a different fault entirely.
+    MembershipVacated,
     /// A beacon stall was confirmed and this node **escalated** for an authorized recovery (audit §4).
     ///
     /// **The half of R-C2 that was missing.** The detector is wired — `RECOVERY_PATIENCE` epoch-driver
@@ -1328,6 +1341,7 @@ impl Station {
         Self::MembershipRepeatIgnored,
         Self::ArbitrationDial,
         Self::MembershipSize,
+        Self::MembershipVacated,
         Self::RecoveryEscalated,
         Self::ExitAdvertisementWithheld,
         Self::RestrictedFrameDropped,
@@ -1408,6 +1422,7 @@ impl Station {
             Self::MembershipRepeatIgnored => "membership.repeat_ignored",
             Self::ArbitrationDial => "directory.arbitration_dial",
             Self::MembershipSize => "membership.size",
+            Self::MembershipVacated => "membership.vacated",
             Self::RecoveryEscalated => "recovery.escalated",
             Self::ExitAdvertisementWithheld => "exit.advertisement_withheld",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
@@ -1567,6 +1582,7 @@ impl Station {
             | Self::ConnCacheMiss
             | Self::RelayOriginRefused
             | Self::MembershipRepeatIgnored
+            | Self::MembershipVacated
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

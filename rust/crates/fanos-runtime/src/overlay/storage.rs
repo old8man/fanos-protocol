@@ -229,9 +229,16 @@ impl<F: Field> OverlayNode<F> {
         // How many of the peers this node asked **could** have answered — recomputed now rather than stored
         // at issue time, because the occupancy view grows while a read is in flight and the whole point of
         // waiting for the timeout is to let it.
-        let answerable = self.occupied_points().len().saturating_sub(1); // less this node
+        let occupied_now = u16::try_from(self.occupied_points().len().saturating_sub(1)).unwrap_or(u16::MAX); // less this node
         for digest in stale {
-            let negatives = self.store.pending.get(&digest).map_or(0, |p| usize::from(p.negatives));
+            // Both read from the SAME entry and **before** it is removed: the denominator lives on the
+            // pending record, so splitting these reads across the `remove` silently makes it zero and turns
+            // the rule below back into the one it replaces.
+            let (negatives, answerable_at_issue) = self
+                .store
+                .pending
+                .get(&digest)
+                .map_or((0, 0), |p| (usize::from(p.negatives), p.answerable_at_issue));
             self.store.pending.remove(&digest);
             self.account_data_loss(now, digest, effects); // R-C3: a held-but-unrecoverable key is accounted lost
             // **The one place a timeout may still be a definite answer, and the reason is exhaustion rather
@@ -246,6 +253,22 @@ impl<F: Field> OverlayNode<F> {
             // the timeout, there is nothing left to wait for — so if every peer known to exist has said it
             // holds nothing, the cell has answered and `Absent` is earned. Otherwise a known peer stayed
             // silent, and that is a non-conclusion (#215).
+            //
+            // **The denominator is the LARGEST set that could have answered during the read's life**, not
+            // the set standing at either end of it, and the two ends move in opposite directions. It grows
+            // as peers are heard from — the reason this was recomputed here rather than stored at issue —
+            // and it **collapses to zero at an epoch boundary**, where every liveness mark is cleared
+            // because every coordinate is re-drawn. Reading only the sweep-time value therefore lets a
+            // boundary crossing turn `negatives >= answerable` into `0 >= 0`: a definite "nothing is here",
+            // concluded from a sample of nobody, for a read that was fanned out to four live peers a second
+            // earlier.
+            //
+            // A node that has genuinely never known a peer still concludes `Absent`, at the timeout, exactly
+            // as before — both values are zero and there is nothing to exhaust. That is a deliberate,
+            // documented trade (`on_get`'s note: *"a solitary node still gets `Absent`; it waits one
+            // `read_timeout` for it, which is the price of not guessing"*), and `cell_diagnosis` is the test
+            // that holds it: a single-node fixture read a 14-epoch window and every read must conclude.
+            let answerable = usize::from(answerable_at_issue.max(occupied_now));
             if negatives >= answerable {
                 effects.push(Effect::Notify(Notification::Retrieved {
                     key: digest,
@@ -298,9 +321,32 @@ impl<F: Field> OverlayNode<F> {
     }
 
     /// The occupied points of this cell, by canonical index: this node, every cell peer we have heard from
-    /// (its algebraic slot is filled by a live node — liveness populates this even before any JOIN/Announce),
-    /// and every announced member. A never-occupied point is simply absent; a heard-then-crashed occupant is
-    /// handled downstream by `routed_send`'s reroute. Always contains this node.
+    /// **since the last seating change**, and every announced member. A never-occupied point is simply
+    /// absent; a heard-then-crashed occupant is handled downstream by `routed_send`'s reroute. Always
+    /// contains this node.
+    ///
+    /// ## The mark is monotone *within* an epoch, and cleared at every seating change
+    ///
+    /// `p.last_seen.is_some()` is read here as a standing fact — "a node lives at that point" — not as a
+    /// freshness test, and the difference is the whole design. Every coordinate on this plane is a
+    /// **rotating name**: the beacon re-draws it each epoch (§L3) and `on_reseat` moves an outranked node
+    /// within one. Left uncleared, this set grows into a union of every seating the node has ever witnessed,
+    /// and `shard_homes` — which takes its first `N` entries — then addresses shards to points nobody lives
+    /// at. No reader can find what no point holds; `a_writer_whose_evidence_has_aged_does_not_address_shards
+    /// _to_vacancy` measures exactly that, and it is total rather than partial once every node carries its
+    /// own residue.
+    ///
+    /// So the mark is cleared where the seating actually changes — `on_epoch_changed`, beside `members`,
+    /// `identities`, `grey_reported` and the healer's seating, which are cleared there for this same stated
+    /// reason — and **not** on a clock.
+    ///
+    /// **The clock version was tried, and measured wrong.** Reading this as
+    /// `now.since(seen) <= config.liveness_timeout` — the ageing `coord_alive` and `health_view` apply to the
+    /// same field — turned **9 live tests red** in one run (7 of 11 in `anonymous_quic`, plus `cell_diagnosis`
+    /// and `role_roster`), all green on the same tree without it. `liveness_timeout` is 1.6 s and answers
+    /// *"did we hear from it just now"*; occupancy asks *"is there a node at that point"*, which is true
+    /// across a quiet minute. Two questions, one constant, and sharing it makes any cell whose traffic comes
+    /// in bursts believe it is alone between them ([[one-constant-two-quantities]]).
     pub(super) fn occupied_points(&self) -> BTreeSet<usize> {
         let mut occupied: BTreeSet<usize> = self
             .peers
@@ -524,6 +570,12 @@ impl<F: Field> OverlayNode<F> {
                 // repair that looks right and concludes early — see `sweep_pending_gets`, where the
                 // narrower count belongs because only there has the read run out of time to hear more.
                 queried: u16::try_from(peers.len()).unwrap_or(u16::MAX),
+                // The occupancy view at issue — see `PendingGet::answerable_at_issue` for why both ends of
+                // the read's life are needed and neither alone is safe.
+                answerable_at_issue: u16::try_from(
+                    self.occupied_points().len().saturating_sub(1),
+                )
+                .unwrap_or(u16::MAX),
                 negatives: 0,
                 supplied: BTreeMap::new(),
             },

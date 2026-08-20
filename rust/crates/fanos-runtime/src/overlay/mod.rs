@@ -2062,6 +2062,382 @@ mod tests {
         );
     }
 
+
+    /// **A cell with no transport at all: every send is delivered, instantly, to whoever is seated.**
+    ///
+    /// The store's own T1 rung, and the instrument the roster-partition investigation lacked. A live fleet
+    /// mixes three planes — placement, membership evidence and QUIC — and a failed read cannot say which one
+    /// lost the value. Here there is exactly one: an `Effect::Send` addressed to an occupied point is handed
+    /// to that engine, one addressed to empty space is dropped, nothing reorders and nothing is lost. A read
+    /// that fails in this mesh fails on the store's logic, and a read that succeeds acquits it.
+    struct Mesh<F: Field> {
+        engines: Vec<(Triple, OverlayNode<F>)>,
+    }
+
+    impl<F: Field> Mesh<F> {
+        /// `seats` are canonical point indices; each gets an engine.
+        fn new(seats: &[usize]) -> Self {
+            Self {
+                engines: seats
+                    .iter()
+                    .map(|&i| {
+                        (
+                            Point::<F>::at(i).coords(),
+                            OverlayNode::<F>::new(Point::at(i), Config::default()),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        /// Give engine `who` the evidence that `heard` are occupied — the exact input `occupied_points`
+        /// reads, set the way the mesh's own traffic would set it.
+        fn heard(&mut self, who: usize, heard: &[usize], now: Instant) {
+            let wanted: BTreeSet<Triple> =
+                heard.iter().map(|&i| Point::<F>::at(i).coords()).collect();
+            let Some((_, node)) = self.engines.get_mut(who) else {
+                return;
+            };
+            let known: Vec<Triple> = node.peers.keys().copied().collect();
+            for c in known {
+                if wanted.contains(&c)
+                    && let Some(p) = node.peers.get_mut(&c)
+                {
+                    p.last_seen = Some(now);
+                }
+            }
+        }
+
+        /// Run `cmd` at engine `origin` and pump every resulting frame to quiescence. Returns every
+        /// notification any engine raised, tagged with the engine that raised it.
+        fn run(&mut self, now: Instant, origin: usize, cmd: Command) -> Vec<(usize, Notification)> {
+            let mut notes = Vec::new();
+            let Some(&(from, _)) = self.engines.get(origin) else {
+                return notes;
+            };
+            let mut queue: Vec<(Triple, Triple, Vec<u8>)> = Vec::new();
+            let effects = {
+                let Some((_, node)) = self.engines.get_mut(origin) else {
+                    return notes;
+                };
+                node.step(now, Input::Command(cmd))
+            };
+            Self::drain(origin, effects, from, &mut queue, &mut notes);
+            // Perfect delivery is not instant termination: bound the pump so a routing loop fails the test
+            // rather than hanging it.
+            let mut hops = 0u32;
+            while let Some((src, dst, frame)) = queue.pop() {
+                hops += 1;
+                assert!(hops < 10_000, "the mesh must quiesce, not loop");
+                let Some(at) = self.engines.iter().position(|&(c, _)| c == dst) else {
+                    continue; // addressed to empty space — dropped, as the plane would
+                };
+                let effects = {
+                    let Some((_, node)) = self.engines.get_mut(at) else {
+                        continue;
+                    };
+                    node.step(now, Input::Message { from: src, frame })
+                };
+                Self::drain(at, effects, dst, &mut queue, &mut notes);
+            }
+            notes
+        }
+
+        fn drain(
+            at: usize,
+            effects: Vec<Effect>,
+            from: Triple,
+            queue: &mut Vec<(Triple, Triple, Vec<u8>)>,
+            notes: &mut Vec<(usize, Notification)>,
+        ) {
+            for e in effects {
+                match e {
+                    Effect::Send { to, frame } => queue.push((from, to, frame)),
+                    Effect::Notify(n) => notes.push((at, n)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// **Every member must be able to read what any member wrote — over perfect delivery, this is the
+    /// store's floor.**
+    ///
+    /// Five engines on `PG(2,4)`, each holding evidence of all the others, so every `occupied_points()` is
+    /// the same set and placement cannot disagree. One writer, five readers, and the value must come back to
+    /// all five. With the views equal this is the control: it isolates the *skewed-view* case below, which is
+    /// what a real cell has at startup and what the fleet fixture reproduces.
+    #[test]
+    fn a_value_written_once_is_readable_by_every_member_when_the_views_agree() {
+        use fanos_field::F4;
+        const SEATS: [usize; 5] = [0, 8, 12, 15, 18];
+        let now = Instant(1);
+        let mut mesh = Mesh::<F4>::new(&SEATS);
+        for (who, &seat) in SEATS.iter().enumerate() {
+            let others: Vec<usize> = SEATS.iter().copied().filter(|&i| i != seat).collect();
+            mesh.heard(who, &others, now);
+        }
+        let key = b"agreed-views".to_vec();
+        let value = b"the value every member must see".to_vec();
+        let stored = mesh.run(now, 0, Command::Put { key: key.clone(), value: value.clone() });
+        assert!(
+            stored.iter().any(|(_, n)| matches!(n, Notification::Stored(_))),
+            "the write must be acknowledged before the reads mean anything: {stored:?}"
+        );
+        for reader in 0..SEATS.len() {
+            let notes = mesh.run(now, reader, Command::Get { key: key.clone() });
+            let found = notes.iter().any(|(who, n)| {
+                *who == reader
+                    && matches!(n, Notification::Retrieved { outcome: ReadOutcome::Found(v), .. } if *v == value)
+            });
+            assert!(found, "reader {reader} must reconstruct the value; it saw {notes:?}");
+        }
+    }
+
+
+    /// **A fully skewed view costs the store nothing, and that refutes the obvious reading of its own
+    /// note.**
+    ///
+    /// `occupied_points()` is *local* evidence, and `on_put` reads it twice — to pick the responsible node
+    /// (`responsible_point`) and to place the shards (`shard_homes`). A node that has heard from nobody is
+    /// its own successor and its own ring, so it keeps all seven shards and acknowledges `Stored`. The
+    /// natural conclusion is that such a write is lost to everyone else, and the storage note's "a writer
+    /// that knows few peers keeps every shard itself" invites exactly that reading.
+    ///
+    /// **It is wrong, and this is the experiment that says so.** `on_get` fans out to the *algebraic*
+    /// neighbour set — every point of the plane, owing nothing to evidence — so the cell asks the isolated
+    /// writer too, and it answers with all seven. Both directions work: the isolated node reads the cell,
+    /// and the cell reads the isolated node.
+    ///
+    /// Which is why this test is worth its lines. It was written to reproduce a live-fleet partition
+    /// (`fanos-sim`'s `the_whole_cell_resolves_every_member`, where three nodes resolve each other and two
+    /// resolve only themselves) at unit level, and it **acquits the store**: over perfect delivery no view
+    /// skew produces that split, so the partition is a delivery fact, not a placement one. A T1 rung that
+    /// refutes a hypothesis is doing its job — see `falsify-every-new-test`.
+    #[test]
+    fn a_skewed_view_costs_the_store_nothing_because_the_read_is_algebraic() {
+        use fanos_field::F4;
+        const SEATS: [usize; 5] = [0, 8, 12, 15, 18];
+        let now = Instant(1);
+        let mut mesh = Mesh::<F4>::new(&SEATS);
+        // Everyone but engine 0 has met the whole cell; engine 0 has met nobody — the startup state of the
+        // first node up, which no later traffic corrects because nothing re-announces within an epoch.
+        for (who, &seat) in SEATS.iter().enumerate().skip(1) {
+            let others: Vec<usize> = SEATS.iter().copied().filter(|&i| i != seat).collect();
+            mesh.heard(who, &others, now);
+        }
+        assert_eq!(
+            mesh.engines.first().map(|(_, n)| n.occupied_points().len()),
+            Some(1),
+            "the fixture's whole point is that engine 0 believes it is alone; if this is not 1 the skew \
+             never happened and the assertions below prove nothing"
+        );
+
+        // Direction 1 — the isolated node writes, and the *whole cell* can still read it.
+        let key = b"written-while-alone".to_vec();
+        let value = b"a write that never left its writer".to_vec();
+        let stored = mesh.run(now, 0, Command::Put { key: key.clone(), value: value.clone() });
+        assert!(
+            stored.iter().any(|(who, n)| *who == 0 && matches!(n, Notification::Stored(_))),
+            "the isolated writer is its own responsible node and acknowledges the write: {stored:?}"
+        );
+        let readers_that_found: Vec<usize> = (0..SEATS.len())
+            .filter(|&reader| {
+                mesh.run(now, reader, Command::Get { key: key.clone() })
+                    .iter()
+                    .any(|(who, n)| {
+                        *who == reader
+                            && matches!(n, Notification::Retrieved { outcome: ReadOutcome::Found(v), .. } if *v == value)
+                    })
+            })
+            .collect();
+        assert_eq!(
+            readers_that_found,
+            (0..SEATS.len()).collect::<Vec<_>>(),
+            "every member reads a value written by a node that believed it was alone — the read asks the \
+             whole plane, so it asks the writer"
+        );
+
+        // Direction 2 — the cell writes, the isolated node reads. Same reason, other way round.
+        let key2 = b"written-by-the-cell".to_vec();
+        let value2 = b"the cell's own value".to_vec();
+        let stored2 = mesh.run(now, 1, Command::Put { key: key2.clone(), value: value2.clone() });
+        assert!(
+            stored2.iter().any(|(_, n)| matches!(n, Notification::Stored(_))),
+            "the cell's write is acknowledged: {stored2:?}"
+        );
+        let notes = mesh.run(now, 0, Command::Get { key: key2.clone() });
+        assert!(
+            notes.iter().any(|(who, n)| *who == 0
+                && matches!(n, Notification::Retrieved { outcome: ReadOutcome::Found(v), .. } if *v == value2)),
+            "the isolated node reads the cell's value: its fan-out is algebraic, not evidential — {notes:?}"
+        );
+    }
+
+
+    /// **A point heard from once is not a point occupied for ever, and the epoch boundary is where that
+    /// stops being true.**
+    ///
+    /// `occupied_points` is placement's only input, and every coordinate on this plane is a *rotating* name:
+    /// the beacon re-draws it each epoch, `on_reseat` moves an outranked node, the probe walk visits several
+    /// points before settling. A mark that no path clears makes each of those leave a permanent claim on a
+    /// point nobody occupies any more.
+    ///
+    /// Asserted on both sides of the boundary on one engine, because the property is the *transition*: a
+    /// mark that never clears and one that is never set both pass a one-sided check. And on the engine's own
+    /// coordinate too — the set must never empty, since this node is always in it.
+    #[test]
+    fn the_epoch_boundary_clears_every_liveness_mark_placement_reads() {
+        use fanos_field::F4;
+        let mut node = OverlayNode::<F4>::new(Point::at(0), Config::default());
+        let seat = Point::<F4>::at(8).coords();
+        if let Some(p) = node.peers.get_mut(&seat) {
+            p.last_seen = Some(Instant(1));
+        }
+        assert!(
+            node.occupied_points().contains(&8),
+            "a peer we have heard from occupies its point"
+        );
+        assert!(
+            node.shard_homes().contains(&seat),
+            "and placement follows it — otherwise the assertion below proves nothing"
+        );
+
+        node.step(Instant(2), Input::Command(Command::AdvanceEpoch));
+        assert!(
+            !node.occupied_points().contains(&8),
+            "past the boundary that point names somebody else, or nobody, and the evidence is gone"
+        );
+        assert!(
+            node.occupied_points().contains(&0),
+            "this node is always in its own occupied set — the set is never empty"
+        );
+        assert!(
+            node.peers.contains_key(&seat),
+            "the PEER stays: the algebraic neighbour set is a property of the plane, not of who is on it"
+        );
+    }
+
+    /// **A mover leaves a vacancy, and the announcement it sends from the new point is the only retraction
+    /// the cell ever gets.**
+    ///
+    /// Within one epoch, arbitration reseats an outranked node and the probe walk settles further along its
+    /// own walk. Both leave the abandoned coordinate marked occupied in three position-keyed places, and no
+    /// frame ever says "I am no longer there". `identities` maps coordinate → identity, so an identity
+    /// appearing at a new point names the old one exactly.
+    #[test]
+    fn an_identity_announcing_from_a_new_point_vacates_the_one_it_left() {
+        use fanos_field::F4;
+        let cfg = Config { require_self_certified_membership: false, ..Config::default() };
+        let mut node = OverlayNode::<F4>::new(Point::at(0), cfg);
+        let old = Point::<F4>::at(8).coords();
+        let new = Point::<F4>::at(12).coords();
+        let id = alloc::vec![7u8; 32];
+        let announce = |at: Triple| {
+            let hier = HierAddr::from_path(alloc::vec![Point::<F4>::new(at).unwrap()]).unwrap();
+            encode(FrameType::Announce, &announce_body(at, &hier, &id, &[], &[], b"info"))
+        };
+        node.step(Instant(1), Input::Message { from: old, frame: announce(old) });
+        assert!(
+            node.membership.members.contains_key(&old),
+            "the first announcement seats it — otherwise the move below has nothing to vacate"
+        );
+        if let Some(p) = node.peers.get_mut(&old) {
+            p.last_seen = Some(Instant(1));
+        }
+
+        node.step(Instant(2), Input::Message { from: new, frame: announce(new) });
+        assert!(
+            node.membership.members.contains_key(&new),
+            "the mover is seated at the point it announced from"
+        );
+        assert!(
+            !node.membership.members.contains_key(&old),
+            "and the point it left is retracted, not held by a member who is elsewhere"
+        );
+        assert!(
+            !node.occupied_points().contains(&8),
+            "so placement stops addressing shards to it — the whole reason the retraction exists"
+        );
+    }
+
+    /// **The consequence the live fleet paid, reproduced end to end: a ring of ghosts loses the value.**
+    ///
+    /// Five engines on `PG(2,4)` at seats `[0, 8, 12, 15, 18]`, each also holding a mark for indices
+    /// `1..=6`, where no engine ever lived — the residue a few reshuffles and reseats leave behind, and
+    /// every node accumulates its own. Those six sort below every real seat but the first, so an uncleared
+    /// `occupied_points` hands `shard_homes` a ring whose seven entries are one live point and six
+    /// vacancies: six shards in seven are addressed to nobody, `K = 3` never assembles, and no reader can
+    /// find what no point holds.
+    ///
+    /// The epoch boundary is what clears it. After the advance the engines re-hear only each other, the
+    /// ring is the five real seats, and the value comes back to all five.
+    ///
+    /// **The residue must be on every engine for this to bite, and finding that out corrected the claim.**
+    /// With the ghosts on the writer alone the value still came back, because `on_put` routes to
+    /// `responsible_point` and a *healthy* responsible node re-places the shards over its own clean ring.
+    /// One sick node therefore loses only the keys it is itself responsible for — which is why the live
+    /// fleet's failure was partial (three nodes resolving each other, two resolving only themselves) rather
+    /// than total, and why a fixture with one sick node proves nothing.
+    #[test]
+    fn the_epoch_boundary_clears_a_ring_of_ghosts_that_would_swallow_every_write() {
+        use fanos_field::F4;
+        const SEATS: [usize; 5] = [0, 8, 12, 15, 18];
+        const GHOSTS: [usize; 6] = [1, 2, 3, 4, 5, 6];
+        let now = Instant(1);
+        let mut mesh = Mesh::<F4>::new(&SEATS);
+        for (who, &seat) in SEATS.iter().enumerate() {
+            let others: Vec<usize> = SEATS.iter().copied().filter(|&i| i != seat).collect();
+            mesh.heard(who, &others, now);
+            mesh.heard(who, &GHOSTS, now);
+        }
+        assert_eq!(
+            mesh.engines.first().map(|(_, n)| n.occupied_points().len()),
+            Some(SEATS.len() + GHOSTS.len()),
+            "the residue is there before the boundary — otherwise this fixture proves nothing"
+        );
+
+        // The advance every node takes, and the traffic that follows it: the seats are heard again, the
+        // vacancies are not, because nothing lives there to be heard from.
+        for (who, _) in SEATS.iter().enumerate() {
+            if let Some((_, node)) = mesh.engines.get_mut(who) {
+                node.step(now, Input::Command(Command::AdvanceEpoch));
+            }
+        }
+        for (who, &seat) in SEATS.iter().enumerate() {
+            let others: Vec<usize> = SEATS.iter().copied().filter(|&i| i != seat).collect();
+            mesh.heard(who, &others, now);
+        }
+        assert_eq!(
+            mesh.engines.first().map(|(_, n)| n.occupied_points().len()),
+            Some(SEATS.len()),
+            "past the boundary only the seats survive"
+        );
+
+        let key = b"written-over-a-graveyard".to_vec();
+        let value = b"the value six ghosts would have swallowed".to_vec();
+        let stored = mesh.run(now, 0, Command::Put { key: key.clone(), value: value.clone() });
+        assert!(
+            stored.iter().any(|(_, n)| matches!(n, Notification::Stored(_))),
+            "the write is acknowledged: {stored:?}"
+        );
+        let readers_that_found: Vec<usize> = (0..SEATS.len())
+            .filter(|&reader| {
+                mesh.run(now, reader, Command::Get { key: key.clone() })
+                    .iter()
+                    .any(|(who, n)| {
+                        *who == reader
+                            && matches!(n, Notification::Retrieved { outcome: ReadOutcome::Found(v), .. } if *v == value)
+                    })
+            })
+            .collect();
+        assert_eq!(
+            readers_that_found,
+            (0..SEATS.len()).collect::<Vec<_>>(),
+            "every member reads it, because every shard went to a point that answers"
+        );
+    }
+
     fn seat_every_neighbour<F: Field>(node: &mut OverlayNode<F>, now: Instant) {
         let coords: Vec<Triple> = node.peers.keys().copied().collect();
         for c in coords {

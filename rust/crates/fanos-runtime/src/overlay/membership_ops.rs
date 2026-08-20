@@ -175,6 +175,35 @@ impl<F: Field> OverlayNode<F> {
             }));
             return effects;
         }
+        // **A first sight here is a vacancy somewhere else, whenever this identity was seated before.**
+        //
+        // Coordinates rotate — arbitration reseats an outranked node, and the probe walk settles further
+        // along its own walk — and every such move leaves the vacated point marked occupied in three places
+        // keyed by position: `members`, `identities`, and `peers[c].last_seen`. Nothing else ever retracts
+        // them within an epoch, because the mover announces where it *is* and no frame says where it no
+        // longer is.
+        //
+        // The announcement itself carries the retraction: `identities` maps coordinate → identity, so an
+        // identity appearing at a new point names the old one exactly. What it costs is a scan of a
+        // cell-sized map per first-sight announce, which is bounded by the plane.
+        //
+        // Skipped for an empty `id`, under which every announcer looks like every other and this would
+        // vacate an arbitrary member on each join.
+        if !id.is_empty()
+            && let Some(&vacated) = self
+                .membership
+                .identities
+                .iter()
+                .find_map(|(at, seated)| (*at != coord && *seated == id).then_some(at))
+        {
+            self.membership.members.remove(&vacated);
+            self.membership.identities.remove(&vacated);
+            if let Some(peer) = self.peers.get_mut(&vacated) {
+                // The evidence, not the peer: the algebraic neighbour set belongs to the plane.
+                peer.last_seen = None;
+            }
+            self.stations.record(Station::MembershipVacated, Some(vacated));
+        }
         self.membership.members.insert(coord, info.clone());
         // …and the identity behind it, which is what a contested sub-cell point is arbitrated on. Inserted
         // beside `members` and under the same first-sight rule, so the two cannot disagree about who is at
@@ -242,6 +271,21 @@ impl<F: Field> OverlayNode<F> {
         // With them, and for the identical reason: `identities` is the same view keyed the same way, and a
         // stale entry there would arbitrate a sub-cell contest against a node that has left the point.
         self.membership.identities.clear();
+        // **And the liveness marks, which are the same kind of state one table over.** `peers[c].last_seen`
+        // is read by `occupied_points` as "a node lives at point `c`" — the sole input to `shard_homes` and
+        // `responsible_point` — and after this instant `c` names somebody else, or nobody. Left standing, the
+        // set grows into the union of every seating this node has ever witnessed, and placement then
+        // addresses shards to points that are empty; nothing can read what no point holds.
+        //
+        // Cleared rather than aged, and the distinction cost a measurement: a clock window borrowed from
+        // `liveness_timeout` turned 9 live tests red, because 1.6 s answers "did we hear from it just now"
+        // and this asks "is there a node there", which stays true across a quiet minute.
+        //
+        // The peers themselves are kept — the algebraic neighbour set is a property of the *plane*, not of
+        // who is on it — so this drops the evidence and not the addressing.
+        for peer in self.peers.values_mut() {
+            peer.last_seen = None;
+        }
         // The epoch re-draws every node's VRF coordinate, so every cell position keeps its name and changes
         // its occupant. State addressed by a position stops describing what its address says — see
         // [`Healer::on_seating_changed`] for the measurement and for the two things deliberately kept.

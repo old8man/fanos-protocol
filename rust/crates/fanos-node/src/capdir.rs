@@ -268,11 +268,16 @@ pub(crate) async fn build_capability_directory<F: Field>(
 
 /// As [`resolve_capability`], distinguishing a read that **did not conclude** from a definite absence.
 ///
+/// `pub` because its unbound sibling already is, and the asymmetry cost a diagnosis: a fixture reaching for
+/// "what does this node see in the directory" picks the public one, gets `None` at every point — including
+/// the node's own — and reads that as an empty cell rather than as the wrong reader. Under VRF coordinates
+/// every record is bound, so the unbound parser is not a fallback, it is a different question.
+///
 /// The timeout is the whole point: `resolve_capability` answers `Option`, so a slow store read and an unpublished
 /// descriptor are the same value, and a roster built from those reads silently shrinks under load.
 /// `Some(beacon)` reads a **coordinate-bound** record ([`parse_bound_advertisement`]); `None` a pinned cell's unbound one.
 /// Not a `verify: bool` — see [`crate::bound`]: having a beacon *is* the VRF mode, and its absence is an absent mechanism.
-async fn read_capability<F: Field>(
+pub async fn read_capability<F: Field>(
     client: &Client,
     coord: Coord,
     epoch: Epoch,

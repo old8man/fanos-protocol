@@ -1764,6 +1764,41 @@ mod tests {
         // the driver's plane alone and concluded the reads never reached the store — an absence that plane
         // structurally cannot report. See `engine_stations`.
         let engine = fleet.engine_stations().await;
+        // **Which coordinates each reader could resolve, not how many** — the reading two refuted hypotheses
+        // showed was missing. A short roster has two very different causes: a writer whose record never
+        // became retrievable (then every reader misses the *same* points) and a reader that cannot see what
+        // others can (then the masks differ). The count cannot tell them apart and the rosters observed —
+        // `[3, 2, 3, 2, 3]`, `[1, 3, 3, 3, 1]` — already disagree, which is the second shape.
+        //
+        // Re-scanned here with the same public entry point the role loop uses, rather than plumbed out of
+        // it: the loop keeps no seating a fixture could read, and a second reader is exactly what is wanted
+        // when the question is whether two readers see the same cell.
+        let mut resolved: Vec<String> = Vec::new();
+        for (i, node) in fleet.nodes().iter().enumerate() {
+            let client = node.client();
+            let mut seen: Vec<String> = Vec::new();
+            let at_epoch = node.assignment().epoch;
+            // The **bound** reader, which is what the role loop uses: under VRF coordinates every record
+            // carries an `Entitlement`, so the unbound parser answers `None` at every point — including the
+            // node's own — and that reads as an empty cell rather than as the wrong question. Measured that
+            // way once before this line said so.
+            // …and at the SAME seed the record was written against. `live_beacon()` is `None` before the
+            // first round, and `read_capability(.., None)` is the unbound path again — the same wrong
+            // question one layer down. The publisher falls back to `client.genesis()`, so this must too.
+            let seed = Some(node.live_beacon().map_or_else(|| client.genesis(), |(_, s)| fanos_primitives::BeaconSeed::new(s)));
+            // The **occupied** points only. Scanning the whole plane costs `N` store reads per node — 105
+            // here, at the store's read timeout each — and every vacant point can only answer `Absent`,
+            // which is not the question. The question is whether two readers see the same *members*.
+            for c in coords.iter().copied() {
+                seen.push(match fanos_node::capdir::read_capability::<F4>(&client, c, at_epoch, seed).await {
+                    fanos_node::resolve::Read::Found(_) => format!("{}=found", crate::fmt_coord(c)),
+                    fanos_node::resolve::Read::Absent => continue,
+                    fanos_node::resolve::Read::Unknown => format!("{}=UNKNOWN", crate::fmt_coord(c)),
+                });
+            }
+            resolved.push(format!("  node {i} @{} resolved {}: {}", crate::fmt_coord(node.health().address), seen.len(), seen.join(" ")));
+        }
+        let resolved = resolved.join("\n");
         fleet.shutdown().await;
         let roster = trace.map(|(a, _)| a.roster);
         assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
@@ -1776,6 +1811,8 @@ mod tests {
              roster over the observation clock:\n{}\n\
              reach over the SAME clock — if this rises while the roster stands still, reach was never the \
              binding constraint and nothing re-derived once it returned:\n{}\n\
+             which coordinates each reader could resolve — same points everywhere means a writer never \
+             landed, differing masks mean a reader cannot see what others can:\n{resolved}\n\
              driver plane — did a frame find a rung:{plane}\n\
              epoch each roster was computed for — a capability slot is keyed by it, so nodes reading \
              different epochs read different slots and each finds the other absent while concluding:\n{}\n\
