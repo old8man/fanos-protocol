@@ -4150,6 +4150,12 @@ fn log_notification_against(note: &Notification, configured: Option<Duration>) {
         // overflow is nesting rather than doubling up on points, which is the design working. `AddressProposed`
         // is one step of a three-message exchange, so it goes to debug and the adoption is what an operator sees.
         Notification::PeerAddressed { coord, path } => info!(?coord, depth = path.len(), "a peer took a sub-cell address"),
+        // Debug rather than info: one per handshake, so on a large cell at churn this is the highest-rate
+        // structural event there is. What an operator acts on is its *absence* beside a live connection,
+        // which the `overlay.first_heard` station answers without a log line per peer.
+        Notification::PeerHandshaken { coord, .. } => {
+            tracing::debug!(?coord, "a peer proved its coordinate and the engine was told");
+        }
         Notification::AddressProposed { path } => tracing::debug!(depth = path.len(), "an overlay address was named for this node"),
         Notification::Grey(p) => info!(node = ?p, "peer greylisted"),
         Notification::Bound => info!("cell bound (homeostat)"),

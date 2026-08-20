@@ -515,6 +515,10 @@ impl<F: Field> Engine for NyxNode<F> {
                 // restart is *supposed* to drop — resurrecting them would replay traffic the network has
                 // already forgotten.
                 | Command::Snapshot
+                // A mix relay routes by circuit, not by cell membership, so who is proved at which
+                // coordinate is not its question — the overlay engine beside it is the one that keeps that
+                // view. Listed rather than wildcarded, so the next command has to be sorted deliberately.
+                | Command::PeerHandshaken { .. }
                 | Command::Put { .. }
                 | Command::PutEphemeral { .. }
                 | Command::Get { .. }

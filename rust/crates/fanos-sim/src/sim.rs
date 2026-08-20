@@ -52,6 +52,7 @@ fn cmd_name(cmd: &Command) -> &'static str {
         Command::Broadcast { .. } => "Broadcast",
         Command::Diagnose => "Diagnose",
         Command::Control { .. } => "Control",
+        Command::PeerHandshaken { .. } => "PeerHandshaken",
         Command::Observe => "Observe",
         Command::Snapshot => "Snapshot",
         Command::Put { .. } => "Put",
@@ -116,6 +117,9 @@ fn note_desc(note: &Notification) -> String {
             format!("HostRegistered {}", short_digest(service_tag))
         }
         Notification::PeerDown(p) => format!("PeerDown {}", fmt_coord(*p)),
+        Notification::PeerHandshaken { coord, .. } => {
+            format!("PeerHandshaken {}", fmt_coord(*coord))
+        }
         // The length, not the bytes: a durable snapshot is the whole store and a trace that inlined it would
         // be unreadable, while the size is the quantity a scenario about persistence actually watches.
         Notification::Snapshot(bytes) => format!("Snapshot {} bytes", bytes.len()),

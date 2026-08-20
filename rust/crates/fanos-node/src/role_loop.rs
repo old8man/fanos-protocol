@@ -1575,6 +1575,28 @@ fn note_deficit<F: Field>(
     occupied: &std::collections::BTreeSet<usize>,
 ) {
     let line_size = Plane::<F>::LINE_SIZE as usize;
+    // **"No line of this cell can be served" is a statement about the cell, not about a role's shortfall,
+    // and it was only ever said inside one.**
+    //
+    // An onion hop *is* a threshold gather on a line, so `servable_lines == 0` means no hop completes —
+    // anywhere, ever. Not slower, not lossy: absent, and silently, because a hop that cannot complete looks
+    // exactly like a gather timing out (`gather.expired`). Until now the number appeared only as a field of
+    // a `warn!` inside the per-role loop below, which means it was said only when *that role* transitioned
+    // into deficit and never on the observability plane an operator or a monitor reads.
+    //
+    // Hoisted out of the loop for that reason, and recorded every epoch it holds rather than on a
+    // transition: this is a *reading*, not an event, and a cell that has been unable to carry anonymous
+    // traffic for twenty epochs should say so twenty times. The count is bounded by the epoch rate.
+    //
+    // On `PG(2,4)` a five-point cell serves **zero** of its twenty-one lines in 91.6 % of placements, so
+    // this is the ordinary state of an under-populated cell rather than an exotic one.
+    if fanos_geometry::servable_lines::<F>(|p| occupied.contains(&p.index())) == 0 {
+        client.record_station(
+            fanos_runtime::ports::stations::Station::AnonymityFloorUnmet,
+            None,
+            u64::try_from(occupied.len()).ok(),
+        );
+    }
     for role in deficit_transitions(deficit, reported) {
         let short = deficit.of(role);
         client.record_station(

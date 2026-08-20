@@ -596,6 +596,58 @@ pub enum Station {
     /// A count that tracks reseats is healthy; one that grows while nothing moves means identities are
     /// colliding, which is a different fault entirely.
     MembershipVacated,
+    /// The **first frame of this epoch** to arrive from a peer's coordinate — one per peer per epoch.
+    ///
+    /// **The observable that separates two faults which were the same silence.** A cell that cannot assemble
+    /// a roster has two very different possible causes: this node cannot *address* that peer, or it can
+    /// address it perfectly and no frame ever arrives. The first is a directory fact and shows up as a short
+    /// `routable_points`; the second shows up as nothing at all, because the tables that would record it are
+    /// exactly the ones never written.
+    ///
+    /// Measured on a five-node fleet: with `route [5, 5, 5, 5, 5]` — every node holding a ranked binding for
+    /// every occupied point — the store view was still split into pairs. Addressing was complete and the
+    /// cell was still partitioned, which leaves only this half of the question.
+    ///
+    /// Keyed by the peer's coordinate. Bounded by construction: the mark it fires on is cleared only at an
+    /// epoch boundary, so this is at most one event per peer per epoch, and its **absence** for a coordinate
+    /// the directory can route to is the finding.
+    OverlayFirstHeard,
+    /// A write whose shard placement **does not survive the loss of the writer** — this node kept more than
+    /// `N − K` of the value's `N` shards, so fewer than `K` went anywhere else.
+    ///
+    /// **The only durability statement a writer can make without an acknowledgement, and before this there
+    /// was none.** `Notification::Stored` is raised the moment the placement effects are *emitted*; nothing
+    /// has been acked, so `directory.publish_failed` — whose whole job is to say "this record never landed"
+    /// — cannot fire for a value dispersed into vacancy. That left the publisher reporting success for a
+    /// value nobody else can reconstruct, which is exactly the instrument a roster-convergence
+    /// investigation needs and did not have.
+    ///
+    /// The bound is the erasure code's own: the cell can lose any `N − K` shards, so a writer that keeps
+    /// more than that has written a value that dies with it.
+    ///
+    /// **Zero is not the target.** On a cell of one, keeping everything is correct — that node *is* the
+    /// store and reconstructs from its own shards — so this is a warning about the cell's shape, not an
+    /// error in the write. A count that stays high while the cell has members means placement is not
+    /// reaching them. [`Observation::tag`] carries how many shards were kept.
+    StoreWriteNotDurable,
+    /// **This cell cannot carry anonymous traffic**: not one of its plane's lines holds `t` occupied points.
+    ///
+    /// An onion hop is a threshold gather on a line, so with `servable_lines == 0` no hop completes —
+    /// anywhere, ever. The failure is total and silent: a hop that cannot complete is indistinguishable from
+    /// a gather timing out, which is what `gather.expired` at 12–31 per node in the five-node fixture
+    /// actually was. That makes the line count a **precondition of the subsystem** rather than a geometry
+    /// nicety, and it is checkable by a node against its own roster.
+    ///
+    /// Recorded once per epoch while the condition holds, not on a transition: it is a reading of the cell's
+    /// shape, and a cell that has been dark for twenty epochs should say so twenty times.
+    ///
+    /// **Not rare.** On `PG(2,4)` a five-point cell serves zero of its twenty-one lines in 91.6 % of
+    /// placements (exhaustive over all `C(21,5)`), so this is the ordinary state of an under-populated cell.
+    /// The mixnet is the *first* casualty of a coverage shortfall — ahead of storage, whose erasure reads use
+    /// `shard_homes` rather than line gathers, and ahead of the roster itself.
+    ///
+    /// [`Observation::tag`] carries how many points the cell occupies, which is the number an operator grows.
+    AnonymityFloorUnmet,
     /// A beacon stall was confirmed and this node **escalated** for an authorized recovery (audit §4).
     ///
     /// **The half of R-C2 that was missing.** The detector is wired — `RECOVERY_PATIENCE` epoch-driver
@@ -1342,6 +1394,9 @@ impl Station {
         Self::ArbitrationDial,
         Self::MembershipSize,
         Self::MembershipVacated,
+        Self::OverlayFirstHeard,
+        Self::StoreWriteNotDurable,
+        Self::AnonymityFloorUnmet,
         Self::RecoveryEscalated,
         Self::ExitAdvertisementWithheld,
         Self::RestrictedFrameDropped,
@@ -1423,6 +1478,9 @@ impl Station {
             Self::ArbitrationDial => "directory.arbitration_dial",
             Self::MembershipSize => "membership.size",
             Self::MembershipVacated => "membership.vacated",
+            Self::OverlayFirstHeard => "overlay.first_heard",
+            Self::StoreWriteNotDurable => "store.write_not_durable",
+            Self::AnonymityFloorUnmet => "anonymity.floor_unmet",
             Self::RecoveryEscalated => "recovery.escalated",
             Self::ExitAdvertisementWithheld => "exit.advertisement_withheld",
             Self::RestrictedFrameDropped => "hello.restricted_frame_dropped",
@@ -1480,7 +1538,12 @@ impl Station {
     /// binds other crates, not this one: inside the defining crate the `match` below must cover every
     /// variant, so adding a station without saying what its tag means is a build error rather than a bare
     /// number on an operator's console.
+    ///
+    /// Long by construction, and splitting it would be worse: this is one total function from a closed set
+    /// to its meanings, and cutting it in two puts half the answers where the exhaustiveness check cannot
+    /// see them together — which is the one property the paragraph above depends on.
     #[must_use]
+    #[allow(clippy::too_many_lines, reason = "one exhaustive table over a closed set; splitting it splits the exhaustiveness")]
     pub const fn tag_kind(self) -> TagKind {
         match self {
             // --- The tag is a discriminant somebody can name. ---
@@ -1527,6 +1590,8 @@ impl Station {
             | Self::EpochAgreeBelowQuorum
             | Self::ArbitrationDial
             | Self::MembershipSize
+            | Self::StoreWriteNotDurable
+            | Self::AnonymityFloorUnmet
             | Self::RecoveryEscalated
             | Self::ExitAdvertisementWithheld
             | Self::RestrictedPullAsked => {
@@ -1583,6 +1648,7 @@ impl Station {
             | Self::RelayOriginRefused
             | Self::MembershipRepeatIgnored
             | Self::MembershipVacated
+            | Self::OverlayFirstHeard
             | Self::DirectoryStaleCoordinate
             | Self::DirectoryMovedPeerRetained
             | Self::ConnSurplusHeld

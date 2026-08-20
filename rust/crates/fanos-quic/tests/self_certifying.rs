@@ -564,3 +564,54 @@ async fn a_node_that_reaches_itself_refuses_the_connection_and_counts_it() {
 
     node.shutdown();
 }
+
+/// Await the notification naming `want`, or fail the test — the shape both ends of the handshake assert.
+///
+/// A free function rather than a closure inside the test: an `async` closure cannot borrow the handle
+/// mutably across two calls, and a nested item is what `items_after_statements` exists to refuse.
+async fn heard(node: &mut NodeHandle, want: Triple) -> [u8; 32] {
+    tokio::time::timeout(fanos_testkit::LIVENESS_BACKSTOP, async {
+        loop {
+            if let Some(Notification::PeerHandshaken { coord, identity }) =
+                node.next_notification().await
+                && coord == want
+            {
+                return identity;
+            }
+        }
+    })
+    .await
+    .expect("the engine must be told who the transport proved")
+}
+
+/// **The engine learns a peer at the moment the transport proves it, and until now it did not.**
+///
+/// A completed mutual-TLS handshake with a coordinate proof is the strongest evidence there is about who
+/// is where — and it is witnessed only by the transport. The engine's view of the cell was built from
+/// `Announce` frames alone, so a peer this node had dialled, verified and held a live connection to was
+/// absent from `occupied_points`, which decides shard placement, the denominator a definite `Absent` must
+/// exhaust, and the membership view.
+///
+/// It is also the change `fanos_keygen` names as the one blocking relayable DKG frames: *"the driver emits
+/// no notification when a peer completes a handshake, so the host never learns the moment at which it would
+/// hand one over."*
+///
+/// Asserted from **both** ends of one handshake, because the two sides reach it by different code paths —
+/// the dialer proves its peer in `get_or_connect`, the acceptor in `accept_loop` — and a wiring that fires
+/// on one only would leave half the cell blind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_ends_of_a_handshake_tell_their_engine_who_it_proved() {
+    fanos_testkit::require_quiet_host("whether a proved handshake reaches the engine");
+    let dir = Directory::new();
+    let mut a = spawn_distinct(&dir, &[]).await;
+    let mut b = spawn_distinct(&dir, &[a.address()]).await;
+    let (a_coord, b_coord) = (a.address(), b.address());
+
+    // Any frame will do; the handshake it forces is the subject.
+    a.command(Command::Send { to: b_coord, payload: b"knock".to_vec() });
+
+    let on_b = heard(&mut b, a_coord).await;
+    let on_a = heard(&mut a, b_coord).await;
+    assert_ne!(on_a, on_b, "two nodes, two certificates, two identities — a constant here would prove nothing");
+    assert_ne!(on_a, [0u8; 32], "the identity is derived from the peer's certificate, not defaulted");
+}

@@ -673,11 +673,13 @@ impl<F: Field> OverlayNode<F> {
         let shards = erasure::encode(value);
         let mut effects = Vec::new();
         let homes = self.shard_homes();
+        let mut kept = 0usize;
         for (i, shard) in shards.into_iter().enumerate() {
             let home = homes.get(i).copied().unwrap_or(me);
             #[allow(clippy::cast_possible_truncation)] // i < N = 7
             let index = i as u8;
             if home == me {
+                kept += 1;
                 self.store.insert_shard(*digest, index, version, shard);
             } else {
                 effects.push(Effect::Send {
@@ -685,6 +687,32 @@ impl<F: Field> OverlayNode<F> {
                     frame: encode_publish(PUBLISH_SHARD, index, version, digest, &shard),
                 });
             }
+        }
+        // **The one thing a writer can honestly check about durability without waiting for an
+        // acknowledgement, and it was not checked.**
+        //
+        // `Notification::Stored` is raised the line after this returns — the shard-placement effects have
+        // been *emitted*, nothing has been acknowledged — so the one station that would say "this record
+        // never landed" (`directory.publish_failed`, off `Client::put_ephemeral`) structurally cannot fire
+        // for a value dispersed into vacancy. That is a proxy standing in for the claim.
+        //
+        // What is decidable **here**, with no ack and no round trip, is what the placement itself implies:
+        // the value survives the loss of this node iff the remote homes hold at least `K` of the `N` shards,
+        // i.e. iff this node kept at most `N − K`. The bound is the erasure code's own, not a chosen number.
+        // A node that keeps more than that has written a value that dies with it, and today it reports the
+        // same success as a fully dispersed one.
+        //
+        // Recorded rather than refused, deliberately. Keeping everything is *correct* on a cell of one — the
+        // node is the whole store and can reconstruct from its own shards — and it is a warning everywhere
+        // else. A refusal would make the solitary case impossible; a count makes the difference visible and
+        // leaves the decision where the evidence is.
+        if kept > erasure::N - erasure::K {
+            self.stations.record_tagged(
+                Station::StoreWriteNotDurable,
+                None,
+                u64::try_from(kept).ok(),
+                1,
+            );
         }
         effects
     }

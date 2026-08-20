@@ -646,6 +646,10 @@ pub struct OverlayNode<F: Field> {
     started_at: Instant,
     peers: BTreeMap<Triple, Peer>,
     heartbeating: bool,
+    /// Which line through this node's point the next heartbeat probes for discovery — see
+    /// [`sweep_targets`](Self::sweep_targets). Wraps; the plane's `q + 1` lines through a point are the
+    /// whole schedule, so this needs no bound of its own.
+    sweep: usize,
     /// This node's Fano point index (`Some` only on the base `N = 7` cell, where the reflexive
     /// loop's index-addressed geometry — syndrome, mediator, peeling — applies).
     self_index: Option<usize>,
@@ -862,6 +866,7 @@ impl<F: Field> OverlayNode<F> {
             started_at: Instant::default(),
             peers,
             heartbeating: false,
+            sweep: 0,
             self_index,
             cell_members: None,
             cell_roster_derived: false,
@@ -1004,6 +1009,29 @@ impl<F: Field> OverlayNode<F> {
 
 
 
+    /// Record that a frame arrived from `from` — the single expression of "a node lives at that point".
+    ///
+    /// Read by `occupied_points`, which is the only input to shard placement and to the denominator a
+    /// definite `Absent` must exhaust, so this mark decides where values are written and whether a read may
+    /// claim the cell holds nothing. It is cleared at every seating change, never on a clock: see
+    /// `occupied_points` for the measurement that settled which.
+    ///
+    /// The first frame from a coordinate in an epoch raises [`Station::OverlayFirstHeard`]. Bounded by
+    /// construction — one per peer per epoch, since the boundary is what clears the mark — and it is the
+    /// observable that separates "this node cannot address that peer" from "it can address it and no frame
+    /// ever arrives", which are different faults with different repairs and were the same silence.
+    fn note_heard(&mut self, now: Instant, from: Triple) {
+        let Some(peer) = self.peers.get_mut(&from) else {
+            return; // not an algebraic neighbour: nothing here is addressed by its coordinate
+        };
+        let first = peer.last_seen.is_none();
+        peer.last_seen = Some(now);
+        peer.reported_down = false;
+        if first {
+            self.stations.record(Station::OverlayFirstHeard, Some(from));
+        }
+    }
+
     fn on_message(&mut self, now: Instant, from: Triple, frame: &[u8]) -> Vec<Effect> {
         // A locally-quarantined (Byzantine) member's frames are dropped (spec §6.2, §6.4) — but only for
         // the bounded quarantine window; once it elapses the [`Healer`] re-admits the member for
@@ -1019,6 +1047,19 @@ impl<F: Field> OverlayNode<F> {
             self.stations.record(Station::FrameDecodeFailed, None);
             return Vec::new(); // canonical decode failure — drop (spec §7.5)
         };
+        // **Here, once, for every frame that parses — and it used to be five copies and three omissions.**
+        //
+        // `from` is the coordinate the transport *proved* before delivering, so a frame arriving at all is
+        // direct evidence that a node lives at that point. Five arms wrote `last_seen = Some(now)` by hand
+        // (Pong and four diagnostics) and the rest did not, so `Ping`, `Route`, `RouteHier` and `App` — every
+        // one of them a frame from a live peer — proved nothing about their sender.
+        //
+        // `Ping` is the sharp one. Under asymmetric loss, A's pings reach B while B's pongs are dropped: A
+        // then holds B's pings in its own dispatch and still concludes B is absent, because only the *answer*
+        // counted. The occupancy view that decides shard placement and a read's definite `Absent` is built
+        // from exactly this mark, so an unread ping is a member the cell cannot place shards on or find
+        // records at.
+        self.note_heard(now, from);
         match frame.frame_type() {
             Some(FrameType::Ping) => alloc::vec![Effect::Send {
                 to: from,
@@ -1026,9 +1067,9 @@ impl<F: Field> OverlayNode<F> {
             }],
             Some(FrameType::Pong) => {
                 if let Some(peer) = self.peers.get_mut(&from) {
-                    peer.last_seen = Some(now);
-                    peer.reported_down = false;
-                    peer.awaiting_pong = false; // this round's ping was answered — a loss-sample "hit" (§6.3)
+                    // Pong-specific, and the only part of the old block that was: `note_heard` above records
+                    // the evidence; this records that *our* ping was the thing answered (§6.3 loss sample).
+                    peer.awaiting_pong = false;
                 }
                 // A recovered node no longer needs rerouting/repair (churn rejoin, spec §3.3).
                 self.healer.clear_healing(from);
@@ -1049,10 +1090,6 @@ impl<F: Field> OverlayNode<F> {
                 // Route delivery it is direct evidence of the sender's liveness and counts as behavioural load;
                 // the raw body is surfaced as `Notification::App` for the app engine to decode and step. A frame
                 // for an app this node does not run is inert — the driver simply has no consumer for it.
-                if let Some(peer) = self.peers.get_mut(&from) {
-                    peer.last_seen = Some(now);
-                    peer.reported_down = false;
-                }
                 self.healer.record_relay(from);
                 alloc::vec![Effect::Notify(Notification::App {
                     from,
@@ -1064,10 +1101,6 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::DiagGossip) => {
                 // Receiving the gossip is itself a direct observation of the sender; its body
                 // corroborates the sender's view of the rest of the cell (spec §6.4).
-                if let Some(peer) = self.peers.get_mut(&from) {
-                    peer.last_seen = Some(now);
-                    peer.reported_down = false;
-                }
                 self.healer.clear_healing(from);
                 self.apply_health_view(now, from, frame.body);
                 Vec::new()
@@ -1075,10 +1108,6 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::DiagAttest) => {
                 // Likewise a direct observation of the sender (spec §6.4); folds its polar-class
                 // report into the cross-attestation store `attested_pairwise_rates` assembles from.
-                if let Some(peer) = self.peers.get_mut(&from) {
-                    peer.last_seen = Some(now);
-                    peer.reported_down = false;
-                }
                 self.healer.clear_healing(from);
                 // Member-only, like its two sibling diagnostics: `attested_pairwise_rates` reads this store
                 // for the seven cell coordinates alone, so a non-member's row could never be read and would
@@ -1091,10 +1120,6 @@ impl<F: Field> OverlayNode<F> {
             Some(FrameType::DiagLoss) => {
                 // The sender's measured per-neighbour loss row (spec §6.3 grey); stored for the grey-detection
                 // matrix. Also a direct observation of the sender's liveness, like the other diagnostics.
-                if let Some(peer) = self.peers.get_mut(&from) {
-                    peer.last_seen = Some(now);
-                    peer.reported_down = false;
-                }
                 self.apply_diag_loss(now, from, frame.body);
                 Vec::new()
             }
@@ -1894,6 +1919,9 @@ impl<F: Field> Engine for OverlayNode<F> {
                 self.membership.descriptor_sig = sig;
                 Vec::new()
             }
+            Input::Command(Command::PeerHandshaken { coord, identity }) => {
+                self.on_peer_handshaken(now, coord, identity)
+            }
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
             Input::Command(Command::ProposeAddress { contested }) => self.on_propose_address(contested),
             Input::Command(Command::Descend { path }) => self.on_descend(&path),
@@ -2436,6 +2464,157 @@ mod tests {
             (0..SEATS.len()).collect::<Vec<_>>(),
             "every member reads it, because every shard went to a point that answers"
         );
+    }
+
+
+    /// **Every point of the plane is an algebraic neighbour, and a frame from any of them is evidence.**
+    ///
+    /// Both halves measured on one engine, because the fleet made them a live question: five nodes on
+    /// `PG(2,4)` recorded **four** `overlay.first_heard` events between them — one apiece for four of the
+    /// five, none for the fifth — while the driver plane showed frames arriving from all four peers on every
+    /// node. Either the neighbour set is not the whole plane, or the mark is not reached from the frame path;
+    /// this pins both so the fleet's reading has something to be read against.
+    #[test]
+    fn a_frame_from_any_point_of_the_plane_marks_its_sender_heard() {
+        use fanos_field::F4;
+        let all: Vec<Triple> = Plane::<F4>::points().map(|p| p.coords()).collect();
+        assert_eq!(all.len(), 21, "PG(2,4) has q²+q+1 = 21 points");
+        // **Every seat, not one.** The fleet seats nodes wherever the VRF puts them, so a neighbour set that
+        // is complete at `Point::at(0)` and short somewhere else would look exactly like the partition being
+        // chased, and a single-seat check could not tell the difference.
+        for seat in 0..all.len() {
+            let at = OverlayNode::<F4>::new(Point::at(seat), Config::default());
+            let missing: Vec<Triple> = all
+                .iter()
+                .copied()
+                .filter(|c| *c != at.coord.coords() && !at.peers.contains_key(c))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "on a projective plane every other point shares a line with this one, so all 20 are \
+                 neighbours of seat {seat}; these are absent: {missing:?}"
+            );
+        }
+        let mut node = OverlayNode::<F4>::new(Point::at(0), Config::default());
+
+        // A frame this dispatch has no arm for is still a frame that arrived — the weakest possible evidence,
+        // and it must still count, because the handshake's own tail (`HelloAck`) is exactly that.
+        let far = Point::<F4>::at(18).coords();
+        assert!(!node.occupied_points().contains(&18), "not heard from yet");
+        node.step(Instant(1), Input::Message { from: far, frame: encode(FrameType::HelloAck, &[]) });
+        assert!(
+            node.occupied_points().contains(&18),
+            "an unclaimed-type frame from a proven coordinate still proves a node lives there"
+        );
+    }
+
+
+    /// **A write that dies with its writer must say so, and `Stored` cannot.**
+    ///
+    /// `Notification::Stored` is raised the moment the placement effects are emitted — nothing has been
+    /// acknowledged — so the publisher reports the same success whether the shards went to five homes or
+    /// stayed on one. The erasure code supplies the only statement decidable at write time: the value
+    /// survives losing this node iff at most `N − K` of its shards stayed here.
+    ///
+    /// Both sides asserted on one engine, because the property is the threshold: an alarm that always fires
+    /// and one that never fires both pass a one-sided check.
+    #[test]
+    fn a_write_that_does_not_outlive_its_writer_raises_the_alarm_stored_cannot() {
+        use fanos_field::F4;
+        const SEATS: [usize; 5] = [0, 8, 12, 15, 18];
+        let now = Instant(1);
+        let count = |node: &OverlayNode<F4>| {
+            node.stations.total(Station::StoreWriteNotDurable)
+        };
+
+        // Alone: every home is this node, all seven shards stay, and the alarm fires.
+        let mut lone = OverlayNode::<F4>::new(Point::at(0), Config::default());
+        assert_eq!(lone.occupied_points().len(), 1, "the fixture's whole point is a cell of one");
+        lone.step(now, Input::Command(Command::Put { key: b"alone".to_vec(), value: b"v".to_vec() }));
+        assert_eq!(count(&lone), 1, "a value written onto its own writer does not survive it");
+
+        // With the cell heard from, the ring spreads and the alarm is silent.
+        let mut seated = OverlayNode::<F4>::new(Point::at(0), Config::default());
+        for &i in &SEATS[1..] {
+            if let Some(p) = seated.peers.get_mut(&Point::<F4>::at(i).coords()) {
+                p.last_seen = Some(now);
+            }
+        }
+        assert_eq!(seated.occupied_points().len(), SEATS.len(), "all five seats are evidence now");
+        // **A key this node is responsible for, found rather than assumed.** `on_put` routes a value whose
+        // responsible point is elsewhere, so an arbitrary key leaves `distribute_shards` unreached and the
+        // assertion below would pass for the wrong reason — it did, and a falsification that made the alarm
+        // fire unconditionally still went green.
+        let me = seated.coord.coords();
+        let key = (0u32..1000)
+            .map(|n| alloc::format!("spread-{n}").into_bytes())
+            .find(|k| {
+                let (_, ideal) = OverlayNode::<F4>::address_of(k);
+                seated.responsible_point(ideal) == me
+            })
+            .expect("some key of a thousand lands on this node");
+        let (digest, _) = OverlayNode::<F4>::address_of(&key);
+        seated.step(now, Input::Command(Command::Put { key, value: b"v".to_vec() }));
+        let mut held = BTreeMap::new();
+        seated.store.seed_versions(&digest, &mut held);
+        assert!(
+            held.values().flatten().flatten().any(|s| !s.is_empty()),
+            "the write must have been placed BY this node, or the silence below means nothing"
+        );
+        assert_eq!(
+            count(&seated),
+            0,
+            "spread over five homes at most ⌈7/5⌉ = 2 shards stay here, well inside N − K = {}",
+            erasure::N - erasure::K
+        );
+    }
+
+
+    /// **A proved handshake is the strongest evidence there is, and the engine used to be told nothing.**
+    ///
+    /// The transport is the only layer that witnesses a coordinate being proved against a certificate. Until
+    /// `Command::PeerHandshaken` the engine learned who was where from `Announce` frames alone, so a peer
+    /// this node had dialled, verified and held a live connection to was absent from `occupied_points` —
+    /// which decides shard placement, the denominator a definite `Absent` must exhaust, and the membership
+    /// view. Measured on a five-node fleet: four transport connections per node against **one** heard peer.
+    ///
+    /// The retraction is asserted too, because a handshake is a *better* witness to a move than an
+    /// announcement: it cannot be relayed, so it cannot be replayed by a third party.
+    #[test]
+    fn a_proved_handshake_seats_the_peer_and_vacates_the_point_it_left() {
+        use fanos_field::F4;
+        let mut node = OverlayNode::<F4>::new(Point::at(0), Config::default());
+        let old = Point::<F4>::at(8).coords();
+        let new = Point::<F4>::at(12).coords();
+        let id = [7u8; 32];
+
+        assert!(!node.occupied_points().contains(&8), "nothing is known about that point yet");
+        let effects = node.step(Instant(1), Input::Command(Command::PeerHandshaken { coord: old, identity: id }));
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Notify(Notification::PeerHandshaken { coord, .. }) if *coord == old
+            )),
+            "the host is told, which is what lets it hand a sub-engine the peer's verifier"
+        );
+        assert!(
+            node.occupied_points().contains(&8),
+            "and placement follows: a peer we have handshaken with occupies its point"
+        );
+
+        // The same identity proving a different point has left the first one.
+        node.step(Instant(2), Input::Command(Command::PeerHandshaken { coord: new, identity: id }));
+        assert!(node.occupied_points().contains(&12), "seated where it proved");
+        assert!(
+            !node.occupied_points().contains(&8),
+            "and the point it left is retracted — no shard may be addressed to a vacancy"
+        );
+
+        // Our own dial arriving back is not a peer.
+        let me = node.coord.coords();
+        let self_effects =
+            node.step(Instant(3), Input::Command(Command::PeerHandshaken { coord: me, identity: [9u8; 32] }));
+        assert!(self_effects.is_empty(), "this node is not a peer of itself");
     }
 
     fn seat_every_neighbour<F: Field>(node: &mut OverlayNode<F>, now: Instant) {

@@ -11,13 +11,18 @@
 //! optional modules a running node actually wires up).
 
 /// This build's protocol version (spec §7.4).
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// The oldest peer version this build still interoperates with. Equal to [`PROTOCOL_VERSION`]
-/// today — the first shipped version, nothing older exists yet — and widens only when a future
-/// version's wire form becomes genuinely unreadable by this build, not on every version bump
-/// (§7.4's whole point is graceful cross-version operation at the lower of the two versions).
-pub const MIN_SUPPORTED_VERSION: u16 = 1;
+/// The oldest peer version this build still interoperates with. Equal to [`PROTOCOL_VERSION`], and it
+/// moved with it: version 2 inserts the advertised **listen port** into the HELLO head, between the epoch
+/// and the coordinate, so a version-1 body is not a version-2 body with a field missing — every byte after
+/// the epoch has shifted and the claim would be read from the wrong offset. That is the case this constant
+/// exists for, as its own rule says: widen only when a wire form becomes genuinely unreadable by this build,
+/// not on every version bump.
+///
+/// Nothing is deployed, so the cost is zero and the alternative — a tolerant parser carrying both layouts —
+/// would buy compatibility with an artefact that does not exist ([[a-version-byte-is-for-before-the-first-artefact]]).
+pub const MIN_SUPPORTED_VERSION: u16 = 2;
 
 /// Negotiate the session version (spec §7.4: "two peers operate at `min(version)`"): the lower of
 /// `mine` and `theirs`, or `None` if that minimum predates [`MIN_SUPPORTED_VERSION`] — this build's
@@ -137,12 +142,19 @@ impl core::ops::BitAnd for Capabilities {
 mod tests {
     use super::*;
 
+    /// Written against the constants rather than literals, and that is the repair rather than the
+    /// convenience: the literals said `negotiate_version(1, 1) == Some(1)`, which stopped being true the
+    /// moment `MIN_SUPPORTED_VERSION` moved to 2 — not because the rule changed, but because the test had
+    /// copied a value instead of importing it. The property is "the lower of the two, if the floor admits
+    /// it", and it holds at every floor.
     #[test]
     fn version_negotiates_to_the_minimum() {
-        assert_eq!(negotiate_version(1, 1), Some(1));
+        let floor = MIN_SUPPORTED_VERSION;
+        let higher = floor + 2;
+        assert_eq!(negotiate_version(floor, floor), Some(floor));
         // Symmetric: order of the two arguments does not matter.
-        assert_eq!(negotiate_version(3, 5), Some(3));
-        assert_eq!(negotiate_version(5, 3), Some(3));
+        assert_eq!(negotiate_version(floor, higher), Some(floor));
+        assert_eq!(negotiate_version(higher, floor), Some(floor));
     }
 
     #[test]

@@ -1641,6 +1641,9 @@ mod tests {
         assert!(expected_distinct(0, 5).abs() < f64::EPSILON);
     }
 
+    // A fixture, and its length IS the diagnosis: every reading here was added because the one before
+    // it could not tell two stories apart, and dropping any of them puts this investigation back a step.
+    #[allow(clippy::too_many_lines, reason = "a diagnostic fixture; each reading separates two hypotheses")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_whole_cell_resolves_every_member() {
         // The property the deterministic cell-wide assignment REQUIRES: every node resolves every member, so all compute
@@ -1750,6 +1753,14 @@ mod tests {
         // Captured unconditionally rather than inside the failure arm: `shutdown` consumes the fleet, so by
         // the time the assertion runs there is nothing left to ask.
         let deliver: Vec<usize> = fleet.nodes().iter().map(|n| n.health().deliverable_points).collect();
+        // **Did the frames LEAVE?** Every reading beside this one is about what a node could reach; this is
+        // the only one about what it actually sent. `send_drops` counts frames the dispatcher could not hand
+        // to a peer's worker (its queue full — the peer is not draining), and `unresolved_drops` counts the
+        // ladder running out of rungs for a coordinate. With reach complete and the store still partitioned,
+        // "the sends were dropped before they left" and "they left and never arrived" are the two remaining
+        // worlds, and nothing printed here could tell them apart.
+        let sent_drops: Vec<u64> = fleet.nodes().iter().map(|n| n.health().send_drops).collect();
+        let unresolved: Vec<usize> = fleet.nodes().iter().map(|n| n.health().unresolved_drops).collect();
         let route: Vec<usize> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
         let peers: Vec<usize> = fleet.nodes().iter().map(|n| n.health().known_peers).collect();
         let complete: Vec<bool> = fleet.nodes().iter().map(|n| n.assignment().complete).collect();
@@ -1786,15 +1797,31 @@ mod tests {
             // first round, and `read_capability(.., None)` is the unbound path again — the same wrong
             // question one layer down. The publisher falls back to `client.genesis()`, so this must too.
             let seed = Some(node.live_beacon().map_or_else(|| client.genesis(), |(_, s)| fanos_primitives::BeaconSeed::new(s)));
-            // The **occupied** points only. Scanning the whole plane costs `N` store reads per node — 105
-            // here, at the store's read timeout each — and every vacant point can only answer `Absent`,
-            // which is not the question. The question is whether two readers see the same *members*.
-            for c in coords.iter().copied() {
-                seen.push(match fanos_node::capdir::read_capability::<F4>(&client, c, at_epoch, seed).await {
-                    fanos_node::resolve::Read::Found(_) => format!("{}=found", crate::fmt_coord(c)),
-                    fanos_node::resolve::Read::Absent => continue,
-                    fanos_node::resolve::Read::Unknown => format!("{}=UNKNOWN", crate::fmt_coord(c)),
-                });
+            // **The whole plane, not just the occupied points, and the identity with each record.**
+            //
+            // Scanning only the nodes' current coordinates cannot see the fact this print exists for: a
+            // record lives in a slot keyed `(coordinate, epoch)`, so a node that moves *within* an epoch
+            // leaves its old slot published and signed. Both records then answer, `role_loop` counts one
+            // entry per coordinate that answered, and one node is two members — which is how a five-node
+            // cell reported `roster = 6`. A vacated point is by construction NOT in `coords`, so the
+            // duplicate is invisible to a scan built from the fleet's addresses.
+            //
+            // The identity is printed with the coordinate for the same reason: the defect is a repeated
+            // `NodeId`, and a mask of coordinates cannot show one.
+            for c in fanos_geometry::Plane::<F4>::points().map(|p| p.coords()) {
+                let entry = match fanos_node::capdir::read_capability::<F4>(&client, c, at_epoch, seed).await {
+                    fanos_node::resolve::Read::Found((id, _)) => {
+                        Some(format!("{}=#{:02x}{:02x}", crate::fmt_coord(c), id.0[0], id.0[1]))
+                    }
+                    // An inconclusive read is only informative where somebody is *supposed* to answer.
+                    // Across the vacant sixteen it is the ordinary timeout and would bury the five that
+                    // matter — as would a definite absence there, which is simply the right answer.
+                    fanos_node::resolve::Read::Unknown if coords.contains(&c) => {
+                        Some(format!("{}=UNKNOWN", crate::fmt_coord(c)))
+                    }
+                    fanos_node::resolve::Read::Absent | fanos_node::resolve::Read::Unknown => None,
+                };
+                seen.extend(entry);
             }
             resolved.push(format!("  node {i} @{} resolved {}: {}", crate::fmt_coord(node.health().address), seen.len(), seen.join(" ")));
         }
@@ -1806,6 +1833,7 @@ mod tests {
             !verdict.is_refuted(),
             "every node must resolve every OCCUPIED coordinate ({occupied} of {N}); the cell froze short of it: \
              {verdict:?}\n  deliver {deliver:?}  route {route:?}  peers {peers:?}  complete {complete:?}\n\
+             \x20 send_drops {sent_drops:?}  unresolved_drops {unresolved:?}\n\
              (deliver ≈ occupied − 1 everywhere means reach is NOT the cause and the missing members were \
              unpublished at read time; a low deliver means the opposite)\n\
              roster over the observation clock:\n{}\n\

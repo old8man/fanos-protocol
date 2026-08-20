@@ -709,6 +709,24 @@ fn live_conn(map: &mut HashMap<Triple, Vec<Connection>>, peer: Triple) -> (Optio
         map.remove(&peer);
         return (None, pruned);
     }
+    // **Kept at the newest, and an evidence-based rule was tried and reverted.**
+    //
+    // The suspicion is real: two connections to one peer is a normal steady state — both ends may dial, and
+    // the acceptor keeps the surplus while the dialer discards it (`ConnSurplusHeld`) — so if the discarded
+    // one is the newest, every send goes into a socket whose other end stopped reading. Nothing prunes it:
+    // `close_reason()` reports only a closure *observed* on this side, and a keep-alive-configured
+    // connection produces none. `ConnSurplusRead` measures that world and shows it on every node of a
+    // five-node fleet: a list of two, read a thousand times, pruning zero.
+    //
+    // The rule tried was "prefer the connection with the most received datagrams". It is wrong, and the test
+    // below caught it: `stats().udp_rx.datagrams` is **cumulative**, so it is a proxy for *age*, not for
+    // liveness — a corpse that lived a minute outscores a healthy connection born a second ago, which is
+    // exactly the redial case this choice exists to serve. It also bought nothing measurable: the fleet's
+    // heard-edge count moved 4 → 6 → 4 across runs with and without it, inside its own run-to-run spread.
+    //
+    // The signal that would work is *recency* of receipt, and quinn exposes no such clock. Getting it means
+    // carrying our own timestamp per connection, updated in `read_frames` — a change to what this map
+    // holds, not to how it chooses — and that is the shape any future attempt should take.
     (live.last().cloned(), pruned)
 }
 
@@ -2002,11 +2020,17 @@ where
     // The self-certifying identity is now LIVE across epochs (Level B, #102): the HELLO and the beacon the
     // verifier checks peers against both sit behind locks the `reshuffle_loop` rewrites when the beacon
     // advances. Cold-start values are the genesis coordinate; a node with no beacon simply never reshuffles.
+    // **`0` here, and the real port is written in at bind time** — this runs before the endpoint exists,
+    // so there is no listen port to advertise yet. `spawn_inner` calls `set_hello_listen_port` the moment
+    // it has one, and every later rebuild (`Reseater::apply`) has `self.local_addr` in hand. A cold HELLO
+    // that somehow escaped unpatched advertises `0`, which reads as "do not file me": a missing directory
+    // entry, never a wrong one.
     let hello_cell = Arc::new(RwLock::new(Arc::new(hello_bytes::<F>(
         Epoch::ZERO,
         coord.coords(),
         &CoordinateClaim::direct(proof),
         capabilities,
+        0,
     ))));
     let beacon_cell = Arc::new(RwLock::new(BeaconWindow::genesis(genesis_seed)));
     // Every peer whose claim this node verifies is remembered for the epoch, because coordinate resolution needs exactly
@@ -2573,7 +2597,7 @@ impl Reseater {
             // rightful occupant unroutable here until it announced again (#241).
             let _ = self.directory.remove_if(at.coord, self.local_addr);
         }
-        let bytes = hello_bytes::<F>(at.epoch, point, claim, self.capabilities);
+        let bytes = hello_bytes::<F>(at.epoch, point, claim, self.capabilities, self.local_addr.port());
         if let Ok(mut h) = self.hello.write() {
             *h = Arc::new(bytes.clone());
         }
@@ -3140,6 +3164,27 @@ fn carrier_for(fabric: Fabric) -> Result<Arc<dyn quinn::AsyncUdpSocket>, QuicErr
     })
 }
 
+/// Write this node's real listen port into its HELLO, once the endpoint has one.
+///
+/// **Called from exactly one place and extracted anyway**, because it is a decision rather than a step: the
+/// HELLO is built before the socket is bound — it needs the coordinate and VRF claim, which come from the
+/// credentials — so `hello_bytes` is called with `0` and this is the first instant a port exists. A node
+/// bound to port `0` has no other source for it at all, which is the ordinary case in the simulator.
+///
+/// Silent on failure by design: a HELLO that cannot be patched keeps advertising `0`, which asks peers not
+/// to file a directory entry. A missing route is recoverable — the peer dials out and learns ours — while a
+/// wrong one is a table pointing somewhere nobody answers.
+fn advertise_listen_port(identity: &Identity, port: u16) {
+    if let Some(id) = identity.as_ref()
+        && let Ok(mut hello) = id.hello.write()
+    {
+        let mut bytes = hello.as_ref().clone();
+        if crate::identity::set_hello_listen_port(&mut bytes, port) {
+            *hello = Arc::new(bytes);
+        }
+    }
+}
+
 /// Bind the endpoint and spawn the driver actors. Synchronous (only sets up channels and
 /// `tokio::spawn`s tasks); the public wrappers stay `async` for API stability.
 #[allow(clippy::too_many_arguments)]
@@ -3185,6 +3230,7 @@ fn spawn_inner(
     )?;
     endpoint.set_default_client_config(client_cfg);
     let local_addr = endpoint.local_addr()?;
+    advertise_listen_port(identity, local_addr.port());
     // Unranked: no coordinate proof exists this early, and the caller rebinds with a rank immediately after.
     bind_own_seat(&directory, &stations, addr, local_addr, None);
     // Read before the directory is moved into the transport: this is the network identity every task above
@@ -3372,6 +3418,32 @@ struct Distrust {
 }
 
 /// A peer's stable identity: the hash of the certificate its coordinate proof is bound to.
+/// Tell the engine which identity the transport just proved at `coord` — see [`Command::PeerHandshaken`].
+///
+/// **Called from both ends of every handshake, and that is why it is a function.** The dialer proves its
+/// peer in `get_or_connect` and the acceptor in `accept_loop`; a wiring that fired on one only would leave
+/// half of every cell blind, and two copies of this is how that happens.
+///
+/// The engine is the only consumer that matters and it is crypto-free, so what travels is the derived
+/// identity rather than the certificate. Spawned, because the input channel is bounded and this must not
+/// hold a handshake open behind a busy engine; dropped silently if the engine is gone, which is shutdown.
+///
+/// Peers that present no certificate raise nothing: there is no identity to name, and a coordinate with no
+/// identity behind it is exactly what this exists to stop feeding the engine.
+fn tell_engine_who_was_proved(t: &Transport, coord: Triple, conn: &Connection) {
+    let Some(cert) = peer_cert_der(conn) else {
+        return;
+    };
+    let identity = identity_of(&cert);
+    let told = t.clone();
+    tokio::spawn(async move {
+        let _ = told
+            .input_tx
+            .send(Input::Command(Command::PeerHandshaken { coord, identity }))
+            .await;
+    });
+}
+
 fn identity_of(cert_der: &[u8]) -> [u8; 32] {
     fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::NODE_ID, cert_der)
 }
@@ -3901,7 +3973,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
             // dialer now does too, rather than inventing a second constant for one quantity.
             let handshake = tokio::time::timeout(HELLO_DEADLINE, hello_exchange(&conn, t, id))
                 .await
-                .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None });
+                .unwrap_or(Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None, listen_port: 0 });
             // Nothing crossed the network, so nothing downstream may treat this as evidence about the network
             // (#350). Returning here — before `apply_outcome` — is the whole point: the breaker must not read a
             // loop-back as a cut morph. The frame is dropped rather than delivered, which is the honest outcome:
@@ -4075,6 +4147,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
     if let Ok(mut map) = t.conns.lock() {
         file_conn(&mut map, to, conn.clone());
     }
+    tell_engine_who_was_proved(t, to, &conn);
     Dialed::Peer(conn)
 }
 
@@ -4144,14 +4217,22 @@ impl Drop for SourceGuard {
 /// Resolve a peer's coordinate from a freshly-established connection: a proof-of-coordinate HELLO exchange
 /// (self-certifying mode) or an unauthenticated HELLO read (directory-trust mode). `None` if the HELLO is
 /// rejected (bad proof / incompatible negotiation) or unreadable.
-async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> PeerIdentity {
+async fn resolve_peer_hello(conn: &Connection, t: &Transport) -> Handshake {
     match &t.identity {
         // The accept side wants the coordinate and nothing else. It deliberately does **not** feed the morph
         // breaker: an inbound exchange reports whether a *peer's* transport reached us, and the breaker
         // regulates whether ours reaches out. Rotating on someone else's reachability would let one peer
         // walk this node's morph chain.
-        Some(id) => hello_exchange(conn, t, id).await.peer,
-        None => read_hello(conn, t).await.map_or(PeerIdentity::Rejected, PeerIdentity::Proven),
+        Some(id) => hello_exchange(conn, t, id).await,
+        // A pinned deployment reads no HELLO body of its own, so there is neither an advertised port nor a
+        // rank here, and the accept side keeps its old behaviour: a live connection is the whole of the
+        // reverse reachability.
+        None => Handshake {
+            peer: read_hello(conn, t).await.map_or(PeerIdentity::Rejected, PeerIdentity::Proven),
+            rank: None,
+            round_trip: true,
+            listen_port: 0,
+        },
     }
 }
 
@@ -4185,7 +4266,9 @@ async fn accept_loop(t: Transport) {
             // link is never reclaimed for silence, since it may back the #119 reverse-reachability path.
             let established = tokio::time::timeout(HELLO_DEADLINE, async {
                 let conn = incoming.await.ok()?;
-                let from = match resolve_peer_hello(&conn, &t).await {
+                let handshake = resolve_peer_hello(&conn, &t).await;
+                let (listen_port, rank) = (handshake.listen_port, handshake.rank);
+                let from = match handshake.peer {
                     PeerIdentity::Proven(from) => from,
                     // **Kept, not dropped, and kept out of every table** (#235). Symmetric with the dial
                     // side: this peer proved an epoch we hold no beacon for, and the connection it arrived
@@ -4194,7 +4277,7 @@ async fn accept_loop(t: Transport) {
                     // coordinate, and none was proved. Handed OUT of the deadline rather than served here:
                     // `HELLO_DEADLINE` bounds a handshake, and this connection's whole purpose is to
                     // outlive one.
-                    PeerIdentity::Unjudged(u) => return Some((conn, PeerIdentity::Unjudged(u))),
+                    PeerIdentity::Unjudged(u) => return Some((conn, PeerIdentity::Unjudged(u), 0, None)),
                     PeerIdentity::Rejected => return None,
                     // Our own dial, arriving back at us (#350). Dropped rather than served: every table below is
                     // a statement about a *peer*, and this is not one. Deliberately not counted here — the dial
@@ -4218,28 +4301,29 @@ async fn accept_loop(t: Transport) {
                         let _ = t.input_tx.send(Input::Command(cmd)).await;
                     }
                 }
-                Some((conn, PeerIdentity::Proven(from)))
+                tell_engine_who_was_proved(&t, from, &conn);
+                Some((conn, PeerIdentity::Proven(from), listen_port, rank))
             })
             .await;
-            let (conn, from) = match established {
-                Ok(Some((conn, PeerIdentity::Proven(from)))) => (conn, from),
+            let (conn, from, listen_port, rank) = match established {
+                Ok(Some((conn, PeerIdentity::Proven(from), port, rank))) => (conn, from, port, rank),
                 // Unreachable for the same reason as its dial-side twin: the closure above answers `Ourself`
                 // with `None`, so it never reaches here. Spelled out rather than wildcarded so that a future
                 // identity variant has to be sorted deliberately instead of inheriting "drop it".
-                Ok(Some((_, PeerIdentity::Ourself))) => return,
+                Ok(Some((_, PeerIdentity::Ourself, _, _))) => return,
                 // The restricted state runs **here**, inside the handler, so the inbound permit and the
                 // per-source guard are held for its whole life — exactly as they are for `read_frames`.
                 // Spawning it instead would free both the moment the handshake ended, and an unjudgeable
                 // peer would then cost nothing to hold, which is the one thing every bound on this path
                 // exists to prevent (audit A6/C3).
-                Ok(Some((conn, PeerIdentity::Unjudged(u)))) => {
+                Ok(Some((conn, PeerIdentity::Unjudged(u), _, _))) => {
                     read_restricted(conn, u, t).await;
                     return;
                 }
                 // Unreachable by construction: the block above returns `None` rather than a `Rejected`.
                 // Matched rather than `_`-ed so that adding a further identity state is a compile error here —
                 // which is exactly what happened when `Ourself` arrived, and the arm above it is the answer.
-                Ok(Some((_, PeerIdentity::Rejected)) | None) => {
+                Ok(Some((_, PeerIdentity::Rejected, _, _)) | None) => {
                     tracing::debug!(
                         "inbound HELLO rejected (bad proof or negotiation incompatible); dropping"
                     );
@@ -4269,6 +4353,45 @@ async fn accept_loop(t: Transport) {
             };
             if already_held > 0 {
                 t.record_station(Station::ConnSurplusHeld, Some(from), None);
+            }
+            // **And a directory entry, which this path never wrote and which is why reverse reachability had
+            // no persistent form.**
+            //
+            // The address is built from two halves of different provenance, and that is the whole design:
+            // the **IP is observed** — the source this connection actually arrived from, evidence this node
+            // collected — while the **port is claimed**, carried in the peer's HELLO. Advertising a full
+            // address instead would let a peer point every directory it meets at a third party, a reflection
+            // primitive assembled out of the routing table; restricted to the port, a lie can only redirect
+            // traffic to another port on the liar's own address.
+            //
+            // Filed with the same rank the dial side files with (#249) and for the same reason: the HELLO
+            // just proved this coordinate against the peer's certificate, so the claim is exactly as strong
+            // here, and an unranked write would lose every arbitration against one. `probe_index` carries
+            // the plane back as a value because `F` is monomorphised away before this point.
+            //
+            // Measured before this existed: `route [1, 2, 3, 4, 5]` on a five-node fleet — a staircase in
+            // *bootstrap order*, because a node learned an address only by dialing out, and the node that
+            // dials nobody learned nothing, permanently. Its dial-side twin was `route [1,1,1,1,1,1,1]`.
+            if listen_port != 0 {
+                let addr = SocketAddr::new(conn.remote_address().ip(), listen_port);
+                let outcome = match (t.probe_index, rank) {
+                    (Some(index_of), Some(rank)) => match index_of(&rank, from) {
+                        Some(index) => t.directory.insert_claimed(from, addr, rank, index),
+                        None => t.directory.insert(from, addr),
+                    },
+                    _ => t.directory.insert(from, addr),
+                };
+                match outcome {
+                    WriteOutcome::Superseded { keeping } => {
+                        t.record_station(Station::DirectoryRouteSuperseded, Some(from), None);
+                        tracing::debug!(?from, ?addr, ?keeping, "advertised route not recorded; a better claim holds the point");
+                    }
+                    WriteOutcome::Displaced { evicted } => {
+                        t.record_station(Station::DirectoryPointTaken, Some(from), None);
+                        tracing::debug!(?from, ?addr, ?evicted, "advertised route took the point from its holder");
+                    }
+                    WriteOutcome::Bound | WriteOutcome::Unchanged => {}
+                }
             }
             // Remember the public source address this peer dialed in from, keyed by its proven coordinate:
             // the hub's hole-punch table (#119). When a third party later asks us to broker a connection to
@@ -4448,14 +4571,14 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
     // the same reason — the dial side to stop a misdelivery, the accept side to stop serving a stranger that is
     // itself. One check, two paths; a per-site copy is the divergence this file has been bitten by before.
     if peer_cert_der(conn).is_some_and(|peer_cert| peer_cert.as_slice() == id.own_cert.as_slice()) {
-        return Handshake { peer: PeerIdentity::Ourself, round_trip: false, rank: None };
+        return Handshake { peer: PeerIdentity::Ourself, round_trip: false, rank: None, listen_port: 0 };
     }
     // Snapshot the current-epoch HELLO (an `Arc` clone) and drop the lock before awaiting, so a concurrent
     // reshuffle can rewrite it without blocking on this connection's I/O. A poisoned lock rejects the
     // handshake, matching the connection-map convention elsewhere in this driver — and it is a *local*
     // fault, so it says nothing about the transport.
     let Ok(hello) = id.hello.read().map(|h| h.clone()) else {
-        return Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None };
+        return Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None, listen_port: 0 };
     };
     // Asked BEFORE the first byte goes out, which is the whole point: by the time an inbound frame could
     // tell us, ours has already left in the wrong shape (#234).
@@ -4467,6 +4590,7 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
                 coord,
                 version,
                 capabilities,
+                listen_port,
                 // The claim material is ALSO recorded by the verifier closure (`spawn_self_certifying`),
                 // which is the only place holding the peer's certificate DER — the identity the coordinate
                 // VRF binds to. That copy feeds the settle oracle; this one feeds the dial table, and until
@@ -4474,21 +4598,26 @@ async fn hello_exchange(conn: &Connection, t: &Transport, id: &SelfCert) -> Hand
                 peer,
             } => {
                 send_hello_ack(conn, &t.shaper, joining, version, capabilities).await;
-                Handshake { peer: PeerIdentity::Proven(coord), round_trip: true, rank: Some(peer.output) }
+                Handshake {
+                    peer: PeerIdentity::Proven(coord),
+                    round_trip: true,
+                    rank: Some(peer.output),
+                    listen_port,
+                }
             }
             HelloResult::Incompatible(err) => {
                 tracing::warn!(?err, "HELLO negotiation incompatible; sending ERROR and aborting");
                 send_error(conn, &t.shaper, joining, err).await;
                 // A version disagreement is proof the shaped bytes crossed intact — we read and parsed them.
-                Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None }
+                Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None, listen_port: 0 }
             }
         },
         // No `HELLO_ACK` and no `ERROR`: an ACK echoes *agreed* parameters, and nothing was agreed — we
         // could not read the peer's claim. An ERROR would be worse: it tells a stranger which of our gates
         // it hit (§L0), and this peer is very likely honest and simply ahead of us.
-        PeerHello::Unjudgeable(u) => Handshake { peer: PeerIdentity::Unjudged(u), round_trip: true, rank: None },
-        PeerHello::Refused => Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None },
-        PeerHello::Silent => Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None },
+        PeerHello::Unjudgeable(u) => Handshake { peer: PeerIdentity::Unjudged(u), round_trip: true, rank: None, listen_port: 0 },
+        PeerHello::Refused => Handshake { peer: PeerIdentity::Rejected, round_trip: true, rank: None, listen_port: 0 },
+        PeerHello::Silent => Handshake { peer: PeerIdentity::Rejected, round_trip: false, rank: None, listen_port: 0 },
     }
 }
 
@@ -4515,6 +4644,14 @@ struct Handshake {
     /// Whether a shaped frame completed the round trip. **A refusal counts as `true`**: we decoded what the
     /// peer sent and rejected its contents, so the transport is not what failed.
     round_trip: bool,
+    /// The port the peer says it **accepts** on, from its HELLO — `0` where it advertises none, and on every
+    /// path that never read one.
+    ///
+    /// Carried out of the exchange for the accept side, which until now had no address for a peer at all:
+    /// an inbound connection's source is an ephemeral client port, so `accept_loop` wrote no directory entry
+    /// and reverse reachability rested entirely on that one connection staying open. Paired with the source
+    /// IP this node observed, never with an IP the peer claims — see `identity::HELLO_HEAD_LEN`.
+    listen_port: u16,
 }
 
 /// What a completed exchange settled about **who** the peer is — three states, because "we do not know"
@@ -5803,7 +5940,7 @@ mod tests {
         let (_, proof, _) =
             verifiable_coordinate_ranked::<F2>(&creds, Epoch::ZERO, &BeaconSeed::GENESIS);
         let claim = CoordinateClaim { proof, index: 0, witnesses: Vec::new() };
-        let hello = hello_bytes::<F2>(Epoch::ZERO, [0, 0, 1], &claim, Capabilities::default()).len();
+        let hello = hello_bytes::<F2>(Epoch::ZERO, [0, 0, 1], &claim, Capabilities::default(), 0).len();
 
         assert!(
             cert < 512,

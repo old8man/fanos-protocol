@@ -286,7 +286,10 @@ fn hello_handshake_transcript_reproduced() {
     let v = load();
     let h = &v["hello_handshake"];
 
-    // HELLO: version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12) ‖ proof(80), framed.
+    // HELLO: version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ listen_port(2) ‖ coord(12) ‖ proof(80),
+    // framed. The port sits BEFORE the coordinate so that `identity::hello_coord`'s
+    // `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN` keeps naming the triple; a field appended to the head would move
+    // what that expression points at while still compiling.
     // fanos-wire has no VRF machinery (that lives in fanos-quic/fanos-vrf), so this vector's `proof`
     // is an opaque placeholder — it pins the FIELD LAYOUT, not cryptographic validity. A real
     // `identity::hello_bytes()` output's non-proof fields are cross-checked against this same layout
@@ -297,6 +300,7 @@ fn hello_handshake_transcript_reproduced() {
     body.extend_from_slice(&(hello["capabilities"].as_u64().unwrap() as u32).to_be_bytes());
     body.extend_from_slice(&(hello["field_q"].as_u64().unwrap() as u32).to_be_bytes());
     body.extend_from_slice(&hello["epoch"].as_u64().unwrap().to_be_bytes());
+    body.extend_from_slice(&(hello["listen_port"].as_u64().unwrap() as u16).to_be_bytes());
     for c in hello["coord"].as_array().unwrap() {
         body.extend_from_slice(&(c.as_u64().unwrap() as u32).to_be_bytes());
     }

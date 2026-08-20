@@ -30,15 +30,144 @@ use super::{
 
 
 impl<F: Field> OverlayNode<F> {
-    /// Flood `frame` to every cell neighbour (the substrate for JOIN and beacon propagation).
+    /// The coordinates this node addresses when it wants to reach **the cell** — gossip, heartbeat, any
+    /// one-to-many frame.
+    ///
+    /// ## Evidence, with algebra as the bootstrap
+    ///
+    /// The algebraic neighbour set is every other point of the plane: on `PG(2,q)` any two points share a
+    /// line, so `peers` holds all `q² + q` of them. That is the right set for a *read*, which must not
+    /// assume where a shard lives, and it is the wrong set for a *send*, because most of those points are
+    /// empty and a frame to an empty point is not "hard to deliver" — it is addressed to nobody.
+    ///
+    /// **What an empty point actually costs, and it is not one dropped frame.** The transport's send ladder
+    /// treats an unresolvable coordinate as a *reachability* problem: no directory entry, no cached
+    /// connection, so it climbs to the symmetric-NAT rung and relays the frame through a hub — **signing it
+    /// first**, since a self-certifying node attests what it relays. At `q = 4` with five nodes, 16 of 21
+    /// points are empty, so every flood and every heartbeat spent three quarters of its sends on signed
+    /// relay traffic aimed at vacancy, and the hub then tried to forward each one. The base cell hid this
+    /// completely: `PG(2,2)` has seven points and a full cell occupies all of them.
+    ///
+    /// **Measured: 36 871 → 31 462 `conns.cache_miss` over one 30 s fleet run — 15 %, not the three
+    /// quarters the paragraph above would suggest.** The remainder is the *read* path, which fans a
+    /// `Lookup` out to every algebraic point on purpose so that a reader never assumes where a shard lives
+    /// (`on_get` records the two narrowings tried and reverted). That traffic is a deliberate cost with its
+    /// own justification; this one had none.
+    ///
+    /// So: address the points this node has **evidence** for. `occupied_points` is that evidence — peers
+    /// heard from since the last seating change, plus announced members — and it is the same input placement
+    /// uses, which is the point: one notion of "who is there", not two.
+    ///
+    /// **Algebra remains the bootstrap, and it has to.** A node that has heard from nobody has no evidence
+    /// to address, and its `Join` announcement is exactly the frame that must escape that state; falling
+    /// back to every point is what lets a cold node be heard at all. One frame from anybody ends the
+    /// fallback, and gossip does the rest — a flood needs the graph to be *connected*, not complete.
+    ///
+    /// **Evidence alone would close the set, and that was measured.** Restricting the *heartbeat* to this
+    /// same list froze every node at whoever it happened to hear first: with no ping to an unknown point,
+    /// nothing ever makes an unmet peer send us anything, and discovery is left entirely to gossip arriving
+    /// through the one peer already known. The fleet stayed at six heard edges of twenty. Discovery belongs
+    /// on the heartbeat, and it sweeps — see [`sweep_targets`](Self::sweep_targets).
+    pub(super) fn fan_out(&self) -> alloc::vec::Vec<Triple> {
+        let me = self.coord.coords();
+        let occupied: alloc::vec::Vec<Triple> = self
+            .occupied_points()
+            .into_iter()
+            .map(|i| Point::<F>::at(i).coords())
+            .filter(|&c| c != me)
+            .collect();
+        if occupied.is_empty() {
+            return self.peers.keys().copied().collect();
+        }
+        occupied
+    }
+
+    /// The heartbeat's targets: everything [`fan_out`](Self::fan_out) addresses, **plus one line's worth of
+    /// discovery**.
+    ///
+    /// A ping is two things at once — a liveness measurement of a peer we know, and the only frame that
+    /// makes a peer we do *not* know send us anything. Evidence covers the first; the second needs to reach
+    /// points with no evidence, which is exactly the traffic `fan_out` exists to stop sending in bulk.
+    ///
+    /// **The plane supplies the bound, so no constant is chosen.** This point lies on `q + 1` lines and
+    /// every other point of the plane lies on exactly one of them, so probing one line per beat sweeps the
+    /// whole plane in `q + 1` beats and costs `q` extra sends — against `q² + q` if every point were probed
+    /// every beat. At `q = 4`: 4 extra sends per beat and a full sweep every 5 beats, in place of 20 every
+    /// beat. At `q = 2`, the base cell, the two sets coincide and nothing changes.
+    pub(super) fn sweep_targets(&mut self) -> alloc::vec::Vec<Triple> {
+        let me = self.coord.coords();
+        let mut targets: alloc::collections::BTreeSet<Triple> = self.fan_out().into_iter().collect();
+        let lines: alloc::vec::Vec<_> = Plane::<F>::lines_through(self.coord).collect();
+        if !lines.is_empty() {
+            let which = self.sweep % lines.len();
+            self.sweep = self.sweep.wrapping_add(1);
+            if let Some(&line) = lines.get(which) {
+                for p in Plane::<F>::points_on(line) {
+                    let c = p.coords();
+                    if c != me {
+                        targets.insert(c);
+                    }
+                }
+            }
+        }
+        targets.into_iter().collect()
+    }
+
+    /// Flood `frame` to the cell — see [`fan_out`](Self::fan_out) for which points that is and why it is not
+    /// every point of the plane.
     pub(super) fn flood(&self, frame: &[u8]) -> Vec<Effect> {
-        self.peers
-            .keys()
-            .map(|&peer| Effect::Send {
+        self.fan_out()
+            .into_iter()
+            .map(|peer| Effect::Send {
                 to: peer,
                 frame: frame.to_vec(),
             })
             .collect()
+    }
+
+    /// `Command::PeerHandshaken` — the transport proved a peer's coordinate against its certificate, and
+    /// this is the engine learning it.
+    ///
+    /// **The strongest evidence there is, and it used to be discarded.** Every other input to
+    /// `occupied_points` is a frame that happened to arrive; this is a completed mutual-TLS handshake with a
+    /// coordinate proof, witnessed by the only layer that can witness it. A node that has dialled a peer,
+    /// verified it and holds a live connection knew nothing about it at this level until an `Announce`
+    /// turned up — measured on a five-node fleet as four transport connections against **one** heard peer,
+    /// with placement, the read denominator and the membership view all following the smaller number.
+    ///
+    /// It also retracts, for the same reason [`on_announce`](Self::on_announce) does: an identity proving a
+    /// *new* coordinate has left the one it held, and the handshake is a better witness to that than an
+    /// announcement, because it cannot be relayed.
+    ///
+    /// The key bundle is deliberately **not** written. A handshake proves *who is where*; what a member
+    /// advertises is a separate claim carried by its announcement, and inventing an empty bundle here would
+    /// make a peer look announced when it has not been.
+    pub(super) fn on_peer_handshaken(
+        &mut self,
+        now: crate::Instant,
+        coord: Triple,
+        identity: [u8; 32],
+    ) -> Vec<Effect> {
+        if coord == self.coord.coords() {
+            return Vec::new(); // our own dial arriving back; not a peer
+        }
+        self.note_heard(now, coord);
+        let id = identity.to_vec();
+        if let Some(&vacated) = self
+            .membership
+            .identities
+            .iter()
+            .find_map(|(at, seated)| (*at != coord && *seated == id).then_some(at))
+        {
+            self.membership.members.remove(&vacated);
+            self.membership.identities.remove(&vacated);
+            if let Some(peer) = self.peers.get_mut(&vacated) {
+                peer.last_seen = None;
+            }
+            self.stations.record(Station::MembershipVacated, Some(vacated));
+        }
+        self.membership.identities.insert(coord, id);
+        alloc::vec![Effect::Notify(Notification::PeerHandshaken { coord, identity })]
     }
 
     /// `Command::Join` — record our own info and flood an announcement (carrying our overlay address)

@@ -293,6 +293,33 @@ pub enum Command {
         /// The signature over `descriptor_message(coord, hier, id)` for the coordinate about to be held.
         sig: Vec<u8>,
     },
+    /// A peer completed the mutual-TLS handshake and **proved** `coord` against its certificate — the one
+    /// moment the identity↔coordinate binding is known, handed to the engine because the transport is the
+    /// only layer that witnesses it.
+    ///
+    /// **Why the engine needs it, and what it cost not to have it.** The engine learns who is at a
+    /// coordinate from `Announce` frames and from nothing else, so a peer this node has *handshaken with* —
+    /// dialled, verified, and holds a live connection to — is invisible to `occupied_points` until an
+    /// overlay frame happens to arrive. Measured on a five-node fleet: the transport held connections to all
+    /// four peers on every node while the engine had heard from **one**, and placement, the read denominator
+    /// and the membership view all follow the engine's number.
+    ///
+    /// **And it is the enabling change for relayable DKG frames.** A complaint or a dealer's shares can only
+    /// be relayed if they authenticate themselves, which needs a verifier the receiver associates with the
+    /// claimed dealer index. Of the three possible sources — the roster file, the frame itself, the
+    /// transport — only the transport is both sound and available, and `fanos_keygen`'s own analysis names
+    /// exactly what blocked it: *"the driver emits no notification when a peer completes a handshake, so the
+    /// host never learns the moment at which it would hand one over."* This is that moment.
+    ///
+    /// `identity` is the peer's descriptor identity — `H(NODE_ID ‖ cert)`, the same value
+    /// `NodeCredentials::descriptor_identity` derives — not the certificate, because the engine is
+    /// crypto-free and needs a key, not material to verify with.
+    PeerHandshaken {
+        /// The coordinate the peer proved.
+        coord: Triple,
+        /// The peer's descriptor identity, derived from the certificate it authenticated with.
+        identity: [u8; 32],
+    },
     /// Re-seat this node at a new VRF coordinate for the per-epoch reshuffle (spec §L3 "epoch reshuffle",
     /// §3.2): the driver computes `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` for the new epoch (the
     /// engine is crypto-free and cannot) and hands it here. The engine re-derives its cell neighbours /
@@ -737,6 +764,19 @@ pub enum Notification {
     /// Self-healing: after shedding, the cell's behavioural coherence fell back to the collective-subject
     /// band, so the node re-integrated (undid its decoupling) — the homeostat's `Bind` band control.
     Bound,
+    /// A peer completed the handshake and proved its coordinate — see [`Command::PeerHandshaken`], which
+    /// this answers. Raised once per handshake, so it is bounded by the connection rate rather than by
+    /// traffic.
+    ///
+    /// The host uses it to hand a sub-engine the peer's verifier at the moment it becomes known: that is
+    /// what makes a DKG complaint relayable, and therefore what makes epidemic delivery available to a class
+    /// of frames that today can only be sent direct.
+    PeerHandshaken {
+        /// The coordinate the peer proved.
+        coord: Triple,
+        /// The peer's descriptor identity, derived from the certificate it authenticated with.
+        identity: [u8; 32],
+    },
     /// A DHT `Put` was acknowledged by the responsible node (spec §L4); carries the key digest.
     Stored([u8; 32]),
     /// A DHT `Get` reached a conclusion (spec §L4) — **or reached the point of not reaching one**.

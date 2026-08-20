@@ -22,10 +22,29 @@ use x509_parser::certificate::X509Certificate;
 use crate::tls::{FANOS_VRF_OID, NodeCredentials};
 
 /// The fixed head of a self-certifying HELLO **frame body** (spec §7.3/§7.4):
-/// `version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12)`, followed by the node's
-/// [`CoordinateClaim`]. The whole thing is carried as the body of a [`FrameType::Hello`] frame (audit #100 — previously
-/// these bytes went on the wire raw, with no version/capability negotiation and no frame envelope at all).
-pub(crate) const HELLO_HEAD_LEN: usize = 2 + 4 + 4 + 8 + 12;
+/// `version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ listen_port(2) ‖ coord(12)`, followed by the
+/// node's [`CoordinateClaim`]. The whole thing is carried as the body of a [`FrameType::Hello`] frame
+/// (audit #100 — previously these bytes went on the wire raw, with no version/capability negotiation and no
+/// frame envelope at all).
+///
+/// ## Why a port and not an address
+///
+/// The acceptor needs *somewhere to dial this peer back*, and before this field it had nothing: the source
+/// address of an inbound connection is an ephemeral client port, so `accept_loop` deliberately wrote no
+/// directory entry at all and reverse reachability rested entirely on the accepted connection staying open.
+/// Measured consequence on a five-node fleet: `route [1, 2, 3, 4, 5]` — a staircase in *bootstrap order*,
+/// because a node only ever learned an address by dialing out, and the node that dials nobody learns
+/// nothing, permanently.
+///
+/// Carrying a full `SocketAddr` would answer that and open two holes this does not. A node bound to
+/// `0.0.0.0` does not know which of its addresses to advertise, and — the sharper one — an advertised IP is
+/// a claim about a *third party*: a peer could make every node it meets file a directory binding pointing at
+/// a victim's address, which is a reflection primitive built out of the routing table. Pairing the peer's
+/// **claimed port** with the **observed source IP** removes both: the IP is evidence this node collected
+/// itself, so a lie can only redirect traffic to another port on the liar's own address.
+///
+/// `0` means "do not file me" — a node that dials out but accepts nothing.
+pub(crate) const HELLO_HEAD_LEN: usize = 2 + 4 + 4 + 8 + 2 + 12;
 
 /// The shortest legal HELLO body: the head plus an **uncontested** claim, `proof(80) ‖ index(2)`.
 ///
@@ -33,6 +52,10 @@ pub(crate) const HELLO_HEAD_LEN: usize = 2 + 4 + 4 + 8 + 12;
 /// — costs exactly two bytes more than before, with the first 80 byte-identical. A displaced node additionally carries one
 /// witness per skipped step, which is why the body is variable-length at all.
 pub(crate) const HELLO_MIN_BODY_LEN: usize = HELLO_HEAD_LEN + PROOF_LEN + 2;
+
+/// Byte offset of the advertised listen port within the body — after the epoch, **before** the coordinate,
+/// so that `hello_coord`'s `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN` keeps pointing at the triple.
+const PORT_AT: usize = 2 + 4 + 4 + 8;
 
 /// Byte offset of the claim's probe index within the body — a fixed position, so a verifier can bound the index
 /// *before* decoding the variable-length witness list it implies. See [`verify_hello`].
@@ -67,6 +90,9 @@ pub(crate) enum HelloResult {
         /// rebuild the VRF input and verify a second time — a second construction of that input being a second place for
         /// it to drift.
         peer: PeerClaimed,
+        /// The port this peer **accepts** connections on, to be paired with the source IP this node observed
+        /// (see [`HELLO_HEAD_LEN`]). `0` means it advertises none.
+        listen_port: u16,
     },
     /// Negotiation failed (version too old, or an empty capability intersection) — the
     /// [`ProtocolError`] to report before aborting.
@@ -200,6 +226,7 @@ pub(crate) fn hello_bytes<F: Field>(
     coord: Triple,
     claim: &CoordinateClaim,
     capabilities: Capabilities,
+    listen_port: u16,
 ) -> Vec<u8> {
     let claim_bytes = claim.to_bytes();
     let mut body = Vec::with_capacity(HELLO_HEAD_LEN + claim_bytes.len());
@@ -207,11 +234,49 @@ pub(crate) fn hello_bytes<F: Field>(
     body.extend_from_slice(&capabilities.bits().to_be_bytes());
     body.extend_from_slice(&F::Q.to_be_bytes());
     body.extend_from_slice(&epoch.get().to_be_bytes());
+    // Before the coordinate, not after it: `hello_coord` reads the triple at
+    // `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN`, so a field appended to the head would silently move what that
+    // expression points at while still type-checking.
+    debug_assert_eq!(body.len(), PORT_AT, "the port must sit at the offset the reader and patcher use");
+    body.extend_from_slice(&listen_port.to_be_bytes());
     body.extend_from_slice(&encode_triple(coord));
     body.extend_from_slice(&claim_bytes);
     let mut out = Vec::new();
     encode_frame(FrameType::Hello.code(), &body, &mut out);
     out
+}
+
+/// Write the real listen port into an already-built HELLO frame.
+///
+/// **The ordering this exists for.** The HELLO is constructed before the endpoint is bound — it needs the
+/// node's coordinate and VRF claim, which come from the credentials, while the port comes from the socket —
+/// so at construction time there is no port to advertise and `hello_bytes` is called with `0`. `spawn_inner`
+/// calls this the instant it has `endpoint.local_addr()`, which is also the only place the *ephemeral* case
+/// is answerable at all: a node bound to port `0` learns its port from the OS and nowhere else, and that is
+/// the ordinary case in the simulator and in any `bind 0` deployment.
+///
+/// Rewrites two bytes at a fixed offset rather than rebuilding the frame, because rebuilding would need the
+/// claim material this layer does not hold. The offset is derived from the frame's own decode, so a change
+/// to the header cannot leave this writing into the body.
+///
+/// Returns `false` if `hello` is not a well-formed HELLO frame — the caller keeps the unpatched bytes, which
+/// advertise `0` and therefore ask peers not to file a directory entry: a missing route, never a wrong one.
+pub(crate) fn set_hello_listen_port(hello: &mut [u8], port: u16) -> bool {
+    let Ok((frame, _)) = decode_frame(hello) else {
+        return false;
+    };
+    if frame.frame_type() != Some(FrameType::Hello) || frame.body.len() < HELLO_MIN_BODY_LEN {
+        return false;
+    }
+    // The body's offset within the frame, taken from the decode rather than assumed: `body` is a slice of
+    // `hello`, so the distance between their starts is exactly the header length.
+    let header = frame.body.as_ptr() as usize - hello.as_ptr() as usize;
+    let at = header + PORT_AT;
+    let Some(slot) = hello.get_mut(at..at + 2) else {
+        return false;
+    };
+    slot.copy_from_slice(&port.to_be_bytes());
+    true
 }
 
 /// Parse a peer's HELLO, verify its coordinate proof against the peer's authenticated certificate
@@ -254,7 +319,8 @@ pub(crate) fn verify_hello<F: Field>(
     // generic `F` this build is instantiated with, not by this value, so it is not gated here.
     let _peer_field_q = u32::from_be_bytes(body.get(6..10)?.try_into().ok()?);
     let epoch = Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?));
-    let coord = decode_triple(body.get(18..30)?)?;
+    let listen_port = u16::from_be_bytes(body.get(PORT_AT..PORT_AT + 2)?.try_into().ok()?);
+    let coord = decode_triple(body.get(HELLO_HEAD_LEN - TRIPLE_WIRE_LEN..HELLO_HEAD_LEN)?)?;
     // Bound the claimed index from its fixed offset, before the witness list it implies is decoded.
     let claimed_index = u16::from_be_bytes(body.get(CLAIM_INDEX_AT..CLAIM_INDEX_AT + 2)?.try_into().ok()?);
     if claimed_index >= fanos_vrf::probe_bound::<F>() {
@@ -283,6 +349,7 @@ pub(crate) fn verify_hello<F: Field>(
         version,
         capabilities,
         peer: PeerClaimed { public, proof: claim.proof, output },
+        listen_port,
     })
 }
 
@@ -353,6 +420,7 @@ mod tests {
         body.extend_from_slice(&capabilities.bits().to_be_bytes());
         body.extend_from_slice(&F::Q.to_be_bytes());
         body.extend_from_slice(&epoch.get().to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes()); // listen port — not what this seam is about
         body.extend_from_slice(&encode_triple(coord));
         body.extend_from_slice(&claim.to_bytes());
         let mut out = Vec::new();
@@ -368,7 +436,7 @@ mod tests {
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
 
         let sender_caps = Capabilities::CORE | Capabilities::APHANTOS_FULL | Capabilities::CALYPSO;
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), sender_caps);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), sender_caps, 0);
 
         // The receiver offers CORE + APHANTOS_FULL only (no CALYPSO) — the intersection drops it.
         let receiver_caps = Capabilities::CORE | Capabilities::APHANTOS_FULL;
@@ -387,6 +455,58 @@ mod tests {
         );
     }
 
+    /// **The port survives verification, and the patch reaches it after the socket is bound.**
+    ///
+    /// Two facts in one test, because they are one mechanism split across a lifetime: `hello_bytes` writes
+    /// the port at a fixed offset before the coordinate, and `set_hello_listen_port` rewrites exactly those
+    /// two bytes once `spawn_inner` knows what the OS gave it — the only source a `bind 0` node has.
+    ///
+    /// The coordinate is asserted on both sides of the patch on purpose. The port sits *before* the triple,
+    /// so an off-by-one in the offset would corrupt the coordinate rather than the port, and a test that
+    /// checked only the port would read the right number out of a broken frame.
+    #[test]
+    fn the_advertised_listen_port_survives_verification_and_the_bind_time_patch() {
+        let creds = NodeCredentials::generate().unwrap();
+        let epoch = Epoch::new(3);
+        let beacon = BeaconSeed::new([0x31; 32]);
+        let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
+        let claim = CoordinateClaim::direct(proof);
+
+        // Built with a port, as `Reseater::apply` does — it holds `local_addr` and needs no patch.
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &claim, Capabilities::CORE, 4433);
+        let Some(HelloResult::Established { coord: got, listen_port, .. }) =
+            verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::CORE)
+        else {
+            unreachable!("a valid HELLO establishes")
+        };
+        assert_eq!((got, listen_port), (coord.coords(), 4433), "the port arrives with the coordinate intact");
+
+        // Built without one, as `spawn_self_certifying` must — the endpoint does not exist yet — and patched
+        // at bind time.
+        let mut cold = hello_bytes::<F2>(epoch, coord.coords(), &claim, Capabilities::CORE, 0);
+        let Some(HelloResult::Established { listen_port: none_yet, .. }) =
+            verify_hello::<F2>(creds.cert_der(), &cold, &beacon, Capabilities::CORE)
+        else {
+            unreachable!("a valid HELLO establishes")
+        };
+        assert_eq!(none_yet, 0, "an unpatched HELLO advertises nothing — a missing route, never a wrong one");
+
+        assert!(set_hello_listen_port(&mut cold, 51820), "a well-formed HELLO accepts the patch");
+        let Some(HelloResult::Established { coord: after, listen_port: patched, .. }) =
+            verify_hello::<F2>(creds.cert_der(), &cold, &beacon, Capabilities::CORE)
+        else {
+            unreachable!("the patch must not disturb the proof")
+        };
+        assert_eq!(
+            (after, patched),
+            (coord.coords(), 51820),
+            "the patched port is read back and the coordinate after it is untouched"
+        );
+
+        // And it refuses what it cannot place: the caller then keeps bytes advertising `0`.
+        assert!(!set_hello_listen_port(&mut [0u8; 4], 51820), "a frame that is not a HELLO is refused");
+    }
+
     #[test]
     fn hello_epoch_reads_the_proven_epoch_for_the_safe_stall_window() {
         // The verifier peeks the epoch a HELLO proves so it can select that epoch's beacon from its accepted
@@ -395,7 +515,7 @@ mod tests {
         let epoch = Epoch::new(7);
         let beacon = BeaconSeed::new([0x77; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE, 0);
 
         assert_eq!(hello_epoch(&hello), Some(epoch), "the proven epoch is recoverable without verifying");
         // Selecting that epoch's beacon, the proof verifies even after the cell has moved on — the essence of
@@ -418,7 +538,7 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x12; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE, 0);
 
         let full_node_caps =
             Capabilities::CORE | Capabilities::APHANTOS_FULL | Capabilities::CALYPSO;
@@ -437,7 +557,7 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x13; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::APHANTOS_LITE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::APHANTOS_LITE, 0);
 
         let result =
             verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::APHANTOS_FULL);
@@ -518,7 +638,7 @@ mod tests {
                 proof: winner_proof,
             }],
         };
-        let hello = hello_bytes::<F2>(epoch, displaced.coords(), &claim, Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, displaced.coords(), &claim, Capabilities::CORE, 0);
         assert!(
             hello.len() > HELLO_MIN_BODY_LEN,
             "a witnessed claim is longer than the uncontested body it extends"
@@ -540,7 +660,7 @@ mod tests {
         assert!(
             verify_hello::<F2>(
                 loser.cert_der(),
-                &hello_bytes::<F2>(epoch, displaced.coords(), &unwitnessed, Capabilities::CORE),
+                &hello_bytes::<F2>(epoch, displaced.coords(), &unwitnessed, Capabilities::CORE, 0),
                 &beacon,
                 Capabilities::CORE
             )
@@ -553,7 +673,7 @@ mod tests {
         assert!(
             verify_hello::<F2>(
                 loser.cert_der(),
-                &hello_bytes::<F2>(epoch, preferred.coords(), &direct, Capabilities::CORE),
+                &hello_bytes::<F2>(epoch, preferred.coords(), &direct, Capabilities::CORE, 0),
                 &beacon,
                 Capabilities::CORE
             )
@@ -571,7 +691,7 @@ mod tests {
         let epoch = Epoch::new(2);
         let beacon = BeaconSeed::new([0x22; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE, 0);
         assert!(verify_hello::<F2>(creds.cert_der(), &hello, &beacon, Capabilities::CORE).is_some());
 
         // `probe_bound::<F2>()` is q + 1 = 3, so 3 and above name a point some lower index already names.
@@ -600,7 +720,7 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::new([0x15; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), Capabilities::CORE, 0);
 
         // Verify against a DIFFERENT certificate than the one the proof was produced for.
         let result = verify_hello::<F2>(other.cert_der(), &hello, &beacon, Capabilities::CORE);
@@ -632,7 +752,7 @@ mod tests {
         let beacon = BeaconSeed::new([0x17; 32]);
         let (coord, proof) = verifiable_coordinate::<F2>(&creds, epoch, &beacon);
         let caps = Capabilities::CORE | Capabilities::CALYPSO;
-        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), caps);
+        let hello = hello_bytes::<F2>(epoch, coord.coords(), &CoordinateClaim::direct(proof), caps, 0);
 
         let (frame, n) = decode_frame(&hello).unwrap();
         assert_eq!(n, hello.len(), "the frame consumes the whole buffer");
@@ -640,7 +760,8 @@ mod tests {
         let body = frame.body;
         assert_eq!(body.len(), HELLO_MIN_BODY_LEN, "an uncontested claim is the shortest legal body");
 
-        // version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ coord(12) ‖ proof(80) ‖ index(2), in that order.
+        // version(2) ‖ capabilities(4) ‖ field_q(4) ‖ epoch(8) ‖ listen_port(2) ‖ coord(12) ‖ proof(80) ‖
+        // index(2), in that order.
         assert_eq!(
             u16::from_be_bytes(body[0..2].try_into().unwrap()),
             PROTOCOL_VERSION,
@@ -662,14 +783,20 @@ mod tests {
             "epoch at offset 10"
         );
         assert_eq!(
-            decode_triple(&body[18..30]).unwrap(),
+            u16::from_be_bytes(body[18..20].try_into().unwrap()),
+            0,
+            "listen_port at offset 18 — before the coordinate, so `hello_coord`'s \
+             `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN` still names the triple"
+        );
+        assert_eq!(
+            decode_triple(&body[20..32]).unwrap(),
             coord.coords(),
-            "coord at offset 18"
+            "coord at offset 20"
         );
         assert_eq!(
             body[HELLO_HEAD_LEN..HELLO_HEAD_LEN + PROOF_LEN].len(),
             PROOF_LEN,
-            "the claim's proof still sits at offset 30 for PROOF_LEN bytes — byte-identical to the pre-claim layout"
+            "the claim's proof sits at HELLO_HEAD_LEN for PROOF_LEN bytes"
         );
         assert_eq!(
             u16::from_be_bytes(body[HELLO_HEAD_LEN + PROOF_LEN..].try_into().unwrap()),

@@ -55,7 +55,10 @@ impl<F: Field> OverlayNode<F> {
     pub(super) fn on_heartbeat(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
         let ping = encode(FrameType::Ping, &[]);
-        let neighbours: Vec<Triple> = self.peers.keys().copied().collect();
+        // The points this node has evidence for, not every point of the plane — see `fan_out`. A ping to an
+        // empty coordinate is not a liveness measurement, it is a signed relay through a hub aimed at
+        // nobody, and at `q = 4` that was three quarters of every heartbeat.
+        let neighbours: Vec<Triple> = self.sweep_targets();
         // §6.3 grey detection: fold last round's per-neighbour ping outcome into the loss EWMA, then mark this
         // round's ping outstanding (the loop below pings every neighbour). Done before building the gossip so
         // the `DiagLoss` row carries this round's fresh loss estimate.
