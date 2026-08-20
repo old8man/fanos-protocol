@@ -4193,6 +4193,21 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
     Dialed::Peer(conn)
 }
 
+// **The bootstrap hole in the arrival-order rule, and an attempt at it that did not pay.**
+//
+// `live_conn` ranks on arrival order, which is silent at exactly the moment it matters most: before a peer
+// has sent anything there is nothing to rank, the tie-break is "newest filed", and the two ends file in
+// different orders. Pick wrong and every send goes into a socket the peer is not reading — so no frame
+// arrives, so no evidence is ever created, so the wrong pick is permanent. One node in every five-node
+// fleet run sits in exactly that state: live connections to all four peers, nothing exchanged with any.
+//
+// **Tried: send on EVERY live connection to a peer until one of them answers**, on the reasoning that a
+// bounded, one-off duplicate is better than a guess that cannot correct itself. Measured over three fleet
+// runs it read 6, 4, 6 heard edges of twenty, against 12, 6, 4, 12 for arrival-order alone — no benefit and
+// a plausible cost, since the duplicate lands on the same per-peer worker queue the real traffic uses. So it
+// is not here, and the hole is still open: what it needs is a way for the two ends to agree on *which*
+// connection carries traffic, rather than for each to guess independently.
+
 /// A cached, still-open connection to `peer`, if any.
 ///
 /// Takes the whole [`Transport`] rather than just the map so the pruning can be **reported** (#267).

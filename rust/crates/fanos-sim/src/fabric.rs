@@ -1759,6 +1759,29 @@ mod tests {
         // ladder running out of rungs for a coordinate. With reach complete and the store still partitioned,
         // "the sends were dropped before they left" and "they left and never arrived" are the two remaining
         // worlds, and nothing printed here could tell them apart.
+        // **The address table itself, one row per reader.** Every count above is a summary; this is the
+        // thing summarised. A node that dials coordinate C and reaches D reports `directory.moved_peer_
+        // retained` and retracts the entry — so the counts say "crossed" without ever saying *what* is
+        // crossed, and the isolated node in every run shows that station against all four of its peers.
+        // Printed as `coord→port`, because in the fabric every node shares an address family and differs
+        // only by port, so the port IS the identity and a full address would bury it.
+        let bindings: Vec<String> = fleet
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let row: Vec<String> = coords
+                    .iter()
+                    .map(|&c| {
+                        n.directory().resolve(c).map_or_else(
+                            || format!("{}→-", crate::fmt_coord(c)),
+                            |a| format!("{}→{}", crate::fmt_coord(c), a.port()),
+                        )
+                    })
+                    .collect();
+                format!("    node {i} @{}:{}", crate::fmt_coord(n.health().address), row.join(" "))
+            })
+            .collect();
         let sent_drops: Vec<u64> = fleet.nodes().iter().map(|n| n.health().send_drops).collect();
         let unresolved: Vec<usize> = fleet.nodes().iter().map(|n| n.health().unresolved_drops).collect();
         let route: Vec<usize> = fleet.nodes().iter().map(|n| n.health().routable_points).collect();
@@ -1834,6 +1857,8 @@ mod tests {
             "every node must resolve every OCCUPIED coordinate ({occupied} of {N}); the cell froze short of it: \
              {verdict:?}\n  deliver {deliver:?}  route {route:?}  peers {peers:?}  complete {complete:?}\n\
              \x20 send_drops {sent_drops:?}  unresolved_drops {unresolved:?}\n\
+             each node's address table, coordinate→port ('-' = no binding); a row that names another node's \
+             port for a coordinate is a crossed table, which is what an isolated node has:\n{}\n\
              (deliver ≈ occupied − 1 everywhere means reach is NOT the cause and the missing members were \
              unpublished at read time; a low deliver means the opposite)\n\
              roster over the observation clock:\n{}\n\
@@ -1845,6 +1870,7 @@ mod tests {
              epoch each roster was computed for — a capability slot is keyed by it, so nodes reading \
              different epochs read different slots and each finds the other absent while concluding:\n{}\n\
              engine plane — did a read reach the store, and how did it end:{engine}",
+            bindings.join("\n"),
             roster.render(),
             reach.render(),
             epoch.render()
