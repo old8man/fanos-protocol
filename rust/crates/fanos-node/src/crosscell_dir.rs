@@ -34,14 +34,33 @@
 //!    nothing could produce one, so the only safe value was `0` — which refuses every child. **Closed**:
 //!    [`sample_child_availability`] establishes it from the child cell's own shards.
 //!
-//! **What is left is the committee.** [`ChildRegistry::attest_available`] resolves a child's registered
-//! `ChildCommittee` before it verifies anything, and an unregistered child is refused outright. Nothing in
-//! the workspace constructs one: there is no directory that publishes a cell's validator keys and none that
-//! resolves them. So a parent can address its children, authenticate their health, and sample their data —
-//! and still cannot check a single signature on their certificates.
+//! 4. *"Nothing constructs a `ChildCommittee`."* [`ChildRegistry::attest_available`] resolves a child's
+//!    registered committee before it verifies anything and refuses an unregistered child outright, and there
+//!    was no directory publishing a cell's validator keys and none resolving them — so a parent could
+//!    address its children, authenticate their health and sample their data, and still not check one
+//!    signature. **Closed**: [`publish_seat_key`] / [`resolve_committee`], one slot per seat, each opened
+//!    against *that seat's* coordinate rather than against the cell as a set.
 //!
-//! The `cell: u32` these slots are keyed by is no longer the same problem it was: `fano::cell_of` derives it.
-//! What a caller still has no way to derive is *whose* keys sit at those seven points.
+//! **What is left is agreement.** The health slot is keyed `(cell, epoch)` — one record per cell — while
+//! every input a node has is its own local reading, the `degraded` mask from its own
+//! `Notification::Liveness`. Wire seven members to that slot and they race, and whichever wrote last speaks
+//! for the cell; the `Entitlement` proves *a member* wrote it and cannot prove the cell agreed. **A cell-wide
+//! record must not be written from a local input** — the standing rule this would break, and the reason the
+//! publishers stay unwired now that all four earlier reasons are closed. Recorded as
+//! [`UNWIRED_BECAUSE`], because `one_cell_premise.rs` scans stripped source and cannot see this paragraph.
+//!
+//! Two smaller things sit beside it, and neither is a missing rule:
+//!
+//! * Nothing in a shipped binary yet *runs* [`publish_seat_key`] / [`resolve_committee`]. A validator has to
+//!   publish its consensus verifying key each epoch beside the keys it already publishes, and a parent has to
+//!   resolve its children's committees before it attests them. Unlike the health record, this one is per
+//!   seat and each writer speaks only for itself, so it has no agreement problem to solve first.
+//! * [`resolve_committee`] is all-or-nothing, because `ChildCommittee::verifiers` is a dense `Vec` indexed
+//!   by validator index and a hole cannot be expressed. `Q = 5` of `7` means a certificate is checkable
+//!   whenever the five that signed it have keys present, so a partial committee is genuinely usable and this
+//!   refuses it. Expressing that is a `fanos-taxis` change.
+//!
+//! The `cell: u32` these slots are keyed by is no longer a problem either: `fano::cell_of` derives it.
 //!
 //! The observability sibling of this is [`crate::telemetry_dir::Census`], and it is worth reading together:
 //! there the same "one cell only" fact was not stated, and an operator-facing verdict claimed to compare
@@ -55,7 +74,7 @@ use fanos_taxis::checkpoint::ExecCertificate;
 use fanos_taxis::crosscell::CrossCellReceipt;
 use fanos_taxis::consensus::ConsensusMsg;
 use fanos_taxis::da::Sampler;
-use fanos_taxis::hierarchy::ChildRegistry;
+use fanos_taxis::hierarchy::{ChildCommittee, ChildRegistry};
 use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame};
 
 use tokio::task::JoinHandle;
@@ -63,6 +82,7 @@ use tokio::task::JoinHandle;
 use fanos_field::Field;
 use fanos_geometry::{Triple, fano};
 use fanos_primitives::BeaconSeed;
+use fanos_pqcrypto::sig::HybridVerifier;
 use fanos_runtime::{Command, Notification};
 use tokio::sync::broadcast;
 
@@ -80,6 +100,20 @@ fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
 
 /// The slot a cell publishes its **health report** at — domain-separated, keyed by cell and epoch, exactly like
 /// [`checkpoint_slot`].
+/// **Why every cross-cell publisher in this module is still unwired**, as a line of code rather than a
+/// paragraph — `one_cell_premise.rs` scans stripped source and cannot see prose, which an earlier attempt at
+/// exactly this discovered.
+///
+/// Four earlier reasons are closed (the module header records each). This one is different in kind: the
+/// health slot is keyed `(cell, epoch)`, one record for a whole cell, while every input a node has is its own
+/// local reading — the `degraded` mask from its own `Notification::Liveness`. Wire seven members to that slot
+/// and they race; whichever wrote last speaks for the cell. The `Entitlement` proves *a member* wrote it and
+/// cannot prove the cell agreed.
+///
+/// **Deleting this constant is how a wiring commit declares the gap closed**, and the tripwire fails unless
+/// exactly one of the two is true: this stands, or a publisher has a production caller.
+pub const UNWIRED_BECAUSE: &str = "a cell-wide record must not be written from a local input";
+
 fn health_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
     let mut key = b"FANOS-v1/cell-health/".to_vec();
     key.extend_from_slice(&cell.to_be_bytes());
@@ -352,6 +386,92 @@ pub async fn publish_health<F: Field>(
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
 
+
+/// A cell's **seat-key slot**: `(cell, seat, epoch)`, one per validator index.
+///
+/// **One slot per seat rather than one per cell, and the reason is who can sign what.** A node knows the
+/// seven coordinates of its cell (`fano::cell_of` + `cell_members_of`) and its own verifying key — and
+/// nobody else's. A single per-cell record would therefore have to be written by somebody asserting six
+/// keys it cannot vouch for, which is the shape the `Entitlement` envelope exists to refuse. Per seat, each
+/// validator asserts exactly the one thing it can prove: *this key sits at this coordinate*.
+fn committee_slot(cell: u32, seat: usize, epoch: Epoch) -> Vec<u8> {
+    let mut key = b"FANOS-v1/cell-committee/".to_vec();
+    key.extend_from_slice(&cell.to_be_bytes());
+    key.extend_from_slice(&(seat as u32).to_be_bytes());
+    key.extend_from_slice(&epoch.to_be_bytes());
+    key
+}
+
+/// Publish this validator's **consensus verifying key** at its seat in `cell` for `epoch` — the record a
+/// parent cell needs before it can check a single signature on this cell's certificates.
+///
+/// **The last of four blockers on live cross-cell finality, and the only one that was about a missing
+/// artefact rather than a missing rule.** This module's header records the other three and how each closed;
+/// what remained was that `ChildRegistry::attest_available` resolves a child's `ChildCommittee` before it
+/// verifies anything, refuses an unregistered child outright, and *nothing in the workspace constructed
+/// one*. A parent could address its children, authenticate their health and sample their data, and still
+/// not check one signature.
+///
+/// The envelope is the sibling directories': the `Entitlement` proves the publisher walked onto **this
+/// seat's** coordinate, so a key filed at somebody else's seat does not open. Unlike `publish_health`, the
+/// unentitled form is not offered — a committee key with no proof of who wrote it is precisely the input
+/// that would let one node speak for its cell's whole validator set.
+pub async fn publish_seat_key<F: Field>(
+    client: &Client,
+    cell: u32,
+    seat: usize,
+    epoch: Epoch,
+    verifier: &HybridVerifier,
+    credential: &(Vec<u8>, fanos_vrf::VrfPublic, fanos_vrf::VrfProof),
+) -> bool {
+    let Some(members) = fano::cell_members_of::<F>(cell as usize) else {
+        return false; // the plane does not split into cells: there is no seat to speak for
+    };
+    if members.coords().get(seat).is_none() {
+        return false;
+    }
+    let (id, public, proof) = credential;
+    let record = Entitlement::encode(id, public, proof, &verifier.encode());
+    let landed =
+        client.put_ephemeral(committee_slot(cell, seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
+    crate::note_publish(client, crate::Directory::Health, epoch, landed)
+}
+
+/// Assemble `cell`'s committee for `epoch` from its seven seat slots, or `None` if any seat is missing.
+///
+/// **Complete or nothing, and that is a property of `ChildCommittee` rather than a policy choice.** Its
+/// `verifiers` is a dense `Vec` indexed by validator index, so a hole cannot be expressed: a committee
+/// assembled from six seats would silently renumber the seventh's votes onto somebody else's key. The
+/// quorum tolerates absent *voters*, not absent *keys*.
+///
+/// **The residual, stated so the next pass does not rediscover it.** `Q = 5` of `7` means a certificate is
+/// checkable whenever the five that signed it have keys here — so a partial committee is genuinely usable
+/// and this refuses it. Expressing that needs `ChildCommittee::verifiers` to become sparse, which is a
+/// `fanos-taxis` wire-adjacent change and deliberately not made here.
+///
+/// Each seat's record is opened against **its own** coordinate, never against the cell as a set: a key that
+/// only proves membership somewhere in the cell would let one validator file every seat.
+pub async fn resolve_committee<F: Field>(
+    client: &Client,
+    cell: u32,
+    epoch: Epoch,
+    beacon: BeaconSeed,
+) -> Option<ChildCommittee> {
+    let members = fano::cell_members_of::<F>(cell as usize)?;
+    let mut verifiers = Vec::with_capacity(fano::N);
+    for (seat, &point) in members.coords().iter().enumerate() {
+        let bytes = tokio::time::timeout(
+            STORE_TIMEOUT,
+            client.get(committee_slot(cell, seat, epoch)),
+        )
+        .await
+        .ok()??;
+        let (_, payload) = Entitlement::open::<F>(&bytes, point, epoch, &beacon)?;
+        verifiers.push(HybridVerifier::decode(payload)?);
+    }
+    Some(ChildCommittee { cell, verifiers, quorum: fanos_taxis::CellParams::FANO.quorum() })
+}
+
 /// One byte as a `Vec` — spelled out so the codec is visibly a single byte rather than a struct that might grow one.
 fn alloc_vec(byte: u8) -> Vec<u8> { vec![byte] }
 
@@ -524,7 +644,6 @@ pub async fn diagnose_children<F: Field>(
 #[must_use]
 pub fn spawn_health_publisher<F: Field>(
     client: Client,
-    cell: u32,
     health: impl Fn() -> Report + Send + 'static,
     prover: Option<fanos_quic::CoordinateProver>,
 ) -> JoinHandle<()> {
@@ -539,13 +658,27 @@ pub fn spawn_health_publisher<F: Field>(
         // epoch it was made — the same reasoning `capdir::spawn_capability_publisher` states.
         let mut seed = client.genesis();
         let credential = |epoch: Epoch, seed: &BeaconSeed| prover.as_ref().map(|prove| prove(epoch, seed));
-        publish_health::<F>(&client, cell, epoch, health(), credential(epoch, &seed).as_ref()).await;
+        // **The cell is derived per epoch, not taken as an argument, because it MOVES.** `fano::cell_of` is
+        // `index mod cells` over this node's coordinate (#145), and the beacon re-draws that coordinate at
+        // every boundary — so a `cell: u32` fixed at spawn names the cell this node was in when it started
+        // and publishes into it for ever after. A caller could not have supplied a correct value at all.
+        let cell_now = |client: &Client| {
+            fanos_geometry::Point::<F>::new(client.address()).and_then(fano::cell_of::<F>)
+        };
+        if let Some(cell) = cell_now(&client) {
+            publish_health::<F>(&client, cell as u32, epoch, health(), credential(epoch, &seed).as_ref()).await;
+        }
         // Latest-state, not the lossy stream: a cell whose health report is missing for an epoch reads to its
         // neighbours as a cell that has nothing to say, which is not the same as one that is healthy (#86).
         while let Some((e, s)) = crate::next_epoch(&mut beacons, epoch).await {
             epoch = e;
             seed = s;
-            publish_health::<F>(&client, cell, epoch, health(), credential(epoch, &seed).as_ref()).await;
+            // Re-derived on every boundary, for the reason above: this is the instant the coordinate — and
+            // therefore the cell — changes. A node that has left the plane's cell structure entirely (a plane
+            // whose point count does not divide by seven) publishes nothing rather than into cell zero.
+            if let Some(cell) = cell_now(&client) {
+                publish_health::<F>(&client, cell as u32, epoch, health(), credential(epoch, &seed).as_ref()).await;
+            }
         }
     });
     crate::supervise::supervise(crate::supervise::NodeActor::HealthPublisher, &supervised, task)
@@ -918,6 +1051,86 @@ mod tests {
         let faulty = ChildDiagnosis::from_resolved(&faulty);
         assert_eq!(faulty.silent, 0, "nobody was silent here — the mask must not borrow the fault's bit");
         assert!(!faulty.is_clean(), "a localized fault with nobody silent must not read clean either");
+    }
+
+
+    /// **A seat key is admitted for THAT seat and for no other** — the binding a committee directory has to
+    /// carry, and the one a cell-wide envelope cannot.
+    ///
+    /// `publish_health`'s rule is "a member of this cell may speak for it", which is right for a single
+    /// per-cell record and wrong here: seven seats mean seven claims, and a rule that only proves *cell
+    /// membership* lets one validator file all seven — every certificate the parent then checks is checked
+    /// against keys that validator chose. So each seat's record is opened against **its own** coordinate.
+    ///
+    /// Both directions on one fixture, because a check that admits everything and a check that admits
+    /// nothing both look like "the right key opened".
+    #[test]
+    fn a_seat_key_opens_at_its_own_seat_and_nowhere_else() {
+        use fanos_field::F4;
+        use fanos_pqcrypto::{SeedRng, sig::HybridSigSecret};
+        use fanos_vrf::{VrfSecret, probe_index_of, prove_coordinate_ranked};
+
+        let (epoch, beacon, cell) = (Epoch::new(4), BeaconSeed::GENESIS, 1u32);
+        let members = fano::cell_members_of::<F4>(cell as usize).expect("PG(2,4) splits into three cells");
+        // Deterministic: the test asserts *which slot* a key opens at, and a fresh key each run would make
+        // the failure message name a different one every time.
+        let (_, key) = HybridSigSecret::generate(&mut SeedRng::from_seed(&[9u8; 32]));
+
+        // An identity whose walk reaches exactly one point of this cell — which is the ordinary case, and
+        // the only one where "its own seat" and "some seat" differ.
+        let sealed = |seed: u8| {
+            let sk = VrfSecret::from_seed([seed; 32]);
+            let id = format!("seat-{seed}").into_bytes();
+            let (_, proof, out) = prove_coordinate_ranked::<F4>(&sk, &id, epoch, &beacon);
+            let reached: Vec<usize> = members
+                .coords()
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| {
+                    fanos_geometry::Point::<F4>::new(c)
+                        .and_then(|p| probe_index_of::<F4>(&out, &p))
+                        .is_some()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            (Entitlement::encode(&id, &sk.public(), &proof, &key.encode()), reached)
+        };
+        let (record, seats) = (0u8..=255)
+            .map(sealed)
+            .find(|(_, reached)| reached.len() == 1)
+            .expect("some identity reaches exactly one seat of this cell");
+        let mine = seats[0];
+
+        let own = members.coords().get(mine).copied().expect("the seat exists");
+        assert!(
+            Entitlement::open::<F4>(&record, own, epoch, &beacon).is_some(),
+            "a validator could not file a key at the seat it actually holds, so no committee can ever form"
+        );
+        for (seat, &point) in members.coords().iter().enumerate() {
+            if seat == mine {
+                continue;
+            }
+            assert!(
+                Entitlement::open::<F4>(&record, point, epoch, &beacon).is_none(),
+                "seat {seat}'s slot accepted a key entitled to seat {mine}: one validator can then file the \
+                 whole committee, and every certificate the parent checks is checked against keys it chose"
+            );
+        }
+    }
+
+    /// The committee slots are distinct across every axis they are keyed by, and domain-separated from the
+    /// health slots that sit one function away.
+    #[test]
+    fn committee_slots_separate_cell_seat_and_epoch() {
+        let base = committee_slot(3, 2, Epoch::new(7));
+        assert_ne!(base, committee_slot(4, 2, Epoch::new(7)), "two cells share a seat slot");
+        assert_ne!(base, committee_slot(3, 5, Epoch::new(7)), "two seats of one cell share a slot");
+        assert_ne!(base, committee_slot(3, 2, Epoch::new(8)), "two epochs share a slot");
+        assert!(
+            base.starts_with(b"FANOS-v1/cell-committee/"),
+            "the domain tag is what keeps this out of every other directory's key space"
+        );
+        assert_ne!(base, health_slot(3, Epoch::new(7)), "committee and health slots collide");
     }
 
     #[test]
