@@ -131,25 +131,52 @@ impl ExecCertificate {
     /// merely being caught by a downstream comparison someone could omit.
     #[must_use]
     pub fn verify(&self, quorum: usize, verifiers: &[HybridVerifier]) -> bool {
-        let mut seen = alloc::vec![false; verifiers.len()];
+        self.verify_by(quorum, verifiers.len(), |i| verifiers.get(i))
+    }
+
+    /// [`verify`](Self::verify) over a committee that may have **holes** — `seats` is how many validator
+    /// indices exist, and `key(i)` is seat `i`'s verifier when it is known.
+    ///
+    /// **Why a hole is not a rejection.** `Q` of `n` means a certificate is sound as soon as `Q` signatures
+    /// check out; the other `n − Q` seats need not even have voted. A parent that has learned five of seven
+    /// keys can therefore verify a five-vote certificate completely, and refusing it because two keys are
+    /// missing would make the quorum's own tolerance unusable — which is what a dense `Vec<HybridVerifier>`
+    /// forces, since it cannot express "seat 3 unknown" at all.
+    ///
+    /// So an in-range vote with no key **contributes nothing** rather than invalidating the certificate: it
+    /// is a vote this reader cannot check, and an unchecked vote is not evidence. It still claims its seat,
+    /// so a duplicate voter is caught exactly as before, and padding a certificate with unverifiable votes
+    /// therefore buys an attacker nothing.
+    ///
+    /// Out of range is still a **rejection**, and the two are deliberately not merged: a voter index that
+    /// names no seat of this committee is a malformed certificate, while a seat whose key this reader has not
+    /// learned is a fact about the reader.
+    #[must_use]
+    pub fn verify_by<'a>(
+        &self,
+        quorum: usize,
+        seats: usize,
+        key: impl Fn(usize) -> Option<&'a HybridVerifier>,
+    ) -> bool {
+        let mut seen = alloc::vec![false; seats];
         let mut count = 0usize;
         for v in &self.votes {
             if v.height != self.height || v.state_root != self.state_root || v.head != self.head {
                 return false;
             }
             let Some(slot) = seen.get_mut(usize::from(v.voter)) else {
-                return false;
+                return false; // names no seat of this committee
             };
             if *slot {
                 return false; // duplicate voter
             }
-            let Some(verifier) = verifiers.get(usize::from(v.voter)) else {
-                return false;
+            *slot = true; // claimed even when unverifiable, so duplicates stay caught
+            let Some(verifier) = key(usize::from(v.voter)) else {
+                continue; // a seat whose key this reader has not learned
             };
             if !v.verify(verifier) {
                 return false;
             }
-            *slot = true;
             count += 1;
         }
         count >= quorum

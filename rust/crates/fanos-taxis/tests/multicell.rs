@@ -238,7 +238,13 @@ impl<S: StateMachine + Clone> Cell<S> {
     }
 
     fn committee(&self, cell: u32) -> ChildCommittee {
-        ChildCommittee { cell, verifiers: self.verifiers.clone(), quorum: CellParams::FANO.quorum() }
+        // Every seat known — this fixture owns the whole cell's keys. `Some` per entry is what a *complete*
+        // committee looks like now that a hole is expressible; `hierarchy.rs` covers the partial case.
+        ChildCommittee {
+            cell,
+            verifiers: self.verifiers.iter().cloned().map(Some).collect(),
+            quorum: CellParams::FANO.quorum(),
+        }
     }
 }
 

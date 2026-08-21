@@ -520,17 +520,14 @@ pub fn spawn_seat_key_publisher<F: Field>(
     crate::supervise::supervise(crate::supervise::NodeActor::HealthPublisher, &supervised, task)
 }
 
-/// Assemble `cell`'s committee for `epoch` from its seven seat slots, or `None` if any seat is missing.
+/// Assemble `cell`'s committee for `epoch` from its seven seat slots — **whichever of them answered**.
 ///
-/// **Complete or nothing, and that is a property of `ChildCommittee` rather than a policy choice.** Its
-/// `verifiers` is a dense `Vec` indexed by validator index, so a hole cannot be expressed: a committee
-/// assembled from six seats would silently renumber the seventh's votes onto somebody else's key. The
-/// quorum tolerates absent *voters*, not absent *keys*.
-///
-/// **The residual, stated so the next pass does not rediscover it.** `Q = 5` of `7` means a certificate is
-/// checkable whenever the five that signed it have keys here — so a partial committee is genuinely usable
-/// and this refuses it. Expressing that needs `ChildCommittee::verifiers` to become sparse, which is a
-/// `fanos-taxis` wire-adjacent change and deliberately not made here.
+/// A seat that has not published is `None` rather than a reason to refuse the whole committee. `Q = 5` of
+/// `7` means a certificate is checkable as soon as the five that signed it have keys here, so refusing on
+/// any hole would make the quorum's own tolerance unusable; `ExecCertificate::verify_by` states what a hole
+/// means downstream — an unchecked vote is not evidence, and it still claims its seat so duplicates stay
+/// caught. `None` only when **no** seat answered, which is a cell that has published nothing rather than a
+/// committee with gaps.
 ///
 /// Each seat's record is opened against **its own** coordinate, never against the cell as a set: a key that
 /// only proves membership somewhere in the cell would let one validator file every seat.
@@ -543,14 +540,22 @@ pub async fn resolve_committee<F: Field>(
     let members = fano::cell_members_of::<F>(cell as usize)?;
     let mut verifiers = Vec::with_capacity(fano::N);
     for (seat, &point) in members.coords().iter().enumerate() {
-        let bytes = tokio::time::timeout(
+        let key = match tokio::time::timeout(
             STORE_TIMEOUT,
             client.get(committee_slot(cell, seat, epoch)),
         )
         .await
-        .ok()??;
-        let (_, payload) = Entitlement::open::<F>(&bytes, point, epoch, &beacon)?;
-        verifiers.push(HybridVerifier::decode(payload)?);
+        {
+            Ok(Some(bytes)) => Entitlement::open::<F>(&bytes, point, epoch, &beacon)
+                .and_then(|(_, payload)| HybridVerifier::decode(payload)),
+            // Silent, unreachable, or a record that does not open at this seat — all three are "this parent
+            // has not learned seat `seat`", and none of them is a statement about the child's other six.
+            _ => None,
+        };
+        verifiers.push(key);
+    }
+    if verifiers.iter().all(Option::is_none) {
+        return None; // the cell published nothing at all
     }
     Some(ChildCommittee { cell, verifiers, quorum: fanos_taxis::CellParams::FANO.quorum() })
 }

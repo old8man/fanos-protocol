@@ -35,8 +35,17 @@ use crate::checkpoint::ExecCertificate;
 pub struct ChildCommittee {
     /// The child cell's address in the hierarchy.
     pub cell: u32,
-    /// The child committee's validator verifying keys (index = validator index, as in the child's `ExecVote`).
-    pub verifiers: Vec<HybridVerifier>,
+    /// The child committee's validator verifying keys, **indexed by validator index** as in the child's
+    /// `ExecVote`, with `None` for a seat this parent has not learned.
+    ///
+    /// **Sparse, because `Q` of `n` is a tolerance a dense list cannot express.** A parent assembles this
+    /// from the child cell's per-seat directory records, and a seat that has not published yet is a fact
+    /// about the parent's reading rather than about the child. With `Vec<HybridVerifier>` the only options
+    /// were to refuse the whole committee — making a five-of-seven quorum unusable whenever two seats are
+    /// quiet — or to pad it, which would silently renumber every vote after the hole onto somebody else's
+    /// key. `ExecCertificate::verify_by` states what a hole means: an unchecked vote is not evidence, and it
+    /// still claims its seat so duplicates stay caught.
+    pub verifiers: Vec<Option<HybridVerifier>>,
     /// The child cell's Byzantine quorum `Q`.
     pub quorum: usize,
 }
@@ -75,7 +84,9 @@ impl ChildRegistry {
     /// forward). Rejects an unknown child, an invalid or sub-quorum certificate, or a stale/replayed height.
     fn attest(&mut self, cell: u32, cert: ExecCertificate) -> Option<(u64, [u8; 32])> {
         let committee = self.committees.get(&cell)?;
-        if !cert.verify(committee.quorum, &committee.verifiers) {
+        if !cert.verify_by(committee.quorum, committee.verifiers.len(), |i| {
+            committee.verifiers.get(i).and_then(Option::as_ref)
+        }) {
             return None; // not a genuine Q-quorum of this child
         }
         if self.attested.get(&cell).is_some_and(|c| cert.height <= c.height) {
@@ -124,7 +135,9 @@ impl ChildRegistry {
         if cert.height != prior.height || cert.state_root == prior.state_root {
             return None;
         }
-        if !cert.verify(committee.quorum, &committee.verifiers) {
+        if !cert.verify_by(committee.quorum, committee.verifiers.len(), |i| {
+            committee.verifiers.get(i).and_then(Option::as_ref)
+        }) {
             return None; // an unverified claim is not evidence
         }
         Some((cert.height, prior.state_root, cert.state_root))
@@ -150,13 +163,51 @@ mod tests {
                 HybridSigSecret::generate(&mut rng)
             })
             .collect();
-        let verifiers = ks.iter().map(|(_, v)| v.clone()).collect();
+        let verifiers = ks.iter().map(|(_, v)| Some(v.clone())).collect();
         (ks.into_iter().map(|(s, _)| s).collect(), ChildCommittee { cell, verifiers, quorum: 5 })
     }
 
     fn cert(height: u64, root: [u8; 32], secrets: &[HybridSigSecret], q: usize) -> ExecCertificate {
         let votes = (0..q).map(|i| ExecVote::sign(height, root, [0xEE; 32], i as u8, &secrets[i])).collect();
         ExecCertificate { height, state_root: root, head: [0xEE; 32], votes }
+    }
+
+    /// **A hole in the committee costs the votes it cannot check, and nothing else.**
+    ///
+    /// `Q` of `n` is a tolerance, and a dense `Vec<HybridVerifier>` could not express the state a parent is
+    /// actually in — five seats learned, two quiet. Refusing the whole committee there makes the quorum's own
+    /// tolerance unusable; padding it would renumber every vote after the hole onto somebody else's key.
+    ///
+    /// Three cases, because the middle one is the point and the outer two are what make it safe.
+    #[test]
+    fn a_committee_with_holes_verifies_what_it_can_and_refuses_what_it_cannot() {
+        let (secrets, committee) = child(3, 0x40);
+        let c = cert(9, [0xAB; 32], &secrets, 5);
+        let seats = committee.verifiers.len();
+
+        assert!(
+            c.verify_by(5, seats, |i| committee.verifiers.get(i).and_then(Option::as_ref)),
+            "a full committee must verify a five-vote certificate, or the two cases below prove nothing"
+        );
+
+        // Two seats unknown, and neither of them signed: the five that did are all checkable.
+        let mut quiet_seats = committee.verifiers.clone();
+        quiet_seats[5] = None;
+        quiet_seats[6] = None;
+        assert!(
+            c.verify_by(5, seats, |i| quiet_seats.get(i).and_then(Option::as_ref)),
+            "five signatures verified against five known keys is a quorum; refusing here would make a \
+             five-of-seven cell unratifiable whenever two of its seats are quiet"
+        );
+
+        // A seat that DID sign is unknown: that vote cannot be counted, and the quorum is one short.
+        let mut missing_signer = committee.verifiers.clone();
+        missing_signer[0] = None;
+        assert!(
+            !c.verify_by(5, seats, |i| missing_signer.get(i).and_then(Option::as_ref)),
+            "an unchecked vote was counted toward the quorum — a parent would then ratify on a signature it \
+             never verified, which is the whole thing a committee is for"
+        );
     }
 
     #[test]
