@@ -72,14 +72,20 @@
 //! a node never asks where anyone else *ended up*. That price was recorded on `settle_index` as **0.8 %**,
 //! measured at `PG(2,7)` load `0.53`, and it is not the price at the loads a deployment actually runs.
 //!
-//! **What removing it would require, and why it is not a small change.** Deferred acceptance is a fixed
-//! point of the whole claim set, so a node's seat is checkable only by someone holding that set — which is
-//! precisely what cell-wide claim propagation delivers, and which today reaches only direct connection
-//! partners. The two are one work item, not two. And `settle_index`'s *monotone in information* property
-//! does not survive: under this rule a node that learns of a new peer can be told to move **backwards**,
-//! where today it only ever advances to a position it can prove. That regression is unmeasured, and this
-//! example measures the complete-knowledge fixed point only — it says what the change is worth, not that
-//! the change is safe.
+//! **What removing it would require.** Deferred acceptance is a fixed point of the whole claim set, so a
+//! node's seat is checkable only by someone holding that set — which is precisely what cell-wide claim
+//! propagation delivers, and which today reaches only direct connection partners. The two are one work
+//! item, not two, and `partial_knowledge_placement.rs` has the row that proves it: quadrupling what a node
+//! knows moves the shipping rule 6.0 → 9.3 → 9.3 → 7.7 % and deferred acceptance 9.3 → 40.3 → 75.0 →
+//! 97.7 %.
+//!
+//! ⛔ **This paragraph also claimed the change gives up `settle_index`'s *monotone in information*
+//! property — that a node learning of a new peer could be told to move backwards. It does not.** Measured
+//! the same day at **zero** backward moves in twelve configurations, both rules, ≈ 30 000 draws, against up
+//! to 13.68 forward moves per trial; and Gale–Shapley's comparative static says it must be zero, since
+//! adding a proposer weakly worsens every other proposer and a node's preference order is its walk order.
+//! The costs that survive measurement are the verification one above and about **a fifth more doubly-held
+//! points** while views disagree.
 //!
 //! **And the required load is not a constant multiple of `N`.** Coverage at a fixed multiple *falls* as the
 //! plane grows (74.5 % against 7.5 % at the same `1.5 N` under the shipping rule), which is the

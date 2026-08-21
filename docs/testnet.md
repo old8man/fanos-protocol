@@ -116,10 +116,24 @@ walks, reads:
 **Nothing in the advice above changes.** Sixteen is still what the shipping code needs, and a deployment
 should size to the rule that ships, not to one that does not. What changes is *why*: the sixteen are buying
 back a property of the arbitration, not working around the shape of the plane — so "more members" is one
-answer and not the only one. The other is not a small change and is not proposed here: deferred acceptance
-is a fixed point of the whole epoch's claim set, so it needs cell-wide claim propagation (which today
-reaches direct connection partners only), and it gives up the guarantee that a node learning of a new peer
-only ever moves *forward*.
+answer and not the only one.
+
+The other answer is a protocol change and is not proposed in this document, but the case for it is now
+measured on a **partial** view as well (`fanos-vrf/examples/partial_knowledge_placement.rs`), which is the
+regime a live cell is in — the claim book reads about half the cell:
+
+| `PG(2,4)`, 31 nodes | a quarter of claims seen | half | three quarters | all |
+|---|---|---|---|---|
+| shipping rule | 6.0 % | 9.3 % | 9.3 % | 7.7 % |
+| deferred acceptance | 9.3 % | **40.3 %** | **75.0 %** | **97.7 %** |
+
+Quadrupling what a node knows buys the shipping rule three points and then gives one back. That is the
+phantom yield again: each new claim it learns is a fresh reason to move rather than a seat. **So cell-wide
+claim propagation and the rule change are one work item — either alone is worth little.** What the change
+costs, measured: about a fifth more points held by two nodes at once while views disagree, and a seat that
+is checked by recomputing from the epoch's claim set rather than from a witness chain. An earlier revision
+of this section also listed "a node can be told to move backwards"; that was **wrong** — measured at zero
+over ~30 000 draws, and Gale-Shapley's own comparative static says it cannot happen.
 
 Sixteen has not been run live; what stands behind it is the ceiling above, plus the one load where the live
 cell was measured against that ceiling and matched it.

@@ -472,14 +472,22 @@ pub fn displacement_is_forced<F: Field>(
 ///   question, not a correctness one, since every intermediate position is one it can prove. Re-run it whenever the peer
 ///   set changes or the beacon advances.
 ///
-/// **What the three cost, and where the fourth property went.** A contender's claim to `p` is honoured here whether or
-/// not that contender ends up on `p` — the *phantom yield* — and that is not an oversight but the price of the three
-/// above: asking "did they actually take it" makes the predicate a question about someone else's outcome, and the
-/// witness chain recursive. It is also the dominant term in a cell's occupancy at deployment loads: removing exactly it
-/// takes `PG(2,4)` at `1.5 N` from **7.5 % to 97.5 %** of draws clearing the line-viability floor
-/// (`examples/line_confinement_coverage.rs`). Before treating that as a defect, read the fourth bullet that would have
-/// to go: deferred acceptance is a fixed point of the *whole* claim set, so a node can be told to move **backwards**
-/// when it learns of a new peer, and its seat is checkable only by a verifier holding the same set.
+/// **What the three cost.** A contender's claim to `p` is honoured here whether or not that contender ends up on `p` —
+/// the *phantom yield* — and that is not an oversight but the price of the first and third above: asking "did they
+/// actually take it" makes the predicate a question about someone else's outcome, and the witness chain recursive. It
+/// is also the dominant term in a cell's occupancy at deployment loads: removing exactly it takes `PG(2,4)` at `1.5 N`
+/// from **7.5 % to 97.5 %** of draws clearing the line-viability floor (`examples/line_confinement_coverage.rs`), and
+/// on the **partial** views a live cell actually holds, from 9.3 % to 40.3 % at half the claims seen and 75.0 % at
+/// three quarters (`examples/partial_knowledge_placement.rs`).
+///
+/// ⛔ **The third bullet is not a distinguishing property, and this doc said it was.** It read *"deferred acceptance …
+/// so a node can be told to move backwards when it learns of a new peer"*. Measured: **zero** backward moves in all
+/// twelve rows of `partial_knowledge_placement.rs`, both rules, ≈ 30 000 draws, while forward moves reach 13.68 nodes
+/// per trial. Gale–Shapley's comparative static says it must be zero — adding an agent to the *proposing* side weakly
+/// worsens every other proposer, and a node's preference order is its walk order. What genuinely separates the two
+/// rules is the **second** bullet's neighbour: a deferred seat is a fixed point of the whole claim set and is checked
+/// by recomputing from that set, where this rule needs at most `q + 1` witnesses and nothing else. The measured price
+/// of the change is about a fifth more doubly-held points while views disagree.
 ///
 /// The walk is bounded by [`probe_bound`] — the line's length — since [`probe_point`] cycles through exactly that many
 /// points. Past it every point of the node's line is better claimed and it cannot be seated at all, which is the honest
