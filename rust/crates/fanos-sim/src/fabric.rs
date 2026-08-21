@@ -3377,8 +3377,45 @@ mod tests {
     /// the *same number* as that ceiling's 74.5 % clearing — so this fixture is not falling short of the
     /// geometry, it is sitting on it.
     ///
-    /// What is still open at 19 %: claims reach only direct connection partners, and in a projective plane
-    /// every two lines meet, so every node contends for exactly one point of every other node's line.
+    /// ⛔ **That agreement was a coincidence of two wrong things, and the section below replaces it.** The
+    /// live path no longer runs `settle_index`, so the ceiling to compare against is the deferred rule's
+    /// (99.2 % at `1.5 N`), and the live shortfall was not the rule at all — it was two mechanical defects,
+    /// both fixed on 2026-08-21.
+    ///
+    /// ## 2026-08-21 — three runs on the deferred rule, and what each of them settles
+    ///
+    /// Samples below the line-viability floor, out of 36 per load (three cores of sixteen busy with a
+    /// neighbour's work; each run is **one draw** per load, which is what bounds what the last column says):
+    ///
+    /// | load | shipping rule (baseline) | + re-judge on the beacon | + settling floor |
+    /// |---|---|---|---|
+    /// | `n = 7` | **30** | 19 | 21 |
+    /// | `n = 10` | — | 7 | 11 |
+    /// | `n = 16` | 0 | 0 | 0 |
+    ///
+    /// **The first fix is signal.** At `n = 7` the baseline reaches 6 of 7 points during the joining phase
+    /// and drops to 5 at the first boundary *for the rest of the run*, with every book stalled at 3–5 of 6
+    /// and every `probe_index` at 0. A peer's new-epoch `HELLO` arrives before this node has the beacon, is
+    /// parked as `EpochUnknown`, and `rejudge_pending` was reached only from *the peer's next frame* — which
+    /// a settled cell never sends. Re-judging on `BeaconReady` closes that, and the cell **recovers** after a
+    /// boundary instead of staying short.
+    ///
+    /// **The second is a mechanism improvement with no occupancy improvement, said plainly.** The settling
+    /// floor does what it targets — at `n = 10` after a boundary, `probe_index` goes from
+    /// `[2,0,0,0,-1,0,0,0,0,0]` (one node walking, one with no seat at all) to `[0,0,0,0,0,0,1,1,0,1]` (three
+    /// walking, none stranded) with fuller books — and the below-floor count moved the wrong way by an amount
+    /// a single draw cannot distinguish from noise. It is kept on the mechanism and the derivation, not on
+    /// this table. **What would settle it is more draws per load**, which is the instrument change this
+    /// fixture owes: it measures one draw over six boundaries, and the question is a distribution.
+    ///
+    /// **And the sizing recommendation therefore does NOT drop to `1.5 N`.** The enumeration prices the
+    /// deferred rule at 99.2 % clearing there, and the live cell at `n = 10` clears 69–81 % — so recommending
+    /// ten would promise what a running node does not deliver. `members_for_a_covered_plane` stays at 16,
+    /// where the live cell measures 0 below floor across every run above, and the gap between 10 and its own
+    /// ceiling is the open question rather than the constant.
+    ///
+    /// What is still open besides that: claims reach only direct connection partners, and in a projective
+    /// plane every two lines meet, so every node contends for exactly one point of every other node's line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary() {
@@ -3401,7 +3438,13 @@ mod tests {
         let sized = fanos_geometry::members_for_a_covered_plane(
             fanos_geometry::Plane::<F2>::LINE_SIZE as usize,
         );
-        for count in [n_points, sized] {
+        // **Three loads, and the middle one is the question.** `n_points` is one node per point — the load a
+        // seven-operator testnet founds at — and `sized` is what the geometry crate currently recommends. The
+        // load between them is `1.5 N`, which the enumeration at complete knowledge prices at **99.2 %** of
+        // draws clearing the floor under the deferred rule (`fanos-vrf/examples/line_confinement_coverage.rs`).
+        // If the live cell reaches that there, the recommendation is `1.5 N`; if only `sized` holds, the extra
+        // members are buying something the rule does not, and the reason is worth naming.
+        for count in [n_points, 3 * n_points / 2, sized] {
             let fleet = match NodeFleet::spawn_as_drawn_with_epoch::<F2>(count, Link::ideal(), roles, period).await {
                 Ok(f) => f,
                 Err(e) => {

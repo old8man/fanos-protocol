@@ -2146,6 +2146,7 @@ where
             beacon: genesis_seed,
             settling: Arc::clone(&handle.settling),
             walk_after: None,
+            settle_floor: None,
             rounds: 0,
             addressed: None,
             deep: Vec::new(),
@@ -2384,6 +2385,23 @@ struct Placement {
     /// contains a walk with room to spare — see the ceiling that implies: `epoch >= (q+1) · HELLO_DEADLINE`
     /// caps the plane at `q = 59` for the 600 s default.
     walk_after: Option<tokio::time::Instant>,
+    /// **The earliest the settling window may close** — the floor under the layer above's `commit_seat`.
+    ///
+    /// `Placement::settling` is re-entered at every boundary and closed by `Client::commit_seat` when the cell can
+    /// read this node's placement. That fact arrives *fast* — the role loop finds its own advertisement within a
+    /// refresh — and it is not the fact the rule needs: at a boundary every claim book in the cell was just cleared,
+    /// so a node can commit before it has heard the peer that outranks it, and the established arm then forbids the
+    /// very move that would resolve the contest. Measured on `PG(2,2)` at `n = 10` with books refilled to 7–8 of 9:
+    /// **every** node reading `probe_index = 0` while seven of them shared five points.
+    ///
+    /// The floor is the walk's own bound rather than a chosen delay: a step is rate-limited to
+    /// [`HELLO_DEADLINE`] (a peer learns a new seat by completing a handshake, and that is this driver's bound on
+    /// how long one may take) and there are `probe_bound = q + 1` of them, so `(q + 1) · HELLO_DEADLINE` is how long
+    /// resolution can take on this plane — 30 s at `q = 2`, inside every epoch period this build ships.
+    ///
+    /// It re-opens the window rather than refusing the commit, because the commit is a true statement (the cell
+    /// *can* read this node) and the window is the thing that was wrong. `None` before the first boundary.
+    settle_floor: Option<tokio::time::Instant>,
     /// Resettle rounds spent in the current window, bounded by the walk itself.
     ///
     /// **The window needs a floor as well as a door, and the first version had only a door.** Closing on
@@ -2775,6 +2793,13 @@ async fn reshuffle_loop<F: Field>(
             },
             () = book.changed() => Wake::Resettle,
         };
+        // **Hold the settling window open until the floor passes**, whoever closed it. `commit_seat` closes it on a
+        // true statement — the cell can read this node — that is simply not the question at a boundary, where every
+        // book in the cell was just emptied and a node can commit before it has heard the claim that outranks it.
+        // Re-opened here rather than refused there, because the layer that knows the floor is this one.
+        if at.settle_floor.is_some_and(|until| tokio::time::Instant::now() < until) {
+            at.settling.store(true, Ordering::Release);
+        }
         match wake {
             Wake::Beacon(epoch, seed) => {
                 // Rotate the PROTEUS wire shape to the new epoch FIRST (§13.4 moving target): the polymorphism
@@ -2826,6 +2851,9 @@ async fn reshuffle_loop<F: Field>(
                 // third of them for good. `Station::SeatCommitted` moved with the fact it reports, to
                 // `Client::commit_seat`, where the commitment actually happens.
                 at.settling.store(true, Ordering::Release);
+                // The window may not close again until the walk's own bound has passed — see `settle_floor`.
+                at.settle_floor =
+                    Some(tokio::time::Instant::now() + HELLO_DEADLINE * u32::from(fanos_vrf::probe_bound::<F>()));
                 at.rounds = 0;
                 at.walk_after = None;
                 // Every claim in the book was just discarded, so every member is worth asking again — and the
@@ -4756,7 +4784,12 @@ enum PeerIdentity {
     Ourself,
 }
 
-/// Tell every live peer when this node moves, by re-sending its (already updated) `HELLO` on each open connection.
+/// **Keep both directions of the coordinate view current across a change**: tell every live peer when this node moves
+/// (by re-sending its already-updated `HELLO` on each open connection), and re-judge every peer `HELLO` this node had to
+/// park because it could not yet judge the epoch (when the beacon that decides them arrives).
+///
+/// One task rather than two because the two are the same event seen from opposite ends — a placement changed, and
+/// somebody's view of it is stale — and because both need the `Transport` rather than the engine.
 ///
 /// The other half of `read_frames`' `Hello` arm. A move is only useful if the peers this node already has hear about it:
 /// they hold the connection filed under the coordinate proved at handshake time, and nothing else would ever correct it.
@@ -4768,6 +4801,37 @@ enum PeerIdentity {
 async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notification>) {
     loop {
         match events.recv().await {
+            // **A HELLO held back for an epoch this node could not judge is re-judged when the beacon
+            // arrives — and until 2026-08-21 nothing did that.**
+            //
+            // `rejudge_pending` was reached from one place: the next frame to arrive on that connection
+            // (`read_frames`). So the retry needed the *peer* to speak again, while the thing that made the
+            // retry possible was the *local* beacon. In a cell that has finished connecting, the peer has
+            // nothing more to say — it announced its new placement once, at the boundary, before this node
+            // had the beacon to check it — and the entry then sat in `pending_hello` for the whole epoch.
+            //
+            // Measured, and this is what made it visible: on `PG(2,2)` at one node per point the joining
+            // phase reaches **6 of 7 points and 7 of 7 servable lines**, the first boundary drops it to
+            // **5 and 6**, and it never recovers — with every node's `probe_index` back at 0 and its claim
+            // book stalled at 3–5 of 6 peers for the rest of the run
+            // (`fanos_sim::fabric::measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary`).
+            // A book that never fills is a node that never walks, so the cell settles by first draw and
+            // sits below its own line-viability floor.
+            //
+            // The sweep is bounded by the live connections (`pending_hello` is keyed by them and
+            // `forget_pending` clears a closed one), and each entry costs a map lookup while it still cannot
+            // be judged — `verify` answers `EpochUnknown` from a window lookup before any signature check.
+            Ok(Notification::BeaconReady { .. }) => {
+                let peers: Vec<(Triple, Connection)> = match t.conns.lock() {
+                    Ok(map) => map.iter().flat_map(|(&c, v)| v.iter().cloned().map(move |conn| (c, conn))).collect(),
+                    Err(_) => continue,
+                };
+                for (known, conn) in peers {
+                    if let Some(moved) = rejudge_pending(&t, &conn, known) {
+                        apply_move(&t, &conn, known, moved);
+                    }
+                }
+            }
             Ok(Notification::Reseated { .. }) => {
                 let Some(hello) = t.identity.as_ref().and_then(|id| id.hello.read().ok().map(|h| h.clone())) else {
                     continue;
@@ -6473,6 +6537,7 @@ mod tests {
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
             walk_after: None,
+            settle_floor: None,
             rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
@@ -6579,6 +6644,7 @@ mod tests {
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
             walk_after: None,
+            settle_floor: None,
             rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
