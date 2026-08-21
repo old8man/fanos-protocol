@@ -3000,6 +3000,21 @@ const KEYGEN_PHASES: u32 = 3;
 /// [`KEYGEN_PHASE_MS`] as the engine's span type.
 const KEYGEN_PHASE: fanos_runtime::Duration = fanos_runtime::Duration::from_millis(KEYGEN_PHASE_MS);
 
+/// `fanos keygen --roster FILE --threshold T --out FILE` — run the founding DKG ceremony and write this
+/// founder's beacon parameters.
+///
+/// Every founder runs this against the **same** roster file and threshold, and each ends holding its own
+/// share of one group key: the beacon the whole network's epochs are drawn from. The roster is read as a
+/// *set* — the canonical name is computed from its lines sorted — so two founders whose files differ only in
+/// order are provisioning the same network rather than two that will never agree.
+///
+/// The identity is this founder's long-term one (`--identity`, or generated), which is the same identity
+/// `fanos node` runs on: the coordinate the ceremony seats it at is the coordinate it holds afterwards.
+///
+/// **This doc is here because its absence is indistinguishable from an orphaned one.** Inserting a function
+/// between a doc and its owner re-points that doc at the newcomer silently and leaves the owner bare, which
+/// is what `every_function_in_the_node_binary_is_documented` watches for (#318) — and this function was one
+/// of the sites it had been reporting.
 async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
     use fanos_keygen::DkgNode;
     use fanos_node::keygen::DkgCeremony;

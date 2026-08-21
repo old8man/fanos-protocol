@@ -431,7 +431,16 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // descriptor spends a stranger's bandwidth and touches the store on their schedule, and that is a
     // product decision for whoever designs the messenger's UX — not something to settle so a counter goes
     // down. The pure core is exercised by three tests including a manifest-substitution refusal.
-    ("fanos-node", 44),
+    // 44 → 45 (2026-08-21), with the reason the rule requires: `crosscell_dir::resolve_committee` assembles a
+    // child cell's committee from its per-seat directory records, which is the artefact whose absence was the
+    // fourth recorded reason for leaving every cross-cell publisher unwired. Its **publisher** is wired (the
+    // validator files its own seat's key each epoch); its reader is not, and cannot be, because nothing
+    // derives *which cells are a parent's children*. The arithmetic in `crosscell_dir`'s header says they
+    // cannot be cells of one plane at all — `federation::CHILDREN` is 7 while a plane holds `N / 7` of them,
+    // which is 1, 3 or 39 — so they are hierarchy sub-cells whose addresses are `HierAddr` paths, and a flat
+    // `cell: u32` cannot name a path. Wiring a reader would mean inventing that keying to satisfy a counter,
+    // which is the one thing this ratchet must never reward.
+    ("fanos-node", 45),
     ("fanos-nyx", 21),
     ("fanos-obolos", 11),
     ("fanos-observatory", 2),

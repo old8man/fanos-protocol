@@ -3460,6 +3460,11 @@ struct Distrust {
 }
 
 /// A peer's stable identity: the hash of the certificate its coordinate proof is bound to.
+/// A peer's stable identity: the hash of the certificate its coordinate proof is bound to.
+fn identity_of(cert_der: &[u8]) -> [u8; 32] {
+    fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::NODE_ID, cert_der)
+}
+
 /// Tell the engine which identity the transport just proved at `coord` — see [`Command::PeerHandshaken`].
 ///
 /// **Called from both ends of every handshake, and that is why it is a function.** The dialer proves its
@@ -3484,10 +3489,6 @@ fn tell_engine_who_was_proved(t: &Transport, coord: Triple, conn: &Connection) {
             .send(Input::Command(Command::PeerHandshaken { coord, identity }))
             .await;
     });
-}
-
-fn identity_of(cert_der: &[u8]) -> [u8; 32] {
-    fanos_primitives::hash::hash_labeled(fanos_primitives::hash::label::NODE_ID, cert_der)
 }
 
 impl Distrust {
@@ -5305,7 +5306,6 @@ async fn read_hello(conn: &Connection, t: &Transport) -> Option<Triple> {
     decode_triple(bytes.get(..HELLO_LEN)?)
 }
 
-/// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
 impl Transport {
     /// Whether frames to this peer must go out under the genesis shape: it reached us not knowing the live
     /// epoch, and until the handshake ends it cannot read anything else (#234).
@@ -5332,6 +5332,12 @@ impl Transport {
     }
 }
 
+/// Read every uni-stream on `conn` as one frame, un-shaping it, delivering `Input::Message`.
+///
+/// **The doc was sitting above the `impl Transport` block between here and its caller**, which is what an
+/// orphaned doc looks like from the outside: Rust attaches it to whatever comes next, and the function it
+/// described reads as undocumented. `no_crate_gains_an_undocumented_free_function` is the guard for exactly
+/// that shape, and this was one of the sites it had been reporting.
 async fn read_frames(conn: Connection, from: Triple, t: Transport) {
     // Mutable because a peer may **move**: a coordinate is not fixed for the life of a connection (spec §L3 reshuffle, and
     // within an epoch when a better claim displaces the peer). A verified move re-keys this connection and re-attributes

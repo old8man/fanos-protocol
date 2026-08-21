@@ -72,7 +72,7 @@
 //! At `q = 2` a parent has no siblings at all; at `q = 4` there are two other cells and the covering's seven
 //! slots cannot be filled; at `q = 16` there are 39 and **nothing says which seven**. So the federation's
 //! children are not the plane's cells — they are sub-cells of the *hierarchy*, whose addresses are
-//! `HierAddr` paths (`docs/design-hierarchy.md`, and `fanos_geometry::derive_address`).
+//! `HierAddr` paths (`docs/design-hierarchy-recursion.md`, and `fanos_geometry::derive_address`).
 //!
 //! And a `HierAddr` path is exactly what a flat `cell: u32` cannot name. So the key space these directories
 //! use is one level below the relation they exist to serve, and closing that is a **design** step — pick how
