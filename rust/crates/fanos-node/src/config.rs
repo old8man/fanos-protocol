@@ -94,8 +94,16 @@ pub const fn largest_plane_order_that_settles(epoch: Duration, step: Duration) -
 /// derivation becoming unbuildable, and it has stayed unbuildable since.
 ///
 /// There is nowhere to port it. `Node::start` dispatches only `q ∈ {2, 4, 7, 31}`, and Fano — the sole
-/// dispatchable plane whose `depth_for` still reaches 2 — has `K = 2` distinct-combiner circuits, so its
-/// linkability floor is `1/2`: a knee sweep there *starts at chance* and cannot discriminate a schedule.
+/// dispatchable plane whose `depth_for` still reaches 2 — supports `K = 3` concurrent circuits, so its
+/// linkability floor is `1/3`: a knee sweep there *starts at chance* (an adversary choosing among `K` is
+/// right `1/K` of the time by guessing) and cannot discriminate a schedule.
+///
+/// ⛔ **This read `K = 2` and `1/2` until 2026-08-21 — the fifth surviving copy of the member-zero combiner
+/// map's figures.** The digest map replaced it and gives **6 of 7** lines distinct combiners, hence `K = 3`;
+/// the guard on that map asserted only `|image| > f`, which cannot tell one map from another, so the
+/// superseded number outlived it in four places that were corrected on 2026-08-18 — and in this one, in the
+/// same file as the corrected copy at `plane_order`. The conclusion above is unchanged: the sweep still
+/// starts at chance, because chance *is* `1/K`.
 ///
 /// So by UHM's own name for it this is a **fossil**: a constant with no incoming observations is a fixed
 /// point of any transmission chain, because its only source is itself. The discipline that rule prescribes
