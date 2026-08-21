@@ -53,7 +53,33 @@
 //! `degraded` mask off the liveness watch the role loop already runs. Five reasons, all closed; what stands
 //! below is work rather than a rule.
 //!
-//! Two smaller things remain, and neither is a missing rule:
+//! ## The next blocker is a level up, and it IS a missing rule
+//!
+//! Everything above is about a cell publishing and a parent reading. What nothing in this workspace derives
+//! is **which cells are a parent's children** — there is no `children_of`, no `parent_of`, and no rule that
+//! produces the seven `cell: u32` values [`diagnose_children`] takes as an argument.
+//!
+//! The arithmetic says they cannot be cells of one plane. `federation::CHILDREN` is `fano::N` = **7**, while
+//! a plane holds `cells_in = N / 7` of them:
+//!
+//! | `q` | points | cells |
+//! |---|---|---|
+//! | 2 | 7 | **1** |
+//! | 4 | 21 | **3** |
+//! | 8 | 73 | none — 7 ∤ 73 |
+//! | 16 | 273 | 39 |
+//!
+//! At `q = 2` a parent has no siblings at all; at `q = 4` there are two other cells and the covering's seven
+//! slots cannot be filled; at `q = 16` there are 39 and **nothing says which seven**. So the federation's
+//! children are not the plane's cells — they are sub-cells of the *hierarchy*, whose addresses are
+//! `HierAddr` paths (`docs/design-hierarchy.md`, and `fanos_geometry::derive_address`).
+//!
+//! And a `HierAddr` path is exactly what a flat `cell: u32` cannot name. So the key space these directories
+//! use is one level below the relation they exist to serve, and closing that is a **design** step — pick how
+//! a path is keyed, and how a parent enumerates its children — rather than the wiring the five entries above
+//! turned out to be.
+//!
+//! Two smaller things remain beside it, and neither is a missing rule:
 //!
 //! * Nothing in a shipped binary yet *runs* [`publish_seat_key`] / [`resolve_committee`]. A validator has to
 //!   publish its consensus verifying key each epoch beside the keys it already publishes, and a parent has to
