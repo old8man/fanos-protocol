@@ -44,7 +44,7 @@ use tokio::task::JoinHandle;
 
 use crate::DIRECTORY_SLOT_EPOCHS;
 use crate::bound::Entitlement;
-use crate::capdir::cell_cap_coords;
+use crate::capdir::plane_cap_coords;
 use crate::resolve::{Coverage, STORE_TIMEOUT, Read, resolve_directory};
 
 /// The overlay store slot a node's per-epoch load report lives at — domain-separated, keyed by coordinate and
@@ -238,7 +238,7 @@ pub(crate) async fn build_cell_setpoint<F: Field>(
     capacity: Demand,
     beacon: Option<BeaconSeed>,
 ) -> (Demand, Coverage) {
-    let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+    let scan = resolve_directory(client, plane_cap_coords::<F>(), move |client, coord| async move {
         read_load::<F>(&client, coord, epoch, beacon).await
     })
     .await;

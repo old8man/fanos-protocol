@@ -865,7 +865,7 @@ fn answer_control<N: Controllable>(
                 } else {
                     None
                 };
-                let coords = fanos_node::telemetry_dir::cell_telemetry_coords::<F2>();
+                let coords = fanos_node::telemetry_dir::plane_telemetry_coords::<F2>();
                 let census = fanos_node::telemetry_dir::take_census::<F2>(
                     &client,
                     &coords,

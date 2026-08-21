@@ -215,9 +215,20 @@ pub async fn read_coherence<F: Field>(
     )
 }
 
-/// Every point of the base cell of plane `F` — the coordinate list a monitor resolves telemetry over.
+/// Every point of **plane `F`** — the coordinate list a monitor resolves telemetry over.
+///
+/// **It was called `plane_telemetry_coords` and documented as "every point of the base cell", and it has
+/// always returned the plane.** On `PG(2,2)` those are the same seven points, so the name was true where
+/// anyone had run it and false everywhere else — the exact shape of confusion that cost a long
+/// investigation elsewhere in this tree, where a constructor documented as being about the reflex was
+/// narrowing the store.
+///
+/// The plane is the right set and the name is what changed. A census exists to compare **cells** (`Census`
+/// groups by `CellId` and refuses a network verdict from one cell, #280), and a scan restricted to the
+/// caller's own cell could never see a second one — it would report "one cell answered" as a fact about the
+/// network when it is a fact about the scan.
 #[must_use]
-pub fn cell_telemetry_coords<F: Field>() -> Vec<Coord> {
+pub fn plane_telemetry_coords<F: Field>() -> Vec<Coord> {
     (0..Plane::<F>::N as usize).map(|i| fanos_geometry::Point::<F>::at(i).coords()).collect()
 }
 
@@ -412,7 +423,7 @@ mod tests {
     fn the_monitor_roster_is_the_whole_cell() {
         // Every point is a potential publisher, so a monitor reads the plane rather than a configured list — the same
         // derivation `capdir`/`mixdir` use, for the same reason: a hand-written roster is a roster that goes stale.
-        let coords = cell_telemetry_coords::<F2>();
+        let coords = plane_telemetry_coords::<F2>();
         assert_eq!(coords.len(), Plane::<F2>::N as usize, "all seven points of the Fano cell");
         assert_eq!(coords.iter().collect::<std::collections::HashSet<_>>().len(), coords.len(), "and distinct");
     }
@@ -479,7 +490,7 @@ mod tests {
 ///
 /// The population asked is a list of *coordinates*, and what comes back describes a *cell* — those are
 /// different things, and conflating them is how this type first shipped. `fanos census` polls
-/// [`cell_telemetry_coords`], "every point of the base cell"; every one of those nodes publishes a frame
+/// [`plane_telemetry_coords`], every point of the plane; every one of those nodes publishes a frame
 /// about the cell it belongs to; and `overlay::cell_id` is a pure function of `(genesis, plane order)`, so
 /// "every node in the cell derives the same id". Seven readings, one cell. Counting them as seven let a
 /// four-of-seven majority **inside one cell** print as `NETWORK`, which is the precise opposite of what an
@@ -998,7 +1009,7 @@ mod census_tests {
     /// **The census must not answer "my cell or the network?" from one cell's members.**
     ///
     /// This is the exact population the shipped CLI polls: `fanos.rs` passes
-    /// [`cell_telemetry_coords`], whose own doc says "every point of the base cell" and whose test is named
+    /// [`plane_telemetry_coords`], which returns every point of the plane and whose test is named
     /// `the_monitor_roster_is_the_whole_cell`. Every one of those nodes publishes a frame describing *its
     /// cell*, and `overlay::cell_id` is a pure function of `(genesis, plane order)` — "every node in the cell
     /// derives the same id". So the seven slots hold seven opinions about **one** cell, and folding them as

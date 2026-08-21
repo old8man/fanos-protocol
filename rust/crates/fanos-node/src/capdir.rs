@@ -203,10 +203,19 @@ fn note_authentication<T>(
     parsed
 }
 
-/// The role-assignment **roster** of the base cell of plane `F`: every one of its `N` points — the same
-/// coordinate list the mix roster uses, since every cell member is a candidate for every role.
+/// The role-assignment **roster** — every point of plane `F`, which is the same coordinate list the mix
+/// roster uses, since every occupant of the plane is a candidate for every role.
+///
+/// **It was called `plane_cap_coords` and documented as "the base cell of plane `F`", and it has always
+/// returned the plane.** `Plane::<F>::N` is the plane's point count: seven on `PG(2,2)`, where a cell and
+/// the plane coincide and the name was true, and twenty-one on `PG(2,4)`, where they do not.
+///
+/// The plane is the right set, and the name is what changed. Roles are plane-scoped by the same argument the
+/// store is: `servable_lines` counts the plane's lines, an onion hop is a gather on one of them, and a
+/// coverage deficit is reported in points of the plane. The **cell** is the unit the reflex diagnoses and the
+/// unit consensus votes in; it is not the unit roles are drawn over.
 #[must_use]
-pub fn cell_cap_coords<F: Field>() -> Vec<Coord> {
+pub fn plane_cap_coords<F: Field>() -> Vec<Coord> {
     (0..Plane::<F>::N as usize).map(|i| Point::<F>::at(i).coords()).collect()
 }
 
@@ -231,7 +240,7 @@ pub(crate) async fn build_capability_directory<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> (Vec<(NodeId, Capability)>, Seating, BTreeSet<usize>, Coverage) {
-    let scan = resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+    let scan = resolve_directory(client, plane_cap_coords::<F>(), move |client, coord| async move {
         read_capability::<F>(&client, coord, epoch, beacon).await
     })
     .await;
@@ -394,6 +403,37 @@ pub fn spawn_capability_publisher(
 #[cfg(test)]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// **A coordinate list named for a cell must not return the plane**, and two of them did.
+    ///
+    /// `PG(2,2)` is one cell of seven points, so "the base cell" and "the plane" are the same list wherever
+    /// anyone had run these — and different everywhere else. That is the shape of confusion that cost this
+    /// tree a long investigation once already, where a constructor documented as being about the reflex was
+    /// narrowing the store's neighbour set.
+    ///
+    /// Asserted on `F4`, because `F2` cannot tell the two apart: the test would pass on a function that
+    /// returned either.
+    #[test]
+    fn the_roster_lists_the_plane_and_says_so() {
+        use fanos_field::{F2, F4};
+        assert_eq!(
+            plane_cap_coords::<F2>().len(),
+            7,
+            "on the Fano plane the two readings coincide — which is why this test needs the one below"
+        );
+        let plane = plane_cap_coords::<F4>();
+        assert_eq!(
+            plane.len(),
+            21,
+            "the roster is every point of the plane; a cell is seven of them, and a function that returned \
+             seven here would be a cell wearing the roster's name"
+        );
+        let cell = fanos_geometry::fano::cell_members_of::<F4>(0).expect("PG(2,4) splits");
+        assert!(
+            cell.coords().iter().all(|c| plane.contains(c)),
+            "and it contains every cell, or a member of one could not be assigned a role at all"
+        );
+    }
+
     use super::*;
     use fanos_core::roles::{Role, RoleSet};
     use fanos_field::{F2, F7};
@@ -609,7 +649,7 @@ mod tests {
 
     #[test]
     fn the_roster_is_the_cell_points() {
-        let roster = cell_cap_coords::<F2>();
+        let roster = plane_cap_coords::<F2>();
         assert_eq!(roster.len(), 7, "a Fano cell's role roster is its seven points");
         assert_eq!(roster, crate::mixdir::cell_mix_coords::<F2>(), "same roster as the mix directory");
     }

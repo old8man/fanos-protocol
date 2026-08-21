@@ -39,7 +39,7 @@ use fanos_rendezvous::Epoch;
 
 use crate::DIAGNOSIS_SLOT_EPOCHS;
 use crate::bound::Entitlement;
-use crate::capdir::{Seating, cell_cap_coords};
+use crate::capdir::{Seating, plane_cap_coords};
 use crate::resolve::{Coverage, Read, STORE_TIMEOUT, resolve_directory};
 
 /// The overlay store slot a node's per-epoch diagnosis lives at — domain-separated, keyed by coordinate and
@@ -177,7 +177,7 @@ pub async fn read_diagnosis_window<F: Field>(
     for (epoch, seed) in window {
         let (epoch, seed) = (*epoch, *seed);
         let scan =
-            resolve_directory(client, cell_cap_coords::<F>(), move |client, coord| async move {
+            resolve_directory(client, plane_cap_coords::<F>(), move |client, coord| async move {
                 read_diagnosis::<F>(&client, coord, epoch, vrf.then_some(seed)).await
             })
             .await;
