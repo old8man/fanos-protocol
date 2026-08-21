@@ -99,6 +99,12 @@ or permission to buy, and those three were each measured and refuted separately.
 one of the seven lines cannot serve a threshold gather, which is what a mixnet hop is — and the cell does
 not say so.
 
+⛔ **That agreement was two wrong things cancelling, and 2026-08-21 separated them.** The ceiling being
+matched was `settle_index`'s, and the live path no longer runs it; against the rule that *does* ship the same
+cell falls well short, and the shortfall was mechanical rather than geometric — a re-judge that waited on the
+peer to speak again, and a settling window that closed before the boundary's emptied claim books refilled.
+Read the table below this one, not this paragraph, for what a deployment should size against.
+
 ⛔ **This section said "at its geometric limit … not a better mechanism" until 2026-08-21, and the second
 half was wrong.** The same enumeration now runs two reference rules on the same draws. Line confinement
 alone — a maximum matching, no arbitration — clears the floor in **99.1 %** of seven-operator draws, so the
@@ -113,10 +119,37 @@ walks, reads:
 | 10 | 74.5 % | **99.2 %** | 100 % |
 | 16 (the constant) | 96.6 % | 100 % | 100 % |
 
-**Nothing in the advice above changes.** Sixteen is still what the shipping code needs, and a deployment
-should size to the rule that ships, not to one that does not. What changes is *why*: the sixteen are buying
-back a property of the arbitration, not working around the shape of the plane — so "more members" is one
-answer and not the only one.
+**Nothing in the advice above changes, and since 2026-08-21 the reason is a different one.** The deferred
+rule *is* what ships now — the phantom yield is gone from the live path — so the middle column is the ceiling
+a deployment should be measured against, and it says ten operators would do. **The live cell does not reach
+it**, and that gap, not the rule, is what sixteen now buys:
+
+| operators | the rule's ceiling (enumerated) | the live cell, three draws, post-boundary samples |
+|---|---|---|
+| 7 | 80.5 % clear | below the floor in 14 of 39 — per draw 2, 8, 4 |
+| 10 | 99.2 % clear | below the floor in 22 of 39 — per draw 1, **13**, 8 |
+| 16 | 100 % clear | below the floor in 8 of 39 — per draw 0, **7**, 1 |
+
+Two mechanical defects were found and fixed inside that gap on the same day — a re-judge that needed the
+*peer* to speak again before a parked `HELLO` could be accepted, and a settling window that closed before the
+epoch's emptied claim books had refilled — and closing them took `n = 7` from 30 of 36 samples below the
+floor to about a third.
+
+**But read the per-draw column, because it is the finding.** The failure is *bimodal*: most draws sit at 0–2
+of 13, and some never rise above the floor again after their first boundary — at **every** load, sixteen
+included. An earlier single-draw run read "0 of 36" at sixteen and that was a property of that draw. So more
+members raise the average and do **not** remove the stuck mode, and the honest operator advice is both halves
+of that:
+
+* **size at sixteen** — it is the best-measured load and the one the code's own constant returns;
+* **and expect a cell that founds badly to stay badly founded until it is restarted**, rather than to
+  converge. `fanos status coherence` (§5) is how you tell, and a cell reading below its line-viability floor
+  cannot serve one of its seven mixnet lines.
+
+What the stuck draws have in common is not a placement decision: their claim books stall at **4 of 9 peers**
+while every node's probe index sits at 0, and the counters that separate a stuck draw from a healthy one are
+the delivery ones (`rejudged` 21 against 66). Claims are not being ignored — they are not arriving. That is
+an addressing question, and it is open.
 
 The other answer is a protocol change and is not proposed in this document, but the case for it is now
 measured on a **partial** view as well (`fanos-vrf/examples/partial_knowledge_placement.rs`), which is the

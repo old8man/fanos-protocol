@@ -3409,10 +3409,31 @@ mod tests {
     /// fixture owes: it measures one draw over six boundaries, and the question is a distribution.
     ///
     /// **And the sizing recommendation therefore does NOT drop to `1.5 N`.** The enumeration prices the
-    /// deferred rule at 99.2 % clearing there, and the live cell at `n = 10` clears 69–81 % — so recommending
-    /// ten would promise what a running node does not deliver. `members_for_a_covered_plane` stays at 16,
-    /// where the live cell measures 0 below floor across every run above, and the gap between 10 and its own
-    /// ceiling is the open question rather than the constant.
+    /// deferred rule at 99.2 % clearing there, and the live cell does not reach it.
+    ///
+    /// ## The instrument change, and what it immediately overturned
+    ///
+    /// Three draws per load, counting only post-boundary samples (13 per draw), same build as the last column
+    /// above:
+    ///
+    /// | load | below floor | per draw |
+    /// |---|---|---|
+    /// | `n = 7` | 14 of 39 | 2, 8, 4 |
+    /// | `n = 10` | 22 of 39 | 1, **13**, 8 |
+    /// | `n = 16` | 8 of 39 | 0, **7**, 1 |
+    ///
+    /// **The failure is bimodal, and it survives every load.** Most draws sit at 0–2 of 13; some never rise
+    /// above the floor again after their first boundary. So "0 of 36 at `n = 16`" — asserted from a single
+    /// draw one paragraph up — was a property of *that draw*, not of sixteen members, and no member count
+    /// measured here removes the stuck mode. **The number of members is not the lever.**
+    ///
+    /// **What the stuck draws look like, which is where the next investigation starts.** In the `n = 10`
+    /// draw that never recovered, every book stalls at **4 of 9 peers** and stays there while `probe_index`
+    /// is uniformly 0 — and the station counters separate it from its healthy sibling by exactly the quantity
+    /// that says claims are not arriving: `rejudged` **21 against 66** and `outranked` **444 against 924**,
+    /// with `cache_miss` around 149 000 in both. Claims are not being ignored; they are not being *delivered*.
+    /// That points at addressing — a node nobody can resolve cannot be asked for its claim — and not at the
+    /// arbitration, which is the third time this investigation has moved a layer down.
     ///
     /// What is still open besides that: claims reach only direct connection partners, and in a projective
     /// plane every two lines meet, so every node contends for exactly one point of every other node's line.
@@ -3444,7 +3465,23 @@ mod tests {
         // draws clearing the floor under the deferred rule (`fanos-vrf/examples/line_confinement_coverage.rs`).
         // If the live cell reaches that there, the recommendation is `1.5 N`; if only `sized` holds, the extra
         // members are buying something the rule does not, and the reason is worth naming.
+        // **Several draws per load, because the question is a distribution and one draw cannot answer it.**
+        //
+        // This ran one fleet per load until 2026-08-21, and the reading it produced was used to compare two
+        // builds — which it cannot support: the coordinates are drawn afresh per fleet, so two runs differ in
+        // the *draw* as well as in the code, and a 7-vs-11-of-36 difference sits inside that spread. The cost
+        // is linear and the fix is not clever: run `DRAWS` fleets per load and report each one's count beside
+        // the total, so an unlucky draw is visible rather than averaged into a verdict.
+        //
+        // **And the samples counted are the ones AFTER the first boundary**, which is the regime the question
+        // is about. The joining phase is systematically better — nothing has committed, every node may still
+        // walk — so including it makes a build look better the longer the fixture runs before the first turn.
+        const DRAWS: usize = 3;
+        const TICKS: u32 = 18; // 180 s at a 60 s period: three boundaries per draw
         for count in [n_points, 3 * n_points / 2, sized] {
+            let mut load_total = (0usize, 0usize);
+            let mut per_draw: Vec<(usize, usize)> = Vec::with_capacity(DRAWS);
+            for draw in 0..DRAWS {
             let fleet = match NodeFleet::spawn_as_drawn_with_epoch::<F2>(count, Link::ideal(), roles, period).await {
                 Ok(f) => f,
                 Err(e) => {
@@ -3453,10 +3490,12 @@ mod tests {
                 }
             };
             println!(
-                "\n=== PG(2,2): {n_points} points, n={count} (n/N={:.2}), epoch period {period:?}",
-                count as f64 / n_points as f64
+                "\n=== PG(2,2): {n_points} points, n={count} (n/N={:.2}), draw {}/{DRAWS}, epoch period {period:?}",
+                count as f64 / n_points as f64,
+                draw + 1,
             );
-            for tick in 0..36u32 {
+            let mut counted = (0usize, 0usize);
+            for tick in 0..TICKS {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let health: Vec<_> = fleet.nodes().iter().map(fanos_node::Node::health).collect();
                 let bound: Vec<fanos_geometry::Triple> =
@@ -3541,8 +3580,27 @@ mod tests {
                     servable,
                     if points.len() >= floor { "AT/ABOVE FLOOR" } else { "BELOW FLOOR" },
                 );
+                // Counted only past the first turn — see the note on `DRAWS` above.
+                if beacons.iter().max().copied().unwrap_or(0) >= 1 {
+                    counted.0 += 1;
+                    counted.1 += usize::from(points.len() < floor);
+                }
             }
             fleet.shutdown().await;
+            println!(
+                "--- n={count} draw {}/{DRAWS}: {} of {} post-boundary samples below the floor",
+                draw + 1,
+                counted.1,
+                counted.0
+            );
+            per_draw.push(counted);
+            load_total.0 += counted.0;
+            load_total.1 += counted.1;
+            }
+            println!(
+                "\n### n={count}: {} of {} post-boundary samples below the floor across {DRAWS} draws — per draw {:?}",
+                load_total.1, load_total.0, per_draw
+            );
         }
     }
 
