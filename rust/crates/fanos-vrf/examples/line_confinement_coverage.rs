@@ -151,6 +151,42 @@ fn deferred_acceptance(walks: &[Vec<Triple>], ranks: &[VrfOutput]) -> usize {
     held.len()
 }
 
+/// **Serial dictatorship by rank** — the same deferred acceptance with one thing changed: a point prefers the
+/// better-**ranked** proposer outright, instead of preferring the one whose walk arrives at it earlier.
+///
+/// `claim_beats` orders by `(index, rank)` and its doc gives the reason: *"a node that merely wants a point yields it to
+/// one whose walk arrives earlier — the cheaper claim, and the one needing no witnesses at all — instead of rank alone
+/// deciding, which is what left a displaced holder squatting a point its preferrer could prove and it could not."* That
+/// argument is about the phantom rule, where a claim counted whether or not its holder went there. Under the seated
+/// rule nobody squats anything, so the choice is open again and this column is what re-opens it.
+fn rank_priority(walks: &[Vec<Triple>], ranks: &[VrfOutput]) -> usize {
+    let mut held: BTreeMap<Triple, (u16, usize)> = BTreeMap::new();
+    let mut next: Vec<usize> = vec![0; walks.len()];
+    let mut free: Vec<usize> = (0..walks.len()).collect();
+    while let Some(i) = free.pop() {
+        while next[i] < walks[i].len() {
+            let k = next[i];
+            next[i] += 1;
+            let p = walks[i][k];
+            let k = u16::try_from(k).unwrap_or(u16::MAX);
+            match held.get(&p).copied() {
+                None => {
+                    held.insert(p, (k, i));
+                    break;
+                }
+                Some((_, cw)) => {
+                    if fanos_vrf::outranks(&ranks[i], &ranks[cw]) {
+                        held.insert(p, (k, i));
+                        free.push(cw);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    held.len()
+}
+
 /// **The geometric ceiling**: a bipartite maximum matching over the same admissible sets, with no
 /// arbitration rule at all — what line confinement *alone* permits.
 fn maximum_matching(walks: &[Vec<Triple>]) -> usize {
@@ -195,6 +231,7 @@ fn main() {
             let (mut pref_cleared, mut pref_total) = (0u64, 0u64);
             let (mut stable_cleared, mut stable_pts) = (0u64, 0u64);
             let (mut max_cleared, mut max_pts) = (0u64, 0u64);
+            let (mut rank_cleared, mut rank_pts) = (0u64, 0u64);
             for trial in 0..$trials {
                 // The same draw the neighbouring example uses: a distinct secret and identity per node, so
                 // the outputs are real VRF outputs rather than sampled points — the walk's line and stride
@@ -248,6 +285,11 @@ fn main() {
                 if ceiling >= floor {
                     max_cleared += 1;
                 }
+                let by_rank = rank_priority(&walks, &ranks);
+                rank_pts += by_rank as u64;
+                if by_rank >= floor {
+                    rank_cleared += 1;
+                }
 
                 unseated += seats.iter().filter(|s| s.is_none()).count() as u64;
                 pts_total += occupied.len() as u64;
@@ -260,8 +302,8 @@ fn main() {
                 }
             }
             println!(
-                "{:>9} n={:<3} N={:<3} floor={:<3} | SHIPPING {:>5.2} pts {:>5.1}% | DEFERRED {:>5.2} pts \
-                 {:>5.1}% | CEILING {:>5.2} pts {:>5.1}% | preferred-only {:>5.2} {:>5.1}% | unseated {:.2}",
+                "{:>9} n={:<3} N={:<3} floor={:<3} | SHIPPING {:>5.2} {:>5.1}% | DEFERRED {:>5.2} {:>5.1}% | \
+                 BY-RANK {:>5.2} {:>5.1}% | CEILING {:>5.2} {:>5.1}% | preferred {:>5.2} {:>5.1}% | unseated {:.2}",
                 $name,
                 $n,
                 Plane::<$F>::N,
@@ -270,6 +312,8 @@ fn main() {
                 100.0 * cleared as f64 / $trials as f64,
                 stable_pts as f64 / $trials as f64,
                 100.0 * stable_cleared as f64 / $trials as f64,
+                rank_pts as f64 / $trials as f64,
+                100.0 * rank_cleared as f64 / $trials as f64,
                 max_pts as f64 / $trials as f64,
                 100.0 * max_cleared as f64 / $trials as f64,
                 pref_total as f64 / $trials as f64,

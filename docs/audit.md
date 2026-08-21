@@ -2771,6 +2771,10 @@ into `peers`; its doc states the assumption and nothing enforced it. On divergen
 contested while `witness_for()` returns `None`, so a node is told it is displaced and cannot prove it — able neither to
 hold the point nor advance past it, for a whole epoch. Falsification: **24 of 57 points** named a forgotten holder.
 
+> ⛔ **Closed by deletion, 2026-08-21.** `witness_for` and the per-point `best` table are gone: settling and
+> proving are one call (`fanos_vrf::deferred_claim`) over the peers the book actually holds, so there is no foreign key
+> to dangle and no state in which a node is told it is displaced and cannot prove it.
+
 The constant's justification was also false: "the largest plane this code represents holds 993 points" is `F31`, but
 `fanos_field` defines `F127` (16257 points) and `F256` (65793) — and 993 counts *points*, i.e. bounds `best`, while
 being applied to `peers`. The shipped binary runs `F2` (7 points), so the arithmetic never bit; it was a proof of the

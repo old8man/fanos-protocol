@@ -111,10 +111,16 @@ pub(crate) struct PeerClaimed {
     pub proof: VrfProof,
     /// The VRF output the proof yielded — the peer's rank.
     ///
-    /// This is the whole of what a peer contributes to another node's resolution, and deliberately so: a claim to a point
-    /// is `(where the claimant's own walk reaches it, its rank)`, both functions of this output, so *where the peer
-    /// actually settled* is not needed and is not carried. That is what keeps `verify_coordinate_claim` non-recursive —
-    /// checking a witness never unfolds into the witness's own chain.
+    /// The output is what every comparison needs: a claim to a point is `(where the claimant's own walk reaches it, its
+    /// rank)`, both functions of it.
+    ///
+    /// ⛔ This doc used to add *"so where the peer actually settled is not needed and is not carried — that is what keeps
+    /// `verify_coordinate_claim` non-recursive"*. Where a peer settled **is** needed since 2026-08-21: a step is forced
+    /// only by the node that *holds* the contested point, so a witness carries its own claim and checking one does
+    /// unfold into the witness's chain. It is bounded rather than absent — a witness's settled index is strictly below
+    /// its claimant's — and what that bought is the difference between 7.5 % and 97.5 % of `PG(2,4)` draws at `1.5 N`
+    /// clearing the line-viability floor. This struct is unchanged: the settled index arrives in the peer's
+    /// `CoordinateClaim`, beside the output rather than instead of it.
     pub output: fanos_vrf::VrfOutput,
 }
 
@@ -635,7 +641,10 @@ mod tests {
             witnesses: vec![fanos_vrf::DisplacementWitness {
                 id: winner.cert_der().to_vec(),
                 public: vrf_public_from_cert(winner.cert_der()).unwrap(),
-                proof: winner_proof,
+                // The winner is SEATED at its own preferred point, which is the one it displaced the loser from — so
+                // its whole justification is the uncontested claim, and the witnessed HELLO is one `u16` longer than
+                // it was before the rule changed.
+                claim: CoordinateClaim::direct(winner_proof),
             }],
         };
         let hello = hello_bytes::<F2>(epoch, displaced.coords(), &claim, Capabilities::CORE, 0);

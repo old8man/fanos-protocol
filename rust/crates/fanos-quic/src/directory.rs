@@ -267,9 +267,14 @@ impl Directory {
 
     /// The **claim** currently bound at `coord` — its probe index and rank — if it is bound *and* was recorded with one.
     ///
-    /// This is the contender oracle [`fanos_vrf::settle_index`] consumes: a node walks its own probe sequence to the first
-    /// point no *better* claim reaches. Returning the pair rather than the rank alone is what lets the walk and this table
-    /// apply one order ([`fanos_vrf::claim_beats`]) instead of two that can disagree.
+    /// The pair a `seat_outranked` check compares against, and the reason the pair is returned rather than the rank
+    /// alone: this table and the arbitration apply one order ([`fanos_vrf::claim_beats`]) instead of two that can
+    /// disagree.
+    ///
+    /// ⛔ It used to be described as *"the contender oracle `fanos_vrf::settle_index` consumes"*. Nothing settles
+    /// through a per-point oracle since 2026-08-21 — `fanos_quic::claims` computes the whole assignment through
+    /// `fanos_vrf::deferred_claim` — so this is a record of what *this* node believes it holds, not an input to the
+    /// rule.
     ///
     /// `None` covers both "free" and "occupied but unranked" — for settling those are the same answer, since an unranked
     /// occupant provides no evidence that it may keep the point.

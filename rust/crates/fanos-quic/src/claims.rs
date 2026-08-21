@@ -1,16 +1,32 @@
 //! The **claim book** — the peer coordinate-claims a node has verified this epoch.
 //!
-//! Coordinate resolution (`fanos_vrf::settle_index`) needs two things a node can only get from the peers it has actually
-//! met: the *best claim* held on each point of its own probe walk, and, for every step it advances, a *witness* proving it
-//! was displaced. Both come from `HELLO` frames it has already verified, so this is where they are kept.
+//! Coordinate resolution (`fanos_vrf::deferred_claim`) needs one thing a node can only get from the peers it has
+//! actually met: their verified claim material, `(id, VRF public, proof, output)`. From that it computes the whole
+//! assignment and reads its own seat and its own justification out of it. All of it comes from `HELLO` frames this node
+//! already verified, so this is where it is kept.
 //!
-//! ## Why the best claim is maintained per point, incrementally
+//! ## ⛔ What changed on 2026-08-21, and why the per-point index went with it
 //!
-//! A claim to point `p` is `(probe_index_of(their_output, p), their_rank)`, and computing it means walking the peer's line
-//! — `O(q² + q + 1)` with an allocation. Answering "who has the best claim to `p`?" by scanning the book per query costs
-//! that for every peer, at every step of every settle. Measured on the simulator's `P = 993` fixture, doing it per query
-//! rather than per peer was a **77× slowdown** (209 s against 2.7 s), so the walk happens **once per peer**, at insert,
-//! and settling is then `q + 1` map lookups.
+//! This module used to maintain a `best` table — *the best claim any peer holds to each point* — built incrementally as
+//! peers were recorded, and `settle_index` consumed it one point at a time. That table is exactly the **phantom yield**:
+//! a peer's claim to `p` counted whether or not it ended up on `p`. Measured, that is the difference between **7.5 %**
+//! and **97.5 %** of `PG(2,4)` draws at `1.5 N` clearing the line-viability floor
+//! (`fanos-vrf/examples/line_confinement_coverage.rs`), so the table is gone and with it the foreign key from `best` to
+//! `peers`, its eviction invariant, and `witness_for`.
+//!
+//! **The performance argument that built it still holds and is answered differently.** Computing a claim to `p` means
+//! walking the peer's line, and doing that per query, at every step of every settle, measured a **77× slowdown** on the
+//! simulator's `P = 993` fixture (209 s against 2.7 s). The deferred rule needs every walk anyway, so it builds each one
+//! **once per assignment** (`fanos_vrf::probe_walk_of`) — the same "once, not once per query" shape, one layer up. What
+//! it costs is one `O(n·q)` pass per settle instead of `q + 1` map lookups, on a path that runs when a peer is met or a
+//! beacon advances, not per frame.
+//!
+//! **No per-point index remains at all, and the second one went the same way.** A replacement — `anyone_reaches`, "is
+//! there any point in asking this peer for its claim" — survived the first pass and was removed on the same day it
+//! landed, because it answers the phantom yield's question one layer up: under deferred acceptance a seat is decided by
+//! who *holds* a point, so "someone I know reaches it" is not evidence about it and using that to skip an ask would
+//! drop exactly the seated claim the assignment must have. The `Wake::Meet` probe now asks once per coordinate per
+//! epoch (`fanos_quic::driver`), which is the same bound and no inference.
 //!
 //! ## Why the book is epoch-scoped
 //!
@@ -19,17 +35,16 @@
 //! therefore *clears* the book when the epoch moves. Carrying claims across an epoch would let a peer's retired placement
 //! justify a displacement in the current one, which is the pre-settling attack the beacon exists to prevent.
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
 use fanos_field::Field;
-use fanos_geometry::{Point, Triple};
+use fanos_geometry::Triple;
 use fanos_primitives::collections::BoundedMap;
 use fanos_primitives::hash::hash_labeled;
 use fanos_primitives::Epoch;
-use fanos_vrf::{DisplacementWitness, VrfOutput, VrfProof, VrfPublic, claim_beats, probe_bound, probe_point};
+use fanos_vrf::{Claimant, VrfOutput, VrfProof, VrfPublic};
 
 /// How many peers' claim material one node retains.
 ///
@@ -41,21 +56,26 @@ use fanos_vrf::{DisplacementWitness, VrfOutput, VrfProof, VrfPublic, claim_beats
 /// **This number carries no correctness argument, deliberately.** It used to: the doc said "the largest plane this code
 /// represents holds 993 points, so this is comfortably past a full cell". That was wrong twice over. 993 is
 /// `31² + 31 + 1`, the point count of `F31` — but `fanos_field` also defines `F127` (16257 points) and `F256`
-/// (`Gf2m<8>`, 65793 points), so it was not the largest plane; and it was a statement about *points*, i.e. about `best`,
-/// applied to `peers`, which is keyed by an identity hash over a 2^256 space and is bounded by nothing geometric — as
+/// (`Gf2m<8>`, 65793 points), so it was not the largest plane; and it was a statement about *points*, i.e. about the
+/// per-point index, applied to `peers`, which is keyed by an identity hash over a 2^256 space and is bounded by nothing
+/// geometric — as
 /// the paragraph above says two sentences earlier. The shipped binary runs `F2` (7 points), so the arithmetic never
 /// bit; it was a proof of the wrong proposition that happened to sit above true code.
 ///
-/// The invariant `peers` actually needs — that it retains every holder `best` names, since `Best::holder` is a foreign
-/// key into it — is now maintained **by construction** in [`ClaimBook::record`], for any plane and any capacity, rather
-/// than by an inequality between a capacity and a point count. So this is free to be what it always was: a flood bound,
-/// comfortably past a full cell, at a fixed cost.
+/// ⛔ The paragraph that used to follow described an invariant tying `peers` to a per-point `best` index — *"it retains
+/// every holder `best` names, since `Best::holder` is a foreign key into it"*. Both the index and the foreign key are
+/// gone with the phantom yield (see the module doc), so `peers` is now the only store and this is free to be what it
+/// always was: a flood bound, comfortably past a full cell, at a fixed cost.
 pub(crate) const CAPACITY: usize = 1024;
 
-/// One peer's verified coordinate claim material — everything a witness needs, and nothing more.
+/// One peer's verified coordinate claim material — exactly what `fanos_vrf::Claimant` needs, kept in the owned form a
+/// book can hold.
 ///
-/// Note what is absent: where the peer *settled*. A witness proves only its own claim to the contested point, which is
-/// what keeps `fanos_vrf::verify_coordinate_claim` non-recursive.
+/// ⛔ **The `output` is new and its absence used to be the point.** This struct's doc read *"note what is absent: where
+/// the peer settled — a witness proves only its own claim to the contested point, which is what keeps
+/// `verify_coordinate_claim` non-recursive"*. Where a peer settles is now a fact about the whole assignment rather than
+/// a field, and computing that assignment needs every peer's output. It was already being kept, one struct over, in the
+/// per-point index that has since been deleted.
 #[derive(Clone)]
 struct PeerClaim {
     /// The peer's identity bytes as fed to the coordinate VRF (its certificate DER).
@@ -64,21 +84,8 @@ struct PeerClaim {
     public: VrfPublic,
     /// The peer's coordinate proof for this epoch.
     proof: VrfProof,
-}
-
-/// The best claim seen on one point, and who holds it.
-#[derive(Clone, Copy)]
-struct Best {
-    index: u16,
+    /// The output that proof yielded — the peer's rank, and the whole of what the assignment consumes.
     output: VrfOutput,
-    /// Key into `peers`, so recovering the witness material is a lookup rather than a scan.
-    ///
-    /// A foreign key across two independently-bounded maps, sound only because [`ClaimBook::record`] keeps `peers` and
-    /// `best` consistent on every eviction. Without that the reference dangles, and the failure is silent and
-    /// self-contradicting: [`ClaimBook::contender`] reads `best` alone and still reports the point contested, while
-    /// [`ClaimBook::witness_for`] cannot resolve the holder and returns `None` — so the node is told it is displaced
-    /// and simultaneously cannot prove it, able neither to hold the point nor to advance past it, for a whole epoch.
-    holder: [u8; 32],
 }
 
 /// A shared, cloneable book of verified peer claims for the current epoch. Cheap to clone (shares one book).
@@ -99,36 +106,6 @@ pub(crate) struct ClaimBook {
 struct Book {
     epoch: Epoch,
     peers: BoundedMap<[u8; 32], PeerClaim>,
-    best: BoundedMap<Triple, Best>,
-}
-
-impl Book {
-    /// Free one slot in `peers` **without ever leaving a [`Best::holder`] dangling**.
-    ///
-    /// Two rules, in order, and the second is what makes this total:
-    ///
-    /// 1. **Prefer irrelevance to age.** A peer no `best` entry names can never be returned as a witness —
-    ///    [`ClaimBook::witness_for`] reaches `peers` only through `holder` — so it is the only kind of entry that is
-    ///    free to drop. `BoundedMap`'s FIFO default would instead drop by age, which is uncorrelated with whether the
-    ///    entry is live and so takes a referenced holder whenever an unreferenced one exists.
-    /// 2. **If every peer is a live witness, drop one and drop its references with it.** `best` is keyed by a point,
-    ///    so it holds at most one entry per point of the plane — 7 on `F2`, but 65793 on `F256` — and once that
-    ///    exceeds `CAPACITY` every retained peer can be referenced at once. Rather than let the capacity silently
-    ///    decide correctness (the shape that made the old doc's inequality load-bearing), forgetting the peer also
-    ///    forgets what named it. Losing a point's best claim is the conservative direction: `contender` then reports
-    ///    the point uncontested, and a claim made on that basis is checked again at the far end by
-    ///    `verify_coordinate_claim`, so the cost is a retry rather than an unprovable displacement.
-    fn evict_one_peer(&mut self) {
-        let referenced: BTreeSet<[u8; 32]> = self.best.iter().map(|(_, b)| b.holder).collect();
-        if self.peers.remove_oldest_where(|k| !referenced.contains(k)).is_some() {
-            return;
-        }
-        let Some((victim, _)) = self.peers.remove_oldest_where(|_| true) else { return };
-        let stale: Vec<Triple> = self.best.iter().filter(|(_, b)| b.holder == victim).map(|(p, _)| *p).collect();
-        for point in &stale {
-            self.best.remove(point);
-        }
-    }
 }
 
 impl Default for ClaimBook {
@@ -142,11 +119,7 @@ impl ClaimBook {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Book {
-                epoch: Epoch::ZERO,
-                peers: BoundedMap::new(CAPACITY),
-                best: BoundedMap::new(CAPACITY),
-            })),
+            inner: Arc::new(Mutex::new(Book { epoch: Epoch::ZERO, peers: BoundedMap::new(CAPACITY) })),
             changed: Arc::new(Notify::new()),
         }
     }
@@ -163,33 +136,21 @@ impl ClaimBook {
         }
         book.epoch = epoch;
         book.peers = BoundedMap::new(CAPACITY);
-        book.best = BoundedMap::new(CAPACITY);
     }
 
     /// Record a peer's **verified** claim material, indexing its whole walk.
     ///
+    /// **No longer generic over the plane.** It used to walk the peer's whole line to index it, which is where the `F`
+    /// went; the assignment builds those walks itself now, once per settle rather than once per record, so recording a
+    /// claim is a map insert and knows nothing about geometry.
+    ///
     /// `output` must be the output the peer's `proof` actually yielded for `(id, epoch, beacon)` — this type does not
     /// re-verify, because its only caller is the `HELLO` verifier that just did. Recording an unverified claim would let a
     /// peer install a witness that fails at the far end, turning its own forgery into *this* node's rejected handshake.
-    pub(crate) fn record<F: Field>(&self, id: &[u8], public: VrfPublic, proof: VrfProof, output: &VrfOutput) {
+    pub(crate) fn record(&self, id: &[u8], public: VrfPublic, proof: VrfProof, output: &VrfOutput) {
         let key = hash_labeled("FANOS-v1/claim-book-peer", id);
         let mut book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        if !book.peers.contains_key(&key) && book.peers.len() >= CAPACITY {
-            book.evict_one_peer();
-        }
-        book.peers.insert(key, PeerClaim { id: id.to_vec(), public, proof });
-        // Index the peer's entire walk once. This is the whole reason the book exists rather than a scan per query.
-        for index in 0..probe_bound::<F>() {
-            let point = probe_point::<F>(output, index).coords();
-            let candidate = Best { index, output: *output, holder: key };
-            let better = match book.best.get(&point) {
-                None => true,
-                Some(held) => claim_beats((candidate.index, &candidate.output), (held.index, &held.output)),
-            };
-            if better {
-                book.best.insert(point, candidate);
-            }
-        }
+        book.peers.insert(key, PeerClaim { id: id.to_vec(), public, proof, output: *output });
         // Signal AFTER the write, and after releasing the lock. Signalling first is a race that looks harmless and is not:
         // the waiter wakes, settles against the book as it was, finds nothing to do, and waits again — and if that record
         // was the only one coming (the common case, a two-node collision) nothing ever wakes it again. This ordering bug
@@ -198,45 +159,51 @@ impl ClaimBook {
         self.changed.notify_one();
     }
 
-    /// The best claim any recorded peer holds to `point` — the contender oracle `fanos_vrf::settle_index` consumes.
+    /// This node's seat under the deferred assignment, or `None` if every point of its line is better held.
+    ///
+    /// The single query the placement loop asks. `me` is the caller's own claimant material; the book supplies every
+    /// peer's. Both go into `fanos_vrf::deferred_assignment`, which is why this cannot be answered one point at a time.
     #[must_use]
-    pub(crate) fn contender<F: Field>(&self, point: &Point<F>) -> Option<(u16, VrfOutput)> {
+    fn with_claimants<T>(&self, me: &Claimant<'_>, f: impl FnOnce(&[Claimant<'_>]) -> T) -> T {
         let book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        book.best.get(&point.coords()).map(|b| (b.index, b.output))
+        let mut claimants = Vec::with_capacity(book.peers.len() + 1);
+        claimants.push(*me);
+        claimants.extend(book.peers.iter().map(|(_, p)| Claimant {
+            id: &p.id,
+            public: p.public,
+            proof: p.proof,
+            output: p.output,
+        }));
+        f(&claimants)
     }
 
-    /// The seat at probe step `index`, when a recorded peer's claim to it **beats this node's own**.
+    /// The seat at probe step `index`, when the assignment gives that point to **someone else**.
     ///
     /// [`settle`] answers "where should I sit"; this answers the narrower question "is where I already sit still mine".
     /// The two differ only for a node that may not act on the answer — an established one, which the reshuffle loop
     /// forbids to move mid-epoch (see `spawn_self_certifying`). It cannot resolve the contest, so what it can do is
     /// *say* so, and that is why this exists apart from [`settle`] rather than inside it.
     ///
-    /// Both halves read the same `best` table under the same [`claim_beats`] order as `settle` and
-    /// [`witness_for`](Self::witness_for), so a node reporting itself outranked here and a peer concluding it won there
-    /// cannot disagree.
+    /// Both read the same assignment from the same book, so a node reporting itself outranked here and a peer
+    /// concluding it won there cannot disagree — the property the old pair maintained by sharing a table, now held by
+    /// sharing the function that builds one.
+    ///
+    /// Takes the **output alone**, not a whole [`Claimant`]: an assignment is a function of the contending outputs, and
+    /// the identity, key and proof are needed only to *build* a claim. The narrower argument is what lets a caller that
+    /// holds only a directory binding — `Client::seat_outranked` — ask this at all.
     #[must_use]
     pub(crate) fn outranked_at<F: Field>(&self, mine: &VrfOutput, index: u16) -> Option<Triple> {
-        let seat = probe_point::<F>(mine, index);
-        let (their_index, their_output) = self.contender::<F>(&seat)?;
-        claim_beats((their_index, &their_output), (index, mine)).then(|| seat.coords())
-    }
-
-    /// The witness proving a node with `mine` was displaced from its `j`-th probe point, if one is recorded.
-    ///
-    /// Returns the *best* claimant on that point, which is the strongest witness available and the one whose claim most
-    /// clearly beats the claimant's. `None` means this node cannot currently justify advancing past step `j` — in which
-    /// case it must not, since `fanos_vrf::verify_coordinate_claim` would reject the claim at the far end.
-    #[must_use]
-    pub(crate) fn witness_for<F: Field>(&self, mine: &VrfOutput, j: u16) -> Option<DisplacementWitness> {
-        let contested = probe_point::<F>(mine, j).coords();
+        let seat = fanos_vrf::probe_point::<F>(mine, index).coords();
         let book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let best = *book.best.get(&contested)?;
-        if !claim_beats((best.index, &best.output), (j, mine)) {
-            return None;
+        let mut outputs = Vec::with_capacity(book.peers.len() + 1);
+        outputs.push(*mine);
+        outputs.extend(book.peers.iter().map(|(_, p)| p.output));
+        drop(book);
+        // Position 0 is always the caller; anyone else on this node's seat is who took it.
+        match fanos_vrf::deferred_assignment::<F>(&outputs).get(&seat) {
+            Some(&(_, holder)) => (holder != 0).then_some(seat),
+            None => None,
         }
-        let peer = book.peers.get(&best.holder)?;
-        Some(DisplacementWitness { id: peer.id.clone(), public: peer.public, proof: peer.proof })
     }
 
     /// Wait until a claim is recorded.
@@ -270,70 +237,98 @@ impl ClaimBook {
 
 }
 
-/// Assemble this node's own claim at the index its walk settles on, given what it has verified.
+/// This node's seat and the **provable claim** to it, given what it has verified.
 ///
-/// Returns the settled index and a claim carrying one witness per skipped step. `None` if every point of the node's line
-/// is better claimed (`settle_index` exhausted — the honest answer, not a wrapped index), or if a witness the settle rule
-/// relied on is missing.
+/// Returns the settled index and a claim whose every skipped step is justified by the node that *holds* that point,
+/// carrying that node's own claim, recursively. `None` if every point of this node's line is better held —
+/// `deferred_claim` exhausted, the honest answer rather than a wrapped index.
 ///
-/// The two halves cannot disagree by construction: [`ClaimBook::witness_for`] and the oracle passed to `settle_index` read
-/// the same `best` table under the same `fanos_vrf::claim_beats` order. That is deliberate — deriving them independently
-/// is exactly what produced the unprovable-displacement defect this machinery was rebuilt to remove.
+/// **Settling and proving are one call now, and that is the repair rather than a tidy-up.** They used to be two —
+/// `settle_index` over a per-point oracle, then `witness_for` per skipped step — kept consistent by both reading one
+/// table, and the comment here said so. Two derivations of one rule is exactly what produced the unprovable-displacement
+/// defect `fanos_vrf::displacement_is_forced` records; the table made them agree without making them one thing.
+/// `fanos_vrf::deferred_claim` is one thing.
 #[must_use]
-pub(crate) fn settle<F: Field>(
-    book: &ClaimBook,
-    mine: &VrfOutput,
-    proof: VrfProof,
-) -> Option<(u16, fanos_vrf::CoordinateClaim)> {
-    let index = fanos_vrf::settle_index::<F>(mine, |p| book.contender::<F>(p))?;
-    let mut witnesses = Vec::with_capacity(usize::from(index));
-    for j in 0..index {
-        witnesses.push(book.witness_for::<F>(mine, j)?);
-    }
-    Some((index, fanos_vrf::CoordinateClaim { proof, index, witnesses }))
+pub(crate) fn settle<F: Field>(book: &ClaimBook, me: &Claimant<'_>) -> Option<(u16, fanos_vrf::CoordinateClaim)> {
+    book.with_claimants(me, |claimants| fanos_vrf::deferred_claim::<F>(0, claimants))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use fanos_field::F7;
+    use fanos_field::{F7, F31};
     use fanos_primitives::BeaconSeed;
-    use fanos_vrf::{VrfSecret, prove_coordinate_ranked, verify_coordinate_claim};
+    use fanos_vrf::{
+        VrfSecret, claim_beats, probe_bound, probe_point, prove_coordinate_ranked, verify_coordinate_claim,
+    };
+
+    /// One identity's epoch claim material, as the HELLO verifier hands it over.
+    type Material = (Vec<u8>, VrfPublic, VrfProof, VrfOutput);
+
+    /// The claimant view of [`Material`] — what `settle` and `outranked_at` take.
+    fn as_claimant(m: &Material) -> Claimant<'_> {
+        Claimant { id: &m.0, public: m.1, proof: m.2, output: m.3 }
+    }
 
     /// Whether two nodes take the identical walk — same line, same stride, so the same point at every index.
     fn walks_coincide(a: &VrfOutput, b: &VrfOutput) -> bool {
         (0..probe_bound::<F7>()).all(|k| probe_point::<F7>(a, k) == probe_point::<F7>(b, k))
     }
 
-    /// As [`peer`], with a 16-bit seed — needed where the fixture must search a few hundred identities.
-    fn peer16(seed: u16, epoch: Epoch, beacon: &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof, VrfOutput) {
+    /// As [`peer`], with a 16-bit seed — needed where the fixture must search a few hundred identities — and generic
+    /// over the plane, because the flood fixture needs one large enough that a book at `CAPACITY` does not fill it.
+    fn peer16<F: Field>(seed: u16, epoch: Epoch, beacon: &BeaconSeed) -> Material {
         let mut bytes = [0u8; 32];
         bytes[..2].copy_from_slice(&seed.to_le_bytes());
         let sk = VrfSecret::from_seed(bytes);
         let id = format!("peer16-{seed}").into_bytes();
-        let (_, proof, output) = prove_coordinate_ranked::<F7>(&sk, &id, epoch, beacon);
+        let (_, proof, output) = prove_coordinate_ranked::<F>(&sk, &id, epoch, beacon);
         (id, sk.public(), proof, output)
     }
 
     /// A peer identity with its epoch claim material, as the HELLO verifier would hand it over.
-    fn peer(seed: u8, epoch: Epoch, beacon: &BeaconSeed) -> (Vec<u8>, VrfPublic, VrfProof, VrfOutput) {
+    fn peer(seed: u8, epoch: Epoch, beacon: &BeaconSeed) -> Material {
         let sk = VrfSecret::from_seed([seed; 32]);
         let id = format!("peer-{seed}").into_bytes();
         let (_, proof, output) = prove_coordinate_ranked::<F7>(&sk, &id, epoch, beacon);
         (id, sk.public(), proof, output)
     }
 
+    /// Find two identities that collide on their preferred point but take **different** walks from it, ordered so the
+    /// first is the one the rank rule moves. Sharing the whole walk is the separate case
+    /// `a_node_beaten_at_every_step_is_not_seated_at_all` pins.
+    fn colliding_pair(peers: &[Material]) -> Option<(&Material, &Material)> {
+        peers.iter().enumerate().find_map(|(i, a)| {
+            peers.iter().skip(i + 1).find_map(|b| {
+                if probe_point::<F7>(&a.3, 0) != probe_point::<F7>(&b.3, 0) || walks_coincide(&a.3, &b.3) {
+                    return None;
+                }
+                Some(if claim_beats((0, &b.3), (0, &a.3)) { (a, b) } else { (b, a) })
+            })
+        })
+    }
+
+    /// ⛔ **Replaces `a_peer_flood_never_leaves_a_best_claim_naming_a_forgotten_holder`.**
+    ///
+    /// That test guarded a foreign key: a per-point index named a holder in `peers`, the two were independently
+    /// bounded, and an eviction could leave the book self-contradicting — reporting a point contested while being
+    /// unable to name the witness. The index is gone with the phantom yield, and with it the whole failure mode: an
+    /// assignment is computed over exactly the peers the book holds, so it cannot reference one it has forgotten.
+    ///
+    /// What survives is the property the invariant existed to protect, under the same load: **a book that has evicted
+    /// half of everything it saw never settles anywhere it cannot prove.** Note the shape — `settle` is allowed to
+    /// answer `None`, and at this load it usually must: 1024 peers on `PG(2,7)`'s 57 points is eighteen times
+    /// oversubscribed, so almost nobody is seated. The property is the implication, not the seat.
+    ///
+    /// **And that is why this one runs on `F31` while every other test here uses `F7`.** Provoking an eviction needs
+    /// more than `CAPACITY = 1024` peers; `PG(2,7)` has 57 points, so 1024 retained peers leave every point held by a
+    /// very-well-ranked one and **no** candidate settles — the implication holds vacuously and the test asserts
+    /// nothing. `PG(2,31)`'s 993 points make the retained book roughly one node per point, which is a load at which
+    /// some candidates seat and some do not: exactly the mix the implication needs. The `checked > 0` guard is what
+    /// caught the vacuous version.
     #[test]
-    fn a_peer_flood_never_leaves_a_best_claim_naming_a_forgotten_holder() {
-        // `Best::holder` is a foreign key into `peers`, and the two are independently-bounded maps. `witness_for`
-        // resolves that key with `?`, so a holder evicted out from under a live `best` entry does not fail loudly —
-        // it makes the book **self-contradicting**: `contender` reads `best` alone and still reports the point
-        // contested, while `witness_for` returns None, and a node in that state can neither hold the point nor prove
-        // the displacement that would let it advance past it, for the rest of the epoch.
-        //
-        // Nothing in the types enforces the reference; `record` does, by choosing the eviction victim from the
-        // *unreferenced* peers rather than by age. This asserts the invariant that makes `witness_for` total.
+    fn a_peer_flood_still_leaves_a_book_that_settles_only_where_it_can_prove() {
         let epoch = Epoch::new(4);
         let beacon = BeaconSeed::GENESIS;
         let book = ClaimBook::new();
@@ -341,24 +336,30 @@ mod tests {
 
         // Twice the capacity, so `peers` must evict about half of everything it ever saw.
         for s in 0..(CAPACITY as u16 * 2) {
-            let (id, public, proof, output) = peer16(s, epoch, &beacon);
-            book.record::<F7>(&id, public, proof, &output);
+            let m = peer16::<F31>(s, epoch, &beacon);
+            book.record(&m.0, m.1, m.2, &m.3);
         }
+        assert_eq!(book.len(), CAPACITY, "the book filled and evicted, so the property is under load");
 
-        let guard = book.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        // THE PROPERTY: every point's best claim can still be turned into a witness.
-        let dangling: Vec<Triple> =
-            guard.best.iter().filter(|(_, b)| guard.peers.get(&b.holder).is_none()).map(|(p, _)| *p).collect();
-        assert!(
-            dangling.is_empty(),
-            "{} of {} points name a holder the book has forgotten — `contender` still calls them contested and \
-             `witness_for` cannot answer",
-            dangling.len(),
-            guard.best.len()
-        );
-        // And it was a real flood, not a run that fit: without eviction the invariant is trivial.
-        assert_eq!(guard.peers.len(), CAPACITY, "the book filled and evicted, so the invariant was under load");
-        assert!(guard.best.len() > 1, "several points carry a best claim, so there is something to dangle");
+        let mut checked = 0;
+        for s in 60_000u16..60_040 {
+            let me = peer16::<F31>(s, epoch, &beacon);
+            let Some((index, claim)) = settle::<F31>(&book, &as_claimant(&me)) else { continue };
+            checked += 1;
+            assert!(
+                verify_coordinate_claim::<F31>(
+                    &me.1,
+                    &me.0,
+                    epoch,
+                    &beacon,
+                    &probe_point::<F31>(&me.3, index),
+                    &claim
+                ),
+                "settled at index {index} against a flooded book, but the verifier rejects the claim"
+            );
+        }
+        // Not an assertion about the seat: it is the guard against the implication being vacuous.
+        assert!(checked > 0, "no candidate seated at all, so the verification above never ran");
     }
 
     #[test]
@@ -370,17 +371,24 @@ mod tests {
         let book = ClaimBook::new();
         book.adopt(epoch);
 
-        let all: Vec<_> = (0..24u8).map(|s| peer(s, epoch, &beacon)).collect();
+        let all: Vec<Material> = (0..24u8).map(|s| peer(s, epoch, &beacon)).collect();
         // Everyone except the last is a recorded peer; the last one settles against them.
-        for (id, public, proof, output) in &all[..all.len() - 1] {
-            book.record::<F7>(id, *public, *proof, output);
+        for m in &all[..all.len() - 1] {
+            book.record(&m.0, m.1, m.2, &m.3);
         }
-        let (id, public, proof, output) = all.last().unwrap();
+        let me = all.last().unwrap();
 
-        let (index, claim) = settle::<F7>(&book, output, *proof).expect("a seat on its own line");
+        let (index, claim) = settle::<F7>(&book, &as_claimant(me)).expect("a seat on its own line");
         assert_eq!(claim.witnesses.len(), usize::from(index), "one witness per skipped step");
         assert!(
-            verify_coordinate_claim::<F7>(public, id, epoch, &beacon, &probe_point::<F7>(output, index), &claim),
+            verify_coordinate_claim::<F7>(
+                &me.1,
+                &me.0,
+                epoch,
+                &beacon,
+                &probe_point::<F7>(&me.3, index),
+                &claim
+            ),
             "settled at index {index} but the verifier rejects the claim"
         );
     }
@@ -390,11 +398,11 @@ mod tests {
         let epoch = Epoch::new(1);
         let beacon = BeaconSeed::GENESIS;
         let book = ClaimBook::new();
-        let (_, _, proof, output) = peer(9, epoch, &beacon);
-        let (index, claim) = settle::<F7>(&book, &output, proof).expect("an empty book contests nothing");
+        let me = peer(9, epoch, &beacon);
+        let (index, claim) = settle::<F7>(&book, &as_claimant(&me)).expect("an empty book contests nothing");
         assert_eq!(index, 0, "nothing observed ⇒ the preference stands");
         assert!(claim.witnesses.is_empty(), "and a direct claim carries no witnesses");
-        assert_eq!(claim, fanos_vrf::CoordinateClaim::direct(proof), "it is exactly the pre-existing claim");
+        assert_eq!(claim, fanos_vrf::CoordinateClaim::direct(me.2), "it is exactly the pre-existing claim");
     }
 
     #[test]
@@ -403,27 +411,16 @@ mod tests {
         // whose claims therefore differ only by rank, record the better one, and settle the worse one against it.
         let epoch = Epoch::new(5);
         let beacon = BeaconSeed::GENESIS;
-        let peers: Vec<_> = (0..80u8).map(|s| peer(s, epoch, &beacon)).collect();
-        // The pair must share a preferred point AND take *different* walks from it. Sharing the whole walk — same line and
-        // same stride, measured at 3.4% of colliding pairs on `PG(2,7)`, against the predicted `1/((q+1)·φ(q+1))` = 1/32 —
-        // is the separate case pinned by `a_node_beaten_at_every_step_is_not_seated_at_all`.
-        let pair = peers.iter().enumerate().find_map(|(i, a)| {
-            peers.iter().skip(i + 1).find_map(|b| {
-                if probe_point::<F7>(&a.3, 0) != probe_point::<F7>(&b.3, 0) || walks_coincide(&a.3, &b.3) {
-                    return None;
-                }
-                // Order them so `loser` is the one the rank rule moves.
-                Some(if claim_beats((0, &b.3), (0, &a.3)) { (a, b) } else { (b, a) })
-            })
-        });
-        let (loser, winner) = pair.expect("two of 80 identities collide on a point but not on a whole walk");
+        let peers: Vec<Material> = (0..80u8).map(|s| peer(s, epoch, &beacon)).collect();
+        let (loser, winner) =
+            colliding_pair(&peers).expect("two of 80 identities collide on a point but not on a whole walk");
 
         let book = ClaimBook::new();
         book.adopt(epoch);
-        book.record::<F7>(&winner.0, winner.1, winner.2, &winner.3);
+        book.record(&winner.0, winner.1, winner.2, &winner.3);
 
-        let (index, claim) = settle::<F7>(&book, &loser.3, loser.2).expect("the loser has somewhere to go");
-        assert!(index >= 1, "displaced from a point claimed better, so the index must advance (got {index})");
+        let (index, claim) = settle::<F7>(&book, &as_claimant(loser)).expect("the loser has somewhere to go");
+        assert!(index >= 1, "displaced from a point held by a better claim, so the index must advance (got {index})");
         assert_eq!(claim.witnesses.len(), usize::from(index), "and every step it took is witnessed");
         assert!(
             verify_coordinate_claim::<F7>(
@@ -439,9 +436,9 @@ mod tests {
         // The winner keeps its preference: settling it against a book holding the loser does not move it.
         let other = ClaimBook::new();
         other.adopt(epoch);
-        other.record::<F7>(&loser.0, loser.1, loser.2, &loser.3);
+        other.record(&loser.0, loser.1, loser.2, &loser.3);
         assert_eq!(
-            settle::<F7>(&other, &winner.3, winner.2).map(|(k, _)| k),
+            settle::<F7>(&other, &as_claimant(winner)).map(|(k, _)| k),
             Some(0),
             "the better claim is the one that stays"
         );
@@ -458,16 +455,9 @@ mod tests {
     fn only_the_side_that_lost_the_arbitration_reports_its_seat_outranked() {
         let epoch = Epoch::new(5);
         let beacon = BeaconSeed::GENESIS;
-        let peers: Vec<_> = (0..80u8).map(|s| peer(s, epoch, &beacon)).collect();
-        let pair = peers.iter().enumerate().find_map(|(i, a)| {
-            peers.iter().skip(i + 1).find_map(|b| {
-                if probe_point::<F7>(&a.3, 0) != probe_point::<F7>(&b.3, 0) || walks_coincide(&a.3, &b.3) {
-                    return None;
-                }
-                Some(if claim_beats((0, &b.3), (0, &a.3)) { (a, b) } else { (b, a) })
-            })
-        });
-        let (loser, winner) = pair.expect("two of 80 identities collide on a point but not on a whole walk");
+        let peers: Vec<Material> = (0..80u8).map(|s| peer(s, epoch, &beacon)).collect();
+        let (loser, winner) =
+            colliding_pair(&peers).expect("two of 80 identities collide on a point but not on a whole walk");
         let contested = probe_point::<F7>(&loser.3, 0).coords();
 
         // An empty book contests nothing: the alarm must not fire merely because the node is seated somewhere.
@@ -477,21 +467,22 @@ mod tests {
 
         let book = ClaimBook::new();
         book.adopt(epoch);
-        book.record::<F7>(&winner.0, winner.1, winner.2, &winner.3);
+        book.record(&winner.0, winner.1, winner.2, &winner.3);
         assert_eq!(
             book.outranked_at::<F7>(&loser.3, 0),
             Some(contested),
-            "the loser is seated on a point a recorded peer claims better, and must be able to say which"
+            "the loser is seated on a point a recorded peer HOLDS, and must be able to say which"
         );
 
         // The other direction, on the same collision: the winner is contested too, and is not outranked.
         let mirror = ClaimBook::new();
         mirror.adopt(epoch);
-        mirror.record::<F7>(&loser.0, loser.1, loser.2, &loser.3);
+        mirror.record(&loser.0, loser.1, loser.2, &loser.3);
         assert_eq!(
             mirror.outranked_at::<F7>(&winner.3, 0),
             None,
-            "a peer merely *wanting* our point is not us losing it — that is the whole content of `claim_beats`"
+            "a peer merely *wanting* our point is not us losing it — and under the seated rule it is not even that: \
+             the loser is assigned elsewhere, so it is not on this point at all"
         );
     }
 
@@ -502,76 +493,96 @@ mod tests {
         let beacon = BeaconSeed::GENESIS;
         let book = ClaimBook::new();
         book.adopt(Epoch::new(7));
-        let (id, public, proof, output) = peer(4, Epoch::new(7), &beacon);
-        book.record::<F7>(&id, public, proof, &output);
+        let m = peer(4, Epoch::new(7), &beacon);
+        book.record(&m.0, m.1, m.2, &m.3);
         assert_eq!(book.len(), 1);
-        assert!(book.contender::<F7>(&probe_point::<F7>(&output, 0)).is_some(), "the point is claimed");
+        let mine = peer(5, Epoch::new(7), &beacon);
+        assert!(settle::<F7>(&book, &as_claimant(&mine)).is_some(), "a recorded peer is a claim the settle reads");
 
         book.adopt(Epoch::new(7)); // idempotent
         assert_eq!(book.len(), 1, "re-announcing the same epoch keeps the book");
         book.adopt(Epoch::new(8));
         assert_eq!(book.len(), 0, "a new epoch discards every claim");
-        assert!(book.contender::<F7>(&probe_point::<F7>(&output, 0)).is_none());
+        assert_eq!(
+            settle::<F7>(&book, &as_claimant(&mine)).map(|(k, _)| k),
+            Some(0),
+            "with the book cleared the node is alone on the plane and settles at its own preferred point"
+        );
     }
 
+    /// ⛔ **Replaces `the_book_keeps_the_best_claim_per_point_not_the_last`.**
+    ///
+    /// That asserted arrival order over the deleted per-point index. The property it was really about — *insertion
+    /// order must not decide anything* — belongs to the assignment now, so it is asserted where the assignment is
+    /// read: every node settles at the same index whichever order the book learned its peers in.
     #[test]
-    fn the_book_keeps_the_best_claim_per_point_not_the_last() {
-        // Insertion order must not decide anything — that is the whole point of arbitrating on an unforgeable pair.
+    fn the_order_the_book_learned_its_peers_in_decides_nothing() {
         let epoch = Epoch::new(2);
         let beacon = BeaconSeed::GENESIS;
-        let peers: Vec<_> = (0..30u8).map(|s| peer(s, epoch, &beacon)).collect();
+        let peers: Vec<Material> = (0..30u8).map(|s| peer(s, epoch, &beacon)).collect();
 
         let forward = ClaimBook::new();
         forward.adopt(epoch);
-        for (id, pk, pr, out) in &peers {
-            forward.record::<F7>(id, *pk, *pr, out);
+        for m in &peers {
+            forward.record(&m.0, m.1, m.2, &m.3);
         }
         let backward = ClaimBook::new();
         backward.adopt(epoch);
-        for (id, pk, pr, out) in peers.iter().rev() {
-            backward.record::<F7>(id, *pk, *pr, out);
+        for m in peers.iter().rev() {
+            backward.record(&m.0, m.1, m.2, &m.3);
         }
-        for i in 0..fanos_geometry::Plane::<F7>::N as usize {
-            let p = Point::<F7>::at(i);
-            assert_eq!(
-                forward.contender::<F7>(&p).map(|(k, o)| (k, o[0])),
-                backward.contender::<F7>(&p).map(|(k, o)| (k, o[0])),
-                "point {i}: the best claim must not depend on arrival order"
-            );
+        let mut moved = 0;
+        for m in &peers {
+            let a = settle::<F7>(&forward, &as_claimant(m)).map(|(k, _)| k);
+            let b = settle::<F7>(&backward, &as_claimant(m)).map(|(k, _)| k);
+            assert_eq!(a, b, "a node's seat must not depend on the order its book learned the others in");
+            if a.is_some_and(|k| k > 0) {
+                moved += 1;
+            }
         }
+        assert!(moved > 0, "the fixture must actually displace somebody, or the assertion is about nothing");
     }
 
+    /// ⛔ **Replaces `a_step_with_no_recorded_witness_is_not_taken`.**
+    ///
+    /// `witness_for` is gone: settling and proving are one call, so "settles where it cannot prove" is no longer a
+    /// state the types admit. The property still worth pinning is the one that made it safe with partial information —
+    /// an empty book moves nobody — plus the end-to-end check that a claim built from *any* book verifies, which the
+    /// two tests above make against fuller ones.
     #[test]
-    fn a_step_with_no_recorded_witness_is_not_taken() {
-        // The safety property that makes this book usable with partial information: it can only settle where it can also
-        // prove, so a node never announces a point whose justification it cannot present.
+    fn an_empty_book_moves_nobody() {
         let epoch = Epoch::new(6);
         let beacon = BeaconSeed::GENESIS;
         let book = ClaimBook::new();
         book.adopt(epoch);
-        let (_, _, proof, output) = peer(11, epoch, &beacon);
-        // Nothing recorded ⇒ nothing contested ⇒ index 0, and `witness_for` refuses every step.
-        assert!(book.witness_for::<F7>(&output, 0).is_none());
-        assert_eq!(settle::<F7>(&book, &output, proof).map(|(k, _)| k), Some(0));
+        let me = peer(11, epoch, &beacon);
+        assert_eq!(settle::<F7>(&book, &as_claimant(&me)).map(|(k, _)| k), Some(0));
+        assert_eq!(book.outranked_at::<F7>(&me.3, 0), None);
     }
 
+    /// ⛔ **`a_node_beaten_at_every_step_is_not_seated_at_all` asserted the opposite of this, and the phantom yield is
+    /// why.**
+    ///
+    /// Two nodes whose outputs give the same preferred point AND the same line AND the same stride take the *identical*
+    /// walk. Under the rule that shipped until 2026-08-21, the better-ranked one held the better *claim* at every index
+    /// of that walk — whether or not it went there — so the other could be seated **nowhere**, and this file documented
+    /// that as "the line restriction's residual failure mode", priced the attack that provokes it
+    /// (`2·N·(q+1)·φ(q+1)` draws: 3 648 at `q = 7`, 1 016 832 at `q = 31`), and pinned it as a test.
+    ///
+    /// It was not the line restriction. It was the phantom yield. The winner is *seated* at one point of the shared
+    /// walk, so under the seated rule it blocks exactly that one and the loser takes the next — which is what this now
+    /// asserts, on the same constructed pair the old test used.
+    ///
+    /// **What remains, and it is a different attack.** `settle` can still answer `None`, and a caller must still read
+    /// that as "announce nothing": a node is unseated when every one of the `q + 1` points of its line is *held* by a
+    /// better claim. Starving a chosen victim therefore needs `q + 1` distinct better-ranked holders on that victim's
+    /// line rather than one identity sharing its whole walk — the residual is not closed, it is `q + 1` times more
+    /// expensive and no longer reachable by a single grind.
     #[test]
-    fn a_node_beaten_at_every_step_is_not_seated_at_all() {
-        // The line restriction's residual failure mode, stated as a test rather than left to be discovered. Two nodes whose
-        // outputs give the same preferred point AND the same line AND the same stride take the *identical* walk, so the
-        // better-ranked one holds the better claim at every index and the other can be seated nowhere. `settle` answers
-        // `None`, which the caller must read as "announce nothing" rather than as an index to fall back on.
-        //
-        // Measured incidence among pairs that share a preferred point on `PG(2,7)`: 3.4% (predicted `1/((q+1)·φ(q+1))` =
-        // 1/32 = 3.1%). Provoking it against a CHOSEN victim means matching that triple and outranking it, which costs
-        // `2·N·(q+1)·φ(q+1)` draws — 3 648 at `q = 7`, **1 016 832 at `q = 31`**, 2.7e8 at `q = 127`. That is
-        // `2(q+1)·φ(q+1)` times the `N` draws it took to make a victim unroutable *before* probing existed (a single
-        // coordinate collision did it), so this residual is 64×/1024×/16384× HARDER than the baseline it replaced, not an
-        // amplification of it. Falling back to a plane-wide walk would close it and reopen the steering primitive that
-        // line restriction exists to remove, which is the worse trade.
+    fn two_nodes_sharing_a_whole_walk_are_both_seated_now() {
         let epoch = Epoch::new(5);
         let beacon = BeaconSeed::GENESIS;
-        let peers: Vec<_> = (0..400u16).map(|s| peer16(s, epoch, &beacon)).collect();
+        let peers: Vec<Material> = (0..400u16).map(|s| peer16::<F7>(s, epoch, &beacon)).collect();
         let pair = peers.iter().enumerate().find_map(|(i, a)| {
             peers.iter().skip(i + 1).find_map(|b| {
                 walks_coincide(&a.3, &b.3).then(|| {
@@ -583,16 +594,25 @@ mod tests {
 
         let book = ClaimBook::new();
         book.adopt(epoch);
-        book.record::<F7>(&winner.0, winner.1, winner.2, &winner.3);
+        book.record(&winner.0, winner.1, winner.2, &winner.3);
+        let (index, claim) =
+            settle::<F7>(&book, &as_claimant(loser)).expect("the winner holds ONE point of the shared walk, not all");
+        assert_eq!(index, 1, "the winner is seated at index 0 of the walk they share, so the next point is free");
         assert!(
-            settle::<F7>(&book, &loser.3, loser.2).is_none(),
-            "beaten at every index of its own line, the node must report no seat rather than an unprovable one"
+            verify_coordinate_claim::<F7>(
+                &loser.1,
+                &loser.0,
+                epoch,
+                &beacon,
+                &probe_point::<F7>(&loser.3, index),
+                &claim
+            ),
+            "and the seat it takes is one it can prove"
         );
-        // The winner is unaffected: its own claim is the best one everywhere on that walk.
+        // The winner is unaffected: it holds its preference whichever way the pair is recorded.
         let other = ClaimBook::new();
         other.adopt(epoch);
-        other.record::<F7>(&loser.0, loser.1, loser.2, &loser.3);
-        assert_eq!(settle::<F7>(&other, &winner.3, winner.2).map(|(k, _)| k), Some(0));
+        other.record(&loser.0, loser.1, loser.2, &loser.3);
+        assert_eq!(settle::<F7>(&other, &as_claimant(winner)).map(|(k, _)| k), Some(0));
     }
 }
-

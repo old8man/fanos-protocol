@@ -218,28 +218,27 @@ pub fn coordinate_from_output<F: Field>(output: &VrfOutput) -> Point<F> {
 /// resourced adversary a steering primitive everywhere; line-restricted probing gives that up and keeps the capacity that
 /// exists at real `q`.
 ///
-/// ## The residual: an identical walk cannot be escaped
+/// ## ⛔ The residual this section called "an identical walk cannot be escaped" was the phantom yield
 ///
 /// Two nodes whose outputs give the same preferred point **and** the same line **and** the same stride take the *same*
-/// walk, point for point. The better-ranked one then holds the better claim at every index ([`claim_beats`]), so the other
-/// is beaten everywhere on its own line and [`settle_index`] answers `None`: it cannot be seated at all. Measured among
-/// pairs that share a preferred point on `PG(2,7)`, this is **3.4%** of them, against the predicted
-/// `1/((q+1)·φ(q+1))` = 1/32 = 3.1% (`fanos_quic::claims`).
+/// walk, point for point. This section used to conclude that the better-ranked one then holds the better claim at every
+/// index, so the other is beaten everywhere on its own line and cannot be seated at all — measured at **3.4%** of pairs
+/// sharing a preferred point on `PG(2,7)` against a predicted `1/((q+1)·φ(q+1))` = 3.1%, and priced as an attack on a
+/// chosen victim at `2·N·(q+1)·φ(q+1)` draws (3 648 at `q = 7`, 1 016 832 at `q = 31`, 2.7e8 at `q = 127`).
 ///
-/// Provoked against a *chosen* victim it costs matching that triple and outranking it,
-/// `2·N·(q+1)·φ(q+1)` draws:
+/// **Every step of that is true of [`settle_index`] and none of it is true of the plane.** "Holds the better claim at
+/// every index" is exactly the phantom yield: the winner is *seated* at one point of the shared walk, and under
+/// [`deferred_assignment`] it blocks that one. The loser takes the next. Pinned by
+/// `fanos_quic::claims::two_nodes_sharing_a_whole_walk_are_both_seated_now`, which asserts index **1** on the same
+/// constructed pair the old test used to assert `None` for.
 ///
-/// | plane | draws | vs. the pre-probing baseline (`N`) |
-/// |---|---|---|
-/// | `q = 7` | 3 648 | 64× harder |
-/// | `q = 31` | 1 016 832 | **1024× harder** |
-/// | `q = 127` | 2.7e8 | 16384× harder |
-///
-/// The baseline is the right comparison and it is what makes this acceptable: before probing existed, a *single*
-/// coordinate collision — `N` draws — already made a victim unroutable. So this residual is `2(q+1)·φ(q+1)` times harder
-/// than the DoS it replaced, not an amplification of it. Falling back to a plane-wide walk would close it and reopen the
-/// steering primitive line restriction exists to remove, which is the worse trade; a caller that gets `None` must announce
-/// nothing rather than pick an index it cannot prove.
+/// What is left is a different and larger attack. A node is unseated when every one of the `q + 1` points of its line
+/// is *held* by a better claim, so starving a chosen victim needs `q + 1` distinct better-ranked holders on that
+/// victim's line instead of one identity matching its whole walk. The old table's comparison still frames it: before
+/// probing existed a *single* coordinate collision — `N` draws — made a victim unroutable, and this is further from
+/// that than the figures above were. Falling back to a plane-wide walk would still reopen the steering primitive line
+/// restriction exists to remove, which is still the worse trade; a caller that gets `None` must still announce nothing
+/// rather than pick an index it cannot prove.
 ///
 /// ## Why the sequence within the line is a permutation, and not another hash
 ///
@@ -290,6 +289,16 @@ pub fn probe_index_of<F: Field>(output: &VrfOutput, p: &Point<F>) -> Option<u16>
 /// **One sequence, two views.** [`probe_point`] reads it forwards and [`probe_index_of`] reads it backwards, so the two
 /// cannot disagree about where a point sits — a class of defect this code has already paid for once (see
 /// [`displacement_is_forced`]).
+///
+/// Public as [`probe_walk_of`] because a caller that needs the *whole* walk — [`deferred_assignment`], and any book
+/// indexing a peer's claims — would otherwise call [`probe_point`] once per index and rebuild this sequence every time,
+/// turning an `O(q)` job into `O(q²)`. That is the same "once per peer, not once per query" argument
+/// `fanos_quic::claims` makes for its own index, one layer down.
+#[must_use]
+pub fn probe_walk_of<F: Field>(output: &VrfOutput) -> Vec<Point<F>> {
+    probe_walk::<F>(output)
+}
+
 fn probe_walk<F: Field>(output: &VrfOutput) -> Vec<Point<F>> {
     let first = coordinate_from_output::<F>(output);
     // The line this node falls back along: one of the `q + 1` lines through its preferred point, chosen by its own output
@@ -436,24 +445,45 @@ pub fn claim_beats(challenger: (u16, &VrfOutput), incumbent: (u16, &VrfOutput)) 
 pub fn displacement_is_forced<F: Field>(
     claimant: &VrfOutput,
     j: u16,
-    witness_public: &VrfPublic,
-    witness_id: &[u8],
+    witness: &DisplacementWitness,
     epoch: Epoch,
     beacon: &BeaconSeed,
-    witness_proof: &VrfProof,
 ) -> bool {
-    let Some(witness_output) = witness_public.verify(&beacon_alpha(witness_id, epoch, beacon), witness_proof) else {
-        return false;
-    };
-    let contested = probe_point::<F>(claimant, j);
-    // A point off the witness's own line is one it has no claim to, so it can displace nobody from it.
-    let Some(reached) = probe_index_of::<F>(&witness_output, &contested) else {
-        return false;
-    };
-    claim_beats((reached, &witness_output), (j, claimant))
+    let mut seen = Vec::new();
+    forced_by_holder::<F>(claimant, j, witness, epoch, beacon, &mut seen)
 }
 
-/// The probe index a node settles at, given whatever peers it can observe — the sans-I/O core of live resolution.
+/// [`displacement_is_forced`] sharing one tree's holder table, so a witness reached twice in a justification DAG is
+/// verified once and a tree can be bounded as a whole. The public wrapper starts a fresh one.
+fn forced_by_holder<'a, F: Field>(
+    claimant: &VrfOutput,
+    j: u16,
+    witness: &'a DisplacementWitness,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    seen: &mut Vec<(&'a [u8], [u8; 32], u16, VrfOutput)>,
+) -> bool {
+    let contested = probe_point::<F>(claimant, j);
+    // The witness must be **seated** at the contested point, not merely want it — so its own claim is checked, against
+    // that point, by the same predicate that checks the claimant's. That is the whole of the change from the rule this
+    // replaced, and everything else here was already true of it.
+    let Some(witness_output) =
+        verify_claim_seen::<F>(&witness.public, &witness.id, epoch, beacon, &contested, &witness.claim, seen)
+    else {
+        return false;
+    };
+    claim_beats((witness.claim.index, &witness_output), (j, claimant))
+}
+
+/// The probe index a node settles at, given whatever peers it can observe — **the retired rule**, kept as the reference
+/// its replacement is measured against.
+///
+/// ⛔ **Nothing on the live path calls this since 2026-08-21.** `fanos_quic::claims` settles through
+/// [`deferred_claim`] and `verify_coordinate_claim` accepts only claims justified by a *seated* witness, so a node
+/// settling here would announce a point the far end refuses. It stays public because
+/// `examples/line_confinement_coverage.rs` measures the two side by side and the comparison is the argument for the
+/// change: this rule clears the line-viability floor in 32.7 % of `PG(2,2)` draws at one node per point where the
+/// deferred one clears 80.5 %, and 7.5 % against 97.5 % on `PG(2,4)` at `1.5 N`.
 ///
 /// `contender(p)` reports the **best claim any other node has to `p`** as `(probe_index_of(their_output, p),
 /// their_output)`, or `None` if nobody the caller knows of reaches `p`. The walk stops at the first index whose point no
@@ -554,6 +584,9 @@ pub fn settle_index<F: Field>(
 #[must_use]
 pub fn deferred_assignment<F: Field>(claims: &[VrfOutput]) -> BTreeMap<Triple, (u16, usize)> {
     let bound = probe_bound::<F>();
+    // Each walk built ONCE. `probe_point(o, k)` rebuilds the whole sequence to read one entry, so asking it `q + 1`
+    // times per node is `O(q²)` per node for a job that is `O(q)`.
+    let walks: Vec<Vec<Point<F>>> = claims.iter().map(|o| probe_walk_of::<F>(o)).collect();
     let mut held: BTreeMap<Triple, (u16, usize)> = BTreeMap::new();
     let mut next: Vec<u16> = vec![0; claims.len()];
     // Proposers with no offer outstanding. A node displaced from a point returns here, which is the whole of what
@@ -567,7 +600,7 @@ pub fn deferred_assignment<F: Field>(claims: &[VrfOutput]) -> BTreeMap<Triple, (
                 break; // every point of this node's line is held by a better claim
             }
             *slot = k.saturating_add(1);
-            let p = probe_point::<F>(mine, k).coords();
+            let Some(p) = walks.get(i).and_then(|w| w.get(usize::from(k))).map(Point::coords) else { break };
             match held.get(&p).copied() {
                 None => {
                     held.insert(p, (k, i));
@@ -597,19 +630,86 @@ pub fn deferred_index<F: Field>(me: usize, claims: &[VrfOutput]) -> Option<u16> 
     deferred_assignment::<F>(claims).into_values().find_map(|(k, i)| (i == me).then_some(k))
 }
 
-/// One step of a [`CoordinateClaim`]'s justification: the node whose *preference* forced the claimant off one of its
-/// earlier probe points.
+/// Everything a [`CoordinateClaim`] needs about one contender: what the coordinate VRF binds to, the key and proof that
+/// certify it, and the output they yield.
 ///
-/// Carries the witness's identity, key and VRF proof — everything needed to check the step without asking anyone. Note
-/// what it does **not** carry: where the witness itself ended up. Verification is non-recursive by construction.
+/// A borrowed `id` because the caller already holds it — a claim book keyed by identity, or a directory of verified
+/// HELLOs — and copying every identity to build one claim would be the largest allocation in the path.
+#[derive(Clone, Copy, Debug)]
+pub struct Claimant<'a> {
+    /// The node's identity bytes, as fed to the coordinate VRF.
+    pub id: &'a [u8],
+    /// Its VRF public key.
+    pub public: VrfPublic,
+    /// Its coordinate proof for this epoch and beacon.
+    pub proof: VrfProof,
+    /// The output that proof yields — carried rather than re-derived, since the caller verified it once already.
+    pub output: VrfOutput,
+}
+
+/// The seat and the **provable claim** to it for the node at position `me`, under [`deferred_assignment`].
+///
+/// This is the counterpart of [`verify_coordinate_claim`] and the reason both live here: the predicate that *moves* a
+/// node and the predicate that *justifies* it must be one thing. Deriving them independently is what produced the
+/// unprovable-displacement defect [`displacement_is_forced`] records, and a second construction of a witness chain
+/// would be a second place for the two to drift.
+///
+/// Each skipped index is justified by the **holder** of that point in the same assignment, carrying its own claim built
+/// the same way. The recursion terminates because a holder that displaced this node settled at a strictly lower index.
+///
+/// `None` if `me` is not seated — every point of its line is held by a better claim, which is the honest answer rather
+/// than a wrapped index.
+#[must_use]
+pub fn deferred_claim<F: Field>(me: usize, claimants: &[Claimant<'_>]) -> Option<(u16, CoordinateClaim)> {
+    let outputs: Vec<VrfOutput> = claimants.iter().map(|c| c.output).collect();
+    let held = deferred_assignment::<F>(&outputs);
+    let claim = claim_from_assignment::<F>(me, claimants, &held)?;
+    Some((claim.index, claim))
+}
+
+/// The recursive half of [`deferred_claim`], walking the assignment down from `me`'s seat.
+fn claim_from_assignment<F: Field>(
+    me: usize,
+    claimants: &[Claimant<'_>],
+    held: &BTreeMap<Triple, (u16, usize)>,
+) -> Option<CoordinateClaim> {
+    let mine = claimants.get(me)?;
+    let index = held.values().find_map(|&(k, i)| (i == me).then_some(k))?;
+    let mut witnesses = Vec::with_capacity(usize::from(index));
+    for j in 0..index {
+        let skipped = probe_point::<F>(&mine.output, j).coords();
+        let &(_, holder) = held.get(&skipped)?;
+        let w = claimants.get(holder)?;
+        let claim = claim_from_assignment::<F>(holder, claimants, held)?;
+        witnesses.push(DisplacementWitness { id: w.id.to_vec(), public: w.public, claim });
+    }
+    Some(CoordinateClaim { proof: mine.proof, index, witnesses })
+}
+
+/// One step of a [`CoordinateClaim`]'s justification: the node **holding** the point that forced the claimant off one of
+/// its earlier probes.
+///
+/// ⛔ **Until 2026-08-21 this carried only `(id, public, proof)` and its doc said "note what it does *not* carry: where
+/// the witness itself ended up".** That was the *phantom yield*: a node seated at index 0 displaced everyone from the
+/// two points further along its own walk, whether or not it ever went there. Measured, that is what costs `PG(2,4)` at
+/// `1.5 N` the difference between **7.5 %** and **97.5 %** of draws clearing the line-viability floor
+/// (`examples/line_confinement_coverage.rs`). A witness now carries its own [`CoordinateClaim`], which is exactly
+/// "where it ended up", and the step is forced only if that is the contested point.
+///
+/// **The recursion this introduces is bounded, and by the same predicate rather than by a counter.** A witness beats
+/// the claimant at the contested point, so its own settled index is *strictly below* the claimant's — depth at most
+/// `q`, and at most `2^k − 1` claims for a seat at index `k`. Measured, the mean per seated node goes from `0.311` to
+/// `0.316` on `PG(2,2)` at one node per point (`examples/deferred_certificate_size.rs`), because 77–99 % of nodes sit
+/// at index 0 and carry nothing at all under either rule.
 #[derive(Clone, Debug)]
 pub struct DisplacementWitness {
     /// The witness node's identity bytes, as fed to the coordinate VRF.
     pub id: Vec<u8>,
     /// The witness's VRF public key.
     pub public: VrfPublic,
-    /// The witness's coordinate proof for this epoch and beacon.
-    pub proof: VrfProof,
+    /// The witness's **own claim** — its proof, the index it settled at, and its own justification. The contested point
+    /// is this witness's `claim.index`-th probe, or the step is not forced and the claim is refused.
+    pub claim: CoordinateClaim,
 }
 
 /// A node's **verifiable claim** to a coordinate: its own coordinate proof, the probe index it sits at, and one witness
@@ -631,9 +731,7 @@ pub struct CoordinateClaim {
 // are the same claim exactly when they serialize the same, which is also the only notion a peer can act on.
 impl PartialEq for DisplacementWitness {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-            && self.public.to_bytes() == other.public.to_bytes()
-            && self.proof.to_bytes() == other.proof.to_bytes()
+        self.id == other.id && self.public.to_bytes() == other.public.to_bytes() && self.claim == other.claim
     }
 }
 impl Eq for DisplacementWitness {}
@@ -654,15 +752,23 @@ impl CoordinateClaim {
         Self { proof, index: 0, witnesses: Vec::new() }
     }
 
-    /// The canonical encoding: `proof ‖ index_be ‖ (id_len_be ‖ id ‖ public ‖ proof)*`.
+    /// The canonical encoding: `proof ‖ index_be ‖ (id_len_be ‖ id ‖ public ‖ <claim>)*`, **recursively** — a witness
+    /// now carries its own claim rather than a bare proof, so the encoding nests.
     ///
     /// Witness identities are length-prefixed because a node id is not fixed-width at this layer (the coordinate VRF
     /// takes arbitrary identity bytes). The witness count is *not* encoded separately — it is `index`, and
     /// [`verify_coordinate_claim`] requires exactly that many, so a stated count could only ever disagree with the
-    /// authoritative one.
+    /// authoritative one. The same holds one level down, which is what keeps the nesting self-delimiting without a
+    /// length prefix per sub-claim.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(PROOF_LEN + 2 + self.witnesses.len() * (2 + 32 + PROOF_LEN));
+        let mut out = Vec::with_capacity(PROOF_LEN + 2 + self.witnesses.len() * (2 + 32 + PROOF_LEN + 2));
+        self.write_to(&mut out);
+        out
+    }
+
+    /// Append this claim's canonical encoding to `out` — the recursive half of [`to_bytes`](Self::to_bytes).
+    fn write_to(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.proof.to_bytes());
         out.extend_from_slice(&self.index.to_be_bytes());
         for w in &self.witnesses {
@@ -670,35 +776,55 @@ impl CoordinateClaim {
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(w.id.get(..usize::from(len)).unwrap_or(&w.id));
             out.extend_from_slice(&w.public.to_bytes());
-            out.extend_from_slice(&w.proof.to_bytes());
+            w.claim.write_to(out);
         }
-        out
     }
 
     /// Parse a claim, or `None` if malformed — a wrong length, a witness count disagreeing with `index`, trailing bytes,
-    /// or a proof/key that is not a valid group element.
+    /// a proof/key that is not a valid group element, or a nesting deeper than [`MAX_CLAIM_DEPTH`].
     ///
     /// Every rejection here is a claim a peer must not act on, so the decoder is strict rather than lenient: an
     /// unparseable claim is indistinguishable from a forged one at this layer.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut r = Reader { bytes, at: 0 };
+        let claim = Self::read_from(&mut r, MAX_CLAIM_DEPTH)?;
+        if r.at != bytes.len() {
+            return None; // trailing bytes: not a canonical encoding
+        }
+        Some(claim)
+    }
+
+    /// The recursive half of [`from_bytes`](Self::from_bytes), with the decode-time depth guard.
+    ///
+    /// The guard is *not* the security bound — [`verify_coordinate_claim`] enforces the exact per-plane one, since a
+    /// witness's index is strictly below its claimant's and both are below `probe_bound`. It is here so that a
+    /// deliberately deep encoding cannot exhaust the parser's stack before anything is verified, which is the one
+    /// failure a decoder must not have.
+    fn read_from(r: &mut Reader<'_>, depth: usize) -> Option<Self> {
+        let depth = depth.checked_sub(1)?;
         let proof = VrfProof::from_bytes(r.array::<PROOF_LEN>()?)?;
         let index = u16::from_be_bytes(r.array::<2>()?);
-        let mut witnesses = Vec::with_capacity(usize::from(index));
+        let mut witnesses = Vec::with_capacity(usize::from(index).min(64));
         for _ in 0..index {
             let len = usize::from(u16::from_be_bytes(r.array::<2>()?));
             let id = r.take(len)?.to_vec();
             let public = VrfPublic::from_bytes(r.array::<32>()?)?;
-            let proof = VrfProof::from_bytes(r.array::<PROOF_LEN>()?)?;
-            witnesses.push(DisplacementWitness { id, public, proof });
-        }
-        if r.at != bytes.len() {
-            return None; // trailing bytes: not a canonical encoding
+            let claim = Self::read_from(r, depth)?;
+            witnesses.push(DisplacementWitness { id, public, claim });
         }
         Some(Self { proof, index, witnesses })
     }
 }
+
+/// The deepest a [`CoordinateClaim`] may nest at **decode** time, before any verification has happened.
+///
+/// Derived, not chosen: a witness's settled index is strictly below its claimant's (it beats the claimant at the
+/// contested point), and every index is below `probe_bound::<F>() = q + 1`. The largest projective order this build
+/// admits is `q = 31` (`NodeConfig::plane_order`), so no honest claim on any supported plane nests deeper than 32.
+/// [`verify_coordinate_claim`] enforces the exact bound for the plane it is checking; this one only keeps a hostile
+/// encoding from recursing the parser before that check can run.
+pub const MAX_CLAIM_DEPTH: usize = 32;
 
 /// A minimal sequential byte reader for [`CoordinateClaim::from_bytes`].
 struct Reader<'a> {
@@ -763,23 +889,57 @@ pub fn verify_coordinate_claim_output<F: Field>(
     claimed: &Point<F>,
     claim: &CoordinateClaim,
 ) -> Option<VrfOutput> {
-    let output = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof)?;
+    let mut seen = Vec::new();
+    verify_claim_seen::<F>(claimant_public, claimant_id, epoch, beacon, claimed, claim, &mut seen)
+}
+
+/// [`verify_coordinate_claim_output`] carrying the **holder table** for one justification tree.
+///
+/// `seen` records every `(id, public, index, output)` this tree has already established, and it is doing three jobs at
+/// once, all of which fall out of one fact: *a valid assignment seats at most one node per point.*
+///
+/// 1. **Work bound.** A witness reached twice down two paths of the DAG costs one verification, not two.
+/// 2. **Total bound.** The table cannot exceed `Plane::<F>::N` entries, because that many distinct holders would be
+///    more holders than there are points. So a hostile claim buys at most `N` VRF verifications, against the `2^k − 1`
+///    an unmemoized recursion would do — and at `q = 31` that is 993 rather than two billion.
+/// 3. **Consistency.** The same identity appearing twice at *different* indices is a claim that one node holds two
+///    points, which no assignment does. It is refused rather than accepted twice.
+///
+/// The bound is structural rather than chosen, which is what makes it safe to state as a limit: an honest tree carries
+/// 3 of 7 entries at worst on `PG(2,2)` and 8 of 21 on `PG(2,4)` (`examples/deferred_certificate_size.rs`).
+fn verify_claim_seen<'a, F: Field>(
+    claimant_public: &VrfPublic,
+    claimant_id: &'a [u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    claimed: &Point<F>,
+    claim: &'a CoordinateClaim,
+    seen: &mut Vec<(&'a [u8], [u8; 32], u16, VrfOutput)>,
+) -> Option<VrfOutput> {
     // The walk cycles after `probe_bound` steps, so an index at or beyond it names a point some lower index already
     // names — while demanding that many more witnesses. Rejecting it keeps a claim's chain as short as the point it
     // reaches actually requires, and denies a claimant the option of presenting a needlessly long one.
     if claim.index >= probe_bound::<F>() {
         return None;
     }
-    if probe_point::<F>(&output, claim.index) != *claimed {
-        return None;
-    }
     if claim.witnesses.len() != usize::from(claim.index) {
         return None;
     }
+    let key = claimant_public.to_bytes();
+    if let Some(&(_, _, index, output)) = seen.iter().find(|&&(id, pk, _, _)| id == claimant_id && pk == key) {
+        // Already established in this tree. Two different seats for one identity is the contradiction, not the repeat.
+        return (index == claim.index && probe_point::<F>(&output, claim.index) == *claimed).then_some(output);
+    }
+    let output = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof)?;
+    if probe_point::<F>(&output, claim.index) != *claimed {
+        return None;
+    }
+    if seen.len() >= Plane::<F>::N as usize {
+        return None; // more distinct holders than the plane has points
+    }
+    seen.push((claimant_id, key, claim.index, output));
     let forced = claim.witnesses.iter().enumerate().all(|(j, w)| {
-        u16::try_from(j).is_ok_and(|j| {
-            displacement_is_forced::<F>(&output, j, &w.public, &w.id, epoch, beacon, &w.proof)
-        })
+        u16::try_from(j).is_ok_and(|j| forced_by_holder::<F>(&output, j, w, epoch, beacon, seen))
     });
     forced.then_some(output)
 }
@@ -1038,21 +1198,45 @@ mod tests {
         let w_out = if outranks(&a_out, &b_out) { a_out } else { b_out };
         let w_pk = VrfSecret::from_seed([winner; 32]).public();
 
+        // A witness at index 0 is *seated* at its preferred point by definition, so `direct` is the whole of its
+        // justification — which is why the commonest witness costs nothing extra under the seated rule either.
+        let w = DisplacementWitness { id: vec![winner], public: w_pk, claim: CoordinateClaim::direct(w_proof) };
         assert!(
-            displacement_is_forced::<F31>(&l_out, 0, &w_pk, &[winner], epoch, &beacon, &w_proof),
-            "a lower-ranked node preferring the same point forces the displacement"
+            displacement_is_forced::<F31>(&l_out, 0, &w, epoch, &beacon),
+            "a lower-ranked node SEATED on the same point forces the displacement"
         );
         // The reverse direction must fail: the higher-ranked node does not displace the lower one.
         let l_pk = VrfSecret::from_seed([loser; 32]).public();
         let l_proof = VrfSecret::from_seed([loser; 32]).prove(&beacon_alpha(&[loser], epoch, &beacon)).0;
+        let l = DisplacementWitness { id: vec![loser], public: l_pk, claim: CoordinateClaim::direct(l_proof) };
         assert!(
-            !displacement_is_forced::<F31>(&w_out, 0, &l_pk, &[loser], epoch, &beacon, &l_proof),
+            !displacement_is_forced::<F31>(&w_out, 0, &l, epoch, &beacon),
             "rank is what decides, and the winner keeps its point"
         );
-        // And a claim about the WRONG index fails: the witness collides with index 0, not index 1.
+        // And a claim about the WRONG index fails: the witness sits on the claimant's point 0, not its point 1.
         assert!(
-            !displacement_is_forced::<F31>(&l_out, 1, &w_pk, &[winner], epoch, &beacon, &w_proof),
-            "a witness justifies exactly the index whose point it collides with — this is what bounds k"
+            !displacement_is_forced::<F31>(&l_out, 1, &w, epoch, &beacon),
+            "a witness justifies exactly the index whose point it HOLDS — this is what bounds k"
+        );
+        // The seated rule's own case, and the one the phantom yield used to admit: a witness that WANTS the contested
+        // point but sits elsewhere. Claiming index 1 while its walk puts the contested point at 0 is refused, because
+        // the sub-claim is checked against the contested point and no longer against whatever it prefers.
+        let phantom = DisplacementWitness {
+            id: vec![winner],
+            public: w_pk,
+            claim: CoordinateClaim {
+                proof: w_proof,
+                index: 1,
+                witnesses: vec![DisplacementWitness {
+                    id: vec![loser],
+                    public: l_pk,
+                    claim: CoordinateClaim::direct(l_proof),
+                }],
+            },
+        };
+        assert!(
+            !displacement_is_forced::<F31>(&l_out, 0, &phantom, epoch, &beacon),
+            "a witness seated somewhere else displaces nobody — this is the phantom yield, refused"
         );
     }
 
@@ -1182,41 +1366,20 @@ mod tests {
             })
             .collect();
 
+        let claimants: Vec<Claimant<'_>> = peers
+            .iter()
+            .map(|(id, public, proof, output)| Claimant { id, public: *public, proof: *proof, output: *output })
+            .collect();
+
         let mut displaced = 0;
-        for (i, (my_id, my_public, my_proof, mine)) in peers.iter().enumerate() {
-            // The best claim any *other* peer holds to a point — exactly what a directory can compute from HELLOs.
-            let contender = |p: &Point<F7>| {
-                peers
-                    .iter()
-                    .enumerate()
-                    .filter(|&(j, _)| j != i)
-                    .filter_map(|(_, (_, _, _, o))| probe_index_of::<F7>(o, p).map(|k| (k, *o)))
-                    .reduce(|a, b| if claim_beats((b.0, &b.1), (a.0, &a.1)) { b } else { a })
-            };
-            let Some(k) = settle_index::<F7>(mine, contender) else { continue };
+        let mut seated = 0;
+        for (i, (my_id, my_public, _, mine)) in peers.iter().enumerate() {
+            let Some((k, claim)) = deferred_claim::<F7>(i, &claimants) else { continue };
+            seated += 1;
             if k > 0 {
                 displaced += 1;
             }
-            // Build the claim the node would actually send: one witness per skipped index, taken from what it observed.
-            let witnesses: Vec<DisplacementWitness> = (0..k)
-                .filter_map(|j| {
-                    let pj = probe_point::<F7>(mine, j);
-                    peers
-                        .iter()
-                        .enumerate()
-                        .filter(|&(w, _)| w != i)
-                        .find(|(_, (_, _, _, o))| {
-                            probe_index_of::<F7>(o, &pj).is_some_and(|kw| claim_beats((kw, o), (j, mine)))
-                        })
-                        .map(|(_, (id, public, proof, _))| DisplacementWitness {
-                            id: id.clone(),
-                            public: *public,
-                            proof: *proof,
-                        })
-                })
-                .collect();
-            assert_eq!(witnesses.len(), usize::from(k), "a witness exists for every step settling took");
-            let claim = CoordinateClaim { proof: *my_proof, index: k, witnesses };
+            assert_eq!(claim.witnesses.len(), usize::from(k), "a witness exists for every step settling took");
             assert!(
                 verify_coordinate_claim::<F7>(
                     my_public,
@@ -1230,6 +1393,7 @@ mod tests {
             );
         }
         assert!(displaced >= 3, "the fixture must actually exercise displacement, saw {displaced}");
+        assert!(seated >= N / 2, "the fixture must seat most of the population, saw {seated} of {N}");
     }
 
     #[test]
@@ -1253,7 +1417,8 @@ mod tests {
         let l_sk = VrfSecret::from_seed([loser; 32]);
         let l_proof = l_sk.prove(&beacon_alpha(&[loser], epoch, &beacon)).0;
         let w_pk = VrfSecret::from_seed([winner; 32]).public();
-        let witness = DisplacementWitness { id: vec![winner], public: w_pk, proof: w_proof };
+        let witness =
+            DisplacementWitness { id: vec![winner], public: w_pk, claim: CoordinateClaim::direct(w_proof) };
         let at_one = probe_point::<F31>(&l_out, 1);
 
         let good = CoordinateClaim { proof: l_proof, index: 1, witnesses: vec![witness.clone()] };
@@ -1341,7 +1506,11 @@ mod tests {
         let bogus = CoordinateClaim {
             proof: w_proof,
             index: 1,
-            witnesses: vec![DisplacementWitness { id: vec![loser], public: l_pk, proof: l_proof }],
+            witnesses: vec![DisplacementWitness {
+                id: vec![loser],
+                public: l_pk,
+                claim: CoordinateClaim::direct(l_proof),
+            }],
         };
         assert!(!verify_coordinate_claim::<F31>(
             &w_sk.public(),
@@ -1367,7 +1536,11 @@ mod tests {
         let probed = CoordinateClaim {
             proof: l_proof,
             index: 1,
-            witnesses: vec![DisplacementWitness { id: vec![winner, 7, 9], public: w_pk, proof: w_proof }],
+            witnesses: vec![DisplacementWitness {
+                id: vec![winner, 7, 9],
+                public: w_pk,
+                claim: CoordinateClaim::direct(w_proof),
+            }],
         };
         let encoded = probed.to_bytes();
         assert_eq!(CoordinateClaim::from_bytes(&encoded).as_ref(), Some(&probed));
@@ -1394,14 +1567,17 @@ mod tests {
         let other = VrfSecret::from_seed([12u8; 32]);
         let (other_proof, _) = other.prove(&beacon_alpha(b"other", epoch, &beacon));
 
+        let w = |id: &[u8], public: VrfPublic| DisplacementWitness {
+            id: id.to_vec(),
+            public,
+            claim: CoordinateClaim::direct(other_proof),
+        };
         // Right proof, wrong node id ⇒ the VRF verification itself fails, so no witness value is ever produced.
-        assert!(!displacement_is_forced::<F31>(&mine, 0, &other.public(), b"wrong-id", epoch, &beacon, &other_proof));
+        assert!(!displacement_is_forced::<F31>(&mine, 0, &w(b"wrong-id", other.public()), epoch, &beacon));
         // Right proof, wrong epoch ⇒ same. A stale witness cannot be replayed into a later epoch.
-        assert!(!displacement_is_forced::<F31>(
-            &mine, 0, &other.public(), b"other", Epoch::new(1), &beacon, &other_proof
-        ));
+        assert!(!displacement_is_forced::<F31>(&mine, 0, &w(b"other", other.public()), Epoch::new(1), &beacon));
         // Right proof, wrong public key ⇒ same.
-        assert!(!displacement_is_forced::<F31>(&mine, 0, &sk.public(), b"other", epoch, &beacon, &other_proof));
+        assert!(!displacement_is_forced::<F31>(&mine, 0, &w(b"other", sk.public()), epoch, &beacon));
     }
 
     fn secret(seed: u8) -> VrfSecret {
@@ -1645,6 +1821,73 @@ mod tests {
         }
     }
 
+    /// Every witness identity in an encoded tree, **with repeats** — what the wire actually carries, as opposed to the
+    /// distinct holders the verifier's table counts.
+    fn carried(claim: &CoordinateClaim, out: &mut Vec<Vec<u8>>) {
+        for w in &claim.witnesses {
+            out.push(w.id.clone());
+            carried(&w.claim, out);
+        }
+    }
+
+    /// **A justification is a DAG, and the verifier must survive it being written out as a tree.**
+    ///
+    /// Two of a claimant's skipped points can be held by nodes whose own justifications share a witness, so the same
+    /// holder appears more than once in the encoding. That is not an attack and not a malformed claim — it is what the
+    /// structure is — and the verifier's holder table exists so it costs one verification rather than two. This asserts
+    /// both halves: that the fixture really does produce a repeat (else the table is untested), and that every claim
+    /// built from a real assignment verifies.
+    ///
+    /// **And it runs on `F7` while the four rule tests above run on `F2`, for opposite reasons.** Those need
+    /// *contention*, which wants a small plane at high load. This needs *depth* — a justification tree only has a
+    /// second level when a witness is itself displaced — and a Fano walk is three points long, so at 16 nodes on 7
+    /// points every seated node sits at index 0 or 1 and 5 of 7 trees are empty. On `F7` at one node per point, 51 of
+    /// 57 seat, trees reach seven witnesses, and one carries a repeat. Load and walk length are two different knobs and
+    /// a test has to pick the one its property lives on.
+    ///
+    /// Falsified by making the table's repeat branch return `None` instead of the recorded output: red here, on the
+    /// claim that carries the repeat.
+    #[test]
+    fn a_witness_reached_twice_in_one_tree_is_carried_twice_and_still_verifies() {
+        const N: usize = 57;
+        let (epoch, beacon) = (Epoch::new(5), BeaconSeed::GENESIS);
+        let peers: Vec<(Vec<u8>, VrfPublic, VrfProof, VrfOutput)> = (0..N)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = u8::try_from(i).unwrap_or(0);
+                let sk = VrfSecret::from_seed(seed);
+                let id = alloc::format!("dag-{i}").into_bytes();
+                let (proof, output) = sk.prove(&beacon_alpha(&id, epoch, &beacon));
+                (id, sk.public(), proof, output)
+            })
+            .collect();
+        let claimants: Vec<Claimant<'_>> = peers
+            .iter()
+            .map(|(id, public, proof, output)| Claimant { id, public: *public, proof: *proof, output: *output })
+            .collect();
+
+        let mut repeats = 0;
+        let mut verified = 0;
+        for (i, (my_id, my_public, _, mine)) in peers.iter().enumerate() {
+            let Some((k, claim)) = deferred_claim::<F7>(i, &claimants) else { continue };
+            assert!(
+                verify_coordinate_claim::<F7>(my_public, my_id, epoch, &beacon, &probe_point::<F7>(mine, k), &claim),
+                "peer {i} settled at index {k} but the verifier rejects its claim"
+            );
+            verified += 1;
+            let mut ids = Vec::new();
+            carried(&claim, &mut ids);
+            let mut distinct = ids.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() < ids.len() {
+                repeats += 1;
+            }
+        }
+        assert!(verified > 0, "the fixture seated nobody");
+        assert!(repeats > 0, "no claim in the fixture carries a repeated witness — the holder table is untested here");
+    }
+
     /// **The two rules differ, and they differ in the direction the measurement says.** `settle_index` lets a
     /// contender block a point it does not take; this seats a node there instead. Asserted as a `>=` on every
     /// draw plus at least one strict win, because "never worse" without "sometimes better" is what a rule that
@@ -1665,5 +1908,76 @@ mod tests {
             }
         }
         assert!(strict > 0, "the two rules agreed on all 40 draws — this one is not removing the phantom yield");
+    }
+
+    /// **A claimant that ends up nowhere changes nobody else's seat** — the theorem that says what a node has to learn.
+    ///
+    /// [`deferred_assignment`] is Gale–Shapley with nodes proposing and points receiving; [`claim_beats`] is each
+    /// point's preference and it is a strict total order, so what it returns is the proposer-optimal stable matching. A
+    /// proposer unmatched there is unmatched in *every* stable matching (the rural-hospitals theorem), and deleting an
+    /// agent no stable matching seats leaves the matching unchanged.
+    ///
+    /// **What that buys is the open half of claim propagation.** A node holding the claims of every *seated* peer
+    /// computes the true assignment whatever else it has not heard — so knowledge does not have to be cell-wide, it has
+    /// to cover the seated set. The flooded `Announce` names exactly that set, because a node beaten on every point of
+    /// its line announces nothing flat (`fanos_quic::driver`'s two exhaustion arms ask for a sub-cell address instead).
+    ///
+    /// ⛔ **The obvious control is vacuous, and finding that out is worth more than the control was.** The first version
+    /// asserted that the phantom-yield rule *moves* seats under the same deletion. It never fired, and it cannot: at
+    /// each point `p` of an unseated node's walk some claimant beats it there, and `claim_beats` is a total order, so
+    /// anyone the unseated node would have blocked at `p` was already blocked by that better claim. Transitivity, not
+    /// the fixture. **So this property holds under both rules** — it is a fact about arbitrating by a per-point total
+    /// order, not about deferred acceptance, and the difference between the two rules lives on *partial* views
+    /// (`examples/partial_knowledge_placement.rs`), not here.
+    ///
+    /// The control that remains is the one that keeps the assertion from being trivially true: the same deletion of a
+    /// **seated** node must change the assignment. Without it, a `deferred_assignment` that ignored its input entirely
+    /// would pass.
+    #[test]
+    fn an_unseated_claimant_changes_no_other_seat() {
+        let (mut checked, mut sensitive) = (0usize, 0usize);
+        for t in 0..40 {
+            let claims = draw(&alloc::format!("unseated{t}"), 12);
+            let held = deferred_assignment::<F2>(&claims);
+            let seated: alloc::collections::BTreeSet<usize> = held.values().map(|&(_, i)| i).collect();
+            let Some(gone) = (0..claims.len()).find(|i| !seated.contains(i)) else { continue };
+            let without = |drop: usize| -> Vec<VrfOutput> {
+                claims.iter().enumerate().filter(|&(i, _)| i != drop).map(|(_, o)| *o).collect()
+            };
+            let after = deferred_assignment::<F2>(&without(gone));
+            // Removing an element shifts every later position down by one; this reads a reduced-set position back.
+            let restore = |i: usize| if i < gone { i } else { i + 1 };
+            assert_eq!(
+                held.len(),
+                after.len(),
+                "draw {t}: dropping a claimant that no point seats changed how many points are held"
+            );
+            for (point, &(k, i)) in &after {
+                assert_eq!(
+                    held.get(point),
+                    Some(&(k, restore(i))),
+                    "draw {t}: dropping an unseated claimant moved the holder of {point:?} — then the assignment is \
+                     not a function of the seated set alone, and claim propagation would have to be cell-wide"
+                );
+            }
+            checked += 1;
+            // The non-vacuity control: this deletion is *supposed* to be invisible, so a deletion that is not must be
+            // visible, or the assertion above is about a function that ignores its argument.
+            if let Some(&held_by) = seated.iter().next() {
+                let moved = deferred_assignment::<F2>(&without(held_by));
+                if moved.len() != held.len()
+                    || moved.iter().any(|(p, &(k, i))| {
+                        held.get(p) != Some(&(k, if i < held_by { i } else { i + 1 }))
+                    })
+                {
+                    sensitive += 1;
+                }
+            }
+        }
+        assert!(checked >= 20, "only {checked} of 40 draws produced an unseated claimant — too few to conclude");
+        assert!(
+            sensitive > 0,
+            "dropping a seated claimant changed nothing either, so this fixture cannot see a deletion at all"
+        );
     }
 }

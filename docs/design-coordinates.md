@@ -377,23 +377,40 @@ held by a *higher*-ranked node, because that node is the one who must move. So e
 a **local pairwise rule**: no negotiation, no round trip, and no dependency on agreed membership (which would be circular,
 since membership is what collisions obstruct).
 
-`settle_index` is the sans-I/O core a node runs: walk to the first index whose point no lower-ranked node holds. It is
-monotone in information — a node that has seen fewer peers may settle early and later advance — which is a *convergence*
-question, not a correctness one, since every intermediate position is a claim it can legitimately prove.
+`deferred_assignment` is the sans-I/O core a node runs: over the claims it holds, compute who ends up on each point, and
+read its own seat out of that. It is monotone in information — a node that has seen fewer peers may settle early and later
+advance — which is a *convergence* question, not a correctness one, since every intermediate position is a claim it can
+legitimately prove. That property is Gale–Shapley's own comparative static (adding a proposer weakly worsens every other
+proposer, and a node's preference order is its walk order), not an accident of the implementation.
+
+> ⛔ **Superseded 2026-08-21.** This paragraph described `settle_index`: *"walk to the first index whose point no
+> lower-ranked node holds"* — where "holds" meant *has a better claim to*, whether or not it goes there. That is the
+> **phantom yield** the next section used to defend as a cheap price, and it is not cheap: removing it, same walks and
+> same order, takes `PG(2,4)` at `1.5 N` from **7.5 % to 97.5 %** of draws clearing the line-viability floor, and
+> `PG(2,2)` at one node per point from 32.7 % to 80.5 % (`fanos-vrf/examples/line_confinement_coverage.rs`). A maximum
+> matching over the same admissible sets clears 99.1 %, so line confinement was never what left the points empty.
+> `settle_index` remains in the crate as the reference the measurement compares against; nothing on the live path calls
+> it.
 
 ### The claim, and the one freedom it closes
 
 The node cannot choose *where* its sequence goes, so the only thing left to misreport is *how far along* it sits.
 `CoordinateClaim { proof, index, witnesses }` closes that: index `k` is accepted only with **exactly** `k` witnesses, the
-`j`-th being a genuinely lower-ranked node whose *preference* is the claimant's `j`-th point. A lower-ranked node
-preferring `p` displaces the claimant from `p`, so each step is a public fact rather than an assertion.
+`j`-th being a genuinely lower-ranked node that **holds** the claimant's `j`-th point — carrying, recursively, its own
+claim to it. A lower-ranked node sitting on `p` displaces the claimant from `p`, so each step is a public fact rather than
+an assertion.
 
 `verify_coordinate_claim` is the acceptance predicate a peer runs on a `HELLO`. Three properties worth stating:
 
-- **Non-recursive.** A witness proves only its own preference, never where it settled, so a chain of length `k` costs `k`
-  independent VRF verifications and never unfolds into the witnesses' own chains. The price is *phantom collisions* — a
-  witness itself displaced from `p` still displaces the claimant — which costs occupancy efficiency, never correctness or
-  security, and cannot be manufactured since the claimant does not choose which witnesses exist.
+- **Recursive, and bounded by the predicate rather than by a counter.** ⛔ This bullet used to read *"non-recursive: a
+  witness proves only its own preference, never where it settled … the price is phantom collisions, which costs occupancy
+  efficiency, never correctness or security"*. The price was measured on 2026-08-21 and it is 90 percentage points of
+  floor-clearing at deployment loads, so the witness now carries its own claim. A witness *beats* the claimant at the
+  contested point, so its own settled index is strictly below the claimant's: the tree has depth at most `q` and at most
+  `2^k − 1` claims. Measured, the mean per seated node goes from **0.311 to 0.316** on `PG(2,2)` at one node per point,
+  because 77–99 % of nodes sit at index 0 and carry nothing under either rule. The verifier also keeps a holder table, so
+  a witness reached twice down two paths costs one verification and the distinct count is capped at `N` — one node per
+  point — which is what turns an adversarial `2^k` into `N`.
 - **Witness distinctness is automatic.** A witness justifies index `j` only if its single preference *is* the claimant's
   `j`-th point, and distinct indices are distinct points on a permutation walk, so one witness can never justify two
   steps. No separate check, and one less thing to get wrong.

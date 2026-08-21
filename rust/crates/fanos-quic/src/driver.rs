@@ -41,7 +41,7 @@ use quinn::{ClientConfig, ServerConfig};
 
 use crate::directory::{Directory, WriteOutcome};
 use crate::reflexive::{ReflexiveAddr, decode_addr, encode_addr};
-use fanos_vrf::{CoordinateClaim, VrfOutput, VrfProof, VrfPublic};
+use fanos_vrf::{Claimant, CoordinateClaim, VrfOutput, VrfProof, VrfPublic};
 
 use crate::claims::{self, ClaimBook};
 use crate::identity::{
@@ -486,8 +486,9 @@ use fanos_wire::MAX_FRAME;
 ///
 /// A function pointer rather than a type parameter, and that is the whole point (#249). The index IS
 /// derivable from what a handshake recovers — `fanos_vrf::probe_index_of`'s own doc says a verifier "learns
-/// how far along `p` sits for that peer **without being told**", which is what keeps
-/// `verify_coordinate_claim` non-recursive. Nothing was ever missing from the wire. What was missing was the
+/// how far along `p` sits for that peer **without being told**". (That used to be stated as what keeps
+/// `verify_coordinate_claim` non-recursive; it no longer is — see `fanos_vrf::DisplacementWitness` — but the
+/// derivability itself is unchanged and is all this needs.) Nothing was ever missing from the wire. What was missing was the
 /// TYPE at the site: walking the plane needs `F`, and `F` is monomorphised away at spawn, so by the time the
 /// send loop holds a `Proven(actual)` there is no type left to walk with. Carrying the walk as a value
 /// closes that without touching a frame, a proof, or a witness chain.
@@ -1371,7 +1372,7 @@ impl Client {
         output: &VrfOutput,
     ) {
         if let Some(book) = &self.claims {
-            book.record::<F>(id, public, proof, output);
+            book.record(id, public, proof, output);
         }
     }
 
@@ -2226,7 +2227,7 @@ fn self_certifying_identity<F: Field + 'static>(
                 // *past* epoch within the safe-stall window is deliberately not recorded: its claim is evidence about that
                 // epoch's placement, and admitting it here would let a retired placement justify a displacement now.
                 if epoch == verify_book.epoch() {
-                    verify_book.record::<F>(peer_cert, peer.public, peer.proof, &peer.output);
+                    verify_book.record(peer_cert, peer.public, peer.proof, &peer.output);
                 }
             }
             HelloVerdict::Ok(Box::new(result))
@@ -2732,6 +2733,10 @@ async fn reshuffle_loop<F: Field>(
         tracing::debug!(?addr, coord = ?at.coord, "our point is already held; asking its holder for its claim");
         seat.client.command(Command::Send { to: at.coord, payload: Vec::new() });
     }
+    // Coordinates this node has already asked for a claim **this epoch** — see the `Wake::Meet` arm for why the
+    // question is "have I asked" and no longer "does anyone I know reach it". Bounded by the membership the flood
+    // names, which is bounded by the plane, and emptied at every boundary along with the claim book.
+    let mut asked: BTreeSet<Triple> = BTreeSet::new();
     loop {
         // Why the loop woke. A local enum rather than a `Notification` variant: "a peer's claim was recorded" is this
         // loop's business, not something the engine has any reason to broadcast.
@@ -2823,6 +2828,9 @@ async fn reshuffle_loop<F: Field>(
                 at.settling.store(true, Ordering::Release);
                 at.rounds = 0;
                 at.walk_after = None;
+                // Every claim in the book was just discarded, so every member is worth asking again — and the
+                // proof each one hands back is bound to *this* epoch's beacon.
+                asked.clear();
                 // The coordinate was just re-derived, so whether this node holds its level-0 point is an
                 // open question again — and a node that descended last epoch may win a seat this one.
                 at.addressed = None;
@@ -2831,7 +2839,8 @@ async fn reshuffle_loop<F: Field>(
                 // immediately afterwards therefore lands at index 0 and moves up again as this epoch's
                 // peers are met — which is why a claim held back by a beacon this node did not have yet is
                 // worth retrying rather than dropping.
-                let Some((index, claim)) = claims::settle::<F>(&book, &rank, proof) else {
+                let me = Claimant { id: creds.cert_der(), public: creds.vrf_secret().public(), proof, output: rank };
+                let Some((index, claim)) = claims::settle::<F>(&book, &me) else {
                     // Every point of this epoch's line is better claimed. Announce nothing **flat** — and
                     // ask for a sub-cell address instead of sitting on a point this node does not own.
                     seat.ask_address(&mut at, true);
@@ -2876,7 +2885,9 @@ async fn reshuffle_loop<F: Field>(
                 // it has no other way to learn that this seat is contested.
                 seat.client.set_contested(book.outranked_at::<F>(&at.output, at.index).is_some());
                 let (_, proof, _) = verifiable_coordinate_ranked::<F>(&creds, at.epoch, &at.beacon);
-                let Some((index, claim)) = claims::settle::<F>(&book, &at.output, proof) else {
+                let me =
+                    Claimant { id: creds.cert_der(), public: creds.vrf_secret().public(), proof, output: at.output };
+                let Some((index, claim)) = claims::settle::<F>(&book, &me) else {
                     // Beaten on every point of the line — which is exactly "this plane has no seat for me",
                     // and is `derive_address`'s trigger. The flat announcement is held rather than retracted
                     // (a retraction would make this node unreachable before the sub-cell address lands).
@@ -2935,14 +2946,25 @@ async fn reshuffle_loop<F: Field>(
             }
             // **Ask, then re-settle.** A member learned by flood is a peer whose claim this node needs and
             // has no other way to get: dialling is by coordinate, and the announcement is the one place the
-            // coordinate arrives without a handshake having happened first. Silent when the book already
-            // holds a claim at that point — which is the common case once a cell is settled, so the steady
-            // state costs one map lookup per announcement.
+            // coordinate arrives without a handshake having happened first.
+            //
+            // ⛔ **The guard used to be `!book.anyone_reaches(point)` — "does any peer I know reach this
+            // point" — and the deferred rule makes that the wrong question.** Under the phantom yield a
+            // claim to `p` was decisive wherever its holder ended up, so knowing *some* claim to `p` was
+            // knowing what mattered about `p`. Under deferred acceptance what decides a seat is who
+            // **holds** it, and a peer whose walk merely passes through `p` says nothing about that: the
+            // guard would skip the announcement of the very node sitting there, and this node would then
+            // compute an assignment that omits a seated claim — the one input it must not be missing
+            // (`fanos_vrf::deferred_assignment`, and the theorem in
+            // `an_unseated_claimant_changes_no_other_seat`).
+            //
+            // Asking once per coordinate per epoch instead: same bound as before — one frame per member the
+            // flood names, and the book is cleared at every boundary, so the set is too.
             Wake::Meet(coord) => {
-                let Some(point) = Point::<F>::new(coord) else {
+                if Point::<F>::new(coord).is_none() {
                     continue; // not a point of this plane; the engine already refuses these
-                };
-                if book.contender::<F>(&point).is_none() {
+                }
+                if asked.insert(coord) {
                     seat.client.command(Command::Send { to: coord, payload: Vec::new() });
                 }
             }
@@ -4065,8 +4087,8 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
                     // an unranked binding, and the comment here argued that "the index is the half a
                     // handshake cannot supply". That premise was false, and `fanos_vrf::probe_index_of`'s
                     // own doc says so: a verifier "learns how far along `p` sits for that peer **without
-                    // being told**", which is exactly what keeps `verify_coordinate_claim` non-recursive.
-                    // Nothing was missing from the frame. TWO things were dropped at TWO boundaries:
+                    // being told**". Nothing was missing from the frame. TWO things were dropped at TWO
+                    // boundaries:
                     //
                     //  * the peer's VRF output — its rank — which `hello_exchange` had in hand and bound to
                     //    `peer: _`, now carried as `Handshake::rank`; and
