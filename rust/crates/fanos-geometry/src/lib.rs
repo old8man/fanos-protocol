@@ -138,10 +138,19 @@ pub const fn points_serving_every_line(line_size: usize) -> usize {
 /// floor". Zero servable lines says the same thing in a form that cannot be misread: **every gather the
 /// cell draws must expire, because no line it could draw holds `t` members.**
 ///
-/// Sizing, from the same measurement (simulated against `fanos_vrf`'s live line-confined probe walk):
-/// `M = N` clears the floor 87 % of the time on `PG(2,2)` and only **25 %** on `PG(2,4)`, while
-/// `M ≈ 1.5·N` clears it ~99 % on both. A cell is sized in **nodes**, and the plane is counted in
-/// **points**; they are not the same number, and the ratio is not 1.
+/// **Sizing lives in [`members_for_a_covered_plane`] and is deliberately not restated here.** A cell is
+/// sized in *nodes* while a plane is counted in *points*, they are not the same number, and the ratio is
+/// not 1 — but the figures that say by how much belong in one place.
+///
+/// ⛔ This paragraph used to carry its own copy: *"`M = N` clears the floor 87 % on `PG(2,2)` and 25 % on
+/// `PG(2,4)`, `M ≈ 1.5·N` ~99 % on both."* Every one of those numbers is from the table refuted on
+/// 2026-08-19, and the refutation's own note said the last surviving copy was in `role_loop`'s
+/// under-provisioning report. It was not: it was here, two functions above the correction, in the doc an
+/// operator reads *first* because it is the function that names the floor. The shipping enumeration reads
+/// `1.0 N` → **32.7 % / 0.0 %** and `1.5 N` → **74.5 % / 7.5 %** — so the old copy would have sized a
+/// `PG(2,4)` testnet at `1.5 N` against a real 7.5 % chance of being able to carry a single anonymous hop.
+///
+/// A number quoted in two places is a number that will diverge; the link is the fix, not a corrected copy.
 #[must_use]
 pub fn servable_lines<F: Field>(occupied: impl Fn(Point<F>) -> bool) -> usize {
     let t = line_threshold(Plane::<F>::LINE_SIZE as usize);
