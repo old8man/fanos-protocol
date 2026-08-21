@@ -225,7 +225,26 @@ impl<F: Field> DkgNode<F> {
         secret: [u8; 32],
         session_nonce: [u8; 32],
     ) -> Self {
+        // **The group is the PLANE, not the cell, and that was never written down.**
+        //
+        // `n` is the number of shares `dkg::deal` produces and the range `1..=n` this node addresses them
+        // over, so it *is* the ceremony's seat count. A roster reaches the engine only as a network id
+        // (`with_context`) — deliberately, the engine cannot read a file — so this is where the size is
+        // decided, and it decides it as `Plane::<F>::N`.
+        //
+        // That is the right choice and it is not obvious: the beacon is the **network's** epoch clock, one
+        // for the whole plane, while a cell (`fano::cell_of`, seven points) is what the reflex diagnoses and
+        // what consensus votes in. A cell-sized ceremony would give every cell its own clock and there would
+        // be no network epoch to agree on.
+        //
+        // **The consequence a deployment reads**: a `PG(2,4)` network is a 21-seat ceremony, not a 7-seat
+        // one, and its threshold is against 21. At `q = 2` the plane *is* one cell and the two readings
+        // coincide, which is why nothing here had to say which it meant — and why this crate, tested only on
+        // `F2`, could not have told them apart.
         let n = Plane::<F>::N as usize;
+        // Every coordinate of the plane is `Point::at(i)` for exactly one `i`, so the fallback is
+        // unreachable for a well-formed point and exists only so a malformed one is a seat rather than a
+        // panic.
         let index = (0..n)
             .find(|&i| Point::<F>::at(i) == coord)
             .map_or(1, |i| i as u8 + 1);
@@ -999,7 +1018,37 @@ mod tests {
     //! Byzantine-robustness tests for the DKG control frames — the cluster the audit flagged CRITICAL
     //! (B1–B3) and previously untested. Each drives one participant with crafted adversarial frames.
     use super::*;
-    use fanos_field::F2;
+    use fanos_field::{F2, F4};
+
+    /// **The ceremony's seat count is the PLANE's, and this crate could not have told you that.**
+    ///
+    /// Every other test here runs on `F2`, where the plane is one cell of seven points and "the plane" and
+    /// "the cell" are the same number — so an `n` that meant either would read the same. `PG(2,4)` is
+    /// twenty-one points and three cells, and it separates them: a `PG(2,4)` network is a **21-seat**
+    /// ceremony whose threshold is against 21, not a 7-seat one per cell.
+    ///
+    /// Asserted on both planes deliberately. The `F2` half is the case every other test already assumes and
+    /// is what makes the `F4` half mean something: without it, a constructor that always answered 7 and one
+    /// that always answered 21 would each pass exactly one of the two.
+    ///
+    /// Reads the fields rather than adding accessors: a `pub fn` nobody calls is what the unwired-capability
+    /// ratchet exists to refuse, and this is an inner test module with the fields in scope.
+    #[test]
+    fn the_ceremonys_seats_are_the_planes_points_on_both_planes() {
+        let seven = DkgNode::<F2>::new(Point::<F2>::at(3), 5, [1u8; 32], [2u8; 32]);
+        assert_eq!(seven.n, 7, "PG(2,2) is seven points, and one cell");
+        assert_eq!(seven.index, 4, "seat = plane index + 1, so shares address `1..=n`");
+
+        let twenty_one = DkgNode::<F4>::new(Point::<F4>::at(15), 5, [1u8; 32], [2u8; 32]);
+        assert_eq!(
+            twenty_one.n,
+            21,
+            "a wider plane is a wider ceremony — a cell-sized group would give every cell its own epoch \
+             clock and leave no network epoch to agree on"
+        );
+        assert_eq!(twenty_one.index, 16, "and the seat is still the plane index + 1");
+    }
+
 
     fn coord(i: u8) -> Triple {
         DkgNode::<F2>::coord_of(i)
