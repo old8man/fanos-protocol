@@ -485,9 +485,15 @@ pub fn displacement_is_forced<F: Field>(
 /// twelve rows of `partial_knowledge_placement.rs`, both rules, ≈ 30 000 draws, while forward moves reach 13.68 nodes
 /// per trial. Gale–Shapley's comparative static says it must be zero — adding an agent to the *proposing* side weakly
 /// worsens every other proposer, and a node's preference order is its walk order. What genuinely separates the two
-/// rules is the **second** bullet's neighbour: a deferred seat is a fixed point of the whole claim set and is checked
-/// by recomputing from that set, where this rule needs at most `q + 1` witnesses and nothing else. The measured price
-/// of the change is about a fifth more doubly-held points while views disagree.
+/// rules is the **second** bullet's neighbour — and that one did not survive measurement either. A deferred seat is
+/// certified by a bounded witness **tree**, not by the claim set: a witness's own settled index is strictly below the
+/// claimant's, so the recursion ends at depth `k ≤ q` and carries `2^k − 1` claims at worst. Measured
+/// (`examples/deferred_certificate_size.rs`), the mean per seated node goes from **0.311 to 0.316** on `PG(2,2)` at
+/// `n = N` and 0.520 to 0.554 on `PG(2,4)`, with 77–99 % of seats carrying nothing at all under either rule.
+///
+/// What is left as the price of the change is one thing, and it is not about proving a seat: **about a fifth more
+/// doubly-held points while views disagree** (`examples/partial_knowledge_placement.rs`), a transient of partial
+/// knowledge that both rules take to zero at complete knowledge.
 ///
 /// The walk is bounded by [`probe_bound`] — the line's length — since [`probe_point`] cycles through exactly that many
 /// points. Past it every point of the node's line is better claimed and it cannot be seated at all, which is the honest
