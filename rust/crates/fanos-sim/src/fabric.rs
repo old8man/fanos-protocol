@@ -3562,13 +3562,23 @@ mod tests {
                 };
                 println!(
                     "          committed={} outranked={} taken={} superseded={} self_conn={} rejudged={} \
-                     withheld={} cache_miss={} stale_coord={} repeat_ignored={} dropped={}",
+                     refreshed={} unjudgeable={} withheld={} cache_miss={} stale_coord={} repeat_ignored={} \
+                     dropped={}",
                     station(fanos_runtime::ports::stations::Station::SeatCommitted),
                     station(fanos_runtime::ports::stations::Station::DirectorySeatOutranked),
                     station(fanos_runtime::ports::stations::Station::DirectoryPointTaken),
                     station(fanos_runtime::ports::stations::Station::DirectorySeatSuperseded),
                     station(fanos_runtime::ports::stations::Station::TransportSelfConnection),
                     station(fanos_runtime::ports::stations::Station::HelloRejudged),
+                    // **The sender's half and the receiver's, so an empty claim book is attributable.** A
+                    // book that stays empty has three causes and until 2026-08-21 no counter told them
+                    // apart: nothing was sent (`refreshed` flat), something was sent and could not be judged
+                    // yet (`unjudgeable`), or it was judged and not recorded because the epoch it proves is
+                    // not the book's — which is what is left when `refreshed` is high and `unjudgeable` is
+                    // not. Three hypotheses were excluded by measurement before these existed, each costing
+                    // a full run.
+                    station(fanos_runtime::ports::stations::Station::HelloRefreshed),
+                    station(fanos_runtime::ports::stations::Station::HelloEpochUnknown),
                     // **What shadowing costs one layer up.** The role loop withholds while it cannot find
                     // its own advertisement, which is exactly a shadowed seat seen from inside — and a node
                     // shadowed since genesis has *never* been assigned, so it holds the default assignment

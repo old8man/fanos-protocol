@@ -418,7 +418,17 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // property starts mattering at exactly that moment.
     ("fanos-ergon", 3),
     ("fanos-field", 1),
-    ("fanos-geometry", 2),
+    // 2 → 3 (2026-08-21), and the reason is that the consumer is blocked rather than absent.
+    // `CellPath::{children_of, member_address}` are the answer to "which cells are a parent's children" —
+    // a pure function of the parent's own address, which is what `crosscell_dir::attest_children` was
+    // missing when it had no caller. What still blocks that caller is one level down: a **sub-cell's**
+    // records cannot be authenticated, because a descended node keeps its transport coordinate while its
+    // overlay address becomes `P ++ [s]`, so the per-seat `Entitlement` proves a point unrelated to the
+    // seat. `resolve_committee` and `diagnose_children` refuse below level 1 on purpose until the §80
+    // descriptor signature is folded into that envelope. Two accessors this raise would also have covered
+    // (`base`, `parent_address`) were **deleted** instead — nothing needed them, and a budget is not a
+    // place to park convenience.
+    ("fanos-geometry", 3),
     ("fanos-holarch", 1),
     ("fanos-keygen", 7),
     // 42 → 44 (2026-08-16), with the reason the rule requires, and NOT by inventing a caller — which this
@@ -440,7 +450,12 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // which is 1, 3 or 39 — so they are hierarchy sub-cells whose addresses are `HierAddr` paths, and a flat
     // `cell: u32` cannot name a path. Wiring a reader would mean inventing that keying to satisfy a counter,
     // which is the one thing this ratchet must never reward.
-    ("fanos-node", 45),
+    // 45 → 46 (2026-08-21): `resolve_committee` joins the cross-cell readers already parked here
+    // (`attest_children`, `diagnose_children`, `resolve_health`, `publish_receipt`, `drain_inbox`) and for
+    // the same single reason — see the note at `fanos-geometry` above. Wiring a parent loop today would
+    // wire a loop that refuses every child it is handed, which is worse than an unwired one because it
+    // reads as coverage.
+    ("fanos-node", 46),
     ("fanos-nyx", 21),
     ("fanos-obolos", 11),
     ("fanos-observatory", 2),
@@ -506,7 +521,15 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     ("fanos-thesauros", 9),
     ("fanos-threshold", 1),
     ("fanos-vpn", 1),
-    ("fanos-vrf", 12),
+    // 12 → 15 (2026-08-21), and all three are the SAME event: the live path stopped running
+    // `settle_index`. `deferred_claim` replaced it, so `settle_index`, `displacement_is_forced` and
+    // `deferred_index` are now **references rather than mechanisms** — `settle_index` is what
+    // `examples/line_confinement_coverage.rs` measures the shipped rule against (32.7 % versus 80.5 % at one
+    // node per point), `displacement_is_forced` records the unprovable-displacement defect that made the two
+    // predicates one call, and `deferred_index` is the seat-only twin of `deferred_claim` that the
+    // enumeration uses. Deleting them would delete the comparison this session's whole placement result
+    // rests on; wiring them would put the phantom yield back on the live path.
+    ("fanos-vrf", 15),
     ("fanos-wasm", 1),
     ("fanos-wire", 6),
     ("fanos-wire-derive", 1),

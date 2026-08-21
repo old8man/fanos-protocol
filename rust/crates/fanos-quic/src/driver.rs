@@ -2677,6 +2677,7 @@ impl Reseater {
         // Only in this branch, so a move is not announced twice: `Reseated` covers the other case, and it
         // covers movers this type never sees (recovery, a direct `Command::Reseat`).
         if unchanged {
+            self.client.record_station(Station::HelloRefreshed, Some(point), None);
             let _ = self.dials.send(SendRequest::Flood { frame: bytes });
         }
         at.coord = point;
@@ -4850,6 +4851,7 @@ async fn announce_moves(t: Transport, mut events: broadcast::Receiver<Notificati
                     Ok(map) => map.values().flatten().cloned().collect(),
                     Err(_) => continue,
                 };
+                t.record_station(Station::HelloRefreshed, None, None);
                 for conn in peers {
                     send_hello(&conn, &t.shaper, t.joining(&conn), &hello).await;
                 }

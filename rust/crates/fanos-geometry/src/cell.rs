@@ -107,19 +107,6 @@ impl<F: Field> CellPath<F> {
         Some(Self { parent, base })
     }
 
-    /// The address of the node that **parents** this cell, or `None` for the base cell, which has no parent inside the
-    /// deployment.
-    #[must_use]
-    pub fn parent_address(&self) -> Option<&HierAddr<F>> {
-        self.parent.as_ref()
-    }
-
-    /// Which Fano cell of its level this is, in `0..fano::cells_in::<F>()`.
-    #[must_use]
-    pub fn base(&self) -> usize {
-        self.base
-    }
-
     /// How deep the cell's **members** sit: `1` for the base cell, one more than the parent's depth otherwise.
     #[must_use]
     pub fn level(&self) -> usize {
@@ -212,7 +199,7 @@ mod tests {
         );
         assert_eq!(mine, sibling, "points 0 and 3 are members of cell 0 of PG(2,4)");
         assert_ne!(mine, other, "point 1 is a member of cell 1 and must not share cell 0's identity");
-        assert_eq!((mine.base(), mine.level()), (0, 1));
+        assert_eq!(mine.level(), 1, "a base cell's members sit at depth 1");
     }
 
     /// **Two cells of one deployment no longer share an identity (#167).**

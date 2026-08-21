@@ -1065,6 +1065,21 @@ pub enum Station {
     /// boundary, close enough to the settled answer to be misread as it.
     SeatCommitted,
 
+    /// **This node pushed a fresh `HELLO` to its live connections** — the sender's half of a claim exchange.
+    ///
+    /// One of three counters that exist together or not at all, because a claim book that stays empty has
+    /// three possible causes and no counter told them apart: nothing was sent ([`HelloRefreshed`] flat),
+    /// something was sent and could not be judged yet — which already had a counter,
+    /// [`HelloEpochUnknown`], and only wanted surfacing — or it was judged and **not recorded** because the
+    /// epoch it proves is not the book's — **which has no counter and needs one**: the verifier closure in
+    /// `fanos_quic::driver::self_certifying_identity` holds no stations handle, and threading one there is a
+    /// signature change this pair does not need, because the third case is what is left when this station is
+    /// high and [`HelloEpochUnknown`] is not.
+    ///
+    /// [`HelloRefreshed`]: Self::HelloRefreshed
+    /// [`HelloEpochUnknown`]: Self::HelloEpochUnknown
+    HelloRefreshed,
+
     /// A **commit was refused because a better claim holds this node's seat** — the window is being held
     /// open on purpose.
     ///
@@ -1391,6 +1406,7 @@ impl Station {
         Self::DirectoryPointTaken,
         Self::DirectorySeatOutranked,
         Self::SeatCommitted,
+        Self::HelloRefreshed,
         Self::SeatCommitContested,
         Self::HostRequestOverBound,
         Self::EscalationUnbudgeted,
@@ -1549,6 +1565,7 @@ impl Station {
             Self::DirectoryPointTaken => "directory.point_taken",
             Self::DirectorySeatOutranked => "directory.seat_outranked",
             Self::SeatCommitted => "seat.committed",
+            Self::HelloRefreshed => "hello.refreshed",
             Self::SeatCommitContested => "seat.commit_contested",
             Self::HostRequestOverBound => "host.request_over_bound",
             Self::EscalationUnbudgeted => "escalation.unbudgeted",
@@ -1643,6 +1660,7 @@ impl Station {
             | Self::DirectoryPointTaken
             | Self::DirectorySeatOutranked
             | Self::SeatCommitted
+            | Self::HelloRefreshed
             | Self::SeatCommitContested
             | Self::HostRequestOverBound
             | Self::GatherExpired

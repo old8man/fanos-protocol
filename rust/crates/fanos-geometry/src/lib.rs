@@ -27,6 +27,9 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+/// Cell identity — what names the sibling-set a node belongs to. `alloc`-gated for the same reason
+/// [`hierarchy`] is: a cell is named by a **path**, and a path is a `Vec`.
+#[cfg(feature = "alloc")]
 pub mod cell;
 pub mod element;
 pub mod fano;
@@ -48,6 +51,7 @@ pub use element::{
 pub use flag::Flag;
 #[cfg(feature = "alloc")]
 pub use cell::CellPath;
+#[cfg(feature = "alloc")]
 pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 
