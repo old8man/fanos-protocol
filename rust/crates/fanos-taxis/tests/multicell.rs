@@ -115,6 +115,18 @@ fn gen_keys(tag: u8) -> Vec<Keys> {
         .collect()
 }
 
+/// The canonical name of the child cell under the parent's point `k` — the key a parent's registry is keyed by.
+///
+/// A real `fanos_geometry::CellPath` rather than the integer this fixture used to pass, because that is what the
+/// directory writes and what separates a parent's child from its grandchild.
+fn child_name(k: u32) -> Vec<u8> {
+    use fanos_field::F2;
+    use fanos_geometry::{CellPath, HierAddr, Point};
+    CellPath::<F2>::under(HierAddr::root(Point::at(k as usize)), 0)
+        .expect("PG(2,2) holds one cell per level")
+        .encode()
+}
+
 /// A driveable cell of `N` validators over a state machine `S`.
 struct Cell<S: StateMachine + Clone> {
     engines: Vec<ConsensusEngine<S>>,
@@ -238,10 +250,12 @@ impl<S: StateMachine + Clone> Cell<S> {
     }
 
     fn committee(&self, cell: u32) -> ChildCommittee {
+        // The parent keys a child by its `CellPath`, not by an integer — at `q = 2` a level holds one cell, so what
+        // separates two children is the parent point they hang under, which is what `cell` names here.
         // Every seat known — this fixture owns the whole cell's keys. `Some` per entry is what a *complete*
         // committee looks like now that a hole is expressible; `hierarchy.rs` covers the partial case.
         ChildCommittee {
-            cell,
+            cell: child_name(cell),
             verifiers: self.verifiers.iter().cloned().map(Some).collect(),
             quorum: CellParams::FANO.quorum(),
         }
@@ -307,16 +321,16 @@ fn a_cross_cell_transfer_is_trust_minimized_end_to_end() {
     // withheld state, and the production path took the unguarded one. Here both children's shards are
     // present, which is what this test is about — the availability refusal has its own test in `hierarchy`.
     assert_eq!(
-        parent.attest_available(1, cert_a, ALL_PRESENT).map(|(h, _)| h),
+        parent.attest_available(&child_name(1), cert_a, ALL_PRESENT).map(|(h, _)| h),
         Some(0),
         "the parent anchors cell A's finality"
     );
     assert!(
-        parent.attest_available(CELL_B, cert_b, ALL_PRESENT).is_some(),
+        parent.attest_available(&child_name(CELL_B), cert_b, ALL_PRESENT).is_some(),
         "the parent anchors cell B's finality"
     );
     // Both children are now anchored in the parent — anyone trusting the parent trusts both, without re-executing.
-    assert!(parent.latest(1).is_some() && parent.latest(CELL_B).is_some());
+    assert!(parent.latest(&child_name(1)).is_some() && parent.latest(&child_name(CELL_B)).is_some());
 }
 
 /// **A validator's mempool must be bounded, and it must refuse rather than evict.**

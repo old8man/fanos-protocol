@@ -1212,7 +1212,7 @@ fn admit<S: StateMachine>(
 #[must_use]
 pub fn spawn_checkpoint_publisher<S>(
     client: Client,
-    cell_id: u32,
+    cell_id: Vec<u8>,
     epoch: Epoch,
     handle: &TaxisHandle<S>,
 ) -> JoinHandle<()> {
@@ -1221,7 +1221,7 @@ pub fn spawn_checkpoint_publisher<S>(
         loop {
             match events.recv().await {
                 Ok(TaxisEvent::Checkpointed(cert)) => {
-                    let _ = publish_checkpoint(&client, cell_id, epoch, &cert).await;
+                    let _ = publish_checkpoint(&client, &cell_id, epoch, &cert).await;
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,

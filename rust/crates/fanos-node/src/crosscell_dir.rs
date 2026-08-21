@@ -53,44 +53,36 @@
 //! `degraded` mask off the liveness watch the role loop already runs. Five reasons, all closed; what stands
 //! below is work rather than a rule.
 //!
-//! ## The next blocker is a level up, and it IS a missing rule
+//! ## The blocker a level up is CLOSED, and what it was missing was a name
 //!
-//! Everything above is about a cell publishing and a parent reading. What nothing in this workspace derives
-//! is **which cells are a parent's children** — there is no `children_of`, no `parent_of`, and no rule that
-//! produces the seven `cell: u32` values [`diagnose_children`] takes as an argument.
+//! What nothing in this workspace derived was **which cells are a parent's children**: no `children_of`, no
+//! `parent_of`, and no rule producing the values [`diagnose_children`] took as an argument. The arithmetic looked
+//! contradictory — `federation::CHILDREN` is `fano::N` = **7**, while a plane holds `cells_in = N / 7` cells: **1** at
+//! `q = 2`, **3** at `q = 4`, **39** at `q = 16` — so *"at `q = 16` there are 39 and nothing says which seven"*.
 //!
-//! The arithmetic says they cannot be cells of one plane. `federation::CHILDREN` is `fano::N` = **7**, while
-//! a plane holds `cells_in = N / 7` of them:
+//! **The seven are seats, not cells.** A cell is the sibling-set under one prefix, so it is named by
+//! `fanos_geometry::CellPath` = *(the parent's address, which Fano cell of the level below it)*. A parent at address
+//! `P` therefore has `cells_in()` **child cells**, each with exactly seven **seats**, and the covering runs once per
+//! child cell over its seven seats — once at `q = 2`, three times at `q = 4`, thirty-nine times at `q = 16`. Nothing
+//! has to pick seven of anything. Enumeration is `CellPath::member_address` over `P ++ [s]`: a pure function of the
+//! parent's own address and the plane, so a parent can name every child it must attest *before* any of them has
+//! published. See `docs/design-hierarchy-recursion.md`.
 //!
-//! | `q` | points | cells |
-//! |---|---|---|
-//! | 2 | 7 | **1** |
-//! | 4 | 21 | **3** |
-//! | 8 | 73 | none — 7 ∤ 73 |
-//! | 16 | 273 | 39 |
+//! Every slot in this module is keyed by `CellPath::encode` accordingly, which is also what a flat `cell: u32` could
+//! not express: under an integer key a parent's child `0` and its grandchild `0` were one record.
 //!
-//! At `q = 2` a parent has no siblings at all; at `q = 4` there are two other cells and the covering's seven
-//! slots cannot be filled; at `q = 16` there are 39 and **nothing says which seven**. So the federation's
-//! children are not the plane's cells — they are sub-cells of the *hierarchy*, whose addresses are
-//! `HierAddr` paths (`docs/design-hierarchy-recursion.md`, and `fanos_geometry::derive_address`).
+//! ## What is still open, and it is one thing rather than four
 //!
-//! And a `HierAddr` path is exactly what a flat `cell: u32` cannot name. So the key space these directories
-//! use is one level below the relation they exist to serve, and closing that is a **design** step — pick how
-//! a path is keyed, and how a parent enumerates its children — rather than the wiring the five entries above
-//! turned out to be.
+//! **A sub-cell's records cannot be authenticated yet**, so [`resolve_committee`] and [`diagnose_children`] refuse
+//! any cell below level 1 rather than reading bytes nobody is bound to. The reason is precise: each record carries an
+//! `Entitlement` proving the publisher's *coordinate*, and a descended node **keeps its transport coordinate** while
+//! its overlay address becomes `P ++ [s]` — so at a sub-cell seat the proven point and the seat have nothing to do
+//! with each other. The §80 descriptor already signs `(coord, hier, id)`, so a record carrying that signature would
+//! bind a publisher to its *address* instead of to a point; that is the shape of the fix, and until it lands
+//! [`seat_now`] names the base cell for every node, which is the case that ships.
 //!
-//! Two smaller things remain beside it, and neither is a missing rule:
-//!
-//! * Nothing in a shipped binary yet *runs* [`publish_seat_key`] / [`resolve_committee`]. A validator has to
-//!   publish its consensus verifying key each epoch beside the keys it already publishes, and a parent has to
-//!   resolve its children's committees before it attests them. Unlike the health record, this one is per
-//!   seat and each writer speaks only for itself, so it has no agreement problem to solve first.
-//! * [`resolve_committee`] is all-or-nothing, because `ChildCommittee::verifiers` is a dense `Vec` indexed
-//!   by validator index and a hole cannot be expressed. `Q = 5` of `7` means a certificate is checkable
-//!   whenever the five that signed it have keys present, so a partial committee is genuinely usable and this
-//!   refuses it. Expressing that is a `fanos-taxis` change.
-//!
-//! The `cell: u32` these slots are keyed by is no longer a problem either: `fano::cell_of` derives it.
+//! The two smaller items recorded here are closed: `ChildCommittee::verifiers` is sparse (`Vec<Option<_>>`), so a
+//! five-of-seven quorum is checkable with two seats quiet; and `fanos validator` runs [`spawn_seat_key_publisher`].
 //!
 //! The observability sibling of this is [`crate::telemetry_dir::Census`], and it is worth reading together:
 //! there the same "one cell only" fact was not stated, and an operator-facing verdict claimed to compare
@@ -110,7 +102,7 @@ use fanos_taxis::wire::{ShardMsg, TaxisApp, parse_app_body, shard_to_frame};
 use tokio::task::JoinHandle;
 
 use fanos_field::Field;
-use fanos_geometry::{Triple, fano};
+use fanos_geometry::{CellPath, Triple, fano};
 use fanos_primitives::BeaconSeed;
 use fanos_pqcrypto::sig::HybridVerifier;
 use fanos_runtime::{Command, Notification};
@@ -121,9 +113,9 @@ use crate::bound::Entitlement;
 use crate::resolve::{Read, STORE_TIMEOUT};
 
 /// A cell's checkpoint slot: the store address its latest execution certificate for `epoch` lives at.
-fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
+fn checkpoint_slot(cell: &[u8], epoch: Epoch) -> Vec<u8> {
     let mut key = b"FANOS-v1/cell-checkpoint/".to_vec();
-    key.extend_from_slice(&cell.to_be_bytes());
+    key.extend_from_slice(cell);
     key.extend_from_slice(&epoch.to_be_bytes());
     key
 }
@@ -135,9 +127,9 @@ fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
 /// record for seven writers: they raced, whoever wrote last spoke for the cell, and the `Entitlement` could
 /// prove only that *a* member wrote it. Per seat each writer speaks for itself, the envelope binds to that
 /// seat's own coordinate, and [`resolve_health`] folds whoever answered — see [`fold_member_reports`].
-fn health_slot(cell: u32, seat: usize, epoch: Epoch) -> Vec<u8> {
+fn health_slot(cell: &[u8], seat: usize, epoch: Epoch) -> Vec<u8> {
     let mut key = b"FANOS-v1/cell-health/".to_vec();
-    key.extend_from_slice(&cell.to_be_bytes());
+    key.extend_from_slice(cell);
     key.extend_from_slice(&(seat as u32).to_be_bytes());
     key.extend_from_slice(&epoch.to_be_bytes());
     key
@@ -186,15 +178,35 @@ fn receipt_slot(dest_cell: u32, source_cell: u32, nonce: u64) -> Vec<u8> {
     key
 }
 
+/// **This node's cell and its seat in it, derived from the coordinate it holds right now.**
+///
+/// Both move: the beacon re-draws the coordinate at every boundary, so a value fixed at spawn names the seat the node
+/// had when it started — and the seat is what a record is bound to, so a stale one is a record nobody can open. Both
+/// publishers therefore call this on every write rather than capturing it.
+///
+/// ⚠️ **It reads the flat coordinate, so it names the base cell even for a node that has descended.** A descended node
+/// keeps its transport coordinate (`OverlayNode::on_descend`: *"the transport coordinate does not move"*) while its
+/// overlay address becomes `P ++ [s]`, and the driver — not the engine — is what holds those deeper levels. Until that
+/// address is readable from a `Client`, this is the honest answer for the case that ships (`hier_path: None`
+/// everywhere) and the wrong one for the case the descent creates. The refusal in [`resolve_committee`] is the other
+/// half of the same gap, stated where a reader would otherwise trust the record.
+fn seat_now<F: Field>(client: &Client) -> Option<(CellPath<F>, usize)> {
+    let coord = client.address();
+    let point = fanos_geometry::Point::<F>::new(coord)?;
+    let cell = CellPath::of_member(&fanos_geometry::HierAddr::root(point))?;
+    let seat = cell.seats()?.coords().iter().position(|&m| m == coord)?;
+    Some((cell, seat))
+}
+
 /// Publish `cell`'s execution certificate for `epoch` so a parent can anchor its finality. `false` if rejected.
-pub async fn publish_checkpoint(client: &Client, cell: u32, epoch: Epoch, cert: &ExecCertificate) -> bool {
+pub async fn publish_checkpoint(client: &Client, cell: &[u8], epoch: Epoch, cert: &ExecCertificate) -> bool {
     let landed =
         client.put_ephemeral(checkpoint_slot(cell, epoch), cert.to_bytes(), DIRECTORY_SLOT_EPOCHS).await;
     crate::note_publish(client, crate::Directory::Checkpoint, epoch, landed)
 }
 
 /// Resolve the execution certificate `cell` published for `epoch`, or `None` if none/timeout/malformed.
-pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Option<ExecCertificate> {
+pub async fn resolve_checkpoint(client: &Client, cell: &[u8], epoch: Epoch) -> Option<ExecCertificate> {
     let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(checkpoint_slot(cell, epoch))).await.ok()??;
     ExecCertificate::from_bytes(&bytes)
 }
@@ -255,8 +267,8 @@ pub async fn resolve_checkpoint(client: &Client, cell: u32, epoch: Epoch) -> Opt
 /// cell's shards too. It credits them to `note_shard_taken` and may retain one at its own index. Both are
 /// bounded (`HELD_CAP`, and a foreign block's height is pruned by `prune_below`), and both disappear once the
 /// driver's seat map is cell-scoped — the same fix the seat-map divergence above needs.
-pub async fn sample_child_availability<F: Field>(client: &Client, cell: u32, block: [u8; 32]) -> u8 {
-    let Some(members) = fano::cell_members_of::<F>(cell as usize) else {
+pub async fn sample_child_availability<F: Field>(client: &Client, cell: &CellPath<F>, block: [u8; 32]) -> u8 {
+    let Some(members) = cell.seats() else {
         return 0; // the child cell is not a cell of this plane — there is nobody to ask
     };
     let seats = members.coords();
@@ -385,15 +397,15 @@ async fn gather_shards(
 pub async fn attest_children<F: Field>(
     client: &Client,
     registry: &mut ChildRegistry,
-    children: &[u32],
+    children: &[CellPath<F>],
     epoch: Epoch,
-) -> Vec<(u32, u64, [u8; 32])> {
+) -> Vec<(CellPath<F>, u64, [u8; 32])> {
     let mut anchored = Vec::new();
-    for &cell in children {
-        let Some(cert) = resolve_checkpoint(client, cell, epoch).await else { continue };
+    for cell in children {
+        let Some(cert) = resolve_checkpoint(client, &cell.encode(), epoch).await else { continue };
         let present = sample_child_availability::<F>(client, cell, cert.head).await;
-        if let Some((height, root)) = registry.attest_available(cell, cert, present) {
-            anchored.push((cell, height, root));
+        if let Some((height, root)) = registry.attest_available(&cell.encode(), cert, present) {
+            anchored.push((cell.clone(), height, root));
         }
     }
     anchored
@@ -423,7 +435,7 @@ pub async fn attest_children<F: Field>(
 /// the moment a cross-cell publisher gains a production caller while it is still here.
 pub async fn publish_health<F: Field>(
     client: &Client,
-    cell: u32,
+    cell: &CellPath<F>,
     seat: usize,
     epoch: Epoch,
     report: Report,
@@ -439,7 +451,7 @@ pub async fn publish_health<F: Field>(
         None => payload.clone(),
     };
     let landed =
-        client.put_ephemeral(health_slot(cell, seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
+        client.put_ephemeral(health_slot(&cell.encode(), seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
     let _ = core::marker::PhantomData::<F>;
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
@@ -452,9 +464,9 @@ pub async fn publish_health<F: Field>(
 /// nobody else's. A single per-cell record would therefore have to be written by somebody asserting six
 /// keys it cannot vouch for, which is the shape the `Entitlement` envelope exists to refuse. Per seat, each
 /// validator asserts exactly the one thing it can prove: *this key sits at this coordinate*.
-fn committee_slot(cell: u32, seat: usize, epoch: Epoch) -> Vec<u8> {
+fn committee_slot(cell: &[u8], seat: usize, epoch: Epoch) -> Vec<u8> {
     let mut key = b"FANOS-v1/cell-committee/".to_vec();
-    key.extend_from_slice(&cell.to_be_bytes());
+    key.extend_from_slice(cell);
     key.extend_from_slice(&(seat as u32).to_be_bytes());
     key.extend_from_slice(&epoch.to_be_bytes());
     key
@@ -476,13 +488,13 @@ fn committee_slot(cell: u32, seat: usize, epoch: Epoch) -> Vec<u8> {
 /// that would let one node speak for its cell's whole validator set.
 pub async fn publish_seat_key<F: Field>(
     client: &Client,
-    cell: u32,
+    cell: &CellPath<F>,
     seat: usize,
     epoch: Epoch,
     verifier: &HybridVerifier,
     credential: &(Vec<u8>, fanos_vrf::VrfPublic, fanos_vrf::VrfProof),
 ) -> bool {
-    let Some(members) = fano::cell_members_of::<F>(cell as usize) else {
+    let Some(members) = cell.seats() else {
         return false; // the plane does not split into cells: there is no seat to speak for
     };
     if members.coords().get(seat).is_none() {
@@ -491,7 +503,7 @@ pub async fn publish_seat_key<F: Field>(
     let (id, public, proof) = credential;
     let record = Entitlement::encode(id, public, proof, &verifier.encode());
     let landed =
-        client.put_ephemeral(committee_slot(cell, seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
+        client.put_ephemeral(committee_slot(&cell.encode(), seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
 
@@ -525,21 +537,14 @@ pub fn spawn_seat_key_publisher<F: Field>(
         let mut beacons = client.beacons();
         let mut epoch = Epoch::ZERO;
         let mut seed = client.genesis();
-        let seat_now = |client: &Client| {
-            let coord = client.address();
-            let cell = fanos_geometry::Point::<F>::new(coord).and_then(fano::cell_of::<F>)?;
-            let members = fano::cell_members_of::<F>(cell)?;
-            let seat = members.coords().iter().position(|&m| m == coord)?;
-            Some((cell, seat))
-        };
-        if let Some((cell, seat)) = seat_now(&client) {
-            publish_seat_key::<F>(&client, cell as u32, seat, epoch, &verifier, &prove(epoch, &seed)).await;
+        if let Some((cell, seat)) = seat_now::<F>(&client) {
+            publish_seat_key::<F>(&client, &cell, seat, epoch, &verifier, &prove(epoch, &seed)).await;
         }
         while let Some((e, s)) = crate::next_epoch(&mut beacons, epoch).await {
             epoch = e;
             seed = s;
-            if let Some((cell, seat)) = seat_now(&client) {
-                publish_seat_key::<F>(&client, cell as u32, seat, epoch, &verifier, &prove(epoch, &seed)).await;
+            if let Some((cell, seat)) = seat_now::<F>(&client) {
+                publish_seat_key::<F>(&client, &cell, seat, epoch, &verifier, &prove(epoch, &seed)).await;
             }
         }
     });
@@ -559,16 +564,27 @@ pub fn spawn_seat_key_publisher<F: Field>(
 /// only proves membership somewhere in the cell would let one validator file every seat.
 pub async fn resolve_committee<F: Field>(
     client: &Client,
-    cell: u32,
+    cell: &CellPath<F>,
     epoch: Epoch,
     beacon: BeaconSeed,
 ) -> Option<ChildCommittee> {
-    let members = fano::cell_members_of::<F>(cell as usize)?;
+    // ⛔ **A sub-cell's seats cannot be opened yet, and the refusal is here rather than in a comment.** Each record is
+    // authenticated by an `Entitlement` against *the seat's own coordinate* — which for a base-cell member is its
+    // transport point and therefore checkable from the plane alone. A descended node **keeps its transport
+    // coordinate** (`on_descend`: "the transport coordinate does not move"), so a sub-cell seat's publisher proves a
+    // point that has nothing to do with the seat it sits on, and nothing here can bridge the two. What would: the §80
+    // descriptor already signs `(coord, hier, id)`, so a record carrying that signature binds the publisher to its
+    // *address* instead of to a coordinate. Until it does, a parent that reads a sub-cell committee would be reading
+    // unauthenticated bytes, and reading none is the safe direction.
+    if cell.level() > 1 {
+        return None;
+    }
+    let members = cell.seats()?;
     let mut verifiers = Vec::with_capacity(fano::N);
     for (seat, &point) in members.coords().iter().enumerate() {
         let key = match tokio::time::timeout(
             STORE_TIMEOUT,
-            client.get(committee_slot(cell, seat, epoch)),
+            client.get(committee_slot(&cell.encode(), seat, epoch)),
         )
         .await
         {
@@ -583,7 +599,7 @@ pub async fn resolve_committee<F: Field>(
     if verifiers.iter().all(Option::is_none) {
         return None; // the cell published nothing at all
     }
-    Some(ChildCommittee { cell, verifiers, quorum: fanos_taxis::CellParams::FANO.quorum() })
+    Some(ChildCommittee { cell: cell.encode(), verifiers, quorum: fanos_taxis::CellParams::FANO.quorum() })
 }
 
 /// One byte as a `Vec` — spelled out so the codec is visibly a single byte rather than a struct that might grow one.
@@ -596,15 +612,16 @@ fn alloc_vec(byte: u8) -> Vec<u8> { vec![byte] }
 /// would fabricate faults and could make the grammar accuse an innocent sibling.
 pub async fn resolve_health<F: Field>(
     client: &Client,
-    cell: u32,
+    cell: &CellPath<F>,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Option<Report> {
-    let members = fano::cell_members_of::<F>(cell as usize)?;
+    let members = cell.seats()?;
+    let key = cell.encode();
     let mut answered = Vec::with_capacity(fano::N);
     for (seat, &point) in members.coords().iter().enumerate() {
         let Ok(Some(bytes)) =
-            tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(cell, seat, epoch))).await
+            tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(&key, seat, epoch))).await
         else {
             continue; // a silent or unreachable member is an erasure, not a clean block
         };
@@ -744,16 +761,25 @@ impl ChildDiagnosis {
 /// being taken on trust.
 pub async fn diagnose_children<F: Field>(
     client: &Client,
-    children: &[u32; federation::CHILDREN],
+    cell: &CellPath<F>,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> ChildDiagnosis {
     let mut resolved: [Option<Report>; federation::CHILDREN] = [None; federation::CHILDREN];
-    for (slot, &cell) in resolved.iter_mut().zip(children.iter()) {
+    // Level 1 only, for the reason `resolve_committee` states: below it the per-seat `Entitlement` proves a coordinate
+    // that has nothing to do with the seat, so a covering run on those records would localize faults from bytes nobody
+    // is bound to — and this covering localizes *confidently*.
+    let (Some(members), 1) = (cell.seats(), cell.level()) else { return ChildDiagnosis::from_resolved(&resolved) };
+    let key = cell.encode();
+    for (seat, (slot, &point)) in resolved.iter_mut().zip(members.coords().iter()).enumerate() {
         // `beacon: None` reads the bare byte, which is what a build with no self-certifying identity writes
         // — and a caller that has a beacon and passes `None` is asking this covering to localize faults from
         // records anyone could have written. The parameter exists so that is a decision rather than a default.
-        *slot = resolve_health::<F>(client, cell, epoch, beacon).await;
+        let Ok(Some(bytes)) = tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(&key, seat, epoch))).await
+        else {
+            continue; // silent, unreachable, or unauthenticated — all three land in `ChildDiagnosis::silent`
+        };
+        *slot = open_health::<F>(&bytes, point, epoch, beacon);
     }
     // SELF-REPORTED, and the distinction is load-bearing: these masks are what each child says about *itself*, so a child
     // controlling its own eight coordinates could otherwise relocate blame onto a healthy sibling — the Golay decoder
@@ -791,15 +817,9 @@ pub fn spawn_health_publisher<F: Field>(
         // The beacon re-draws that coordinate at every boundary, so a value fixed at spawn names the seat
         // the node had when it started; and the seat is what the record is bound to, so a stale one is a
         // record nobody can open.
-        let seat_now = |client: &Client| {
-            let coord = client.address();
-            let cell = fanos_geometry::Point::<F>::new(coord).and_then(fano::cell_of::<F>)?;
-            let members = fano::cell_members_of::<F>(cell)?;
-            let seat = members.coords().iter().position(|&m| m == coord)?;
-            Some((cell, seat))
-        };
+        let seat_now = seat_now::<F>;
         if let Some((cell, seat)) = seat_now(&client) {
-            publish_health::<F>(&client, cell as u32, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
+            publish_health::<F>(&client, &cell, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
         }
         // Latest-state, not the lossy stream: a cell whose health report is missing for an epoch reads to its
         // neighbours as a cell that has nothing to say, which is not the same as one that is healthy (#86).
@@ -810,7 +830,7 @@ pub fn spawn_health_publisher<F: Field>(
             // therefore the cell — changes. A node that has left the plane's cell structure entirely (a plane
             // whose point count does not divide by seven) publishes nothing rather than into cell zero.
             if let Some((cell, seat)) = seat_now(&client) {
-                publish_health::<F>(&client, cell as u32, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
+                publish_health::<F>(&client, &cell, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
             }
         }
     });
@@ -1097,30 +1117,47 @@ mod tests {
         }
     }
 
+    /// The name of the child cell under the parent's point `k` — what a slot is keyed by since 2026-08-21.
+    fn cell_name(k: usize) -> Vec<u8> {
+        use fanos_field::F2;
+        use fanos_geometry::{HierAddr, Point};
+        CellPath::<F2>::under(HierAddr::root(Point::at(k)), 0).expect("PG(2,2) holds one cell per level").encode()
+    }
+
     /// The committee slots are distinct across every axis they are keyed by, and domain-separated from the
     /// health slots that sit one function away.
+    ///
+    /// **The fourth axis is the one a `u32` key did not have.** A base cell and a cell one level below it used to
+    /// produce the same bytes whenever their indices matched — a parent's child `0` and its grandchild `0` writing
+    /// over each other — so the last assertion is the whole reason these keys became `CellPath::encode`.
     #[test]
     fn committee_slots_separate_cell_seat_and_epoch() {
-        let base = committee_slot(3, 2, Epoch::new(7));
-        assert_ne!(base, committee_slot(4, 2, Epoch::new(7)), "two cells share a seat slot");
-        assert_ne!(base, committee_slot(3, 5, Epoch::new(7)), "two seats of one cell share a slot");
-        assert_ne!(base, committee_slot(3, 2, Epoch::new(8)), "two epochs share a slot");
+        let base = committee_slot(&cell_name(3), 2, Epoch::new(7));
+        assert_ne!(base, committee_slot(&cell_name(4), 2, Epoch::new(7)), "two cells share a seat slot");
+        assert_ne!(base, committee_slot(&cell_name(3), 5, Epoch::new(7)), "two seats of one cell share a slot");
+        assert_ne!(base, committee_slot(&cell_name(3), 2, Epoch::new(8)), "two epochs share a slot");
         assert!(
             base.starts_with(b"FANOS-v1/cell-committee/"),
             "the domain tag is what keeps this out of every other directory's key space"
         );
-        assert_ne!(base, health_slot(3, 2, Epoch::new(7)), "committee and health slots collide");
+        assert_ne!(base, health_slot(&cell_name(3), 2, Epoch::new(7)), "committee and health slots collide");
+        let flat = CellPath::<fanos_field::F2>::base_cell(0).expect("PG(2,2) has one base cell").encode();
+        assert_ne!(
+            committee_slot(&flat, 2, Epoch::new(7)),
+            committee_slot(&cell_name(3), 2, Epoch::new(7)),
+            "the base cell and a cell below it must not share a slot — the collision a flat cell id could not express"
+        );
     }
 
     #[test]
     fn health_slots_are_deterministic_distinct_and_domain_separated() {
-        let h = health_slot(3, 2, Epoch::new(7));
-        assert_eq!(h, health_slot(3, 2, Epoch::new(7)));
-        assert_ne!(h, health_slot(4, 2, Epoch::new(7)), "distinct cell → distinct slot");
+        let h = health_slot(&cell_name(3), 2, Epoch::new(7));
+        assert_eq!(h, health_slot(&cell_name(3), 2, Epoch::new(7)));
+        assert_ne!(h, health_slot(&cell_name(4), 2, Epoch::new(7)), "distinct cell → distinct slot");
         // The axis the record gained when it stopped being one per cell: seven members, seven slots, and a
         // collision here would put two members' readings on top of each other and fold one of them twice.
-        assert_ne!(h, health_slot(3, 5, Epoch::new(7)), "distinct seat → distinct slot");
-        assert_ne!(h, health_slot(3, 2, Epoch::new(8)), "distinct epoch → distinct slot");
+        assert_ne!(h, health_slot(&cell_name(3), 5, Epoch::new(7)), "distinct seat → distinct slot");
+        assert_ne!(h, health_slot(&cell_name(3), 2, Epoch::new(8)), "distinct epoch → distinct slot");
         assert!(h.starts_with(b"FANOS-v1/cell-health/"));
         assert!(!h.starts_with(b"FANOS-v1/cell-checkpoint/"), "a distinct domain from its sibling directory");
     }
@@ -1176,10 +1213,10 @@ mod tests {
     #[test]
     fn checkpoint_and_receipt_slots_are_deterministic_distinct_and_domain_separated() {
         // Checkpoint slots.
-        let c = checkpoint_slot(1, Epoch::ZERO);
-        assert_eq!(c, checkpoint_slot(1, Epoch::ZERO));
-        assert_ne!(c, checkpoint_slot(2, Epoch::ZERO), "distinct cell → distinct slot");
-        assert_ne!(c, checkpoint_slot(1, Epoch::new(1)), "distinct epoch → distinct slot");
+        let c = checkpoint_slot(&cell_name(1), Epoch::ZERO);
+        assert_eq!(c, checkpoint_slot(&cell_name(1), Epoch::ZERO));
+        assert_ne!(c, checkpoint_slot(&cell_name(2), Epoch::ZERO), "distinct cell → distinct slot");
+        assert_ne!(c, checkpoint_slot(&cell_name(1), Epoch::new(1)), "distinct epoch → distinct slot");
         assert!(c.starts_with(b"FANOS-v1/cell-checkpoint/"));
         // Receipt slots.
         let r = receipt_slot(2, 1, 0);

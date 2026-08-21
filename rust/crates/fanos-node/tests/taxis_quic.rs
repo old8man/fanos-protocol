@@ -40,7 +40,13 @@ const BOB: [u8; 32] = [0xB0; 32];
 const SEED: BeaconSeed = BeaconSeed::new([0x11; 32]);
 const EPOCH: Epoch = Epoch::new(1);
 /// The logical cell id this cell publishes its execution checkpoints under (a parent attests them).
-const CELL_ID: u32 = 0;
+/// The cell these validators form, as the directory names it: the plane's base cell, `CellPath::encode`d.
+///
+/// A `u32` until 2026-08-21. A flat id cannot tell a base cell from a cell one level below it, which is a slot
+/// collision rather than a naming preference — see `fanos_geometry::cell`.
+fn cell_id() -> Vec<u8> {
+    fanos_geometry::CellPath::<F2>::base_cell(0).expect("PG(2,2) has one base cell").encode()
+}
 
 /// The production overlay engine, seated at a pinned point — the same `OverlayNode` that ships, so the cell
 /// carries App-overlay (`0x70`) frames (the TAXIS receive seam) and routes by coordinate.
@@ -134,7 +140,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     // checkpoints to the cell's slot in the overlay store, where a parent cell would attest them.
     let mut publishers = Vec::with_capacity(N);
     for (i, h) in handles.iter().enumerate() {
-        publishers.push(spawn_checkpoint_publisher(cell.nodes[i].client(), CELL_ID, EPOCH, h));
+        publishers.push(spawn_checkpoint_publisher(cell.nodes[i].client(), cell_id(), EPOCH, h));
     }
 
     // Watch node 0's finalization stream — a direct witness that blocks actually commit over the wire.
@@ -201,7 +207,7 @@ async fn a_transaction_finalizes_and_executes_over_a_real_quic_cell() {
     let ckpt_deadline = tokio::time::Instant::now() + common::HANG_CEILING;
     let cert = loop {
         assert!(tokio::time::Instant::now() <= ckpt_deadline, "the cell published no execution checkpoint in time");
-        if let Some(cert) = resolve_checkpoint(&reader, CELL_ID, EPOCH).await {
+        if let Some(cert) = resolve_checkpoint(&reader, &cell_id(), EPOCH).await {
             break cert;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

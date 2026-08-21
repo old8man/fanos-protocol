@@ -33,8 +33,18 @@ use crate::checkpoint::ExecCertificate;
 /// quorum its certificates must meet.
 #[derive(Clone)]
 pub struct ChildCommittee {
-    /// The child cell's address in the hierarchy.
-    pub cell: u32,
+    /// The child cell's address in the hierarchy — the canonical bytes of a `fanos_geometry::CellPath`.
+    ///
+    /// ⛔ **This was a `u32` until 2026-08-21, and a flat integer cannot name a cell of a tree.** A cell is the
+    /// sibling-set under one prefix (`docs/design-hierarchy-recursion.md`), so its identity is *(the parent's address,
+    /// which Fano cell of the level below it)* — and the first half is a path. Keyed by an integer, a parent's child
+    /// `0` and its grandchild `0` are one entry, which is a registry that silently merges two committees and then
+    /// verifies a certificate against the wrong keys.
+    ///
+    /// Opaque bytes rather than a `CellPath<F>` because that would make this type generic over the plane for a field it
+    /// only ever compares — `ChildRegistry` needs `Ord`, not geometry. `fanos_geometry::CellPath::encode` produces
+    /// them and `decode` reads them back, so the meaning is one function call away and lives where the geometry does.
+    pub cell: Vec<u8>,
     /// The child committee's validator verifying keys, **indexed by validator index** as in the child's
     /// `ExecVote`, with `None` for a seat this parent has not learned.
     ///
@@ -54,8 +64,8 @@ pub struct ChildCommittee {
 /// latest **verified** execution certificate — the parent's authoritative view of each child's executed state.
 #[derive(Default)]
 pub struct ChildRegistry {
-    committees: BTreeMap<u32, ChildCommittee>,
-    attested: BTreeMap<u32, ExecCertificate>,
+    committees: BTreeMap<Vec<u8>, ChildCommittee>,
+    attested: BTreeMap<Vec<u8>, ExecCertificate>,
 }
 
 impl ChildRegistry {
@@ -67,7 +77,7 @@ impl ChildRegistry {
 
     /// Register (or update) a child cell's committee — the parent learns whose certificates to trust for `cell`.
     pub fn register(&mut self, committee: ChildCommittee) {
-        self.committees.insert(committee.cell, committee);
+        self.committees.insert(committee.cell.clone(), committee);
     }
 
     /// Verify and record a child's execution certificate, **without checking that its data is available**.
@@ -82,18 +92,18 @@ impl ChildRegistry {
     /// Returns the newly-attested `(height, state_root)` iff the certificate verifies under the child's
     /// registered committee **and strictly advances** that child's attested height (finality only moves
     /// forward). Rejects an unknown child, an invalid or sub-quorum certificate, or a stale/replayed height.
-    fn attest(&mut self, cell: u32, cert: ExecCertificate) -> Option<(u64, [u8; 32])> {
-        let committee = self.committees.get(&cell)?;
+    fn attest(&mut self, cell: &[u8], cert: ExecCertificate) -> Option<(u64, [u8; 32])> {
+        let committee = self.committees.get(cell)?;
         if !cert.verify_by(committee.quorum, committee.verifiers.len(), |i| {
             committee.verifiers.get(i).and_then(Option::as_ref)
         }) {
             return None; // not a genuine Q-quorum of this child
         }
-        if self.attested.get(&cell).is_some_and(|c| cert.height <= c.height) {
+        if self.attested.get(cell).is_some_and(|c| cert.height <= c.height) {
             return None; // finality does not regress
         }
         let anchor = (cert.height, cert.state_root);
-        self.attested.insert(cell, cert);
+        self.attested.insert(cell.to_vec(), cert);
         Some(anchor)
     }
 
@@ -109,7 +119,7 @@ impl ChildRegistry {
     /// which is the safe direction. Today nothing produces one — the §L4.3 sampler yields `available: bool`
     /// per store key, and no shipped binary issues even that (#173) — so this is where that gap becomes
     /// visible instead of being skipped.
-    pub fn attest_available(&mut self, cell: u32, cert: ExecCertificate, present: u8) -> Option<(u64, [u8; 32])> {
+    pub fn attest_available(&mut self, cell: &[u8], cert: ExecCertificate, present: u8) -> Option<(u64, [u8; 32])> {
         let missing = (!present) & 0x7F;
         if !is_recoverable_fano(missing) {
             return None; // the child's data is unavailable — do not vouch for it
@@ -119,8 +129,8 @@ impl ChildRegistry {
 
     /// The latest certificate the parent has attested for `cell` (its authoritative view of the child's state).
     #[must_use]
-    pub fn latest(&self, cell: u32) -> Option<&ExecCertificate> {
-        self.attested.get(&cell)
+    pub fn latest(&self, cell: &[u8]) -> Option<&ExecCertificate> {
+        self.attested.get(cell)
     }
 
     /// Detect a **child equivocation**: a validly-signed child certificate that certifies a *different* root at
@@ -129,9 +139,9 @@ impl ChildRegistry {
     /// evidence the parent escalates/slashes. `None` if the child is unknown, the certificate is invalid, it is
     /// for a different height, or it agrees.
     #[must_use]
-    pub fn conflict(&self, cell: u32, cert: &ExecCertificate) -> Option<(u64, [u8; 32], [u8; 32])> {
-        let committee = self.committees.get(&cell)?;
-        let prior = self.attested.get(&cell)?;
+    pub fn conflict(&self, cell: &[u8], cert: &ExecCertificate) -> Option<(u64, [u8; 32], [u8; 32])> {
+        let committee = self.committees.get(cell)?;
+        let prior = self.attested.get(cell)?;
         if cert.height != prior.height || cert.state_root == prior.state_root {
             return None;
         }
@@ -155,8 +165,19 @@ mod tests {
 
     use crate::checkpoint::ExecVote;
 
+    /// The canonical name of the child cell hanging under the parent's point `k` — a real
+    /// `fanos_geometry::CellPath`, not a stand-in integer, so these tests exercise the key the directory writes.
+    ///
+    /// At `q = 2` a level holds exactly one Fano cell, so what distinguishes two children is their *prefix*: the point
+    /// of the parent they hang under. That is the case a `u32` key merged.
+    fn name(k: usize) -> Vec<u8> {
+        use fanos_field::F2;
+        use fanos_geometry::{CellPath, HierAddr, Point};
+        CellPath::<F2>::under(HierAddr::root(Point::at(k)), 0).expect("PG(2,2) holds one cell per level").encode()
+    }
+
     /// A child committee of 7 validators (secrets kept for signing test certificates).
-    fn child(cell: u32, tag: u8) -> (Vec<HybridSigSecret>, ChildCommittee) {
+    fn child(cell: usize, tag: u8) -> (Vec<HybridSigSecret>, ChildCommittee) {
         let ks: Vec<(HybridSigSecret, HybridVerifier)> = (0..7)
             .map(|i| {
                 let mut rng = SeedRng::from_seed(&[tag, i as u8]);
@@ -164,7 +185,7 @@ mod tests {
             })
             .collect();
         let verifiers = ks.iter().map(|(_, v)| Some(v.clone())).collect();
-        (ks.into_iter().map(|(s, _)| s).collect(), ChildCommittee { cell, verifiers, quorum: 5 })
+        (ks.into_iter().map(|(s, _)| s).collect(), ChildCommittee { cell: name(cell), verifiers, quorum: 5 })
     }
 
     fn cert(height: u64, root: [u8; 32], secrets: &[HybridSigSecret], q: usize) -> ExecCertificate {
@@ -216,25 +237,26 @@ mod tests {
         let mut reg = ChildRegistry::new();
         reg.register(committee);
         let c = cert(4, [0xAA; 32], &secrets, 5);
-        assert_eq!(reg.attest_available(2, c, ALL_PRESENT), Some((4, [0xAA; 32])), "a valid Q-quorum child cert is anchored");
-        assert_eq!(reg.latest(2).map(|c| c.height), Some(4));
+        assert_eq!(reg.attest_available(&name(2), c, ALL_PRESENT), Some((4, [0xAA; 32])), "a valid Q-quorum child cert is anchored");
+        assert_eq!(reg.latest(&name(2)).map(|c| c.height), Some(4));
         // Finality advances; a later height is anchored, an equal/earlier one is not.
-        assert_eq!(reg.attest_available(2, cert(5, [0xBB; 32], &secrets, 5), ALL_PRESENT), Some((5, [0xBB; 32])));
-        assert_eq!(reg.attest_available(2, cert(5, [0xCC; 32], &secrets, 5), ALL_PRESENT), None, "finality does not regress");
+        assert_eq!(reg.attest_available(&name(2), cert(5, [0xBB; 32], &secrets, 5), ALL_PRESENT), Some((5, [0xBB; 32])));
+        assert_eq!(reg.attest_available(&name(2), cert(5, [0xCC; 32], &secrets, 5), ALL_PRESENT), None, "finality does not regress");
     }
 
     #[test]
     fn an_unknown_child_or_sub_quorum_or_forged_cert_is_refused() {
         let (secrets, committee) = child(2, 0x20);
         let mut reg = ChildRegistry::new();
-        // Unknown child.
-        assert_eq!(reg.attest_available(9, cert(1, [1; 32], &secrets, 5), ALL_PRESENT), None);
+        // Unknown child — a real cell of the plane that simply was never registered, since `name` builds an
+        // address and `Point::at` refuses an index the plane does not have.
+        assert_eq!(reg.attest_available(&name(6), cert(1, [1; 32], &secrets, 5), ALL_PRESENT), None);
         reg.register(committee);
         // Sub-quorum (4 < 5).
-        assert_eq!(reg.attest_available(2, cert(1, [1; 32], &secrets, 4), ALL_PRESENT), None);
+        assert_eq!(reg.attest_available(&name(2), cert(1, [1; 32], &secrets, 4), ALL_PRESENT), None);
         // A certificate signed by a DIFFERENT committee's keys is refused.
         let (other_secrets, _) = child(2, 0x99);
-        assert_eq!(reg.attest_available(2, cert(1, [1; 32], &other_secrets, 5), ALL_PRESENT), None);
+        assert_eq!(reg.attest_available(&name(2), cert(1, [1; 32], &other_secrets, 5), ALL_PRESENT), None);
     }
 
     #[test]
@@ -245,9 +267,9 @@ mod tests {
         let c = cert(1, [0x77; 32], &secrets, 5);
         // A hyperoval's worth of shards missing → unrecoverable → refused even with a valid certificate.
         let hyperoval = (0u8..=0x7F).find(|&m| !is_recoverable_fano(m)).unwrap();
-        assert_eq!(reg.attest_available(3, c.clone(), (!hyperoval) & 0x7F), None, "unavailable child is not anchored");
+        assert_eq!(reg.attest_available(&name(3), c.clone(), (!hyperoval) & 0x7F), None, "unavailable child is not anchored");
         // Full availability → anchored.
-        assert_eq!(reg.attest_available(3, c, ALL_PRESENT), Some((1, [0x77; 32])));
+        assert_eq!(reg.attest_available(&name(3), c, ALL_PRESENT), Some((1, [0x77; 32])));
     }
 
     #[test]
@@ -255,12 +277,12 @@ mod tests {
         let (secrets, committee) = child(4, 0x40);
         let mut reg = ChildRegistry::new();
         reg.register(committee);
-        reg.attest_available(4, cert(7, [0xA0; 32], &secrets, 5), ALL_PRESENT).unwrap();
+        reg.attest_available(&name(4), cert(7, [0xA0; 32], &secrets, 5), ALL_PRESENT).unwrap();
         // The child committee certifies a DIFFERENT root at the same height (>f equivocated) → parent has proof.
         let forked = cert(7, [0xB0; 32], &secrets, 5);
-        assert_eq!(reg.conflict(4, &forked), Some((7, [0xA0; 32], [0xB0; 32])));
+        assert_eq!(reg.conflict(&name(4), &forked), Some((7, [0xA0; 32], [0xB0; 32])));
         // An agreeing cert, or one for another height, is not a conflict.
-        assert_eq!(reg.conflict(4, &cert(7, [0xA0; 32], &secrets, 5)), None);
-        assert_eq!(reg.conflict(4, &cert(8, [0xB0; 32], &secrets, 5)), None);
+        assert_eq!(reg.conflict(&name(4), &cert(7, [0xA0; 32], &secrets, 5)), None);
+        assert_eq!(reg.conflict(&name(4), &cert(8, [0xB0; 32], &secrets, 5)), None);
     }
 }
