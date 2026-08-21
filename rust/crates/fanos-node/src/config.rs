@@ -2625,4 +2625,44 @@ mod tests {
             "a threshold of provisioned members reconstructs the committed descriptor",
         );
     }
+
+    /// **The default plane order is FORCED, not chosen — three derived constraints intersect in exactly one of the
+    /// four orders this binary dispatches.** (`docs/open-tasks.md` Tier B §4 asked for a decision between 2, 3 and 4.)
+    ///
+    /// `Node::start` dispatches `q ∈ {2, 4, 7, 31}`, and a deployment needs all three of:
+    ///
+    /// 1. **a cell can exist on it** — `7 | N`, since every cell-scoped mechanism (the reflex, the roster, the
+    ///    federated covering) is a Fano cell of seven seats: that drops 7 and 31 by divisibility alone;
+    /// 2. **a circuit can exist on it** — `slots::plane_can_anonymize`, i.e. the fixed-slot onion budget still reaches
+    ///    `TARGET_DEPTH` hops once one slot is reserved for the payload: that drops 4, where `depth_for` falls to 2;
+    /// 3. **the plane is dispatchable at all**, which is the table above.
+    ///
+    /// What is left is `q = 2`. So "should the default be 3 or 4 instead" is not a preference to settle: `q = 3` holds
+    /// no Fano cell (`7 ∤ 13`) and `q = 4` cannot carry a sound circuit at the shipped `THRESHOLD_ONION_LEN`. **The
+    /// order to change first is the onion budget, not the plane** — a wider cell buys more slots, not more payload, so
+    /// raising `q` without raising that constant trades a hop for an anonymity set and reports neither.
+    ///
+    /// This is a guard rather than a note: it fails the moment the budget grows enough to admit `q = 4` (then the
+    /// decision is genuinely open again and should be re-taken with the numbers), and it fails if a future order is
+    /// dispatched without both properties.
+    #[test]
+    fn exactly_one_dispatchable_plane_order_can_host_both_a_cell_and_a_circuit() {
+        let admits: Vec<u32> = [2u32, 4, 7, 31]
+            .into_iter()
+            .filter(|&q| fanos_geometry::fano::cells_in_order(q).is_some())
+            .filter(|&q| fanos_aphantos::slots::plane_can_anonymize(q as usize + 1))
+            .collect();
+        assert_eq!(
+            admits,
+            alloc_default_order(),
+            "the dispatch table's orders that hold a Fano cell AND can carry a TARGET_DEPTH circuit are {admits:?};              if this set changed, `NodeConfig::plane_order`'s default is a decision again — see Tier B §4"
+        );
+        assert_eq!(NodeConfig::default().plane_order, 2, "the default must be the order the constraints leave");
+    }
+
+    /// The one order the constraints above leave, spelled out so the assertion reads as a comparison rather than as a
+    /// literal nobody has to justify.
+    fn alloc_default_order() -> Vec<u32> {
+        vec![2]
+    }
 }

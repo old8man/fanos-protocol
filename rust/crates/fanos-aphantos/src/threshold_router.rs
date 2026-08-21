@@ -1727,6 +1727,58 @@ mod tests {
         );
     }
 
+    /// **Salting cannot raise `K` on the plane that ships, and the reason is the plane's size, not the map.**
+    ///
+    /// `docs/open-tasks.md` Tier B §4 left this open as a *measurement*: the linkability floor `1/K` is quoted from the
+    /// **unsalted** canonical map (`|image| = 6` of 7 ⇒ `K = ⌊6/2⌋ = 3`), while production draws a per-onion
+    /// [`combiner_for_salted`] pick, so *"whether salting raises `K` above 3 is unmeasured — the sweep that would say is
+    /// `#[ignore]`d and written for `PG(2,7)`"*.
+    ///
+    /// It does not need a sweep. A salted pick is always a **member of its own line**, so the image over all salts is
+    /// the union of the lines' members — every point of the plane, since every point lies on `q + 1` lines. That gives
+    /// `N`, and on Fano `⌊7/2⌋ = 3 = ⌊6/2⌋`: the plane has too few points for one more circuit to fit. The number was
+    /// never going to move.
+    ///
+    /// `PG(2,7)` is here because a Fano-only assertion would prove the opposite of what it looks like — there salting
+    /// **does** buy circuits (`⌊37/2⌋ = 18` against `⌊57/2⌋ = 28`), so the Fano result is a fact about the *plane* and
+    /// not a fact about salting. Both halves, or neither means anything.
+    #[test]
+    fn the_salted_pick_cannot_raise_the_circuit_count_on_fano() {
+        use fanos_field::F7;
+        use fanos_geometry::Plane;
+
+        /// Every point a salted pick can ever land on, over enough salts to exhaust each line's members.
+        fn salted_image<F: Field>() -> usize {
+            let mut seen = BTreeSet::new();
+            for line in Plane::<F>::lines() {
+                for s in 0..256u16 {
+                    if let Some(p) = combiner_for_salted::<F>(line.coords(), &s.to_be_bytes()) {
+                        seen.insert(p);
+                    }
+                }
+            }
+            seen.len()
+        }
+        fn unsalted_image<F: Field>() -> usize {
+            Plane::<F>::lines()
+                .filter_map(|l| ThresholdRouter::<F>::combiner_of(l.coords()))
+                .collect::<BTreeSet<_>>()
+                .len()
+        }
+
+        assert_eq!(salted_image::<F2>(), 7, "over all salts the picks reach every point of the Fano plane");
+        assert_eq!(
+            (unsalted_image::<F2>() / 2, salted_image::<F2>() / 2),
+            (3, 3),
+            "salting cannot raise K on PG(2,2): 6 and 7 points halve to the same 3, so the flow-matching floor              stays 1/3 whatever the per-onion pick does"
+        );
+        assert_eq!(
+            (unsalted_image::<F7>() / 2, salted_image::<F7>() / 2),
+            (18, 28),
+            "on PG(2,7) the same salting is worth ten more concurrent circuits — which is what makes the Fano              result above a statement about the plane rather than about the salt"
+        );
+    }
+
     use fanos_pqcrypto::SeedRng;
 
     fn has_delivery(effects: &[Effect], payload: &[u8]) -> bool {

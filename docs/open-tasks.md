@@ -1031,7 +1031,30 @@ remaining two rows the same way — look for claims that no assertion checks, no
 
 ## Tier B — platform capability
 
-### 4. Settle the default plane order — now constrained by the onion payload floor
+### 4. ~~Settle the default plane order~~ — **DECIDED 2026-08-21: it is forced, and the constant to change first is the onion budget**
+
+**The decision is an intersection, not a preference.** `Node::start` dispatches `q ∈ {2, 4, 7, 31}`, and a deployment
+needs all three of: a **cell** can exist on it (`7 | N` — drops 7 and 31 by divisibility); a **circuit** can exist on it
+(`slots::plane_can_anonymize`, i.e. the fixed-slot budget still reaches `TARGET_DEPTH` once one slot is reserved for the
+payload — drops 4, where `depth_for` falls to 2); and it is dispatchable at all. What is left is **`q = 2`**. `q = 3` was
+never a candidate for the first reason (`7 ∤ 13`), so the three-way question had a one-element answer.
+
+Guarded by `config::tests::exactly_one_dispatchable_plane_order_can_host_both_a_cell_and_a_circuit`, and **falsified by
+the change it exists to catch**: doubling `THRESHOLD_ONION_LEN` admits `q = 4` and the guard reddens at its own
+assertion. That is also the standing advice — *raise the onion budget first, then the plane*, because a wider cell buys
+more slots rather than more payload.
+
+**And the "unmeasured" half is closed by derivation rather than by the sweep.** Whether the per-onion *salted* combiner
+raises `K` above 3 needed no linkability run: a salted pick is always a member of its own line, so the image over all
+salts is the union of the lines' members — every point of the plane — and on Fano `⌊7/2⌋ = 3 = ⌊6/2⌋`. The plane has too
+few points for one more circuit to fit. Pinned by
+`threshold_router::tests::the_salted_pick_cannot_raise_the_circuit_count_on_fano`, which asserts `PG(2,7)` beside it
+(`⌊37/2⌋ = 18` against `⌊57/2⌋ = 28`) so that the Fano result reads as a fact about the plane rather than about salting.
+
+**So the operative figure is 1/3 and it is not going to move on this plane.** What remains open is not the order — it is
+that an anonymous circuit cannot leave its cell (`HierAddr` appears nowhere in `fanos-aphantos`), which is the item
+above, and the way up is the recursion rather than a wider plane.
+
 - `plane_order` defaults to **2**, where `PG(2,2)` has **6** lines with distinct combiners ⇒ **3** concurrent circuits ⇒ a
   passive adversary's flow-matching floor is **1/3 regardless of the mix schedule** (`8df2b08` made the order selectable and
   warns on under-delivery; the schedule itself is calibrated and closed).

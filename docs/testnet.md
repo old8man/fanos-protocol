@@ -163,9 +163,27 @@ system. A passive adversary's flow-matching floor on the default plane is **1/3*
 > **structural** limit the combiner map permits, and since a floor is the adversary's accuracy the larger
 > number binds. So **1/3 is the operative figure and 1/7 the unreachable ideal.**
 
-If the testnet's purpose includes exercising the anonymity properties (not just connectivity, storage and
-consensus), raise `--plane-order` — see §3.5's caution before you do, since it isn't free and it isn't
-exposed by the `fanos init` wizard.
+⛔ **This paragraph used to end "if the testnet's purpose includes exercising the anonymity properties, raise
+`--plane-order`". Do not: on this build a wider plane is a downgrade.** The fixed-slot onion reserves one slot of
+payload, so circuit depth falls as the plane widens — `slots::depth_for` gives **3 hops at `q = 2`, 2 at `q = 4`, 1 at
+`q = 7`** — and `slots::plane_can_anonymize` is false at `q ≥ 4`, i.e. a `PG(2,4)` deployment buys a larger anonymity
+set by dropping below the depth the anonymity argument needs. Intersect that with the requirement that a cell exist at
+all (`7 | N`, which drops `q ∈ {7, 31}` and `q = 3`), and **`q = 2` is the only dispatchable order that can host both a
+cell and a circuit** — forced rather than chosen, and guarded by
+`config::tests::exactly_one_dispatchable_plane_order_can_host_both_a_cell_and_a_circuit`.
+
+**The constant to raise first is `THRESHOLD_ONION_LEN`, not the plane order.** A wider cell buys more *slots*, not more
+payload, so the budget is the knob; when it grows enough to admit `q = 4`, that guard fails on purpose and the choice is
+open again.
+
+**And salting does not move the 1/3 either** — it was recorded as unmeasured and it is a derivation: a per-onion salted
+combiner pick is always a member of its own line, so over all salts the picks reach every point of the plane, and on
+Fano `⌊7/2⌋ = 3 = ⌊6/2⌋`. There are too few points for one more circuit. (On `PG(2,7)` the same salting is worth ten
+more — which is what makes the Fano result a statement about the plane rather than about the salt.)
+
+So: a testnet on this build exercises connectivity, storage, consensus and the anonymity *mechanism*, with a
+flow-matching floor of **1/3** that no dial on this plane lowers. The way to a larger anonymity set is the recursion —
+circuits that leave their cell — and that is not built: `HierAddr` appears nowhere in `fanos-aphantos`.
 
 ---
 
