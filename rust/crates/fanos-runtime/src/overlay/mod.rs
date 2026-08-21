@@ -952,7 +952,31 @@ impl<F: Field> OverlayNode<F> {
     pub fn with_cell_members(mut self, cell: fano::CellMembers<F>) -> Self {
         let members = cell.coords();
         self.self_index = members.iter().position(|&m| m == self.coord.coords());
-        self.peers.clear();
+        // **The cell is added to the neighbour set, never substituted for it — and it used to be
+        // substituted.**
+        //
+        // This constructor's purpose is the reflex: *"so liveness sensing, witnessing, and the whole reflex
+        // run over the real cell"*, and those read `cell_members` (through `cell_position`, `cell_coord`,
+        // `healer.cell_members`), not this map. What `peers` actually is, is the **algebraic** neighbour set
+        // — every point sharing a line with this one, which on a projective plane is every other point — and
+        // three subsystems that are not the reflex read it: the store's read fan-out, `occupied_points`
+        // (hence shard placement), and the gossip flood.
+        //
+        // Clearing it narrowed all three to seven points. The store cannot survive that: a key's address is
+        // `storage_point::<F>(key)`, which maps into the **whole plane**, so a cell-scoped occupancy ring
+        // makes `nearest_occupied` cell-relative and the same key resolves to a different responsible node in
+        // every cell. `PG(2,4)` then holds three disjoint stores that each believe they are the one DHT — and
+        // every cross-cell directory (`crosscell_dir`'s checkpoints, receipts and committee slots) writes into
+        // its author's cell and is unreadable from any other, which is exactly the transport those directories
+        // are *for*.
+        //
+        // Measured before this line: five nodes over three cells resolved only their own cell's members, and
+        // every `overlay.first_heard` count was `Σ nᶜ(nᶜ − 1)` over the cell sizes. That reads as a cell
+        // partition and is one; what it is not is a *designed* one.
+        //
+        // The insert below is therefore a no-op on any projective plane — two points always share a line, so
+        // the cell is already in the set — and is kept for the case a caller provisions a roster of points
+        // this node's plane does not contain.
         for &m in &members {
             if m != self.coord.coords() {
                 self.peers.entry(m).or_insert(Peer {

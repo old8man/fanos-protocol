@@ -1704,37 +1704,21 @@ mod tests {
             .await;
         let coords: HashSet<fanos_geometry::Triple> =
             fleet.nodes().iter().map(|node| node.health().address).collect();
-        // **A node's roster is its CELL, not the fleet**, and asserting otherwise is asking the architecture
-        // for a property it deliberately does not have.
+        // **A node's roster is the occupied plane, and for one release it was asserted as its cell.**
         //
-        // `OverlayNode::with_derived_cell` — which every composed node goes through — calls
-        // `with_cell_members`, and that **clears the peer set** and refills it with the six other members of
-        // this node's Fano cell. `PG(2,4)` splits into three cells of seven (`fano::cell_of` is
-        // `index mod cells`, #145), so a node outside this one's cell is not a peer of it at any layer: not
-        // in the flood, not in the read fan-out, not in `occupied_points`. Five nodes drawn over 21 points
-        // land in different cells, and a cell-scoped directory is exactly what a member of another cell
-        // cannot read.
+        // The reasoning that led there was right about the mechanism and one layer off about the intent.
+        // `with_cell_members` used to `clear()` the neighbour set and refill it with the node's seven Fano
+        // cell-mates, so on `PG(2,4)` — three cells — a node resolved only its own cell's members and every
+        // `overlay.first_heard` count was `Σ nᶜ(nᶜ − 1)` over the cell sizes. That is a cell partition, and it
+        // is not a designed one: the constructor's own doc gives its purpose as the **reflex** ("liveness
+        // sensing, witnessing, and the whole reflex run over the real cell"), and the reflex reads
+        // `cell_members`, not that map. The store's read fan-out, `occupied_points` and the gossip flood read
+        // it too, and narrowing it took them along.
         //
-        // **This is what the "partition" was.** Measured: with the fleet at `[1:3:3] [1:2:0] [1:2:1] [1:0:0]
-        // [0:1:0]` the cells are `0, 2, 0, 0, 1` — and the resolution mask was `{node0, node2, node3}`
-        // mutually, `node1` alone, `node4` alone. Exactly the cells. Every `overlay.first_heard` count taken
-        // across the whole investigation — 4, 6 and 12 of a possible 20 — is `Σ nᶜ(nᶜ − 1)` over the cell
-        // sizes: `12 = [4,1]`, `6 = [3,1,1]`, `4 = [2,2,1]`. Nothing else was ever varying.
-        let cell_of = |c: fanos_geometry::Triple| {
-            fanos_geometry::Point::<F4>::new(c).and_then(fanos_geometry::fano::cell_of::<F4>)
-        };
-        let mut per_cell: std::collections::BTreeMap<Option<usize>, usize> =
-            std::collections::BTreeMap::new();
-        for &c in &coords {
-            *per_cell.entry(cell_of(c)).or_default() += 1;
-        }
-        // What each node can see is its own cell's occupancy. The fixture's subject is whether a cell
-        // converges, so the target is per node rather than a single number.
-        let reachable: Vec<usize> = fleet
-            .nodes()
-            .iter()
-            .map(|n| per_cell.get(&cell_of(n.health().address)).copied().unwrap_or(1))
-            .collect();
+        // The store cannot survive that: a key's address is `storage_point::<F>(key)` over the **whole
+        // plane**, so a cell-scoped occupancy ring resolves the same key to a different responsible node in
+        // every cell. The cell adds to the neighbour set now instead of replacing it, and this assertion is
+        // the plane-wide one again.
         let occupied = coords.len();
         assert!(
             !placed.is_refuted() || occupied > 1,
@@ -1748,12 +1732,7 @@ mod tests {
         // `FROZEN_SPAN` has genuinely stopped.
         let verdict = fleet
             .until_settled(
-                |f| {
-                    f.nodes()
-                        .iter()
-                        .zip(&reachable)
-                        .all(|(n, &want)| n.assignment().roster == want)
-                },
+                |f| f.nodes().iter().all(|n| n.assignment().roster == occupied),
                 |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
             )
             .await;
@@ -1890,8 +1869,7 @@ mod tests {
         assert!(occupied > 1, "the premise: the draw left more than one point occupied ({occupied} of {N})");
         assert!(
             !verdict.is_refuted(),
-            "every node must resolve every occupied coordinate OF ITS OWN CELL (cell sizes {reachable:?}, \
-             {occupied} occupied of {N} points); it froze short of it: \
+            "every node must resolve every OCCUPIED coordinate ({occupied} of {N}); the cell froze short of it: \
              {verdict:?}\n  deliver {deliver:?}  route {route:?}  peers {peers:?}  complete {complete:?}\n\
              \x20 send_drops {sent_drops:?}  unresolved_drops {unresolved:?}\n\
              each node's address table, coordinate→port ('-' = no binding); a row that names another node's \
