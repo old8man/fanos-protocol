@@ -27,6 +27,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+pub mod cell;
 pub mod element;
 pub mod fano;
 mod flag;
@@ -46,6 +47,7 @@ pub use element::{
 };
 pub use flag::Flag;
 #[cfg(feature = "alloc")]
+pub use cell::CellPath;
 pub use hierarchy::{HierAddr, MAX_DEPTH, derive_address, next_hop, rendezvous};
 pub use plane::{Line, Plane, Point, pgl3_order};
 

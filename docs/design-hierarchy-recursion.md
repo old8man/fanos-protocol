@@ -45,6 +45,37 @@ under this reading those seven values are the seven siblings' subtree aggregates
 trie is actually built — the nodes at `[p, *]` are exactly the ones that wanted `p` and lost it, so "the
 cell under `p`" is a set with a cause, not a labelling imposed on top.
 
+### And here is what *names* one — `fanos_geometry::CellPath` (2026-08-21)
+
+The decision above says what a cell **is**; nothing said what it is **called**, and every cross-cell surface was keyed by
+a flat `cell: u32`. That is why `crosscell_dir`'s module doc recorded a design step nobody could take: `federation::CHILDREN`
+is 7 while a plane holds `cells_in()` cells — 1 at `q = 2`, 3 at `q = 4`, **39** at `q = 16` — so *"at `q = 16` there are 39
+and nothing says which seven"*.
+
+**The seven are seats, not cells, and that dissolves it.** A cell is named by the pair
+
+> `CellPath = (the parent's address, which Fano cell of the level below it)`
+
+where the parent's address is a `HierAddr` path (empty for the base cell) and the second half is `fano::cell_of` of any
+member's seat. So a parent at address `P` has `cells_in()` **child cells**, each with exactly `fano::N = 7` seats, and the
+covering runs once per child cell: once at `q = 2`, three times at `q = 4`, thirty-nine times at `q = 16`. Nothing has to
+pick seven of anything, and `diagnose_level`'s `[f64; 7]` is the shape of *one child cell*.
+
+Three consequences, each of which was previously a blocker:
+
+* **Enumeration needs no directory.** A parent's children are `P ++ [s]` over the seven seats `s`
+  (`CellPath::member_address`), derived from its own address and the plane. `crosscell_dir::attest_children` had no caller
+  because nothing could tell it *whose* certificates to read; now the answer is a pure function.
+* **A child and a grandchild stop colliding.** Keyed by `u32`, a parent's child `0` and its grandchild `0` are one
+  registry entry — a merge that ends with a certificate verified against the wrong committee. `CellPath::encode` is
+  injective in both the prefix and the index (`a_prefix_separates_cells_a_flat_index_would_merge`).
+* **#167 has its missing input.** `fanos_runtime`'s `cell_id` folds the genesis seed and the plane's points, and says so
+  itself: *"two cells of the same deployment still collide, because the runtime has no identity above the base cell to
+  fold in"*. This is that identity.
+
+A plane that holds no Fano cell (`7 ∤ N`, so `q ∈ {7, 8, 31}`) names none, from both doors — the constructor and the
+decoder — because a directory keyed by a name no member can claim is a directory nobody will ever read.
+
 **Why not the other way round.** Making a *cell* rather than a node occupy a parent's point would require
 agreement on that cell's membership before any node could be placed — and placement is the one thing this
 platform derives rather than negotiates (`derive_address`'s own summary: *"conflict-free, no
