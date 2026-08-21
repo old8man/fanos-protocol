@@ -447,7 +447,7 @@ impl<F: Field> OverlayNode<F> {
         // so two writers with different views still place differently. That is the agreed-input problem the
         // read path's note names, and it is untouched here; this makes the placement good *given a view*.
         // At most `N` of them are ever needed, and they cycle when the cell holds fewer.
-        let ring: alloc::vec::Vec<usize> = occupied.iter().copied().take(erasure::N).collect();
+        let ring: Vec<usize> = occupied.iter().copied().take(erasure::N).collect();
         core::array::from_fn(|i| {
             ring.get(i % ring.len().max(1))
                 // Unreachable: `occupied_points` always contains this node, so the ring is never empty.

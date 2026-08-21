@@ -63,7 +63,7 @@ impl<F: Field> OverlayNode<F> {
     ///
     /// The ordinary path needs neither builder: `on_announce` records both halves from the same frame.
     #[must_use]
-    pub fn with_hier_peer_identity(mut self, id: alloc::vec::Vec<u8>, addr: HierAddr<F>, transport: Triple) -> Self {
+    pub fn with_hier_peer_identity(mut self, id: Vec<u8>, addr: HierAddr<F>, transport: Triple) -> Self {
         self.membership.identities.insert(transport, id);
         self.learn_hier_peer(addr, transport);
         self

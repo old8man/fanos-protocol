@@ -3828,6 +3828,12 @@ async fn cmd_term(_args: &[String]) -> Result<(), NodeError> {
 /// the committee it was configured with, so the key it publishes and the key its peers check its votes
 /// against cannot drift. A validator whose index names no entry publishes nothing, which is the same refusal
 /// `consensus.seat_index_mismatch` records one layer down.
+/// ⛔ **Gated, because its only caller is.** `cmd_validator` is `#[cfg(feature = "validator")]` and this was not, so a
+/// default-feature build compiled a function nothing calls — `dead_code`, which CI promotes to an error with
+/// `-D warnings`. It reddened `clippy · test · verify` **and** `reproducible release build` for every push between
+/// `44ae999` and here, while a local `cargo test` printed it as a warning and moved on. That gap between "warning
+/// locally, error in CI" is the whole reason `gate.sh` exists, and this is the shape of what slips through it.
+#[cfg(feature = "validator")]
 fn publish_this_seats_key<S>(node: &fanos_quic::NodeHandle, params: &fanos_node::TaxisParams<S>) {
     if let Some(mine) = params.verifiers.get(usize::from(params.me)).cloned() {
         // The handle is deliberately dropped: this publisher lives as long as the process, exactly like the

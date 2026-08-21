@@ -8,7 +8,11 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use Vec;
+// `use Vec;` until 2026-08-21, which is a **std-only** import: uniform paths resolve a single-segment `use` against the
+// crate root's scope, and `Vec` is there only through the std prelude. So it compiled on every job that matters to a
+// developer and broke the one that does not run locally — `no_std · wasm cross-build` — where the error reads
+// "no external crate `Vec`". This crate is `no_std` with `alloc`; the import belongs where the other two above it point.
+use alloc::vec::Vec;
 
 use fanos_code::erasure;
 use crate::ports::stations::{GatherHealth, Station, Stations};

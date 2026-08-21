@@ -68,9 +68,9 @@ impl<F: Field> OverlayNode<F> {
     /// nothing ever makes an unmet peer send us anything, and discovery is left entirely to gossip arriving
     /// through the one peer already known. The fleet stayed at six heard edges of twenty. Discovery belongs
     /// on the heartbeat, and it sweeps — see [`sweep_targets`](Self::sweep_targets).
-    pub(super) fn fan_out(&self) -> alloc::vec::Vec<Triple> {
+    pub(super) fn fan_out(&self) -> Vec<Triple> {
         let me = self.coord.coords();
-        let occupied: alloc::vec::Vec<Triple> = self
+        let occupied: Vec<Triple> = self
             .occupied_points()
             .into_iter()
             .map(|i| Point::<F>::at(i).coords())
@@ -94,10 +94,10 @@ impl<F: Field> OverlayNode<F> {
     /// whole plane in `q + 1` beats and costs `q` extra sends — against `q² + q` if every point were probed
     /// every beat. At `q = 4`: 4 extra sends per beat and a full sweep every 5 beats, in place of 20 every
     /// beat. At `q = 2`, the base cell, the two sets coincide and nothing changes.
-    pub(super) fn sweep_targets(&mut self) -> alloc::vec::Vec<Triple> {
+    pub(super) fn sweep_targets(&mut self) -> Vec<Triple> {
         let me = self.coord.coords();
         let mut targets: alloc::collections::BTreeSet<Triple> = self.fan_out().into_iter().collect();
-        let lines: alloc::vec::Vec<_> = Plane::<F>::lines_through(self.coord).collect();
+        let lines: Vec<_> = Plane::<F>::lines_through(self.coord).collect();
         if !lines.is_empty() {
             let which = self.sweep % lines.len();
             self.sweep = self.sweep.wrapping_add(1);
