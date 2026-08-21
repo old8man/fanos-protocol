@@ -3437,6 +3437,11 @@ mod tests {
     ///
     /// What is still open besides that: claims reach only direct connection partners, and in a projective
     /// plane every two lines meet, so every node contends for exactly one point of every other node's line.
+    /// `known/routable/deliverable` as one field, so a fleet's reach reads as a column rather than three.
+    fn alloc_reach(known: usize, routable: usize, deliverable: usize) -> String {
+        format!("{known}/{routable}/{deliverable}")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
     async fn measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary() {
@@ -3519,6 +3524,18 @@ mod tests {
                     health.iter().map(|h| h.verified_claims.map_or(-1, |c| c as i64)).collect();
                 let indices: Vec<i64> =
                     health.iter().map(|h| h.probe_index.map_or(-1, i64::from)).collect();
+                // **The three reach numbers, because the stuck draws are a delivery question and `claims`
+                // alone cannot say which delivery.** `known_peers` is the dial book (seeds included),
+                // `routable_points` is the *proven* bindings, `deliverable_points` adds peers that dialled
+                // **in** — so a node that knows a coordinate and holds no address for it reads
+                // `known > routable`, while one that never heard of the peer at all reads both low. Without
+                // these, "claims are not arriving" cannot be told from "claims are arriving and being
+                // refused", which are opposite defects — the same trap the `outranked`/`committed` pair was
+                // added for one layer up.
+                let reach: Vec<String> = health
+                    .iter()
+                    .map(|h| alloc_reach(h.known_peers, h.routable_points, h.deliverable_points))
+                    .collect();
                 let servable = fanos_geometry::servable_lines::<F2>(|p| points.contains(&p.coords()));
                 // **The second discriminator, and it separates the two ways a node stops walking.** A node
                 // that has not moved is either uninformed (its book lacks the claim that beats it) or
@@ -3572,7 +3589,7 @@ mod tests {
                 );
                 println!(
                     "t={:>3}s  bound={:>2}  points={:>2}  excess={:>2}  servable={:>2}/{n_points}  {}  \
-                     assigned={assigned:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}",
+                     assigned={assigned:?} beacons={beacons:?}\n          claims={claims:?} probe_index={indices:?}\n          reach(known/routable/deliverable)={reach:?}",
                     tick * 10,
                     bound.len(),
                     points.len(),
