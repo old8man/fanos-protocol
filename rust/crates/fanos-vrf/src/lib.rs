@@ -412,7 +412,23 @@ pub fn claim_beats(challenger: (u16, &VrfOutput), incumbent: (u16, &VrfOutput)) 
 /// Under this rule the count is **0 by construction** — the predicate that moves a node is the predicate that justifies
 /// it. The cost is occupancy: 2812 of 3000 seated versus the old rule's 3000, but 166 of those were inadmissible, so the
 /// comparison is 2812 against 2834 — 0.8%, spent on phantom yields (a node vacates `p` for a contender that settles
-/// elsewhere). The security-relevant quantity is unchanged and, measured, marginally better: a node can prove any index up
+/// elsewhere).
+///
+/// ⛔ **That 0.8% is a figure at `PG(2,7)`, load 0.53, and it is not the price at the loads a cell runs.** The phantom
+/// yield's cost rises steeply with load, because a contender that blocks a point it will not take is only harmless while
+/// there are spare points. Measured on the same walks by `examples/line_confinement_coverage.rs` (2026-08-21), against
+/// the same order with the yield removed and nothing else changed:
+///
+/// | plane, load | this rule clears the floor | deferred acceptance | maximum matching |
+/// |---|---|---|---|
+/// | `PG(2,2)`, `n = N` | 32.7 % | **80.5 %** | 99.1 % |
+/// | `PG(2,4)`, `n = N` | 0.0 % | **14.2 %** | 99.5 % |
+/// | `PG(2,4)`, `n = 1.5N` | 7.5 % | **97.5 %** | 100.0 % |
+///
+/// So the honest statement of the trade is: **non-recursive verification costs about `2.7×` a cell's membership**
+/// (`members_for_a_covered_plane` returns 84 for `PG(2,4)`; 31 would do without the yield). It is still the right
+/// default — the alternative is a fixed point of the whole claim set, checkable only by someone holding that set — but
+/// it must be priced where it is paid, and 0.8% is the price at a load nobody deploys at. The security-relevant quantity is unchanged and, measured, marginally better: a node can prove any index up
 /// to its first unbeaten one and none beyond, and that prefix is **1.28** points wide on average against the old rule's
 /// **1.30** (`PG(2,7)`, load 0.53).
 #[must_use]
@@ -455,6 +471,15 @@ pub fn displacement_is_forced<F: Field>(
 /// * **Monotone in information.** A node that has seen fewer peers may settle too early and later advance — a convergence
 ///   question, not a correctness one, since every intermediate position is one it can prove. Re-run it whenever the peer
 ///   set changes or the beacon advances.
+///
+/// **What the three cost, and where the fourth property went.** A contender's claim to `p` is honoured here whether or
+/// not that contender ends up on `p` — the *phantom yield* — and that is not an oversight but the price of the three
+/// above: asking "did they actually take it" makes the predicate a question about someone else's outcome, and the
+/// witness chain recursive. It is also the dominant term in a cell's occupancy at deployment loads: removing exactly it
+/// takes `PG(2,4)` at `1.5 N` from **7.5 % to 97.5 %** of draws clearing the line-viability floor
+/// (`examples/line_confinement_coverage.rs`). Before treating that as a defect, read the fourth bullet that would have
+/// to go: deferred acceptance is a fixed point of the *whole* claim set, so a node can be told to move **backwards**
+/// when it learns of a new peer, and its seat is checkable only by a verifier holding the same set.
 ///
 /// The walk is bounded by [`probe_bound`] — the line's length — since [`probe_point`] cycles through exactly that many
 /// points. Past it every point of the node's line is better claimed and it cannot be seated at all, which is the honest

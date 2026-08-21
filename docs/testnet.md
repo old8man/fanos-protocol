@@ -94,9 +94,32 @@ epoch turns; measured on an idle machine, two paired runs of the same build (202
 | **10** | **5.9–6.1 of 7** | **25 %** |
 
 At ten operators the live cell clears the floor 75 % of the time and the enumerated ceiling is 74.5 %. **So
-the running placement is at its geometric limit**, and the way to a cell that stays above the floor is more
-members, not a better mechanism. Below that floor at least one of the seven lines cannot serve a threshold
-gather, which is what a mixnet hop is — and the cell does not say so.
+the running placement is at the ceiling of the rule it runs** — there is nothing left for signalling, timing
+or permission to buy, and those three were each measured and refuted separately. Below that floor at least
+one of the seven lines cannot serve a threshold gather, which is what a mixnet hop is — and the cell does
+not say so.
+
+⛔ **This section said "at its geometric limit … not a better mechanism" until 2026-08-21, and the second
+half was wrong.** The same enumeration now runs two reference rules on the same draws. Line confinement
+alone — a maximum matching, no arbitration — clears the floor in **99.1 %** of seven-operator draws, so the
+geometry is almost never what leaves a point empty. What does is the *phantom yield*: `settle_index` honours
+a contender's claim to a point whether or not that contender ends up on it, which is the price of a seat
+being checkable without recursing into anyone else's claim chain. Removing exactly that, same order and same
+walks, reads:
+
+| operators | shipping rule | deferred acceptance | line confinement alone |
+|---|---|---|---|
+| 7 (`1.0 N`) | 32.7 % | **80.5 %** | 99.1 % |
+| 10 | 74.5 % | **99.2 %** | 100 % |
+| 16 (the constant) | 96.6 % | 100 % | 100 % |
+
+**Nothing in the advice above changes.** Sixteen is still what the shipping code needs, and a deployment
+should size to the rule that ships, not to one that does not. What changes is *why*: the sixteen are buying
+back a property of the arbitration, not working around the shape of the plane — so "more members" is one
+answer and not the only one. The other is not a small change and is not proposed here: deferred acceptance
+is a fixed point of the whole epoch's claim set, so it needs cell-wide claim propagation (which today
+reaches direct connection partners only), and it gives up the guarantee that a node learning of a new peer
+only ever moves *forward*.
 
 Sixteen has not been run live; what stands behind it is the ceiling above, plus the one load where the live
 cell was measured against that ceiling and matched it.

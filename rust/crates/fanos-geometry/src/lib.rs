@@ -189,6 +189,23 @@ pub fn servable_lines<F: Field>(occupied: impl Fn(Point<F>) -> bool) -> usize {
 /// numbers follow is the coupon-collector shape: line-confined draws must cover `N − d` of `N` points,
 /// where `d` is what the viability floor may leave empty, and that costs about `N·(H(N) − H(d))` draws.
 ///
+/// ⛔ **And the load this table prices is a property of the arbitration, not of the plane.** Measured
+/// 2026-08-21 on the same draws and the same walks, with one change — a contender blocks a point only when
+/// it actually takes that point (`fanos-vrf/examples/line_confinement_coverage.rs`):
+///
+/// | load | shipping `PG(2,2)` | deferred | shipping `PG(2,4)` | deferred |
+/// |---|---|---|---|---|
+/// | `1.0 N` | 32.7 % | **80.5 %** | 0.0 % | **14.2 %** |
+/// | `1.5 N` | 74.5 % | **99.2 %** | 7.5 % | **97.5 %** |
+/// | the constant | 96.6 % | 100 % | 98.0 % | 100 % |
+///
+/// A maximum matching over the same admissible sets clears the floor in **99.1 %** and **99.5 %** of draws
+/// at `1.0 N`, so line confinement is almost never what leaves a point empty. **This constant exists to buy
+/// back the phantom yield** — a contender that displaces a node from a point it will not occupy — and that
+/// is worth stating where the number is read, because it is the difference between "the plane needs this
+/// many nodes" and "this rule does". The rule is the one that ships, so the constant stands; see
+/// `fanos_vrf::settle_index` for what the property costs and what giving it up would require.
+///
 /// So the `3/2` was the right factor applied to the wrong base. It is kept — as **confidence over the
 /// expectation** rather than slack over the point count — and it lands both planes where a deployment wants
 /// them: `PG(2,2)` at **16** members (between the measured 93.8 % and 99.4 %) and `PG(2,4)` at **84**, which
