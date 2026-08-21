@@ -5400,6 +5400,20 @@ and lose post-quantum unforgeability for commit certificates, or carry a proof s
 which is constant-size, hash-based, and the reason "no aggregate" is a statement about *algebraic* aggregation
 only.
 
+> ✅ **DECIDED 2026-08-21 — keep `Q` signatures, and the question underneath was already answered by the code.**
+> The open question this entry left was *"does a commit certificate need post-quantum unforgeability at all?"*
+> It has one: `ExecCertificate::verify` takes `&[HybridVerifier]`, and a `HybridVerifier` is Ed25519 **plus**
+> ML-DSA-65 (`fanos_pqcrypto::sig`, `HYBRID_SIG_LEN = 3373 = 64 + 3309`). The certificate is post-quantum
+> today. So route 2 is not a trade, it is a **regression** — adopting a pairing would take a property the tree
+> already has — and route 3 is an optimisation with no security argument behind it.
+>
+> **What the status quo costs, since that is the only thing left to weigh.** A Fano cell's quorum is `Q = 5`, so
+> a certificate carries `5 × 3373 B ≈ 16.5 KiB` of signatures. It travels twice: once per **checkpoint** —
+> which is per epoch, i.e. once per `epoch_period` (default 10 min) per cell — and once per **state-sync
+> answer**. Neither is a rate at which 16.5 KiB is a cost worth a new proof system; the same node publishes a
+> ~5.4 KiB §80 descriptor every epoch beside it. Revisit if a consumer appears that reads certificates at
+> block rate rather than checkpoint rate, and revisit route 3 (never route 2) when it does.
+
 **`fanos-hermes` — "reusing the built DKG + threshold signing."** The DKG is built. Threshold signing is not:
 no `partial_sign`, no signature combine, nothing of the kind anywhere in the tree. A planned consumer of a
 capability that does not exist, which no compiler catches because it lives in prose — the mirror image of the
