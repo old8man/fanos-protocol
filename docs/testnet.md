@@ -733,11 +733,36 @@ instead.
 
 Verified against the code, not copied from an earlier claim:
 
-**Trust in the binary.** Releases are unsigned — `docs/design-upgrade.md` §6 names "signed releases" as
-still needed, and nothing in `.github/workflows/ci.yml` signs a build artifact. Every operator in the
-testnet is building from source, which means every operator is also a point where the source could differ
-from what everyone else built. `docs/design-governance.md` §2.3: "open source does not decentralize the
-binary."
+**Trust in the binary — now checkable, and here is how.** This paragraph said *"releases are unsigned"* until
+2026-08-21. What ships now is the pair that has to exist together, because neither half is worth much alone:
+
+* **Reproducibility** (`.github/workflows/ci.yml`, job `reproducible`) — every push builds `fanos` and
+  `fanos-verify` twice, from two source paths and two target directories, and compares them byte for byte. That
+  is what makes an artefact checkable against its source *by anyone*, and it is the half that usually breaks
+  first (rustc embeds absolute paths in panic locations, so a build reproducible in place can still differ
+  between two checkouts).
+* **Provenance** (`.github/workflows/release.yml`) — a release archive carries a keyless attestation binding it
+  to the repository, the commit and the workflow that built it. Deliberately not a release key: §6 of
+  `docs/design-upgrade.md` calls the release key *"the power that does not dilute"*, and minting one to close
+  this gap would have created exactly that power.
+
+So a founding operator has two independent checks, and should run both:
+
+```bash
+# 1. the artefact is what this repository's workflow produced, at this commit
+gh attestation verify fanos-<version>-<target>.tar.gz --repo old8man/fanos-protocol
+
+# 2. …and that is the source you can read: rebuild the recipe printed in the archive's BUILD.txt
+cargo build --release --locked -p fanos-node -p fanos-cli
+shasum -a 256 target/release/fanos     # compare against the published .sha256
+```
+
+**What is still open, said plainly.** The attestation binds the artefact to an *account* rather than to a key —
+better than a founder holding a signing key, and not the same as decentralized. Multi-party release signing is
+the eventual answer (§6), by the same reasoning that moves the beacon from dealt to DKG. And a testnet whose
+operators build from source rather than downloading a release gets none of this automatically: check that every
+founder is on the same commit, or have them all use the published archive.
+`docs/design-governance.md` §2.3: *"open source does not decentralize the binary."*
 
 **No running node builds an ERGON term.** `fanos-ergon` is a workspace member, but neither `fanos-node` nor
 any binary depends on it (`crates/fanos-node/Cargo.toml` has no such dependency; only `fanos-sim` and

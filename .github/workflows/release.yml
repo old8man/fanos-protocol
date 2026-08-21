@@ -1,0 +1,114 @@
+name: release
+
+# **What this closes.** `docs/design-upgrade.md` §6 names "signed releases" as the missing half of upgrade
+# trust, and `docs/testnet.md` §8 said the honest thing about the state of it: releases were unsigned, so
+# every founding operator built from source and every one of them was a place the source could differ from
+# what everyone else built.
+#
+# **Why an attestation and not a release key.** §6's own sentence is *"the release key is the power that does
+# not dilute"* — every other founding advantage decays as the network grows, but whoever holds the signing
+# key can change any derivation, any threshold, any bound, and §1 established that derivation changes are
+# silent on the wire. A long-lived key held by one founder would *create* that power in the act of closing
+# this gap. A keyless attestation does not: it binds the artefact to **the repository, the commit and the
+# workflow that produced it**, verifiable by anyone with `gh attestation verify` and holding no secret that
+# anybody can be persuaded, coerced or compromised into using. What it proves is weaker than "a person
+# vouched for this" and it is the *right* weaker thing — it is exactly the claim a reproducible build can be
+# checked against.
+#
+# **And reproducibility is the load-bearing half, which is why it is gated separately.** A signature binds an
+# artefact to a signer; only reproducibility lets a third party rebuild the source and confirm the artefact
+# *is* that source. `ci.yml`'s `reproducible` job proves the recipe below is deterministic — two builds from
+# different source paths and different target directories, compared byte for byte — so an operator who does
+# not want to trust GitHub's attestation can run the same three lines and compare hashes with `SHA256SUMS`.
+# Neither half is worth much alone; `docs/testnet.md` §8 states both.
+
+on:
+  push:
+    tags: ["v*"]
+  # So a release can be cut (or re-cut, after a botched tag) without inventing a tag for it, and so this
+  # workflow is runnable at all before the first tag exists — an untested release path is the one that fails
+  # on the day it matters.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to build"
+        required: true
+        type: string
+
+permissions:
+  contents: write # create the release and upload its assets
+  id-token: write # the OIDC token the keyless attestation is minted against
+  attestations: write # write the provenance attestation itself
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  artifacts:
+    name: build · attest · publish (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The two platforms this tree is actually exercised on: CI runs Linux, development runs macOS on
+          # Apple silicon. A target nobody builds is a target whose breakage is discovered by a user.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Install pinned toolchain
+        run: rustup show # rust-toolchain.toml drives the install, exactly as in ci.yml
+
+      # `--locked` and nothing else, deliberately. The lockfile is what makes two builds of one tag the same
+      # build; a release that resolves dependencies afresh is not the artefact the reproducibility job
+      # checked, whatever the tag says.
+      - name: Build the shipped binaries
+        run: cargo build --release --locked -p fanos-node -p fanos-cli
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="${{ inputs.ref || github.ref_name }}"
+          name="fanos-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp target/release/fanos target/release/fanos-verify "dist/${name}/"
+          # Recorded beside the binaries rather than in a release note, so an operator checking a download a
+          # year later has the recipe in hand: this is what `reproducible` in ci.yml re-runs.
+          cat > "dist/${name}/BUILD.txt" <<EOF
+          fanos ${version}
+          commit:    ${{ github.sha }}
+          target:    ${{ matrix.target }}
+          toolchain: $(rustc --version)
+          recipe:    cargo build --release --locked -p fanos-node -p fanos-cli
+          EOF
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      # First-party, keyless, and it signs the **archive** rather than each binary: the archive is what a
+      # download is, and attesting anything smaller leaves the packaging unattested.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: rust/dist/${{ steps.package.outputs.name }}.tar.gz
+
+      # `gh` rather than a third-party upload action, because a release workflow that pulls an unattested
+      # action into the step that publishes attested artefacts has undone its own point.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.ref || github.ref_name }}"
+          name="${{ steps.package.outputs.name }}"
+          gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$version" --repo "$GITHUB_REPOSITORY" --title "$version" --generate-notes
+          gh release upload "$version" --repo "$GITHUB_REPOSITORY" --clobber \
+            "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256"

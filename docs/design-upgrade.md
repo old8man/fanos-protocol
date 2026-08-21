@@ -197,10 +197,22 @@ silent — can do so without an observable wire event.
 
 So the release pipeline is a governance surface, not a build detail:
 
-* **reproducible builds**, so a published binary is checkable against its source by anyone;
-* **signed releases**, so the artefact is bound to a key;
+* **reproducible builds**, so a published binary is checkable against its source by anyone — **built**
+  (`.github/workflows/ci.yml`, job `reproducible`: two builds from different source paths *and* different target
+  directories, compared byte for byte, with the comparison shown to be live by perturbing a printed string);
+* **signed releases**, so the artefact is bound to something — **built**, and deliberately not to a *key*
+  (`.github/workflows/release.yml`): a keyless provenance attestation binds the archive to the repository, the
+  commit and the workflow that produced it, checkable with `gh attestation verify`;
 * **multi-party release signing** eventually, so the durable power is at least a threshold rather than a person —
-  the same reasoning that moves the beacon from dealt to DKG.
+  the same reasoning that moves the beacon from dealt to DKG. **Still open**, and the attestation does not close
+  it: it mints no private key, which is a real improvement over a founder holding one, but whoever controls the
+  repository can still run the workflow. The power moved from a key to an account; it did not dilute.
+
+**Why the order of those three is not arbitrary.** A signature binds an artefact to a signer and says nothing
+about what is *in* it; only reproducibility lets a third party rebuild the source and confirm the artefact is that
+source. So the signature is worth what the reproducibility gate is worth, and an operator who distrusts the
+attestation has a strictly stronger check available: run the recipe in the archive's `BUILD.txt` and compare
+`shasum -a 256`. `docs/testnet.md` §8 gives both commands.
 
 Without these, the rest of this document describes a mechanism that a single key can bypass.
 
