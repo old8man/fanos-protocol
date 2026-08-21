@@ -782,10 +782,17 @@ operators build from source rather than downloading a release gets none of this 
 founder is on the same commit, or have them all use the published archive.
 `docs/design-governance.md` §2.3: *"open source does not decentralize the binary."*
 
-**No running node builds an ERGON term.** `fanos-ergon` is a workspace member, but neither `fanos-node` nor
-any binary depends on it (`crates/fanos-node/Cargo.toml` has no such dependency; only `fanos-sim` and
-`fanos-dromos` do). Whatever ERGON's execution model proves on paper, no process this testnet runs
-constructs or serializes one.
+⛔ **"No running node builds an ERGON term" — stale, and in the direction that matters: a validator does.**
+This paragraph read *"neither `fanos-node` nor any binary depends on it … only `fanos-sim` and `fanos-dromos`
+do"*, which stops one link short. `fanos-node`'s `validator` feature is
+`["dep:fanos-dromos", "dep:fanos-obolos"]`, `fanos-dromos` depends on `fanos-ergon`, and its hybrid ledger
+**dispatches** the tag: `TAG_ERGON = 0x08` reaches `apply_term` in `hybrid.rs`, with a stateless-check path
+beside it. So a node built `--features validator` links, deserializes and executes ERGON terms.
+
+What is true of the **default** build is narrower and worth keeping: without `--features validator` the
+binary has no chain and no ERGON, so a testnet of plain `fanos node` processes constructs none. Read
+`docs/design-ergon.md` before enabling one; this line was the record under-claiming what ships, which is the
+class the audit doc names.
 
 **A punch that fails is now exercised — against a modelled NAT, not a real one (2026-08-04).**
 `crates/fanos-quic/tests/real_nat.rs` supplies a `quinn::AsyncUdpSocket` modelling both RFC 4787 axes —
