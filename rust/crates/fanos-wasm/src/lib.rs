@@ -7,6 +7,25 @@
 //! FANOS's *more principled* computed-coordinate self-organization is only worth its elegance if it is as
 //! reachable as a zero-config web/mobile client, and this crate makes the core reachable from JavaScript.
 //!
+//! ## ⚠️ This client is a **Fano** client, end to end
+//!
+//! Every entry point here is instantiated at `F2`: it proves coordinates on `PG(2,2)` and verifies them on
+//! `PG(2,2)`, and [`verify_point`] refuses any index `>= fano::N`. Against a network running a wider plane
+//! that is not a degraded client, it is a **wrong** one: it computes a coordinate the network does not
+//! assign, and it rejects the placements of every peer seated past point six.
+//!
+//! The rejection is the dangerous half. `verify_point` answering `false` is what a caller reads as *forged
+//! placement* (spec §7.3 `BAD_COORD`), so a client on the wrong plane reports fourteen of a `PG(2,4)`
+//! network's twenty-one honest peers as attackers — and it reports it with the same value it uses for a real
+//! forgery, which no caller can tell apart.
+//!
+//! Today the shipped node binary is `F2` too, so the two agree and nothing here is reachable. **That
+//! agreement is the hazard**: a plane order is a property of the network being talked to, not of the client,
+//! and the day a deployment widens (`warn_if_plane_cannot_anonymize` steers operators toward exactly that)
+//! this surface silently disagrees with it. Making the plane a parameter is a change to a public client ABI
+//! and a design step for whoever owns that surface; stating what it assumes is not, and is what this
+//! paragraph is.
+//!
 //! The whole FANOS crypto stack (curve25519 ECVRF, hybrid PQ) already cross-builds to `wasm32-unknown-unknown`;
 //! this crate wraps the client-side operations. The **pure core** ([`Identity`], [`verify_point`]) is ordinary
 //! Rust with native tests; the **`wasm` feature** adds a thin `#[wasm_bindgen]` layer (`FanosIdentity`,
@@ -84,6 +103,11 @@ impl Identity {
 /// `node_id` self-certifies that key (`node_id == H(vrf_public)`). This is the self-organizing admission a
 /// client runs locally — a forged placement, a mismatched key, or the wrong beacon is rejected (spec §7.3
 /// `BAD_COORD`) — with no directory and no trusted authority.
+///
+/// **`point >= fano::N` is refused, and on a wider plane that refusal is wrong rather than safe.** The bound
+/// is `PG(2,2)`'s seven, matching the `F2` this whole surface is built at; a `PG(2,4)` peer seated at point
+/// seven or above earns its coordinate honestly and is reported here as a forgery, in the one value a caller
+/// cannot distinguish from a real one. See this crate's header for why that is stated rather than fixed.
 #[must_use]
 pub fn verify_point(
     node_id: [u8; 32],
