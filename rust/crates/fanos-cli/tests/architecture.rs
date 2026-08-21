@@ -2679,7 +2679,7 @@ fn a_station_observation_cannot_reach_a_published_surface() {
 /// the reference is fine.
 ///
 /// **Re-exports are counted, and that was the difference between 13 findings and 5.** The first scan flagged
-/// `crate::build_cell_mix_directory` and seven like it — all `pub use` re-exports at the crate root, and all
+/// `crate::build_plane_mix_directory` and seven like it — all `pub use` re-exports at the crate root, and all
 /// legitimate. A scan of this shape without the re-export pass reports mostly noise, and noise is what gets
 /// a guard deleted.
 #[test]

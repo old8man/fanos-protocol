@@ -206,7 +206,7 @@ fn note_authentication<T>(
 /// The role-assignment **roster** — every point of plane `F`, which is the same coordinate list the mix
 /// roster uses, since every occupant of the plane is a candidate for every role.
 ///
-/// **It was called `plane_cap_coords` and documented as "the base cell of plane `F`", and it has always
+/// **It was called `cell_cap_coords` and documented as "the base cell of plane `F`", and it has always
 /// returned the plane.** `Plane::<F>::N` is the plane's point count: seven on `PG(2,2)`, where a cell and
 /// the plane coincide and the name was true, and twenty-one on `PG(2,4)`, where they do not.
 ///
@@ -651,6 +651,6 @@ mod tests {
     fn the_roster_is_the_cell_points() {
         let roster = plane_cap_coords::<F2>();
         assert_eq!(roster.len(), 7, "a Fano cell's role roster is its seven points");
-        assert_eq!(roster, crate::mixdir::cell_mix_coords::<F2>(), "same roster as the mix directory");
+        assert_eq!(roster, crate::mixdir::plane_mix_coords::<F2>(), "same roster as the mix directory");
     }
 }

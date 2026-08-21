@@ -4,7 +4,7 @@
 //! ([`fanos_node::mixdir`]). In a unit test those keys are handed in; here they are *discovered the way a
 //! real client discovers them* — every relay advertises its per-epoch onion public into the overlay store
 //! ([`publish_mix_key`] / [`spawn_mix_publisher`]), and a client resolves the current epoch's roster into a
-//! [`MixDirectory`] ([`build_cell_mix_directory`]) with no central directory and no hand-built map. The
+//! [`MixDirectory`] ([`build_plane_mix_directory`]) with no central directory and no hand-built map. The
 //! cell is genuine mutual-TLS QUIC (via [`fanos_quic::spawn_cell`]), the tier the deterministic simulator
 //! cannot cover: real sockets, real replication, real concurrency.
 //!
@@ -22,7 +22,7 @@ use std::time::Duration;
 use fanos_field::F2;
 use fanos_geometry::Point;
 use fanos_node::{
-    EpochDriver, build_cell_mix_directory, cell_mix_coords, publish_mix_key, spawn_mix_publisher,
+    EpochDriver, build_plane_mix_directory, plane_mix_coords, publish_mix_key, spawn_mix_publisher,
 };
 use fanos_quic::spawn_cell;
 use fanos_rendezvous::Epoch;
@@ -71,7 +71,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
     let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
-    let roster = cell_mix_coords::<F2>();
+    let roster = plane_mix_coords::<F2>();
     let epoch = Epoch::ZERO;
 
     // Each relay advertises its own current onion public at its epoch-tagged slot — publishing from its
@@ -91,7 +91,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
     // writes to and no reader can check one (S1-M3). Note that these nodes *do* hold self-certifying identities — having an
     // identity and sitting on a provable point are different things, and conflating them is what made an earlier attempt at
     // the binding reject every honest record here.
-    let dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await.0;
+    let dir = build_plane_mix_directory::<F2>(&reader, epoch, None).await.0;
     assert_eq!(dir.len(), 7, "every live relay is discovered");
     for (i, &coord) in roster.iter().enumerate() {
         assert_eq!(
@@ -104,7 +104,7 @@ async fn the_live_cell_directory_is_assembled_from_published_keys_over_real_quic
 
     // Epoch-scoping: nothing was published for a later epoch, so its directory is empty — a client for
     // that epoch resolves a distinct slot and finds nobody, never a stale key from a past epoch.
-    let future = build_cell_mix_directory::<F2>(&reader, Epoch::new(1), None).await.0;
+    let future = build_plane_mix_directory::<F2>(&reader, Epoch::new(1), None).await.0;
     assert_eq!(
         future.len(),
         0,
@@ -125,7 +125,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
     let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
-    let roster = cell_mix_coords::<F2>();
+    let roster = plane_mix_coords::<F2>();
     let epoch = Epoch::new(3);
 
     // Only the first five of the seven relays advertise for this epoch.
@@ -138,7 +138,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
         );
     }
 
-    let dir = build_cell_mix_directory::<F2>(&cell.nodes[6].client(), epoch, None).await.0;
+    let dir = build_plane_mix_directory::<F2>(&cell.nodes[6].client(), epoch, None).await.0;
     assert_eq!(
         dir.len(),
         present,
@@ -164,7 +164,7 @@ async fn the_live_directory_is_best_effort_absent_relays_are_simply_missing() {
 }
 
 /// [`spawn_mix_publisher`] closes the loop: spawned on each relay, it advertises the relay's genesis onion
-/// key with no further prompting, so a client that only ever calls [`build_cell_mix_directory`] finds a
+/// key with no further prompting, so a client that only ever calls [`build_plane_mix_directory`] finds a
 /// fully populated, live directory. (Beacon-driven republish is proven deterministically by the
 /// `EpochDriver` unit tests; here we confirm the async task publishes over real QUIC.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -173,7 +173,7 @@ async fn the_publisher_task_keeps_each_relays_key_live() {
     // unserialized they put twenty-one endpoints on one loopback and one scheduler (`common::serial_cell`).
     let _serial = common::serial_cell().await;
     let cell = spawn_cell::<F2>(make_node).await.expect("assemble cell");
-    let roster = cell_mix_coords::<F2>();
+    let roster = plane_mix_coords::<F2>();
     let epoch = Epoch::ZERO;
 
     // Every relay runs its publisher task, seeded with the same onion seed its router would use.
@@ -187,13 +187,13 @@ async fn the_publisher_task_keeps_each_relays_key_live() {
     // The publishers write asynchronously; poll the discovered directory until every relay's genesis key
     // has landed (bounded — a real store ack is fast over loopback QUIC), then assert the full roster.
     let reader = cell.nodes[0].client();
-    let mut dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await.0;
+    let mut dir = build_plane_mix_directory::<F2>(&reader, epoch, None).await.0;
     for _ in 0..40 {
         if dir.len() == roster.len() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        dir = build_cell_mix_directory::<F2>(&reader, epoch, None).await.0;
+        dir = build_plane_mix_directory::<F2>(&reader, epoch, None).await.0;
     }
     assert_eq!(
         dir.len(),

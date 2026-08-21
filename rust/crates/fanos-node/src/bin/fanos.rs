@@ -24,8 +24,8 @@ use fanos_pqcrypto::sig::{HybridSigSecret, HybridVerifier};
 use fanos_node::{
     AnonRouteParams, BeaconParams, BeaconSeed, Coverage, Environment, Epoch, ExitParams, FanosDialer, Morph, Node,
     NodeConfig,
-    NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_cell_exit_directory,
-    HostedService, build_cell_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
+    NodeError, NodeResolver, Peer, RoleSet, ServiceParams, build_plane_exit_directory,
+    HostedService, build_plane_mix_directory, identity, publish_service, serve_proxy, spawn_rendezvous_host,
 };
 // Only the (feature-gated) `fanos vpn` command dials clearnet by IP with an empty resolver.
 #[cfg(feature = "vpn")]
@@ -919,7 +919,7 @@ fn data_dir_for(args: &[String]) -> Result<PathBuf, NodeError> {
 /// Two routing profiles (`--profile`): **direct** (default) opens the DIAULOS stream straight to the service
 /// coordinate — fast, but an observer sees which coordinate the client talks to. **anonymous** draws a
 /// *fresh, unlinkable* threshold-onion rendezvous route for every dial from the cell's live mix directory
-/// (`build_cell_mix_directory` — the relays that published an onion key this epoch), so neither party's
+/// (`build_plane_mix_directory` — the relays that published an onion key this epoch), so neither party's
 /// location is revealed and an observer cannot link one client's successive connections by their path. It
 /// refuses to start unless at least `threshold + 1` relays are live, and takes the epoch's public `--beacon`
 /// so its drawn meeting line matches the service's.
@@ -1318,7 +1318,7 @@ async fn build_proxy_dialer(
         // `Some(beacon)` — the live beacon resolved just above. A forged mix key at another relay's slot is
         // refused rather than sealed to (S1-M3).
         let (directory, view) =
-            build_cell_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
+            build_plane_mix_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
         let need = usize::from(cfg.threshold) + 1;
         if directory.len() < need {
             return Err(NodeError::Config(too_few_relays(
@@ -1482,7 +1482,7 @@ async fn submit_tx_frame(
         return Ok(node.command(Command::Emit { to: Point::<F2>::at(0).coords(), frame: frame.to_vec() }));
     }
     let client = node.client();
-    let (directory, view) = build_cell_mix_directory::<F2>(&client, epoch, Some(*beacon)).await;
+    let (directory, view) = build_plane_mix_directory::<F2>(&client, epoch, Some(*beacon)).await;
     if !view.complete() {
         // Not a refusal: unlike the proxy above, this path fails CLOSED — `emit_anonymously` returning
         // `None` produces an error that offers `--direct` with its cost stated. What it does not do is
@@ -4260,7 +4260,7 @@ async fn discover_exit(node: &Node, epoch: Epoch) -> Option<([u32; 3], HybridKem
     let beacon = node
         .live_beacon()
         .map_or_else(|| node.client().genesis(), |(_, seed)| BeaconSeed::new(seed));
-    let mut exits = build_cell_exit_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
+    let mut exits = build_plane_exit_directory::<F2>(&node.client(), epoch, Some(beacon)).await;
     let n = exits.len();
     if n == 0 {
         return None;

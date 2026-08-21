@@ -2280,12 +2280,12 @@ mod tests {
     async fn a_relay_node_publishes_its_mix_key_to_the_directory() {
         // The Node::start relay wiring end-to-end: a relay composes a CellNode (overlay + beacon + mix
         // router) AND spawns the publisher that keeps its onion key live in the cell directory — so a
-        // client's `build_cell_mix_directory` surfaces it, i.e. the anonymity mixnet is actually reachable.
+        // client's `build_plane_mix_directory` surfaces it, i.e. the anonymity mixnet is actually reachable.
         use std::time::Duration;
 
         use fanos_vrf::vss::{DeterministicRng, deal};
 
-        use crate::build_cell_mix_directory;
+        use crate::build_plane_mix_directory;
 
         let (_shares, commitment) =
             deal(&[0xB6; 32], 2, 3, &mut DeterministicRng::new(b"relay-mix")).unwrap();
@@ -2323,13 +2323,13 @@ mod tests {
         // derived from the beacon this test provisions — not the constant. Naming the constant here was the
         // shape that hid the real defect: reader and writer agreed with each other and with nothing else.
         let genesis = client.genesis();
-        let mut dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
+        let mut dir = build_plane_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
         for _ in 0..30 {
             if !dir.is_empty() {
                 break;
             }
             let _ = tokio::time::timeout(Duration::from_millis(100), node.next_notification()).await;
-            dir = build_cell_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
+            dir = build_plane_mix_directory::<F2>(&client, Epoch::ZERO, Some(genesis)).await.0;
         }
         assert!(
             !dir.is_empty(),

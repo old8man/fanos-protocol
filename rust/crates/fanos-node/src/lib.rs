@@ -356,7 +356,7 @@ pub use diaulos::{
 pub use epoch_driver::{EpochDriver, next_epoch};
 pub use error::NodeError;
 pub use exit::{
-    ExitPolicy, ExitRefusal, build_cell_exit_directory, dial_exit, publish_exit_key, resolve_exit_key,
+    ExitPolicy, ExitRefusal, build_plane_exit_directory, dial_exit, publish_exit_key, resolve_exit_key,
     serve_exit, spawn_exit_publisher,
 };
 pub use fanos_onoma::Epoch;
@@ -367,7 +367,7 @@ pub use rendezvous_host::{
     HostedService, HostEpoch, RpcService, serve_anonymous, serve_anonymous_rpc, spawn_rendezvous_host, spawn_rendezvous_host_rpc,
 };
 pub use mixdir::{
-    build_cell_mix_directory, build_mix_directory, cell_mix_coords, publish_mix_key,
+    build_plane_mix_directory, build_mix_directory, plane_mix_coords, publish_mix_key,
     resolve_mix_key, spawn_mix_directory_feeder, spawn_mix_publisher,
 };
 pub use ingress_node::IngressNode;

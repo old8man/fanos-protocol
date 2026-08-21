@@ -2,7 +2,7 @@
 //! the epoch-driving DVRF beacon) *plus* the anonymity mixnet role — a threshold-onion router wrapped in
 //! a [`RendezvousRelay`], so the same coordinate that serves membership/storage/healing also **peels
 //! rendezvous hops and forwards anonymous replies** (spec §L5, audit #54). This is what turns a cell of
-//! nodes into a live mixnet: a client's [`build_cell_mix_directory`](crate::build_cell_mix_directory)
+//! nodes into a live mixnet: a client's [`build_plane_mix_directory`](crate::build_plane_mix_directory)
 //! reads the onion keys these nodes publish, and draws its anonymous circuits over them.
 //!
 //! ## Why one engine

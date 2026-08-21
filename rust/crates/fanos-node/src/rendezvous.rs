@@ -202,7 +202,7 @@ pub struct RendezvousRoute {
 /// `directory`, so an observer cannot link successive dials by their shared path (the fixed-route
 /// [`FanosDialer::anonymous`](crate::FanosDialer::anonymous) reuses one path across dials and is linkable — a real proxy must use this).
 pub struct AnonRouteParams {
-    /// The live mixnet key directory (e.g. from [`build_cell_mix_directory`](crate::build_cell_mix_directory)).
+    /// The live mixnet key directory (e.g. from [`build_plane_mix_directory`](crate::build_plane_mix_directory)).
     pub directory: MixDirectory,
     /// How many of each hop line's members must cooperate to peel an onion.
     pub threshold: u8,

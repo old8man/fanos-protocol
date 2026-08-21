@@ -687,13 +687,19 @@ pub async fn resolve_exit_key<F: Field>(
     open_exit_record::<F>(&bytes, coord, epoch, beacon)
 }
 
-/// Assemble the **live** exit directory of the base cell of plane `F` for `epoch`: resolve every cell
-/// point's published exit key and keep those currently answering — a best-effort roster of exits the proxy
+/// Assemble the **live** exit directory of plane `F` for `epoch`: resolve every **plane** point's published
+/// exit key and keep those currently answering — a best-effort roster of exits the proxy
 /// can route clearnet traffic through (no central directory; the cell advertises itself through the store).
 /// `beacon` states whether this deployment can prove coordinates — `Some` on any cell with VRF
 /// coordinates, and a record that is not bound to the point it sits at is then skipped rather than routed
 /// through. Symmetric with the publisher's `credential`, and with the three sibling directories.
-pub async fn build_cell_exit_directory<F: Field>(
+///
+/// **It was `build_cell_exit_directory` and its doc said "of the base cell"**, while the body has always
+/// walked `0..Plane::<F>::N`. True on `PG(2,2)`, where a cell and the plane coincide, and false on every
+/// larger one — the same lie its three siblings carried (`plane_cap_coords`, `plane_mix_coords`,
+/// `plane_telemetry_coords`). The plane is the right set: an exit is a service any occupant may offer, and
+/// the cell is what the reflex diagnoses rather than what a client routes over.
+pub async fn build_plane_exit_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
@@ -709,7 +715,7 @@ pub async fn build_cell_exit_directory<F: Field>(
 }
 
 /// Keep an exit **discoverable**: spawn the task that (re)publishes the exit at `coord` its stable service
-/// public key each epoch, so [`build_cell_exit_directory`] always sees it while the node runs. Publishes
+/// public key each epoch, so [`build_plane_exit_directory`] always sees it while the node runs. Publishes
 /// the genesis-epoch key at once, then follows the node's `BeaconReady` stream (the exit's identity is
 /// seed-pinned, so the same key is refreshed at each new epoch's slot). Ends when the node shuts down.
 /// Publishes at the node's **live** coordinate, re-read on every cycle rather than captured at spawn.

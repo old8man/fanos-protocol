@@ -70,7 +70,7 @@ const RPC_REQUEST_BOUND: usize = 64 * 1024;
 
 use fanos_node::{
     AnonRouteParams, CellNode, FanosDialer, HostedService, OverlayBeaconNode, RendezvousRoute, StaticResolver,
-    build_cell_mix_directory, RpcService, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
+    build_plane_mix_directory, RpcService, serve_anonymous_rpc, spawn_mix_publisher, spawn_rendezvous_host_rpc,
 };
 use fanos_pqcrypto::{HybridKemPublic, HybridKemSecret, HybridSigSecret, OnionKeyRatchet, SeedRng};
 use fanos_proxy::{Dialer, Target};
@@ -1307,7 +1307,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
         nodes.push(Some(handle));
     }
     // Publish each node's mix key (same onion seed its router uses), so the host driver's
-    // `build_cell_mix_directory` resolves the whole cell.
+    // `build_plane_mix_directory` resolves the whole cell.
     let mut publishers = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         let mut onion_seed = [0xC4u8; 32];
@@ -1325,7 +1325,7 @@ async fn the_spawn_rendezvous_host_driver_serves_a_dialer_over_real_quic() {
     // Wait for the mix keys to be readable, not for a duration: the host driver below builds its directory from this
     // store, and an empty read makes it register a route through nothing.
     common::converge("every cell mix key is published", || async {
-        let dir = build_cell_mix_directory::<F2>(&nodes[0].as_ref().unwrap().client(), fanos_rendezvous::Epoch::ZERO, None).await.0;
+        let dir = build_plane_mix_directory::<F2>(&nodes[0].as_ref().unwrap().client(), fanos_rendezvous::Epoch::ZERO, None).await.0;
         (dir.len() == 7, format!("mix keys readable: {}", dir.len()))
     })
     .await;

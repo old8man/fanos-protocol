@@ -1256,7 +1256,7 @@ mod tests {
         let client = reader.client();
         let genesis = client.genesis();
         // Ask about the coordinates the fleet actually occupies, not the whole plane.
-        // `build_cell_exit_directory` sweeps all `Plane::<F2>::N = 7` points and each miss waits out
+        // `build_plane_exit_directory` sweeps all `Plane::<F2>::N = 7` points and each miss waits out
         // `resolve::STORE_TIMEOUT` (5 s), so one sweep of a five-node fleet costs up to eighty seconds —
         // polling it in a loop is what made the first version of this test exceed a 500 s timeout without
         // ever reaching an assertion. Five targeted reads, all of which should hit, cost nothing by

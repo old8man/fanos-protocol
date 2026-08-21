@@ -44,7 +44,7 @@ use fanos_rendezvous::{
 use fanos_runtime::{Command, Notification};
 use fanos_session::{ChannelTransport, serve_over_channels_paced_observed};
 
-use crate::mixdir::build_cell_mix_directory;
+use crate::mixdir::build_plane_mix_directory;
 use crate::resolve::Coverage;
 use rand_core::CryptoRng;
 use tokio::io::DuplexStream;
@@ -600,7 +600,7 @@ async fn rotate_host(
     // The mix directory's binding mode is the cell's, so it is read from the client rather than configured here: a record
     // must prove its slot exactly where coordinates are VRF-derived (S1-M3, `mixdir::parse_bound_record`).
     let (dir, view) =
-        build_cell_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
+        build_plane_mix_directory::<F2>(client, epoch, vrf_coordinates.then_some(beacon)).await;
     if !may_register(dir.len(), view) {
         if !view.complete() {
             tracing::warn!(

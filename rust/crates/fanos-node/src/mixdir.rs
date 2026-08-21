@@ -134,19 +134,28 @@ pub async fn build_mix_directory(
     Some(dir)
 }
 
-/// The mixnet **roster** of the base cell of plane `F`: every one of its `N` points (all seven, for a
-/// Fano cell). A base cell *is* its plane, so every point is a potential mix hop; this is the membership
-/// a client resolves keys over to discover the live directory ([`build_cell_mix_directory`]). It is the
-/// coordinate list a hand-built map used to be — now derived from the geometry, not written by hand.
+/// The mixnet **roster** — every point of plane `F`, each of them a potential mix hop. This is the
+/// membership a client resolves keys over to discover the live directory ([`build_plane_mix_directory`]),
+/// derived from the geometry rather than written by hand.
+///
+/// **It was called `cell_mix_coords` and its doc said "a base cell *is* its plane".** That sentence is true
+/// on `PG(2,2)` and false on every larger one: a plane holds `N / 7` cells — three at `q = 4`, thirty-nine
+/// at `q = 16` — so the name promised seven points and the body returned all of them.
+///
+/// The plane is the right set, and the name is what changed. An onion hop is a threshold gather on a **line**
+/// of the plane (`fanos_geometry::servable_lines` counts the plane's lines, and the anonymity floor is stated
+/// in them), so every occupant of the plane is a candidate hop. The cell is what the reflex diagnoses and what
+/// consensus votes in; it is not what a circuit is built over. Its two siblings carried the same lie and were
+/// corrected with it: `plane_cap_coords` and `plane_telemetry_coords`.
 #[must_use]
-pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
+pub fn plane_mix_coords<F: Field>() -> Vec<Coord> {
     (0..Plane::<F>::N as usize)
         .map(|i| Point::<F>::at(i).coords())
         .collect()
 }
 
-/// Assemble the **live** mix directory of the base cell for `epoch`: resolve every roster member's
-/// ([`cell_mix_coords`]) published onion key and keep those currently answering. Unlike
+/// Assemble the **live** mix directory of the plane for `epoch`: resolve every roster member's
+/// ([`plane_mix_coords`]) published onion key and keep those currently answering. Unlike
 /// [`build_mix_directory`] — which seals *one chosen circuit* and so is all-or-nothing (a single missing
 /// member means re-draw) — this is a *best-effort roster view*: a member that is down, or has not yet
 /// published for `epoch`, is simply absent, and the client draws its circuit from whoever is present. The
@@ -176,12 +185,12 @@ pub fn cell_mix_coords<F: Field>() -> Vec<Coord> {
 /// Every sibling directory already returns it (`build_capability_directory`, `build_cell_setpoint`,
 /// `read_diagnosis_window`) and the role loop already declines to act on a partial view. This one was the
 /// exception.
-pub async fn build_cell_mix_directory<F: Field>(
+pub async fn build_plane_mix_directory<F: Field>(
     client: &Client,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> (MixDirectory, Coverage) {
-    let scan = resolve_directory(client, cell_mix_coords::<F>(), move |client, coord| async move {
+    let scan = resolve_directory(client, plane_mix_coords::<F>(), move |client, coord| async move {
         read_mix_key_in_mode::<F>(&client, coord, epoch, beacon).await
     })
     .await;
@@ -218,7 +227,7 @@ async fn read_mix_key_in_mode<F: Field>(
 
 
 /// Keep a relay's onion key **live** in the directory: spawn the task that (re)publishes the relay at
-/// `coord` its current forward-secure onion public each epoch, so [`build_cell_mix_directory`] always
+/// `coord` its current forward-secure onion public each epoch, so [`build_plane_mix_directory`] always
 /// reads a key the relay can still peel with. This is the async closure of the E4∩E5 loop (see
 /// [`EpochDriver`]): it publishes the genesis-epoch key at once, then follows the relay's own
 /// [`Notification::BeaconReady`](fanos_runtime::Notification::BeaconReady) stream — a mirror [`EpochDriver`] seeded from the same `onion_seed`
@@ -279,7 +288,7 @@ pub fn spawn_mix_publisher(
 /// A cell node is a potential meeting combiner for any hidden service whose key lands on its line, and a combiner
 /// must seal the forward onion to a registered host's dead-drop — which needs that line's member keys. It cannot
 /// resolve them itself: [`RendezvousRelay`](crate::rendezvous_relay::RendezvousRelay) is a sans-I/O engine and
-/// [`build_cell_mix_directory`] is a store lookup. So an async sibling resolves and hands it over through
+/// [`build_plane_mix_directory`] is a store lookup. So an async sibling resolves and hands it over through
 /// [`Command::Control`], which is local by construction — key material may be installed from a command precisely
 /// because, unlike a frame, no peer can produce one.
 ///
@@ -301,7 +310,7 @@ pub fn spawn_mix_directory_feeder<F: Field>(client: Client, vrf_coordinates: boo
             // that cannot seal simply does not forward, so an incomplete directory produces no route rather
             // than a wrong one. The host side is the opposite (`rotate_host`) and must refuse.
             let (dir, _complete) =
-                build_cell_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
+                build_plane_mix_directory::<F>(client, epoch, vrf_coordinates.then_some(beacon)).await;
             if !dir.is_empty() {
                 client.command(Command::Control {
                     tag: fanos_rendezvous::CONTROL_MIX_DIRECTORY,
@@ -369,7 +378,7 @@ mod tests {
     #[test]
     fn the_cell_roster_is_the_planes_points() {
         use fanos_field::F2;
-        let roster = cell_mix_coords::<F2>();
+        let roster = plane_mix_coords::<F2>();
         assert_eq!(
             roster.len(),
             7,

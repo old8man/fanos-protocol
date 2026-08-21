@@ -217,7 +217,7 @@ pub async fn read_coherence<F: Field>(
 
 /// Every point of **plane `F`** — the coordinate list a monitor resolves telemetry over.
 ///
-/// **It was called `plane_telemetry_coords` and documented as "every point of the base cell", and it has
+/// **It was called `cell_telemetry_coords` and documented as "every point of the base cell", and it has
 /// always returned the plane.** On `PG(2,2)` those are the same seven points, so the name was true where
 /// anyone had run it and false everywhere else — the exact shape of confusion that cost a long
 /// investigation elsewhere in this tree, where a constructor documented as being about the reflex was
@@ -424,7 +424,7 @@ mod tests {
         // Every point is a potential publisher, so a monitor reads the plane rather than a configured list — the same
         // derivation `capdir`/`mixdir` use, for the same reason: a hand-written roster is a roster that goes stale.
         let coords = plane_telemetry_coords::<F2>();
-        assert_eq!(coords.len(), Plane::<F2>::N as usize, "all seven points of the Fano cell");
+        assert_eq!(coords.len(), Plane::<F2>::N as usize, "every point of the plane — seven, on this one");
         assert_eq!(coords.iter().collect::<std::collections::HashSet<_>>().len(), coords.len(), "and distinct");
     }
 
