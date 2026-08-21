@@ -140,7 +140,11 @@ fn a_cross_cell_publisher_may_not_be_wired_while_only_one_cell_can_exist() {
         }
         for (i, line) in text.lines().enumerate() {
             for name in CROSS_CELL_PUBLISHERS {
-                if line.contains(&format!("{name}(")) {
+                // **`name(` and `name::<`, because a generic publisher is called with a turbofish** and
+                // matching only the first spelling made this scan blind to exactly the wiring it guards:
+                // `spawn_health_publisher::<F>(client, …)` does not contain `spawn_health_publisher(`.
+                // Found by wiring one and watching the tripwire stay green.
+                if line.contains(&format!("{name}(")) || line.contains(&format!("{name}::<")) {
                     callers.push(format!("{path}:{} {}", i + 1, line.trim()));
                 }
             }

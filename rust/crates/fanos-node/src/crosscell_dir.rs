@@ -41,15 +41,19 @@
 //!    signature. **Closed**: [`publish_seat_key`] / [`resolve_committee`], one slot per seat, each opened
 //!    against *that seat's* coordinate rather than against the cell as a set.
 //!
-//! **What is left is agreement.** The health slot is keyed `(cell, epoch)` — one record per cell — while
-//! every input a node has is its own local reading, the `degraded` mask from its own
-//! `Notification::Liveness`. Wire seven members to that slot and they race, and whichever wrote last speaks
-//! for the cell; the `Entitlement` proves *a member* wrote it and cannot prove the cell agreed. **A cell-wide
-//! record must not be written from a local input** — the standing rule this would break, and the reason the
-//! publishers stay unwired now that all four earlier reasons are closed. Recorded as
-//! [`UNWIRED_BECAUSE`], because `one_cell_premise.rs` scans stripped source and cannot see this paragraph.
+//! 5. *"A cell-wide record cannot be written from a local input."* The health slot was keyed `(cell, epoch)`
+//!    — one record for a whole cell — while every input a node has is its own reading. Seven members would
+//!    have raced for it and whoever wrote last would have spoken for the cell, with the `Entitlement`
+//!    proving *a member* wrote it and unable to prove the cell agreed. **Closed by removing the requirement
+//!    rather than by meeting it**: the record is per *seat* now, bound to that seat's coordinate, and
+//!    [`resolve_health`] folds the answering members per axis by **majority** — no agreement to reach, a
+//!    minority cannot accuse, and the reader gets strictly more than one block's worth of information.
 //!
-//! Two smaller things sit beside it, and neither is a missing rule:
+//! **[`spawn_health_publisher`] is wired** (`role_loop::spawn_self_organization`), reading this node's own
+//! `degraded` mask off the liveness watch the role loop already runs. Five reasons, all closed; what stands
+//! below is work rather than a rule.
+//!
+//! Two smaller things remain, and neither is a missing rule:
 //!
 //! * Nothing in a shipped binary yet *runs* [`publish_seat_key`] / [`resolve_committee`]. A validator has to
 //!   publish its consensus verifying key each epoch beside the keys it already publishes, and a parent has to
@@ -98,27 +102,53 @@ fn checkpoint_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
     key
 }
 
-/// The slot a cell publishes its **health report** at — domain-separated, keyed by cell and epoch, exactly like
-/// [`checkpoint_slot`].
-/// **Why every cross-cell publisher in this module is still unwired**, as a line of code rather than a
-/// paragraph — `one_cell_premise.rs` scans stripped source and cannot see prose, which an earlier attempt at
-/// exactly this discovered.
+/// The slot **one member** of a cell publishes its health reading at — domain-separated, and keyed by seat as
+/// well as by cell and epoch.
 ///
-/// Four earlier reasons are closed (the module header records each). This one is different in kind: the
-/// health slot is keyed `(cell, epoch)`, one record for a whole cell, while every input a node has is its own
-/// local reading — the `degraded` mask from its own `Notification::Liveness`. Wire seven members to that slot
-/// and they race; whichever wrote last speaks for the cell. The `Entitlement` proves *a member* wrote it and
-/// cannot prove the cell agreed.
-///
-/// **Deleting this constant is how a wiring commit declares the gap closed**, and the tripwire fails unless
-/// exactly one of the two is true: this stands, or a publisher has a production caller.
-pub const UNWIRED_BECAUSE: &str = "a cell-wide record must not be written from a local input";
-
-fn health_slot(cell: u32, epoch: Epoch) -> Vec<u8> {
+/// The seat is what makes the record bindable and the fold honest. Keyed `(cell, epoch)` alone it was one
+/// record for seven writers: they raced, whoever wrote last spoke for the cell, and the `Entitlement` could
+/// prove only that *a* member wrote it. Per seat each writer speaks for itself, the envelope binds to that
+/// seat's own coordinate, and [`resolve_health`] folds whoever answered — see [`fold_member_reports`].
+fn health_slot(cell: u32, seat: usize, epoch: Epoch) -> Vec<u8> {
     let mut key = b"FANOS-v1/cell-health/".to_vec();
     key.extend_from_slice(&cell.to_be_bytes());
+    key.extend_from_slice(&(seat as u32).to_be_bytes());
     key.extend_from_slice(&epoch.to_be_bytes());
     key
+}
+
+/// Fold however many member readings answered into the cell's one block, **per axis by majority**.
+///
+/// The covering downstream localizes `(child, axis)` from one block per child, so a cell has to speak with
+/// one voice — and seven members each have their own view. Two ways to get there, and only one of them
+/// needs no agreement protocol:
+///
+/// * have the members agree and one of them publish. That is a cell-wide decision taken on local inputs,
+///   which is the rule this platform does not break; and with a single `(cell, epoch)` slot it is not even
+///   a decision, it is a race whose winner is whoever wrote last.
+/// * have each member publish **its own** reading and let the reader fold. No agreement, strictly more
+///   information, and the fold is where it belongs — with the party that is about to act on it.
+///
+/// Majority rather than OR, and the difference is who can accuse. Under OR a single member sets every axis
+/// of its own cell, which is the input `golay::Provenance` warns about: the decoder corrects toward the
+/// nearest codeword, so an injected coordinate does not add noise, it **moves the blame** onto a healthy
+/// sibling. A majority requires the cell's own members to corroborate — the same rule `coord_alive` applies
+/// to liveness, for the same reason.
+///
+/// `None` when nobody answered: a cell that said nothing is not a cell that said "healthy" — silence is an
+/// erasure, which `ChildDiagnosis` counts separately.
+fn fold_member_reports(reports: &[Report]) -> Option<Report> {
+    if reports.is_empty() {
+        return None;
+    }
+    let majority = reports.len() / 2 + 1;
+    let axes = (0..golay::AXES)
+        .filter(|&axis| reports.iter().filter(|r| r.axes >> axis & 1 == 1).count() >= majority)
+        .fold(0u8, |mask, axis| mask | 1 << axis);
+    Some(Report {
+        axes,
+        bus_fault: reports.iter().filter(|r| r.bus_fault).count() >= majority,
+    })
 }
 
 /// A destination cell's cross-cell inbox slot for a specific `(source cell, nonce)` message.
@@ -368,6 +398,7 @@ pub async fn attest_children<F: Field>(
 pub async fn publish_health<F: Field>(
     client: &Client,
     cell: u32,
+    seat: usize,
     epoch: Epoch,
     report: Report,
     credential: Option<&(Vec<u8>, fanos_vrf::VrfPublic, fanos_vrf::VrfProof)>,
@@ -381,7 +412,8 @@ pub async fn publish_health<F: Field>(
         Some((id, public, proof)) => Entitlement::encode(id, public, proof, &payload),
         None => payload.clone(),
     };
-    let landed = client.put_ephemeral(health_slot(cell, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
+    let landed =
+        client.put_ephemeral(health_slot(cell, seat, epoch), record, DIRECTORY_SLOT_EPOCHS).await;
     let _ = core::marker::PhantomData::<F>;
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
@@ -486,8 +518,19 @@ pub async fn resolve_health<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Option<Report> {
-    let bytes = tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(cell, epoch))).await.ok()??;
-    open_health::<F>(&bytes, cell, epoch, beacon)
+    let members = fano::cell_members_of::<F>(cell as usize)?;
+    let mut answered = Vec::with_capacity(fano::N);
+    for (seat, &point) in members.coords().iter().enumerate() {
+        let Ok(Some(bytes)) =
+            tokio::time::timeout(STORE_TIMEOUT, client.get(health_slot(cell, seat, epoch))).await
+        else {
+            continue; // a silent or unreachable member is an erasure, not a clean block
+        };
+        if let Some(report) = open_health::<F>(&bytes, point, epoch, beacon) {
+            answered.push(report);
+        }
+    }
+    fold_member_reports(&answered)
 }
 
 /// The inverse of the publish encoding — and, when `beacon` is `Some`, the **authentication** the federated
@@ -513,17 +556,17 @@ pub async fn resolve_health<F: Field>(
 #[must_use]
 fn open_health<F: Field>(
     bytes: &[u8],
-    cell: u32,
+    seat: Triple,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Option<Report> {
     let payload = match beacon {
         Some(seed) => {
-            let members = fano::cell_members_of::<F>(cell as usize)?;
-            let (_, payload) = members
-                .coords()
-                .iter()
-                .find_map(|&point| Entitlement::open::<F>(bytes, point, epoch, &seed))?;
+            // **This seat's coordinate, not any of the cell's seven**, which is the binding a per-member
+            // slot makes available and a per-cell one could not. Under the old rule a record was admitted
+            // from a member of the cell *somewhere*, so one member could fill all seven seats and the
+            // majority fold below would be a majority of one identity's opinions.
+            let (_, payload) = Entitlement::open::<F>(bytes, seat, epoch, &seed)?;
             payload.to_vec()
         }
         None => bytes.to_vec(),
@@ -662,11 +705,19 @@ pub fn spawn_health_publisher<F: Field>(
         // `index mod cells` over this node's coordinate (#145), and the beacon re-draws that coordinate at
         // every boundary — so a `cell: u32` fixed at spawn names the cell this node was in when it started
         // and publishes into it for ever after. A caller could not have supplied a correct value at all.
-        let cell_now = |client: &Client| {
-            fanos_geometry::Point::<F>::new(client.address()).and_then(fano::cell_of::<F>)
+        // **The cell AND this node's seat in it, both derived from the coordinate it holds right now.**
+        // The beacon re-draws that coordinate at every boundary, so a value fixed at spawn names the seat
+        // the node had when it started; and the seat is what the record is bound to, so a stale one is a
+        // record nobody can open.
+        let seat_now = |client: &Client| {
+            let coord = client.address();
+            let cell = fanos_geometry::Point::<F>::new(coord).and_then(fano::cell_of::<F>)?;
+            let members = fano::cell_members_of::<F>(cell)?;
+            let seat = members.coords().iter().position(|&m| m == coord)?;
+            Some((cell, seat))
         };
-        if let Some(cell) = cell_now(&client) {
-            publish_health::<F>(&client, cell as u32, epoch, health(), credential(epoch, &seed).as_ref()).await;
+        if let Some((cell, seat)) = seat_now(&client) {
+            publish_health::<F>(&client, cell as u32, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
         }
         // Latest-state, not the lossy stream: a cell whose health report is missing for an epoch reads to its
         // neighbours as a cell that has nothing to say, which is not the same as one that is healthy (#86).
@@ -676,8 +727,8 @@ pub fn spawn_health_publisher<F: Field>(
             // Re-derived on every boundary, for the reason above: this is the instant the coordinate — and
             // therefore the cell — changes. A node that has left the plane's cell structure entirely (a plane
             // whose point count does not divide by seven) publishes nothing rather than into cell zero.
-            if let Some(cell) = cell_now(&client) {
-                publish_health::<F>(&client, cell as u32, epoch, health(), credential(epoch, &seed).as_ref()).await;
+            if let Some((cell, seat)) = seat_now(&client) {
+                publish_health::<F>(&client, cell as u32, seat, epoch, health(), credential(epoch, &seed).as_ref()).await;
             }
         }
     });
@@ -814,245 +865,91 @@ where
 mod tests {
     use super::*;
 
-    /// **A cell's health may be spoken for by a member of that cell and by nobody else** — the binding the
-    /// federated covering was running without.
+    /// **A member speaks for its own seat, and one member cannot speak for the cell.**
     ///
-    /// `diagnose_children` localizes up to three faults to `(child, axis)` from these bytes, and a covering
-    /// designed to localize confidently mislocalizes confidently on forged input. The slot is keyed by
-    /// `(cell, epoch)` and not by a coordinate, which is why the rule its five sibling directories use — the
-    /// publisher is entitled to the slot's own point — does not reach here. What replaces it is the cell's
-    /// membership, derived from the plane by `fano::cell_members_of`.
+    /// The record used to be one byte at a `(cell, epoch)` slot, admitted from *any* member of the cell —
+    /// so seven writers raced for one slot and whoever wrote last was the cell's voice, while the covering
+    /// downstream localizes `(child, axis)` faults from that byte with `t = 3` confidence. Now each member
+    /// publishes its own reading at its own seat and the **reader** folds, per axis by majority.
     ///
-    /// **On `PG(2,4)`, because `PG(2,2)` cannot express the negative case.** The Fano plane is one cell, so
-    /// every node is a member of it and a refusal is unreachable — the doc says so and this fixture is what
-    /// makes that statement checkable rather than a hope. `PG(2,4)` has three cells of seven points.
-    ///
-    /// Asserted in both directions: a member's record opens, an outsider's is refused, and the unauthenticated
-    /// path still reads a bare byte — a change that refused everything would satisfy the middle assertion and
-    /// break the directory.
+    /// Both halves are asserted here because either alone is a hole: the binding without the fold lets one
+    /// member fill all seven seats, and the fold without the binding folds one identity's seven opinions.
     #[test]
-    fn a_cells_health_is_spoken_for_by_a_member_of_that_cell_and_refused_from_anyone_else() {
+    fn a_member_speaks_for_its_own_seat_and_a_minority_cannot_accuse_the_cell() {
         use fanos_field::F4;
-        use fanos_primitives::BeaconSeed;
         use fanos_vrf::{VrfSecret, probe_index_of, prove_coordinate_ranked};
 
         let (epoch, beacon, cell) = (Epoch::new(4), BeaconSeed::GENESIS, 1u32);
         let members = fano::cell_members_of::<F4>(cell as usize).expect("PG(2,4) splits into three cells");
         let report = Report { axes: 0b010_1101, bus_fault: true };
 
-        // Seal a record with `seed`'s identity, and say which of the cell's points its walk reaches.
         let sealed = |seed: u8| {
             let sk = VrfSecret::from_seed([seed; 32]);
             let id = format!("health-{seed}").into_bytes();
             let (_, proof, out) = prove_coordinate_ranked::<F4>(&sk, &id, epoch, &beacon);
-            let reaches = members
+            let reached: Vec<usize> = members
                 .coords()
                 .iter()
-                .any(|&c| fanos_geometry::Point::<F4>::new(c).and_then(|p| probe_index_of::<F4>(&out, &p)).is_some());
-            (Entitlement::encode(&id, &sk.public(), &proof, &[report.block()]), reaches, out)
+                .enumerate()
+                .filter(|&(_, &c)| {
+                    fanos_geometry::Point::<F4>::new(c)
+                        .and_then(|p| probe_index_of::<F4>(&out, &p))
+                        .is_some()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            (Entitlement::encode(&id, &sk.public(), &proof, &[report.block()]), reached)
         };
+        // Exactly one seat, which is the case where "its own seat" and "some seat of the cell" differ — and
+        // the walk is `q + 1 = 5` points of twenty-one against a cell of seven, so it is not a rare draw.
+        let (record, seats) = (0u8..=255)
+            .map(sealed)
+            .find(|(_, reached)| reached.len() == 1)
+            .expect("some identity reaches exactly one seat of this cell");
+        let mine = seats[0];
 
-        // A member: its walk reaches a point of the cell. A stranger: it reaches none. Both exist — the
-        // walk is `q + 1 = 5` of twenty-one points and the cell is seven, so neither is a rare draw.
-        let member = (0u8..=255).find_map(|s| { let (r, ok, _) = sealed(s); ok.then_some(r) });
-        let stranger = (0u8..=255).find_map(|s| { let (r, ok, _) = sealed(s); (!ok).then_some(r) });
-        let member = member.expect("some identity's walk reaches this cell — if none does, the fixture is wrong");
-        let stranger = stranger.expect("some identity's walk misses all seven — the negative case must exist");
-
-        assert!(
-            open_health::<F4>(&member, cell, epoch, Some(beacon)).is_some(),
-            "a member of the cell must be able to publish its health, or the directory refuses everyone and \
-             the covering has no input at all"
-        );
-        assert!(
-            open_health::<F4>(&stranger, cell, epoch, Some(beacon)).is_none(),
-            "an identity entitled to no point of this cell spoke for it — which is the forged input the \
-             Turyn covering localizes confidently and wrongly"
-        );
+        let own = members.coords().get(mine).copied().expect("the seat exists");
         assert_eq!(
-            open_health::<F4>(&member, cell, epoch, Some(beacon)).map(|r| (r.axes, r.bus_fault)),
+            open_health::<F4>(&record, own, epoch, Some(beacon)).map(|r| (r.axes, r.bus_fault)),
             Some((report.axes, report.bus_fault)),
-            "and the payload survives the envelope — an authenticated record that decodes to something else \
-             is a different defect wearing this one's clothes"
+            "a member could not publish at the seat it holds, so no cell can report at all — and the payload \
+             must survive the envelope, since an authenticated record decoding to something else is a \
+             different defect wearing this one's clothes"
         );
-
-        // The unauthenticated path is unchanged: `None` reads a bare byte, which is what a build with no
-        // self-certifying identity writes and what every existing caller drives.
-        assert_eq!(
-            open_health::<F4>(&[report.block()], cell, epoch, None).map(|r| r.axes),
-            Some(report.axes),
-            "the ungated path must still parse the bare byte"
-        );
-        // And an authenticated read of a bare byte is a refusal rather than a lenient parse: the record
-        // carries no entitlement, so there is nobody to have written it.
-        assert!(
-            open_health::<F4>(&[report.block()], cell, epoch, Some(beacon)).is_none(),
-            "a bare byte read under a beacon must be refused, or the envelope is optional in the direction \
-             that matters"
-        );
-    }
-
-    /// A `Notification::App` body carrying `msg` — the bytes the receive path actually sees.
-    ///
-    /// Built by encoding the production frame and unwrapping it with the production decoder, rather than by
-    /// hand-assembling `kind ‖ payload`: a hand-built body is a second spelling of the wire format, and the
-    /// two would drift with nothing to notice.
-    #[cfg(test)]
-    fn app_body(frame: &[u8]) -> Vec<u8> {
-        fanos_wire::decode_frame(frame).expect("a canonical App frame").0.body.to_vec()
-    }
-
-    /// **A parent's availability mask must be what reconstructed, not who answered** — and both ways it could
-    /// stop being that are cheap for a child cell to arrange.
-    ///
-    /// The mask decides whether a parent anchors a child's finality (`ChildRegistry::attest_available`), so a
-    /// mask that can be inflated is a parent vouching for a state whose data is withheld — the exact failure
-    /// the guard exists to prevent, arrived at through its evidence instead of around it.
-    ///
-    /// Four properties, and the third and fourth are the ones an implementation gets wrong:
-    ///
-    /// 1. the honest case concludes — enough shards from their own seats rebuild the payload and the mask
-    ///    names them;
-    /// 2. a **shard that arrives from the wrong seat** sets no bit, so one node cannot answer for seven (it
-    ///    can: `on_shard` falls back to `shard_of`, which regenerates any index from a held block);
-    /// 3. **bits set without a reconstruction are discarded** — a child that sends two shards and withholds
-    ///    the rest has told us nothing, and a mask of two bits is not "two shards are available", it is a
-    ///    sample that did not conclude;
-    /// 4. a skeleton for a **different block** is not adopted, because everything downstream is checked
-    ///    against its `da_commit` and adopting a foreign one moves the whole test to the attacker's block.
-    ///
-    /// Time is paused: each negative case is a deadline, and asserting four of them at `STORE_TIMEOUT` apiece
-    /// would cost twenty seconds of wall clock to learn nothing extra.
-    #[tokio::test(start_paused = true)]
-    async fn a_parents_availability_mask_is_what_reconstructed_and_not_who_answered() {
-        use fanos_code::lrc::is_recoverable_fano;
-        use fanos_field::F4;
-        use fanos_taxis::wire::to_frame;
-        use fanos_taxis::{Block, GENESIS_PARENT};
-
-        let block = Block::assemble(GENESIS_PARENT, 1, Epoch::new(3), 4, vec![]);
-        let (hash, skeleton, shards) = (block.hash(), block.skeleton(), block.da_shards());
-        let seats = fano::cell_members_of::<F4>(1).expect("PG(2,4) has three cells").coords();
-        let deliver = |i: usize| {
-            let msg = ShardMsg::Deliver { block: hash, index: i as u8, data: shards[i].clone() };
-            app_body(&shard_to_frame(&msg))
-        };
-
-        // ── 1. the honest case: shards from their own seats, and the sample concludes.
-        let (tx, mut rx) = broadcast::channel(32);
-        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
-        assert!(sampler.begin(skeleton.clone()), "a fresh sampler begins");
-        for i in 0..7 {
-            let _ = tx.send(Notification::App { from: seats[i], body: deliver(i) });
+        for (seat, &point) in members.coords().iter().enumerate() {
+            if seat != mine {
+                assert!(
+                    open_health::<F4>(&record, point, epoch, Some(beacon)).is_none(),
+                    "seat {seat} accepted a record entitled to seat {mine}: one member then fills all seven \
+                     and the majority below is a majority of one identity's opinions"
+                );
+            }
         }
-        let present = gather_shards(&mut rx, &mut sampler, &seats, hash).await;
-        assert!(
-            present.count_ones() >= 3 && is_recoverable_fano((!present) & 0x7F),
-            "the sample concluded, so its mask must be one `attest_available` accepts — got {present:#09b}"
-        );
 
-        // ── 2. every shard from the wrong seat: nothing is credited, so nothing reconstructs.
-        let (tx, mut rx) = broadcast::channel(32);
-        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
-        assert!(sampler.begin(skeleton.clone()));
-        for i in 0..7 {
-            let _ = tx.send(Notification::App { from: seats[(i + 1) % 7], body: deliver(i) });
-        }
+        // The fold. Axis 0 is set by one member of five, axis 1 by three — a minority cannot accuse, a
+        // majority can, and the boundary between them is the whole rule.
+        let say = |axes: u8| Report { axes, bus_fault: false };
+        let mixed = [say(0b01), say(0b10), say(0b10), say(0b10), say(0b00)];
         assert_eq!(
-            gather_shards(&mut rx, &mut sampler, &seats, hash).await,
-            0,
-            "a shard credited to the seat that did not send it lets one node answer for the whole cell"
+            fold_member_reports(&mixed).map(|r| r.axes),
+            Some(0b10),
+            "a single member set an axis of its own cell — which is exactly the injected coordinate \
+             `golay::Provenance` warns about: the decoder moves blame toward the nearest codeword rather \
+             than adding noise, so one member could accuse a healthy sibling"
         );
-
-        // ── 3. two honest shards and silence: bits were set, and they are not a conclusion.
-        let (tx, mut rx) = broadcast::channel(32);
-        let mut sampler = Sampler::new(NOT_A_CUSTODIAN);
-        assert!(sampler.begin(skeleton.clone()));
-        for i in 0..2 {
-            let _ = tx.send(Notification::App { from: seats[i], body: deliver(i) });
-        }
         assert_eq!(
-            gather_shards(&mut rx, &mut sampler, &seats, hash).await,
-            0,
-            "a mask survived a sample that never rebuilt the payload — presence was taken on the sender's word"
+            fold_member_reports(&[]),
+            None,
+            "an empty fold must be silence, not a clean block — seven silent children reading `Healthy` is \
+             the defect `ChildDiagnosis` counts separately"
         );
-
-        // ── 4. a skeleton for another block is not what the shards get checked against.
-        let other = Block::assemble([9u8; 32], 2, Epoch::new(3), 1, vec![]);
-        assert_ne!(other.hash(), hash, "the fixture needs two distinct blocks");
-        let (tx, mut rx) = broadcast::channel(32);
-        let _ = tx.send(Notification::App {
-            from: seats[0],
-            body: app_body(&to_frame(&ConsensusMsg::Propose(other.skeleton()))),
-        });
-        assert!(
-            await_skeleton(&mut rx, hash).await.is_none(),
-            "a seat answered `NeedSkeleton` with a different block and it was adopted"
-        );
-
-        // …and the same channel, given the right skeleton, does return it — so case 4 is a discrimination
-        // and not a helper that refuses everything.
-        let (tx, mut rx) = broadcast::channel(32);
-        let _ = tx.send(Notification::App {
-            from: seats[0],
-            body: app_body(&to_frame(&ConsensusMsg::Propose(skeleton.clone()))),
-        });
         assert_eq!(
-            await_skeleton(&mut rx, hash).await.map(|b| b.hash()),
-            Some(hash),
-            "the skeleton of the block being sampled must be adopted"
+            fold_member_reports(&[say(0b101)]).map(|r| r.axes),
+            Some(0b101),
+            "a cell of one answering member is its own majority; refusing there would make a single-member \
+             reading unreportable rather than uncorroborated"
         );
     }
-
-    /// **A parent that heard from nobody must not report its federation healthy.**
-    ///
-    /// `federation::Cell::Healthy` means *"no child reports a fault"*, and a child that published nothing
-    /// contributes a clean block — so seven silences decode to the strongest statement the covering can
-    /// make, produced from no evidence at all — an alarm that cannot fire, sitting under the Turyn covering the
-    /// whole cross-cell directory exists to feed.
-    ///
-    /// The clean block itself is **not** the defect and is deliberately kept: substituting a fabricated
-    /// "fully degraded" block for a silent child would move blame rather than add noise, because the Golay
-    /// decoder corrects toward the nearest codeword — `golay::Provenance`'s own note measures that at a
-    /// 24.9 % false-accusation rate. Silence is an erasure, this code has no erasure decoder, so the honest
-    /// place for it is beside the verdict.
-    ///
-    /// Both directions, because a `is_clean` that always refused would satisfy the first assertion alone.
-    #[test]
-    fn a_parent_that_heard_from_no_child_does_not_read_as_healthy() {
-        let heard_nobody = ChildDiagnosis::from_resolved(&[None; federation::CHILDREN]);
-        assert_eq!(
-            heard_nobody.verdict,
-            federation::Cell::Healthy,
-            "the covering itself is unchanged — it still decodes seven clean blocks to Healthy, and that is \
-             why the verdict alone cannot be the answer"
-        );
-        assert!(
-            !heard_nobody.is_clean(),
-            "seven children said nothing and the parent called its federation clean"
-        );
-
-        let all_well = [Some(Report::default()); federation::CHILDREN];
-        assert!(
-            ChildDiagnosis::from_resolved(&all_well).is_clean(),
-            "every child reported and none reports a fault — refusing this would make the guard useless \
-             rather than strict"
-        );
-        // One silent child is already enough: the covering carries `t = 3` faults, and a missing report is
-        // not one of them — it is a child the verdict says nothing about.
-        let mut one_quiet = all_well;
-        one_quiet[2] = None;
-        let one_quiet = ChildDiagnosis::from_resolved(&one_quiet);
-        assert_eq!(one_quiet.silent, 0b000_0100, "the silent bit must name the child that said nothing");
-        assert!(!one_quiet.is_clean(), "a single silent child must still deny a clean bill of health");
-        // And a reported fault is not laundered by everyone else being present.
-        let mut faulty = all_well;
-        faulty[2] = Some(Report { axes: 0b000_0001, bus_fault: false });
-        let faulty = ChildDiagnosis::from_resolved(&faulty);
-        assert_eq!(faulty.silent, 0, "nobody was silent here — the mask must not borrow the fault's bit");
-        assert!(!faulty.is_clean(), "a localized fault with nobody silent must not read clean either");
-    }
-
 
     /// **A seat key is admitted for THAT seat and for no other** — the binding a committee directory has to
     /// carry, and the one a cell-wide envelope cannot.
@@ -1130,15 +1027,18 @@ mod tests {
             base.starts_with(b"FANOS-v1/cell-committee/"),
             "the domain tag is what keeps this out of every other directory's key space"
         );
-        assert_ne!(base, health_slot(3, Epoch::new(7)), "committee and health slots collide");
+        assert_ne!(base, health_slot(3, 2, Epoch::new(7)), "committee and health slots collide");
     }
 
     #[test]
     fn health_slots_are_deterministic_distinct_and_domain_separated() {
-        let h = health_slot(3, Epoch::new(7));
-        assert_eq!(h, health_slot(3, Epoch::new(7)));
-        assert_ne!(h, health_slot(4, Epoch::new(7)), "distinct cell → distinct slot");
-        assert_ne!(h, health_slot(3, Epoch::new(8)), "distinct epoch → distinct slot");
+        let h = health_slot(3, 2, Epoch::new(7));
+        assert_eq!(h, health_slot(3, 2, Epoch::new(7)));
+        assert_ne!(h, health_slot(4, 2, Epoch::new(7)), "distinct cell → distinct slot");
+        // The axis the record gained when it stopped being one per cell: seven members, seven slots, and a
+        // collision here would put two members' readings on top of each other and fold one of them twice.
+        assert_ne!(h, health_slot(3, 5, Epoch::new(7)), "distinct seat → distinct slot");
+        assert_ne!(h, health_slot(3, 2, Epoch::new(8)), "distinct epoch → distinct slot");
         assert!(h.starts_with(b"FANOS-v1/cell-health/"));
         assert!(!h.starts_with(b"FANOS-v1/cell-checkpoint/"), "a distinct domain from its sibling directory");
     }

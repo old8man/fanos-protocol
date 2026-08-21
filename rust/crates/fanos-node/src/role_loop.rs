@@ -1729,6 +1729,9 @@ pub struct SelfOrganization {
     pub capability_publisher: JoinHandle<()>,
     /// Keeps the node's load report live each epoch.
     pub load_publisher: JoinHandle<()>,
+    /// Keeps this node's **cell health** reading live each epoch — its own `degraded` mask at its own seat,
+    /// which a parent cell folds with its six siblings' into the block the federated covering runs over.
+    pub health_publisher: JoinHandle<()>,
     /// Runs the assignment each epoch.
     pub role_loop: JoinHandle<()>,
     /// This node's currently-assigned roles.
@@ -1823,9 +1826,37 @@ pub fn spawn_self_organization<F: Field>(
     // cell-wide constant every node computes identically, which is what lets the scale need no agreement.
     let (load_publisher, load_ready) =
         spawn_load_publisher(client.clone(), load_source, prover.clone(), Plane::<F>::N);
+    // **This cell's health, published per member and folded by whoever reads it** (#167).
+    //
+    // The last of five reasons for leaving the cross-cell directories unwired was that a `(cell, epoch)` slot
+    // is one record for seven writers, so wiring it would have been a race whose winner spoke for the cell.
+    // The record is now per *seat*, entitled to that seat's coordinate, and `resolve_health` takes the
+    // majority per axis — no agreement to reach, and a minority cannot accuse.
+    //
+    // The reading is this node's own `degraded` mask, which is exactly `golay::Report::axes`: the same
+    // 7-bit degraded-axis vector DIAKRISIS carries everywhere. It comes off the liveness watch the role loop
+    // already runs, so no second observer and no second window.
+    let sensed = spawn_liveness_watch(&client);
+    let health = move || {
+        // `None` before the first observation lands — a node that has not measured its cell yet reports a
+        // clean block rather than inventing faults, which is the same direction `resolve_health` takes for a
+        // missing record. Silence and health are told apart by the *count* of answering members, not here.
+        sensed.borrow().map_or(
+            fanos_code::golay::Report { axes: 0, bus_fault: false },
+            |(_, degraded, _)| fanos_code::golay::Report {
+                axes: degraded & 0x7F,
+                bus_fault: false,
+            },
+        )
+    };
+    let health_publisher = crate::crosscell_dir::spawn_health_publisher::<F>(
+        client.clone(),
+        health,
+        prover.clone(),
+    );
     let (role_loop, assigned) =
         spawn_role_loop::<F>(client, node_id, controller, capacity, (capability_ready, load_ready), peers, assigned, prover);
-    SelfOrganization { capability_publisher, load_publisher, role_loop, assigned }
+    SelfOrganization { capability_publisher, load_publisher, health_publisher, role_loop, assigned }
 }
 
 #[cfg(test)]
@@ -2005,6 +2036,7 @@ mod tests {
         let org = SelfOrganization {
             capability_publisher: tokio::spawn(async {}),
             load_publisher: tokio::spawn(async {}),
+            health_publisher: tokio::spawn(async {}),
             role_loop: tokio::spawn(async {}),
             assigned: rx,
         };
