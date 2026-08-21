@@ -44,7 +44,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use fanos_field::Field;
-use fanos_geometry::{Plane, Point};
+use alloc::collections::BTreeMap;
+use fanos_geometry::{Plane, Point, Triple};
 use fanos_primitives::hash::label;
 use fanos_primitives::{BeaconSeed, Epoch, map_to_point};
 use vrf_r255::{Proof, PublicKey, SecretKey};
@@ -510,6 +511,92 @@ pub fn settle_index<F: Field>(
     })
 }
 
+/// The point each node **holds** under deferred acceptance over a whole claim set — [`settle_index`] with the
+/// phantom yield removed, and nothing else changed.
+///
+/// [`settle_index`] honours a contender's claim to `p` whether or not that contender ends up on `p`, so a node seated
+/// at index 0 still displaces everyone from the points further along its own walk. This honours a claim only where its
+/// holder is the one sitting there. Same walks, same [`claim_beats`] order; the difference is which claims count.
+///
+/// # What the difference is worth, measured
+///
+/// | plane, load | [`settle_index`] clears the floor | this | a maximum matching |
+/// |---|---|---|---|
+/// | `PG(2,2)`, `n = N` | 32.7 % | **80.5 %** | 99.1 % |
+/// | `PG(2,4)`, `n = 1.5N` | 7.5 % | **97.5 %** | 100.0 % |
+///
+/// and on the **partial** views a live cell holds, `PG(2,4)` at `n = 31` with half the claims seen: 9.3 % against
+/// **40.3 %** (`examples/line_confinement_coverage.rs`, `examples/partial_knowledge_placement.rs`). The third column is
+/// what line confinement alone permits, so the geometry is a 1-in-100 obstacle and this rule is most of the rest.
+///
+/// # The three properties [`settle_index`] is documented for, and which survive
+///
+/// * **One-shot** — *survives, in a weaker form.* This is a pure function of the claim set, so every holder of the same
+///   set computes the same assignment and no iteration or arrival order is involved. What it is not is a function of
+///   one point at a time: a caller must hold the set, not an oracle.
+/// * **Injective** — *survives by construction.* The result is keyed by point.
+/// * **Monotone in information** — *survives, and it is a theorem rather than a hope.* Gale–Shapley's comparative
+///   static says adding an agent to the **proposing** side weakly worsens every other proposer, and a node's
+///   preference order is its walk order, so a node that learns of a new peer moves at the same index or further along,
+///   never back. Measured at **zero** backward moves over ≈ 30 000 draws in twelve configurations
+///   (`examples/partial_knowledge_placement.rs`), against up to 13.68 forward moves per trial.
+///
+/// # What it costs
+///
+/// A seat is certified by a witness **tree** rather than a flat list: the holder of each skipped point justifies its
+/// own seat the same way. The recursion terminates because a witness beats the claimant at the contested point, so its
+/// own settled index is *strictly below* the claimant's — depth `≤ q`, size `≤ 2^k − 1`. Measured, the mean per seated
+/// node goes from `0.311` to `0.316` on `PG(2,2)` at `n = N` (`examples/deferred_certificate_size.rs`). The one real
+/// price is transient: about a fifth more doubly-held points while views disagree.
+///
+/// Returns `point → (the holder's probe index, its position in `claims`)`. A node absent from the values is one every
+/// point of whose line is better held — the same "not seated at all" [`settle_index`] answers with `None`.
+#[must_use]
+pub fn deferred_assignment<F: Field>(claims: &[VrfOutput]) -> BTreeMap<Triple, (u16, usize)> {
+    let bound = probe_bound::<F>();
+    let mut held: BTreeMap<Triple, (u16, usize)> = BTreeMap::new();
+    let mut next: Vec<u16> = vec![0; claims.len()];
+    // Proposers with no offer outstanding. A node displaced from a point returns here, which is the whole of what
+    // distinguishes this from the one-shot rule: a claim that loses is re-made further along instead of standing.
+    let mut free: Vec<usize> = (0..claims.len()).collect();
+    while let Some(i) = free.pop() {
+        let Some(mine) = claims.get(i) else { continue };
+        while let Some(slot) = next.get_mut(i) {
+            let k = *slot;
+            if k >= bound {
+                break; // every point of this node's line is held by a better claim
+            }
+            *slot = k.saturating_add(1);
+            let p = probe_point::<F>(mine, k).coords();
+            match held.get(&p).copied() {
+                None => {
+                    held.insert(p, (k, i));
+                    break;
+                }
+                Some((their_k, them)) => {
+                    let Some(theirs) = claims.get(them) else { break };
+                    if claim_beats((k, mine), (their_k, theirs)) {
+                        held.insert(p, (k, i));
+                        free.push(them);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    held
+}
+
+/// Where the node at position `me` in `claims` settles under [`deferred_assignment`], or `None` if it is not seated.
+///
+/// The counterpart of [`settle_index`] for the deferred rule, and the shape of the difference is visible in the
+/// signature: this one takes the *set*, because a node's seat under deferred acceptance is a fact about the whole
+/// assignment and cannot be read one contended point at a time.
+#[must_use]
+pub fn deferred_index<F: Field>(me: usize, claims: &[VrfOutput]) -> Option<u16> {
+    deferred_assignment::<F>(claims).into_values().find_map(|(k, i)| (i == me).then_some(k))
+}
+
 /// One step of a [`CoordinateClaim`]'s justification: the node whose *preference* forced the claimant off one of its
 /// earlier probe points.
 ///
@@ -797,7 +884,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use fanos_field::{F7, F31};
+    use fanos_field::{F2, F7, F31};
 
     /// Seating is not free, and the cost falls as the plane grows.
     ///
@@ -1434,5 +1521,149 @@ mod tests {
             VrfPublic::from_bytes(pk.to_bytes()).unwrap().to_bytes(),
             pk.to_bytes()
         );
+    }
+
+    // ---- the deferred rule ------------------------------------------------------------------------------
+
+    /// A draw of `n` real VRF outputs, the same shape the placement examples use — real outputs rather than
+    /// sampled points, because the walk's line and stride are derived from the output and a model that
+    /// skipped that would be exercising a different mechanism.
+    ///
+    /// **Every test below runs on `F2`, the shipped plane, and the first draft ran them on `F7`.** That was
+    /// 16 nodes on 57 points — load 0.28, almost no contention — and two of the four tests stayed GREEN with
+    /// the arbitration deliberately broken to first-come-first-served, because at that load the order never
+    /// decides anything. A rule about who yields to whom cannot be tested where nobody has to yield.
+    fn draw(tag: &str, n: usize) -> Vec<VrfOutput> {
+        let (epoch, beacon) = (Epoch::new(9), BeaconSeed::GENESIS);
+        (0..n)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                for (slot, byte) in seed.iter_mut().zip(tag.as_bytes()).take(24) {
+                    *slot = *byte;
+                }
+                for (slot, byte) in seed.iter_mut().skip(24).zip((i as u64).to_le_bytes()) {
+                    *slot = byte;
+                }
+                let sk = VrfSecret::from_seed(seed);
+                let id = alloc::format!("{tag}-{i}").into_bytes();
+                sk.prove(&beacon_alpha(&id, epoch, &beacon)).1
+            })
+            .collect()
+    }
+
+    /// The one-shot rule's occupancy on the same draw, at complete knowledge — the thing the deferred rule
+    /// is compared against. Written out rather than imported because `settle_index` takes an oracle and
+    /// this is the oracle a directory with every HELLO would offer.
+    fn shipping_points<F: Field>(claims: &[VrfOutput]) -> alloc::collections::BTreeSet<Triple> {
+        let mut on = alloc::collections::BTreeSet::new();
+        for (i, mine) in claims.iter().enumerate() {
+            let best = |p: &Point<F>| {
+                claims
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| j != i)
+                    .filter_map(|(_, o)| probe_index_of::<F>(o, p).map(|k| (k, *o)))
+                    .reduce(|a, b| if claim_beats((b.0, &b.1), (a.0, &a.1)) { b } else { a })
+            };
+            if let Some(k) = settle_index::<F>(mine, best) {
+                on.insert(probe_point::<F>(mine, k).coords());
+            }
+        }
+        on
+    }
+
+    /// **Injective, and every seat is on the holder's own walk.** The first half is by construction (the map
+    /// is keyed by point) so what this really checks is the second: that the value's index really does name
+    /// the key, which is the invariant every caller of [`deferred_assignment`] relies on to turn a seat back
+    /// into a coordinate.
+    ///
+    /// Falsified by filing a seat under `probe_point(mine, k + 1)`: red here, at `the seat must be the
+    /// holder's k-th point`.
+    #[test]
+    fn every_deferred_seat_names_the_point_it_is_filed_under() {
+        for n in [1usize, 2, 7, 16] {
+            let claims = draw("seat", n);
+            let held = deferred_assignment::<F2>(&claims);
+            let mut seen: Vec<usize> = Vec::new();
+            for (point, &(k, i)) in &held {
+                let Some(o) = claims.get(i) else { unreachable!("holder is a position in claims") };
+                assert_eq!(&probe_point::<F2>(o, k).coords(), point, "the seat must be the holder's k-th point");
+                assert!(!seen.contains(&i), "a node held two points at n={n}");
+                seen.push(i);
+            }
+            assert!(held.len() <= n, "n={n}: more seats than nodes");
+        }
+    }
+
+    /// **Order-independent**, which is what makes this a rule rather than a race. Gale–Shapley's
+    /// proposer-optimal matching is unique, so rotating the claim set must return the same seats — and the
+    /// implementation pops proposers off a stack, so the rotation genuinely changes the proposal order.
+    ///
+    /// Falsified by making a point keep whoever proposed *first* (`if false && claim_beats(..)`): red here.
+    /// It was **green** under that same break while these tests ran on `F7` — see the note on [`draw`].
+    #[test]
+    fn a_rotated_claim_set_settles_the_same_nodes_on_the_same_points() {
+        let claims = draw("rotate", 16);
+        let straight = deferred_assignment::<F2>(&claims);
+        let mut rotated: Vec<VrfOutput> = claims.iter().skip(5).copied().collect();
+        rotated.extend(claims.iter().take(5).copied());
+        let other = deferred_assignment::<F2>(&rotated);
+        // Compare by (point, holder's OUTPUT), since the position of a node in the slice has moved.
+        let key = |m: &BTreeMap<Triple, (u16, usize)>, src: &[VrfOutput]| -> Vec<(Triple, VrfOutput, u16)> {
+            let mut v: Vec<_> = m.iter().filter_map(|(p, &(k, i))| src.get(i).map(|o| (*p, *o, k))).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(key(&straight, &claims), key(&other, &rotated), "the assignment depends on the proposal order");
+    }
+
+    /// **Monotone in information — the property this rule was wrongly said to give up.** Gale–Shapley's
+    /// comparative static: adding an agent to the *proposing* side weakly worsens every other proposer, and
+    /// a node's preference order is its walk order, so a node that learns of more peers settles at the same
+    /// index or further along, never back.
+    ///
+    /// Unseated is the worst outcome, so it sorts after every index — a node that had a seat on the small
+    /// view and loses it on the large one is still moving forward, and a node that GAINS one would be moving
+    /// back.
+    ///
+    /// **What it actually guards, established by falsifying it four ways.** It is green under
+    /// first-come-first-served, under "the point keeps the *worse* claim", and under "the displaced node
+    /// never re-proposes" — none of those can move a node back. It goes red under a **non-transitive**
+    /// order (`(k < their_k) ^ outranks(..)`), at `node 0 moved back from 0 to 1 when the view grew to 4`.
+    /// So the property does not rest on this rule's particular ordering; it rests on [`claim_beats`] being a
+    /// *total* one. If a node A rejects us at `p` and a new node B displaces A, transitivity says B rejects
+    /// us too — which is the whole proof, and this test is its regression guard.
+    #[test]
+    fn learning_of_more_peers_never_moves_a_node_back_along_its_walk() {
+        let claims = draw("monotone", 16);
+        let rank = |k: Option<u16>| k.map_or(u32::MAX, u32::from);
+        for m in 1..=claims.len() {
+            let Some(view) = claims.get(..m) else { unreachable!("m <= len") };
+            let small = rank(deferred_index::<F2>(0, view));
+            let large = rank(deferred_index::<F2>(0, &claims));
+            assert!(large >= small, "node 0 moved back from {large} to {small} when the view grew to {m}");
+        }
+    }
+
+    /// **The two rules differ, and they differ in the direction the measurement says.** `settle_index` lets a
+    /// contender block a point it does not take; this seats a node there instead. Asserted as a `>=` on every
+    /// draw plus at least one strict win, because "never worse" without "sometimes better" is what a rule that
+    /// silently degraded to the old one would also satisfy.
+    ///
+    /// Falsified by dropping `free.push(them)`, so a displaced node never re-proposes and the rule collapses
+    /// towards the one-shot one: red here, at the `>=`.
+    #[test]
+    fn the_deferred_rule_seats_at_least_as_many_and_sometimes_more() {
+        let mut strict = 0;
+        for t in 0..40 {
+            let claims = draw(&alloc::format!("phantom{t}"), 7);
+            let ship = shipping_points::<F2>(&claims).len();
+            let deferred = deferred_assignment::<F2>(&claims).len();
+            assert!(deferred >= ship, "draw {t}: deferred seated {deferred} against the one-shot rule's {ship}");
+            if deferred > ship {
+                strict += 1;
+            }
+        }
+        assert!(strict > 0, "the two rules agreed on all 40 draws — this one is not removing the phantom yield");
     }
 }
