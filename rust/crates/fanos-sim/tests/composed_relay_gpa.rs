@@ -448,25 +448,81 @@ fn the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay() {
 ///
 /// The test above shows the heartbeat dominates the tape. Dominance still leaves room for the relay to
 /// contribute something, and "dominated by" is a weaker claim than the measurement supports. This runs the
-/// identical span with the drive removed — no sealed onions, no forwarding, nothing through
-/// `forward_send`:
+/// identical span with the drive removed — no sealed onions, no forwarding, nothing through `forward_send`
+/// — and then re-runs it at **ten times the cargo**, because one dose cannot tell a small real effect from
+/// a tolerance fitted to one sighting of it.
+///
+/// # The tolerance is measured now, and the first one was chosen
+///
+/// The original guard was `|Δ| < 0.01`, picked because the two staggered arms then read `−0.0038` and
+/// `−0.0067`. That is a constant fitted to a single sample of a noisy statistic, and 146 commits of overlay
+/// work later the same arms read `+0.0045` and `−0.0112`: the property held, the fitted line did not, and
+/// the suite went red for a figure that had moved by one part in seventy. [[the-guard-becomes-the-defect]].
+///
+/// What replaces it has no free parameter. Deleting a fraction `f` of the observations cannot move a
+/// *normalized second moment* of them by more than `f`, to first order — so the guard is
 ///
 /// ```text
-///                     with cargo   with NO cargo   the relay's whole contribution
-///   synchronised        1.000000        1.000000                          0.000000
-///   staggered  71 ms    0.767467        0.771255                         −0.003788
-///   staggered 149 ms    0.750058        0.756731                         −0.006673
+///   |r(with cargo) − r(without)|  ≤  cargo frames / tape frames
 /// ```
 ///
-/// So the number is not *mostly* about something else; deleting the entire subject moves it by at most
-/// `0.007`, and at a synchronised start by nothing at all. That is the strongest available statement that a
-/// measurement says nothing about its subject, and it is cheap, because removing the stimulus is always a
-/// legal experiment.
+/// with both sides measured in this same run. It tightens by itself as the heartbeat's share of the tape
+/// grows, which is the direction a guard should move.
 ///
-/// **Note the sign.** Without cargo `r` goes *up*. The relay's traffic is a small aperiodic perturbation on
-/// a periodic signal's self-correlation, so its only effect on this observable is to *decorrelate* it
-/// slightly — the opposite direction from a leak. Any reading of these figures as "the relay leaks" has the
-/// sign backwards as well as the subject wrong.
+/// # The dose sweep behind it
+///
+/// Measured 2026-08-21, `BIN = 100 ms`, one run per cell (the sim is deterministic — three runs, one inside
+/// a fully loaded workspace sweep, returned byte-identical figures):
+///
+/// ```text
+///                      cargo    tape       f          r           Δ      Δ/f
+///   synchronised
+///     quiet                0    4872              1.000000
+///     ×1                 100    4972    0.020     1.000000    0.000000   0.00
+///     ×10                995    5867    0.170     1.000000    0.000000   0.00
+///     ×80               2833    7705    0.368     1.000000    0.000000   0.00
+///   staggered  71 ms
+///     quiet                0    4886              0.747573
+///     ×1                 100    4986    0.020     0.752080   +0.004507   0.22
+///     ×10               1000    5886    0.170     0.695416   −0.052157   0.31
+///     ×80               2823    7709    0.366     0.773762   +0.026189   0.07
+///   staggered 149 ms
+///     quiet                0    4931              0.754543
+///     ×1                 100    5031    0.020     0.743389   −0.011154   0.56
+///     ×10                995    5926    0.168     0.748066   −0.006477   0.04
+///     ×80               2823    7754    0.364     0.781607   +0.027064   0.07
+/// ```
+///
+/// `Δ/f` never reaches `1` and does not grow with the dose — quadrupling the cargo from `×20` to `×80`
+/// *lowers* it. The tightest reading is `0.56`, at the shipping dose, so the guard sits `1.8×` above the
+/// worst measurement rather than on top of it. The sweep runs `×1` and `×10`; `×80` is recorded here
+/// because it is the evidence that the bound is the right *shape* and not another fitted number.
+///
+/// # Falsified, and it fires on the property it is about
+///
+/// `drive`'s send pattern is *deliberately aperiodic* — its own comment says so, and until now nothing
+/// checked it. Replacing the ten aperiodic send times with ten evenly spaced ones, **same 100 frames of
+/// 4986, same 2 % dose**, moves the 71 ms arm from `0.7476` to `0.8020`: `0.0544`, or **2.71 f**, and this
+/// guard fails at its own assertion with the message above. Aperiodic cargo at the same dose reads `0.56 f`.
+///
+/// So the bound is not merely arithmetic that happens to hold — it discriminates on exactly the thing that
+/// distinguishes a perturbation from a leak, which is whether the deleted frames carried correlated
+/// structure. The old `|Δ| < 0.01` would have caught this too, but by a fitted number rather than by the
+/// property, and it had already begun failing on figures that carried no structure at all.
+///
+/// # The synchronised arm is not the weak case, it is the strongest one
+///
+/// At a synchronised start the two arms return **the same float** — bit for bit, asserted as such — and
+/// they keep returning it at every dose up to `2833 of 7705 frames`, **37 % of the tape**. An observable
+/// that does not move when 37 % of its input is deleted is not measuring that input, and saying so needs no
+/// tolerance at all.
+///
+/// **Note the sign.** Without cargo `r` goes *up* at the shipping dose. The relay's traffic is a small
+/// aperiodic perturbation on a periodic signal's self-correlation, so its only effect on this observable is
+/// to *decorrelate* it slightly — the opposite direction from a leak. The sign is also not stable across
+/// arms (`+0.0045` at 71 ms against `−0.0112` at 149 ms), which is what an effect indistinguishable from
+/// zero looks like and what a leak never looks like. Any reading of these figures as "the relay leaks" has
+/// the sign backwards as well as the subject wrong.
 ///
 /// **What the residual is.** `fanos_testkit::gpa`'s own doc warns that a periodic signal correlates with its
 /// own shifts at a value the period fixes, which is why `drive` is deliberately aperiodic. The heartbeat is
@@ -477,16 +533,44 @@ fn the_figures_above_are_dominated_by_the_overlay_heartbeat_not_by_the_relay() {
 #[test]
 fn the_gpa_figure_does_not_move_when_the_relay_carries_nothing() {
     const BIN: u64 = 100;
+    // The shipping drive, and ten times it. See the doc: one dose cannot separate a bounded response from
+    // a fitted tolerance, and the ratio `Δ/f` is only a dose-response statement if there are two doses.
+    const DOSES: [usize; 2] = [1, 10];
     for (label, stagger) in [("synchronised", 0u64), ("staggered 71 ms", 71), ("staggered 149 ms", 149)] {
-        let (_, with_cargo) = tape_correlation_full(Duration(0), Duration(0), BIN, true, true, stagger);
-        let (_, no_cargo) = tape_correlation_full(Duration(0), Duration(0), BIN, true, false, stagger);
-        println!("{label}: r with cargo {with_cargo:.6}, with none {no_cargo:.6}");
-        assert!(
-            (with_cargo - no_cargo).abs() < 0.01,
-            "the whole point is that these are the same number: {with_cargo:.6} vs {no_cargo:.6}. If they \
-             have separated, the relay's traffic now reaches this observable and every figure in \
-             DEFAULT_COVER_INTERVAL's entry can be re-read as being about the relay."
-        );
+        let ((quiet_frames, _), no_cargo) =
+            tape_correlation_full(Duration(0), Duration(0), BIN, true, false, stagger);
+        for dose in DOSES {
+            let ((frames, _), with_cargo) =
+                tape_correlation_dense(Duration(0), Duration(0), BIN, true, true, stagger, dose);
+            let cargo = frames.saturating_sub(quiet_frames);
+            let share = cargo as f64 / frames as f64;
+            let moved = (with_cargo - no_cargo).abs();
+            println!(
+                "{label} x{dose}: cargo {cargo} of {frames} (f {share:.4}), r {with_cargo:.6} vs \
+                 {no_cargo:.6}, moved {moved:.6} = {:.2} f",
+                moved / share
+            );
+            assert!(
+                moved <= share,
+                "{label} x{dose}: deleting {cargo} of {frames} frames — a fraction {share:.4} of the tape \
+                 — moved this figure by {moved:.6}, MORE than the fraction deleted. A normalized second \
+                 moment cannot do that unless the deleted frames carried the correlation, so the relay's \
+                 traffic now reaches this observable and every figure in DEFAULT_COVER_INTERVAL's entry \
+                 can be re-read as being about the relay."
+            );
+            if stagger == 0 {
+                // Bit-for-bit, deliberately: at a synchronised start the heartbeat saturates the figure at
+                // 1.0, and the two arms do not merely agree to some tolerance — they return the same float.
+                // A comparison on the bits says that without inviting a lint about comparing floats.
+                assert_eq!(
+                    with_cargo.to_bits(),
+                    no_cargo.to_bits(),
+                    "a synchronised start saturates this figure; {cargo} cargo frames of {frames} changed \
+                     it from {no_cargo:.6} to {with_cargo:.6}, so it is no longer saturated and the \
+                     staggered arms' periodicity floor needs re-deriving"
+                );
+            }
+        }
     }
 }
 
@@ -580,3 +664,4 @@ fn on_its_own_traffic_the_mix_delay_buys_as_much_as_the_cover() {
         plain - cover
     );
 }
+
