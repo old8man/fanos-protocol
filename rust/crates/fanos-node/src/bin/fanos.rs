@@ -3801,6 +3801,30 @@ async fn cmd_term(_args: &[String]) -> Result<(), NodeError> {
 /// blockchain validator — the caller that closes the "`spawn_taxis` has no prod caller" production gap. It
 /// seats a node at its consensus point `Point::at(me)` (a production fixed-coordinate node — `spawn_pinned`'s
 /// grind, so the coordinate is *chosen*, not VRF-accepted, which the Fano-cell BFT structure requires), wires
+/// Publish this validator's verifying key at its seat in the cell committee directory (#167).
+///
+/// **The consumer is a parent cell, not this one.** A validator's own committee arrives by configuration, so
+/// nothing here is discovering what this node already knows; what has no configuration is a *child's*
+/// committee, and `ChildRegistry::attest_available` resolves one before it verifies anything and refuses an
+/// unregistered child outright. Without this a parent can address its children, authenticate their health and
+/// sample their data, and still not check one signature on their certificates.
+///
+/// Taken from `params.verifiers[me]` rather than re-derived from the seed: that is this node's own entry in
+/// the committee it was configured with, so the key it publishes and the key its peers check its votes
+/// against cannot drift. A validator whose index names no entry publishes nothing, which is the same refusal
+/// `consensus.seat_index_mismatch` records one layer down.
+fn publish_this_seats_key<S>(node: &fanos_quic::NodeHandle, params: &fanos_node::TaxisParams<S>) {
+    if let Some(mine) = params.verifiers.get(usize::from(params.me)).cloned() {
+        // The handle is deliberately dropped: this publisher lives as long as the process, exactly like the
+        // capability and load publishers the role loop spawns, and there is nothing to await it for.
+        drop(fanos_node::crosscell_dir::spawn_seat_key_publisher::<F2>(
+            node.client(),
+            mine,
+            node.coordinate_prover(),
+        ));
+    }
+}
+
 /// the other validators' coordinates→sockets from `--bootstrap`, and runs the sans-I/O consensus engine over
 /// the DROMOS hybrid ledger (`spawn_taxis`). Provision a cell with `fanos taxis-deal`.
 #[cfg(feature = "validator")]
@@ -3872,6 +3896,15 @@ async fn cmd_validator(args: &[String]) -> Result<(), NodeError> {
     let params = config
         .to_taxis_params(Some(data_dir_for(args)?))
         .ok_or_else(|| NodeError::Config("the validator config carries a malformed verifier".to_owned()))?;
+    // **This validator's verifying key, in its cell's committee directory** (#167). Its own committee comes
+    // from configuration, so this publishes nothing this cell needs — it publishes what a *parent* cell
+    // cannot configure: `ChildRegistry::attest_available` resolves a child's committee before it verifies
+    // anything and refuses an unregistered child outright, so without this a parent can address its children,
+    // authenticate their health and sample their data, and still not check one signature.
+    //
+    // Taken from `params` rather than re-derived: `verifiers[me]` is this node's own entry in the committee it
+    // was configured with, so the key it publishes and the key its peers check its votes against cannot drift.
+    publish_this_seats_key(&node, &params);
     let handle = spawn_taxis::<F2, HybridLedger>(node.client(), params);
     let mut events = handle.subscribe();
 

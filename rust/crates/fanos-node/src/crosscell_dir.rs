@@ -469,6 +469,57 @@ pub async fn publish_seat_key<F: Field>(
     crate::note_publish(client, crate::Directory::Health, epoch, landed)
 }
 
+/// Keep this validator's **consensus verifying key** live in its cell's committee directory: publish it at
+/// this node's seat on every epoch boundary.
+///
+/// **The consumer is a parent cell, not this one.** A validator's own committee arrives by configuration
+/// (`taxis_config`'s `verifiers`), so nothing here is discovering what it already knows; what has no
+/// configuration is a *child's* committee, which is exactly what `ChildRegistry::attest_available` needs and
+/// refuses to proceed without. This publisher is the half that makes [`resolve_committee`] answerable.
+///
+/// Both the cell and the seat are re-derived at every boundary from the coordinate this node holds *then*.
+/// The beacon re-draws it, and the record is bound to the seat's coordinate — so a seat captured at spawn is
+/// a record nobody can open.
+///
+/// **A node with no coordinate prover publishes nothing, and that is the fail-closed direction.**
+/// [`publish_seat_key`] has no unentitled form: a committee key with no proof of who wrote it is precisely
+/// the input the envelope exists to refuse, and a parent that accepted one would check every certificate
+/// against keys chosen by whoever wrote last.
+#[must_use]
+pub fn spawn_seat_key_publisher<F: Field>(
+    client: Client,
+    verifier: HybridVerifier,
+    prover: Option<fanos_quic::CoordinateProver>,
+) -> JoinHandle<()> {
+    let supervised = client.clone();
+    let task = tokio::spawn(async move {
+        let Some(prove) = prover else {
+            return; // no proof to offer, and this directory admits nothing else
+        };
+        let mut beacons = client.beacons();
+        let mut epoch = Epoch::ZERO;
+        let mut seed = client.genesis();
+        let seat_now = |client: &Client| {
+            let coord = client.address();
+            let cell = fanos_geometry::Point::<F>::new(coord).and_then(fano::cell_of::<F>)?;
+            let members = fano::cell_members_of::<F>(cell)?;
+            let seat = members.coords().iter().position(|&m| m == coord)?;
+            Some((cell, seat))
+        };
+        if let Some((cell, seat)) = seat_now(&client) {
+            publish_seat_key::<F>(&client, cell as u32, seat, epoch, &verifier, &prove(epoch, &seed)).await;
+        }
+        while let Some((e, s)) = crate::next_epoch(&mut beacons, epoch).await {
+            epoch = e;
+            seed = s;
+            if let Some((cell, seat)) = seat_now(&client) {
+                publish_seat_key::<F>(&client, cell as u32, seat, epoch, &verifier, &prove(epoch, &seed)).await;
+            }
+        }
+    });
+    crate::supervise::supervise(crate::supervise::NodeActor::HealthPublisher, &supervised, task)
+}
+
 /// Assemble `cell`'s committee for `epoch` from its seven seat slots, or `None` if any seat is missing.
 ///
 /// **Complete or nothing, and that is a property of `ChildCommittee` rather than a policy choice.** Its
