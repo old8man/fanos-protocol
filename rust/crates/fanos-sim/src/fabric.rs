@@ -3159,10 +3159,11 @@ mod tests {
     ///   needs **6 of 7** points occupied and consensus **5 of 7** (`CellParams::FANO` quorum over the
     ///   point count), so on this plane a single doubly-held point is one step from switching the mixnet
     ///   off and two from stalling the chain. There is no margin to average over.
-    /// ⚠️ **The second load was 10 when every table below was measured, and the constant now says 16.**
-    /// `members_for_a_covered_plane` was corrected on 2026-08-19 (its `3/2` was applied to the point count
-    /// rather than to the coupon-collector expectation), so a fresh run of this fixture measures a *larger*
-    /// cell than the numbers recorded here and they are not comparable to it. Re-run before quoting.
+    ///
+    /// ⚠️ **The loads have changed twice since the tables below were measured.** It ran `n = 7` and `n = 10`
+    /// when they were taken, then `n = 7` and the sizing constant (16), and it now runs three — `N`,
+    /// `1.5 N` and the constant — over three draws each. Numbers recorded here against a two-load run are
+    /// not comparable to a fresh one; re-run before quoting.
     ///
     /// * `n = 7` (`n/N = 1.0`) and `n = 10` — the second **read from
     ///   `fanos_geometry::members_for_a_covered_plane`** rather than chosen, since a load factor picked by
@@ -3444,7 +3445,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "measurement — run with --ignored --nocapture"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a measurement whose body IS the scenario: three loads, three draws each, and one printed                   line per reading — splitting it would thread a dozen locals through a signature and hide                   which reading answers which question, which is the same judgement line 1611 records"
+    )]
     async fn measure_whether_the_shipped_fano_plane_stays_packed_across_a_boundary() {
+        /// Fleets per load — see the note on draws above: one draw cannot compare two builds.
+        const DRAWS: usize = 3;
+        /// Samples per draw at ten seconds apiece: 180 s, which is three boundaries at a 60 s period.
+        const TICKS: u32 = 18;
         use std::collections::{BTreeSet, HashSet};
         use fanos_field::F2;
         let roles = fanos_node::RoleSet {
@@ -3481,8 +3490,6 @@ mod tests {
         // **And the samples counted are the ones AFTER the first boundary**, which is the regime the question
         // is about. The joining phase is systematically better — nothing has committed, every node may still
         // walk — so including it makes a build look better the longer the fixture runs before the first turn.
-        const DRAWS: usize = 3;
-        const TICKS: u32 = 18; // 180 s at a 60 s period: three boundaries per draw
         for count in [n_points, 3 * n_points / 2, sized] {
             let mut load_total = (0usize, 0usize);
             let mut per_draw: Vec<(usize, usize)> = Vec::with_capacity(DRAWS);

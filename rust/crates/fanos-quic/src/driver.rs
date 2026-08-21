@@ -6544,9 +6544,7 @@ mod tests {
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
-            walk_after: None,
-            settle_floor: None,
-            rounds: 0, addressed: None, deep: Vec::new(),
+            walk_after: None, settle_floor: None, rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
@@ -6651,9 +6649,7 @@ mod tests {
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
-            walk_after: None,
-            settle_floor: None,
-            rounds: 0, addressed: None, deep: Vec::new(),
+            walk_after: None, settle_floor: None, rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // **The receiver is kept here**, unlike the neighbouring case: this one asserts what the

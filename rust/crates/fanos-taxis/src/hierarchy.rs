@@ -173,7 +173,9 @@ mod tests {
     fn name(k: usize) -> Vec<u8> {
         use fanos_field::F2;
         use fanos_geometry::{CellPath, HierAddr, Point};
-        CellPath::<F2>::under(HierAddr::root(Point::at(k)), 0).expect("PG(2,2) holds one cell per level").encode()
+        // `unwrap`, not `expect`: this module allows the first and not the second, and a fixture that
+        // cannot build the name it is about has nothing to assert either way.
+        CellPath::<F2>::under(HierAddr::root(Point::at(k)), 0).unwrap().encode()
     }
 
     /// A child committee of 7 validators (secrets kept for signing test certificates).
