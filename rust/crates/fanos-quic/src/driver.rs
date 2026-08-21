@@ -3532,11 +3532,19 @@ fn tell_engine_who_was_proved(t: &Transport, coord: Triple, conn: &Connection) {
         return;
     };
     let identity = identity_of(&cert);
+    // **The key, not only the name.** A digest identifies a peer and verifies nothing, so an engine holding
+    // only that can accept a frame from this peer *directly* and never one relayed on its behalf. The
+    // certificate this handshake just proved already commits to the peer's coordinate-VRF public key — the
+    // same key its coordinate is derived from — so handing it over costs one parse and turns "who is there"
+    // into "what to check a relayed frame against". `None` is a peer whose certificate carries no VRF key:
+    // its coordinate is not self-certifying, and its frames stay direct-only, which is the same guarantee it
+    // had before.
+    let vrf_public = crate::identity::vrf_public_from_cert(&cert).map(|k| k.to_bytes());
     let told = t.clone();
     tokio::spawn(async move {
         let _ = told
             .input_tx
-            .send(Input::Command(Command::PeerHandshaken { coord, identity }))
+            .send(Input::Command(Command::PeerHandshaken { coord, identity, vrf_public }))
             .await;
     });
 }

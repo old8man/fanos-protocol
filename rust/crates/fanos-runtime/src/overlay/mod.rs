@@ -1952,7 +1952,10 @@ impl<F: Field> Engine for OverlayNode<F> {
                 self.membership.descriptor_sig = sig;
                 Vec::new()
             }
-            Input::Command(Command::PeerHandshaken { coord, identity }) => {
+            // `vrf_public` is not this engine's business — it is the key a *sub-engine* checks a relayed
+            // frame against, and the overlay accepts nothing relayed. Ignored here rather than threaded
+            // through `on_peer_handshaken`, which would carry it to a place with nothing to do with it.
+            Input::Command(Command::PeerHandshaken { coord, identity, .. }) => {
                 self.on_peer_handshaken(now, coord, identity)
             }
             Input::Command(Command::Reseat { coord }) => self.on_reseat(coord),
@@ -2622,7 +2625,7 @@ mod tests {
         let id = [7u8; 32];
 
         assert!(!node.occupied_points().contains(&8), "nothing is known about that point yet");
-        let effects = node.step(Instant(1), Input::Command(Command::PeerHandshaken { coord: old, identity: id }));
+        let effects = node.step(Instant(1), Input::Command(Command::PeerHandshaken { coord: old, identity: id, vrf_public: None }));
         assert!(
             effects.iter().any(|e| matches!(
                 e,
@@ -2636,7 +2639,7 @@ mod tests {
         );
 
         // The same identity proving a different point has left the first one.
-        node.step(Instant(2), Input::Command(Command::PeerHandshaken { coord: new, identity: id }));
+        node.step(Instant(2), Input::Command(Command::PeerHandshaken { coord: new, identity: id, vrf_public: None }));
         assert!(node.occupied_points().contains(&12), "seated where it proved");
         assert!(
             !node.occupied_points().contains(&8),
@@ -2646,7 +2649,7 @@ mod tests {
         // Our own dial arriving back is not a peer.
         let me = node.coord.coords();
         let self_effects =
-            node.step(Instant(3), Input::Command(Command::PeerHandshaken { coord: me, identity: [9u8; 32] }));
+            node.step(Instant(3), Input::Command(Command::PeerHandshaken { coord: me, identity: [9u8; 32], vrf_public: None }));
         assert!(self_effects.is_empty(), "this node is not a peer of itself");
     }
 

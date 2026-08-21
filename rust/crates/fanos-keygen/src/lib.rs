@@ -69,6 +69,8 @@ use fanos_geometry::{Plane, Point, Triple};
 use fanos_ports::{Command, Duration, Effect, Engine, Input, Instant, Notification, TimerToken};
 use fanos_vrf::dkg::{self, Dealing, Participant};
 use fanos_vrf::vss::{self, DeterministicRng, VssCommitment, VssShare};
+use fanos_primitives::hash::hash_labeled;
+use fanos_vrf::{PROOF_LEN, VrfProof, VrfPublic, VrfSecret};
 use fanos_wire::{FrameType, decode_frame, encode_frame};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -199,6 +201,16 @@ pub struct DkgNode<F: Field> {
     confirmations: BTreeMap<u8, [u8; 32]>,
     /// `(agreed, heard)` once the confirm phase has closed — see [`DkgNode::agreement`].
     agreement: Option<(usize, usize)>,
+    /// The key this node signs its broadcast frames with, or `None` for a ceremony the host gave none —
+    /// which is every fixture predating signing, and why the unsigned envelope still parses.
+    signer: Option<VrfSecret>,
+    /// Participant index → the coordinate-VRF public key the **transport** proved for that index's
+    /// coordinate ([`Command::PeerHandshaken`]).
+    ///
+    /// A ceremony's roster names everyone and every participant dials every other at the start, so these
+    /// are established while all links are healthy — which is exactly what makes a link that fails *later*
+    /// recoverable by relay rather than fatal.
+    identities: BTreeMap<u8, VrfPublic>,
 }
 
 impl<F: Field> DkgNode<F> {
@@ -273,7 +285,34 @@ impl<F: Field> DkgNode<F> {
             context: [0u8; 32],
             confirmations: BTreeMap::new(),
             agreement: None,
+            signer: None,
+            identities: BTreeMap::new(),
         }
+    }
+
+    /// Sign this ceremony's broadcast frames with `secret`, so a frame that reaches a peer **by relay** is
+    /// still attributable to its author.
+    ///
+    /// **This is the repair [`DkgNode::broadcast_to_peers`] recommends, and the key comes from the
+    /// transport.** `DkgCommit`, `DkgComplaint` and `DkgConfirm` are otherwise accepted only *direct from
+    /// their author* — the transport authenticates `from` and nothing else does — so a censored link between
+    /// two participants cannot be routed around and the ceremony forks into two `QUAL` sets the confirm
+    /// round can detect but not repair. With a signature the flood is sound and a relayed frame is
+    /// admissible.
+    ///
+    /// **A VRF proof rather than a hybrid signature, and that is a size decision with a security argument
+    /// under it.** The proof costs `PROOF_LEN` bytes against 3373 for a hybrid signature, and it needs no new
+    /// key material or trust root: the key it verifies under is the one the node's *coordinate* is derived
+    /// from, which its certificate already commits to and which the transport proves at every handshake
+    /// (`Command::PeerHandshaken::vrf_public`). An ECVRF proof is an unforgeable signature over its input.
+    ///
+    /// Optional because a ceremony run over a fixture transport has no identity to offer: a receiver holding
+    /// no key for an index falls back to the direct-only rule, which is precisely the guarantee it had
+    /// before this existed.
+    #[must_use]
+    pub fn with_identity(mut self, secret: VrfSecret) -> Self {
+        self.signer = Some(secret);
+        self
     }
 
     /// Bind this ceremony to a caller-chosen **context**, folded into the agreement digest of step 5.
@@ -347,7 +386,7 @@ impl<F: Field> DkgNode<F> {
             if j != self.index {
                 effects.push(Effect::Send {
                     to: Self::coord_of(j),
-                    frame: commit_frame(self.index, &commitment),
+                    frame: self.sealed(FrameType::DkgCommit, &commit_body(self.index, &commitment)),
                 });
             }
         }
@@ -359,7 +398,7 @@ impl<F: Field> DkgNode<F> {
             if let Some(share) = dealing.share_for(j) {
                 effects.push(Effect::Send {
                     to: Self::coord_of(j),
-                    frame: deal_frame(share, &commitment),
+                    frame: self.sealed(FrameType::DkgDeal, &deal_body(share, &commitment)),
                 });
             }
         }
@@ -422,14 +461,14 @@ impl<F: Field> DkgNode<F> {
     /// a bogus commitment for a silent dealer (first-writer-wins) — commitment poisoning (audit B1). The
     /// dealer broadcasts its commitment directly to every member, so no echo (which would fail this check)
     /// is needed.
-    fn on_commit(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+    fn on_commit(&mut self, from: Triple, body: &[u8], proof: Option<&VrfProof>) -> Vec<Effect> {
         if self.done {
             return Vec::new();
         }
         let Some((d, commitment)) = parse_commit(body) else {
             return Vec::new();
         };
-        if self.dealer_of(from) != Some(d) {
+        if !self.authored(from, d, FrameType::DkgCommit, body, proof) {
             self.rejects.commit_impersonated = self.rejects.commit_impersonated.saturating_add(1);
             return Vec::new(); // a commitment may only come from its own dealer
         }
@@ -445,7 +484,7 @@ impl<F: Field> DkgNode<F> {
         // arrived, only the commitment was lost) is not accused of anything.
         if self.phase == Phase::Complaint && d != self.index && !self.qualified.contains(&d) {
             self.complaints.entry(d).or_default().insert(self.index);
-            return Self::broadcast_to_peers(&complaint_frame(self.index, d));
+            return Self::broadcast_to_peers(&self.sealed(FrameType::DkgComplaint, &complaint_body(self.index, d)));
         }
         Vec::new()
     }
@@ -457,14 +496,14 @@ impl<F: Field> DkgNode<F> {
     /// every honest dealer (audit B1, CRITICAL). An honest complainer broadcasts directly to the whole
     /// complete-graph cell (including the accused), so the complaint reaches the dealer to be justified
     /// without an echo relay (which would fail the `from` check).
-    fn on_complaint(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+    fn on_complaint(&mut self, from: Triple, body: &[u8], proof: Option<&VrfProof>) -> Vec<Effect> {
         if self.done {
             return Vec::new();
         }
         let Some((c, d)) = parse_complaint(body) else {
             return Vec::new();
         };
-        if self.dealer_of(from) != Some(c) {
+        if !self.authored(from, c, FrameType::DkgComplaint, body, proof) {
             // **B1, counted.** Forging complaints in another member's name evicts every honest dealer, and a
             // ceremony that never terminates is its only other symptom.
             self.rejects.complaint_impersonated = self.rejects.complaint_impersonated.saturating_add(1);
@@ -482,7 +521,7 @@ impl<F: Field> DkgNode<F> {
                 let commitment = dealing.commitment().clone();
                 let share = share.clone();
                 self.justified.entry(d).or_default().insert(c);
-                effects.extend(Self::broadcast_to_peers(&justify_frame(d, &share, &commitment)));
+                effects.extend(Self::broadcast_to_peers(&self.sealed(FrameType::DkgJustify, &justify_body(d, &share, &commitment))));
             }
         }
         effects
@@ -518,7 +557,7 @@ impl<F: Field> DkgNode<F> {
                 self.my_shares.entry(d).or_insert(share.clone());
                 self.try_verify(d);
             }
-            effects.extend(Self::broadcast_to_peers(&justify_frame(d, &share, &commitment)));
+            effects.extend(Self::broadcast_to_peers(&self.sealed(FrameType::DkgJustify, &justify_body(d, &share, &commitment))));
         }
         effects
     }
@@ -553,7 +592,7 @@ impl<F: Field> DkgNode<F> {
             if d != self.index && !self.commitments.contains_key(&d) {
                 effects.push(Effect::Send {
                     to: Self::coord_of(d),
-                    frame: frame(FrameType::DkgCommitReq, &[]),
+                    frame: self.sealed(FrameType::DkgCommitReq, &[]),
                 });
             }
         }
@@ -562,7 +601,7 @@ impl<F: Field> DkgNode<F> {
             if !self.qualified.contains(&d) {
                 // We are missing/invalid a share from d → complain (recorded locally + broadcast).
                 self.complaints.entry(d).or_default().insert(self.index);
-                effects.extend(Self::broadcast_to_peers(&complaint_frame(self.index, d)));
+                effects.extend(Self::broadcast_to_peers(&self.sealed(FrameType::DkgComplaint, &complaint_body(self.index, d))));
             }
         }
         effects.push(Effect::ArmTimer {
@@ -640,7 +679,7 @@ impl<F: Field> DkgNode<F> {
         let Some(digest) = self.agreement_digest() else {
             return Vec::new(); // unreachable: `aggregate` was just set — but a `?` here beats an unwrap
         };
-        let mut effects = Self::broadcast_to_peers(&confirm_frame(self.index, &digest));
+        let mut effects = Self::broadcast_to_peers(&self.sealed(FrameType::DkgConfirm, &confirm_body(self.index, &digest)));
         effects.push(Effect::ArmTimer {
             token: DKG_CONFIRM_DEADLINE,
             after: self.complaint_deadline,
@@ -667,7 +706,7 @@ impl<F: Field> DkgNode<F> {
         buf.extend_from_slice(&(self.n as u64).to_le_bytes());
         buf.extend_from_slice(&(self.threshold as u64).to_le_bytes());
         buf.extend_from_slice(&aggregate);
-        Some(fanos_primitives::hash::hash_labeled(
+        Some(hash_labeled(
             fanos_primitives::hash::label::DKG_CONFIRM,
             &buf,
         ))
@@ -680,12 +719,12 @@ impl<F: Field> DkgNode<F> {
     /// Recorded in **any** phase, deliberately. Deadlines fire on each node's own clock, so a fast peer's
     /// confirmation routinely arrives before this node has finalized; dropping it would make the tally a
     /// measurement of clock skew. It is data, and it is counted when the phase closes.
-    fn on_confirm(&mut self, from: Triple, body: &[u8]) -> Vec<Effect> {
+    fn on_confirm(&mut self, from: Triple, body: &[u8], proof: Option<&VrfProof>) -> Vec<Effect> {
         let Some((j, digest)) = parse_confirm(body) else {
             self.rejects.frame_unusable = self.rejects.frame_unusable.saturating_add(1);
             return Vec::new();
         };
-        if self.dealer_of(from) != Some(j) {
+        if !self.authored(from, j, FrameType::DkgConfirm, body, proof) {
             self.rejects.confirm_impersonated = self.rejects.confirm_impersonated.saturating_add(1);
             return Vec::new();
         }
@@ -767,7 +806,7 @@ impl<F: Field> DkgNode<F> {
         };
         std::vec![Effect::Send {
             to: from,
-            frame: commit_frame(self.index, dealing.commitment()),
+            frame: self.sealed(FrameType::DkgCommit, &commit_body(self.index, dealing.commitment())),
         }]
     }
 
@@ -866,6 +905,42 @@ impl<F: Field> DkgNode<F> {
         std::vec![Effect::Flood { frame: frame.to_vec() }]
     }
 
+    /// A broadcast frame with this node's author proof in front of it, when it has a key to make one.
+    ///
+    /// The envelope is a discriminant plus, when signed, the proof — so an unsigned ceremony's bytes are one
+    /// byte longer than they were and a signed one's are `1 + PROOF_LEN`. Both parse under [`opened`], which
+    /// is what lets a cell of mixed builds refuse rather than misread.
+    fn sealed(&self, ty: FrameType, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + PROOF_LEN + body.len());
+        match &self.signer {
+            None => out.push(FRAME_UNSIGNED),
+            Some(secret) => {
+                let (proof, _) = secret.prove(&frame_alpha(ty, body));
+                out.push(FRAME_SIGNED);
+                out.extend_from_slice(&proof.to_bytes());
+            }
+        }
+        out.extend_from_slice(body);
+        frame(ty, &out)
+    }
+
+    /// Whether `author` really sent this frame — **direct from its own coordinate, or proved under the key
+    /// the transport established for it**.
+    ///
+    /// The first half is the rule this engine has always had, and it is what makes a relay impossible: a
+    /// frame arrives from the relayer, so `from` names the wrong participant. The second half is the repair,
+    /// and it is deliberately *additive* — a receiver that holds no key for `author` (no handshake with it
+    /// yet, or a peer whose certificate carries no VRF key) keeps exactly the old rule.
+    fn authored(&self, from: Triple, author: u8, ty: FrameType, body: &[u8], proof: Option<&VrfProof>) -> bool {
+        if self.dealer_of(from) == Some(author) {
+            return true;
+        }
+        match (proof, self.identities.get(&author)) {
+            (Some(proof), Some(key)) => key.verify(&frame_alpha(ty, body), proof).is_some(),
+            _ => false,
+        }
+    }
+
     /// This node's final key share bytes (a point on the aggregate polynomial), once complete.
     #[must_use]
     pub fn final_share_bytes(&self) -> [u8; 32] {
@@ -912,17 +987,36 @@ impl<F: Field> Engine for DkgNode<F> {
             // Reused as "begin DKG" (a keygen node has no heartbeat).
             Input::Command(Command::StartHeartbeat) => self.start(now),
             Input::Message { from, frame } => match decode_frame(&frame) {
-                Ok((f, _)) => match f.frame_type() {
-                    Some(FrameType::DkgDeal) => self.on_deal(from, f.body),
-                    Some(FrameType::DkgCommit) => self.on_commit(from, f.body),
-                    Some(FrameType::DkgComplaint) => self.on_complaint(from, f.body),
-                    Some(FrameType::DkgJustify) => self.on_justify(from, f.body),
-                    Some(FrameType::DkgCommitReq) => self.on_commit_req(from),
-                    Some(FrameType::DkgConfirm) => self.on_confirm(from, f.body),
-                    _ => Vec::new(),
-                },
+                Ok((f, _)) => {
+                    // The envelope comes off before anything is parsed, so a malformed one is refused as a
+                    // frame rather than as a bad commitment — the two are different faults and only one of
+                    // them is anybody's dealer's doing.
+                    let Some((body, proof)) = opened(f.body) else {
+                        return Vec::new();
+                    };
+                    match f.frame_type() {
+                        Some(FrameType::DkgDeal) => self.on_deal(from, body),
+                        Some(FrameType::DkgCommit) => self.on_commit(from, body, proof.as_ref()),
+                        Some(FrameType::DkgComplaint) => self.on_complaint(from, body, proof.as_ref()),
+                        Some(FrameType::DkgJustify) => self.on_justify(from, body),
+                        Some(FrameType::DkgCommitReq) => self.on_commit_req(from),
+                        Some(FrameType::DkgConfirm) => self.on_confirm(from, body, proof.as_ref()),
+                        _ => Vec::new(),
+                    }
+                }
                 Err(_) => Vec::new(),
             },
+            // **The key, taken when the transport proves it.** The engine does no crypto to *get* it — the
+            // driver parsed the certificate this handshake authenticated — and a participant outside the
+            // roster is ignored rather than recorded, since an index is what the map is for.
+            Input::Command(Command::PeerHandshaken { coord, vrf_public, .. }) => {
+                if let (Some(index), Some(key)) =
+                    (self.dealer_of(coord), vrf_public.and_then(VrfPublic::from_bytes))
+                {
+                    self.identities.insert(index, key);
+                }
+                Vec::new()
+            }
             Input::Timer(DKG_SHARE_DEADLINE) => self.open_complaints(),
             Input::Timer(DKG_COMPLAINT_DEADLINE) => self.finalize(),
             Input::Timer(DKG_CONFIRM_DEADLINE) => self.close_confirm(),
@@ -940,11 +1034,11 @@ impl<F: Field> Engine for DkgNode<F> {
 /// The index is carried even though the transport already names the sender, for the same reason
 /// `commit_frame` carries the dealer: the receiver checks the two against each other, so a frame that
 /// travelled a path its author did not is refused rather than attributed to whoever handed it over.
-fn confirm_frame(index: u8, digest: &[u8; 32]) -> Vec<u8> {
+fn confirm_body(index: u8, digest: &[u8; 32]) -> Vec<u8> {
     let mut body = Vec::with_capacity(1 + 32);
     body.push(index);
     body.extend_from_slice(digest);
-    frame(FrameType::DkgConfirm, &body)
+    body
 }
 
 /// Parse a `DkgConfirm` body into `(index, digest)`. Exact length: a 32-byte digest and nothing else.
@@ -954,33 +1048,65 @@ fn parse_confirm(body: &[u8]) -> Option<(u8, [u8; 32])> {
 }
 
 /// Encode a private `DkgDeal`: `share(33) ‖ commitment`.
-fn deal_frame(share: &VssShare, commitment: &VssCommitment) -> Vec<u8> {
+fn deal_body(share: &VssShare, commitment: &VssCommitment) -> Vec<u8> {
     let mut body = Vec::with_capacity(SHARE_LEN + commitment.threshold() * 32);
     body.extend_from_slice(&share.to_bytes());
     body.extend_from_slice(&commitment.to_bytes());
-    frame(FrameType::DkgDeal, &body)
+    body
 }
 
 /// Encode a broadcast `DkgCommit`: `dealer(1) ‖ commitment`.
-fn commit_frame(dealer: u8, commitment: &VssCommitment) -> Vec<u8> {
+fn commit_body(dealer: u8, commitment: &VssCommitment) -> Vec<u8> {
     let mut body = Vec::with_capacity(1 + commitment.threshold() * 32);
     body.push(dealer);
     body.extend_from_slice(&commitment.to_bytes());
-    frame(FrameType::DkgCommit, &body)
+    body
 }
 
 /// Encode a broadcast `DkgComplaint`: `complainer(1) ‖ dealer(1)`.
-fn complaint_frame(complainer: u8, dealer: u8) -> Vec<u8> {
-    frame(FrameType::DkgComplaint, &[complainer, dealer])
+fn complaint_body(complainer: u8, dealer: u8) -> Vec<u8> {
+    std::vec![complainer, dealer]
 }
 
 /// Encode a broadcast `DkgJustify`: `dealer(1) ‖ share(33) ‖ commitment`.
-fn justify_frame(dealer: u8, share: &VssShare, commitment: &VssCommitment) -> Vec<u8> {
+fn justify_body(dealer: u8, share: &VssShare, commitment: &VssCommitment) -> Vec<u8> {
     let mut body = Vec::with_capacity(1 + SHARE_LEN + commitment.threshold() * 32);
     body.push(dealer);
     body.extend_from_slice(&share.to_bytes());
     body.extend_from_slice(&commitment.to_bytes());
-    frame(FrameType::DkgJustify, &body)
+    body
+}
+
+/// A frame body that carries no author proof: the form every ceremony spoke before signing existed.
+const FRAME_UNSIGNED: u8 = 0x00;
+
+/// A frame body prefixed with its author's VRF proof over [`frame_alpha`].
+const FRAME_SIGNED: u8 = 0x01;
+
+/// What a broadcast frame's author signs: **the frame's own type and its body**, so a body cannot be lifted
+/// out of one frame type and replayed under another — the shape of attack a signature over the body alone
+/// would leave open.
+fn frame_alpha(ty: FrameType, body: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(8 + body.len());
+    input.extend_from_slice(&ty.code().to_be_bytes());
+    input.extend_from_slice(body);
+    hash_labeled("FANOS-v1/dkg-frame", &input).to_vec()
+}
+
+/// Split an incoming frame body into `(payload, author proof)`, or `None` if the envelope is malformed.
+///
+/// Strict about the discriminant rather than lenient: a body whose first byte is neither form is not a frame
+/// this build wrote, and treating it as unsigned would let a peer choose which rule judges it.
+fn opened(body: &[u8]) -> Option<(&[u8], Option<VrfProof>)> {
+    match body.split_first()? {
+        (&FRAME_UNSIGNED, rest) => Some((rest, None)),
+        (&FRAME_SIGNED, rest) => {
+            let (proof, payload) = rest.split_at_checked(PROOF_LEN)?;
+            let proof = VrfProof::from_bytes(<[u8; PROOF_LEN]>::try_from(proof).ok()?)?;
+            Some((payload, Some(proof)))
+        }
+        _ => None,
+    }
 }
 
 fn frame(ty: FrameType, body: &[u8]) -> Vec<u8> {
@@ -1018,6 +1144,89 @@ mod tests {
     //! Byzantine-robustness tests for the DKG control frames — the cluster the audit flagged CRITICAL
     //! (B1–B3) and previously untested. Each drives one participant with crafted adversarial frames.
     use super::*;
+
+    /// A frame signed by an arbitrary key — the test-side twin of `DkgNode::sealed`, so a fixture can play
+    /// an author it does not own the engine of.
+    fn sealed_by(secret: &VrfSecret, ty: FrameType, body: &[u8]) -> Vec<u8> {
+        let (proof, _) = secret.prove(&frame_alpha(ty, body));
+        let mut out = std::vec![FRAME_SIGNED];
+        out.extend_from_slice(&proof.to_bytes());
+        out.extend_from_slice(body);
+        frame(ty, &out)
+    }
+
+    /// **A signed frame survives the relay that an unsigned one does not** — and the key has to come from the
+    /// transport, not from the frame.
+    ///
+    /// This is the repair `broadcast_to_peers`' doc recommends, and the failure it repairs is not
+    /// hypothetical: `one_censored_link_gives_the_dkg_two_different_qualified_sets` asserts the fork that a
+    /// censored link produces today, because a `DkgComplaint` is accepted only *direct from its complainer*
+    /// and a relayed one arrives from the relayer.
+    ///
+    /// Four steps, and the last two are what keep the third honest:
+    ///
+    /// 1. relayed and **unsigned** → refused, which is the rule as it stood;
+    /// 2. relayed and **signed by a key this node has never been shown** → still refused, because a frame
+    ///    that carries its own credential proves nothing about who wrote it;
+    /// 3. the transport proves that key for that participant's coordinate, and the *same* relayed frame is
+    ///    now accepted;
+    /// 4. a frame signed by a **different** key, with the right one installed, is refused again.
+    #[test]
+    fn a_signed_frame_survives_the_relay_that_an_unsigned_one_does_not() {
+        let author = VrfSecret::from_seed([7u8; 32]);
+        let impostor = VrfSecret::from_seed([8u8; 32]);
+        // This node is index 1 (`Point::at(0)`); the author is index 2 and the relay is index 4, so `from`
+        // never names the author and the direct-only rule cannot admit any of these frames.
+        let mut node = DkgNode::<F2>::new(Point::<F2>::at(0), 2, [1u8; 32], [2u8; 32]);
+        let (author_coord, relay_coord) = (Point::<F2>::at(1).coords(), Point::<F2>::at(3).coords());
+        let body = complaint_body(2, 3);
+        let relayed = |frame: Vec<u8>| Input::Message { from: relay_coord, frame };
+        let refusals = |n: &DkgNode<F2>| n.rejects().complaint_impersonated;
+
+        let start = refusals(&node);
+        node.step(Instant(0), relayed(framed(FrameType::DkgComplaint, &body)));
+        assert_eq!(refusals(&node), start + 1, "an unsigned relayed complaint must be refused");
+
+        let signed = sealed_by(&author, FrameType::DkgComplaint, &body);
+        node.step(Instant(0), relayed(signed.clone()));
+        assert_eq!(
+            refusals(&node),
+            start + 2,
+            "a signature is not a credential: with no key established for that index the frame proves nothing"
+        );
+
+        node.step(
+            Instant(0),
+            Input::Command(Command::PeerHandshaken {
+                coord: author_coord,
+                identity: [0u8; 32],
+                vrf_public: Some(author.public().to_bytes()),
+            }),
+        );
+        node.step(Instant(0), relayed(signed));
+        assert_eq!(
+            refusals(&node),
+            start + 2,
+            "with the author's key proved by the transport, the SAME relayed frame is admissible"
+        );
+
+        node.step(Instant(0), relayed(sealed_by(&impostor, FrameType::DkgComplaint, &body)));
+        assert_eq!(
+            refusals(&node),
+            start + 3,
+            "and a proof under any other key is refused — the key is the author's, not the frame's"
+        );
+    }
+
+    /// A frame carrying the **unsigned** envelope — what a fixture with no identity writes, and what every
+    /// injection in this module was before signing existed. A signed one is built by the engine itself
+    /// (`DkgNode::sealed`), which is the only place a key lives.
+    fn framed(ty: FrameType, body: &[u8]) -> Vec<u8> {
+        let mut out = std::vec![FRAME_UNSIGNED];
+        out.extend_from_slice(body);
+        frame(ty, &out)
+    }
+
     use fanos_field::{F2, F4};
 
     /// **The ceremony's seat count is the PLANE's, and this crate could not have told you that.**
@@ -1062,7 +1271,10 @@ mod tests {
         let dealing = dkg::deal(&secret, threshold, n, &mut rng).unwrap();
         let commitment = dealing.commitment().clone();
         let share = dealing.share_for(j).unwrap();
-        (commit_frame(d, &commitment), deal_frame(share, &commitment))
+        (
+            framed(FrameType::DkgCommit, &commit_body(d, &commitment)),
+            framed(FrameType::DkgDeal, &deal_body(share, &commitment)),
+        )
     }
 
     fn completed(effects: &[Effect]) -> bool {
@@ -1103,7 +1315,7 @@ mod tests {
             Instant(2),
             Input::Message {
                 from: coord(3),
-                frame: complaint_frame(2, 2),
+                frame: framed(FrameType::DkgComplaint, &complaint_body(2, 2)),
             },
         );
 
@@ -1200,7 +1412,7 @@ mod tests {
             Instant(2),
             Input::Message {
                 from: coord(3),
-                frame: complaint_frame(3, 2),
+                frame: framed(FrameType::DkgComplaint, &complaint_body(3, 2)),
             },
         );
 
@@ -1214,7 +1426,7 @@ mod tests {
             Instant(3),
             Input::Message {
                 from: coord(2),
-                frame: justify_frame(2, &bogus_share, &bogus_commitment),
+                frame: framed(FrameType::DkgJustify, &justify_body(2, &bogus_share, &bogus_commitment)),
             },
         );
         assert!(

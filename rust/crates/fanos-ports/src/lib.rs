@@ -314,11 +314,24 @@ pub enum Command {
     /// `identity` is the peer's descriptor identity — `H(NODE_ID ‖ cert)`, the same value
     /// `NodeCredentials::descriptor_identity` derives — not the certificate, because the engine is
     /// crypto-free and needs a key, not material to verify with.
+    ///
+    /// ⛔ **And for two months it carried no key**, which is why the sentence above ends the way it does and
+    /// the mechanism it was added for stayed unbuilt: a digest identifies, it verifies nothing. `vrf_public`
+    /// is the missing half — the key the peer's *coordinate* is derived from, which the certificate already
+    /// commits to (`fanos_quic::identity::vrf_public_from_cert`) and which the transport has just proved
+    /// belongs to whoever is on the other end. A sub-engine can then accept a **relayed** frame that carries
+    /// a proof under that key, instead of only frames that arrive directly. The alternatives were priced and
+    /// are worse: a hybrid signature costs 3373 bytes a frame and the digest does not bind its bundle, and
+    /// carrying the certificate costs ~2 KB and needs an X.509 parser in a crate that has none.
     PeerHandshaken {
         /// The coordinate the peer proved.
         coord: Triple,
         /// The peer's descriptor identity, derived from the certificate it authenticated with.
         identity: [u8; 32],
+        /// The peer's **coordinate-VRF public key**, as embedded in that same certificate — the key a
+        /// relayed frame's proof is checked against. `None` when the certificate carries none, which is a
+        /// peer whose coordinate is not self-certifying and whose frames therefore stay direct-only.
+        vrf_public: Option<[u8; 32]>,
     },
     /// Re-seat this node at a new VRF coordinate for the per-epoch reshuffle (spec §L3 "epoch reshuffle",
     /// §3.2): the driver computes `coord = MapToPoint(VRF(sk, node‖epoch‖beacon))` for the new epoch (the

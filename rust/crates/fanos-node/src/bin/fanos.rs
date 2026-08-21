@@ -3063,6 +3063,12 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
 
     let outcome = DkgCeremony::<F2>::slot();
     let slot = outcome.clone();
+    // **The key the ceremony signs its broadcast frames with**, so a frame that reaches a participant by
+    // relay is still attributable to its author — which is what makes the flood sound when a link between
+    // two founders is censored *after* the roster has connected. It is this node's own coordinate VRF
+    // secret: no new key material, and the public half is already committed by the certificate every
+    // handshake proves, which is where the receiver gets it (`Command::PeerHandshaken::vrf_public`).
+    let signing = creds.vrf_secret();
     let handle = fanos_quic::spawn_self_certifying_persistent_over::<F2>(
         listen.into(),
         &creds,
@@ -3075,7 +3081,8 @@ async fn cmd_keygen(args: &[String]) -> Result<(), NodeError> {
                 // Bind the ceremony to the network the roster names, so two founders holding rosters that
                 // differ disagree **here**, by name, rather than founding two networks that each look
                 // complete. The engine cannot see a roster file; this is the one fact it needs from it.
-                .with_context(*network_id.as_bytes());
+                .with_context(*network_id.as_bytes())
+                .with_identity(signing.clone());
             Box::new(DkgCeremony::new(node, slot))
         },
         directory,
