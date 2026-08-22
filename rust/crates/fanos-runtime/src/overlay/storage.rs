@@ -542,7 +542,7 @@ impl<F: Field> OverlayNode<F> {
             READ_FANOUT_MARGIN,
             self.healer.stress(),
         );
-        peers.truncate(width);
+        read_window(&mut peers, width, &digest);
         // **No early conclusion here at all, and that is the third repair this branch has had.**
         //
         // It briefly held a fast path: if no asked peer is known to be occupied then this node is every shard
@@ -994,5 +994,80 @@ impl<F: Field> OverlayNode<F> {
             Some(digest) => alloc::vec![Effect::Notify(Notification::Stored(digest))],
             None => Vec::new(),
         }
+    }
+}
+
+/// The peers a read asks, when it may not ask them all: **the window rotates with the key**.
+///
+/// `peers` arrives in coordinate order (a `BTreeMap`), so truncating to `width` keeps the *lowest*
+/// coordinates and never asks the highest members at all. That is harmless only while the width is the whole
+/// set — and [`read_fanout`](fanos_diakrisis::stability::read_fanout) narrows to `K + margin` exactly under
+/// stress, which is exactly when a cell is struggling. So the cell answers trouble by going blind to the same
+/// members every time: a node whose shards live there is unreadable for as long as the stress lasts, its
+/// roster stays short, and the stress stays high.
+///
+/// Measured 2026-08-22 in `the_whole_cell_resolves_every_member`: the one coordinate no reader could resolve
+/// was the **highest** of the five, on two separate reproductions, while every reader read the other four.
+///
+/// Rotating by the digest makes the window a function of the key — every peer is asked for some keys, no
+/// member is permanently invisible, and for any one key the choice stays deterministic.
+fn read_window(peers: &mut Vec<Triple>, width: usize, digest: &[u8; DIGEST]) {
+    let span = peers.len();
+    if span > 1 {
+        let offset =
+            digest.first_chunk::<8>().map_or(0, |b| usize::try_from(u64::from_be_bytes(*b) % span as u64).unwrap_or(0));
+        peers.rotate_left(offset);
+    }
+    peers.truncate(width);
+}
+
+#[cfg(test)]
+mod read_window_tests {
+    use super::{DIGEST, read_window};
+    use fanos_geometry::Triple;
+
+    /// **Every member is asked for some key, and no member is asked for all of them.**
+    ///
+    /// The property a narrowed read fan-out owes: it may ask fewer peers than it knows, but it must not ask
+    /// the *same* fewer every time. Before the rotation, `truncate` kept the head of a coordinate-ordered
+    /// list, so the highest members were never asked at all — and the fan-out narrows precisely under
+    /// stress, so a struggling cell went blind to a fixed subset and stayed struggling.
+    ///
+    /// Falsified by deleting the rotation in [`read_window`]: the coverage assertion goes red naming the
+    /// members that were never asked, and the determinism assertion below stays green — which is why both
+    /// are here, since a window that rotated *randomly* would satisfy coverage and break reads.
+    #[test]
+    fn a_narrowed_read_window_still_reaches_every_peer_and_is_stable_per_key() {
+        let peers: Vec<Triple> = (0u32..7).map(|i| [1, i, i]).collect();
+        let width = 3; // `K` with no margin: the narrowest the fan-out ever gets
+        let mut asked: Vec<Triple> = Vec::new();
+        for k in 0u8..64 {
+            let digest = [k; DIGEST];
+            let mut window = peers.clone();
+            read_window(&mut window, width, &digest);
+            assert_eq!(window.len(), width, "the window is the width it was given");
+            for p in &window {
+                assert!(peers.contains(p), "a window may only contain peers this node knows");
+            }
+            for p in window {
+                if !asked.contains(&p) {
+                    asked.push(p);
+                }
+            }
+        }
+        let missed: Vec<&Triple> = peers.iter().filter(|p| !asked.contains(p)).collect();
+        assert!(
+            missed.is_empty(),
+            "a narrowed window never asked {missed:?} for any of 64 keys — those members are invisible to \
+             every read this node makes, which is how a cell goes blind to its own highest coordinates"
+        );
+
+        // Deterministic per key: two readers with the same peer set must ask the same peers for one key, or
+        // a retry of the same read is a different read and the gather can never converge.
+        let digest = [9u8; DIGEST];
+        let (mut a, mut b) = (peers.clone(), peers.clone());
+        read_window(&mut a, width, &digest);
+        read_window(&mut b, width, &digest);
+        assert_eq!(a, b, "one key, one window");
     }
 }
