@@ -4049,6 +4049,28 @@ enum Dialed {
     Ourself,
 }
 
+/// One dial, **tagged by which of its three ways it failed** — see [`Station::ConnDialFailed`].
+///
+/// Split out of [`get_or_connect`] so the classification has a name: until 2026-08-22 all three outcomes were
+/// silent, and the only trace a failed dial left was `conns.cache_miss` — a *send-time* rate, not a dial
+/// outcome. A cell frozen with a node holding no binding for a peer looks identical whether it never had an
+/// address to dial or dialled a thousand times and never connected.
+async fn dial_once(t: &Transport, to: Triple, addr: SocketAddr) -> Option<Connection> {
+    // Bounded: a peer that has gone away must fail FAST rather than hang the send loop for the full QUIC
+    // handshake timeout — the #129 availability bug, where `get`'s lookups to live shard-homes queued behind
+    // a dead peer's dial and the erasure shards never gathered though the redundancy tolerated the loss.
+    let why = match t.endpoint.connect(addr, "fanos.node") {
+        Ok(connecting) => match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
+            Ok(Ok(conn)) => return Some(conn),
+            Ok(Err(_)) => 2,
+            Err(_) => 1,
+        },
+        Err(_) => 0,
+    };
+    t.record_station(Station::ConnDialFailed, Some(to), Some(why));
+    None
+}
+
 /// Reuse a cached connection to `to`, or dial one, establish identity (HELLO or self-certifying
 /// cert check), and start reading frames the peer sends back on it.
 ///
@@ -4064,14 +4086,7 @@ async fn get_or_connect(t: &Transport, to: Triple, addr: SocketAddr) -> Dialed {
     // gathered even though the redundancy tolerates the loss. A real peer answers in well under this.
     // A connect failure (the transport refused/timed out) feeds the morph auto-fallback breaker. A completed
     // handshake does **not** reset it — see below.
-    let established = match t.endpoint.connect(addr, "fanos.node") {
-        Ok(connecting) => tokio::time::timeout(DIAL_TIMEOUT, connecting)
-            .await
-            .ok()
-            .and_then(Result::ok),
-        Err(_) => None,
-    };
-    let Some(conn) = established else {
+    let Some(conn) = dial_once(t, to, addr).await else {
         apply_outcome(&t.shaper, &t.controller, false);
         return Dialed::Unreachable;
     };

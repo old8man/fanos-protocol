@@ -477,6 +477,16 @@ pub enum Station {
     /// and re-sending will never fix that.
     HelloClaimRefused,
 
+    /// A **dial did not produce a connection**, tagged by which of its three ways it failed: `0` the endpoint
+    /// refused to start it, `1` the handshake did not finish inside the dial timeout, `2` it finished as an
+    /// error.
+    ///
+    /// Silent until 2026-08-22, and the silence is what it was added for. `conns.cache_miss` counts sends
+    /// that found no live connection — a *rate*, large in healthy runs — so a node that dialled a peer a
+    /// thousand times and never connected reported exactly what a node with no address to dial reported. A
+    /// stuck cell where two nodes hold no binding for a third turns on that distinction.
+    ConnDialFailed,
+
     /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
     /// (#235) — the count of joins currently in progress.
     ///
@@ -1451,6 +1461,7 @@ impl Station {
         Self::HelloRejudged,
         Self::HelloClaimStale,
         Self::HelloClaimRefused,
+        Self::ConnDialFailed,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
@@ -1538,6 +1549,7 @@ impl Station {
             Self::HelloRejudged => "hello.rejudged",
             Self::HelloClaimStale => "hello.claim_stale",
             Self::HelloClaimRefused => "hello.claim_refused",
+            Self::ConnDialFailed => "conns.dial_failed",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
@@ -1720,6 +1732,7 @@ impl Station {
             | Self::HelloRejudged
             | Self::HelloClaimStale
             | Self::HelloClaimRefused
+            | Self::ConnDialFailed
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed
