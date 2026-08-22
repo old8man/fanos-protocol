@@ -467,9 +467,14 @@ fn forced_by_holder<'a, F: Field>(
     // The witness must be **seated** at the contested point, not merely want it — so its own claim is checked, against
     // that point, by the same predicate that checks the claimant's. That is the whole of the change from the rule this
     // replaced, and everything else here was already true of it.
+    // **The inner reason travels, it is not collapsed.** Mapping every recursive failure to one variant is
+    // what made the first reading of this station useless: `WitnessNotSeated` then covered a bad proof, a
+    // holder already seen at another index, and a genuine seating mismatch alike — three different defects
+    // wearing one tag. `PointMismatch` from here *is* "not seated where it was offered"; anything else is
+    // the witness's own claim failing on its own terms.
     let witness_output =
         verify_claim_seen::<F>(&witness.public, &witness.id, epoch, beacon, &contested, &witness.claim, seen)
-            .map_err(|_| ClaimRefusal::WitnessNotSeated)?;
+            .map_err(|why| if why == ClaimRefusal::PointMismatch { ClaimRefusal::WitnessNotSeated } else { why })?;
     if claim_beats((witness.claim.index, &witness_output), (j, claimant)) {
         Ok(())
     } else {
