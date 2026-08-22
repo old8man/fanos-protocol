@@ -30,6 +30,42 @@ use crate::tls::NodeCredentials;
 /// plane far larger than a cell — from looping unboundedly.
 pub const DEFAULT_GRIND_LIMIT: usize = 4096;
 
+/// The PKCS#8 v1 prefix an Ed25519 private key carries in front of its 32-byte seed — the whole of what
+/// separates a seed from a DER a key parser will accept.
+///
+/// `30 2e 02 01 00 30 05 06 03 2b 65 70 04 22 04 20`: a 46-byte SEQUENCE, version 0, the AlgorithmIdentifier
+/// for `id-Ed25519` (OID 1.3.101.112), then an OCTET STRING wrapping an OCTET STRING of 32 bytes. Written out
+/// rather than pulled from a crate because it is a constant of the format, and the one line below is the only
+/// thing in this tree that needs it.
+const PKCS8_ED25519_PREFIX: [u8; 16] =
+    [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+
+/// Mint [`NodeCredentials`] **deterministically from `seed`** — the same seed always yields the same
+/// certificate, hence the same identity, the same VRF key and the same coordinate at every epoch.
+///
+/// **Why a test surface needs this, and it is not a convenience.** A fleet whose nodes mint fresh random
+/// identities draws a fresh *placement* on every run, so a fixture over it is a sample rather than a
+/// scenario: `fanos_sim::fabric::the_whole_cell_resolves_every_member` fails on roughly a quarter to a half
+/// of runs, and three separate bisects over that noise reached three different conclusions — each of them
+/// four runs a side, which cannot distinguish a half from a quarter. A seeded fleet turns "budget tens of
+/// runs and hope" into "replay the draw that failed".
+///
+/// **The identity is a production identity in every respect**, exactly as [`credentials_for_point`]'s is:
+/// self-signed, with the coordinate-VRF public embedded, and the VRF secret derived from the key as always.
+/// What is chosen is the *entropy*, not the rule — which is why this lives in the harness and why a
+/// deployment cannot reach it.
+///
+/// Ed25519 rather than the generator's default P-256: a P-256 key cannot be reconstructed from 32 bytes
+/// without a scalar-reduction step of its own, while an Ed25519 key **is** its seed.
+#[must_use]
+pub fn credentials_from_seed(seed: [u8; 32]) -> Option<NodeCredentials> {
+    let mut der = Vec::with_capacity(PKCS8_ED25519_PREFIX.len() + seed.len());
+    der.extend_from_slice(&PKCS8_ED25519_PREFIX);
+    der.extend_from_slice(&seed);
+    let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der.into(), &rcgen::PKCS_ED25519).ok()?;
+    NodeCredentials::from_key_pair(&key).ok()
+}
+
 /// Mint self-certifying [`NodeCredentials`] whose coordinate `MapToPoint(H(cert))` is exactly
 /// `target`, by rejection sampling up to `max_tries` mints. `None` if none matched within the bound.
 ///

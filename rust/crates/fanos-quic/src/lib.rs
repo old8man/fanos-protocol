@@ -60,7 +60,7 @@ pub use driver::{Beacons, CoordinateProver, DriverActor, REQUEST_TIMEOUT, Sample
     spawn_self_certifying_with_capabilities, spawn_shaped,
 };
 pub use fanos_proteus::{Environment, Morph, MorphCodec};
-pub use harness::{Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, spawn_cell, spawn_pinned};
+pub use harness::{Cell, DEFAULT_GRIND_LIMIT, credentials_for_point, credentials_from_seed, spawn_cell, spawn_pinned};
 pub use identity::{
     coordinate_at_level, coordinate_from_cert, hierarchical_coordinate, verifiable_coordinate,
     verify_peer_coordinate, vrf_public_from_cert,

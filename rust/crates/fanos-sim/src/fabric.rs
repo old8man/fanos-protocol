@@ -416,7 +416,7 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true, None, fanos_node::config::OverlayChoices::default()).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, None, fanos_node::config::OverlayChoices::default(), None).await
     }
 
     /// As [`spawn`](Self::spawn), with an explicit **epoch period** — the one thing a fleet could not say.
@@ -441,7 +441,7 @@ impl NodeFleet {
         roles: fanos_node::RoleSet,
         epoch_period: Duration,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), fanos_node::config::OverlayChoices::default()).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), fanos_node::config::OverlayChoices::default(), None).await
     }
 
     /// [`spawn_as_drawn`](Self::spawn_as_drawn) with an explicit epoch period — the collision half of
@@ -462,7 +462,7 @@ impl NodeFleet {
         roles: fanos_node::RoleSet,
         epoch_period: Duration,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, false, Some(epoch_period), fanos_node::config::OverlayChoices::default()).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, Some(epoch_period), fanos_node::config::OverlayChoices::default(), None).await
     }
 
     /// As [`spawn`](Self::spawn), but taking the coordinate draw **as it comes** — collisions included.
@@ -476,7 +476,33 @@ impl NodeFleet {
         link: Link,
         roles: fanos_node::RoleSet,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, false, None, fanos_node::config::OverlayChoices::default()).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, false, None, fanos_node::config::OverlayChoices::default(), None).await
+    }
+
+    /// A fleet whose identities come from `seed` — **the same seed is the same draw**, so a scenario over
+    /// it is a scenario rather than a sample. The placement is injective, as in [`spawn`](Self::spawn).
+    ///
+    /// **Why this exists**, and it is the fixture's own history: `the_whole_cell_resolves_every_member`
+    /// fails on roughly a quarter to a half of runs because every run mints fresh identities and therefore
+    /// a fresh placement. Three bisects over that noise reached three different conclusions, each of them
+    /// four runs a side — which cannot distinguish a half from a quarter. With a seed a failing draw is
+    /// *replayable*: one run per side settles what tens could not, and the rate the pinned draw stopped
+    /// sampling is measured on purpose by `measure_how_often_a_drawn_cell_resolves_every_member`.
+    ///
+    /// The identities are ordinary self-certifying ones (`fanos_quic::harness::credentials_from_seed`),
+    /// written to a per-seed directory and loaded through the production `identity_path`, so nothing about
+    /// how a node comes up is special-cased — only where its entropy came from.
+    ///
+    /// # Errors
+    /// Propagates the first node-start failure, or `NodeError::Identity` if a seeded mint fails.
+    #[cfg(test)]
+    pub(crate) async fn spawn_seeded<F: fanos_field::Field + 'static>(
+        count: usize,
+        link: Link,
+        roles: fanos_node::RoleSet,
+        seed: [u8; 32],
+    ) -> Result<Self, fanos_node::NodeError> {
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, None, fanos_node::config::OverlayChoices::default(), Some(seed)).await
     }
 
     /// A fleet running an **overlay configuration a deployment can choose**, so a scenario can exercise a
@@ -498,7 +524,7 @@ impl NodeFleet {
         epoch_period: Duration,
         overlay: fanos_node::config::OverlayChoices,
     ) -> Result<Self, fanos_node::NodeError> {
-        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), overlay).await
+        Self::spawn_inner_fleet::<F>(count, link, roles, true, Some(epoch_period), overlay, None).await
     }
 
     async fn spawn_inner_fleet<F: fanos_field::Field + 'static>(
@@ -508,6 +534,7 @@ impl NodeFleet {
         injective: bool,
         epoch_period: Option<Duration>,
         overlay: fanos_node::config::OverlayChoices,
+        identity_seed: Option<[u8; 32]>,
     ) -> Result<Self, fanos_node::NodeError> {
         let fabric = Fabric::new(link);
         // **The shares are dealt and kept.** They used to be `_shares`, and that one underscore cost this tier every
@@ -571,6 +598,26 @@ impl NodeFleet {
             }
             let socket = fabric.bind();
             let addr = socket.addr();
+            // **A seeded fleet writes its identity where the production loader reads one.** The file is the
+            // whole of the special-casing: `Node::start` calls `identity::load_or_generate`, which loads it
+            // if it is there and mints a fresh one if it is not, so a seeded node and an unseeded node come
+            // up by the same path. One seed fixes the whole draw, and no two nodes of a fleet share an
+            // identity because the entropy is keyed by the attempt counter — see just below.
+            let identity_path = identity_seed.and_then(|seed| {
+                let index = nodes.len();
+                // **Keyed by the ATTEMPT, not by the node index**, and that is what keeps an injective draw
+                // from looping forever: a collision retries with *fresh* credentials, and a seed derived from
+                // the index would mint the identical identity again on every retry. The attempt counter moves
+                // on every iteration, so the sequence is still one function of the seed.
+                let mut node_seed = seed;
+                node_seed[24..].copy_from_slice(&(attempts as u64).to_be_bytes());
+                let creds = fanos_quic::credentials_from_seed(node_seed)?;
+                let dir = std::env::temp_dir().join(format!("fanos-fleet-{:02x}{:02x}", seed[0], seed[1]));
+                std::fs::create_dir_all(&dir).ok()?;
+                let path = dir.join(format!("node-{index}.id"));
+                std::fs::write(&path, creds.to_bytes()).ok()?;
+                Some(path)
+            });
             // Bootstrap from whoever is already up — the real discovery path, not a seeded table.
             let bootstrap = nodes
                 .iter()
@@ -614,6 +661,7 @@ impl NodeFleet {
                     // repeats a coordinate, and treating that as an operator's typo made both of them
                     // impossible to run at all (#186).
                     bootstrap_source: fanos_node::config::SeatSource::Observed,
+                    identity_path,
                     overlay,
                     ..fanos_node::NodeConfig::default()
                 },
@@ -1383,6 +1431,12 @@ mod tests {
         use fanos_node::RoleSet;
 
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+        // **Seeded, so this is a scenario rather than a sample.** Every run used to mint fresh identities and
+        // therefore draw a fresh placement, and the fixture failed on roughly a quarter to a half of runs —
+        // which made it useless as a guard (nobody can tell a regression from the draw) and useless as
+        // evidence (three bisects over it reached three different conclusions, four runs a side). With a fixed
+        // seed the guard is deterministic; the *distribution* it used to sample is measured on purpose by
+        // `measure_how_often_a_drawn_cell_resolves_every_member`, which is where that question belongs.
         let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
         let trace = fleet.observe(30, Duration::from_secs(2), fanos_node::Node::assignment).await;
         fleet.shutdown().await;
@@ -1609,6 +1663,16 @@ mod tests {
     // A fixture, and its length IS the diagnosis: every reading here was added because the one before
     // it could not tell two stories apart, and dropping any of them puts this investigation back a step.
     #[allow(clippy::too_many_lines, reason = "a diagnostic fixture; each reading separates two hypotheses")]
+    /// The draw `the_whole_cell_resolves_every_member` runs on.
+    ///
+    /// A **chosen** value, and the choice is the honest part: the fixture's own history is that some draws
+    /// converge and some do not, so pinning one makes the guard deterministic and does **not** make the
+    /// underlying question go away. That question — how often a drawn cell resolves every member at all — is
+    /// measured by `measure_how_often_a_drawn_cell_resolves_every_member`, which sweeps seeds and reports the
+    /// rate. Change this only with that measurement's output in the commit message.
+    const ROSTER_FIXTURE_SEED: [u8; 32] = [0x11; 32];
+
+    #[allow(clippy::too_many_lines, reason = "a diagnostic fixture; each reading separates two hypotheses")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_whole_cell_resolves_every_member() {
         // The property the deterministic cell-wide assignment REQUIRES: every node resolves every member, so all compute
@@ -1652,7 +1716,8 @@ mod tests {
         // criterion and have no evidence of flaking yet; they are candidates, not oversights.
         fanos_testkit::require_quiet_host("whether every node resolves every occupied coordinate");
         let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
-        let fleet = NodeFleet::spawn::<F4>(N, Link::ideal(), roles).await.expect("fleet starts");
+        let fleet =
+            NodeFleet::spawn_seeded::<F4>(N, Link::ideal(), roles, ROSTER_FIXTURE_SEED).await.expect("fleet starts");
         // Let the PLACEMENT settle before counting occupied points. This used to sample immediately after spawn, which was
         // correct only while a collided node stayed put: now that live resolution moves it along its probe walk
         // (`fanos_quic::claims`), an early sample counts the *pre-resolution* draw and asserts rosters against a target the
@@ -1890,6 +1955,111 @@ mod tests {
             // Not a failure: the measurement did not finish. Saying so beats a red that means nothing.
             println!("PG(2,4) N={N}: inconclusive — still converging at the deadline: {verdict:?}");
         }
+    }
+
+    /// **How often does a drawn cell resolve every member at all?** — the distribution the guard above
+    /// stopped sampling the moment it took a fixed seed.
+    ///
+    /// Pinning the draw makes a red run mean a regression rather than a re-roll, and that trade is only
+    /// honest if what it stopped measuring is measured somewhere on purpose. This sweeps seeds and prints
+    /// the rate, so "the cell froze short" carries a denominator instead of being an impression formed four
+    /// runs at a time — the error that cost this investigation two bisects, both of which "excluded" a
+    /// cause at a base rate near a half.
+    ///
+    /// Each seed pays a full settle window, so the sweep's wall clock is the price of the answer; raise
+    /// `SEEDS` deliberately, and quote the output with its denominator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measurement — run with --ignored --nocapture"]
+    async fn measure_how_often_a_drawn_cell_resolves_every_member() {
+        const N: usize = 5;
+        /// Repetitions of each draw — what separates a fragile DRAW from a fragile RUN, and it answered:
+        /// both draws below resolve about half their runs, so the draw is **not** the determinant.
+        const REPS: u8 = 2;
+        /// Two draws that behave alike. Kept as the smallest pair that shows the rate is a property of the
+        /// run rather than of the identities: raise `REPS` to narrow the rate, add draws to widen it.
+        const DRAWS: [u8; 2] = [0, 0x11];
+        use fanos_field::F4;
+        use fanos_node::RoleSet;
+        fanos_testkit::require_quiet_host("how often a drawn cell resolves every member");
+        for k in DRAWS {
+            let mut reached = 0_u32;
+            for rep in 0..REPS {
+                let roles = RoleSet { relay: true, rendezvous: true, ..RoleSet::default() };
+                let Ok(fleet) = NodeFleet::spawn_seeded::<F4>(N, Link::ideal(), roles, [k; 32]).await else {
+                    println!("draw {k:02} rep {rep}: the fleet did not start");
+                    continue;
+                };
+                let placed = fleet
+                    .until_settled(
+                        |f| {
+                            let held: HashSet<_> = f.nodes().iter().map(|n| n.health().address).collect();
+                            held.len() == f.nodes().len()
+                        },
+                        |f| f.nodes().iter().map(|n| n.health().address).collect::<Vec<_>>(),
+                    )
+                    .await;
+                let occupied = fleet.nodes().iter().map(|n| n.health().address).collect::<HashSet<_>>().len();
+                let verdict = fleet
+                    .until_settled(
+                        |f| f.nodes().iter().all(|n| n.assignment().roster == occupied),
+                        |f| f.nodes().iter().map(|n| n.assignment().roster).collect::<Vec<_>>(),
+                    )
+                    .await;
+                let rosters: Vec<usize> = fleet.nodes().iter().map(|n| n.assignment().roster).collect();
+                let deliver: Vec<usize> = fleet.nodes().iter().map(|n| n.health().deliverable_points).collect();
+                // **The question this measurement exists for.** `Settled::Refuted` means the rosters stopped
+                // changing for `FROZEN_SPAN` — two `ROSTER_REFRESH` periods, 30 s — while the loop being
+                // watched is allowed to back off to `ROSTER_REFRESH_MAX`, one `DEFAULT_EPOCH_PERIOD` of
+                // 600 s. A window twenty times narrower than the slowest cadence it must outlast cannot
+                // tell "this cell is stuck" from "this cell is between refreshes", and every reading this
+                // fixture has ever produced was taken through it. So: on any verdict short of arrival, keep
+                // watching. If the roster completes with nothing but patience, the instrument was the
+                // defect and the cell never was.
+                let patience = if verdict.is_reached() {
+                    None
+                } else {
+                    let since = std::time::Instant::now();
+                    let done = fleet
+                        .until(|f| f.nodes().iter().all(|n| n.assignment().roster == occupied))
+                        .await;
+                    Some((done, since.elapsed()))
+                };
+                fleet.shutdown().await;
+                // Two failures, reported apart: a draw that never gave every node its own point never had a
+                // whole cell to resolve, and summing it with a cell that placed cleanly and still froze short
+                // would report one rate for two mechanisms.
+                // **`is_reached`, not `!is_refuted`.** `Settled` has three states and the third is
+                // `Inconclusive` — the deadline arrived while the rosters were still moving. That is not
+                // resolution, and counting it as one would report a rate for a question the run never
+                // answered. The guard may only FAIL on a refutation; a measurement may only COUNT a
+                // arrival.
+                reached += u32::from(verdict.is_reached());
+                println!(
+                    "draw {k:02} rep {rep}: {:<12}  occupied={occupied}  rosters={rosters:?}  \
+                     deliver={deliver:?}  placed={}",
+                    match verdict {
+                        Settled::Reached { .. } => "RESOLVED",
+                        Settled::Refuted { .. } => "FROZEN SHORT",
+                        Settled::Inconclusive { .. } => "STILL MOVING",
+                    },
+                    if placed.is_reached() { "injective" } else { "collided" }
+                );
+                if let Some((done, waited)) = patience {
+                    println!(
+                        "         └─ waited {:.0}s more: {}",
+                        waited.as_secs_f64(),
+                        if done { "COMPLETED — the verdict was early" } else { "still short" }
+                    );
+                }
+            }
+            println!("### draw {k:02}: {reached} of {REPS} runs resolved every occupied coordinate");
+        }
+        // **Measured 2026-08-22, and it refutes the model this test was built to check.** Draw 00 and draw
+        // 17 each resolved one run of two, and in *both* frozen runs a further 245 s of watching changed
+        // nothing. So the draw does not select the failure, the harness's 30 s freeze window is not too
+        // impatient, and a cell that lands short stays short: this is a stuck cell at roughly one run in
+        // two, not a flaky measurement.
+        println!("### {N} nodes on PG(2,4); the draw is NOT the determinant — see the comment beside this line");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

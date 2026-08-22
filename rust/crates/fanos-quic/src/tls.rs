@@ -165,7 +165,17 @@ impl NodeCredentials {
     /// certificate, `H(cert)` — the node's identity anchor — commits to the key that earns its coordinate,
     /// and a peer's coordinate proof cannot be transplanted onto another certificate.
     pub fn generate() -> Result<Self, TlsError> {
-        let key = rcgen::KeyPair::generate().map_err(|_| TlsError::Cert)?;
+        Self::from_key_pair(&rcgen::KeyPair::generate().map_err(|_| TlsError::Cert)?)
+    }
+
+    /// [`generate`](Self::generate) over a key the caller already holds — the same certificate, the same
+    /// embedded VRF public, the same derivation, with the entropy supplied instead of drawn.
+    ///
+    /// Exists for one caller: `crate::harness::credentials_from_seed`, which needs a *reproducible* identity
+    /// so a fleet can replay a draw rather than sample a new one. Everything a deployment reaches still goes
+    /// through `generate`, and this changes nothing about what a credential is — only where its randomness
+    /// came from.
+    pub fn from_key_pair(key: &rcgen::KeyPair) -> Result<Self, TlsError> {
         let key_der = key.serialize_der();
         let vrf_public = vrf_secret_from_key(&key_der).public();
         let mut params = rcgen::CertificateParams::new(vec!["fanos.node".to_owned()])
@@ -174,7 +184,7 @@ impl NodeCredentials {
             FANOS_VRF_OID,
             vrf_public.to_bytes().to_vec(),
         ));
-        let cert = params.self_signed(&key).map_err(|_| TlsError::Cert)?;
+        let cert = params.self_signed(key).map_err(|_| TlsError::Cert)?;
         Ok(Self {
             cert_der: cert.der().to_vec(),
             key_der,
