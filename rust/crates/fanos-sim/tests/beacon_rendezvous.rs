@@ -16,7 +16,7 @@
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_field::F2;
-use fanos_geometry::{Line, Point};
+use fanos_geometry::{Line, Point, Triple};
 use fanos_pqcrypto::{HybridKemSecret, OnionKeyRatchet, SeedRng};
 use fanos_rendezvous::{
     ANONYMOUS, BeaconSeed, Epoch, MixDirectory, line_member_coords, meeting_line, seal_forward,
@@ -112,6 +112,71 @@ fn a_beacon_derived_meeting_line_delivers_over_the_mixnet() {
             .deliveries()
             .any(|(recv, from, bytes)| members.contains(&recv) && from == ANONYMOUS && bytes == payload),
         "an onion sealed to the beacon-derived meeting line delivered anonymously at a line member"
+    );
+}
+
+/// **A hidden service survives the epoch turn, and the line it was reached at stops working.**
+///
+/// The two properties beside it cover one epoch each: a beacon-derived line delivers *now*, and next epoch's
+/// line is uncomputable *now*. Neither says what a testnet operator actually needs — that a service reachable
+/// at epoch `e` is still reachable at `e + 1` with no out-of-band step, because both ends re-derive the line
+/// from a beacon they each already verify.
+///
+/// It also asserts the half that makes the rotation worth having: the **old** line is no longer where the
+/// service is. Without that, a scenario that never moved would pass, and the rotation would be decoration.
+/// A client that cached `e`'s line and kept using it must find nobody, which is exactly the property that
+/// makes a rendezvous point unlinkable across epochs.
+///
+/// Not a timing test: the epoch is advanced by deriving the next seed, the same way every node does when the
+/// beacon lands. What is *not* covered here and needs a live fleet is the transport-level turn — connections,
+/// directory re-keying, and the reshuffle running underneath a session in flight.
+#[test]
+fn a_service_reached_at_one_epoch_is_reached_at_the_next_and_not_at_the_old_line() {
+    let mut sim = Sim::new(0xE5E);
+    let onion_t = 2usize;
+    let dir = spawn_mixnet(&mut sim, onion_t);
+    let (shares, commitment) = beacon_group();
+
+    let (before, after) = (Epoch::new(5), Epoch::new(6));
+    let seed_before = beacon_seed(&shares, &commitment, before);
+    let seed_after = beacon_seed(&shares, &commitment, after);
+    let line_before = meeting_line::<F2>(SERVICE_PUBKEY, before, &seed_before).coords();
+    let line_after = meeting_line::<F2>(SERVICE_PUBKEY, after, &seed_after).coords();
+    assert_ne!(
+        line_before, line_after,
+        "the meeting line must move with the epoch, or there is nothing here to survive and nothing to \
+         unlink — this is the premise the two deliveries below are measured against"
+    );
+
+    let deliver = |sim: &mut Sim, line: Triple, payload: &[u8]| {
+        let hop = (0..7).map(|i| Line::<F2>::at(i).coords()).find(|&l| l != line).unwrap();
+        let fwd = seal_forward::<F2>(&[hop, line], &dir, onion_t as u8, payload, b"e5-turn").unwrap();
+        sim.inject_frame(Point::<F2>::at(6).coords(), fwd.combiner, fwd.frame);
+        sim.run_for(Duration::from_millis(4000));
+    };
+    let arrived = |sim: &Sim, line: Triple, payload: &[u8]| {
+        let members = line_member_coords::<F2>(line);
+        sim.report()
+            .deliveries()
+            .any(|(recv, from, bytes)| members.contains(&recv) && from == ANONYMOUS && bytes == payload)
+    };
+
+    deliver(&mut sim, line_before, b"before the turn");
+    assert!(arrived(&sim, line_before, b"before the turn"), "the service is reachable at its epoch's line");
+
+    // The turn: nothing is re-negotiated, both ends simply fold the next beacon into the same derivation.
+    deliver(&mut sim, line_after, b"after the turn");
+    assert!(
+        arrived(&sim, line_after, b"after the turn"),
+        "the service must be reachable at the next epoch's line with no out-of-band step — a hidden service \
+         that needs one has not survived the turn"
+    );
+
+    // And the old line is not where it is any more: a client holding `before`'s line reaches nobody with it.
+    assert!(
+        !arrived(&sim, line_before, b"after the turn"),
+        "the payload sent to the NEW line surfaced at the OLD one, so the two lines share a member and this \
+         scenario cannot tell a survived turn from a line that never moved"
     );
 }
 

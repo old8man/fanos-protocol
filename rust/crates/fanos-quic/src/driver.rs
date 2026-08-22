@@ -4550,6 +4550,14 @@ async fn accept_loop(t: Transport) {
                     }
                     WriteOutcome::Bound | WriteOutcome::Unchanged => {}
                 }
+            } else {
+                // **A peer that announced no port is accepted and never filed**, and until 2026-08-22 that
+                // was silent. The comment on the genesis HELLO already names the state — "a HELLO that
+                // somehow escaped unpatched advertises `0`, which reads as *do not file me*: a missing
+                // directory entry, never a wrong one" — but nothing counted it, so a cell where one member
+                // is reachable on an open connection and unresolvable in every table looked exactly like a
+                // cell that had never heard of it. That is the shape the roster fixture freezes in.
+                t.record_station(Station::ConnPeerUnannounced, Some(from), None);
             }
             // Remember the public source address this peer dialed in from, keyed by its proven coordinate:
             // the hub's hole-punch table (#119). When a third party later asks us to broker a connection to

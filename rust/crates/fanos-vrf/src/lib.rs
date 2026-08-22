@@ -1115,6 +1115,122 @@ mod tests {
     use super::*;
     use fanos_field::{F2, F7, F31};
 
+    /// **One identity twice in the claimant set produces a certificate its own peers refuse.**
+    ///
+    /// The live reading this reproduces: three nodes refusing one mover's announcement with
+    /// `ClaimRefusal::SeenAtAnotherIndex`. `seen` is filled from the announced tree alone, so a contradiction
+    /// inside it can only come from the builder — and the builder's input is the claim book plus the node's
+    /// own material. A book that has recorded the node's *own* claim (a self-connection is a real event here:
+    /// the reshuffle deliberately sends to its own point to reach the incumbent) hands
+    /// `deferred_assignment` the same identity twice. The two copies share an output, so they walk the same
+    /// line: the first takes index 0, the second is displaced to index 1, and the tree then names one
+    /// identity at two indices — which the verifier is right to refuse.
+    ///
+    /// The claim is therefore unannounceable, its peers keep resolving it where it used to be, and it cannot
+    /// repair the book that would fix the tree.
+    #[test]
+    fn one_identity_twice_in_the_book_makes_an_unannounceable_claim() {
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let ids: Vec<Vec<u8>> = (0..4).map(|i| alloc::format!("node-{i}").into_bytes()).collect();
+        let material: Vec<(VrfPublic, VrfProof, VrfOutput)> = (0..4u8)
+            .zip(&ids)
+            .map(|(i, id)| {
+                let sk = VrfSecret::from_seed([i; 32]);
+                let (proof, output) = sk.prove(&beacon_alpha(id, epoch, &beacon));
+                (sk.public(), proof, output)
+            })
+            .collect();
+        let honest: Vec<Claimant<'_>> = ids
+            .iter()
+            .zip(&material)
+            .map(|(id, &(public, proof, output))| Claimant { id, public, proof, output })
+            .collect();
+        let Some(first) = honest.first().copied() else { return };
+
+        // The honest set first, so the duplicate below is the only difference between the two runs.
+        if let Some((index, claim)) = deferred_claim::<F2>(0, &honest) {
+            let seat = probe_point::<F2>(&first.output, index);
+            assert!(
+                verify_coordinate_claim_reason::<F2>(&first.public, first.id, epoch, &beacon, &seat, &claim)
+                    .is_ok(),
+                "the honest set must produce an announceable claim, or nothing below is about the duplicate"
+            );
+        }
+
+        // The same set with claimant 0 present twice — what a book that recorded this node's own claim gives.
+        let doubled: Vec<Claimant<'_>> = core::iter::once(first).chain(honest.iter().copied()).collect();
+        let Some((dup_index, dup_claim)) = deferred_claim::<F2>(0, &doubled) else {
+            return; // seating the duplicate away entirely is also an acceptable outcome
+        };
+        let dup_seat = probe_point::<F2>(&first.output, dup_index);
+        let verdict =
+            verify_coordinate_claim_reason::<F2>(&first.public, first.id, epoch, &beacon, &dup_seat, &dup_claim);
+        assert_eq!(
+            verdict.err(),
+            Some(ClaimRefusal::SeenAtAnotherIndex),
+            "a duplicated identity must be refused for the reason the live cell reported, or this is a \
+             reproduction of some other defect"
+        );
+    }
+
+    /// **Every claim the assignment produces must verify against the rule that judges it.**
+    ///
+    /// `deferred_claim` builds a claim — an index and one witness per skipped step — from a node's own
+    /// `deferred_assignment`, and `verify_coordinate_claim_reason` is what a *peer* runs on it. The two are
+    /// written independently and nothing made them agree, so a node could announce a seat it is entitled to
+    /// in a form no peer accepts. That is not a hypothetical: three live nodes were measured refusing one
+    /// mover's announcement with `ClaimRefusal::SeenAtAnotherIndex` — one identity appearing at two indices
+    /// inside a single tree, which can only come from the builder, since `seen` is filled from that tree
+    /// alone.
+    ///
+    /// This is the deterministic half of that investigation: no network, no epoch, no timing — just the two
+    /// pure functions, over the load factors where displacement actually happens.
+    #[test]
+    fn every_claim_the_assignment_produces_verifies_under_the_rule_that_judges_it() {
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        for population in [2usize, 3, 5, 7, 9, 12] {
+            let secrets: Vec<VrfSecret> =
+                (0..population).map(|i| VrfSecret::from_seed([u8::try_from(i).unwrap_or(0); 32])).collect();
+            let ids: Vec<Vec<u8>> = (0..population).map(|i| alloc::format!("node-{i}").into_bytes()).collect();
+            let material: Vec<(VrfPublic, VrfProof, VrfOutput)> = secrets
+                .iter()
+                .zip(&ids)
+                .map(|(sk, id)| {
+                    let alpha = beacon_alpha(id, epoch, &beacon);
+                    let (proof, output) = sk.prove(&alpha);
+                    (sk.public(), proof, output)
+                })
+                .collect();
+            let claimants: Vec<Claimant<'_>> = ids
+                .iter()
+                .zip(&material)
+                .map(|(id, &(public, proof, output))| Claimant { id, public, proof, output })
+                .collect();
+
+            for (me, mine) in claimants.iter().enumerate() {
+                let Some((index, claim)) = deferred_claim::<F2>(me, &claimants) else {
+                    continue; // unseated: every point of its line is better held, which is a legal outcome
+                };
+                let seat = probe_point::<F2>(&mine.output, index);
+                let verdict = verify_coordinate_claim_reason::<F2>(
+                    &mine.public,
+                    mine.id,
+                    epoch,
+                    &beacon,
+                    &seat,
+                    &claim,
+                );
+                assert!(
+                    verdict.is_ok(),
+                    "population {population}, claimant {me}: the assignment seats it at index {index} and \
+                     the verifier refuses its own certificate with {:?} — a node cannot announce a seat it \
+                     is entitled to, so its peers keep resolving it where it used to be",
+                    verdict.unwrap_err()
+                );
+            }
+        }
+    }
+
     /// Seating is not free, and the cost falls as the plane grows.
     ///
     /// A coordinate is a uniform draw; collisions are resolved by the probe walk, which is confined to the

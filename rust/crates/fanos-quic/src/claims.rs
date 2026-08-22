@@ -174,7 +174,20 @@ impl ClaimBook {
         let book = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mut claimants = Vec::with_capacity(book.peers.len() + 1);
         claimants.push(*me);
-        claimants.extend(book.peers.iter().map(|(_, p)| Claimant {
+        // **This node's own claim is filtered out, and leaving it in produced a certificate nobody accepts.**
+        //
+        // A self-connection is a real event here — the reshuffle deliberately sends to its own point to reach
+        // whoever the directory says holds it — so the verifier can record this node's own claim into its own
+        // book. `deferred_assignment` then sees one identity twice, and because the copies share an output
+        // they walk the same line: the first takes index 0, the second is displaced to index 1. The tree
+        // built from that assignment names one identity at two indices, which
+        // `fanos_vrf::verify_claim_seen` refuses as `ClaimRefusal::SeenAtAnotherIndex` — correctly, since no
+        // assignment seats one node twice.
+        //
+        // Measured 2026-08-22: three peers refusing one mover's announcement with exactly that reason, at
+        // the point it had left, while `transport.self_connection` was non-zero on the same run. Reproduced
+        // deterministically in `fanos_vrf`'s `one_identity_twice_in_the_book_makes_an_unannounceable_claim`.
+        claimants.extend(book.peers.iter().map(|(_, p)| p).filter(|p| p.id != me.id).map(|p| Claimant {
             id: &p.id,
             public: p.public,
             proof: p.proof,

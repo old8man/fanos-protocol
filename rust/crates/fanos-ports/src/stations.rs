@@ -487,6 +487,16 @@ pub enum Station {
     /// stuck cell where two nodes hold no binding for a third turns on that distinction.
     ConnDialFailed,
 
+    /// A peer's connection was **accepted and its coordinate never filed**, because the HELLO announced no
+    /// listen port.
+    ///
+    /// Port `0` reads as *"do not file me"* — the receiver has no address to call back on, so a directory
+    /// entry would be a wrong one rather than a missing one. That is the right refusal and it was invisible:
+    /// the connection is live, frames flow on it, and the coordinate resolves nowhere. A cell with one such
+    /// member looks identical to a cell that never heard of it, which is the state
+    /// `the_whole_cell_resolves_every_member` freezes in.
+    ConnPeerUnannounced,
+
     /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
     /// (#235) — the count of joins currently in progress.
     ///
@@ -1462,6 +1472,7 @@ impl Station {
         Self::HelloClaimStale,
         Self::HelloClaimRefused,
         Self::ConnDialFailed,
+        Self::ConnPeerUnannounced,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
@@ -1550,6 +1561,7 @@ impl Station {
             Self::HelloClaimStale => "hello.claim_stale",
             Self::HelloClaimRefused => "hello.claim_refused",
             Self::ConnDialFailed => "conns.dial_failed",
+            Self::ConnPeerUnannounced => "conns.peer_unannounced",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
@@ -1733,6 +1745,7 @@ impl Station {
             | Self::HelloClaimStale
             | Self::HelloClaimRefused
             | Self::ConnDialFailed
+            | Self::ConnPeerUnannounced
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed
