@@ -804,8 +804,19 @@ The mechanism, with the counter that names each step:
 
 A tree verifies only when the announcer's assignment and the verifier's agree about every holder inside it;
 during convergence they do not. This is placement, not the beacon: the reproduction runs a 600 s epoch inside
-a 240 s window, so **no epoch boundary occurs at all**. Until it is fixed, treat a testnet cell that has not
-converged within a few minutes as one that will not converge, and restart it.
+a 240 s window, so **no epoch boundary occurs at all**.
+
+**And that is only one of two shapes.** The other freezes identically with *no refusal of any kind* — no
+claim refused, no proof rejected, no dial failed — and it is a storage loop rather than an arbitration one:
+`Storage::shard_homes` picks a key's holders from `occupied_points()`, which is each node's **own** peer map.
+A node with a short view writes shards to holders the others never consult, their reads time out
+(`read.inconclusive` at 140–150 per node), the roster stays short, and the view stays short. The two repairs
+that suggest themselves are both already refuted by measurement — placing on the pinned roster froze a
+scenario, and ageing the contact set by the liveness clock turned nine live tests red — so the answer has to
+be an *agreed* live-point set, decided once per epoch, which is a design change rather than a patch.
+
+Until both are fixed, treat a testnet cell that has not converged within a few minutes as one that will not
+converge, and restart it.
 
 
 **Trust in the binary — now checkable, and here is how.** This paragraph said *"releases are unsigned"* until
