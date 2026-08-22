@@ -17,7 +17,7 @@
 //! is simply absent from the roster (a liveness fault, which the assignment already tolerates by running over whoever *did*
 //! verify).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fanos_core::roles::{Capability, CapabilityDescriptor};
 use fanos_diaulos::Coord;
@@ -99,7 +99,29 @@ pub fn parse_bound_advertisement<F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
 ) -> Option<(NodeId, Capability)> {
-    let (entitled, payload) = Entitlement::open::<F>(bytes, coord, epoch, beacon)?;
+    parse_bound_advertisement_ranked::<F>(bytes, coord, epoch, beacon).map(|(id, cap, _)| (id, cap))
+}
+
+/// As [`parse_bound_advertisement`], and **hands back the probe index the entitlement already proved**.
+///
+/// That index is what tells a *vacated* seat from a live one. A node walks its own line forward within an
+/// epoch and never back (`fanos_vrf::deferred_assignment` is monotone in information), and it publishes at
+/// each point it takes — so when one identity holds records at two coordinates, the one it reaches at the
+/// **higher** index is the seat it moved to and the other is the slot it left behind. Both are honestly
+/// signed and both verify: the binding proves "this publisher's walk reaches this point", which is true of
+/// every point it has passed through. Nothing else in the record separates them.
+///
+/// Measured cost of not having it: a five-node cell read its roster as **six** — the same identity answering
+/// at `[1:1:2]` and `[0:1:2]` — and `role_loop` withheld every assignment because the roster it scanned never
+/// matched the cell it was in (`fanos_sim::fabric::the_whole_cell_resolves_every_member`, which fails on
+/// roughly two runs in three).
+pub fn parse_bound_advertisement_ranked<F: Field>(
+    bytes: &[u8],
+    coord: Coord,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> Option<(NodeId, Capability, u16)> {
+    let (entitled, payload, _, index) = Entitlement::open_with_claim::<F>(bytes, coord, epoch, beacon)?;
     let desc = CapabilityDescriptor::from_bytes(payload)?;
     // The roster's *identity* is bound too, not just its coordinate. A node's role-assignment id **is** its coordinate-VRF
     // public key (`node.rs`'s `SelfOrgConfig`), so requiring them equal means an entitled publisher cannot advertise under
@@ -108,7 +130,7 @@ pub fn parse_bound_advertisement<F: Field>(
     if desc.epoch != epoch || desc.node_id.0 != entitled.public.to_bytes() || !desc.verify(&entitled.public) {
         return None;
     }
-    Some((desc.node_id, desc.capability))
+    Some((desc.node_id, desc.capability, index))
 }
 
 /// **Who holds this node's own slot, when it is not this node.**
@@ -241,9 +263,42 @@ pub(crate) async fn build_capability_directory<F: Field>(
     beacon: Option<BeaconSeed>,
 ) -> (Vec<(NodeId, Capability)>, Seating, BTreeSet<usize>, Coverage) {
     let scan = resolve_directory(client, plane_cap_coords::<F>(), move |client, coord| async move {
-        read_capability::<F>(&client, coord, epoch, beacon).await
+        read_capability_ranked::<F>(&client, coord, epoch, beacon).await
     })
     .await;
+    // **A node that moved within the epoch answers at BOTH points, and the roster must count it once.**
+    //
+    // Its advertisement at the seat it left is still published, still signed and still verifies — the
+    // binding proves "this publisher's walk reaches this point", which stays true of every point it has
+    // passed through. So a five-node cell reads as six, and `role_loop` withholds every assignment because
+    // the roster it scanned is not the cell it is in. Measured directly:
+    // `fanos_sim::fabric::the_whole_cell_resolves_every_member` fails on about two runs in three, with one
+    // identity answering at two coordinates in the dump it prints.
+    //
+    // The discriminator is the probe index, and it is a fact rather than a preference: a node walks its line
+    // **forward** within an epoch and never back, so of two records from one identity the one at the higher
+    // index is the seat it moved to. Every reader computes the same answer from the same records, which is
+    // what a roster has to be. A tie is impossible in the intended case (one identity cannot reach one point
+    // at two indices) and is broken by the lower coordinate so that even a malformed set is deterministic.
+    let scan = {
+        let mut best: BTreeMap<NodeId, (u16, Coord)> = BTreeMap::new();
+        for (coord, (id, _, index)) in &scan.found {
+            let seat = (*index, *coord);
+            match best.get(id) {
+                Some(&(held, at)) if (held, at) >= (seat.0, seat.1) => {}
+                _ => {
+                    best.insert(*id, seat);
+                }
+            }
+        }
+        let mut scan = scan;
+        scan.found.retain(|(coord, (id, _, index))| best.get(id) == Some(&(*index, *coord)));
+        scan
+    };
+    let scan = crate::resolve::Scan {
+        found: scan.found.into_iter().map(|(c, (id, cap, _))| (c, (id, cap))).collect(),
+        unknown: scan.unknown,
+    };
     // The third value is what the caller could not previously know: whether this is the whole cell or only the part that
     // answered in time, and by how much it falls short. An assignment derived from a partial view is not a settled
     // answer (`role_loop`), and the shortfall is what distinguishes ordinary jitter from a cell going dark.
@@ -292,7 +347,6 @@ pub async fn read_capability<F: Field>(
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Read<(NodeId, Capability)> {
-    let slot = cap_slot(coord, epoch);
     // Completed. The **caller's** answer is `Absent` whether nothing was published or something unsignable
     // was — and that is right: `Read`'s three values are about what the reader may conclude, not about why.
     // What was wrong is that the *reason* died here too (#109). Nothing published is a quiet slot; something
@@ -303,13 +357,37 @@ pub async fn read_capability<F: Field>(
     // four different reasons — only one of which was "the cell answered and holds nothing". A read that timed
     // out now says so, and `Read::of` maps it to `Unknown` instead of quietly shrinking the roster this
     // function feeds.
+    match read_capability_ranked::<F>(client, coord, epoch, beacon).await {
+        Read::Found((id, cap, _)) => Read::Found((id, cap)),
+        Read::Absent => Read::Absent,
+        Read::Unknown => Read::Unknown,
+    }
+}
+
+/// As [`read_capability`], carrying the **probe index** the record's own entitlement proves.
+///
+/// Only the roster scan wants it, and it wants it for one reason: to tell a seat a node has **left** from the
+/// one it moved to when both slots still answer. See [`parse_bound_advertisement_ranked`].
+///
+/// The unbound path has no index to carry — its record proves no coordinate at all — so it reports `0`, which
+/// is what a cell that does not authenticate placements can say and no more.
+pub(crate) async fn read_capability_ranked<F: Field>(
+    client: &Client,
+    coord: Coord,
+    epoch: Epoch,
+    beacon: Option<BeaconSeed>,
+) -> Read<(NodeId, Capability, u16)> {
+    let slot = cap_slot(coord, epoch);
     Read::of(tokio::time::timeout(STORE_TIMEOUT, client.read(slot)).await.ok(), |b| {
         let (gate, parsed) = match beacon {
             Some(seed) => (
                 crate::Gate::BoundCapabilityAdvertisement,
-                parse_bound_advertisement::<F>(b, coord, epoch, &seed),
+                parse_bound_advertisement_ranked::<F>(b, coord, epoch, &seed),
             ),
-            None => (crate::Gate::CapabilityAdvertisement, parse_advertisement(b, epoch)),
+            None => (
+                crate::Gate::CapabilityAdvertisement,
+                parse_advertisement(b, epoch).map(|(id, cap)| (id, cap, 0)),
+            ),
         };
         note_authentication(client, coord, gate, parsed)
     })
@@ -581,6 +659,46 @@ mod tests {
         }
         // PG(2,7): 57 points, a line holds q + 1 = 8, so 49 of the 57 are unreachable for this publisher.
         assert_eq!(refused, 49, "the forgery is refused at 49 of the plane's 57 points");
+    }
+
+    /// **A vacated seat is the SAME record at a lower probe index**, and that is what tells it from the live one.
+    ///
+    /// One identity, one record, two coordinates on its own walk: both verify, because the binding proves
+    /// *"this publisher's walk reaches this point"* and that stays true of every point it has passed
+    /// through. So a node that moved within an epoch answers at both, a five-node cell reads as six, and
+    /// `role_loop` withholds every assignment because the roster it scanned is not the cell it is in —
+    /// measured as `fanos_sim::fabric::the_whole_cell_resolves_every_member` failing about two runs in
+    /// three, with one identity printed at two coordinates.
+    ///
+    /// The index the entitlement already proves separates them: a node walks its line **forward** within an
+    /// epoch and never back, so of two records from one identity the one at the higher index is the seat it
+    /// moved to. This asserts the two halves that makes true — the same bytes verify at both points, and the
+    /// indices they verify *at* differ and are ordered by the walk.
+    #[test]
+    fn one_record_verifies_at_two_points_and_the_index_says_which_is_current() {
+        let (epoch, beacon) = (Epoch::new(3), BeaconSeed::GENESIS);
+        let (sk, prove) = member(5, epoch, &beacon);
+        let node_id = NodeId(sk.public().to_bytes());
+        let record = bound_advertisement(&prove, &sk, node_id, epoch, cap());
+        let output = fanos_vrf::coordinate_output(&prove.1, &prove.0, epoch, &beacon, &prove.2).unwrap();
+
+        let (left, moved_to) =
+            (fanos_vrf::probe_point::<F7>(&output, 0).coords(), fanos_vrf::probe_point::<F7>(&output, 1).coords());
+        assert_ne!(left, moved_to, "a walk's first two points are distinct, or this fixture proves nothing");
+
+        let vacated = parse_bound_advertisement_ranked::<F7>(&record, left, epoch, &beacon);
+        let current = parse_bound_advertisement_ranked::<F7>(&record, moved_to, epoch, &beacon);
+        assert_eq!(
+            (vacated.map(|(_, _, i)| i), current.map(|(_, _, i)| i)),
+            (Some(0), Some(1)),
+            "the SAME bytes verify at both points — the entitlement proves a walk, not a seat — and the \
+             indices they verify at are the walk's own order"
+        );
+        assert_eq!(
+            vacated.map(|(id, _, _)| id),
+            current.map(|(id, _, _)| id),
+            "and both name one identity, which is why a roster keyed by coordinate counts it twice"
+        );
     }
 
     #[test]

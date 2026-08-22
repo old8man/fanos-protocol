@@ -2146,7 +2146,6 @@ where
             beacon: genesis_seed,
             settling: Arc::clone(&handle.settling),
             walk_after: None,
-            settle_floor: None,
             rounds: 0,
             addressed: None,
             deep: Vec::new(),
@@ -2352,6 +2351,28 @@ struct Placement {
     /// to 15 points and 13 lines, and six boundaries do not recover it — because after the first one no node
     /// is permitted to resolve anything.
     ///
+    /// ⛔ **A FLOOR under this door was tried on 2026-08-21 and reverted the same night, with the reasoning
+    /// kept because the argument for it still looks right.** The argument: at a boundary every claim book in
+    /// the cell is cleared, `commit_seat` fires within a role-loop refresh, so a node can commit **before it
+    /// has heard the peer that outranks it** — and the established arm then forbids exactly the move that
+    /// would resolve the contest. Measured support: at `n = 10` after a boundary, `probe_index` went from
+    /// `[2,0,0,0,-1,…]` (one node walking, one with no seat at all) to `[0,…,1,1,0,1]` (three walking, none
+    /// stranded) once the window was held open for the walk's own bound, `probe_bound × HELLO_DEADLINE`.
+    ///
+    /// **What refuted it is the cost, and it took four runs per configuration to see** — the failure it
+    /// causes is intermittent, and a single-run bisect said the opposite. `the_whole_cell_resolves_every_member`
+    /// fails **2 of 4** runs with the floor and **0 of 4** without it: holding the window open for 30 s of
+    /// every 60 s epoch keeps nodes moving, so the roster scan never reads a settled cell, ranked bindings
+    /// lag the moves (`route [3,3,3,4,4]` of five peers), and reads at the coordinates that moved do not
+    /// conclude. The occupancy it was meant to buy never appeared either: below-floor samples went 7 → 11 of
+    /// 36, inside one draw's spread.
+    ///
+    /// So the door is right and a *timed* floor is not the fix. What the argument still wants is a floor on
+    /// the **fact** rather than on the clock — "nothing above has derived from this placement" is what the
+    /// flag names, and `commit_seat`'s self-read is a lower bound on it that fires too early. A cheaper
+    /// candidate than a timer: refuse the commit while this node's own claim book is smaller than the
+    /// membership it can see, which is the state the early commit actually happens in.
+    ///
     /// So the window is re-entered at every boundary and closed by the fact it always named: **the cell has
     /// read this placement.** Shared rather than owned because only the layer above knows that
     /// ([`Client::commit_seat`]) — the role loop already computes it, since a node that cannot find its own
@@ -2385,23 +2406,6 @@ struct Placement {
     /// contains a walk with room to spare — see the ceiling that implies: `epoch >= (q+1) · HELLO_DEADLINE`
     /// caps the plane at `q = 59` for the 600 s default.
     walk_after: Option<tokio::time::Instant>,
-    /// **The earliest the settling window may close** — the floor under the layer above's `commit_seat`.
-    ///
-    /// `Placement::settling` is re-entered at every boundary and closed by `Client::commit_seat` when the cell can
-    /// read this node's placement. That fact arrives *fast* — the role loop finds its own advertisement within a
-    /// refresh — and it is not the fact the rule needs: at a boundary every claim book in the cell was just cleared,
-    /// so a node can commit before it has heard the peer that outranks it, and the established arm then forbids the
-    /// very move that would resolve the contest. Measured on `PG(2,2)` at `n = 10` with books refilled to 7–8 of 9:
-    /// **every** node reading `probe_index = 0` while seven of them shared five points.
-    ///
-    /// The floor is the walk's own bound rather than a chosen delay: a step is rate-limited to
-    /// [`HELLO_DEADLINE`] (a peer learns a new seat by completing a handshake, and that is this driver's bound on
-    /// how long one may take) and there are `probe_bound = q + 1` of them, so `(q + 1) · HELLO_DEADLINE` is how long
-    /// resolution can take on this plane — 30 s at `q = 2`, inside every epoch period this build ships.
-    ///
-    /// It re-opens the window rather than refusing the commit, because the commit is a true statement (the cell
-    /// *can* read this node) and the window is the thing that was wrong. `None` before the first boundary.
-    settle_floor: Option<tokio::time::Instant>,
     /// Resettle rounds spent in the current window, bounded by the walk itself.
     ///
     /// **The window needs a floor as well as a door, and the first version had only a door.** Closing on
@@ -2794,13 +2798,6 @@ async fn reshuffle_loop<F: Field>(
             },
             () = book.changed() => Wake::Resettle,
         };
-        // **Hold the settling window open until the floor passes**, whoever closed it. `commit_seat` closes it on a
-        // true statement — the cell can read this node — that is simply not the question at a boundary, where every
-        // book in the cell was just emptied and a node can commit before it has heard the claim that outranks it.
-        // Re-opened here rather than refused there, because the layer that knows the floor is this one.
-        if at.settle_floor.is_some_and(|until| tokio::time::Instant::now() < until) {
-            at.settling.store(true, Ordering::Release);
-        }
         match wake {
             Wake::Beacon(epoch, seed) => {
                 // Rotate the PROTEUS wire shape to the new epoch FIRST (§13.4 moving target): the polymorphism
@@ -2852,9 +2849,6 @@ async fn reshuffle_loop<F: Field>(
                 // third of them for good. `Station::SeatCommitted` moved with the fact it reports, to
                 // `Client::commit_seat`, where the commitment actually happens.
                 at.settling.store(true, Ordering::Release);
-                // The window may not close again until the walk's own bound has passed — see `settle_floor`.
-                at.settle_floor =
-                    Some(tokio::time::Instant::now() + HELLO_DEADLINE * u32::from(fanos_vrf::probe_bound::<F>()));
                 at.rounds = 0;
                 at.walk_after = None;
                 // Every claim in the book was just discarded, so every member is worth asking again — and the
@@ -6546,7 +6540,7 @@ mod tests {
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
-            walk_after: None, settle_floor: None, rounds: 0, addressed: None, deep: Vec::new(),
+            walk_after: None, rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // The unit tests drive  directly; a dropped receiver makes every dial a no-op, which
@@ -6651,7 +6645,7 @@ mod tests {
                 epoch: Epoch::ZERO,
                 beacon: BeaconSeed::GENESIS,
                 settling: Arc::new(AtomicBool::new(true)),
-            walk_after: None, settle_floor: None, rounds: 0, addressed: None, deep: Vec::new(),
+            walk_after: None, rounds: 0, addressed: None, deep: Vec::new(),
             },
             Reseater {
                 // **The receiver is kept here**, unlike the neighbouring case: this one asserts what the
