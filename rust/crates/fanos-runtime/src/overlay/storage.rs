@@ -1011,6 +1011,13 @@ impl<F: Field> OverlayNode<F> {
 ///
 /// Rotating by the digest makes the window a function of the key — every peer is asked for some keys, no
 /// member is permanently invisible, and for any one key the choice stays deterministic.
+///
+/// ⚠️ **It does not measurably move the fixture that found it, and the first reading said it did.** Six runs
+/// after the change came back 5 green, against a pooled ~9 failures in ~19 runs before it; eight more came
+/// back **3** green, for 8 of 14 overall — indistinguishable from the ~47 % that was there already. The
+/// change stays because the defect it removes is proven independently (delete the rotation and the coverage
+/// test names the four of seven members that are never asked), not because it fixed the flake. Whatever
+/// keeps `the_whole_cell_resolves_every_member` red at roughly one run in two is still unfound.
 fn read_window(peers: &mut Vec<Triple>, width: usize, digest: &[u8; DIGEST]) {
     let span = peers.len();
     if span > 1 {
