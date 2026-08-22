@@ -1379,7 +1379,16 @@ impl Client {
     /// This node's driver-side readings, to be folded into the engine's answer to `Observe`.
     #[must_use]
     pub fn driver_stations(&self) -> Vec<Observation> {
-        self.stations.lock().unwrap_or_else(PoisonError::into_inner).observations()
+        let mut plane = self.stations.lock().unwrap_or_else(PoisonError::into_inner).observations();
+        // **Folded in on read, not recorded on the event**, because the site that refuses a stale claim is
+        // the HELLO verify closure — built before the station plane exists (`spawn_inner` creates it) and
+        // holding no handle to it. The book both sides already share carries the count instead, and a
+        // reading is a reading: `observations()` does not clear, so folding a current total in here reports
+        // the same quantity the rest of the plane reports.
+        if let Some(stale) = self.claims.as_ref().map(ClaimBook::stale).filter(|&n| n > 0) {
+            plane.push(Observation { station: Station::HelloClaimStale, line: None, tag: None, count: stale });
+        }
+        plane
     }
 
     /// **Is this node on its way out?** — the discriminator that makes an actor's ending readable (#257).
@@ -2228,6 +2237,11 @@ fn self_certifying_identity<F: Field + 'static>(
                 // epoch's placement, and admitting it here would let a retired placement justify a displacement now.
                 if epoch == verify_book.epoch() {
                     verify_book.record(peer_cert, peer.public, peer.proof, &peer.output);
+                } else {
+                    // The drop above is deliberate and it is also **silent**, which is the part that cost a
+                    // measurement: a book that stops growing looks the same whether the peer never announced,
+                    // announced unjudgeably, or announced perfectly against an epoch this node has left.
+                    verify_book.note_stale();
                 }
             }
             HelloVerdict::Ok(Box::new(result))
@@ -4642,7 +4656,7 @@ async fn read_verified_hello(
     match verify(&cert, &hello) {
         HelloVerdict::Ok(result) => PeerHello::Answered(result),
         HelloVerdict::BadProof => {
-            t.record_station(Station::HelloProofRejected, None, None);
+            t.record_station(Station::HelloProofRejected, None, index_tag(&hello));
             PeerHello::Refused
         }
         HelloVerdict::EpochUnknown => {
@@ -4932,6 +4946,12 @@ fn apply_move(t: &Transport, conn: &Connection, from: Triple, moved: Triple) -> 
     moved
 }
 
+/// The probe index a refused HELLO claimed, as a station tag — see
+/// [`hello_claim_index`](crate::identity::hello_claim_index) for why a refusal without it is ambiguous.
+fn index_tag(hello: &[u8]) -> Option<u64> {
+    crate::identity::hello_claim_index(hello).map(u64::from)
+}
+
 /// The peer's **new** coordinate from a mid-connection `HELLO`, if it verifies and actually differs from `known`.
 ///
 /// `None` when there is no self-certifying identity to check against (a build that never verified coordinates cannot start
@@ -4947,7 +4967,7 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
             HelloResult::Incompatible(_) => None,
         },
         HelloVerdict::BadProof => {
-            t.record_station(Station::HelloProofRejected, Some(known), None);
+            t.record_station(Station::HelloProofRejected, Some(known), index_tag(frame));
             None
         }
         HelloVerdict::EpochUnknown => {
@@ -4991,7 +5011,7 @@ fn rejudge_pending(t: &Transport, conn: &Connection, known: Triple) -> Option<Tr
         map.remove(&conn.stable_id());
     }
     let HelloVerdict::Ok(result) = verdict else {
-        t.record_station(Station::HelloProofRejected, Some(known), None);
+        t.record_station(Station::HelloProofRejected, Some(known), index_tag(&hello));
         return None;
     };
     let HelloResult::Established { coord, .. } = *result else {
@@ -5040,15 +5060,32 @@ async fn deliver_attested(t: &Transport, body: &[u8], frame: &[u8]) -> bool {
         }
         return true;
     }
-    let Some(origin) = t.identity.as_ref().and_then(|id| match (id.verify)(cert, hello) {
-        HelloVerdict::Ok(result) => match *result {
-            HelloResult::Established { coord, .. } => Some(coord),
-            HelloResult::Incompatible(_) => None,
+    // **Tagged by WHY, because the four ways this refusal happens want four different repairs** and the
+    // untagged form could not tell them apart. Measured 2026-08-22: a node that had just moved reported 331
+    // of these while its own roster sat at 2 of 5 — with `line` empty and no tag, that number named the
+    // symptom and nothing else. `0` no identity to verify with, `1` incompatible negotiation, `2` bad proof,
+    // `3` an epoch this node cannot judge.
+    let verified = t.identity.as_ref().map(|id| (id.verify)(cert, hello));
+    let origin = match verified {
+        Some(HelloVerdict::Ok(result)) => match *result {
+            HelloResult::Established { coord, .. } => coord,
+            HelloResult::Incompatible(_) => {
+                t.record_station(Station::RelayOriginRefused, None, Some(1));
+                return true;
+            }
         },
-        HelloVerdict::BadProof | HelloVerdict::EpochUnknown => None,
-    }) else {
-        t.record_station(Station::RelayOriginRefused, None, None);
-        return true;
+        Some(HelloVerdict::BadProof) => {
+            t.record_station(Station::RelayOriginRefused, None, Some(2));
+            return true;
+        }
+        Some(HelloVerdict::EpochUnknown) => {
+            t.record_station(Station::RelayOriginRefused, None, Some(3));
+            return true;
+        }
+        None => {
+            t.record_station(Station::RelayOriginRefused, None, Some(0));
+            return true;
+        }
     };
     let attested = crate::identity::vrf_public_from_cert(cert)
         .is_some_and(|pk| pk.verify(&relay_alpha(target, inner), &proof).is_some());

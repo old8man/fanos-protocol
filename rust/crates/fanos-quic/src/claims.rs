@@ -106,6 +106,12 @@ pub(crate) struct ClaimBook {
 struct Book {
     epoch: Epoch,
     peers: BoundedMap<[u8; 32], PeerClaim>,
+    /// Claims that **verified and were refused** because they prove an epoch this book has left.
+    ///
+    /// Counted here rather than at the refusal site because the refusal happens inside the HELLO verify
+    /// closure, which is built before the driver's station plane exists and has no handle to it. The book
+    /// is the one object both the verifier and the reader already share.
+    stale: u64,
 }
 
 impl Default for ClaimBook {
@@ -119,7 +125,7 @@ impl ClaimBook {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Book { epoch: Epoch::ZERO, peers: BoundedMap::new(CAPACITY) })),
+            inner: Arc::new(Mutex::new(Book { epoch: Epoch::ZERO, peers: BoundedMap::new(CAPACITY), stale: 0 })),
             changed: Arc::new(Notify::new()),
         }
     }
@@ -222,6 +228,17 @@ impl ClaimBook {
     #[must_use]
     pub(crate) fn epoch(&self) -> Epoch {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner).epoch
+    }
+
+    /// Note a claim that verified against an epoch this book has already left — see [`Book::stale`].
+    pub(crate) fn note_stale(&self) {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).stale += 1;
+    }
+
+    /// How many verified claims this book has refused for proving a retired epoch.
+    #[must_use]
+    pub(crate) fn stale(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).stale
     }
 
     /// The number of peers whose coordinate claims are recorded this epoch.

@@ -784,6 +784,30 @@ instead.
 
 Verified against the code, not copied from an earlier claim:
 
+**⛔ A cell converges about half the time, and a cell that does not stays broken.** This is the one finding a
+founding operator has to read before anything else on this page, and it was measured on 2026-08-22 rather
+than argued: five nodes on `PG(2,4)` over ideal links, repeated on two fixed draws, resolved every occupied
+coordinate on **4 of 8 runs**. The failures are not slow — after the harness gave up, a further **245 s** of
+watching changed nothing, twice.
+
+The mechanism, with the counter that names each step:
+
+1. A node loses its preferred point and walks to probe index `k` (`k = 3` in the reproduction).
+2. Its move announcement carries the `k` witnesses the claim format requires, built from **its own**
+   assignment; its peers refuse the whole claim — `hello.proof_rejected@<the point it left>#3`, where the tag
+   is that index.
+3. Frames relayed to it are refused the same way — `transport.relay_origin_refused#2` (tag 2 is `BadProof`),
+   331–1444 of them, and only on the mover.
+4. So its peers keep resolving it at the point it left, its own roster collapses to 2 of 5, and it cannot
+   repair the claim book that would make its tree acceptable — because nobody will accept the claim that
+   would make them talk to it.
+
+A tree verifies only when the announcer's assignment and the verifier's agree about every holder inside it;
+during convergence they do not. This is placement, not the beacon: the reproduction runs a 600 s epoch inside
+a 240 s window, so **no epoch boundary occurs at all**. Until it is fixed, treat a testnet cell that has not
+converged within a few minutes as one that will not converge, and restart it.
+
+
 **Trust in the binary — now checkable, and here is how.** This paragraph said *"releases are unsigned"* until
 2026-08-21. What ships now is the pair that has to exist together, because neither half is worth much alone:
 

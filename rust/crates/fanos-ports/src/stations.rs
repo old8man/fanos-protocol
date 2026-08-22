@@ -458,6 +458,15 @@ pub enum Station {
     /// not reaching the frames, and a run where both are high is a cell whose beacon spreads slowly.
     HelloRejudged,
 
+    /// A peer's claim **verified and was not filed**, because it proves an epoch this node has already left.
+    ///
+    /// Deliberate — a retired placement must not justify a displacement now — and therefore invisible: the
+    /// book simply does not grow, which reads identically to a peer that never announced. It is the third
+    /// of the three ways a claim fails to reach a book, beside `hello.epoch_unknown` (arrived unjudgeable)
+    /// and `hello.rejudged` (arrived unjudgeable, recovered later), and it was the one with no counter
+    /// while a stuck draw sat at 4 of 9 books filled with full connectivity.
+    HelloClaimStale,
+
     /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
     /// (#235) — the count of joins currently in progress.
     ///
@@ -1430,6 +1439,7 @@ impl Station {
         Self::HelloProofRejected,
         Self::HelloEpochUnknown,
         Self::HelloRejudged,
+        Self::HelloClaimStale,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
@@ -1515,6 +1525,7 @@ impl Station {
             Self::HelloProofRejected => "hello.proof_rejected",
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::HelloRejudged => "hello.rejudged",
+            Self::HelloClaimStale => "hello.claim_stale",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
@@ -1695,6 +1706,7 @@ impl Station {
             | Self::HelloProofRejected
             | Self::HelloEpochUnknown
             | Self::HelloRejudged
+            | Self::HelloClaimStale
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed

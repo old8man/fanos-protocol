@@ -376,6 +376,27 @@ pub(crate) fn hello_epoch(hello: &[u8]) -> Option<Epoch> {
     Some(Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?)))
 }
 
+/// The **probe index** a HELLO claims, for labelling a refusal.
+///
+/// A claim at index `k` is required to carry exactly `k` witnesses
+/// (`fanos_vrf::verify_coordinate_claim_output`), each one proving the point at the previous step is held by
+/// a better claimant. So "the proof did not verify" has two very different meanings depending on this
+/// number: at index 0 the peer's own VRF proof failed, and above it the *witness chain* did — which a node
+/// can only assemble from a claim book that knows who beat it. Refusals that carry no index and refusals
+/// that all sit at index 1 are different defects, and without this they render identically.
+#[must_use]
+pub(crate) fn hello_claim_index(hello: &[u8]) -> Option<u16> {
+    let (frame, _) = decode_frame(hello).ok()?;
+    if frame.frame_type() != Some(FrameType::Hello) {
+        return None;
+    }
+    let body = frame.body;
+    if body.len() < HELLO_MIN_BODY_LEN {
+        return None;
+    }
+    Some(u16::from_be_bytes(body.get(CLAIM_INDEX_AT..CLAIM_INDEX_AT + 2)?.try_into().ok()?))
+}
+
 /// Peek the coordinate a HELLO *claims*, without verifying it. Paired with [`hello_epoch`], and read from
 /// the same fixed head — the claim sits at `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN`, right after the epoch.
 ///
