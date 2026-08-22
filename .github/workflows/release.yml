@@ -88,6 +88,19 @@ jobs:
           toolchain: $(rustc --version)
           recipe:    cargo build --release --locked -p fanos-node -p fanos-cli
           EOF
+          # **The BINARY digests, because they are the reproducible ones and the archive is not.**
+          #
+          # `ci.yml`'s `reproducible` job compares `fanos` and `fanos-verify` byte for byte across two source
+          # paths and two target directories. It says nothing about the tar.gz — archive bytes carry
+          # timestamps, ownership and ordering that no rebuild reproduces — so publishing only
+          # `${name}.tar.gz.sha256` asked an operator to check the artefact that *cannot* be re-derived while
+          # withholding the one that can. The header above tells them to "run the same three lines and
+          # compare hashes"; until these lines existed there was nothing to compare against.
+          #
+          # These are also what a maintainer countersignature has to be over, for the same reason: a
+          # statement about a digest nobody else can compute convinces nobody.
+          ( cd "dist/${name}" && shasum -a 256 fanos fanos-verify > SHA256SUMS )
+          cp "dist/${name}/SHA256SUMS" "dist/${name}.SHA256SUMS"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           echo "name=${name}" >> "$GITHUB_OUTPUT"
@@ -111,4 +124,4 @@ jobs:
           gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$version" --repo "$GITHUB_REPOSITORY" --title "$version" --generate-notes
           gh release upload "$version" --repo "$GITHUB_REPOSITORY" --clobber \
-            "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256"
+            "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256" "dist/${name}.SHA256SUMS"

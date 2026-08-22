@@ -187,6 +187,14 @@ impl ClaimBook {
         // Measured 2026-08-22: three peers refusing one mover's announcement with exactly that reason, at
         // the point it had left, while `transport.self_connection` was non-zero on the same run. Reproduced
         // deterministically in `fanos_vrf`'s `one_identity_twice_in_the_book_makes_an_unannounceable_claim`.
+        //
+        // ⚠️ **It does not measurably move `the_whole_cell_resolves_every_member`, and the first batch said
+        // it did.** Eight runs after came back 7 green; eight more came back 4, for **11 of 16** against a
+        // pooled 10 of 19 before — indistinguishable. That is the third fix in one session to look decisive
+        // over six-to-eight runs and regress to the baseline over sixteen, so the filter is kept on its
+        // deterministic reproduction and not on a rate. Whatever dominates that fixture is still unfound;
+        // the standing suspicion is its own premise, since 5 nodes on `PG(2,4)` is below `erasure::N = 7`
+        // occupied points and the store cannot place a full shard set at all.
         claimants.extend(book.peers.iter().map(|(_, p)| p).filter(|p| p.id != me.id).map(|p| Claimant {
             id: &p.id,
             public: p.public,

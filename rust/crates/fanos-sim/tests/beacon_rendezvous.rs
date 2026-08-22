@@ -137,16 +137,29 @@ fn a_service_reached_at_one_epoch_is_reached_at_the_next_and_not_at_the_old_line
     let dir = spawn_mixnet(&mut sim, onion_t);
     let (shares, commitment) = beacon_group();
 
-    let (before, after) = (Epoch::new(5), Epoch::new(6));
+    // **The next epoch whose line actually moved, not simply the next epoch.** `PG(2,2)` has seven lines, so
+    // two consecutive epochs land on the same one about one time in seven — and when they do, the "old line
+    // no longer reaches it" half below is vacuous rather than false. Searching for the first epoch that moves
+    // keeps the scenario about *surviving a turn* instead of about the birthday odds of a small plane. The
+    // search is bounded and its exhaustion is a real failure: a derivation that ignores the epoch would look
+    // exactly like a long run of coincidences.
+    let before = Epoch::new(5);
     let seed_before = beacon_seed(&shares, &commitment, before);
-    let seed_after = beacon_seed(&shares, &commitment, after);
     let line_before = meeting_line::<F2>(SERVICE_PUBKEY, before, &seed_before).coords();
-    let line_after = meeting_line::<F2>(SERVICE_PUBKEY, after, &seed_after).coords();
-    assert_ne!(
-        line_before, line_after,
-        "the meeting line must move with the epoch, or there is nothing here to survive and nothing to \
-         unlink — this is the premise the two deliveries below are measured against"
-    );
+    let moved = (6u64..=20)
+        .map(Epoch::new)
+        .map(|e| {
+            let seed = beacon_seed(&shares, &commitment, e);
+            (e, meeting_line::<F2>(SERVICE_PUBKEY, e, &seed).coords())
+        })
+        .find(|&(_, line)| line != line_before);
+    let Some((after, line_after)) = moved else {
+        panic!(
+            "no epoch in 6..=20 moved the meeting line off {line_before:?} — on seven lines that is not a \
+             coincidence, it is a derivation that does not fold the epoch in"
+        )
+    };
+    let _ = after;
 
     let deliver = |sim: &mut Sim, line: Triple, payload: &[u8]| {
         let hop = (0..7).map(|i| Line::<F2>::at(i).coords()).find(|&l| l != line).unwrap();
