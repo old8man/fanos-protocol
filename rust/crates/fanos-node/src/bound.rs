@@ -53,7 +53,7 @@
 
 use fanos_diaulos::Coord;
 use fanos_field::Field;
-use fanos_geometry::Point;
+use fanos_geometry::{HierAddr, Point};
 use fanos_primitives::BeaconSeed;
 use fanos_rendezvous::Epoch;
 use fanos_vrf::{VrfOutput, VrfProof, VrfPublic, coordinate_output, probe_index_of};
@@ -120,6 +120,43 @@ impl Entitlement {
         Some((me, payload))
     }
 
+    /// Split a bound record and verify its publisher is entitled to a **seat in the address trie** — the
+    /// sub-cell counterpart of [`open`](Self::open), which can only speak about the base plane.
+    ///
+    /// The two halves of "entitled" are answered by two different things, and separating them is what makes
+    /// a sub-cell record checkable at all:
+    ///
+    /// * **Key possession** — the same VRF proof [`open`](Self::open) checks. Only the holder of the secret
+    ///   can produce it, so a record is not forgeable by anyone who merely knows the certificate.
+    /// * **Seat membership** — a *recomputation*, not a proof. `coordinate_at_level(cert, level)` is a pure
+    ///   function of the publisher's certificate, so the reader re-derives the address the identity descends
+    ///   to and compares it, level by level, with the seat's own. If the identity derives this address, this
+    ///   address **is** its seat; no signature can say more than the derivation already does.
+    ///
+    /// This is why a descended node keeping its transport coordinate is not the obstacle it looked like: the
+    /// seat was never a claim about the transport point. What it deliberately does **not** establish is the
+    /// *depth* — `hierarchical_coordinate` descends while its `occupied` predicate says a level is full, and
+    /// that predicate is local knowledge. A node may therefore publish at a seat deeper than it occupies,
+    /// which is a liveness claim about an absent node and is caught the way every other absence is: by the
+    /// parent sampling the child.
+    pub fn open_at_seat<'a, F: Field>(
+        bytes: &'a [u8],
+        seat: &HierAddr<F>,
+        epoch: Epoch,
+        beacon: &BeaconSeed,
+    ) -> Option<(Self, &'a [u8])> {
+        let (me, payload) = Self::split(bytes)?;
+        // Key possession first: a mismatch below is a wrong seat, and a wrong seat by an unauthenticated
+        // publisher is not worth distinguishing from noise.
+        coordinate_output(&me.public, &me.id, epoch, beacon, &me.proof)?;
+        let derives_this_seat = seat
+            .points()
+            .iter()
+            .enumerate()
+            .all(|(level, point)| fanos_quic::coordinate_at_level::<F>(&me.id, level) == *point);
+        derives_this_seat.then_some((me, payload))
+    }
+
     /// As [`open`](Self::open), and **hands back the claim it had to compute anyway**.
     ///
     /// Opening a bound record already derives the writer's `VrfOutput` and asks `probe_index_of` where the
@@ -151,6 +188,64 @@ impl Entitlement {
 mod tests {
     use super::*;
     use fanos_field::F2;
+
+    /// A sub-cell seat opens for the identity that **derives** it, and for no other seat on the path.
+    ///
+    /// Both halves are asserted because either alone is a hole. Acceptance alone would pass with a check that
+    /// admits everything; refusal alone would pass with one that admits nothing — and "admits nothing" is
+    /// exactly the state this replaced, so it is the failure mode most likely to come back.
+    ///
+    /// Falsified before it was trusted: replacing the level comparison in `open_at_seat` with `true` reddens
+    /// the second assertion, and dropping the VRF check reddens the third.
+    #[test]
+    fn a_sub_cell_seat_opens_for_the_identity_that_derives_it() {
+        use fanos_field::F4;
+        use fanos_geometry::HierAddr;
+        use fanos_vrf::{VrfSecret, prove_coordinate};
+
+        let (epoch, beacon) = (Epoch::new(9), BeaconSeed::GENESIS);
+        let sk = VrfSecret::from_seed([7u8; 32]);
+        let id = b"a certificate, as far as the descent is concerned".to_vec();
+        let (_, proof) = prove_coordinate::<F4>(&sk, &id, epoch, &beacon);
+        let record = Entitlement::encode(&id, &sk.public(), &proof, b"payload");
+
+        // The address this identity descends to, level by level — the same function the node itself walks.
+        let mine = HierAddr::root(fanos_quic::coordinate_at_level::<F4>(&id, 0))
+            .descended(fanos_quic::coordinate_at_level::<F4>(&id, 1))
+            .expect("a depth-2 address exists below the root");
+        assert_eq!(
+            Entitlement::open_at_seat::<F4>(&record, &mine, epoch, &beacon).map(|(_, p)| p),
+            Some(&b"payload"[..]),
+            "a member could not open the sub-cell seat its own certificate derives, so no sub-cell can \
+             publish at all"
+        );
+
+        // A neighbouring seat of the same cell: same prefix, a point this identity does not derive.
+        let elsewhere = fanos_geometry::fano::cell_members_of::<F4>(0)
+            .expect("PG(2,4) splits into cells")
+            .coords()
+            .iter()
+            .filter_map(|&c| Point::<F4>::new(c))
+            .find(|p| Some(p) != mine.points().get(1))
+            .expect("a cell has more than one seat");
+        let wrong = HierAddr::root(fanos_quic::coordinate_at_level::<F4>(&id, 0))
+            .descended(elsewhere)
+            .expect("the neighbour is an address too");
+        assert!(
+            Entitlement::open_at_seat::<F4>(&record, &wrong, epoch, &beacon).is_none(),
+            "a seat accepted a record whose identity descends elsewhere: one member then fills every seat of \
+             the cell, and everything folded from those seats is one identity's opinion seven times"
+        );
+
+        // Key possession is still required: the same identity bytes with somebody else's proof.
+        let theirs = prove_coordinate::<F4>(&VrfSecret::from_seed([8u8; 32]), &id, epoch, &beacon).1;
+        let forged = Entitlement::encode(&id, &sk.public(), &theirs, b"payload");
+        assert!(
+            Entitlement::open_at_seat::<F4>(&forged, &mine, epoch, &beacon).is_none(),
+            "a seat opened for a record nobody proved a key for — the descent is public, so the VRF proof is \
+             the whole of what separates the holder from anyone who has seen its certificate"
+        );
+    }
 
     #[test]
     fn a_malformed_record_is_refused_rather_than_panicking() {

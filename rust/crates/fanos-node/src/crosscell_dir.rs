@@ -568,17 +568,10 @@ pub async fn resolve_committee<F: Field>(
     epoch: Epoch,
     beacon: BeaconSeed,
 ) -> Option<ChildCommittee> {
-    // ⛔ **A sub-cell's seats cannot be opened yet, and the refusal is here rather than in a comment.** Each record is
-    // authenticated by an `Entitlement` against *the seat's own coordinate* — which for a base-cell member is its
-    // transport point and therefore checkable from the plane alone. A descended node **keeps its transport
-    // coordinate** (`on_descend`: "the transport coordinate does not move"), so a sub-cell seat's publisher proves a
-    // point that has nothing to do with the seat it sits on, and nothing here can bridge the two. What would: the §80
-    // descriptor already signs `(coord, hier, id)`, so a record carrying that signature binds the publisher to its
-    // *address* instead of to a coordinate. Until it does, a parent that reads a sub-cell committee would be reading
-    // unauthenticated bytes, and reading none is the safe direction.
-    if cell.level() > 1 {
-        return None;
-    }
+    // A sub-cell's seats open too, and the bridge is a *recomputation* rather than the descriptor signature this
+    // refusal used to wait for: `coordinate_at_level` is a pure function of the publisher's certificate, so a reader
+    // re-derives the address the identity descends to and compares it with the seat's own. Key possession still comes
+    // from the entitlement's VRF proof. See `open_seat_record`.
     let members = cell.seats()?;
     let mut verifiers = Vec::with_capacity(fano::N);
     for (seat, &point) in members.coords().iter().enumerate() {
@@ -588,8 +581,8 @@ pub async fn resolve_committee<F: Field>(
         )
         .await
         {
-            Ok(Some(bytes)) => Entitlement::open::<F>(&bytes, point, epoch, &beacon)
-                .and_then(|(_, payload)| HybridVerifier::decode(payload)),
+            Ok(Some(bytes)) => open_seat_record::<F>(&bytes, cell, seat, point, epoch, &beacon)
+                .and_then(HybridVerifier::decode),
             // Silent, unreachable, or a record that does not open at this seat — all three are "this parent
             // has not learned seat `seat`", and none of them is a statement about the child's other six.
             _ => None,
@@ -625,11 +618,33 @@ pub async fn resolve_health<F: Field>(
         else {
             continue; // a silent or unreachable member is an erasure, not a clean block
         };
-        if let Some(report) = open_health::<F>(&bytes, point, epoch, beacon) {
+        if let Some(report) = open_health::<F>(&bytes, cell, seat, point, epoch, beacon) {
             answered.push(report);
         }
     }
     fold_member_reports(&answered)
+}
+
+/// Open a seat's bound record: by the **base plane's** entitlement at level 1, by the **address trie** below it.
+///
+/// One function because the two are the same question asked of two different structures — "is this publisher
+/// entitled to this seat?" — and splitting the call sites is how the sub-cell case stayed unanswered for a
+/// release. See [`Entitlement::open_at_seat`](crate::bound::Entitlement::open_at_seat) for why a descended
+/// node keeping its transport coordinate is not the obstacle it appeared to be.
+fn open_seat_record<'a, F: Field>(
+    bytes: &'a [u8],
+    cell: &CellPath<F>,
+    seat: usize,
+    point: Triple,
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+) -> Option<&'a [u8]> {
+    if cell.level() == 1 {
+        Entitlement::open::<F>(bytes, point, epoch, beacon).map(|(_, payload)| payload)
+    } else {
+        let address = cell.member_address(seat)?;
+        Entitlement::open_at_seat::<F>(bytes, &address, epoch, beacon).map(|(_, payload)| payload)
+    }
 }
 
 /// The inverse of the publish encoding — and, when `beacon` is `Some`, the **authentication** the federated
@@ -655,7 +670,9 @@ pub async fn resolve_health<F: Field>(
 #[must_use]
 fn open_health<F: Field>(
     bytes: &[u8],
-    seat: Triple,
+    cell: &CellPath<F>,
+    seat: usize,
+    point: Triple,
     epoch: Epoch,
     beacon: Option<BeaconSeed>,
 ) -> Option<Report> {
@@ -665,7 +682,7 @@ fn open_health<F: Field>(
             // slot makes available and a per-cell one could not. Under the old rule a record was admitted
             // from a member of the cell *somewhere*, so one member could fill all seven seats and the
             // majority fold below would be a majority of one identity's opinions.
-            let (_, payload) = Entitlement::open::<F>(bytes, seat, epoch, &seed)?;
+            let payload = open_seat_record::<F>(bytes, cell, seat, point, epoch, &seed)?;
             payload.to_vec()
         }
         None => bytes.to_vec(),
@@ -766,10 +783,11 @@ pub async fn diagnose_children<F: Field>(
     beacon: Option<BeaconSeed>,
 ) -> ChildDiagnosis {
     let mut resolved: [Option<Report>; federation::CHILDREN] = [None; federation::CHILDREN];
-    // Level 1 only, for the reason `resolve_committee` states: below it the per-seat `Entitlement` proves a coordinate
-    // that has nothing to do with the seat, so a covering run on those records would localize faults from bytes nobody
-    // is bound to — and this covering localizes *confidently*.
-    let (Some(members), 1) = (cell.seats(), cell.level()) else { return ChildDiagnosis::from_resolved(&resolved) };
+    // Every level, now that a sub-cell seat is checkable (`open_seat_record`). It was level 1 only while the per-seat
+    // `Entitlement` could speak about the base plane alone — and this covering localizes *confidently*, so reading
+    // records nobody is bound to would have put invented evidence into a decoder that moves blame rather than adding
+    // noise.
+    let Some(members) = cell.seats() else { return ChildDiagnosis::from_resolved(&resolved) };
     let key = cell.encode();
     for (seat, (slot, &point)) in resolved.iter_mut().zip(members.coords().iter()).enumerate() {
         // `beacon: None` reads the bare byte, which is what a build with no self-certifying identity writes
@@ -779,7 +797,7 @@ pub async fn diagnose_children<F: Field>(
         else {
             continue; // silent, unreachable, or unauthenticated — all three land in `ChildDiagnosis::silent`
         };
-        *slot = open_health::<F>(&bytes, point, epoch, beacon);
+        *slot = open_health::<F>(&bytes, cell, seat, point, epoch, beacon);
     }
     // SELF-REPORTED, and the distinction is load-bearing: these masks are what each child says about *itself*, so a child
     // controlling its own eight coordinates could otherwise relocate blame onto a healthy sibling — the Golay decoder
@@ -983,6 +1001,7 @@ mod tests {
 
         let (epoch, beacon, cell) = (Epoch::new(4), BeaconSeed::GENESIS, 1u32);
         let members = fano::cell_members_of::<F4>(cell as usize).expect("PG(2,4) splits into three cells");
+        let path = CellPath::<F4>::base_cell(cell as usize).expect("the same three cells, as a path");
         let report = Report { axes: 0b010_1101, bus_fault: true };
 
         let sealed = |seed: u8| {
@@ -1012,7 +1031,7 @@ mod tests {
 
         let own = members.coords().get(mine).copied().expect("the seat exists");
         assert_eq!(
-            open_health::<F4>(&record, own, epoch, Some(beacon)).map(|r| (r.axes, r.bus_fault)),
+            open_health::<F4>(&record, &path, mine, own, epoch, Some(beacon)).map(|r| (r.axes, r.bus_fault)),
             Some((report.axes, report.bus_fault)),
             "a member could not publish at the seat it holds, so no cell can report at all — and the payload \
              must survive the envelope, since an authenticated record decoding to something else is a \
@@ -1021,7 +1040,7 @@ mod tests {
         for (seat, &point) in members.coords().iter().enumerate() {
             if seat != mine {
                 assert!(
-                    open_health::<F4>(&record, point, epoch, Some(beacon)).is_none(),
+                    open_health::<F4>(&record, &path, seat, point, epoch, Some(beacon)).is_none(),
                     "seat {seat} accepted a record entitled to seat {mine}: one member then fills all seven \
                      and the majority below is a majority of one identity's opinions"
                 );

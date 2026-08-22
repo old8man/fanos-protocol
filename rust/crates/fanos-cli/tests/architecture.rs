@@ -421,11 +421,11 @@ const UNWIRED_BUDGET: &[(&str, usize)] = &[
     // 2 → 3 (2026-08-21), and the reason is that the consumer is blocked rather than absent.
     // `CellPath::{children_of, member_address}` are the answer to "which cells are a parent's children" —
     // a pure function of the parent's own address, which is what `crosscell_dir::attest_children` was
-    // missing when it had no caller. What still blocks that caller is one level down: a **sub-cell's**
-    // records cannot be authenticated, because a descended node keeps its transport coordinate while its
-    // overlay address becomes `P ++ [s]`, so the per-seat `Entitlement` proves a point unrelated to the
-    // seat. `resolve_committee` and `diagnose_children` refuse below level 1 on purpose until the §80
-    // descriptor signature is folded into that envelope. Two accessors this raise would also have covered
+    // missing when it had no caller. The level below it is no longer what blocks: a sub-cell's records ARE
+    // authenticated now (`Entitlement::open_at_seat` — key possession from the VRF proof, seat membership
+    // from re-deriving `coordinate_at_level` off the publisher's certificate), so `resolve_committee` and
+    // `diagnose_children` read every level. What keeps them in this budget is the plain thing the budget is
+    // for: nobody calls them yet. Two accessors this raise would also have covered
     // (`base`, `parent_address`) were **deleted** instead — nothing needed them, and a budget is not a
     // place to park convenience.
     ("fanos-geometry", 3),

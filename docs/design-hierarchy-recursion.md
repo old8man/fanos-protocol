@@ -102,6 +102,33 @@ depth `d` receives `n / 7^d` nodes), and a cell with fewer than three occupied p
 anything, whatever the arithmetic says. So this decision fixes the *structure*; it does not make diagnosis
 available everywhere in the tree, and a deployment should expect it at the levels that are full.
 
+## Authenticating a sub-cell's records — the bridge is a recomputation, not a new envelope
+
+`crosscell_dir::{resolve_committee, diagnose_children}` refused `cell.level() > 1` for a release: a seat's
+record is opened by an `Entitlement` against *the seat's own coordinate*, and a descended node **keeps its
+transport coordinate** (`on_descend`), so its entitlement proves a point unrelated to the seat it occupies.
+
+That refusal's own note proposed carrying the §80 descriptor signature. That was half of what is needed, and
+the other half needs no cryptography at all — which is why what shipped (`Entitlement::open_at_seat`) is
+smaller than the note expected:
+
+1. **Seat membership is RECOMPUTABLE.** `fanos_quic::identity::coordinate_at_level(cert_der, level)` is a
+   pure function of the certificate (`fanos_primitives::address_point`). A reader holding the record's
+   certificate re-derives the publisher's coordinate at *every* level and compares it against the `CellPath`
+   prefix it is reading. If the identity hashes to this path, this path **is** its seat — no proof, no
+   signature, no extra bytes.
+2. **Key possession is what the entitlement already proves.** The VRF proof in the record is producible only
+   by the holder of the secret, so a record is not forgeable by anyone who has merely *seen* the certificate
+   — which matters precisely because the descent half is public. (The §80 descriptor signature the original
+   note reached for binds a transport *address*; the seat never was a claim about the transport point, so it
+   is not what this needed.)
+
+**What this deliberately does not prove is the DEPTH.** `hierarchical_coordinate` descends while its
+`occupied` predicate reports the level full — local knowledge, unverifiable remotely — so a node can publish
+at a seat deeper than it occupies. That is a liveness claim about an absent node, and absence is already a
+fault under the nesting model decided above, with the parent's sampling as its instrument. It is detected
+rather than trusted, which is the same standing every other absence has here.
+
 ## Why scale-invariance holds — and the honest caveat
 
 The projective structure is identical at every level (`S(2,3,7)` for `q = 2`), so the localization pyramid
