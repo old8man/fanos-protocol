@@ -819,6 +819,24 @@ Until both are fixed, treat a testnet cell that has not converged within a few m
 converge, and restart it.
 
 
+**Rolling upgrades are transparent to placement, and the reason is structural rather than a tuned window.**
+Traced 2026-08-22 through `fanos_runtime::overlay`: `self.peers` is written in exactly two ways — inserted on
+contact, and replaced wholesale in `on_reseat` when *this* node moves. **Nothing evicts a peer.** A node's
+coordinate is `VRF(identity, epoch, beacon)`, so a node restarted with the same `--identity` file comes back
+to the same point, and while it is down its peers keep it in `occupied_points()` — the set that drives shard
+placement. So an operator may restart nodes one at a time without the cell re-placing anything, and there is
+no upgrade window to keep under a re-heal window, because the re-heal is not triggered.
+
+Two things that follows from, and an operator should know both:
+
+* **Restart with the same identity file, always.** A node restarted *without* it draws a new coordinate and
+  is a different member as far as the cell is concerned — that is the case that does force a re-heal.
+* **The converse is a known limit**: because nothing evicts, a node that leaves for good is never removed
+  from its peers' occupancy view either. The clock-based version of that eviction was tried and reverted —
+  reading `last_seen` against the 1.6 s liveness timeout turned nine live tests red, because occupancy asks
+  "is there a node at that point" while liveness asks "did we hear from it just now". Departures are handled
+  by membership and the healer, not by ageing contact.
+
 **Trust in the binary — now checkable, and here is how.** This paragraph said *"releases are unsigned"* until
 2026-08-21. What ships now is the pair that has to exist together, because neither half is worth much alone:
 
