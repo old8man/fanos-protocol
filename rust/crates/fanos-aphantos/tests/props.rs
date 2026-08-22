@@ -76,7 +76,7 @@ proptest! {
         // Structural parse, per-member decapsulation, and padding must all fail gracefully.
         let _ = ThresholdSealed::from_bytes(&bytes);
         let _ = member_partial::<F2>(&bytes, index, &secret);
-        let _ = pad_onion(&bytes);
+        let _ = pad_onion(&bytes, 3);
 
         // Reconstruction over attacker-chosen shares (arbitrary x, arbitrary-length y, possibly
         // duplicate indices) must not divide by zero or panic — only ever Err.

@@ -467,6 +467,16 @@ pub enum Station {
     /// while a stuck draw sat at 4 of 9 books filled with full connectivity.
     HelloClaimStale,
 
+    /// **Which** of the eight ways a coordinate claim can fail to verify fired — the tag is
+    /// `fanos_vrf::ClaimRefusal`'s discriminant.
+    ///
+    /// Beside [`HelloProofRejected`](Self::HelloProofRejected), which counts *that* a claim was refused and
+    /// (by its tag) at which probe index. The two together separate a forgery from a **disagreement**: a
+    /// claim at index `k` carries `k` witnesses built from the announcer's own assignment, so
+    /// `WitnessNotSeated`/`WitnessDoesNotBeat` mean two nodes do not agree about who holds a third point —
+    /// and re-sending will never fix that.
+    HelloClaimRefused,
+
     /// A connection whose peer could not be judged is being **held open anyway**, in the restricted state
     /// (#235) — the count of joins currently in progress.
     ///
@@ -1440,6 +1450,7 @@ impl Station {
         Self::HelloEpochUnknown,
         Self::HelloRejudged,
         Self::HelloClaimStale,
+        Self::HelloClaimRefused,
         Self::PeerUnjudged,
         Self::RestrictedFrameAdmitted,
         Self::RestrictedRoundServed,
@@ -1526,6 +1537,7 @@ impl Station {
             Self::HelloEpochUnknown => "hello.epoch_unknown",
             Self::HelloRejudged => "hello.rejudged",
             Self::HelloClaimStale => "hello.claim_stale",
+            Self::HelloClaimRefused => "hello.claim_refused",
             Self::PeerUnjudged => "hello.peer_unjudged",
             Self::RestrictedFrameAdmitted => "hello.restricted_frame_admitted",
             Self::RestrictedRoundServed => "hello.restricted_round_served",
@@ -1707,6 +1719,7 @@ impl Station {
             | Self::HelloEpochUnknown
             | Self::HelloRejudged
             | Self::HelloClaimStale
+            | Self::HelloClaimRefused
             | Self::PeerUnjudged
             | Self::RestrictedFrameAdmitted
             | Self::RestrictedRoundServed

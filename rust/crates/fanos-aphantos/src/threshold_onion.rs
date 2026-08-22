@@ -16,7 +16,7 @@ use fanos_threshold::{NONCE_LEN, ThresholdError, ThresholdSealed};
 use crate::slots;
 
 /// The seal's own surface, re-exported so a caller working at the onion level reaches both halves through one path.
-pub use fanos_threshold::THRESHOLD_ONION_LEN;
+pub use fanos_threshold::onion_len;
 pub use fanos_threshold::pad_onion as pad;
 
 // The peeled command byte, fixed by the canonical Tessera layout (`fanos_wire::tessera::command`):
@@ -333,7 +333,7 @@ mod tests {
     use super::*;
     use fanos_pqcrypto::SeedRng;
     use fanos_field::{F2, F4, F5, F7};
-    use fanos_threshold::{THRESHOLD_ONION_LEN, pad_onion};
+    use fanos_threshold::{onion_len, pad_onion};
 
     fn line(n: usize, seed: u8) -> Vec<(HybridKemSecret, HybridKemPublic)> {
         (0..n)
@@ -396,7 +396,7 @@ mod tests {
             slots::header_len(3) + slots::payload_len(3).unwrap(),
             "and the width is the plane's, not an accident of this payload"
         );
-        assert_eq!(first, THRESHOLD_ONION_LEN, "which is the bucket the previous layout already paid for");
+        assert_eq!(first, onion_len(3), "which is the bucket the previous layout already paid for");
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         let mut onion = seal_onion(&hops, t, payload, b"circuit-seed").unwrap();
         assert_eq!(
             onion.len(),
-            THRESHOLD_ONION_LEN,
+            onion_len(3),
             "the built onion is the fixed bucket size"
         );
 
@@ -517,7 +517,7 @@ mod tests {
                     onion = inner;
                     assert_eq!(
                         onion.len(),
-                        THRESHOLD_ONION_LEN,
+                        onion_len(3),
                         "each hop stays constant-size"
                     );
                 }
@@ -632,7 +632,7 @@ mod tests {
 
     /// A circuit built on one plane is refused on every other — loudly, before a secret is touched (#112).
     ///
-    /// Nothing in the bytes says which plane they are for. The total is [`THRESHOLD_ONION_LEN`] on *every* plane, so
+    /// The total is [`onion_len`] of the *reader's own* plane, which is the width this guard checks against
     /// length cannot tell; the layout used to declare `slots ‖ slot_len` in a cleartext preamble instead, which both let
     /// a foreign relay parse the packet at the sender's split and published the sender's cell order at a fixed offset
     /// for anyone sorting traffic. Now the split is the reader's own `Plane::<F>::LINE_SIZE`, cross-checked against the
@@ -768,12 +768,12 @@ mod tests {
     #[test]
     fn pad_onion_boundary() {
         // A short onion pads up to the constant bucket.
-        assert_eq!(pad_onion(b"short").unwrap().len(), THRESHOLD_ONION_LEN);
+        assert_eq!(pad_onion(b"short", 3).unwrap().len(), onion_len(3));
         // Exactly the bucket size is a no-op pad (0 filler), still Ok.
-        let exact = alloc::vec![0u8; THRESHOLD_ONION_LEN];
-        assert_eq!(pad_onion(&exact).unwrap().len(), THRESHOLD_ONION_LEN);
+        let exact = alloc::vec![0u8; onion_len(3)];
+        assert_eq!(pad_onion(&exact, 3).unwrap().len(), onion_len(3));
         // One byte over the bucket cannot be padded down.
-        let over = alloc::vec![0u8; THRESHOLD_ONION_LEN + 1];
-        assert!(matches!(pad_onion(&over), Err(ThresholdError::TooLong)));
+        let over = alloc::vec![0u8; onion_len(3) + 1];
+        assert!(matches!(pad_onion(&over, 3), Err(ThresholdError::TooLong)));
     }
 }

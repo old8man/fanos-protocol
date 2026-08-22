@@ -60,7 +60,7 @@ pub enum ThresholdError {
     Sharing,
     /// A KEM ciphertext failed to parse.
     Kem,
-    /// The built onion would exceed the fixed [`THRESHOLD_ONION_LEN`] bucket (path too long).
+    /// The built onion would exceed its plane's [`onion_len`] bucket (path too long).
     TooLong,
     /// The hybrid KEM's X25519 leg produced a non-contributory (low-order-point) shared secret —
     /// a malformed or malicious member key (audit B5, defense-in-depth per X-Wing guidance).
@@ -86,18 +86,72 @@ impl core::fmt::Display for ThresholdError {
 
 impl core::error::Error for ThresholdError {}
 
-/// The fixed on-the-wire size of a threshold onion. Every hop's packet is padded to this constant
-/// bucket, so a passive observer cannot link hops by the shrinking layer size a naive nested onion
-/// leaks (spec §5.7). Sized to hold a Fano threshold circuit of several hops. Packet **size** is
-/// fully constant on the wire. (Residual, documented: the per-layer `ct_len` in the header is
-/// cleartext, so a party holding the *decrypted* packet — an on-path relay, or an observer of an
-/// un-encrypted hop — can read the layer size; the encrypting transport hides it from a passive
-/// network observer, and full defence-in-depth field hiding is the flat-header Sphinx construction.)
-/// It is a network-wide parameter — every node must agree on it — sized for the deepest supported
-/// threshold circuit (each hop costs `≈ line_size × 1169` bytes of KEM-sealed shares).
-pub const THRESHOLD_ONION_LEN: usize = 20480;
+/// The **command** inside an onion slot: `tag(1) ‖ operand(32) ‖ payload_key(32)`.
+///
+/// Defined here rather than in `fanos_aphantos::slots` (which re-exports it) so that
+/// [`onion_len`] below can be *derived* from the slot geometry instead of chosen. The layering is
+/// the right way round: a slot is a threshold-onion concept, and the crate that pads onions is the one that
+/// has to know how wide one is.
+pub const ONION_CMD_LEN: usize = 1 + 32 + 32;
 
-/// Pad a threshold onion to the constant [`THRESHOLD_ONION_LEN`] bucket with keystream filler that
+/// The width of one onion slot on a plane whose lines hold `line_size` members.
+///
+/// `nonce ‖ len(2) ‖ members(4) ‖ command ‖ tag ‖ line_size × sealed share` — every part a constant of this
+/// crate except the line size, which is a network-wide parameter.
+#[must_use]
+pub const fn onion_slot_len(line_size: usize) -> usize {
+    NONCE_LEN + 2 + 4 + ONION_CMD_LEN + TAG_LEN + line_size * SEALED_SHARE_LEN
+}
+
+/// Hops a circuit must reach — `fanos_aphantos::slots::TARGET_DEPTH`, which asserts the two agree at compile
+/// time. Here because the budget is derived from it.
+pub const ONION_TARGET_DEPTH: usize = 3;
+
+/// Bytes the bucket leaves for the payload once the hops are paid for.
+///
+/// **Measured, not chosen, and the measurement is a failure**: `fanos_aphantos::slots` records that a payload
+/// shortage at `q = 2` "broke every full anonymous session under budget-filling". This is exactly what the
+/// shipped 20 480 left there (`20480 − 3 × 3606`), so naming it changes nothing about `q = 2` — it just stops
+/// the number from being an unexplained remainder. Deriving the bucket as `(TARGET_DEPTH + 1) × slot_len`
+/// alone would have cut it 2.7×, which is the trap this constant exists to mark.
+pub const ONION_PAYLOAD_TARGET: usize = 9662;
+
+/// The fixed on-the-wire size of a threshold onion **on a plane whose lines hold `line_size` members**.
+///
+/// Every hop's packet is padded to this bucket, so a passive observer cannot link hops by the shrinking layer
+/// size a naive nested onion leaks (spec §5.7). (Residual, documented: the per-layer `ct_len` in the header is
+/// cleartext, so a party holding the *decrypted* packet — an on-path relay, or an observer of an un-encrypted
+/// hop — can read the layer size; the encrypting transport hides it from a passive network observer, and full
+/// defence-in-depth field hiding is the flat-header Sphinx construction.)
+///
+/// **Derived, and per plane — both halves are corrections of what shipped.**
+///
+/// It was `20480`: a round number whose doc said it was "sized to hold a Fano threshold circuit", i.e. derived
+/// for `q = 2` and nothing else. That silently capped the whole protocol's plane order at three, because
+/// `plane_can_anonymize` asks whether the bucket still reaches `TARGET_DEPTH` hops with a payload slot left
+/// over, and at `q = 4` it did not. Four independent arguments push the order *up* — Byzantine line ownership,
+/// single-fault localization, the innate code's strength, and the anonymity set itself — and all four were
+/// held by this one number.
+///
+/// The parameter is per plane because everything else already is (`slot_len`, `depth_for`, `payload_len`,
+/// `nested_seal_len`, `Packet::line_size`), and because the alternative charges every deployment for the
+/// widest plane anyone might run: sizing one global bucket for `q = 4` costs a `q = 2` network 34 % on every
+/// packet, cover traffic included, for capacity it will never use.
+///
+/// **What that trades away, stated where the claim used to live**: `threshold_onion`'s cross-plane guard notes
+/// that "the total is `THRESHOLD_ONION_LEN` on *every* plane, so length cannot tell" which plane a packet is
+/// for. That is now false across planes and still true within one — and within one is where it matters, since
+/// `plane_order` is a network-wide parameter and a circuit built on one plane is refused on every other. An
+/// observer who sees two FANOS networks at once already separates them by beacon, directory and node set; the
+/// packet length tells it nothing it did not have. What #112 actually removed — a cleartext `slots ‖ slot_len`
+/// preamble that let a *foreign relay parse the packet* — stays removed.
+#[must_use]
+pub const fn onion_len(line_size: usize) -> usize {
+    let slot = onion_slot_len(line_size);
+    ONION_TARGET_DEPTH * slot + if ONION_PAYLOAD_TARGET > slot { ONION_PAYLOAD_TARGET } else { slot }
+}
+
+/// Pad a threshold onion to its plane's [`onion_len`] bucket with keystream filler that
 /// looks like ciphertext (the receiver's [`ThresholdSealed::from_bytes`] self-delimits and ignores
 /// it). Errors with [`ThresholdError::TooLong`] if the onion already exceeds the bucket.
 ///
@@ -110,13 +164,14 @@ pub const THRESHOLD_ONION_LEN: usize = 20480;
 /// threshold onion's therefore relies **entirely on the encrypting transport (QUIC/TLS)** — it has no
 /// defence-in-depth if that layer is stripped or downgraded. Callers that need parity must run it only
 /// under transport encryption (as the FANOS node does).
-pub fn pad_onion(onion: &[u8]) -> Result<Vec<u8>, ThresholdError> {
-    if onion.len() > THRESHOLD_ONION_LEN {
+pub fn pad_onion(onion: &[u8], line_size: usize) -> Result<Vec<u8>, ThresholdError> {
+    let bucket = onion_len(line_size);
+    if onion.len() > bucket {
         return Err(ThresholdError::TooLong);
     }
-    let mut out = Vec::with_capacity(THRESHOLD_ONION_LEN);
+    let mut out = Vec::with_capacity(bucket);
     out.extend_from_slice(onion);
-    let mut pad = alloc::vec![0u8; THRESHOLD_ONION_LEN - onion.len()];
+    let mut pad = alloc::vec![0u8; bucket - onion.len()];
     fanos_primitives::hash::hash_xof("FANOS-v1/threshold-onion-pad", onion, &mut pad);
     out.extend_from_slice(&pad);
     Ok(out)
@@ -331,12 +386,12 @@ mod tests {
     #[test]
     fn a_padded_onion_is_one_width_whatever_it_carries() {
         // Length is a side channel: a hop must not learn its position from the size of what it forwards.
-        for payload in [0usize, 1, 100, 4096, THRESHOLD_ONION_LEN] {
-            let padded = pad_onion(&alloc::vec![7u8; payload]).expect("within the fixed width");
-            assert_eq!(padded.len(), THRESHOLD_ONION_LEN, "one width for every onion, including an exactly-full one");
+        for payload in [0usize, 1, 100, 4096, onion_len(3)] {
+            let padded = pad_onion(&alloc::vec![7u8; payload], 3).expect("within the fixed width");
+            assert_eq!(padded.len(), onion_len(3), "one width for every onion, including an exactly-full one");
         }
         assert!(
-            pad_onion(&alloc::vec![0u8; THRESHOLD_ONION_LEN + 1]).is_err(),
+            pad_onion(&alloc::vec![0u8; onion_len(3) + 1], 3).is_err(),
             "over the width is refused, never truncated — truncation would corrupt an onion instead of rejecting it"
         );
     }

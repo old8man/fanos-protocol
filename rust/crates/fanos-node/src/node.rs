@@ -978,7 +978,7 @@ fn spawn_roles<F: Field + 'static>(
             node_id: NodeId(credentials.vrf_secret().public().to_bytes()),
             vrf_secret: credentials.vrf_secret(),
             capability: Capability::new(offered, ROLE_CAPACITY_WEIGHT),
-            capacity: role_capacity(),
+            capacity: role_capacity(Plane::<F>::LINE_SIZE as usize),
             controller: RoleController::new(Demand::default(), Demand::default(), ROLE_GAIN_SEVENTH),
             // A `Node` runs VRF coordinates, so it publishes a coordinate-bound advertisement and verifies everyone
             // else's (`crate::bound`). `None` only in a pinned cell, where the proof cannot exist.
@@ -992,7 +992,7 @@ fn spawn_roles<F: Field + 'static>(
         // reporter writes to. Building a second here — which an earlier edit of this function did, and the
         // unused-parameter warning caught — leaves the exit gauge feeding a sensor nobody publishes from, so the
         // role reads unsensed forever while looking fully wired.
-        move || load.load(offered, role_capacity()),
+        move || load.load(offered, role_capacity(Plane::<F>::LINE_SIZE as usize)),
         // The transport's own peer table, as a lower bound on live membership that owes nothing to the overlay store.
         // The role loop uses it to tell "I am alone" from "I have found no one yet" — see `ROSTER_REFRESH`.
         move || peers.len(),

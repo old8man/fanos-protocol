@@ -397,6 +397,36 @@ pub(crate) fn hello_claim_index(hello: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes(body.get(CLAIM_INDEX_AT..CLAIM_INDEX_AT + 2)?.try_into().ok()?))
 }
 
+/// Why a peer's coordinate claim was refused, as a station tag — `None` when it was not refused, or when the
+/// HELLO is too malformed for the question to mean anything.
+///
+/// Re-parses rather than being threaded out of [`verify_hello`], and that is a deliberate trade: the verify
+/// path is on every handshake and every mid-connection move, while this runs only where one has already been
+/// refused. It reads the same fields from the same offsets — the *reason* is what was missing, not the parse.
+#[must_use]
+pub(crate) fn hello_claim_refusal<F: Field>(
+    peer_cert_der: &[u8],
+    hello: &[u8],
+    beacon: &BeaconSeed,
+) -> Option<u64> {
+    let (frame, _) = decode_frame(hello).ok()?;
+    if frame.frame_type() != Some(FrameType::Hello) {
+        return None;
+    }
+    let body = frame.body;
+    if body.len() < HELLO_MIN_BODY_LEN {
+        return None;
+    }
+    let epoch = Epoch::new(u64::from_be_bytes(body.get(10..18)?.try_into().ok()?));
+    let coord = decode_triple(body.get(HELLO_HEAD_LEN - TRIPLE_WIRE_LEN..HELLO_HEAD_LEN)?)?;
+    let claim = CoordinateClaim::from_bytes(body.get(HELLO_HEAD_LEN..)?)?;
+    let point = Point::<F>::new(coord)?;
+    let public = vrf_public_from_cert(peer_cert_der)?;
+    fanos_vrf::verify_coordinate_claim_reason::<F>(&public, peer_cert_der, epoch, beacon, &point, &claim)
+        .err()
+        .map(fanos_vrf::ClaimRefusal::tag)
+}
+
 /// Peek the coordinate a HELLO *claims*, without verifying it. Paired with [`hello_epoch`], and read from
 /// the same fixed head — the claim sits at `HELLO_HEAD_LEN - TRIPLE_WIRE_LEN`, right after the epoch.
 ///

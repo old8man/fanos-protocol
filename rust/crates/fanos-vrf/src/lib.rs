@@ -450,7 +450,7 @@ pub fn displacement_is_forced<F: Field>(
     beacon: &BeaconSeed,
 ) -> bool {
     let mut seen = Vec::new();
-    forced_by_holder::<F>(claimant, j, witness, epoch, beacon, &mut seen)
+    forced_by_holder::<F>(claimant, j, witness, epoch, beacon, &mut seen).is_ok()
 }
 
 /// [`displacement_is_forced`] sharing one tree's holder table, so a witness reached twice in a justification DAG is
@@ -462,17 +462,19 @@ fn forced_by_holder<'a, F: Field>(
     epoch: Epoch,
     beacon: &BeaconSeed,
     seen: &mut Vec<(&'a [u8], [u8; 32], u16, VrfOutput)>,
-) -> bool {
+) -> Result<(), ClaimRefusal> {
     let contested = probe_point::<F>(claimant, j);
     // The witness must be **seated** at the contested point, not merely want it — so its own claim is checked, against
     // that point, by the same predicate that checks the claimant's. That is the whole of the change from the rule this
     // replaced, and everything else here was already true of it.
-    let Some(witness_output) =
+    let witness_output =
         verify_claim_seen::<F>(&witness.public, &witness.id, epoch, beacon, &contested, &witness.claim, seen)
-    else {
-        return false;
-    };
-    claim_beats((witness.claim.index, &witness_output), (j, claimant))
+            .map_err(|_| ClaimRefusal::WitnessNotSeated)?;
+    if claim_beats((witness.claim.index, &witness_output), (j, claimant)) {
+        Ok(())
+    } else {
+        Err(ClaimRefusal::WitnessDoesNotBeat)
+    }
 }
 
 /// The probe index a node settles at, given whatever peers it can observe — **the retired rule**, kept as the reference
@@ -874,6 +876,41 @@ pub fn verify_coordinate_claim<F: Field>(
     verify_coordinate_claim_output::<F>(claimant_public, claimant_id, epoch, beacon, claimed, claim).is_some()
 }
 
+/// Why a coordinate claim was refused — the discriminant a station tag carries.
+///
+/// Every one of these was `None` until 2026-08-22, and the difference between the first four and the last
+/// two is the difference between a forgery and a *disagreement*: a tree is built from the announcer's own
+/// assignment, so `WitnessNotSeated` and `WitnessDoesNotBeat` mean the two nodes do not agree about who holds
+/// a third point — which no amount of re-sending will fix.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum ClaimRefusal {
+    /// The claimed probe index is past `probe_bound` — the walk has no such step.
+    IndexPastBound = 0,
+    /// The claim carries a number of witnesses other than its index. A claim at step `k` owes exactly `k`.
+    WitnessCountWrong = 1,
+    /// This identity already appears in the tree at a *different* index: one node, two points.
+    SeenAtAnotherIndex = 2,
+    /// The VRF proof does not verify against `(id, epoch, beacon)`.
+    ProofInvalid = 3,
+    /// The proof verifies but its probe walk does not reach the claimed point at this index.
+    PointMismatch = 4,
+    /// The holder table reached the plane's point count — more distinct holders than there are points.
+    HolderTableFull = 5,
+    /// A witness is not itself seated at the point it is offered as the holder of.
+    WitnessNotSeated = 6,
+    /// A witness is seated there but does not *beat* the claimant, so it forces nothing.
+    WitnessDoesNotBeat = 7,
+}
+
+impl ClaimRefusal {
+    /// The discriminant, for a station tag.
+    #[must_use]
+    pub const fn tag(self) -> u64 {
+        self as u64
+    }
+}
+
 /// As [`verify_coordinate_claim`], but returning the claimant's **VRF output** on success.
 ///
 /// The output is what every later comparison needs — it is the claimant's rank, and `probe_index_of` reads it to place any
@@ -889,6 +926,24 @@ pub fn verify_coordinate_claim_output<F: Field>(
     claimed: &Point<F>,
     claim: &CoordinateClaim,
 ) -> Option<VrfOutput> {
+    verify_coordinate_claim_reason::<F>(claimant_public, claimant_id, epoch, beacon, claimed, claim).ok()
+}
+
+/// [`verify_coordinate_claim_output`] carrying **why** it refused — see [`ClaimRefusal`].
+///
+/// The `Option` form stays because most callers only decide admit-or-drop; this one exists for the sites that
+/// have to *report*, and a report that cannot name its cause is what left the roster investigation guessing.
+///
+/// # Errors
+/// Returns the first [`ClaimRefusal`] the tree hits, depth-first in witness order.
+pub fn verify_coordinate_claim_reason<F: Field>(
+    claimant_public: &VrfPublic,
+    claimant_id: &[u8],
+    epoch: Epoch,
+    beacon: &BeaconSeed,
+    claimed: &Point<F>,
+    claim: &CoordinateClaim,
+) -> Result<VrfOutput, ClaimRefusal> {
     let mut seen = Vec::new();
     verify_claim_seen::<F>(claimant_public, claimant_id, epoch, beacon, claimed, claim, &mut seen)
 }
@@ -915,33 +970,42 @@ fn verify_claim_seen<'a, F: Field>(
     claimed: &Point<F>,
     claim: &'a CoordinateClaim,
     seen: &mut Vec<(&'a [u8], [u8; 32], u16, VrfOutput)>,
-) -> Option<VrfOutput> {
+) -> Result<VrfOutput, ClaimRefusal> {
     // The walk cycles after `probe_bound` steps, so an index at or beyond it names a point some lower index already
     // names — while demanding that many more witnesses. Rejecting it keeps a claim's chain as short as the point it
     // reaches actually requires, and denies a claimant the option of presenting a needlessly long one.
     if claim.index >= probe_bound::<F>() {
-        return None;
+        return Err(ClaimRefusal::IndexPastBound);
     }
     if claim.witnesses.len() != usize::from(claim.index) {
-        return None;
+        return Err(ClaimRefusal::WitnessCountWrong);
     }
     let key = claimant_public.to_bytes();
     if let Some(&(_, _, index, output)) = seen.iter().find(|&&(id, pk, _, _)| id == claimant_id && pk == key) {
         // Already established in this tree. Two different seats for one identity is the contradiction, not the repeat.
-        return (index == claim.index && probe_point::<F>(&output, claim.index) == *claimed).then_some(output);
+        if index != claim.index {
+            return Err(ClaimRefusal::SeenAtAnotherIndex);
+        }
+        if probe_point::<F>(&output, claim.index) != *claimed {
+            return Err(ClaimRefusal::PointMismatch);
+        }
+        return Ok(output);
     }
-    let output = claimant_public.verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof)?;
+    let output = claimant_public
+        .verify(&beacon_alpha(claimant_id, epoch, beacon), &claim.proof)
+        .ok_or(ClaimRefusal::ProofInvalid)?;
     if probe_point::<F>(&output, claim.index) != *claimed {
-        return None;
+        return Err(ClaimRefusal::PointMismatch);
     }
     if seen.len() >= Plane::<F>::N as usize {
-        return None; // more distinct holders than the plane has points
+        return Err(ClaimRefusal::HolderTableFull); // more distinct holders than the plane has points
     }
     seen.push((claimant_id, key, claim.index, output));
-    let forced = claim.witnesses.iter().enumerate().all(|(j, w)| {
-        u16::try_from(j).is_ok_and(|j| forced_by_holder::<F>(&output, j, w, epoch, beacon, seen))
-    });
-    forced.then_some(output)
+    for (j, w) in claim.witnesses.iter().enumerate() {
+        let j = u16::try_from(j).map_err(|_| ClaimRefusal::IndexPastBound)?;
+        forced_by_holder::<F>(&output, j, w, epoch, beacon, seen)?;
+    }
+    Ok(output)
 }
 
 /// The VRF input a node proves for its epoch coordinate: `node_id ‖ epoch_low32_be ‖ beacon_seed`

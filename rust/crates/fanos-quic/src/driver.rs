@@ -335,6 +335,10 @@ fn apply_outcome(shaper: &Shaper, controller: &MaybeController, success: bool) {
 /// `(peer_cert_der, peer_hello) →` the negotiation outcome, or `None` to silently reject (bad proof).
 type HelloVerifier = Arc<dyn Fn(&[u8], &[u8]) -> HelloVerdict + Send + Sync>;
 
+/// Why [`HelloVerifier`] refused a claim, as a station tag: `(peer_cert_der, peer_hello) →`
+/// `fanos_vrf::ClaimRefusal`'s discriminant, or `None` when the claim was not the thing that failed.
+type HelloRefusalReason = Arc<dyn Fn(&[u8], &[u8]) -> Option<u64> + Send + Sync>;
+
 /// Why a peer's HELLO was accepted or refused — **three answers, because two of them call for opposite
 /// operator actions** (#236).
 ///
@@ -378,6 +382,14 @@ struct SelfCert {
     /// Not behind a lock, unlike `hello`: the reshuffle rewrites where this node sits, never who it is.
     own_cert: Arc<Vec<u8>>,
     verify: HelloVerifier,
+    /// **Why** [`verify`](Self::verify) refused a claim, for a station tag — see
+    /// [`hello_claim_refusal`](crate::identity::hello_claim_refusal).
+    ///
+    /// A second hook rather than a richer verdict, because the verdict is on every handshake's hot path while
+    /// this is asked only where one has already been refused. It captures the same beacon window `verify`
+    /// does, which is the whole reason it cannot live at the call site: a caller holds the frame and the
+    /// station plane, and not the beacon the claim must be judged against.
+    refusal: HelloRefusalReason,
     /// Prove this node's coordinate for an arbitrary `(epoch, beacon)`: identity bytes, VRF public, and proof.
     ///
     /// A **closure over the credentials**, so the secret never leaves this module while anything that must publish a
@@ -2199,6 +2211,7 @@ fn self_certifying_identity<F: Field + 'static>(
     capabilities: Capabilities,
 ) -> SelfCert {
     let verify_beacon = beacons.clone();
+    let refusal_beacon = beacons.clone();
     let verify_book = book.clone();
     let prover_creds = creds.clone();
     SelfCert {
@@ -2211,6 +2224,11 @@ fn self_certifying_identity<F: Field + 'static>(
         prove: Arc::new(move |epoch, beacon| {
             let (_, proof) = crate::identity::verifiable_coordinate::<F>(&prover_creds, epoch, beacon);
             (prover_creds.cert_der().to_vec(), prover_creds.vrf_secret().public(), proof)
+        }),
+        refusal: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
+            let epoch = hello_epoch(peer_hello)?;
+            let beacon = refusal_beacon.read().ok().and_then(|w| w.beacon_for(epoch))?;
+            crate::identity::hello_claim_refusal::<F>(peer_cert, peer_hello, &beacon)
         }),
         verify: Arc::new(move |peer_cert: &[u8], peer_hello: &[u8]| {
             // Select the beacon for the epoch the peer proves — the current one, or a recent last-good epoch
@@ -4657,6 +4675,7 @@ async fn read_verified_hello(
         HelloVerdict::Ok(result) => PeerHello::Answered(result),
         HelloVerdict::BadProof => {
             t.record_station(Station::HelloProofRejected, None, index_tag(&hello));
+            t.record_station(Station::HelloClaimRefused, None, refusal_tag(t, &cert, &hello));
             PeerHello::Refused
         }
         HelloVerdict::EpochUnknown => {
@@ -4946,6 +4965,11 @@ fn apply_move(t: &Transport, conn: &Connection, from: Triple, moved: Triple) -> 
     moved
 }
 
+/// Which [`ClaimRefusal`](fanos_vrf::ClaimRefusal) a refused HELLO hit, as a station tag.
+fn refusal_tag(t: &Transport, cert: &[u8], hello: &[u8]) -> Option<u64> {
+    t.identity.as_ref().and_then(|id| (id.refusal)(cert, hello))
+}
+
 /// The probe index a refused HELLO claimed, as a station tag — see
 /// [`hello_claim_index`](crate::identity::hello_claim_index) for why a refusal without it is ambiguous.
 fn index_tag(hello: &[u8]) -> Option<u64> {
@@ -4968,6 +4992,7 @@ fn verified_move(t: &Transport, conn: &Connection, frame: &[u8], known: Triple) 
         },
         HelloVerdict::BadProof => {
             t.record_station(Station::HelloProofRejected, Some(known), index_tag(frame));
+            t.record_station(Station::HelloClaimRefused, Some(known), refusal_tag(t, &cert, frame));
             None
         }
         HelloVerdict::EpochUnknown => {
@@ -5012,6 +5037,7 @@ fn rejudge_pending(t: &Transport, conn: &Connection, known: Triple) -> Option<Tr
     }
     let HelloVerdict::Ok(result) = verdict else {
         t.record_station(Station::HelloProofRejected, Some(known), index_tag(&hello));
+        t.record_station(Station::HelloClaimRefused, Some(known), refusal_tag(t, &cert, &hello));
         return None;
     };
     let HelloResult::Established { coord, .. } = *result else {

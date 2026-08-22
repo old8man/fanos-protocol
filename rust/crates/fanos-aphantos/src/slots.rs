@@ -51,7 +51,7 @@
 use alloc::vec::Vec;
 
 use fanos_primitives::hash::hash_xof;
-use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, THRESHOLD_ONION_LEN, ThresholdError};
+use fanos_threshold::{NONCE_LEN, SEALED_SHARE_LEN, ThresholdError, onion_len};
 
 /// The fewest **intermediate** hops a forward circuit needs before its destination line — derived, and the
 /// derivation is what [`TARGET_DEPTH`] rests on.
@@ -104,7 +104,7 @@ pub const MIN_REPLY_DEPTH: usize = MIN_FORWARD_DEPTH;
 ///
 /// A **policy**, not a budget maximum, and the distinction is load-bearing. Filling the cell with slots leaves almost
 /// nothing for the payload — and worse, it makes the payload *shrink* as the cell grows, since a wider cell buys more slots
-/// rather than more room. Measured: doubling `THRESHOLD_ONION_LEN` to 40 960 took the payload from 2 444 B to **1 288 B**.
+/// rather than more room. Measured: doubling `onion_len(line_size)` to 40 960 took the payload from 2 444 B to **1 288 B**.
 /// An experiment that widened the cell to test for a payload shortage therefore tested nothing, and wrongly cleared it.
 ///
 /// It used to say "three hops is what Tor uses". That is true and it is not a derivation — worse, Tor's hop is a
@@ -114,6 +114,10 @@ pub const MIN_REPLY_DEPTH: usize = MIN_FORWARD_DEPTH;
 ///
 /// Capping here also leaves ~9.6 KiB of payload at `q = 2` instead of 2.4.
 pub const TARGET_DEPTH: usize = MIN_FORWARD_DEPTH + 1;
+
+/// The budget in `fanos_threshold` is derived from *its* copy of this depth, and a crate cycle stops it from
+/// importing this one. So the agreement is pinned where a disagreement cannot compile.
+const _: () = assert!(TARGET_DEPTH == fanos_threshold::ONION_TARGET_DEPTH);
 
 /// The number of slots in every header on a plane whose lines hold `line_size` points — and so the ceiling on circuit
 /// depth there: [`TARGET_DEPTH`], or fewer if the plane's slots are too wide to fit that many.
@@ -137,12 +141,12 @@ pub const TARGET_DEPTH: usize = MIN_FORWARD_DEPTH + 1;
 /// still delivers — so it would have shipped the identical defect to anyone running `--plane-order 4`.
 ///
 /// Resulting depths: **3 hops at `q = 2` and `q = 3`, 2 at `q = 4`, 1 at `q = 7`.** The last is honest rather than acceptable:
-/// at that width `THRESHOLD_ONION_LEN` cannot carry a multi-hop circuit *and* a usable payload, and the answer is a wider cell
+/// at that width `onion_len(line_size)` cannot carry a multi-hop circuit *and* a usable payload, and the answer is a wider cell
 /// for wide planes (the budget is a per-deployment parameter) — not a thinner payload.
 #[must_use]
 pub const fn depth_for(line_size: usize) -> usize {
     // `n` slots fit in the bucket; one is reserved for the payload, so `n - 1` may carry hops.
-    match THRESHOLD_ONION_LEN.checked_div(slot_len(line_size)) {
+    match onion_len(line_size).checked_div(slot_len(line_size)) {
         Some(0) | None => 0,
         Some(n) if n - 1 < TARGET_DEPTH => n - 1,
         Some(_) => TARGET_DEPTH,
@@ -158,12 +162,12 @@ pub const fn depth_for(line_size: usize) -> usize {
 /// existed nothing compared them — the platform picked the depth that fit rather than the depth that was
 /// needed, and a circuit one hop short still looks exactly like a circuit.
 ///
-/// At the shipped `THRESHOLD_ONION_LEN` this is true at `q = 2` and `q = 3` and **false at `q = 4` and above**.
+/// At the shipped `onion_len(line_size)` this is true at `q = 2` and `q = 3` and **false at `q = 4` and above**.
 /// That is a real limit and it has a real answer — the onion budget is a per-deployment parameter, so a wide
 /// plane wants a wider onion — but it must be *reported*, not discovered as dials that carry no anonymity.
 #[must_use]
 pub const fn plane_can_anonymize(line_size: usize) -> bool {
-    depth_for(line_size) >= TARGET_DEPTH
+    depth_for(line_size) >= TARGET_DEPTH && onion_len(line_size) <= fanos_wire::frame::MAX_FRAME
 }
 
 /// The largest structure this protocol nests inside an onion payload: a threshold seal to one hop line.
@@ -184,7 +188,7 @@ pub const fn nested_seal_len(line_size: usize) -> usize {
 /// The hop's **payload key** rides here rather than being derived from the threshold layer key, so the seal needs no new API
 /// to hand its reconstructed key back. Deriving it from the *command* instead would be a trap: two hops forwarding to the
 /// same next line would then share a keystream.
-pub const CMD_LEN: usize = 1 + 32 + 32;
+pub use fanos_threshold::ONION_CMD_LEN as CMD_LEN;
 
 /// Offset of the payload key within a command.
 pub const CMD_KEY_AT: usize = 1 + 32;
@@ -195,7 +199,9 @@ pub const CMD_KEY_AT: usize = 1 + 32;
 /// `CMD_LEN` plus the AEAD tag — all fixed once `line_size` is.
 #[must_use]
 pub const fn slot_len(line_size: usize) -> usize {
-    NONCE_LEN + 2 + 4 + CMD_LEN + AEAD_TAG_LEN + line_size * SEALED_SHARE_LEN
+    // Delegated, not restated: `fanos_threshold` derives `onion_len(line_size)` from this same width, and two
+    // spellings of one geometry is how a budget and its consumer drift apart.
+    fanos_threshold::onion_slot_len(line_size)
 }
 
 /// The AEAD tag appended by the seal's ciphertext.
@@ -213,7 +219,7 @@ pub const fn header_len(line_size: usize) -> usize {
 /// silently truncated packet.
 #[must_use]
 pub const fn payload_len(line_size: usize) -> Option<usize> {
-    match THRESHOLD_ONION_LEN.checked_sub(header_len(line_size)) {
+    match onion_len(line_size).checked_sub(header_len(line_size)) {
         Some(n) if n > 4 => Some(n),
         _ => None,
     }
@@ -229,7 +235,7 @@ pub const fn payload_len(line_size: usize) -> Option<usize> {
 ///   possibly be a hop for;
 /// * the sender's cell order sat in the clear at a fixed offset, so a passive observer could sort traffic by it. In a
 ///   deployment running more than one order that is an anonymity-set partition along a line no user chose — and it is
-///   invisible from length alone, since the total is [`THRESHOLD_ONION_LEN`] on *every* plane.
+///   invisible from length alone, since the total is [`onion_len(line_size)`] on *every* plane.
 ///
 /// Derived locally instead, a foreign-plane packet fails to parse. That is the correct outcome rather than a
 /// regression: each slot is threshold-sealed to a line of the **sender's** size, so a relay on another plane could
@@ -280,7 +286,7 @@ impl Packet {
     /// than inside a peel.
     #[must_use]
     pub fn from_bytes(bytes: &[u8], line_size: usize) -> Option<Self> {
-        if bytes.len() != THRESHOLD_ONION_LEN {
+        if bytes.len() != onion_len(line_size) {
             return None;
         }
         let header = bytes.get(..header_len(line_size))?.to_vec();
@@ -389,12 +395,12 @@ mod tests {
         // fixed budget, where the nested layout let a sender exceed both and leak instead.
         // Every plane's header fits its own budget, and the depth it can carry is the legible trade the layout makes.
         for line_size in [3usize, 4, 5, 6, 8] {
-            assert!(header_len(line_size) <= THRESHOLD_ONION_LEN, "line {line_size}: header fits");
+            assert!(header_len(line_size) <= onion_len(line_size), "line {line_size}: header fits");
             assert!(payload_len(line_size).is_some(), "line {line_size}: a payload block remains");
             // Header and payload partition the budget *exactly* — there is nothing else on the wire, on any plane.
             assert_eq!(
                 header_len(line_size) + payload_len(line_size).unwrap(),
-                THRESHOLD_ONION_LEN,
+                onion_len(line_size),
                 "line {line_size}: the two blocks are the whole packet"
             );
         }
@@ -414,11 +420,34 @@ mod tests {
         for (q, line_size) in [(2usize, 3usize), (3, 4), (4, 5)] {
             assert!(depth_for(line_size) >= REPLY_HOPS, "q = {q} must afford a {REPLY_HOPS}-hop reply circuit");
         }
-        assert!(depth_for(8) < REPLY_HOPS, "q = 7 cannot, inside this bucket — a wider cell is required there");
+        // **`q = 7` affords a reply circuit now, and that inversion is the finding.** This line read
+        // `depth_for(8) < REPLY_HOPS` while the bucket was one global 20 KiB: a wider plane got the same
+        // number of bytes and so fewer hops, which made an arbitrary constant the ceiling on the whole
+        // protocol's plane order. With the bucket derived per plane the depth is the *same* everywhere and
+        // what a wider plane costs is bytes, not hops — so the plane order's real caps are the ones that
+        // were always there: `7 | q² + q + 1` for a cell, an epoch long enough to contain a walk, and
+        // roughly `3N/2` operators to cover the plane.
+        for line_size in [3usize, 4, 5, 6, 8, 9, 17, 32] {
+            assert_eq!(
+                depth_for(line_size),
+                TARGET_DEPTH,
+                "line {line_size}: a bucket derived for its own plane affords the target depth everywhere"
+            );
+        }
         assert_eq!(depth_for(3), TARGET_DEPTH, "q = 2 affords the target depth");
         assert_eq!(depth_for(4), TARGET_DEPTH, "q = 3 affords it too");
-        assert_eq!(depth_for(5), 2, "q = 4 affords only two hops once the payload floor is honoured");
-        assert_eq!(depth_for(8), 1, "q = 7 affords only one — the bucket is too narrow for a circuit there");
+        // **`q = 4` reads 3 since 2026-08-22, and this line is where that change had to be stated.** It read 2
+        // for as long as `onion_len(line_size)` was a chosen 20 KiB; the budget is now derived for
+        // `fanos_threshold::WIDEST_SUPPORTED_LINE`, so the widest plane that can hold a Fano cell affords a
+        // full circuit. That is the whole of what admitting `PG(2,4)` required — see
+        // `NodeConfig::plane_order`'s guard, which re-took the default with the numbers.
+        // What a plane's bucket *costs* is the quantity that now varies, and it is what a deployment weighs.
+        assert_eq!(onion_len(3), 20480, "q = 2's bucket is exactly what shipped before the derivation");
+        assert_eq!(onion_len(5), 27494, "q = 4 pays 34 % more per packet for 21 points and three cells");
+        assert!(
+            onion_len(32) < fanos_wire::frame::MAX_FRAME,
+            "even q = 31's 150 KB bucket fits a frame — the wire is not what caps the plane either"
+        );
         // And the payload is what the policy is for: budget-filling left 2.4 KiB, which is smaller than structures this
         // protocol nests *inside* an onion payload (sealing to a 3-member line alone is ~3.5 KiB).
         // **Against the packet's own width, not a copy of it.** `8192` here was `fanos_wire::tessera::TOTAL_LEN`
@@ -460,17 +489,25 @@ mod tests {
 
         // **Nothing on the wire says which plane this is.** The layout used to open with `slots(2) ‖ slot_len(4)`, so
         // the sender's cell order sat in the clear at a fixed offset and a passive observer could sort traffic by it —
-        // a partition of the anonymity set along a line no user chose, invisible from length alone because the total is
-        // the same bucket on every plane. The packet is now the two blocks and nothing else.
+        // a partition of the anonymity set along a line no user chose. The packet is now the two blocks and nothing
+        // else, and every packet *on one network* is the same width, because the plane order is network-wide.
         assert_eq!(bytes.len(), header.len() + payload.len(), "the wire is header ‖ payload, and nothing else");
         assert_eq!(&bytes[..header.len()], &header[..], "no preamble precedes the header");
-        assert_eq!(bytes.len(), THRESHOLD_ONION_LEN, "and it is exactly the budget, on every plane");
+        assert_eq!(bytes.len(), onion_len(line_size), "and it is exactly this plane's budget");
 
-        // A reader on another plane splits the same bytes elsewhere. That is precisely why the split must be the
-        // *reader's* and then be checked against the seal (`open_slot0`): the packet can no longer dictate it, so a
-        // foreign-plane circuit fails loudly instead of being mis-parsed into a peel.
-        let foreign = Packet::from_bytes(&bytes, 5).expect("same total width, different plane");
-        assert_ne!(foreign.header.len(), back.header.len(), "the split is the reader's, not the packet's");
+        // **A foreign-plane packet is now refused by its LENGTH**, and this line used to assert the opposite.
+        //
+        // While the bucket was one global constant, a `q = 4` reader could parse a `q = 2` packet — same total,
+        // different split — and the only thing standing between that and a *cross-plane decryption oracle* was the
+        // member-count comparison inside `open_slot0`. The bucket is derived per plane now, so the widths differ and
+        // the mis-parse cannot begin. What was traded for it: the total no longer hides which plane a packet is for.
+        // That mattered when the fear was a cleartext field naming the order — it does not here, because a deployment
+        // runs one plane order, so within a network every packet is identical in width, and across networks an
+        // observer who sees both already separates them by beacon, directory and node set.
+        assert!(
+            Packet::from_bytes(&bytes, 5).is_none(),
+            "a reader on another plane must refuse this packet outright — its bucket is a different width"
+        );
 
         // Constant width is the layout's premise, so anything else is refused here rather than inside a peel.
         assert!(Packet::from_bytes(&bytes[..bytes.len() - 1], line_size).is_none(), "a truncated packet is refused");

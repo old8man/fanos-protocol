@@ -281,6 +281,9 @@ pub fn spawn_load_publisher(
     load_source: impl Fn() -> Demand + Send + 'static,
     prover: Option<CoordinateProver>,
     points: u32,
+    // Points per line on this node's plane — what the relay capacity derives from, since a wider plane
+    // costs more per gather and so buys fewer of them out of the same budget.
+    line_size: usize,
 ) -> (JoinHandle<()>, oneshot::Receiver<()>) {
     let (ready_tx, ready_rx) = oneshot::channel();
     // Supervised: this actor's death is a capability the node loses, and #106's failure counter — the one
@@ -311,7 +314,7 @@ pub fn spawn_load_publisher(
                 // whole function exists to stop leaving the node.
                 let _ = getrandom::fill(&mut seed_bytes);
                 let mut rng = fanos_pqcrypto::rng::SeedRng::from_seed(&seed_bytes);
-                let reported = privatize(load, crate::role_loop::role_capacity(), points, &mut rng);
+                let reported = privatize(load, crate::role_loop::role_capacity(line_size), points, &mut rng);
                 publish_load(&client, client.address(), epoch, reported, credential.as_ref()).await
             }
         };

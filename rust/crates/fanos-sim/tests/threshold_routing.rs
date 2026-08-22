@@ -386,50 +386,45 @@ fn build_onion_f7(hop_lines: &[Triple], t: u8, payload: &[u8], pubs: &BTreeMap<T
         .collect();
     seal_onion(&hops, t, payload, b"f7-linkability-seed").unwrap_or_else(|e| {
         // **Not an incident — the recorded breakage, named where it lands.** `TooLong` here means the
-        // circuit's `hop_lines.len()` layers do not fit `THRESHOLD_ONION_LEN` at a `PG(2,7)` line size of
+        // circuit's `hop_lines.len()` layers do not fit `onion_len(3)` at a `PG(2,7)` line size of
         // 8, i.e. `depth_for(8) == 1`. Three measurements in this file build 2-hop circuits and therefore
         // die exactly here; before this message they died on a bare `unwrap` and a reader saw the word
         // `TooLong` with nothing to attach it to.
         panic!(
             "sealing a {}-hop PG(2,7) onion failed with {e:?}: the fixed-slot layout allows \
-             depth_for(8) = {} on this plane, so anything past one hop cannot be built. This is the \
-             breakage recorded at fanos-node/src/config.rs (`4ba78c3`, 2026-07-27) and watched by \
-             `the_mixnet_defaults_revision_clock_has_not_rung`; see \
-             `the_three_two_hop_measurements_here_still_cannot_run` for what becomes runnable when it \
-             lifts",
+             depth_for(8) = {} on this plane. This used to be the ordinary state — one global 20 KiB \
+             bucket gave a wider plane fewer hops — and since 2026-08-22 the bucket derives per plane, so \
+             reaching here again means that derivation regressed. See \
+             `the_two_hop_measurements_here_run_and_one_refuses_its_own_premise`",
             hop_lines.len(),
             fanos_aphantos::slots::depth_for(8),
         )
     })
 }
 
-/// The three measurements below that build a **2-hop** `PG(2,7)` circuit cannot run, and this says so out
-/// loud rather than leaving it to whoever passes `--ignored` (#187 (a) part 2).
+/// The three `PG(2,7)` measurements here **ran on 2026-08-22**, and this records what came back (#187 (a)).
 ///
-/// `#[ignore]` was carrying two different states under one reason. Two of the five measurements in this
-/// file — `measure_gpa_timing_on_the_shipping_router` and `measure_what_the_default_plane_actually_delivers`
-/// — do run when asked; the other three abort in [`build_onion_f7`] before producing a single number. A
-/// reader could not tell "a measurement, deliberately not asserted" from "cannot be built on any plane a
-/// deployment dispatches", because both said the same thing.
+/// They were unbuildable for as long as the onion bucket was one global 20 KiB, which gave a wider plane the
+/// same bytes and so fewer hops. The bucket derives per plane now, `depth_for(8)` reaches the target depth,
+/// and all three build. What they produced is in `config.rs`'s
+/// `the_mixnet_defaults_are_the_pair_the_2026_08_22_sweep_examined`, because that is where the debt they owe
+/// is carried.
 ///
-/// **This guard is not the constants' clock repeated.** `config.rs`'s
-/// `the_mixnet_defaults_revision_clock_has_not_rung` watches the same condition for a different debt: the
-/// two shipped anonymity defaults are numbers no dispatchable plane reproduces, and it rings to demand they
-/// be *re-derived*. This one rings to demand these three measurements be *run*. One predicate, two
-/// obligations — so it reads `depth_for` itself rather than restating any number.
+/// **One of the three refuses its own premise, and that is the finding to carry forward**:
+/// `measure_linkability_on_the_shipping_engine` asserts that the *undefended* baseline must be attackable
+/// before any defence is graded, and it measured `0.20` against a chance of `0.20`. So this harness has no
+/// signal for a defence to attenuate, and the two neighbouring sweeps are non-monotone in the same run —
+/// heavier defence scoring worse. Neither is evidence about the shipping engine; both are evidence about the
+/// attacker, which needs replacing rather than re-running.
 #[test]
-fn the_three_two_hop_measurements_here_still_cannot_run() {
+fn the_two_hop_measurements_here_run_and_one_refuses_its_own_premise() {
     const LINE_SIZE: usize = 8; // PG(2,7): q + 1 members on a line
     let depth = fanos_aphantos::slots::depth_for(LINE_SIZE);
     assert!(
-        depth < 2,
-        "`depth_for({LINE_SIZE}) = {depth}` now reaches two hops, so the fixed-slot layout no longer \
-         blocks a PG(2,7) circuit. The three measurements this file `#[ignore]`s for that reason — \
-         measure_the_knee_with_enough_seeds_to_move_a_default, \
-         sweep_the_shipping_engine_for_the_anonymity_cost_knee and \
-         measure_linkability_on_the_shipping_engine — are runnable again. Run them with `--ignored \
-         --nocapture`, read what they say about the shipping mix/cover defaults, and correct their \
-         `#[ignore]` reasons, which currently assert this refusal as a fact"
+        depth >= 2,
+        "`depth_for({LINE_SIZE}) = {depth}` no longer reaches two hops, so these measurements have become \
+         unbuildable again. That is a regression in the onion budget's derivation, not a reason to restore \
+         their old `#[ignore]` reasons — the obligation they carry does not go away by becoming unrunnable"
     );
 }
 
@@ -533,7 +528,7 @@ fn linkability_shipping(mix: Duration, cover: Duration, runs: u64) -> (f64, f64)
 /// With `K = 5` each mis-matched circuit moves the mean by `0.2/runs`, so 8 runs resolve to 0.025 — fine for locating a
 /// knee, not enough to justify moving a security constant. This re-measures the two candidate points at 24 runs.
 #[test]
-#[ignore = "CANNOT RUN: builds a 2-hop PG(2,7) circuit, which depth_for(8) = 1 forbids — it aborts in build_onion_f7 with TooLong, it does not merely go unasserted. Guarded by the_three_two_hop_measurements_here_still_cannot_run"]
+#[ignore = "measurement — run with --ignored --nocapture. Buildable since the onion bucket derives per plane (2026-08-22); its numbers are quoted in config.rs's mixnet-defaults guard"]
 fn measure_the_knee_with_enough_seeds_to_move_a_default() {
     for (name, mix, cover) in [("current default 50/1000", 50u64, 1_000u64), ("candidate     120/500", 120, 500)] {
         let (a, chance) = linkability_shipping(Duration::from_millis(mix), Duration::from_millis(cover), 24);
@@ -547,7 +542,7 @@ fn measure_the_knee_with_enough_seeds_to_move_a_default() {
 /// bandwidth and 10× the added latency. If an intermediate schedule reaches chance, the default is simply mis-set; if the
 /// curve is smooth all the way, it is a genuine trade and belongs to the operator. Measuring rather than assuming which.
 #[test]
-#[ignore = "CANNOT RUN: builds a 2-hop PG(2,7) circuit, which depth_for(8) = 1 forbids — it aborts in build_onion_f7 with TooLong, it does not merely go unasserted. Guarded by the_three_two_hop_measurements_here_still_cannot_run"]
+#[ignore = "measurement — run with --ignored --nocapture. Buildable since the onion bucket derives per plane (2026-08-22); its numbers are quoted in config.rs's mixnet-defaults guard"]
 fn sweep_the_shipping_engine_for_the_anonymity_cost_knee() {
     println!("ThresholdRouter, PG(2,7), 5 circuits, chance 0.20 — mix/cover -> matching accuracy:");
     for (mix, cover) in [(50u64, 1_000u64), (120, 500), (120, 300), (250, 300), (250, 150), (500, 150), (500, 100)] {
@@ -560,7 +555,7 @@ fn sweep_the_shipping_engine_for_the_anonymity_cost_knee() {
 }
 
 #[test]
-#[ignore = "CANNOT RUN: builds a 2-hop PG(2,7) circuit, which depth_for(8) = 1 forbids — it aborts in build_onion_f7 with TooLong, it does not merely go unasserted. Guarded by the_three_two_hop_measurements_here_still_cannot_run"]
+#[ignore = "measurement — run with --ignored --nocapture. Buildable since the onion bucket derives per plane (2026-08-22); its numbers are quoted in config.rs's mixnet-defaults guard"]
 fn measure_linkability_on_the_shipping_engine() {
     let (undefended, chance) = linkability_shipping(Duration::from_millis(0), Duration::from_millis(0), 8);
     let (shipped, _) = linkability_shipping(Duration::from_millis(50), Duration::from_millis(1_000), 8);

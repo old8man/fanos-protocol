@@ -23,7 +23,7 @@
 //! ## The instrument
 //!
 //! A global passive adversary's tape (`Sim::observe_frames`) gives `(t, from, to, len)`. Restrict to frames
-//! leaving the peeling node whose length is the **cell width** `1 + 12 + THRESHOLD_ONION_LEN` — the class that
+//! leaving the peeling node whose length is the **cell width** `1 + 12 + onion_len(3)` — the class that
 //! `cf55ead` merged, holding forwarded onions, cover cells and drop cells alike (a share-request is 20 bytes
 //! wider and a share reply is tiny, so both fall out by length, which is how a GPA would separate them too).
 //! Then take [`widest_instant`]: the most such frames sharing one timestamp. That is the burst.
@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 
 use fanos_aphantos::ThresholdRouter;
 use fanos_aphantos::nostos::{ReplyKeys, seal_reply};
-use fanos_aphantos::threshold::{HopLine, THRESHOLD_ONION_LEN, seal_onion};
+use fanos_aphantos::threshold::{HopLine, onion_len, seal_onion};
 use fanos_aphantos::threshold_router::{launch_frame, line_member_coords};
 use fanos_field::{F2, F4, Field};
 use fanos_geometry::{Line, Plane, Point, Triple};
@@ -55,7 +55,7 @@ use fanos_sim::{FrameObs, NetworkModel, Sim};
 
 /// The on-wire width of one cell: a forwarded onion frame, a cover cell and a dead-drop cell are all exactly
 /// this, which is what `cf55ead` bought. Computed from the constant rather than written down, so it tracks.
-const CELL_LEN: usize = 1 + 12 + THRESHOLD_ONION_LEN;
+const CELL_LEN: usize = 1 + 12 + onion_len(3);
 
 /// The two things a peeling node can do with a peeled last layer — the arm and its control.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -238,7 +238,7 @@ fn line_size<F: Field>() -> usize {
 /// AEAD open, which fails on keystream — so a cover cell drew its `q` requests and then drew **no replies at
 /// all**, while a cargo cell drew `q` of them. Measured on a composed relay cell, `TAG_REP` frames came to
 /// `4 + 4·cells` while this class and the cell class stayed on the slot rate, and a reply is 42 bytes against
-/// a cell's `THRESHOLD_ONION_LEN` — so it separates by size exactly as this one does. `on_request` now answers
+/// a cell's `onion_len(3)` — so it separates by size exactly as this one does. `on_request` now answers
 /// an unpeelable request with a decoy share, and the same run reads `replies == requests` at every cargo level.
 ///
 /// With that, the family is complete: **cells** unified in width by `cf55ead`, **requests** filled by cover as

@@ -475,10 +475,10 @@ mod tests {
         assert_eq!(read(&mut node, Instant(0)), Some(0), "a relay carrying nothing measured zero, not nothing");
 
         // One cover cell: a block of keystream and nothing else, so there is no cargo anywhere in this test.
-        // Built exactly as `emit_cover` builds one — a `THRESHOLD_ONION_LEN` XOF block handed to the same
+        // Built exactly as `emit_cover` builds one — a `onion_len(3)` XOF block handed to the same
         // public launch encoder a real client uses, which is the point: the two are the same frame.
         let line = Line::<F2>::at(0).coords();
-        let mut keystream = vec![0u8; fanos_aphantos::threshold::THRESHOLD_ONION_LEN];
+        let mut keystream = vec![0u8; fanos_aphantos::threshold::onion_len(3)];
         fanos_primitives::hash::hash_xof("test/cover-body", b"mix-load", &mut keystream);
         node.step(
             Instant(1),

@@ -64,7 +64,7 @@ const GATHER_MEMORY_BUDGET: usize = fanos_primitives::budget::GATHER_SHARE;
 /// What **one** pending gather costs at its worst, in bytes the wire supplied.
 ///
 /// Both terms are now enforced widths rather than assumed ones (#218):
-/// * the onion is [`THRESHOLD_ONION_LEN`](threshold::THRESHOLD_ONION_LEN), checked by [`decode_onion`];
+/// * the onion is [`THRESHOLD_ONION_LEN`](threshold::onion_len(line_size)), checked by [`decode_onion`];
 /// * the candidate shares are [`MAX_CANDIDATES`] × [`SHARE_LEN`](fanos_threshold::SHARE_LEN), checked by
 ///   [`decode_rep`].
 ///
@@ -73,8 +73,9 @@ const GATHER_MEMORY_BUDGET: usize = fanos_primitives::budget::GATHER_SHARE;
 /// prose named the term and the arithmetic dropped it, which is [`GATHER_MEMORY_BUDGET`]'s own defect one
 /// level in. With the shares unbounded the omission was not a rounding error: 64 frames were measured
 /// leaving 62 MiB in a single gather.
-const PENDING_ENTRY_BYTES: usize =
-    threshold::THRESHOLD_ONION_LEN + MAX_CANDIDATES * fanos_threshold::SHARE_LEN;
+const fn pending_entry_bytes(line_size: usize) -> usize {
+    threshold::onion_len(line_size) + MAX_CANDIDATES * fanos_threshold::SHARE_LEN
+}
 
 /// Cap on concurrently-pending gathers, so **memory is bounded by count rather than by the deadline**.
 ///
@@ -87,22 +88,29 @@ const PENDING_ENTRY_BYTES: usize =
 ///
 /// It is what the budget buys at the true per-entry cost, so it is not a round number and should not be
 /// made one — the same discipline `fanos_diaulos::budget::MAX_SESSIONS` states.
-pub const MAX_PENDING: usize = GATHER_MEMORY_BUDGET / (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES);
+#[must_use]
+pub const fn max_pending(line_size: usize) -> usize {
+    GATHER_MEMORY_BUDGET / (pending_entry_bytes(line_size) + RESOLVED_ENTRY_BYTES)
+}
 
 /// The product the budget was never checked against, now checked by the compiler.
 ///
 /// The assertion whose absence *was* the defect: `MAX_PENDING` divided by one of the two terms it needed to
 /// divide by, and nothing multiplied the result back out.
+/// **Per supported plane, since the onion bucket is per plane.** A wider plane costs more per gather, so the
+/// same budget buys fewer of them — which is the derivation working, not a regression to absorb.
 const _: () = assert!(
-    MAX_PENDING * (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES) <= GATHER_MEMORY_BUDGET,
+    max_pending(3) * (pending_entry_bytes(3) + RESOLVED_ENTRY_BYTES) <= GATHER_MEMORY_BUDGET
+        && max_pending(5) * (pending_entry_bytes(5) + RESOLVED_ENTRY_BYTES) <= GATHER_MEMORY_BUDGET,
     "the gather state's worst case exceeds GATHER_MEMORY_BUDGET — raise the budget deliberately or lower a factor"
 );
 
 /// [`MAX_PENDING`] is the **largest** count the budget buys, not merely a count that fits — without this the
 /// assertion above is satisfied by any small number and neither says the count was derived.
 const _: () = assert!(
-    (MAX_PENDING + 1) * (PENDING_ENTRY_BYTES + RESOLVED_ENTRY_BYTES) > GATHER_MEMORY_BUDGET,
-    "MAX_PENDING is below what the budget buys, so it was chosen rather than derived"
+    (max_pending(3) + 1) * (pending_entry_bytes(3) + RESOLVED_ENTRY_BYTES) > GATHER_MEMORY_BUDGET
+        && (max_pending(5) + 1) * (pending_entry_bytes(5) + RESOLVED_ENTRY_BYTES) > GATHER_MEMORY_BUDGET,
+    "the pending cap is below what the budget buys, so it was chosen rather than derived"
 );
 
 /// One attribution-ring entry, **measured by the compiler** rather than restated.
@@ -155,7 +163,9 @@ const MAX_CANDIDATES: usize = 64;
 /// The cost is `24 B` an entry against the same `GATHER_SHARE` budget the pending map is drawn from:
 /// **70 KiB, 0.1 %**. Sizing a diagnostic ring below its own derivation to save a tenth of a percent of the
 /// budget it reports on is not a trade.
-const MAX_RESOLVED: usize = MAX_PENDING;
+const fn max_resolved(line_size: usize) -> usize {
+    max_pending(line_size)
+}
 
 /// The ring must cover every late share this node can still be owed, and that is what ties it to
 /// [`MAX_PENDING`] rather than to a taste for round numbers.
@@ -165,7 +175,7 @@ const MAX_RESOLVED: usize = MAX_PENDING;
 /// refuses to exceed. Anything smaller silently re-merges the three worlds the ring exists to separate — and
 /// does it *under load*, where the deadline signal is worth the most and the shortfall is least visible.
 const _: () = assert!(
-    MAX_RESOLVED >= MAX_PENDING,
+    max_resolved(3) >= max_pending(3) && max_resolved(5) >= max_pending(5),
     "the attribution ring is shorter than the pending set it must outlive, so late shares will be attributed \
      as unknown exactly when the node is busiest"
 );
@@ -320,8 +330,9 @@ const ROUTER_QUEUE_MEMORY_BUDGET: usize = fanos_primitives::budget::THRESHOLD_RO
 ///
 /// The correction moves the derived count from 2048 to 2045 — three cells stricter, which is the safe
 /// direction and the reason it is worth stating rather than rounding away.
-const QUEUED_CELL_BYTES: usize =
-    1 + 12 + threshold::THRESHOLD_ONION_LEN + size_of::<Triple>();
+const fn queued_cell_bytes(line_size: usize) -> usize {
+    1 + 12 + threshold::onion_len(line_size) + size_of::<Triple>()
+}
 
 /// Bound on the constant-rate [`outbox`](ThresholdRouter::outbox): real forwards queued for a send slot.
 /// Beyond this the **oldest** is dropped — correct here because the reliability layer retransmits and this
@@ -336,7 +347,9 @@ const QUEUED_CELL_BYTES: usize =
 /// default, for the **whole node**, not per circuit. Offered `λ`, this queue fills in `MAX_OUTBOX / (λ − 2)`
 /// seconds and cargo is shed from then on. That figure is also what #135 left open for the `Relay` role: its
 /// capacity is a derived protocol bound, not a measurement waiting to be taken.
-const MAX_OUTBOX: usize = ROUTER_QUEUE_BUYS;
+const fn max_outbox(line_size: usize) -> usize {
+    router_queue_buys(line_size)
+}
 
 /// What the §L5 replay set may hold, carved from the router's own share rather than claimed separately.
 ///
@@ -375,13 +388,15 @@ const MAX_REPLAY_TAGS: usize = REPLAY_CACHE_BYTES / crate::sealed::REPLAY_TAG_LE
 /// Steady state is `λ × mean_delay` by Little's law, so at the shipping 120 ms mean this cap is reached at
 /// roughly `λ = 17 000 /s` — far above any honest relay and reachable by a flood, which is what it is for.
 /// Each entry also holds a live timer, so the bound caps two resources, not one.
-const MAX_MIX_PENDING: usize = ROUTER_QUEUE_BUYS;
+const fn max_mix_pending(line_size: usize) -> usize {
+    router_queue_buys(line_size)
+}
 
 /// How many queued cells [`ROUTER_QUEUE_MEMORY_BUDGET`] buys **once its other tenant is paid for**.
 ///
 /// # The share had three tenants and an arithmetic for none of them
 ///
-/// [`MAX_OUTBOX`] and [`MAX_MIX_PENDING`] each divided the whole share by the per-cell cost, and
+/// [`MAX_OUTBOX`] and [`max_mix_pending(Self::line_size())`] each divided the whole share by the per-cell cost, and
 /// [`MAX_REPLAY_TAGS`] took `REPLAY_CACHE_BYTES` beside it — so the worst case was `42_194_869 B` against a
 /// `41_943_040 B` share, over by `251_829 B`, and **nothing multiplied the counts back out to notice**. That
 /// is verbatim the defect [`MAX_PENDING`]'s own doc records one budget over: *"the assertion whose absence
@@ -396,26 +411,29 @@ const MAX_MIX_PENDING: usize = ROUTER_QUEUE_BUYS;
 /// this doc is where it must be read first.
 ///
 /// The correction costs `13` cells of `2045`.
-const ROUTER_QUEUE_BUYS: usize =
-    (ROUTER_QUEUE_MEMORY_BUDGET - REPLAY_CACHE_BYTES) / QUEUED_CELL_BYTES;
+const fn router_queue_buys(line_size: usize) -> usize {
+    (ROUTER_QUEUE_MEMORY_BUDGET - REPLAY_CACHE_BYTES) / queued_cell_bytes(line_size)
+}
 
 /// The product the share was never checked against, now checked by the compiler — the outbox *or* the
 /// mixing queue (never both, see [`ROUTER_QUEUE_BUYS`]) plus the replay cache that sits beside them.
 const _: () = assert!(
-    MAX_OUTBOX * QUEUED_CELL_BYTES + REPLAY_CACHE_BYTES <= ROUTER_QUEUE_MEMORY_BUDGET,
+    max_outbox(3) * queued_cell_bytes(3) + REPLAY_CACHE_BYTES <= ROUTER_QUEUE_MEMORY_BUDGET
+        && max_outbox(5) * queued_cell_bytes(5) + REPLAY_CACHE_BYTES <= ROUTER_QUEUE_MEMORY_BUDGET,
     "the router's queue worst case exceeds THRESHOLD_ROUTER_SHARE — raise the share deliberately or lower a factor"
 );
 
 /// …and it is the **largest** count the share buys, so the number is derived rather than merely fitting.
 const _: () = assert!(
-    (MAX_OUTBOX + 1) * QUEUED_CELL_BYTES + REPLAY_CACHE_BYTES > ROUTER_QUEUE_MEMORY_BUDGET,
+    (max_outbox(3) + 1) * queued_cell_bytes(3) + REPLAY_CACHE_BYTES > ROUTER_QUEUE_MEMORY_BUDGET
+        && (max_outbox(5) + 1) * queued_cell_bytes(5) + REPLAY_CACHE_BYTES > ROUTER_QUEUE_MEMORY_BUDGET,
     "the queue bound is below what the share buys, so it was chosen rather than derived"
 );
 
 /// The two queues are alternatives, so they are one count — stated as an identity because the assertion
 /// above checks only one of them and would be blind to the other drifting.
 const _: () = assert!(
-    MAX_OUTBOX == MAX_MIX_PENDING,
+    max_outbox(3) == max_mix_pending(3) && max_outbox(5) == max_mix_pending(5),
     "the outbox and the mixing queue share one budget because they are never both live; if they stop being \
      one number, the assertion above stops covering the pair"
 );
@@ -465,6 +483,12 @@ impl<F: Field> ThresholdRouter<F> {
             outbox: VecDeque::new(),
             delivery_check: None,
         }
+    }
+
+    /// This node's plane width — the one parameter every packet geometry here derives from.
+    #[must_use]
+    const fn line_size() -> usize {
+        Plane::<F>::LINE_SIZE as usize
     }
 
     /// This router's current-epoch **onion public key** — what a client seals hops to, and what the
@@ -622,7 +646,7 @@ impl<F: Field> ThresholdRouter<F> {
             self.cover_seq = self.cover_seq.wrapping_add(1);
             let mut material = self.mix_seed.to_vec();
             material.extend_from_slice(&self.cover_seq.to_be_bytes());
-            let mut cell = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+            let mut cell = alloc::vec![0u8; threshold::onion_len(Self::line_size())];
             fanos_primitives::hash::hash_xof("FANOS-v1/threshold-cover-body", &material, &mut cell);
             // Salted like a real launch (#55): cover traffic must draw its gatherer the same way real
             // onions do, or the address pattern alone would tell cover and cargo apart.
@@ -654,7 +678,7 @@ impl<F: Field> ThresholdRouter<F> {
     /// reordered.
     fn forward_send(&mut self, to: Triple, frame: Vec<u8>) -> Vec<Effect> {
         if self.cover_interval.as_nanos() != 0 {
-            if self.outbox.len() >= MAX_OUTBOX {
+            if self.outbox.len() >= max_outbox(Self::line_size()) {
                 // Shedding real cargo, past the relay's `1 / cover_interval` ceiling. Counted, because an
                 // operator whose relay is discarding traffic must not be the last to know (#294).
                 self.outbox.pop_front();
@@ -670,8 +694,8 @@ impl<F: Field> ThresholdRouter<F> {
         if self.mean_delay.as_nanos() == 0 {
             return alloc::vec![Effect::Send { to, frame }];
         }
-        if self.mix_pending.len() >= MAX_MIX_PENDING {
-            // Refuse the newest rather than evict the oldest — see `MAX_MIX_PENDING`. No timer is armed, so
+        if self.mix_pending.len() >= max_mix_pending(Self::line_size()) {
+            // Refuse the newest rather than evict the oldest — see `max_mix_pending(Self::line_size())`. No timer is armed, so
             // the cap bounds live timers as well as bytes (#295).
             self.stations.record(Station::RelayMixRefused, Some(to));
             return Vec::new();
@@ -907,7 +931,7 @@ impl<F: Field> ThresholdRouter<F> {
         // Bounded by COUNT, not by the deadline (see `MAX_PENDING`): memory must not depend on a timing
         // value that is now measured and free to grow. The oldest incomplete gather goes — it is the one
         // most likely already dead, and its client retransmits.
-        if self.pending.len() >= MAX_PENDING
+        if self.pending.len() >= max_pending(Self::line_size())
             && let Some(&oldest) = self.pending.keys().next()
         {
             let evicted = self.pending.remove(&oldest);
@@ -1139,7 +1163,7 @@ impl<F: Field> ThresholdRouter<F> {
     /// Bounded by COUNT and not by time, for the same reason `pending` is: memory must not depend on a
     /// deadline that is measured and free to grow.
     fn remember_resolved(&mut self, req_id: u64, how: Resolved) {
-        if self.resolved.len() >= MAX_RESOLVED {
+        if self.resolved.len() >= max_resolved(Self::line_size()) {
             self.resolved.pop_front();
         }
         self.resolved.push_back((req_id, how));
@@ -1202,7 +1226,7 @@ impl<F: Field> ThresholdRouter<F> {
                 // for a second reason worth stating rather than trusting: an unpadded forward would be a frame
                 // the NEXT hop drops, because `from_bytes` requires the exact bucket length. The property
                 // degrades to a lost packet, never to a short one on the wire carrying the remaining depth.
-                let padded = threshold::pad(&onion).unwrap_or(onion);
+                let padded = threshold::pad(&onion, Self::line_size()).unwrap_or(onion);
                 match self.gather_member(next, &padded) {
                     Some(c) => self.forward_send(c, encode_onion(next, &padded)),
                     None => Vec::new(),
@@ -1273,7 +1297,7 @@ impl<F: Field> ThresholdRouter<F> {
             // rather than trusted, and the fallback is a *skipped member* rather than a short frame —
             // a narrow cell on the wire would be precisely the distinguisher the padding removes, so
             // the property degrades to a lost delivery and never to a leaking one.
-            let Some(frame) = encode_drop(line, e2e) else { continue };
+            let Some(frame) = encode_drop(line, e2e, Self::line_size()) else { continue };
             effects.extend(self.forward_send(member, frame));
         }
         effects
@@ -1359,11 +1383,11 @@ impl<F: Field> Engine for ThresholdRouter<F> {
             // are unattributed by construction (`None`), which the station type keeps distinct from a
             // line's own count.
             Input::Message { frame, .. } => match frame.split_first() {
-                Some((&TAG_ONION, body)) => match decode_onion(body) {
+                Some((&TAG_ONION, body)) => match decode_onion(body, Self::line_size()) {
                     Some((line, onion)) => self.on_onion(now, line, onion),
                     None => self.undecodable(),
                 },
-                Some((&TAG_REQ, body)) => match decode_req(body) {
+                Some((&TAG_REQ, body)) => match decode_req(body, Self::line_size()) {
                     Some((req_id, combiner, line, onion)) => {
                         self.on_request(req_id, combiner, line, onion)
                     }
@@ -1373,7 +1397,7 @@ impl<F: Field> Engine for ThresholdRouter<F> {
                     Some((req_id, share)) => self.on_reply(now, req_id, share),
                     None => self.undecodable(),
                 },
-                Some((&TAG_DROP, body)) => match decode_drop(body) {
+                Some((&TAG_DROP, body)) => match decode_drop(body, Self::line_size()) {
                     Some((line, e2e)) => self.on_drop(line, e2e),
                     None => self.undecodable(),
                 },
@@ -1495,7 +1519,7 @@ fn encode_onion(line: Triple, onion: &[u8]) -> Vec<u8> {
 /// Decode a launch frame. **Fail-closed on width**, the same rule [`decode_drop`] states and for the same
 /// two reasons (#218).
 ///
-/// A threshold onion is [`THRESHOLD_ONION_LEN`](threshold::THRESHOLD_ONION_LEN) on **every** plane —
+/// A threshold onion is [`THRESHOLD_ONION_LEN`](threshold::onion_len(line_size)) on **every** plane —
 /// `slots::Packet` is a fixed-slot layout whose total is that constant by construction, which is what makes
 /// the plane order "invisible from length alone" (`slots`, the module doc). This decoder read `body[12..]`,
 /// everything, and handed the result to [`ThresholdRouter::on_onion`], which retains it in `Pending::onion`
@@ -1503,10 +1527,10 @@ fn encode_onion(line: Triple, onion: &[u8]) -> Vec<u8> {
 ///
 /// So the width the protocol guarantees was never checked at the one place it arrives from a stranger, and
 /// [`MAX_PENDING`] — `budget / THRESHOLD_ONION_LEN` — was dividing by a length nothing enforced.
-fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
+fn decode_onion(body: &[u8], line_size: usize) -> Option<(Triple, Vec<u8>)> {
     let line = fanos_geometry::decode_triple(body.get(..12)?)?;
     let onion = body.get(12..)?;
-    if onion.len() != threshold::THRESHOLD_ONION_LEN {
+    if onion.len() != threshold::onion_len(line_size) {
         return None;
     }
     Some((line, onion.to_vec()))
@@ -1540,12 +1564,12 @@ fn decode_onion(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
 ///
 /// The body always fits: it arrived inside an onion of exactly this bucket, so it is strictly shorter.
 /// `None` when it somehow is not — fail closed rather than emit a short cell that would be a distinguisher.
-fn encode_drop(line: Triple, e2e: &[u8]) -> Option<Vec<u8>> {
-    let room = threshold::THRESHOLD_ONION_LEN.checked_sub(4)?;
+fn encode_drop(line: Triple, e2e: &[u8], line_size: usize) -> Option<Vec<u8>> {
+    let room = threshold::onion_len(line_size).checked_sub(4)?;
     if e2e.len() > room {
         return None;
     }
-    let mut v = Vec::with_capacity(1 + 12 + threshold::THRESHOLD_ONION_LEN);
+    let mut v = Vec::with_capacity(1 + 12 + threshold::onion_len(line_size));
     v.push(TAG_DROP);
     v.extend_from_slice(&fanos_geometry::encode_triple(line));
     v.extend_from_slice(&u32::try_from(e2e.len()).ok()?.to_be_bytes());
@@ -1559,10 +1583,10 @@ fn encode_drop(line: Triple, e2e: &[u8]) -> Option<Vec<u8>> {
 /// Decode a dead-drop cell. **Fail-closed on width**: a cell whose padded region is not exactly
 /// [`THRESHOLD_ONION_LEN`] is refused rather than accepted at its natural length, so the constant-width
 /// property cannot silently degrade to "whatever arrived".
-fn decode_drop(body: &[u8]) -> Option<(Triple, Vec<u8>)> {
+fn decode_drop(body: &[u8], line_size: usize) -> Option<(Triple, Vec<u8>)> {
     let line = fanos_geometry::decode_triple(body.get(..12)?)?;
     let region = body.get(12..)?;
-    if region.len() != threshold::THRESHOLD_ONION_LEN {
+    if region.len() != threshold::onion_len(line_size) {
         return None;
     }
     let len = u32::from_be_bytes(*region.first_chunk::<4>()?) as usize;
@@ -1583,12 +1607,12 @@ fn encode_req(req_id: u64, combiner: Triple, line: Triple, onion: &[u8]) -> Vec<
 /// member that peels a partial from an off-width blob is doing work no honest combiner ever asks for. This
 /// one borrows rather than copies, so it was never the memory defect; it is here because the rule is the
 /// onion's, not the decoder's, and a rule enforced on one of two paths is the shape #218 is about.
-fn decode_req(body: &[u8]) -> Option<(u64, Triple, Triple, &[u8])> {
+fn decode_req(body: &[u8], line_size: usize) -> Option<(u64, Triple, Triple, &[u8])> {
     let req_id = u64::from_be_bytes(body.get(0..8)?.try_into().ok()?);
     let combiner = fanos_geometry::decode_triple(body.get(8..20)?)?;
     let line = fanos_geometry::decode_triple(body.get(20..32)?)?;
     let onion = body.get(32..)?;
-    if onion.len() != threshold::THRESHOLD_ONION_LEN {
+    if onion.len() != threshold::onion_len(line_size) {
         return None;
     }
     Some((req_id, combiner, line, onion))
@@ -1832,7 +1856,7 @@ mod tests {
         let line = Plane::<F2>::lines()
             .find(|&l| Plane::<F2>::points_on(l).any(|p| p == me))
             .expect("every point lies on a line");
-        let mut garbage = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        let mut garbage = alloc::vec![0u8; threshold::onion_len(3)];
         fanos_primitives::hash::hash_xof("test/cover-body", b"self-share", &mut garbage);
 
         let out = r.step(
@@ -1883,7 +1907,7 @@ mod tests {
             .expect("every point lies on a line");
         let combiner = Point::<F2>::at(3).coords();
         // Keystream where an onion should be — byte-for-byte what `emit_cover` puts on the wire.
-        let mut garbage = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        let mut garbage = alloc::vec![0u8; threshold::onion_len(3)];
         fanos_primitives::hash::hash_xof("test/cover-body", b"decoy", &mut garbage);
 
         let out = r.step(
@@ -1956,7 +1980,7 @@ mod tests {
         assert_eq!(sends.len(), 1, "exactly one cover cell per tick");
         // The cover cell is exactly the size of a real launched onion carrying a full padded packet.
         let real_len =
-            launch_frame([0, 0, 0], &alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN]).len();
+            launch_frame([0, 0, 0], &alloc::vec![0u8; threshold::onion_len(3)]).len();
         assert_eq!(
             sends[0].len(),
             real_len,
@@ -2002,11 +2026,11 @@ mod tests {
 
         // Past the cap the length STOPS and the refusals are counted.
         let first_id = *r.mix_pending.keys().next().expect("a held cell");
-        for _ in 8..MAX_MIX_PENDING + 32 {
+        for _ in 8..max_mix_pending(3) + 32 {
             let out = r.forward_send(dest, alloc::vec![7u8; 4]);
             assert!(out.len() <= 1, "a refusal arms no timer, so the cap bounds timers too");
         }
-        assert_eq!(r.mix_pending.len(), MAX_MIX_PENDING, "the queue stops at its cap, not at the flood");
+        assert_eq!(r.mix_pending.len(), max_mix_pending(3), "the queue stops at its cap, not at the flood");
         assert_eq!(
             r.stations().total(Station::RelayMixRefused),
             32,
@@ -2024,7 +2048,7 @@ mod tests {
 
     /// **The relay's throughput ceiling, asserted rather than derived in a comment.**
     ///
-    /// [`MAX_OUTBOX`]'s doc computes it: a real forward *displaces* a cover slot rather than adding a send,
+    /// [`max_outbox(3)`]'s doc computes it: a real forward *displaces* a cover slot rather than adding a send,
     /// and there is one slot stream per router, so a Full-profile relay sustains `1 / cover_interval` — ≈2
     /// cells/s at the shipping default, **for the whole node**, and that figure is what #135 records as the
     /// `Relay` role's capacity. It is a derived protocol bound and it had no executable check: the test below
@@ -2032,7 +2056,7 @@ mod tests {
     ///
     /// The premise is the one thing worth pinning, because every number above follows from it: **one tick,
     /// one cell, however deep the queue.** If a tick ever emitted two, the ceiling doubles silently and the
-    /// role's capacity, the fill time `MAX_OUTBOX / (λ − 2)`, and the displacement invariant that makes
+    /// role's capacity, the fill time `max_outbox(3) / (λ − 2)`, and the displacement invariant that makes
     /// emitted volume independent of cargo all move together.
     #[test]
     fn one_cover_tick_emits_exactly_one_cell_however_deep_the_queue_is() {
@@ -2078,10 +2102,10 @@ mod tests {
             .with_cover(Duration::from_millis(500));
         let dest = Point::<F2>::at(3).coords();
 
-        for _ in 0..MAX_OUTBOX {
+        for _ in 0..max_outbox(3) {
             r.forward_send(dest, alloc::vec![9u8; 4]);
         }
-        assert_eq!(r.outbox.len(), MAX_OUTBOX, "filled to the cap");
+        assert_eq!(r.outbox.len(), max_outbox(3), "filled to the cap");
         assert_eq!(
             r.stations().total(Station::RelayCargoDropped),
             0,
@@ -2091,7 +2115,7 @@ mod tests {
         for _ in 0..5 {
             r.forward_send(dest, alloc::vec![9u8; 4]);
         }
-        assert_eq!(r.outbox.len(), MAX_OUTBOX, "still capped");
+        assert_eq!(r.outbox.len(), max_outbox(3), "still capped");
         assert_eq!(r.stations().total(Station::RelayCargoDropped), 5, "and each shed cell is named");
     }
 
@@ -2107,7 +2131,7 @@ mod tests {
 
         // A real forward (what the peel path calls) is queued, not sent immediately, while cover is on.
         let dest = Point::<F2>::at(3).coords();
-        let real = alloc::vec![0xABu8; threshold::THRESHOLD_ONION_LEN];
+        let real = alloc::vec![0xABu8; threshold::onion_len(3)];
         let queued = r.forward_send(dest, encode_onion(dest, &real));
         assert!(
             !queued.iter().any(|e| matches!(e, Effect::Send { .. })),
@@ -2234,24 +2258,30 @@ mod tests {
     /// shows up here as a diff rather than as a silently different bound (#213/#218).
     #[test]
     fn the_pending_cap_is_what_the_gather_budget_buys() {
-        assert_eq!(threshold::THRESHOLD_ONION_LEN, 20480, "the constant bucket, on every plane");
+        // **Per plane since 2026-08-22, and this is the line that says so.** It read
+        // `THRESHOLD_ONION_LEN == 20480, "the constant bucket, on every plane"`. The bucket is now derived
+        // from the plane's own slot width, so `q = 2` still gets exactly 20 480 — the number is unchanged
+        // where it was measured — and a wider plane gets what a circuit on *it* costs instead of charging
+        // every deployment for the widest one anyone might run.
+        assert_eq!(threshold::onion_len(3), 20480, "q = 2's bucket, unchanged by the derivation");
+        assert_eq!(threshold::onion_len(5), 27494, "q = 4's, which the old global constant could not reach");
         assert_eq!(fanos_threshold::SHARE_LEN, 33, "x(1) ‖ y(32), the Shamir split of a 32-byte layer key");
-        assert_eq!(PENDING_ENTRY_BYTES, 22592, "20480 onion + 64 × 33 candidate shares");
+        assert_eq!(pending_entry_bytes(3), 22592, "20480 onion + 64 × 33 candidate shares");
         // **Two terms, because the gather state is two maps.** The attribution ring was allocated beside a
         // budget the pending map already consumed whole, so its bytes were outside the arithmetic this test
         // exists to write out. Derived from `size_of` rather than restated, which is why the second term is
         // read from the constant instead of spelled here.
         assert_eq!(
-            MAX_PENDING,
+            max_pending(3),
             (64 * 1024 * 1024) / (22592 + RESOLVED_ENTRY_BYTES),
             "the budget buys the pending entry AND the resolution that outlives it"
         );
         // The two invariants are `const` assertions above, so they fail the BUILD rather than a run.
         // What is left here is what the old divisor bought and what it left out.
-        let onion_only = GATHER_MEMORY_BUDGET / threshold::THRESHOLD_ONION_LEN;
+        let onion_only = GATHER_MEMORY_BUDGET / threshold::onion_len(3);
         assert_eq!(onion_only, 3276, "what dividing by the onion alone bought");
         assert!(
-            onion_only * PENDING_ENTRY_BYTES > GATHER_MEMORY_BUDGET,
+            onion_only * pending_entry_bytes(3) > GATHER_MEMORY_BUDGET,
             "the previous cap does not fit the true per-entry cost — the dropped term was not a rounding error"
         );
     }
@@ -2261,9 +2291,9 @@ mod tests {
     /// The two widths a stranger supplies — the onion and every candidate share — are fixed by the sealing
     /// side, and this asserts the router enforces both, by measuring what one gather retains under a flood
     /// that tries to exceed them. Measured before the checks: **62 MiB in one gather from 64 frames**, and
-    /// `MAX_PENDING × 62 MiB = 201 GiB` against a stated 64 MiB budget.
+    /// `max_pending(3) × 62 MiB = 201 GiB` against a stated 64 MiB budget.
     ///
-    /// The assertion is against [`PENDING_ENTRY_BYTES`] rather than a literal, so a future change to either
+    /// The assertion is against [`pending_entry_bytes(3)`] rather than a literal, so a future change to either
     /// width moves the test with the constant instead of leaving it pinning a number nothing else believes.
     #[test]
     fn a_gather_cannot_be_flooded_past_the_width_the_sealing_side_produces() {
@@ -2292,7 +2322,7 @@ mod tests {
         // it ever stopped being constant the flood below would be measuring the wrong thing.
         assert_eq!(
             onion.len(),
-            threshold::THRESHOLD_ONION_LEN,
+            threshold::onion_len(3),
             "a sealed onion is the constant bucket on every plane (`slots`), which is what makes the width \
              checkable at all"
         );
@@ -2316,9 +2346,10 @@ mod tests {
             .map(|p| p.onion.len() + p.shares.iter().map(|s| s.y().len()).sum::<usize>())
             .sum();
         assert!(
-            retained <= PENDING_ENTRY_BYTES,
-            "one gather retained {retained} B, above the {PENDING_ENTRY_BYTES} B the budget divides by — \
-             MAX_PENDING is then a count of entries that do not cost what it assumed"
+            retained <= pending_entry_bytes(3),
+            "one gather retained {retained} B, above the {} B the budget divides by — the pending cap is \
+             then a count of entries that do not cost what it assumed",
+            pending_entry_bytes(3)
         );
 
         // The other half of the same rule, on the launch path: an off-width onion is refused outright
@@ -2623,7 +2654,7 @@ mod tests {
             if let Effect::Send { to, frame } = e {
                 let (tag, body) = frame.split_first().unwrap();
                 assert_eq!(*tag, TAG_DROP, "a multicast cell is a dead-drop frame");
-                let (line, e2e_body) = decode_drop(body).unwrap();
+                let (line, e2e_body) = decode_drop(body, 3).unwrap();
                 assert_eq!(line, l, "the cell names the delivery line");
                 assert_eq!(
                     reply_keys.open(&e2e_body).as_deref(),
@@ -2736,7 +2767,7 @@ mod tests {
                 [Effect::Send { to, frame }] => {
                     let (tag, body) = frame.split_first().unwrap();
                     assert_eq!(*tag, TAG_DROP, "a released cell is still a dead-drop frame");
-                    let (line, e2e) = decode_drop(body).unwrap();
+                    let (line, e2e) = decode_drop(body, 3).unwrap();
                     assert_eq!(line, l);
                     assert_eq!(reply_keys.open(&e2e).as_deref(), Some(&payload[..]));
                     released.push(*to);
@@ -2761,24 +2792,24 @@ mod tests {
         let (reply_keys, reply_pub) = ReplyKeys::generate(b"rk-drop");
         let payload = b"drop me home";
         let e2e = seal_to_receiver(&reply_pub, payload, b"e2e").unwrap();
-        let cell = encode_drop(l, &e2e).expect("a body that came out of an onion fits a cell");
+        let cell = encode_drop(l, &e2e, 3).expect("a body that came out of an onion fits a cell");
 
         // THE PROPERTY: the cell's width is a constant, so it carries no information about the reply. Asserted
         // against the ONION frame's width rather than a literal, because sharing the bucket is the point —
         // a cell in a bucket of its own would announce "dead-drop delivery" as loudly as its length used to
         // announce the reply's size.
-        let onion_frame = 1 + 12 + threshold::THRESHOLD_ONION_LEN;
+        let onion_frame = 1 + 12 + threshold::onion_len(3);
         assert_eq!(cell.len(), onion_frame, "a drop cell is the same width as a forwarded onion frame");
         let longer = seal_to_receiver(&reply_pub, &[7u8; 400], b"e2e2").unwrap();
         assert_ne!(longer.len(), e2e.len(), "the two replies really do differ in size");
         assert_eq!(
-            encode_drop(l, &longer).expect("also fits").len(),
+            encode_drop(l, &longer, 3).expect("also fits").len(),
             cell.len(),
             "and a reply 400 bytes longer produces a cell of the identical width — the length of the plaintext \
              is what used to reach every member of the line"
         );
         // Fail closed on width: a short cell must be refused, not accepted at whatever arrived.
-        assert!(decode_drop(&cell[1..cell.len() - 1]).is_none(), "a truncated cell is refused");
+        assert!(decode_drop(&cell[1..cell.len() - 1], 3).is_none(), "a truncated cell is refused");
 
         // A router at a member coordinate of L hands the body to its application.
         let (id_r, _) = HybridKemSecret::generate(&mut SeedRng::from_seed(b"id-r"));
@@ -3003,7 +3034,7 @@ mod tests {
         assert!(router.stations().is_empty(), "a fresh router has observed nothing");
 
         // Launch a hop, then fire its deadline with no partial ever arriving: t = 2 was never reached.
-        let mut onion = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        let mut onion = alloc::vec![0u8; threshold::onion_len(3)];
         onion[..8].copy_from_slice(&7u64.to_be_bytes());
         let armed = router.step(
             Instant(0),
@@ -3033,7 +3064,7 @@ mod tests {
         );
 
         // A forged share index is an ATTACK indicator, not an error rate, so it gets its own station.
-        let mut onion2 = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        let mut onion2 = alloc::vec![0u8; threshold::onion_len(3)];
         onion2[..8].copy_from_slice(&8u64.to_be_bytes());
         router.step(
             Instant(2),
@@ -3065,8 +3096,8 @@ mod tests {
             ThresholdRouter::<F2>::new(Point::<F2>::new(members[0]).unwrap(), &identity, 2, [0x3B; 32]);
 
         // Flood distinct onions with NO timer ever firing — the deadline cannot be what saves us here.
-        for i in 0..(MAX_PENDING + 128) {
-            let mut onion = alloc::vec![0u8; threshold::THRESHOLD_ONION_LEN];
+        for i in 0..(max_pending(3) + 128) {
+            let mut onion = alloc::vec![0u8; threshold::onion_len(3)];
             onion[..8].copy_from_slice(&(i as u64).to_be_bytes());
             router.step(
                 Instant(i as u64),
@@ -3074,8 +3105,9 @@ mod tests {
             );
         }
         assert!(
-            router.pending.len() <= MAX_PENDING,
-            "in-flight gathers are capped at {MAX_PENDING}, got {} — with no timer fired",
+            router.pending.len() <= max_pending(3),
+            "in-flight gathers are capped at {}, got {} — with no timer fired",
+            max_pending(3),
             router.pending.len()
         );
     }

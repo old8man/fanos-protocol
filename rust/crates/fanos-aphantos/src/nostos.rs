@@ -485,7 +485,7 @@ mod tests {
             .map(|(i, (sk, _))| (i, sk))
             .collect();
         let inner_onion = match peel_onion::<F2>(&onion, &mix_secrets).unwrap() {
-            ThresholdPeel::Forward { onion, .. } => crate::threshold::pad_onion(&onion).unwrap(),
+            ThresholdPeel::Forward { onion, .. } => crate::threshold::pad_onion(&onion, 3).unwrap(),
             ThresholdPeel::Deliver { .. } => panic!("the first hop forwards, it does not deliver"),
         };
 

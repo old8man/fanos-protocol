@@ -142,7 +142,7 @@ const STORAGE_CAPACITY_PER_NODE: u16 =
 /// surfaces as a deficit rather than as a silent disagreement. That is the correct direction, and it is why
 /// this reads the constants rather than any live configuration.
 #[must_use]
-pub(crate) fn role_capacity() -> Demand {
+pub(crate) fn role_capacity(line_size: usize) -> Demand {
     Demand::per_role(|role| {
         match role {
             Role::Storage => STORAGE_CAPACITY_PER_NODE,
@@ -173,7 +173,10 @@ pub(crate) fn role_capacity() -> Demand {
             // nodes — the answer is a shorter `cover_interval`, a deployment parameter — and the observable
             // is `Station::RelayCargoDropped`, which exists precisely so that ceiling is not silent. What is not in doubt is that an admission bound beats a placeholder of `1`, which reads
             // an event count as a node count and makes the controller express nothing at all.
-            Role::Relay => saturating_cap(fanos_aphantos::threshold_router::MAX_PENDING),
+            // **Per plane, since the gather budget buys fewer entries on a wider one.** Still a constant
+            // rather than live configuration — the plane order is network-wide, so every node in the cell
+            // computes the same number, which is the property this doc says the model needs.
+            Role::Relay => saturating_cap(fanos_aphantos::threshold_router::max_pending(line_size)),
             Role::Ingress => saturating_cap(crate::poros::DEFAULT_MAX_PENDING),
         }
     })
@@ -1826,7 +1829,7 @@ pub fn spawn_self_organization<F: Field>(
     // The plane's point count is the `n` in the published report's noise scale (`loaddir::noise_scale`) — a
     // cell-wide constant every node computes identically, which is what lets the scale need no agreement.
     let (load_publisher, load_ready) =
-        spawn_load_publisher(client.clone(), load_source, prover.clone(), Plane::<F>::N);
+        spawn_load_publisher(client.clone(), load_source, prover.clone(), Plane::<F>::N, Plane::<F>::LINE_SIZE as usize);
     // **This cell's health, published per member and folded by whoever reads it** (#167).
     //
     // The last of five reasons for leaving the cross-cell directories unwired was that a `(cell, epoch)` slot
@@ -2087,7 +2090,7 @@ mod tests {
         // `MAX_STORE_ENTRIES` rather than restated, because a copy would drift the moment the cap moved and
         // nothing would notice: the assignment would simply provision the wrong number of storage nodes.
         assert_eq!(
-            usize::from(role_capacity().of(Role::Storage)),
+            usize::from(role_capacity(3).of(Role::Storage)),
             fanos_runtime::MAX_STORE_ENTRIES,
             "storage capacity must equal the store's own admission bound",
         );
@@ -2095,7 +2098,7 @@ mod tests {
         // vector rather than against one named neighbour: the previous spelling compared Storage with Relay,
         // and when Relay stopped being a placeholder the assertion started testing an accident of two
         // unrelated bounds. What is actually meant is that the roles do not share a capacity.
-        let caps = role_capacity();
+        let caps = role_capacity(3);
         assert!(
             Role::ALL.iter().any(|&r| caps.of(r) != caps.of(Role::Storage)),
             "if every role carries one capacity, the per-role denominator has silently become a constant",
@@ -2111,7 +2114,7 @@ mod tests {
     /// two remain the same number.
     #[test]
     fn each_derived_capacity_is_its_subsystems_own_admission_bound() {
-        let cap = role_capacity();
+        let cap = role_capacity(3);
         assert_eq!(
             usize::from(cap.of(Role::Rendezvous)),
             crate::rendezvous_relay::MAX_REGISTRATIONS + crate::rendezvous_relay::MAX_HOSTS,
@@ -2130,7 +2133,7 @@ mod tests {
 
         assert_eq!(
             usize::from(cap.of(Role::Relay)),
-            fanos_aphantos::threshold_router::MAX_PENDING,
+            fanos_aphantos::threshold_router::max_pending(3),
             "a relay reports gathers in flight, and the router refuses to arm another past MAX_PENDING"
         );
 
@@ -2239,7 +2242,7 @@ mod tests {
         // Sanity on the reachable half: no role divides by a fabricated denominator, so every shortfall
         // `note_deficit` sees is a real one. Without this the assertion below would be pinning the absence of
         // an escalation for demand nobody could meet.
-        let cap = role_capacity();
+        let cap = role_capacity(3);
         for role in Role::ALL {
             assert_ne!(cap.of(role), 1, "{role:?}: a placeholder denominator fabricates its own deficit");
         }
@@ -2389,7 +2392,7 @@ mod tests {
         // zero, precisely when it should be shrinking the role. It bound the two roles that *are* measured,
         // relay and storage: a cell could not conclude "nobody here needs relays".
         let offered = RoleSet::of(&[Role::Relay, Role::Storage, Role::Service]);
-        let cap = role_capacity();
+        let cap = role_capacity(3);
         // The feeder's token, held for the test's lifetime: the TEST is the feeder here.
         let (sensor, _feeding) = LoadSensor::new();
 

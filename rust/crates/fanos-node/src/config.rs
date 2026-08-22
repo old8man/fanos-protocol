@@ -2069,45 +2069,57 @@ mod tests {
         }
     }
 
-    /// The **revision clock** on the two mixnet defaults: it rings when their sweep becomes buildable
-    /// again (#187, UHM `316edd9`).
+    /// The revision clock on the two mixnet defaults **rang on 2026-08-22, and this is what it got**.
     ///
-    /// UHM's rule: *"a constant with no incoming observations is a fixed point of any transmission chain
-    /// — it has no revision mechanism, since its only source is itself. Give every blind constant a
-    /// revision clock against observations, or the chain will carry it forever."*
+    /// UHM's rule (#187, UHM `316edd9`): *"a constant with no incoming observations is a fixed point of any
+    /// transmission chain — it has no revision mechanism, since its only source is itself."* Both defaults
+    /// came from one `PG(2,7)` knee sweep that stopped building the day after it ran. Deriving the onion
+    /// bucket per plane made it buildable again, the clock fired, and all five measurements in
+    /// `fanos-sim/tests/threshold_routing.rs` were run.
     ///
-    /// Both defaults came from one `PG(2,7)` knee sweep that stopped building the day after it ran, and
-    /// nothing since has been able to feed them an observation. The failure mode this guards is not the
-    /// breakage — that is known — it is the **repair going unnoticed**: someone raises the onion budget for
-    /// an unrelated reason, the sweep becomes runnable, and two shipped anonymity defaults quietly stay at
-    /// numbers nobody can reproduce. That is a conditional obligation with no tripwire, and this is the
-    /// tripwire.
+    /// **What they said, verbatim, and it does not settle the constants:**
     ///
-    /// It computes the condition from `depth_for` and `slot_len` rather than restating `37 804`: a guard
-    /// that copies the value it guards stops guarding the moment the original moves.
+    /// ```text
+    ///   current default 50/1000 -> matching accuracy 0.000  (chance 0.20)
+    ///   candidate     120/500   -> matching accuracy 0.283  (chance 0.20)
+    ///
+    ///   mix  120 / cover  300 -> 0.25      mix  250 / cover  150 -> 0.47
+    ///   mix  250 / cover  300 -> 0.25      mix  500 / cover  100 -> 0.28
+    ///
+    ///   GPA in/out rate correlation: no defence r = 1.000, shipped r = 0.913, aggressive r = 0.898
+    /// ```
+    ///
+    /// Read plainly: the pair that ships (120/500) scores *worse than* the pair it replaced (50/1000), which
+    /// would be a reason to revert — except that the sweep beside it is **non-monotone** (heavier defence
+    /// scoring worse, at 0.25 → 0.47 → 0.28), and `measure_linkability_on_the_shipping_engine` refuses its
+    /// own premise: its undefended baseline sits exactly at chance, so that harness has no signal to
+    /// attenuate. A metric that cannot rank "no defence" above "some defence" cannot rank two defences.
+    ///
+    /// So the obligation is **not discharged, and it is no longer invisible**: the numbers exist, they are
+    /// here, and what is missing is an attacker the harness can actually run — not another sweep of the same
+    /// one. This guard pins the pair those numbers were taken against, so moving either constant without
+    /// reading this block fails the build.
     #[test]
-    fn the_mixnet_defaults_revision_clock_has_not_rung() {
-        // `PG(2,7)` — the plane the sweep ran on — has 8 points per line.
-        const SWEEP_LINE_SIZE: usize = 8;
-        let depth = fanos_aphantos::slots::depth_for(SWEEP_LINE_SIZE);
-
-        assert!(
-            depth < 2,
-            "the knee sweep that set DEFAULT_MIX_DELAY ({DEFAULT_MIX_DELAY:?}) and DEFAULT_COVER_INTERVAL \
-             ({DEFAULT_COVER_INTERVAL:?}) needs a \
-             2-hop circuit on PG(2,7), and depth_for(8) has risen to {depth} — it BUILDS again. Re-run \
-             `cargo test -p fanos-sim --test threshold_routing -- --ignored` and re-derive both defaults \
-             from it, then retire this clock. Leaving them is exactly the fossil UHM 316edd9 names: a \
-             constant whose only source is itself (#187)",
+    fn the_mixnet_defaults_are_the_pair_the_2026_08_22_sweep_examined() {
+        assert_eq!(
+            (DEFAULT_MIX_DELAY, DEFAULT_COVER_INTERVAL),
+            (Duration::from_millis(120), Duration::from_millis(500)),
+            "the sweep of 2026-08-22 measured this pair and did not settle it — read the doc above before \
+             moving either, and do not move them on that sweep alone"
         );
-
-        // And the clock must be watching the right thing: Fano, the one dispatchable plane that *does*
-        // reach depth 2, is not a substitute — its own line is smaller, and #187 records why its floor of
-        // 1/2 cannot discriminate a schedule. Asserting both keeps the clock from reading as "no plane
-        // works", which would make it ring for the wrong reason.
+        // The sweep must stay runnable: it became buildable when the onion bucket started deriving per
+        // plane, and a change that re-blocked it would retire the obligation instead of discharging it.
+        assert!(
+            fanos_aphantos::slots::depth_for(8) >= 2,
+            "PG(2,7) must still afford the 2-hop circuit the sweep needs, or the measurement that owes these \
+             constants an observation cannot be run at all"
+        );
+        // Fano too, for the reason the clock this replaced gave: #187 records that its 1/2 floor cannot
+        // discriminate a schedule, so it is not a substitute plane for the sweep — but a build where it
+        // stopped forming circuits at all would be a larger finding than these two constants.
         assert!(
             fanos_aphantos::slots::depth_for(3) >= 2,
-            "Fano must still build a circuit — if it does not, the finding is larger than this clock"
+            "Fano must still build a circuit — if it does not, the finding is larger than these defaults"
         );
     }
 
@@ -2634,17 +2646,27 @@ mod tests {
     /// 1. **a cell can exist on it** — `7 | N`, since every cell-scoped mechanism (the reflex, the roster, the
     ///    federated covering) is a Fano cell of seven seats: that drops 7 and 31 by divisibility alone;
     /// 2. **a circuit can exist on it** — `slots::plane_can_anonymize`, i.e. the fixed-slot onion budget still reaches
-    ///    `TARGET_DEPTH` hops once one slot is reserved for the payload: that drops 4, where `depth_for` falls to 2;
+    ///    `TARGET_DEPTH` hops once one slot is reserved for the payload;
     /// 3. **the plane is dispatchable at all**, which is the table above.
     ///
-    /// What is left is `q = 2`. So "should the default be 3 or 4 instead" is not a preference to settle: `q = 3` holds
-    /// no Fano cell (`7 ∤ 13`) and `q = 4` cannot carry a sound circuit at the shipped `THRESHOLD_ONION_LEN`. **The
-    /// order to change first is the onion budget, not the plane** — a wider cell buys more slots, not more payload, so
-    /// raising `q` without raising that constant trades a hop for an anonymity set and reports neither.
+    /// **The set changed on 2026-08-22 and this guard is the thing that said so.** It used to leave `q = 2` alone,
+    /// because `THRESHOLD_ONION_LEN` was a round 20 KiB global constant sized for a Fano circuit and nothing else,
+    /// so `plane_can_anonymize(5)` was false. The bucket is now `fanos_threshold::onion_len(line_size)` — derived
+    /// from the plane's own slot width, per plane — so `q = 2` still gets exactly the 20 480 it always had and
+    /// `q = 4` gets the 27 494 a circuit on *it* costs. `q = 3` still holds no Fano cell (`7 ∤ 13`), and 7 and 31
+    /// still fail the same divisibility, so the admissible set is exactly `{2, 4}`.
     ///
-    /// This is a guard rather than a note: it fails the moment the budget grows enough to admit `q = 4` (then the
-    /// decision is genuinely open again and should be re-taken with the numbers), and it fails if a future order is
-    /// dispatched without both properties.
+    /// **The default stays 2, and now that is a choice rather than the only option left.** `q = 4` is the better
+    /// plane on every structural count — 21 points against 7, three diagnostic cells against one, 21 lines against
+    /// four with distinct combiners — but covering it takes `≈ 3N/2 ≈ 32` operators
+    /// (`members_for_a_covered_plane`), and a plane run below that coverage has lines that cannot serve, which is
+    /// worse anonymity than a small plane that works. So: `q = 2` for a first deployment, `q = 4` from about thirty
+    /// operators up. And having the option costs a `q = 2` deployment nothing: the earlier attempt at this made the
+    /// bucket one global number sized for the widest plane, which would have charged every packet — cover traffic
+    /// included — 34 % for capacity a Fano network never uses.
+    ///
+    /// This is a guard rather than a note: it fails if the admissible set moves again, and it fails if a future
+    /// order is dispatched without both properties.
     #[test]
     fn exactly_one_dispatchable_plane_order_can_host_both_a_cell_and_a_circuit() {
         let admits: Vec<u32> = [2u32, 4, 7, 31]
@@ -2657,12 +2679,17 @@ mod tests {
             alloc_default_order(),
             "the dispatch table's orders that hold a Fano cell AND can carry a TARGET_DEPTH circuit are {admits:?};              if this set changed, `NodeConfig::plane_order`'s default is a decision again — see Tier B §4"
         );
-        assert_eq!(NodeConfig::default().plane_order, 2, "the default must be the order the constraints leave");
+        assert_eq!(
+            NodeConfig::default().plane_order,
+            2,
+            "the default is now a CHOICE between two admissible orders, and it is 2 because covering PG(2,4) \
+             takes about thirty operators; change it together with the doc above, never on its own"
+        );
     }
 
-    /// The one order the constraints above leave, spelled out so the assertion reads as a comparison rather than as a
+    /// The orders the constraints above leave, spelled out so the assertion reads as a comparison rather than as a
     /// literal nobody has to justify.
     fn alloc_default_order() -> Vec<u32> {
-        vec![2]
+        vec![2, 4]
     }
 }
